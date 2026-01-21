@@ -1,0 +1,297 @@
+================================================================================
+         OPERATION-BASED NEURAL NETWORKS - RESEARCH NOTES
+================================================================================
+Created: 2026-01-21
+Updated: 2026-01-21
+Project: Glassbox (Monorepo - this is ONE project within it)
+
+================================================================================
+PART 1: THE VISION (PRECISE DEFINITION)
+================================================================================
+
+GOAL: Design a NEW TYPE OF NEURAL NETWORK architecture where:
+      - EDGES carry VALUES (constants like 0.5, 1, 2, 3)
+      - NEURONS ARE OPERATIONS (sin, +, *, ^2, log, etc.)
+      - Multi-input neurons aggregate: [1,2,3] → + neuron → 6
+
+THE ARCHITECTURE:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│   EDGE = VALUE (constant)          NEURON = OPERATION                       │
+│   ─────────────────────            ──────────────────                       │
+│   Like 0.5, 1, 2, 3...             Like sin, +, *, ^2                       │
+│   NOT a "weight" to multiply       Transforms incoming values              │
+│   The value flows through          Operations can be:                       │
+│                                     - Unary: sin(x), x^2, log(x)            │
+│                                     - Aggregation: +(1,2,3)=6, *(2,3)=6     │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+EXAMPLE: 3 edges with values [1, 2, 3] → "+" neuron → outputs 6
+
+         [1] ──────┐
+                   │
+         [2] ──────┼──→  ( + )  ──→  [6]
+                   │
+         [3] ──────┘
+
+EXAMPLE: 1 edge with value [4] → "^2" neuron → outputs 16
+
+         [4] ──────────→  ( ^2 )  ──→  [16]
+
+EXAMPLE: 2 edges with values [3, 2] → "*" neuron → outputs 6
+
+         [3] ──────┐
+                   ├──→  ( * )  ──→  [6]
+         [2] ──────┘
+
+EXAMPLE: Chain of operations
+
+         [2] ──→ ( ^2 ) ──→ [4] ──→ ( +1 ) ──→ [5] ──→ ( sin ) ──→ [sin(5)]
+
+THE KEY DIFFERENCES FROM TRADITIONAL NN:
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  Traditional NN                    │  Operation-Based NN (Our Design)      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  Neuron: output = σ(W·x + b)       │  Neuron: output = op(inputs)          │
+│  Edge: carries a weight (float)    │  Edge: carries a value (+ optional c) │
+│  Learn: weights via backprop       │  Learn: WHICH op via ???              │
+│  Fixed activation (ReLU, etc)      │  Activation IS the learnable part     │
+│  Designed for: function approx     │  Designed for: ??? (NEW TERRITORY)    │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+================================================================================
+PART 2: THE CORE PROBLEM
+================================================================================
+
+WHY CURRENT NN FRAMEWORKS DON'T WORK:
+
+Problem 1: BACKPROP ASSUMES CONTINUOUS PARAMETERS
+- Traditional: ∂Loss/∂weight is well-defined (weight is continuous)
+- Our design: ∂Loss/∂(which_operation) is NOT well-defined (discrete choice)
+- Workaround: Gumbel-Softmax (soft approximation) - but it's a HACK, not a solution
+
+Problem 2: COMPUTATION GRAPH ASSUMES FIXED STRUCTURE
+- Traditional: Forward pass = same operations, different weights
+- Our design: Forward pass = different operations entirely
+- Issue: PyTorch/TensorFlow build graphs assuming structure is fixed
+
+Problem 3: GRADIENT FLOW DIFFERS PER OPERATION
+- sin(x) has gradient cos(x)
+- x² has gradient 2x
+- When operation is LEARNED, gradient computation becomes meta-level
+
+Problem 4: BINARY/AGGREGATION OPS BREAK THE PARADIGM
+- Traditional: Each neuron takes weighted sum of inputs
+- Our design: A neuron might SUM inputs, or MULTIPLY them, or take MAX
+- This changes the fundamental dataflow model
+
+================================================================================
+PART 3: WHAT WE'VE BUILT (Proof of Concept)
+================================================================================
+
+FILES:
+- glassbox/sr/operation_rnn.py    : First attempt at the architecture
+- tests/test_operation_rnn.py     : Test suite
+
+COMPONENTS:
+- OperationCell: A single "neuron" that learns which op to apply
+- OperationRNN: Recurrent stacking of cells
+- OperationLSTM: LSTM-style gates using operations
+- 29 Operations: unary, binary, aggregation
+- Gumbel-Softmax: Differentiable (soft) operation selection
+
+WHAT WORKS:
+✅ Forward pass computes correctly
+✅ Gradient flows (via Gumbel-Softmax trick)
+✅ Can learn to select different operations
+✅ Numerically stable
+✅ Multi-input aggregation (your idea: + neuron sums all inputs)
+
+WHAT DOESN'T WORK WELL:
+❌ Training is unstable (oscillates, doesn't converge cleanly)
+❌ Gumbel-Softmax is a hack (not true discrete selection)
+❌ RNN architecture adds temporal assumptions we don't want
+❌ Performance is worse than traditional NNs on standard tasks
+
+================================================================================
+PART 4: THE RESEARCH QUESTION
+================================================================================
+
+CORE QUESTION:
+How do we design a training algorithm for a network where the
+"weights" are discrete operation choices, not continuous floats?
+
+SUB-QUESTIONS:
+
+Q1: WHAT IS THE RIGHT GRADIENT ANALOG?
+    - Traditional: gradient = direction of steepest descent
+    - Our design: ??? what's the "direction" in operation space?
+
+Q2: WHAT IS THE RIGHT LOSS LANDSCAPE?
+    - Traditional: smooth loss surface, gradient descent works
+    - Our design: loss surface is discontinuous (change sin→cos = jump)
+
+Q3: WHAT IS THE RIGHT ARCHITECTURE?
+    - We tried RNN → adds temporal dependencies we don't want
+    - Tree? DAG? Something else?
+
+Q4: HOW DO WE HANDLE COMPOSITIONALITY?
+    - How does the network learn to compose: sin(x²) vs (sin(x))²?
+    - Depth of composition must be learnable
+
+Q5: HOW DO EDGE VALUES INTERACT WITH OPERATIONS?
+    - Your idea: edge can have a coefficient (like 0.5)
+    - How does this interact with learned operations?
+
+================================================================================
+PART 5: POSSIBLE NEW MATHEMATICAL APPROACHES
+================================================================================
+
+APPROACH A: EVOLUTIONARY STRUCTURE + GRADIENT CONSTANTS
+- Idea: Don't gradient-descend through operation choice
+- Use evolution/mutation to explore operation structures
+- Use gradient descent only for continuous constants
+- Hybrid: best of both worlds?
+
+APPROACH B: CONTINUOUS OPERATION EMBEDDING
+- Idea: Embed all operations in a continuous latent space
+- sin and cos are "nearby" in this space
+- Then we CAN gradient descend through operation space
+- Challenge: how to define this embedding?
+
+APPROACH C: REINFORCEMENT LEARNING
+- Treat operation selection as an action
+- Reward = negative loss
+- Policy gradient to learn which operations to select
+- Challenge: high variance, sample inefficiency
+
+APPROACH D: DIFFERENTIABLE PROGRAMMING
+- Don't select operations - COMPOSE PRIMITIVES
+- Every operation is built from basic differentiable primitives
+- Example: sin(x) ≈ x - x³/6 + x⁵/120 - ... (Taylor series)
+- Challenge: loses interpretability
+
+APPROACH E: NEURAL ARCHITECTURE SEARCH (NAS) STYLE
+- Operation selection IS architecture search
+- Use NAS techniques: weight sharing, super-network, etc.
+- Challenge: NAS is expensive, designed for layer-level not neuron-level
+
+APPROACH F: NEW GRADIENT-FREE OPTIMIZATION
+- Design a new optimization algorithm specifically for this
+- Not gradient descent, not evolution, something new
+- Based on information theory? Causal inference? 
+- This is NOVEL RESEARCH territory
+
+APPROACH G: PROBABILISTIC PROGRAMMING
+- Model operation selection as a probabilistic inference problem
+- Use variational inference or MCMC to find best operations
+- Challenge: computational cost
+
+================================================================================
+PART 6: SPECIFIC TECHNICAL BLOCKERS
+================================================================================
+
+BLOCKER 1: DISCRETE OPTIMIZATION
+- Current fix: Gumbel-Softmax (soft approximation to discrete)
+- Problem: It's a continuous relaxation, not true discrete
+- During inference: we pick argmax anyway
+- Training ≠ Inference behavior (train with soft, infer with hard)
+
+BLOCKER 2: OPERATION-DEPENDENT GRADIENTS
+- Each operation has its own derivative
+- d/dx sin(x) = cos(x)
+- d/dx x² = 2x
+- When operation is LEARNED, we need "meta-gradients"
+
+BLOCKER 3: VARIABLE-ARITY OPERATIONS
+- Unary: takes 1 input
+- Binary: takes 2 inputs
+- Aggregation: takes N inputs
+- How does one neuron dynamically change its arity?
+
+BLOCKER 4: SEARCH SPACE SIZE
+- 29 operations per neuron
+- 10 neurons = 29^10 ≈ 10^14 possible configurations
+- Gradient descent explores locally
+- Need global exploration strategy
+
+================================================================================
+PART 7: WHAT MAKES THIS DIFFERENT FROM EXISTING WORK
+================================================================================
+
+                        ┌────────────────────────────────────────┐
+                        │            OUR APPROACH                │
+                        │  Neuron = learned operation            │
+                        │  Edge = value (not weight)             │
+┌───────────────────────┴────────────────────────────────────────┤
+│ vs TRADITIONAL NN                                              │
+│ - They learn weights, we learn operations                      │
+│ - They have fixed activations, ours are the learnable part     │
+├────────────────────────────────────────────────────────────────┤
+│ vs SYMBOLIC REGRESSION (PySR, AI Feynman)                      │
+│ - They search for formulas, we design a neural architecture    │
+│ - They output equations, we output a network that can be used  │
+│ - Formula discovery is a side effect for us, not the goal      │
+├────────────────────────────────────────────────────────────────┤
+│ vs KAN (Kolmogorov-Arnold Networks)                            │
+│ - KAN learns spline-based activations on edges                 │
+│ - We learn discrete operation selection per neuron             │
+│ - KAN is continuous, ours is fundamentally discrete            │
+├────────────────────────────────────────────────────────────────┤
+│ vs NAS (Neural Architecture Search)                            │
+│ - NAS searches layer-level structure                           │
+│ - We search neuron-level operation                             │
+│ - NAS is for architecture, ours is for computation itself      │
+└────────────────────────────────────────────────────────────────┘
+
+================================================================================
+PART 8: NEXT STEPS FOR RESEARCH
+================================================================================
+
+IMMEDIATE (Understand the problem deeper):
+1. Define formal mathematical model of Operation-Based NN
+2. Characterize the loss landscape (is it piecewise? fractal?)
+3. Benchmark: what tasks would this architecture excel at?
+
+SHORT-TERM (Prototype solutions):
+4. Implement hybrid: evolution for structure + gradient for constants
+5. Try continuous operation embedding (can sin→cos be smooth?)
+6. Test on non-sequence data (remove RNN, use feedforward)
+
+LONG-TERM (Novel contributions):
+7. Design new optimization algorithm for discrete+continuous problems
+8. Formalize the theory of "operation gradients"
+9. Publish: "Operation-Based Neural Networks: A New Paradigm"
+
+================================================================================
+PART 9: KEY INSIGHT
+================================================================================
+
+Traditional NNs ask: "What weights minimize the loss?"
+                     (continuous optimization, well-understood)
+
+Our design asks:     "What COMPUTATION minimizes the loss?"
+                     (discrete+continuous, NOT well-understood)
+
+This is fundamentally a HARDER problem, but potentially more powerful:
+- If solved, we get interpretable, efficient, compositional networks
+- The network literally tells you what it's computing
+- Could lead to new understanding of what computation means
+
+
+================================================================================
+PART 10: THINGS TO RESEARCH
+================================================================================
+
+oncrete ideas you could research:
+
+Evolution for structure + Gradient for constants: Don't backprop through operation selection - evolve it. Then use gradient for any constants.
+Continuous operation embedding: What if sin and cos aren't discrete choices but exist on a continuous manifold? Then you could gradient-descend between operations.
+Symbolic differentiation: Instead of numeric gradients, use exact symbolic derivatives. This eliminates numerical errors entirely.
+Two-phase training: Phase 1 = explore many structures randomly. Phase 2 = refine best candidates with gradient descent.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
