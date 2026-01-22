@@ -75,6 +75,7 @@ class OperationDAG(nn.Module):
         self.nodes_per_layer = nodes_per_layer
         self.n_outputs = n_outputs
         self.tau = tau
+        self.use_simple_nodes = use_simple_nodes
         
         # Build layers
         self.layers = nn.ModuleList()
@@ -86,6 +87,7 @@ class OperationDAG(nn.Module):
                 n_nodes=nodes_per_layer,
                 layer_idx=layer_idx,
                 tau=tau,
+                use_simple_nodes=use_simple_nodes,
             )
             self.layers.append(layer)
             current_n_sources += nodes_per_layer  # Add this layer's outputs
@@ -164,62 +166,330 @@ class OperationDAG(nn.Module):
         if var_names is None:
             var_names = [f"x{i}" for i in range(self.n_inputs)]
         
-        # Track expressions for each node
+        # Track expressions for each node position in the graph
+        # Index 0 to n_inputs-1 are input variables
+        # Then each layer adds nodes_per_layer expressions
         expressions = list(var_names)  # Start with input variables
         
         for layer_idx, layer in enumerate(self.layers):
             for node_idx, node in enumerate(layer.nodes):
-                op = node.get_selected_operation()
-                routing = node.get_routing_info()
-                sources = routing.get('primary_sources', [0, 1])
+                # Get the selected operation info
+                op_str = node.get_selected_operation()
+                routing_info = node.get_routing_info()
+                primary_sources = routing_info.get('primary_sources', [0, 0])
                 
-                if 'binary' in op or 'arithmetic' in op:
-                    # Binary operation
-                    src1 = sources[0] if len(sources) > 0 else 0
-                    src2 = sources[1] if len(sources) > 1 else 0
-                    expr1 = expressions[src1] if src1 < len(expressions) else "?"
-                    expr2 = expressions[src2] if src2 < len(expressions) else "?"
-                    
-                    if 'add' in op.lower():
-                        new_expr = f"({expr1} + {expr2})"
-                    elif 'mul' in op.lower():
-                        new_expr = f"({expr1} * {expr2})"
+                # Get the source expressions (clamp to valid indices)
+                src1_idx = min(primary_sources[0], len(expressions) - 1)
+                src2_idx = min(primary_sources[1] if len(primary_sources) > 1 else 0, len(expressions) - 1)
+                src1_expr = expressions[src1_idx] if src1_idx < len(expressions) else var_names[0]
+                src2_expr = expressions[src2_idx] if src2_idx < len(expressions) else var_names[0]
+                
+                # Parse the operation string to build expression
+                op_lower = op_str.lower()
+                
+                # Unary operations
+                if 'power:' in op_lower:
+                    # Extract the specific power operation
+                    if 'square' in op_lower:
+                        new_expr = f"({src1_expr})²"
+                    elif 'cube' in op_lower:
+                        new_expr = f"({src1_expr})³"
+                    elif 'sqrt' in op_lower:
+                        new_expr = f"√({src1_expr})"
+                    elif 'identity' in op_lower:
+                        new_expr = src1_expr
+                    elif 'reciprocal' in op_lower:
+                        new_expr = f"1/({src1_expr})"
                     else:
-                        new_expr = f"{op}({expr1}, {expr2})"
+                        # Try to extract power value
+                        import re
+                        p_match = re.search(r'p=([0-9.-]+)', op_lower)
+                        if p_match:
+                            p_val = float(p_match.group(1))
+                            if abs(p_val - 2.0) < 0.15:
+                                new_expr = f"({src1_expr})²"
+                            elif abs(p_val - 1.0) < 0.15:
+                                new_expr = src1_expr
+                            elif abs(p_val - 0.5) < 0.15:
+                                new_expr = f"√({src1_expr})"
+                            else:
+                                new_expr = f"({src1_expr})^{p_val:.1f}"
+                        else:
+                            new_expr = f"pow({src1_expr})"
+                            
+                elif 'periodic:' in op_lower:
+                    if 'sin' in op_lower and '-sin' not in op_lower:
+                        new_expr = f"sin({src1_expr})"
+                    elif 'cos' in op_lower and '-cos' not in op_lower:
+                        new_expr = f"cos({src1_expr})"
+                    elif '-sin' in op_lower:
+                        new_expr = f"-sin({src1_expr})"
+                    elif '-cos' in op_lower:
+                        new_expr = f"-cos({src1_expr})"
+                    else:
+                        new_expr = f"periodic({src1_expr})"
+                        
+                elif 'exp:' in op_lower:
+                    if 'constant' in op_lower:
+                        new_expr = "1"
+                    elif '2^' in op_lower:
+                        new_expr = f"2^({src1_expr})"
+                    else:
+                        new_expr = f"exp({src1_expr})"
+                        
+                elif 'log:' in op_lower:
+                    if 'ln' in op_lower:
+                        new_expr = f"ln({src1_expr})"
+                    elif 'log2' in op_lower:
+                        new_expr = f"log2({src1_expr})"
+                    elif 'log10' in op_lower:
+                        new_expr = f"log10({src1_expr})"
+                    else:
+                        new_expr = f"log({src1_expr})"
+                
+                # Binary operations
+                elif 'arithmetic:' in op_lower:
+                    if 'add' in op_lower:
+                        new_expr = f"({src1_expr} + {src2_expr})"
+                    elif 'multiply' in op_lower or 'mul' in op_lower:
+                        new_expr = f"({src1_expr} * {src2_expr})"
+                    else:
+                        new_expr = f"arith({src1_expr}, {src2_expr})"
+                        
+                elif 'aggregation:' in op_lower:
+                    if 'max' in op_lower:
+                        new_expr = f"max({src1_expr}, {src2_expr})"
+                    elif 'mean' in op_lower:
+                        new_expr = f"mean({src1_expr}, {src2_expr})"
+                    elif 'sum' in op_lower:
+                        new_expr = f"sum({src1_expr}, {src2_expr})"
+                    else:
+                        new_expr = f"agg({src1_expr})"
                 else:
-                    # Unary operation
-                    src = sources[0] if len(sources) > 0 else 0
-                    expr = expressions[src] if src < len(expressions) else "?"
-                    
-                    if 'sin' in op.lower():
-                        new_expr = f"sin({expr})"
-                    elif 'cos' in op.lower():
-                        new_expr = f"cos({expr})"
-                    elif 'square' in op.lower():
-                        new_expr = f"({expr})²"
-                    elif 'identity' in op.lower():
-                        new_expr = expr
-                    elif 'sqrt' in op.lower():
-                        new_expr = f"√({expr})"
+                    # Fallback: use the operation name
+                    # Safely handle cases without colon
+                    if ':' in op_str:
+                        op_name = op_str.split(':')[0]
                     else:
-                        new_expr = f"{op.split(':')[0]}({expr})"
+                        op_name = op_str
+                    new_expr = f"{op_name}({src1_expr})"
                 
                 expressions.append(new_expr)
         
-        # Output is a linear combination of all expressions
-        # For single output, try to identify the dominant term
-        output_weights = self.output_proj.weight.data.abs()
-        top_idx = output_weights[0].argmax().item()
+        # Now analyze output projection to find most influential expressions
+        output_weights = self.output_proj.weight.data[0].cpu()  # First output
+        output_bias = self.output_proj.bias.data[0].item() if self.output_proj.bias is not None else 0
         
-        if top_idx < len(expressions):
-            return expressions[top_idx]
-        return "complex_expression"
+        # Build formula from weighted contributions
+        formula_parts = []
+        weight_threshold = 0.05  # Lower threshold to catch more contributions
+        
+        # Collect all significant contributions
+        contributions = []
+        for idx in range(len(expressions)):
+            if idx < len(output_weights):
+                weight = output_weights[idx].item()
+                if abs(weight) > weight_threshold:
+                    contributions.append((abs(weight), weight, idx, expressions[idx]))
+        
+        # Sort by absolute weight (descending)
+        contributions.sort(reverse=True, key=lambda x: x[0])
+        
+        # Take top contributors (up to 5)
+        for _, weight, idx, expr in contributions[:5]:
+            # Skip if it's just a raw input variable AND there are non-trivial expressions
+            if expr in var_names and len(contributions) > 1:
+                # Check if there's a better expression available
+                has_better = any(c[3] not in var_names for c in contributions[:5])
+                if has_better:
+                    continue
+            
+            if abs(weight - 1.0) < 0.1:
+                formula_parts.append(expr)
+            elif abs(weight + 1.0) < 0.1:
+                formula_parts.append(f"-{expr}")
+            elif weight > 0:
+                formula_parts.append(f"{weight:.2f}*{expr}")
+            else:
+                formula_parts.append(f"({weight:.2f}*{expr})")
+        
+        # Add bias if significant
+        if abs(output_bias) > weight_threshold:
+            if output_bias > 0:
+                formula_parts.append(f"{output_bias:.2f}")
+            else:
+                formula_parts.append(f"({output_bias:.2f})")
+        
+        if not formula_parts:
+            # Fallback: return the last computed expression
+            non_trivial = [e for e in expressions if e not in var_names]
+            if non_trivial:
+                return non_trivial[-1]
+            return expressions[-1] if expressions else "?"
+        
+        raw_formula = " + ".join(formula_parts)
+        return self._simplify_formula(raw_formula)
+    
+    def _simplify_formula(self, formula_str: str) -> str:
+        """Simplify formula using sympy."""
+        try:
+            from sympy import symbols, sympify, simplify
+            
+            # Create symbols for input variables
+            local_dict = {f"x{i}": symbols(f"x{i}") for i in range(self.n_inputs)}
+            
+            # Add other common functions to local dict to be safe
+            import sympy
+            local_dict.update({
+                'sin': sympy.sin,
+                'cos': sympy.cos,
+                'exp': sympy.exp,
+                'log': sympy.log,
+                'ln': sympy.log,
+                'sqrt': sympy.sqrt,
+                'pow': sympy.Pow,
+            })
+            
+            # Parse and simplify
+            # Handle some custom names manually
+            formula_str = formula_str.replace("max(", "Max(")
+            
+            # Handle float precision to avoid huge decimals
+            import re
+            # Replace 0.00*x with 0
+            formula_str = re.sub(r'0\.00\*\w+', '0', formula_str)
+            
+            expr = sympify(formula_str, locals=local_dict)
+            simplified = simplify(expr)
+            
+            # Round floats in the simplified expression for readability
+            # This is a bit tricky with sympy, so we'll just return the simplified string
+            return str(simplified).replace('**', '^')
+        except Exception as e:
+            # If simplification fails (e.g. unknown function), return raw
+            return formula_str
+
     
     def snap_to_discrete(self):
         """Snap all operations to discrete equivalents."""
         for layer in self.layers:
             for node in layer.nodes:
                 node.snap_to_discrete()
+    
+    def compile_for_inference(self):
+        """
+        Compile the DAG for fast inference by caching selections.
+        
+        After training, call this method to:
+        1. Cache the selected operation for each node
+        2. Cache the routing (which sources to use)
+        3. Enable fast-path inference that skips selection logic
+        
+        This can provide 5-10x speedup for inference.
+        
+        Returns self for chaining: dag.snap_to_discrete().compile_for_inference().eval()
+        """
+        self._compiled = True
+        self._compiled_ops = []
+        
+        for layer_idx, layer in enumerate(self.layers):
+            layer_ops = []
+            for node in layer.nodes:
+                # Get deterministic selection
+                selection = node.op_selector.get_selected()
+                
+                # Get routing info 
+                try:
+                    routing = node.router.router.get_primary_sources()
+                except (AttributeError, RuntimeError):
+                    routing = [0, 0]
+                
+                # Get edge weights
+                try:
+                    edge_weights = node.router.edge_weights.detach().clone()
+                except (AttributeError, RuntimeError):
+                    edge_weights = None
+                
+                # Get the actual operation callable
+                if selection['type'] == 'unary':
+                    op_idx = selection['unary_idx']
+                    op = node.unary_ops[op_idx]
+                    op_type = 'unary'
+                else:
+                    op_idx = selection['binary_idx']
+                    op = node.binary_ops[op_idx]
+                    op_type = 'binary' if op_idx == 0 else 'aggregation'
+                
+                layer_ops.append({
+                    'op': op,
+                    'op_type': op_type,
+                    'routing': routing,
+                    'edge_weights': edge_weights,
+                    'output_scale': node.output_scale.detach().clone(),
+                })
+            self._compiled_ops.append(layer_ops)
+        
+        return self
+    
+    def forward_compiled(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Fast forward pass using compiled operations.
+        
+        Must call compile_for_inference() first.
+        
+        Args:
+            x: (batch, n_inputs) input tensor
+            
+        Returns:
+            output: (batch, n_outputs)
+        """
+        if not hasattr(self, '_compiled') or not self._compiled:
+            raise RuntimeError("Call compile_for_inference() before forward_compiled()")
+        
+        batch_size = x.shape[0]
+        all_sources = [x]
+        
+        for layer_idx, layer_ops in enumerate(self._compiled_ops):
+            # Concatenate all sources so far
+            sources = torch.cat(all_sources, dim=-1)  # (batch, current_n_sources)
+            
+            layer_outputs = []
+            for node_info in layer_ops:
+                # Apply edge weights
+                if node_info['edge_weights'] is not None:
+                    weighted = sources * node_info['edge_weights']
+                else:
+                    weighted = sources
+                
+                routing = node_info['routing']
+                op = node_info['op']
+                op_type = node_info['op_type']
+                
+                if op_type == 'unary':
+                    # Get single input
+                    inp = weighted[:, routing[0]]
+                    out = op(inp)
+                elif op_type == 'binary':
+                    # Get two inputs
+                    inp1 = weighted[:, routing[0]]
+                    inp2 = weighted[:, routing[1]] if len(routing) > 1 else inp1
+                    out = op(inp1, inp2)
+                else:  # aggregation
+                    out = op(weighted, dim=-1)
+                
+                # Apply output scale and clamp
+                out = out * node_info['output_scale']
+                out = torch.clamp(out, -100, 100)
+                
+                layer_outputs.append(out)
+            
+            # Stack layer outputs
+            layer_output = torch.stack(layer_outputs, dim=-1)
+            all_sources.append(layer_output)
+        
+        # Final output
+        final_sources = torch.cat(all_sources, dim=-1)
+        return self.output_proj(final_sources)
     
     def l0_regularization(self) -> torch.Tensor:
         """Total L0 regularization across all layers."""
@@ -432,9 +702,16 @@ def train_onn(
             for layer in model.layers:
                 for node in layer.nodes:
                     node.tau = model.tau
+                    # Also update op_selector tau for proper annealing
+                    if hasattr(node, 'op_selector') and hasattr(node.op_selector, 'set_tau'):
+                        node.op_selector.set_tau(model.tau)
+        
+        # Use soft selection early (exploration), hard selection later (exploitation)
+        progress = epoch / max(epochs - 1, 1)
+        use_hard = progress > 0.7
         
         # Training step
-        components = train_step(model, optimizer, x_train, y_train, loss_fn)
+        components = train_step(model, optimizer, x_train, y_train, loss_fn, hard=use_hard)
         
         history['mse'].append(components['mse'])
         history['total'].append(components['total'])

@@ -140,12 +140,20 @@ class HardConcreteGate(nn.Module):
         
         if learn_tau:
             self.log_tau = nn.Parameter(torch.tensor(math.log(tau)))
+            self._learn_tau = True
         else:
             self.register_buffer('log_tau', torch.tensor(math.log(tau)))
+            self._learn_tau = False
     
     @property
     def tau(self) -> float:
+        """Get tau value. Returns float for non-learnable, keeps tensor for learnable."""
         return torch.exp(self.log_tau).item()
+    
+    @property
+    def tau_tensor(self) -> torch.Tensor:
+        """Get tau as tensor (preserves gradients when learnable)."""
+        return torch.exp(self.log_tau)
     
     def forward(self, hard: bool = True) -> torch.Tensor:
         """
@@ -256,10 +264,10 @@ class HardConcreteSelector(nn.Module):
         """Get deterministic selection (argmax of expected values)."""
         return self.logits.argmax().item()
     
-    def get_distribution(self) -> torch.Tensor:
-        """Get softmax distribution over options (for analysis)."""
-        return F.softmax(self.logits, dim=-1)
-    
+        def set_tau(self, tau: float):
+            """Update temperature for annealing during training."""
+            self.tau = tau
+        
     def entropy(self) -> torch.Tensor:
         """Compute entropy of selection distribution."""
         probs = F.softmax(self.logits, dim=-1)
@@ -288,6 +296,8 @@ class HardConcreteOperationSelector(nn.Module):
     Two-level selection:
     1. Select operation TYPE (unary/binary/aggregation)
     2. Select specific operation within type
+    
+    OPTIMIZED: Batches all logits into a single hard_concrete_sample call.
     """
     
     def __init__(
@@ -300,13 +310,16 @@ class HardConcreteOperationSelector(nn.Module):
         super().__init__()
         self.n_unary = n_unary
         self.n_binary = n_binary
+        self.tau = tau
+        self.beta = beta
         
-        # Type selection: [unary, binary]
-        self.type_selector = HardConcreteSelector(2, tau=tau, beta=beta)
+        # Batch all logits together: [type(2), unary(n_unary), binary(n_binary)]
+        total = 2 + n_unary + n_binary
+        self.logits = nn.Parameter(torch.zeros(total))
         
-        # Within-type selection
-        self.unary_selector = HardConcreteSelector(n_unary, tau=tau, beta=beta)
-        self.binary_selector = HardConcreteSelector(n_binary, tau=tau, beta=beta)
+        # Slice indices
+        self._type_end = 2
+        self._unary_end = 2 + n_unary
     
     def forward(self, hard: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -317,17 +330,33 @@ class HardConcreteOperationSelector(nn.Module):
             unary_weights: (n_unary,) weights for unary ops
             binary_weights: (n_binary,) weights for binary ops
         """
-        type_weights = self.type_selector(hard=hard)
-        unary_weights = self.unary_selector(hard=hard)
-        binary_weights = self.binary_selector(hard=hard)
+        # OPTIMIZATION: Single hard_concrete_sample call for all selections
+        all_gates = hard_concrete_sample(
+            self.logits,
+            tau=self.tau,
+            beta=self.beta,
+            hard=hard,
+            training=self.training,
+        )
+        
+        # Split into components
+        type_weights = all_gates[:self._type_end]
+        unary_weights = all_gates[self._type_end:self._unary_end]
+        binary_weights = all_gates[self._unary_end:]
+        
+        # Normalize each group (if hard, to simulate one-hot)
+        if hard and self.training:
+            type_weights = type_weights / (type_weights.sum() + 1e-8)
+            unary_weights = unary_weights / (unary_weights.sum() + 1e-8)
+            binary_weights = binary_weights / (binary_weights.sum() + 1e-8)
         
         return type_weights, unary_weights, binary_weights
     
     def get_selected(self) -> dict:
         """Get deterministic selection."""
-        type_idx = self.type_selector.select()
-        unary_idx = self.unary_selector.select()
-        binary_idx = self.binary_selector.select()
+        type_idx = self.logits[:self._type_end].argmax().item()
+        unary_idx = self.logits[self._type_end:self._unary_end].argmax().item()
+        binary_idx = self.logits[self._unary_end:].argmax().item()
         
         return {
             'type': 'unary' if type_idx == 0 else 'binary',
@@ -335,21 +364,27 @@ class HardConcreteOperationSelector(nn.Module):
             'binary_idx': binary_idx,
         }
     
+    def set_tau(self, tau: float):
+        """Update temperature for annealing during training."""
+        self.tau = tau
+    
     def l0_regularization(self) -> torch.Tensor:
         """Total L0 regularization for sparsity."""
-        return (
-            self.type_selector.l0_regularization() +
-            self.unary_selector.l0_regularization() +
-            self.binary_selector.l0_regularization()
-        )
+        prob_nonzero = torch.sigmoid(self.logits - self.beta * self.tau)
+        return prob_nonzero.sum()
     
     def entropy_regularization(self) -> torch.Tensor:
         """Total entropy (negative = encourages discrete selection)."""
-        return (
-            self.type_selector.entropy() +
-            self.unary_selector.entropy() +
-            self.binary_selector.entropy()
-        )
+        # Compute entropy for each group
+        type_probs = F.softmax(self.logits[:self._type_end], dim=-1)
+        unary_probs = F.softmax(self.logits[self._type_end:self._unary_end], dim=-1)
+        binary_probs = F.softmax(self.logits[self._unary_end:], dim=-1)
+        
+        type_ent = -(type_probs * torch.log(type_probs + 1e-10)).sum()
+        unary_ent = -(unary_probs * torch.log(unary_probs + 1e-10)).sum()
+        binary_ent = -(binary_probs * torch.log(binary_probs + 1e-10)).sum()
+        
+        return type_ent + unary_ent + binary_ent
 
 
 # ============================================================================

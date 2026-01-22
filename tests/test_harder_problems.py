@@ -5,7 +5,7 @@ import os
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from glassbox.core.evolution import EvolutionEngine
+from glassbox.sr.evolution import EvolutionaryONNTrainer as EvolutionEngine
 
 def run_test(name, input_names, X_dict, y_target, generations=100):
     print(f"\n[Test] {name}")

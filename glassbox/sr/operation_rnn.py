@@ -87,7 +87,7 @@ BINARY_OPS: Dict[str, Callable] = {
     'div':   lambda a, b: safe_div(a, b),
     'max':   lambda a, b: torch.maximum(a, b),
     'min':   lambda a, b: torch.minimum(a, b),
-    'pow':   lambda a, b: safe_pow(a, torch.clamp(b, -3, 3).mean().item()),
+    'pow':   lambda a, b: safe_pow(a, torch.clamp(b, -3, 3)),  # Keep tensor for gradients
 }
 BINARY_NAMES = list(BINARY_OPS.keys())
 

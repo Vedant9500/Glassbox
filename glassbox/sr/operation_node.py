@@ -130,33 +130,43 @@ class OperationNode(nn.Module):
             info: Dict with selection info for interpretability
         """
         batch_size = sources.shape[0]
+        device = sources.device
         
         # Get operation selection weights
         type_weights, unary_weights, binary_weights = self.op_selector(hard=hard)
         
-        # Compute unary outputs
-        unary_input = self.router.forward_unary(sources, tau=self.tau, hard=hard)
-        unary_outputs = []
-        for i, op in enumerate(self.unary_ops):
-            out = op(unary_input)
-            unary_outputs.append(out * unary_weights[i])
-        unary_result = sum(unary_outputs)
+        # OPTIMIZATION: Short-circuit evaluation based on weights
+        # Skip computation paths with near-zero weights (threshold 1e-6)
+        eps = 1e-6
+        compute_unary = type_weights[0].abs() > eps
+        compute_binary = type_weights[1].abs() > eps
         
-        # Compute binary outputs
-        x, y = self.router.forward_binary(sources, tau=self.tau, hard=hard)
-        binary_outputs = []
+        output = torch.zeros(batch_size, device=device)
         
-        # Arithmetic operation
-        binary_outputs.append(self.binary_ops[0](x, y) * binary_weights[0])
+        # Compute unary outputs only if needed
+        if compute_unary:
+            unary_input = self.router.forward_unary(sources, tau=self.tau, hard=hard)
+            unary_result = torch.zeros(batch_size, device=device)
+            for i, op in enumerate(self.unary_ops):
+                if unary_weights[i].abs() > eps:
+                    unary_result = unary_result + op(unary_input) * unary_weights[i]
+            output = output + type_weights[0] * unary_result
         
-        # Aggregation operation (needs all weighted sources)
-        agg_input = self.router.forward_aggregation(sources)
-        binary_outputs.append(self.binary_ops[1](agg_input, dim=-1) * binary_weights[1])
-        
-        binary_result = sum(binary_outputs)
-        
-        # Combine unary and binary based on type selection
-        output = type_weights[0] * unary_result + type_weights[1] * binary_result
+        # Compute binary outputs only if needed
+        if compute_binary:
+            binary_result = torch.zeros(batch_size, device=device)
+            
+            # Arithmetic operation
+            if binary_weights[0].abs() > eps:
+                x, y = self.router.forward_binary(sources, tau=self.tau, hard=hard)
+                binary_result = binary_result + self.binary_ops[0](x, y) * binary_weights[0]
+            
+            # Aggregation operation
+            if binary_weights[1].abs() > eps:
+                agg_input = self.router.forward_aggregation(sources)
+                binary_result = binary_result + self.binary_ops[1](agg_input, dim=-1) * binary_weights[1]
+            
+            output = output + type_weights[1] * binary_result
         
         # Normalize output
         if normalize and batch_size > 1:
@@ -196,9 +206,21 @@ class OperationNode(nn.Module):
     
     def get_routing_info(self) -> Dict:
         """Get routing information for visualization."""
+        # Get primary sources from the nested DifferentiableRouter
+        try:
+            primary_sources = self.router.router.get_primary_sources()
+        except (AttributeError, RuntimeError):
+            primary_sources = [0, 0]  # Default fallback
+        
+        # Get edge weights
+        try:
+            edge_weights = self.router.edge_weights.detach().tolist()
+        except (AttributeError, RuntimeError):
+            edge_weights = []
+        
         return {
-            'edge_weights': self.router.edge_weights.tolist() if hasattr(self.router, 'edge_weights') else [],
-            'primary_sources': self.router.router.get_primary_sources(),
+            'edge_weights': edge_weights,
+            'primary_sources': primary_sources,
         }
     
     def snap_to_discrete(self):
@@ -261,16 +283,19 @@ class OperationNodeSimple(nn.Module):
         self,
         sources: torch.Tensor,
         tau: float = 1.0,
-    ) -> torch.Tensor:
+        hard: bool = True,  # Ignored for simple node, but accepted for API compatibility
+    ) -> Tuple[torch.Tensor, Dict]:
         """
         Forward pass.
         
         Args:
             sources: (batch, n_sources)
             tau: Temperature for softmax
+            hard: Ignored (for API compatibility with OperationNode)
             
         Returns:
             output: (batch,)
+            info: Empty dict (for API compatibility)
         """
         # Apply edge weights
         weighted = sources * self.edge_weights
@@ -291,7 +316,7 @@ class OperationNodeSimple(nn.Module):
         op_probs = F.softmax(self.op_logits / tau, dim=-1)  # (3,)
         output = (outputs * op_probs).sum(dim=-1)  # (batch,)
         
-        return torch.clamp(output, -100, 100)
+        return torch.clamp(output, -100, 100), {'node_idx': self.node_idx}
     
     def get_selected_operation(self) -> str:
         """Get selected operation."""
@@ -303,6 +328,15 @@ class OperationNodeSimple(nn.Module):
     def get_routing(self) -> List[int]:
         """Get routing as [slot1_source, slot2_source]."""
         return self.route_logits.argmax(dim=-1).tolist()
+    
+    def l0_regularization(self) -> torch.Tensor:
+        """Return 0 for simple nodes (no Hard Concrete selection)."""
+        return torch.tensor(0.0)
+    
+    def entropy_regularization(self) -> torch.Tensor:
+        """Compute entropy of operation selection."""
+        probs = F.softmax(self.op_logits, dim=-1)
+        return -(probs * torch.log(probs + 1e-10)).sum()
 
 
 class OperationLayer(nn.Module):
@@ -322,6 +356,7 @@ class OperationLayer(nn.Module):
         n_nodes: int,
         layer_idx: int = 0,
         tau: float = 0.5,
+        use_simple_nodes: bool = False,
     ):
         """
         Args:
@@ -329,14 +364,17 @@ class OperationLayer(nn.Module):
             n_nodes: Number of nodes in this layer
             layer_idx: Index of this layer
             tau: Temperature for selection
+            use_simple_nodes: If True, use simplified nodes (faster)
         """
         super().__init__()
         self.n_sources = n_sources
         self.n_nodes = n_nodes
         self.layer_idx = layer_idx
+        self.use_simple_nodes = use_simple_nodes
         
+        NodeClass = OperationNodeSimple if use_simple_nodes else OperationNode
         self.nodes = nn.ModuleList([
-            OperationNode(n_sources, node_idx=i, tau=tau)
+            NodeClass(n_sources, node_idx=i, tau=tau) if not use_simple_nodes else NodeClass(n_sources, node_idx=i)
             for i in range(n_nodes)
         ])
     

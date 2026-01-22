@@ -61,6 +61,48 @@ from .operation_dag import (
     ONNLoss,
     train_onn,
 )
+# v2: Hybrid Optimization
+from .hybrid_optimizer import (
+    LBFGSConstantOptimizer,
+    EvolutionaryOptimizer,
+    HybridOptimizer,
+    GradientGuidedEvolution,
+)
+
+# v2: Benchmarking
+from .benchmark import (
+    BaselineMLP,
+    BaselineLSTM,
+    BaselineCNN,
+    BenchmarkRunner,
+    run_all_benchmarks,
+    quick_comparison,
+    generate_polynomial_data,
+    generate_time_series_data,
+    generate_multivariate_data,
+    get_device,
+)
+
+# v2: Improved Training
+from .training import (
+    ImprovedONNTrainer,
+    train_onn_improved,
+    curriculum_schedule,
+    normalize_data,
+    initialize_for_identity,
+)
+
+# v2: Evolutionary Training (PROPER approach)
+from .evolution import (
+    EvolutionaryONNTrainer,
+    train_onn_evolutionary,
+    random_operation_init,
+    mutate_operations,
+    refine_constants,
+)
+
+
+
 
 
 __all__ = [
@@ -112,4 +154,19 @@ __all__ = [
     'OperationDAGSimple',
     'ONNLoss',
     'train_onn',
+    
+    # v2: Hybrid Optimization
+    'LBFGSConstantOptimizer',
+    'EvolutionaryOptimizer',
+    'HybridOptimizer',
+    'GradientGuidedEvolution',
+    
+    # v2: Benchmarking
+    'BaselineMLP',
+    'BaselineLSTM',
+    'BaselineCNN',
+    'BenchmarkRunner',
+    'run_all_benchmarks',
+    'quick_comparison',
 ]
+
