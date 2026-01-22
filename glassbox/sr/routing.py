@@ -95,9 +95,9 @@ class DifferentiableRouter(nn.Module):
         # Only use expensive Gumbel-softmax when hard=True AND training
         if hard and self.training:
             # Gumbel-softmax with straight-through (slower but needed for discrete gradients)
-            # Optimization: sample Gumbel noise directly instead of expand
-            gumbel_noise = -torch.empty_like(self.R).exponential_().log()
-            gumbel_noise = gumbel_noise - torch.empty_like(self.R).exponential_().log()
+            # Sample proper Gumbel noise: -log(-log(u))
+            u = torch.rand_like(self.R).clamp(1e-8, 1 - 1e-8)
+            gumbel_noise = -torch.log(-torch.log(u))
             y = (self.R + gumbel_noise) / tau
             probs_soft = F.softmax(y, dim=-1)
             # Straight-through: hard forward, soft backward

@@ -46,7 +46,8 @@ def hard_concrete_sample(
         Samples in [0, 1] with exact 0s and 1s possible
     """
     if not training:
-        # Deterministic during inference
+        # Deterministic during inference - return soft sigmoid values
+        # The actual discrete selection is handled at a higher level
         return torch.sigmoid(logits).clamp(0, 1)
     
     # Sample uniform noise
@@ -165,13 +166,23 @@ class HardConcreteGate(nn.Module):
         Returns:
             Gate values in [0, 1], shape (n_gates,)
         """
+        # Use tensor tau when learnable to preserve gradients
+        tau = self.tau_tensor if self._learn_tau else self.tau
         return hard_concrete_sample(
             self.logits,
-            tau=self.tau,
+            tau=tau,
             beta=self.beta,
             hard=hard,
             training=self.training,
         )
+
+    def set_tau(self, tau: float):
+        """Set temperature for annealing (supports learnable and fixed tau)."""
+        with torch.no_grad():
+            if self._learn_tau:
+                self.log_tau.copy_(torch.log(torch.tensor(tau)))
+            else:
+                self.log_tau.copy_(torch.tensor(math.log(tau)))
     
     def get_mask(self, threshold: float = 0.5) -> torch.Tensor:
         """Get deterministic binary mask."""
@@ -243,7 +254,13 @@ class HardConcreteSelector(nn.Module):
         Returns:
             Weights in [0, 1]^K (NOT guaranteed to sum to 1)
         """
-        # Sample each gate independently
+        # Discrete inference: return one-hot based on argmax
+        if hard and not self.training:
+            one_hot = torch.zeros_like(self.logits)
+            one_hot[self.logits.argmax()] = 1.0
+            return one_hot
+        
+        # Training: use hard concrete sampling
         gates = hard_concrete_sample(
             self.logits,
             tau=self.tau,
@@ -264,9 +281,9 @@ class HardConcreteSelector(nn.Module):
         """Get deterministic selection (argmax of expected values)."""
         return self.logits.argmax().item()
     
-        def set_tau(self, tau: float):
-            """Update temperature for annealing during training."""
-            self.tau = tau
+    def set_tau(self, tau: float):
+        """Update temperature for annealing during training."""
+        self.tau = tau
         
     def entropy(self) -> torch.Tensor:
         """Compute entropy of selection distribution."""
@@ -330,7 +347,17 @@ class HardConcreteOperationSelector(nn.Module):
             unary_weights: (n_unary,) weights for unary ops
             binary_weights: (n_binary,) weights for binary ops
         """
-        # OPTIMIZATION: Single hard_concrete_sample call for all selections
+        if hard and not self.training:
+            # Deterministic discrete selection at inference
+            type_weights = torch.zeros(self._type_end, device=self.logits.device)
+            unary_weights = torch.zeros(self.n_unary, device=self.logits.device)
+            binary_weights = torch.zeros(self.n_binary, device=self.logits.device)
+            type_weights[self.logits[:self._type_end].argmax()] = 1.0
+            unary_weights[self.logits[self._type_end:self._unary_end].argmax()] = 1.0
+            binary_weights[self.logits[self._unary_end:].argmax()] = 1.0
+            return type_weights, unary_weights, binary_weights
+
+        # Training (and soft mode): use Hard Concrete sampling
         all_gates = hard_concrete_sample(
             self.logits,
             tau=self.tau,
@@ -344,12 +371,12 @@ class HardConcreteOperationSelector(nn.Module):
         unary_weights = all_gates[self._type_end:self._unary_end]
         binary_weights = all_gates[self._unary_end:]
         
-        # Normalize each group (if hard, to simulate one-hot)
         if hard and self.training:
+            # Normalize to approximate one-hot while allowing zeros
             type_weights = type_weights / (type_weights.sum() + 1e-8)
             unary_weights = unary_weights / (unary_weights.sum() + 1e-8)
             binary_weights = binary_weights / (binary_weights.sum() + 1e-8)
-        
+
         return type_weights, unary_weights, binary_weights
     
     def get_selected(self) -> dict:

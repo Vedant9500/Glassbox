@@ -324,11 +324,33 @@ class ImprovedONNTrainer:
             self.model.snap_to_discrete()
         
         if hasattr(self.model, 'get_formula'):
-            return self.model.get_formula()
+            formula = self.model.get_formula()
         elif hasattr(self.model, 'get_graph_summary'):
-            return self.model.get_graph_summary()
+            formula = self.model.get_graph_summary()
         else:
             return "Formula extraction not supported"
+
+        # If normalization was used, denormalize the formula
+        if self.normalize and self.norm_stats and isinstance(formula, str):
+            import re
+            x_mean = self.norm_stats['x_mean'].view(-1).tolist()
+            x_std = self.norm_stats['x_std'].view(-1).tolist()
+            y_mean = float(self.norm_stats['y_mean'])
+            y_std = float(self.norm_stats['y_std'])
+
+            def fmt(val: float) -> str:
+                return f"{val:.6g}"
+
+            # Replace x{i} with normalized form using token boundaries
+            for i, (mean_i, std_i) in enumerate(zip(x_mean, x_std)):
+                token = rf"\bx{i}\b"
+                repl = f"((x{i} - {fmt(mean_i)})/{fmt(std_i)})"
+                formula = re.sub(token, repl, formula)
+
+            # Denormalize output: y = y_std * f(x_norm) + y_mean
+            formula = f"({fmt(y_std)})*({formula}) + {fmt(y_mean)}"
+
+        return formula
     
     def predict(self, x: torch.Tensor) -> torch.Tensor:
         """Make predictions on new data."""

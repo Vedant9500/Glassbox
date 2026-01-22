@@ -360,6 +360,14 @@ class MetaAggregation(nn.Module):
         # Scale factor (allows sum when scale = n_elements)
         # For mean: scale = 1, for sum: scale = n
         return result * self.scale
+
+    def set_tau(self, tau: float):
+        """Update temperature for annealing."""
+        with torch.no_grad():
+            if isinstance(self.tau, torch.nn.Parameter):
+                self.tau.copy_(torch.tensor(tau))
+            else:
+                self.tau = torch.tensor(tau)
     
     def get_discrete_op(self, threshold: float = 0.2) -> str:
         tau = self.tau.item()

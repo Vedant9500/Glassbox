@@ -26,6 +26,39 @@ import math
 import time
 
 
+def set_model_tau(model: nn.Module, tau: float):
+    """
+    Set temperature (tau) on all selectors in the model.
+    
+    Lower tau = more discrete selection (sharper softmax).
+    """
+    for module in model.modules():
+        if hasattr(module, 'set_tau') and callable(getattr(module, 'set_tau')):
+            module.set_tau(tau)
+        elif hasattr(module, 'tau') and not isinstance(getattr(module, 'tau'), nn.Parameter):
+            module.tau = tau
+
+
+def anneal_tau(generation: int, total_generations: int, 
+               tau_start: float = 1.0, tau_end: float = 0.2) -> float:
+    """
+    Cosine annealing for temperature.
+    
+    Args:
+        generation: Current generation
+        total_generations: Total number of generations
+        tau_start: Starting temperature (high = soft selection)
+        tau_end: Ending temperature (low = hard selection)
+    
+    Returns:
+        Annealed tau value
+    """
+    progress = generation / max(total_generations - 1, 1)
+    # Cosine annealing
+    tau = tau_end + 0.5 * (tau_start - tau_end) * (1 + math.cos(math.pi * progress))
+    return max(tau, tau_end)  # Floor at tau_end
+
+
 class Individual:
     """
     An individual in the evolutionary population.
@@ -141,11 +174,23 @@ def refine_constants(
     y: torch.Tensor,
     steps: int = 50,
     lr: float = 0.01,
+    use_lbfgs: bool = False,
+    scales_only: bool = False,
+    hard: bool = True,
 ) -> float:
     """
     Use gradient descent to optimize ONLY the constants.
     
     Lock operation selection, only tune parameters.
+    
+    Args:
+        model: The model to refine
+        x: Input data
+        y: Target data
+        steps: Number of optimization steps
+        lr: Learning rate (for Adam)
+        use_lbfgs: If True, use L-BFGS (better for symbolic regression constants)
+        scales_only: If True, only tune output_scale and edge_weights (use after snap)
     """
     import gc
     
@@ -153,49 +198,85 @@ def refine_constants(
     
     # Identify constant parameters (not selection logits)
     constant_params = []
+    param_names = []  # DEBUG
     for name, param in model.named_parameters():
-        if 'logit' not in name and 'selector' not in name:
+        # Skip selection logits
+        if 'logit' in name or 'selector' in name:
+            continue
+        
+        # If scales_only, only include output_scale, edge_weights, output_proj
+        if scales_only:
+            if 'output_scale' in name or 'edge_weight' in name or 'output_proj' in name:
+                if param.requires_grad:
+                    constant_params.append(param)
+                    param_names.append(name)
+        else:
+            # Skip meta-op core parameters (p, omega, phi, beta) - these are snapped
+            if any(x in name for x in ['.p', '.omega', '.phi', '.beta', 'amplitude']):
+                continue
             if param.requires_grad:
                 constant_params.append(param)
+                param_names.append(name)
+    
+    # DEBUG: Print what we're optimizing
+    # print(f"  [refine_constants] Optimizing {len(constant_params)} params: {param_names[:5]}...")
     
     if not constant_params:
         return float('inf')
     
+    best_loss = float('inf')
+    
     try:
-        optimizer = Adam(constant_params, lr=lr)
-    except (MemoryError, RuntimeError):
-        # Clear memory and try again
+        if use_lbfgs:
+            # L-BFGS: Better for finding exact constants (recommended by research)
+            y_squeezed = y.squeeze()
+            def closure():
+                nonlocal best_loss
+                optimizer.zero_grad()
+                pred, _ = model(x, hard=hard)
+                pred = pred.squeeze()
+                loss = F.mse_loss(pred, y_squeezed)
+                if torch.isnan(loss):
+                    return torch.tensor(float('inf'))
+                loss.backward()
+                best_loss = min(best_loss, loss.item())
+                return loss
+            
+            optimizer = LBFGS(constant_params, lr=1.0, max_iter=steps, line_search_fn='strong_wolfe')
+            try:
+                optimizer.step(closure)
+            except Exception:
+                pass  # L-BFGS can fail, that's ok
+        else:
+            # Adam: Faster but less precise
+            optimizer = Adam(constant_params, lr=lr)
+            y_squeezed = y.squeeze()
+            
+            for step in range(steps):
+                optimizer.zero_grad()
+                
+                pred, _ = model(x, hard=hard)
+                pred = pred.squeeze()
+                loss = F.mse_loss(pred, y_squeezed)
+                
+                if torch.isnan(loss):
+                    del optimizer
+                    gc.collect()
+                    return float('inf')
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(constant_params, max_norm=1.0)
+                optimizer.step()
+                
+                best_loss = min(best_loss, loss.item())
+    except (MemoryError, RuntimeError) as e:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        try:
-            optimizer = Adam(constant_params, lr=lr)
-        except Exception:
-            return float('inf')
-    
-    best_loss = float('inf')
-    
-    for step in range(steps):
-        optimizer.zero_grad()
-        
-        try:
-            pred, _ = model(x, hard=True)
-            loss = F.mse_loss(pred, y)
-            
-            if torch.isnan(loss):
-                del optimizer
-                gc.collect()
-                return float('inf')
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(constant_params, max_norm=1.0)
-            optimizer.step()
-            
-            best_loss = min(best_loss, loss.item())
-        except Exception:
-            del optimizer
-            gc.collect()
-            return float('inf')
+        return float('inf')
+    except Exception:
+        gc.collect()
+        return float('inf')
     
     # Cleanup
     del optimizer
@@ -253,6 +334,11 @@ class EvolutionaryONNTrainer:
         constant_refine_steps: int = 30,
         complexity_penalty: float = 0.02,
         device: Optional[torch.device] = None,
+        tau_start: float = 1.0,
+        tau_end: float = 0.2,
+        entropy_weight: float = 0.01,
+        normalize_data: bool = False,
+        constant_refine_hard: bool = False,
     ):
         self.model_factory = model_factory
         self.population_size = population_size
@@ -261,6 +347,14 @@ class EvolutionaryONNTrainer:
         self.constant_refine_steps = constant_refine_steps
         self.complexity_penalty = complexity_penalty
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Tau annealing parameters
+        self.tau_start = tau_start
+        self.tau_end = tau_end
+        self.entropy_weight = entropy_weight
+        self.normalize_data = normalize_data
+        self.constant_refine_hard = constant_refine_hard
+        self.norm_stats: Optional[Dict] = None
         
         self.population: List[Individual] = []
         self.generation = 0
@@ -282,13 +376,14 @@ class EvolutionaryONNTrainer:
     def evaluate_fitness(self, x: torch.Tensor, y: torch.Tensor):
         """Evaluate fitness of all individuals."""
         x = x.to(self.device)
-        y = y.to(self.device)
+        y = y.to(self.device).squeeze()  # Ensure y is 1D
         
         for ind in self.population:
             ind.model.eval()
             try:
                 with torch.no_grad():
                     pred, _ = ind.model(x, hard=True)
+                    pred = pred.squeeze()  # Ensure pred is 1D
                     mse = F.mse_loss(pred, y).item()
                     
                     if math.isnan(mse) or math.isinf(mse):
@@ -296,7 +391,15 @@ class EvolutionaryONNTrainer:
                     else:
                         # Add complexity penalty (Parsimony)
                         complexity = calculate_complexity(ind.model)
-                        ind.fitness = mse + self.complexity_penalty * complexity
+                        fitness = mse + self.complexity_penalty * complexity
+                        # Entropy regularization (encourage discrete selection)
+                        if self.entropy_weight > 0 and hasattr(ind.model, 'entropy_regularization'):
+                            try:
+                                entropy = ind.model.entropy_regularization().item()
+                                fitness = fitness + self.entropy_weight * entropy
+                            except Exception:
+                                pass
+                        ind.fitness = fitness
             except Exception:
                 ind.fitness = float('inf')
         
@@ -339,6 +442,7 @@ class EvolutionaryONNTrainer:
                     child.model, x, y,
                     steps=10, # Fewer steps for speed
                     lr=0.02,
+                    hard=self.constant_refine_hard,
                 )
                 new_population.append(child)
                 
@@ -364,6 +468,7 @@ class EvolutionaryONNTrainer:
                     child.model, x, y,
                     steps=self.constant_refine_steps,
                     lr=0.02,
+                    hard=self.constant_refine_hard,
                 )
                 
                 new_population.append(child)
@@ -375,6 +480,8 @@ class EvolutionaryONNTrainer:
         self,
         x: torch.Tensor,
         y: torch.Tensor,
+        fitness_x: Optional[torch.Tensor] = None,
+        fitness_y: Optional[torch.Tensor] = None,
         generations: int = 50,
         print_every: int = 5,
     ) -> Dict:
@@ -400,6 +507,26 @@ class EvolutionaryONNTrainer:
         
         x = x.to(self.device)
         y = y.to(self.device)
+        fit_x = fitness_x.to(self.device) if fitness_x is not None else x
+        fit_y = fitness_y.to(self.device) if fitness_y is not None else y
+
+        # Optional normalization (improves stability on complex targets)
+        if self.normalize_data:
+            x_mean = x.mean(dim=0, keepdim=True)
+            x_std = x.std(dim=0, keepdim=True).clamp(min=1e-6)
+            y_mean = y.mean()
+            y_std = y.std().clamp(min=1e-6)
+            self.norm_stats = {
+                'x_mean': x_mean,
+                'x_std': x_std,
+                'y_mean': y_mean,
+                'y_std': y_std,
+            }
+
+            x = (x - x_mean) / x_std
+            y = (y - y_mean) / y_std
+            fit_x = (fit_x - x_mean) / x_std
+            fit_y = (fit_y - y_mean) / y_std
         
         # Initialize
         self.initialize_population()
@@ -407,13 +534,22 @@ class EvolutionaryONNTrainer:
         # Initial constant refinement for all
         print("Refining initial constants...")
         for ind in self.population:
-            refine_constants(ind.model, x, y, steps=self.constant_refine_steps)
+            refine_constants(
+                ind.model, x, y,
+                steps=self.constant_refine_steps,
+                hard=self.constant_refine_hard,
+            )
         
         start_time = time.time()
         
         for gen in range(generations):
-            # Evaluate
-            self.evaluate_fitness(x, y)
+            # Anneal tau for all individuals (early soft, late hard)
+            current_tau = anneal_tau(gen, generations, self.tau_start, self.tau_end)
+            for ind in self.population:
+                set_model_tau(ind.model, current_tau)
+            
+            # Evaluate (optionally on validation set)
+            self.evaluate_fitness(fit_x, fit_y)
             
             # Stats
             fitnesses = [ind.fitness for ind in self.population if ind.fitness < float('inf')]
@@ -450,18 +586,60 @@ class EvolutionaryONNTrainer:
         
         # Get best model
         best_model = self.best_ever.model if self.best_ever else self.population[0].model
+        
+        # IMPORTANT: Do NOT snap_to_discrete - it destroys model performance
+        # The continuous parameters are more expressive and give better results
+        # Formula extraction still works with continuous values
+        # 
+        # if hasattr(best_model, 'snap_to_discrete'):
+        #     best_model.snap_to_discrete()
+        
+        # CRITICAL: Put model in eval mode for deterministic behavior
         best_model.eval()
         
+        # Evaluate on TRAINING data (for debugging)
         with torch.no_grad():
-            pred, _ = best_model(x, hard=True)
-            final_mse = F.mse_loss(pred, y).item()
-            corr = torch.corrcoef(torch.stack([
-                pred.squeeze().cpu(), y.squeeze().cpu()
-            ]))[0, 1].item()
+            pred_train, _ = best_model(x, hard=True)
+            mse_train = F.mse_loss(pred_train.squeeze(), y.squeeze()).item()
+            print(f"  Train MSE: {mse_train:.4f}")
         
-        # Get formula
-        if hasattr(best_model, 'snap_to_discrete'):
-            best_model.snap_to_discrete()
+        # Also evaluate on VALIDATION data if provided
+        if fitness_x is not None and fitness_y is not None:
+            with torch.no_grad():
+                pred_val, _ = best_model(fit_x, hard=True)
+                mse_val = F.mse_loss(pred_val.squeeze(), fit_y.squeeze()).item()
+                print(f"  Val MSE: {mse_val:.4f}")
+        
+        # DISABLED: Compiled inference path (has bugs causing MSE discrepancy)
+        use_compiled = False
+        # if hasattr(best_model, 'compile_for_inference'):
+        #     try:
+        #         best_model.compile_for_inference()
+        #         use_compiled = True
+        #     except Exception:
+        #         pass
+        
+        # Squeeze y for consistent shape
+        y_eval = y.squeeze()
+        
+        with torch.no_grad():
+            if use_compiled and hasattr(best_model, 'forward_compiled'):
+                pred = best_model.forward_compiled(x)
+            else:
+                pred, _ = best_model(x, hard=True)
+            pred = pred.squeeze()
+            
+            # DEBUG: Check MSE before denorm
+            final_mse_raw = F.mse_loss(pred, y_eval).item()
+            print(f"  DEBUG: MSE raw (before denorm): {final_mse_raw:.4f}")
+            
+            if self.normalize_data and self.norm_stats:
+                pred = pred * self.norm_stats['y_std'] + self.norm_stats['y_mean']
+                y_eval = y_eval * self.norm_stats['y_std'] + self.norm_stats['y_mean']
+            final_mse = F.mse_loss(pred, y_eval).item()
+            corr = torch.corrcoef(torch.stack([
+                pred.cpu(), y_eval.cpu()
+            ]))[0, 1].item()
         
         formula = "N/A"
         if hasattr(best_model, 'get_formula'):
@@ -490,6 +668,15 @@ def train_onn_evolutionary(
     population_size: int = 20,
     generations: int = 50,
     device: Optional[torch.device] = None,
+    fitness_x: Optional[torch.Tensor] = None,
+    fitness_y: Optional[torch.Tensor] = None,
+    normalize_data: bool = False,
+    constant_refine_hard: bool = False,
+    elite_fraction: float = 0.25,
+    mutation_rate: float = 0.3,
+    constant_refine_steps: int = 30,
+    tau_start: float = 1.0,
+    tau_end: float = 0.2,
 ) -> Dict:
     """
     Convenience function for evolutionary ONN training.
@@ -503,10 +690,38 @@ def train_onn_evolutionary(
         
         results = train_onn_evolutionary(make_model, x, y, generations=50)
         print(results['formula'])
+    
+    Args:
+        model_factory: Callable that creates a new model instance
+        x, y: Training data
+        population_size: Number of individuals in population
+        generations: Number of evolutionary generations
+        device: Torch device
+        fitness_x, fitness_y: Optional validation data for fitness evaluation
+        normalize_data: If True, normalize x and y during training
+        constant_refine_hard: If True, use hard selection during constant refinement
+        elite_fraction: Fraction of population to keep as elites (0.0-1.0)
+        mutation_rate: Probability of mutating each parameter
+        constant_refine_steps: Number of gradient steps for constant refinement
+        tau_start, tau_end: Temperature annealing schedule
     """
+    elite_size = max(2, int(population_size * elite_fraction))
+    
     trainer = EvolutionaryONNTrainer(
         model_factory=model_factory,
         population_size=population_size,
+        elite_size=elite_size,
+        mutation_rate=mutation_rate,
+        constant_refine_steps=constant_refine_steps,
         device=device,
+        normalize_data=normalize_data,
+        constant_refine_hard=constant_refine_hard,
+        tau_start=tau_start,
+        tau_end=tau_end,
     )
-    return trainer.train(x, y, generations=generations)
+    return trainer.train(
+        x, y,
+        fitness_x=fitness_x,
+        fitness_y=fitness_y,
+        generations=generations,
+    )
