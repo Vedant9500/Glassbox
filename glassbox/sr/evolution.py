@@ -59,6 +59,92 @@ def anneal_tau(generation: int, total_generations: int,
     return max(tau, tau_end)  # Floor at tau_end
 
 
+def anneal_entropy_weight(generation: int, total_generations: int,
+                         start_weight: float = 0.001, end_weight: float = 0.1) -> float:
+    """
+    Entropy annealing schedule: mild early, strong late.
+    
+    Research insight: Start with weak entropy penalty (allow exploration),
+    gradually strengthen to force discrete decisions.
+    
+    Uses exponential schedule for sharper increase near end.
+    
+    Args:
+        generation: Current generation
+        total_generations: Total generations
+        start_weight: Initial entropy weight (small = exploration)
+        end_weight: Final entropy weight (large = force discrete)
+    
+    Returns:
+        Annealed entropy weight
+    """
+    progress = generation / max(total_generations - 1, 1)
+    # Exponential increase (slow start, fast end)
+    # w = start * (end/start)^progress
+    ratio = end_weight / max(start_weight, 1e-8)
+    weight = start_weight * (ratio ** progress)
+    return weight
+
+
+def soft_round(x: torch.Tensor, sharpness: float = 5.0) -> torch.Tensor:
+    """
+    Differentiable soft rounding that nudges values toward integers.
+    
+    Instead of hard snap (p=1.97 -> 2.0), this creates a smooth
+    potential well around each integer. As sharpness increases,
+    approaches hard rounding.
+    
+    Uses: round_soft(x) = x - sin(2πx) / (2π * sharpness)
+    
+    Args:
+        x: Input tensor
+        sharpness: How strongly to push toward integers (higher = sharper)
+    
+    Returns:
+        Soft-rounded tensor (differentiable)
+    """
+    # Periodic function that is 0 at integers, pushes toward them elsewhere
+    correction = torch.sin(2 * math.pi * x) / (2 * math.pi * sharpness)
+    return x - correction
+
+
+def progressive_round_loss(model: nn.Module, target_params: List[str] = None) -> torch.Tensor:
+    """
+    Loss that encourages continuous parameters to approach discrete values.
+    
+    Instead of hard snapping (which destroys performance), this adds
+    a soft penalty for being away from integers/nice values.
+    
+    Targets: exponents (p), frequencies (omega), blend parameters
+    
+    Args:
+        model: The model
+        target_params: Parameter name patterns to target (default: ['p', 'omega'])
+    
+    Returns:
+        Loss encouraging discrete-ish values
+    """
+    if target_params is None:
+        target_params = ['.p', '.omega']
+    
+    loss = torch.tensor(0.0)
+    count = 0
+    
+    for name, param in model.named_parameters():
+        if any(t in name for t in target_params):
+            if 'output' in name or 'proj' in name:
+                continue
+            # Penalty for distance from nearest integer
+            # min(x - floor(x), ceil(x) - x)^2
+            frac = param - param.floor()
+            # Distance to nearest integer: min(frac, 1-frac)
+            dist = torch.minimum(frac, 1 - frac)
+            loss = loss + (dist ** 2).mean()
+            count += 1
+    
+    return loss / max(count, 1)
+
+
 class Individual:
     """
     An individual in the evolutionary population.
@@ -163,6 +249,134 @@ def mutate_operations(individual: Individual, mutation_rate: float = 0.3) -> Ind
                     # Mutate routing
                     if random.random() < 0.3:
                         # Swap routing connections
+                        param.add_(torch.randn_like(param) * 0.5)
+    
+    return mutant
+
+
+def mutate_operations_lamarckian(individual: Individual, mutation_rate: float = 0.3) -> Individual:
+    """
+    Lamarckian mutation: only mutate discrete structure, preserve continuous weights.
+    
+    Key insight from research (Prellberg & Kramer 2018):
+    - Passing optimized weights from parent to child dramatically speeds convergence
+    - We only mutate OPERATION SELECTION (discrete), not the parameters
+    - Continuous parameters (p, omega, coefficients) are inherited as-is
+    - Then we fine-tune with gradient descent
+    
+    This is "Lamarckian" because learned traits (optimized weights) are inherited.
+    """
+    mutant = individual.clone()
+    
+    with torch.no_grad():
+        for name, param in mutant.model.named_parameters():
+            # ONLY mutate operation selection logits
+            # Leave all continuous parameters (p, omega, R, etc.) UNCHANGED
+            if 'logit' in name or 'selector' in name:
+                if random.random() < mutation_rate:
+                    if random.random() < 0.5:
+                        # Option 1: Shift to a different operation
+                        param.zero_()
+                        new_choice = random.randint(0, param.numel() - 1)
+                        param.view(-1)[new_choice] = 3.0
+                    else:
+                        # Option 2: Add noise to soften selection
+                        param.add_(torch.randn_like(param) * 0.5)
+    
+    return mutant
+
+
+def compute_param_sensitivity(
+    model: nn.Module, 
+    x: torch.Tensor, 
+    y: torch.Tensor
+) -> Dict[str, float]:
+    """
+    Compute gradient-based sensitivity for each parameter.
+    
+    Tier 2 feature: Use gradients to identify which operations/parameters
+    have the most impact on the loss. This can guide mutation toward
+    more impactful parts of the model.
+    
+    Returns:
+        Dict mapping parameter names to their sensitivity (|gradient|)
+    """
+    model.train()
+    model.zero_grad()
+    
+    try:
+        pred, _ = model(x, hard=False)  # Soft forward for gradients
+        loss = F.mse_loss(pred.squeeze(), y.squeeze())
+        loss.backward()
+    except Exception:
+        return {}
+    
+    sensitivities = {}
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            sensitivities[name] = param.grad.abs().mean().item()
+        else:
+            sensitivities[name] = 0.0
+    
+    model.zero_grad()
+    return sensitivities
+
+
+def mutate_operations_gradient_informed(
+    individual: Individual, 
+    x: torch.Tensor, 
+    y: torch.Tensor,
+    mutation_rate: float = 0.3,
+    sensitivity_bias: float = 0.5,
+) -> Individual:
+    """
+    Gradient-informed mutation: bias mutations toward less sensitive parameters.
+    
+    Tier 2 feature: Use gradient information to guide which operations to mutate.
+    - Low-sensitivity operations are more likely to be mutated (they're not important)
+    - High-sensitivity operations are preserved (they're working)
+    
+    Args:
+        individual: Parent individual
+        x, y: Data for computing gradients
+        mutation_rate: Base mutation probability
+        sensitivity_bias: How much to bias by sensitivity (0=ignore, 1=strong bias)
+    
+    Returns:
+        Mutated individual
+    """
+    # Compute sensitivities
+    sensitivities = compute_param_sensitivity(individual.model, x, y)
+    
+    if not sensitivities:
+        # Fallback to regular mutation if gradient computation fails
+        return mutate_operations_lamarckian(individual, mutation_rate)
+    
+    # Normalize sensitivities to [0, 1]
+    max_sens = max(sensitivities.values()) if sensitivities.values() else 1.0
+    if max_sens > 0:
+        norm_sens = {k: v / max_sens for k, v in sensitivities.items()}
+    else:
+        norm_sens = sensitivities
+    
+    mutant = individual.clone()
+    
+    with torch.no_grad():
+        for name, param in mutant.model.named_parameters():
+            if 'logit' in name or 'selector' in name:
+                # Compute adjusted mutation rate
+                # Low sensitivity = higher mutation rate (not important)
+                # High sensitivity = lower mutation rate (important)
+                sens = norm_sens.get(name, 0.5)
+                adjusted_rate = mutation_rate * (1.0 + sensitivity_bias * (1.0 - sens))
+                adjusted_rate = min(adjusted_rate, 1.0)
+                
+                if random.random() < adjusted_rate:
+                    if random.random() < 0.5:
+                        param.zero_()
+                        new_choice = random.randint(0, param.numel() - 1)
+                        param.view(-1)[new_choice] = 3.0
+                    else:
                         param.add_(torch.randn_like(param) * 0.5)
     
     return mutant
@@ -331,6 +545,144 @@ def calculate_complexity(model: nn.Module) -> float:
     return complexity + bic_penalty
 
 
+def prune_small_coefficients(
+    model: nn.Module, 
+    threshold_ratio: float = 0.3,
+    absolute_threshold: float = 0.1,
+) -> int:
+    """
+    Prune operations with small output coefficients.
+    
+    Key insight: If formula is "1.37*x² + 0.74*√(x) + 0.63*exp(x)",
+    the x² term dominates (1.37). Terms with coefficients < 0.3*1.37 = 0.41
+    are likely noise and can be pruned.
+    
+    This speeds up convergence by removing spurious operations early.
+    
+    Args:
+        model: The ONN model
+        threshold_ratio: Prune terms with |coef| < ratio * max(|coefs|)
+        absolute_threshold: Also prune if |coef| < this absolute value
+    
+    Returns:
+        Number of operations pruned
+    """
+    if not hasattr(model, 'output_proj'):
+        return 0
+    
+    with torch.no_grad():
+        weights = model.output_proj.weight.data  # (1, n_features)
+        
+        if weights.numel() == 0:
+            return 0
+        
+        abs_weights = weights.abs().squeeze()
+        if abs_weights.dim() == 0:
+            return 0
+            
+        max_weight = abs_weights.max().item()
+        
+        if max_weight < 1e-6:
+            return 0
+        
+        # Compute threshold: relative to max OR absolute minimum
+        threshold = max(threshold_ratio * max_weight, absolute_threshold)
+        
+        # Find small coefficients
+        small_mask = abs_weights < threshold
+        n_pruned = small_mask.sum().item()
+        
+        # Zero out small coefficients
+        if weights.dim() == 2:
+            weights[0, small_mask] = 0.0
+        else:
+            weights[small_mask] = 0.0
+    
+    return int(n_pruned)
+
+
+def adaptive_coefficient_pruning(
+    model: nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    prune_ratio: float = 0.3,
+) -> Tuple[int, float]:
+    """
+    Intelligently prune coefficients by measuring their contribution to loss.
+    
+    For each output coefficient:
+    1. Temporarily zero it out
+    2. Measure increase in MSE
+    3. If MSE increase is small, prune permanently
+    
+    This is more accurate than just looking at coefficient magnitude.
+    
+    Args:
+        model: The ONN model
+        x, y: Data for evaluating contribution
+        prune_ratio: Prune if MSE increase < ratio * current_MSE
+    
+    Returns:
+        (n_pruned, new_mse)
+    """
+    if not hasattr(model, 'output_proj'):
+        return 0, float('inf')
+    
+    model.eval()
+    weights = model.output_proj.weight.data
+    
+    if weights.numel() == 0:
+        return 0, float('inf')
+    
+    with torch.no_grad():
+        # Baseline MSE
+        pred, _ = model(x, hard=True)
+        base_mse = F.mse_loss(pred.squeeze(), y.squeeze()).item()
+        
+        if math.isnan(base_mse) or math.isinf(base_mse):
+            return 0, float('inf')
+        
+        n_features = weights.shape[1] if weights.dim() == 2 else weights.shape[0]
+        pruned_indices = []
+        
+        for i in range(n_features):
+            # Save original weight
+            if weights.dim() == 2:
+                orig_weight = weights[0, i].clone()
+                weights[0, i] = 0.0
+            else:
+                orig_weight = weights[i].clone()
+                weights[i] = 0.0
+            
+            # Measure MSE without this coefficient
+            pred, _ = model(x, hard=True)
+            new_mse = F.mse_loss(pred.squeeze(), y.squeeze()).item()
+            
+            # Restore weight
+            if weights.dim() == 2:
+                weights[0, i] = orig_weight
+            else:
+                weights[i] = orig_weight
+            
+            # If MSE increase is small, mark for pruning
+            mse_increase = new_mse - base_mse
+            if mse_increase < prune_ratio * base_mse:
+                pruned_indices.append(i)
+        
+        # Prune marked coefficients
+        for i in pruned_indices:
+            if weights.dim() == 2:
+                weights[0, i] = 0.0
+            else:
+                weights[i] = 0.0
+        
+        # Final MSE
+        pred, _ = model(x, hard=True)
+        final_mse = F.mse_loss(pred.squeeze(), y.squeeze()).item()
+    
+    return len(pruned_indices), final_mse
+
+
 def hoyer_sparsity(weights: torch.Tensor) -> torch.Tensor:
     """
     Compute Hoyer sparsity measure (ratio of L1 to L2 norms).
@@ -392,6 +744,13 @@ class EvolutionaryONNTrainer:
     4. Create offspring via discrete mutation
     5. Refine constants with gradient descent
     6. Repeat
+    
+    Key features (from research):
+    - Entropy annealing: mild early (exploration), strong late (force discrete)
+    - Progressive rounding: soft push toward integers (not hard snap)
+    - Lamarckian inheritance: children inherit parent weights
+    - Gradient-informed mutations: bias toward impactful changes
+    - Coefficient pruning: remove low-impact terms for cleaner formulas
     """
     
     def __init__(
@@ -408,6 +767,18 @@ class EvolutionaryONNTrainer:
         entropy_weight: float = 0.01,
         normalize_data: bool = False,
         constant_refine_hard: bool = False,
+        # NEW: Entropy annealing schedule (Tier 1)
+        entropy_weight_start: float = 0.001,
+        entropy_weight_end: float = 0.05,
+        # NEW: Progressive rounding (Tier 1)
+        progressive_round_weight: float = 0.01,
+        # NEW: Lamarckian inheritance (Tier 2)
+        lamarckian: bool = True,
+        # NEW: Coefficient pruning
+        prune_coefficients: bool = True,
+        prune_every: int = 5,  # Prune every N generations
+        prune_threshold: float = 0.15,  # Prune if |coef| < 15% of max (more aggressive)
+        use_adaptive_pruning: bool = True,  # Use MSE-based pruning (smarter)
     ):
         self.model_factory = model_factory
         self.population_size = population_size
@@ -420,10 +791,26 @@ class EvolutionaryONNTrainer:
         # Tau annealing parameters
         self.tau_start = tau_start
         self.tau_end = tau_end
-        self.entropy_weight = entropy_weight
+        self.entropy_weight = entropy_weight  # Deprecated: use entropy_weight_start/end
         self.normalize_data = normalize_data
         self.constant_refine_hard = constant_refine_hard
         self.norm_stats: Optional[Dict] = None
+        
+        # NEW: Entropy annealing (research Tier 1)
+        self.entropy_weight_start = entropy_weight_start
+        self.entropy_weight_end = entropy_weight_end
+        
+        # NEW: Progressive rounding (research Tier 1)
+        self.progressive_round_weight = progressive_round_weight
+        
+        # NEW: Lamarckian inheritance (research Tier 2)
+        self.lamarckian = lamarckian
+        
+        # NEW: Coefficient pruning
+        self.prune_coefficients = prune_coefficients
+        self.prune_every = prune_every
+        self.prune_threshold = prune_threshold
+        self.use_adaptive_pruning = use_adaptive_pruning
         
         self.population: List[Individual] = []
         self.generation = 0
@@ -442,10 +829,23 @@ class EvolutionaryONNTrainer:
         
         print(f"Initialized population of {self.population_size} individuals")
     
-    def evaluate_fitness(self, x: torch.Tensor, y: torch.Tensor):
-        """Evaluate fitness of all individuals."""
+    def evaluate_fitness(self, x: torch.Tensor, y: torch.Tensor, 
+                         generation: int = 0, total_generations: int = 50):
+        """
+        Evaluate fitness of all individuals.
+        
+        Includes annealed penalties that change over generations:
+        - Entropy: mild early (exploration), strong late (force discrete)
+        - Progressive rounding: nudge parameters toward integers
+        """
         x = x.to(self.device)
         y = y.to(self.device).squeeze()  # Ensure y is 1D
+        
+        # Compute annealed weights (Tier 1: entropy annealing)
+        current_entropy_weight = anneal_entropy_weight(
+            generation, total_generations,
+            self.entropy_weight_start, self.entropy_weight_end
+        )
         
         for ind in self.population:
             ind.model.eval()
@@ -466,13 +866,24 @@ class EvolutionaryONNTrainer:
                         sparsity = coefficient_sparsity_loss(ind.model).item()
                         fitness = fitness + 0.01 * sparsity
                         
-                        # Entropy regularization (encourage discrete selection)
-                        if self.entropy_weight > 0 and hasattr(ind.model, 'entropy_regularization'):
+                        # Entropy regularization with ANNEALED weight (Tier 1)
+                        # Mild early (allow exploration), strong late (force discrete)
+                        if current_entropy_weight > 0 and hasattr(ind.model, 'entropy_regularization'):
                             try:
                                 entropy = ind.model.entropy_regularization().item()
-                                fitness = fitness + self.entropy_weight * entropy
+                                fitness = fitness + current_entropy_weight * entropy
                             except Exception:
                                 pass
+                        
+                        # Progressive rounding penalty (Tier 1)
+                        # Soft push toward integers for p, omega, etc.
+                        if self.progressive_round_weight > 0:
+                            try:
+                                round_loss = progressive_round_loss(ind.model).item()
+                                fitness = fitness + self.progressive_round_weight * round_loss
+                            except Exception:
+                                pass
+                        
                         ind.fitness = fitness
             except Exception:
                 ind.fitness = float('inf')
@@ -483,7 +894,13 @@ class EvolutionaryONNTrainer:
             self.best_ever = best_current.clone()
     
     def select_and_reproduce(self, x: torch.Tensor, y: torch.Tensor, diversity: int = 10):
-        """Selection and reproduction."""
+        """
+        Selection and reproduction with Lamarckian inheritance.
+        
+        Tier 2 feature: Lamarckian inheritance passes optimized continuous
+        weights from parent to child, then fine-tunes. This dramatically
+        speeds convergence by reusing learned weights.
+        """
         x = x.to(self.device)
         y = y.to(self.device)
         
@@ -494,7 +911,6 @@ class EvolutionaryONNTrainer:
         
         # Mass Mutation condition: Low diversity
         if diversity < 3:
-            # print("(!) Low diversity detected. Triggering MASS MUTATION.")
             # Keep only the very best (Elite = 1 or 2)
             for elite in sorted_pop[:2]:
                 new_population.append(elite)
@@ -508,13 +924,14 @@ class EvolutionaryONNTrainer:
                     child = Individual(model, generation=self.generation)
                 else:
                     # Heavily mutated elite (Exploration)
-                    parent = sorted_pop[0] # Best one
-                    child = mutate_operations(parent, mutation_rate=0.8) # High mutation rate
+                    parent = sorted_pop[0]  # Best one
+                    child = mutate_operations(parent, mutation_rate=0.8)
+                    # Lamarckian: child inherits parent's refined weights
                 
                 # Fast refine
                 refine_constants(
                     child.model, x, y,
-                    steps=10, # Fewer steps for speed
+                    steps=10,
                     lr=0.02,
                     hard=self.constant_refine_hard,
                 )
@@ -534,13 +951,19 @@ class EvolutionaryONNTrainer:
                                            min(3, len(sorted_pop)))
                 parent = min(candidates, key=lambda ind: ind.fitness)
                 
-                # Mutate
-                child = mutate_operations(parent, self.mutation_rate)
+                # Lamarckian mutation: clone preserves all parent weights
+                # Mutation only changes discrete structure (operation selection)
+                # Continuous weights (p, omega, etc.) are inherited!
+                if self.lamarckian:
+                    child = mutate_operations_lamarckian(parent, self.mutation_rate)
+                else:
+                    child = mutate_operations(parent, self.mutation_rate)
                 
-                # Refine constants
+                # Refine constants (shorter if Lamarckian since weights are pre-tuned)
+                steps = self.constant_refine_steps // 2 if self.lamarckian else self.constant_refine_steps
                 refine_constants(
                     child.model, x, y,
-                    steps=self.constant_refine_steps,
+                    steps=max(10, steps),
                     lr=0.02,
                     hard=self.constant_refine_hard,
                 )
@@ -622,8 +1045,8 @@ class EvolutionaryONNTrainer:
             for ind in self.population:
                 set_model_tau(ind.model, current_tau)
             
-            # Evaluate (optionally on validation set)
-            self.evaluate_fitness(fit_x, fit_y)
+            # Evaluate with annealed entropy weight (pass generation info)
+            self.evaluate_fitness(fit_x, fit_y, generation=gen, total_generations=generations)
             
             # Stats
             fitnesses = [ind.fitness for ind in self.population if ind.fitness < float('inf')]
@@ -635,12 +1058,19 @@ class EvolutionaryONNTrainer:
                 best_fit = mean_fit = float('inf')
                 diversity = 0
             
+            # Compute current entropy weight for logging
+            current_entropy_weight = anneal_entropy_weight(
+                gen, generations, self.entropy_weight_start, self.entropy_weight_end
+            )
+            
             self.history.append({
                 'generation': gen,
                 'best_fitness': best_fit,
                 'mean_fitness': mean_fit,
                 'diversity': diversity,
                 'best_ever': self.best_ever.fitness if self.best_ever else float('inf'),
+                'tau': current_tau,
+                'entropy_weight': current_entropy_weight,
             })
             
             if gen % print_every == 0 or gen == generations - 1:
@@ -648,11 +1078,55 @@ class EvolutionaryONNTrainer:
                       f"Mean: {mean_fit:.4f} | Diversity: {diversity} | "
                       f"Best Ever: {self.best_ever.fitness:.4f}")
             
+            # NEW: Coefficient pruning - remove low-impact terms periodically
+            # This cleans up formulas by zeroing small coefficients
+            if self.prune_coefficients and gen > 0 and gen % self.prune_every == 0:
+                for ind in self.population:
+                    if self.use_adaptive_pruning:
+                        # Adaptive pruning: uses MSE contribution (smarter)
+                        n_pruned, new_mse = adaptive_coefficient_pruning(
+                            ind.model, fit_x, fit_y,
+                            prune_ratio=0.05  # Prune if MSE increase < 5% 
+                        )
+                    else:
+                        # Simple threshold pruning
+                        n_pruned = prune_small_coefficients(
+                            ind.model, 
+                            threshold_ratio=self.prune_threshold,
+                            absolute_threshold=0.1
+                        )
+                    # Re-evaluate after pruning
+                    if n_pruned > 0:
+                        ind.model.eval()
+                        with torch.no_grad():
+                            pred, _ = ind.model(fit_x, hard=True)
+                            mse = F.mse_loss(pred.squeeze(), fit_y.squeeze()).item()
+                            if not math.isnan(mse) and not math.isinf(mse):
+                                complexity = calculate_complexity(ind.model)
+                                ind.fitness = mse + self.complexity_penalty * complexity
+            
             # Reproduce (skip on last generation)
             if gen < generations - 1:
                 self.select_and_reproduce(x, y, diversity=diversity)
         
         elapsed = time.time() - start_time
+        
+        # Final pruning on best model for clean formula
+        if self.prune_coefficients and self.best_ever:
+            if self.use_adaptive_pruning:
+                # Adaptive: prune terms that don't contribute much to MSE
+                n_final_pruned, _ = adaptive_coefficient_pruning(
+                    self.best_ever.model, x, y,
+                    prune_ratio=0.03  # More aggressive final prune (3% MSE tolerance)
+                )
+            else:
+                n_final_pruned = prune_small_coefficients(
+                    self.best_ever.model,
+                    threshold_ratio=self.prune_threshold,
+                    absolute_threshold=0.1
+                )
+            if n_final_pruned > 0:
+                print(f"Final pruning removed {n_final_pruned} small coefficients")
         
         # Final evaluation
         print("-"*60)
@@ -751,6 +1225,9 @@ def train_onn_evolutionary(
     constant_refine_steps: int = 30,
     tau_start: float = 1.0,
     tau_end: float = 0.2,
+    prune_coefficients: bool = True,
+    prune_threshold: float = 0.15,
+    use_adaptive_pruning: bool = True,
 ) -> Dict:
     """
     Convenience function for evolutionary ONN training.
@@ -778,6 +1255,9 @@ def train_onn_evolutionary(
         mutation_rate: Probability of mutating each parameter
         constant_refine_steps: Number of gradient steps for constant refinement
         tau_start, tau_end: Temperature annealing schedule
+        prune_coefficients: If True, periodically prune small coefficients
+        prune_threshold: Threshold for coefficient pruning (ratio of max)
+        use_adaptive_pruning: If True, use MSE-based pruning (smarter)
     """
     elite_size = max(2, int(population_size * elite_fraction))
     
@@ -792,6 +1272,9 @@ def train_onn_evolutionary(
         constant_refine_hard=constant_refine_hard,
         tau_start=tau_start,
         tau_end=tau_end,
+        prune_coefficients=prune_coefficients,
+        prune_threshold=prune_threshold,
+        use_adaptive_pruning=use_adaptive_pruning,
     )
     return trainer.train(
         x, y,
@@ -799,3 +1282,170 @@ def train_onn_evolutionary(
         fitness_y=fitness_y,
         generations=generations,
     )
+
+
+def train_onn_hybrid(
+    model_factory: Callable[[], nn.Module],
+    x: torch.Tensor,
+    y: torch.Tensor,
+    cycles: int = 5,
+    es_generations_per_cycle: int = 10,
+    gd_steps_per_cycle: int = 100,
+    population_size: int = 15,
+    device: Optional[torch.device] = None,
+    gd_lr: float = 0.01,
+) -> Dict:
+    """
+    Hybrid ES + Gradient training (Tier 2).
+    
+    Alternates between:
+    1. Evolutionary structure search (discrete mutations)
+    2. Gradient descent refinement (continuous optimization)
+    
+    This combines the exploration ability of ES with the 
+    precision of gradient descent.
+    
+    Args:
+        model_factory: Function that creates a new model
+        x, y: Training data
+        cycles: Number of ES/GD cycles
+        es_generations_per_cycle: ES generations per cycle
+        gd_steps_per_cycle: Gradient steps per cycle
+        population_size: ES population size
+        device: Torch device
+        gd_lr: Learning rate for gradient descent
+    
+    Returns:
+        Training results dict
+    """
+    device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    x = x.to(device)
+    y = y.to(device)
+    
+    print("="*60)
+    print("HYBRID ES + GRADIENT TRAINING")
+    print("="*60)
+    print(f"Cycles: {cycles}")
+    print(f"ES gens/cycle: {es_generations_per_cycle}")
+    print(f"GD steps/cycle: {gd_steps_per_cycle}")
+    print("-"*60)
+    
+    start_time = time.time()
+    
+    # Initialize trainer
+    trainer = EvolutionaryONNTrainer(
+        model_factory=model_factory,
+        population_size=population_size,
+        elite_size=max(2, population_size // 4),
+        device=device,
+        lamarckian=True,
+    )
+    trainer.initialize_population()
+    
+    best_model = None
+    best_mse = float('inf')
+    history = []
+    
+    for cycle in range(cycles):
+        print(f"\n--- Cycle {cycle+1}/{cycles} ---")
+        
+        # Phase 1: ES structure search
+        print(f"  ES Phase: {es_generations_per_cycle} generations...")
+        for gen in range(es_generations_per_cycle):
+            current_tau = anneal_tau(
+                cycle * es_generations_per_cycle + gen,
+                cycles * es_generations_per_cycle,
+                1.0, 0.3
+            )
+            for ind in trainer.population:
+                set_model_tau(ind.model, current_tau)
+            
+            trainer.evaluate_fitness(
+                x, y, 
+                generation=cycle * es_generations_per_cycle + gen,
+                total_generations=cycles * es_generations_per_cycle
+            )
+            
+            diversity = len(set(ind.structure_hash for ind in trainer.population))
+            if gen < es_generations_per_cycle - 1:
+                trainer.select_and_reproduce(x, y, diversity=diversity)
+        
+        # Get best from ES
+        es_best = trainer.best_ever.model if trainer.best_ever else trainer.population[0].model
+        
+        # Phase 2: Gradient refinement on best
+        print(f"  GD Phase: {gd_steps_per_cycle} steps...")
+        es_best.train()
+        
+        # Only optimize continuous parameters
+        continuous_params = [
+            p for n, p in es_best.named_parameters() 
+            if 'logit' not in n and 'selector' not in n and p.requires_grad
+        ]
+        
+        if continuous_params:
+            optimizer = Adam(continuous_params, lr=gd_lr)
+            
+            for step in range(gd_steps_per_cycle):
+                optimizer.zero_grad()
+                pred, _ = es_best(x, hard=False)
+                loss = F.mse_loss(pred.squeeze(), y.squeeze())
+                
+                if torch.isnan(loss):
+                    break
+                    
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(continuous_params, 1.0)
+                optimizer.step()
+        
+        # Evaluate after GD
+        es_best.eval()
+        with torch.no_grad():
+            pred, _ = es_best(x, hard=True)
+            cycle_mse = F.mse_loss(pred.squeeze(), y.squeeze()).item()
+        
+        print(f"  Cycle {cycle+1} MSE: {cycle_mse:.6f}")
+        
+        history.append({
+            'cycle': cycle,
+            'mse': cycle_mse,
+        })
+        
+        if cycle_mse < best_mse:
+            best_mse = cycle_mse
+            best_model = copy.deepcopy(es_best)
+        
+        # Inject refined model back into population
+        if trainer.best_ever:
+            trainer.best_ever.model = copy.deepcopy(es_best)
+            trainer.best_ever.fitness = cycle_mse
+    
+    elapsed = time.time() - start_time
+    
+    # Final evaluation
+    best_model.eval()
+    with torch.no_grad():
+        pred, _ = best_model(x, hard=True)
+        final_mse = F.mse_loss(pred.squeeze(), y.squeeze()).item()
+        corr = torch.corrcoef(torch.stack([
+            pred.squeeze().cpu(), y.squeeze().cpu()
+        ]))[0, 1].item()
+    
+    formula = "N/A"
+    if hasattr(best_model, 'get_formula'):
+        formula = best_model.get_formula()
+    
+    print("-"*60)
+    print(f"Training complete in {elapsed:.1f}s")
+    print(f"Final MSE: {final_mse:.6f}")
+    print(f"Correlation: {corr:.4f}")
+    print(f"Formula: {formula}")
+    
+    return {
+        'model': best_model,
+        'history': history,
+        'final_mse': final_mse,
+        'correlation': corr,
+        'formula': formula,
+        'training_time': elapsed,
+    }

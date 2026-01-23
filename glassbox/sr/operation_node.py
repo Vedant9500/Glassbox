@@ -177,13 +177,13 @@ class OperationNode(nn.Module):
         if compute_binary:
             binary_result = torch.zeros(batch_size, device=device)
             
-            # Arithmetic operation
+            # Arithmetic operation (always index 0)
             if binary_weights[0].abs() > eps:
                 x, y = self.router.forward_binary(sources, tau=self.tau, hard=hard)
                 binary_result = binary_result + self.binary_ops[0](x, y) * binary_weights[0]
             
-            # Aggregation operation
-            if binary_weights[1].abs() > eps:
+            # Aggregation operation (only if we have more than 1 binary op)
+            if len(self.binary_ops) > 1 and binary_weights[1].abs() > eps:
                 agg_input = self.router.forward_aggregation(sources)
                 binary_result = binary_result + self.binary_ops[1](agg_input, dim=-1) * binary_weights[1]
             

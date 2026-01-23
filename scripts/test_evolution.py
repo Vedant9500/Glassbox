@@ -69,6 +69,7 @@ def test_evolutionary_training():
                 nodes_per_layer=4,   # 4 nodes is enough for simple formulas
                 n_outputs=1,
                 tau=0.5,
+                simplified_ops=True,  # Only power, periodic, arithmetic (no exp/log)
             )
         
         # Evolutionary training - smaller budget for faster iteration
@@ -84,6 +85,9 @@ def test_evolutionary_training():
             constant_refine_hard=False,
             elite_fraction=0.2,
             mutation_rate=0.4,
+            prune_coefficients=True,   # Enable coefficient pruning
+            prune_threshold=0.15,      # Aggressive pruning (15% of max)
+            use_adaptive_pruning=True, # Use MSE-based pruning
         )
         
         # Evaluate on validation using compiled inference (faster & consistent)
