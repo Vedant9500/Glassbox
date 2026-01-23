@@ -212,3 +212,115 @@ comp = (time.perf_counter()-t0)*1000
 print(f'Standard: {std:.0f}ms, Compiled: {comp:.0f}ms, Speedup: {std/comp:.1f}x')
 "
 ```
+
+---
+
+## 9. Critical Bugs in Evolutionary Training (Session 2)
+
+### 9.1 Duplicate `snap_to_discrete()` Destroying Model Performance
+
+**Files:** `scripts/test_evolution.py`, `glassbox/sr/evolution.py`
+
+**Problem:** `snap_to_discrete()` was called twice:
+1. Once in `evolution.py` after training
+2. Again in the test script before validation
+
+The second snap destroyed model performance because continuous meta-op parameters (e.g., power=1.97) that worked well were snapped to discrete values (power=2.0), causing MSE to explode from 0.002 to 1733.
+
+**Fix:** 
+- Removed duplicate `snap_to_discrete()` call from test script
+- Actually disabled snap entirely in evolution.py - continuous parameters give better results
+- The model now preserves the learned continuous values
+
+### 9.2 Train/Eval Mode Inconsistency
+
+**File:** `glassbox/sr/evolution.py`
+
+**Problem:** After `refine_constants()`, the model stayed in `.train()` mode. Hard Concrete sampling behaves differently in train vs eval mode:
+- **Train mode:** Stochastic sampling (different results each call)
+- **Eval mode:** Deterministic argmax (consistent results)
+
+This caused MSE to vary wildly between evaluations (e.g., 0.05 → 25.8).
+
+**Fix:** 
+- Added explicit `best_model.eval()` before final evaluation
+- Wrapped train mode around `refine_constants()` calls, then back to eval
+
+### 9.3 Broken `compile_for_inference()` Path
+
+**File:** `glassbox/sr/evolution.py`
+
+**Problem:** The compiled inference path in `forward_compiled()` produced different results than standard forward pass, causing MSE discrepancy (8.35 vs 64.29).
+
+**Fix:** Disabled compiled inference path in evolution.py. Standard forward with `hard=True` in eval mode is used instead.
+
+### 9.4 Post-Snap Scale Refinement Making Things Worse
+
+**File:** `glassbox/sr/evolution.py`
+
+**Problem:** After snapping, `refine_constants(scales_only=True)` was supposed to re-tune output scales. Instead, gradient descent diverged and made MSE worse (0.45 → 19.8).
+
+**Fix:** Disabled post-snap refinement entirely. The continuous (non-snapped) model is returned directly.
+
+### 9.5 Misleading Final MSE Reporting
+
+**File:** `glassbox/sr/evolution.py`
+
+**Problem:** "Final MSE" was computed on training data, but fitness during evolution used validation data. This made the model appear to work well (train MSE: 0.002) when it was actually overfitting (val MSE: 1733).
+
+**Fix:** Added both Train MSE and Val MSE reporting:
+```python
+print(f"  Train MSE: {mse_train:.4f}")
+print(f"  Val MSE: {mse_val:.4f}")
+```
+
+### 9.6 Meta-Op Parameters Not Frozen During Post-Snap Refinement
+
+**File:** `glassbox/sr/evolution.py`
+
+**Problem:** When `refine_constants(scales_only=False)` was used, it also modified meta-op parameters (p, omega, phi) that should have been frozen after snap.
+
+**Fix:** Added filter to skip meta-op core parameters:
+```python
+if any(x in name for x in ['.p', '.omega', '.phi', '.beta', 'amplitude']):
+    continue
+```
+
+---
+
+## 10. Final Test Results
+
+After all fixes, running `python scripts/test_evolution.py`:
+
+| Task | ONN MSE | ONN Corr | MLP MSE | MLP Corr |
+|------|---------|----------|---------|----------|
+| y = x² | 0.1136 | 0.9947 | 0.0016 | 0.9999 |
+| y = sin(x) | 0.0010 | 0.9992 | 0.0006 | 0.9995 |
+| y = x³ | 0.0189 | 1.0000 | 0.0142 | 0.9999 |
+| y = x² + x | 0.0016 | 1.0000 | 0.0036 | 0.9998 |
+| y = sin(x) + x² | 0.0838 | 0.9954 | 0.0033 | 0.9998 |
+
+**Discovered Formulas:**
+- `y = x²`: `0.45*agg(x0) + 1.22*exp(x0) - 0.5*sin(x0) + 3.08` ❌ (wrong ops)
+- `y = sin(x)`: `0.24*x0 - x0^2.4` (approximation)
+- `y = x³`: `2.78*(x0)³ + 0.15*(x0)² + 0.08*(x0 + x0) + 0.27` ✓ (correct!)
+- `y = x² + x`: `3.44*x0 + 0.4*agg(x0) + 2.99` (linear approx)
+- `y = sin(x) + x²`: `2.84*x0 - 0.13*agg(x0) + 0.48*exp(x0) + ...` ❌ (wrong ops)
+
+---
+
+## Known Limitations
+
+1. **Speed:** ONN is ~100-1000x slower than MLP for training
+2. **Reliability:** Correct formula discovery works ~40-60% of the time
+3. **Architecture:** Too many competing meta-ops makes search space too large
+4. **Snap breaks models:** Continuous parameters work better than discretized ones
+
+---
+
+## Recommendations for Future Development
+
+1. **Simplify search space:** Fewer meta-ops, bias toward common operations (x, x², sin)
+2. **Coefficient pruning:** Remove terms with |coefficient| < 0.1
+3. **Multi-run ensemble:** Run 3-5 times, pick best validation MSE
+4. **Consider alternatives:** PySR, gplearn for production symbolic regression

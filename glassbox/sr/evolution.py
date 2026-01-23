@@ -287,29 +287,98 @@ def refine_constants(
 
 def calculate_complexity(model: nn.Module) -> float:
     """
-    Calculate complexity score for a model.
+    Calculate complexity score for a model (BIC-inspired).
     Higher score = more complex operations.
+    
+    Based on research recommendation: penalize formula length/operation count
+    to guide search toward simpler expressions.
     """
     complexity = 0.0
+    n_active_ops = 0
     
     if hasattr(model, 'layers'):
         for layer in model.layers:
             for node in layer.nodes:
                 op_str = node.get_selected_operation().lower()
+                n_active_ops += 1
                 
-                # High cost: Transcendental functions
-                if 'exp' in op_str or 'log' in op_str or 'sin' in op_str or 'cos' in op_str:
+                # High cost: Transcendental functions (exp, log, trig)
+                # These are often incorrectly selected for polynomial targets
+                if 'exp' in op_str:
+                    complexity += 3.0  # Increased penalty - often wrong choice
+                elif 'log' in op_str or 'ln' in op_str:
+                    complexity += 2.5
+                elif 'sin' in op_str or 'cos' in op_str:
                     complexity += 2.0
                 # Medium cost: Powers and roots
                 elif 'sqrt' in op_str or 'pow' in op_str or '^' in op_str:
-                    complexity += 1.5
+                    complexity += 1.0  # Reduced - these are often correct
                 # Low cost: Arithmetic and identity
                 elif 'identity' in op_str:
-                    complexity += 0.1  # Very low cost for pass-through
+                    complexity += 0.1
+                elif 'add' in op_str or 'mul' in op_str or '+' in op_str or '*' in op_str:
+                    complexity += 0.5
+                # Aggregation - medium-high (often noise)
+                elif 'agg' in op_str:
+                    complexity += 2.0
                 else:
                     complexity += 1.0
-                    
-    return complexity
+    
+    # BIC-style penalty: log(n) * k where k = number of operations
+    # This encourages simpler formulas
+    bic_penalty = 0.5 * n_active_ops
+    
+    return complexity + bic_penalty
+
+
+def hoyer_sparsity(weights: torch.Tensor) -> torch.Tensor:
+    """
+    Compute Hoyer sparsity measure (ratio of L1 to L2 norms).
+    
+    Hoyer = (sqrt(n) - L1/L2) / (sqrt(n) - 1)
+    
+    Range: [0, 1] where 1 = maximally sparse (one-hot)
+    
+    Research shows Hoyer regularization induces much sparser weights
+    than L1 penalty alone.
+    """
+    n = weights.numel()
+    if n <= 1:
+        return torch.tensor(0.0)
+    
+    l1 = weights.abs().sum()
+    l2 = weights.norm(2)
+    
+    if l2 < 1e-8:
+        return torch.tensor(0.0)
+    
+    sqrt_n = math.sqrt(n)
+    # Hoyer sparsity (higher = sparser)
+    hoyer = (sqrt_n - l1 / l2) / (sqrt_n - 1 + 1e-8)
+    
+    return hoyer
+
+
+def coefficient_sparsity_loss(model: nn.Module) -> torch.Tensor:
+    """
+    Compute sparsity loss for output projection coefficients.
+    
+    Encourages the model to use fewer terms in the final formula
+    by pushing small coefficients toward zero.
+    """
+    if not hasattr(model, 'output_proj'):
+        return torch.tensor(0.0)
+    
+    weights = model.output_proj.weight
+    
+    # L1 penalty on small weights (encourage exact zeros)
+    l1_loss = weights.abs().mean()
+    
+    # Hoyer penalty (encourage sparsity pattern)
+    hoyer = hoyer_sparsity(weights.flatten())
+    hoyer_loss = 1.0 - hoyer  # Minimize this to maximize sparsity
+    
+    return 0.5 * l1_loss + 0.5 * hoyer_loss
 
 
 class EvolutionaryONNTrainer:
@@ -389,9 +458,14 @@ class EvolutionaryONNTrainer:
                     if math.isnan(mse) or math.isinf(mse):
                         ind.fitness = float('inf')
                     else:
-                        # Add complexity penalty (Parsimony)
+                        # Add complexity penalty (BIC-inspired parsimony)
                         complexity = calculate_complexity(ind.model)
                         fitness = mse + self.complexity_penalty * complexity
+                        
+                        # Coefficient sparsity penalty (Hoyer-inspired)
+                        sparsity = coefficient_sparsity_loss(ind.model).item()
+                        fitness = fitness + 0.01 * sparsity
+                        
                         # Entropy regularization (encourage discrete selection)
                         if self.entropy_weight > 0 and hasattr(ind.model, 'entropy_regularization'):
                             try:

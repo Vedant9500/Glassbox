@@ -182,65 +182,71 @@ class MetaArithmetic(nn.Module):
     """
     Continuous interpolation between addition and multiplication.
     
-    Formula: output = (2 - β) * (x + y) + (β - 1) * (x * y)
+    Uses SIGMOID parameterization to avoid gradient plateau.
+    
+    OLD (linear): output = (2 - β) * (x + y) + (β - 1) * (x * y)
+        Problem: ∂f/∂β = xy - (x+y) = 0 when xy = x+y, causing plateaus
+    
+    NEW (sigmoid): output = (1 - σ(α)) * (x + y) + σ(α) * (x * y)
+        where σ(α) = sigmoid(α), learnable α ∈ (-∞, ∞)
+        Gradient: ∂f/∂α = σ(α)(1-σ(α)) * (xy - (x+y))
+        Still has same zero point, but σ'(α) provides additional gradient signal
+        near the boundaries (α → ±∞ gives clear add/mul selection)
     
     Recovers:
-    - addition: β=1 → output = x + y
-    - multiplication: β=2 → output = x * y
-    - intermediate: 1 < β < 2 → weighted mix
-    
-    Note: Uses linear interpolation for simplicity.
-    For more mathematically rigorous interpolation, see fractional hyperoperations.
+    - addition: α << 0 → σ(α) ≈ 0 → output ≈ x + y
+    - multiplication: α >> 0 → σ(α) ≈ 1 → output ≈ x * y
     """
     
     def __init__(
         self,
-        init_beta: float = 1.5,
+        init_alpha: float = 0.0,  # Start at midpoint (σ(0) = 0.5)
         learnable: bool = True,
-        beta_min: float = 1.0,
-        beta_max: float = 2.0,
     ):
         super().__init__()
-        self.beta_min = beta_min
-        self.beta_max = beta_max
         
         if learnable:
-            self.beta = nn.Parameter(torch.tensor(init_beta))
+            self.alpha = nn.Parameter(torch.tensor(init_alpha))
         else:
-            self.register_buffer('beta', torch.tensor(init_beta))
+            self.register_buffer('alpha', torch.tensor(init_alpha))
     
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Apply parametric arithmetic operation."""
-        # Clamp beta to valid range
-        beta = torch.clamp(self.beta, self.beta_min, self.beta_max)
+        # Sigmoid blend factor - avoids gradient plateau of linear interpolation
+        blend = torch.sigmoid(self.alpha)
         
         add_result = x + y
         mul_result = x * y
         
-        # Linear interpolation
-        result = (2 - beta) * add_result + (beta - 1) * mul_result
+        # Sigmoid interpolation
+        result = (1 - blend) * add_result + blend * mul_result
         
         return torch.clamp(result, -100, 100)
     
-    def get_discrete_op(self, threshold: float = 0.1) -> str:
+    @property
+    def beta(self) -> float:
+        """Compatibility: return equivalent beta value (1=add, 2=mul)."""
+        return 1.0 + torch.sigmoid(self.alpha).item()
+    
+    def get_discrete_op(self, threshold: float = 0.3) -> str:
         """Identify which discrete operation this approximates."""
-        beta = self.beta.item()
+        blend = torch.sigmoid(self.alpha).item()
         
-        if abs(beta - 1.0) < threshold:
+        if blend < threshold:
             return "add"
-        elif abs(beta - 2.0) < threshold:
+        elif blend > (1 - threshold):
             return "multiply"
         else:
-            return f"add_mul_mix(β={beta:.2f})"
+            return f"({blend:.2f}*mul + {1-blend:.2f}*add)"
     
     def snap_to_discrete(self):
-        """Snap beta to nearest standard value."""
+        """Snap alpha to push toward pure add or mul."""
         with torch.no_grad():
-            beta = self.beta.item()
-            if beta < 1.5:
-                self.beta.fill_(1.0)  # Addition
+            blend = torch.sigmoid(self.alpha).item()
+            if blend < 0.5:
+                self.alpha.fill_(-5.0)  # σ(-5) ≈ 0.007 → addition
             else:
-                self.beta.fill_(2.0)  # Multiplication
+                self.alpha.fill_(5.0)   # σ(5) ≈ 0.993 → multiplication
 
 
 class MetaArithmeticExtended(nn.Module):

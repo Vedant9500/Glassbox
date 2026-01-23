@@ -59,6 +59,7 @@ class OperationDAG(nn.Module):
         n_outputs: int = 1,
         tau: float = 0.5,
         use_simple_nodes: bool = False,
+        simplified_ops: bool = False,  # NEW: Use smaller op menu
     ):
         """
         Args:
@@ -68,6 +69,8 @@ class OperationDAG(nn.Module):
             n_outputs: Number of output features
             tau: Temperature for Hard Concrete selection
             use_simple_nodes: If True, use simplified nodes (faster)
+            simplified_ops: If True, use smaller op menu (no exp/log/agg)
+                           Reduces search space for faster/more reliable convergence
         """
         super().__init__()
         self.n_inputs = n_inputs
@@ -76,6 +79,7 @@ class OperationDAG(nn.Module):
         self.n_outputs = n_outputs
         self.tau = tau
         self.use_simple_nodes = use_simple_nodes
+        self.simplified_ops = simplified_ops
         
         # Build layers
         self.layers = nn.ModuleList()
@@ -88,6 +92,7 @@ class OperationDAG(nn.Module):
                 layer_idx=layer_idx,
                 tau=tau,
                 use_simple_nodes=use_simple_nodes,
+                simplified_ops=simplified_ops,  # Pass through
             )
             self.layers.append(layer)
             current_n_sources += nodes_per_layer  # Add this layer's outputs

@@ -66,6 +66,7 @@ class OperationNode(nn.Module):
         node_idx: int = 0,
         tau: float = 0.5,
         beta: float = 0.1,
+        simplified_ops: bool = False,  # NEW: Use smaller op menu
     ):
         """
         Args:
@@ -73,37 +74,57 @@ class OperationNode(nn.Module):
             node_idx: Index of this node (for debugging/visualization)
             tau: Temperature for Hard Concrete
             beta: Stretch parameter for Hard Concrete
+            simplified_ops: If True, use smaller op menu (no exp/log/agg)
+                           Recommended for simple formulas - faster convergence
         """
         super().__init__()
         self.n_sources = n_sources
         self.node_idx = node_idx
         self.tau = tau
         self.beta = beta
+        self.simplified_ops = simplified_ops
         
         # Routing: handles edge weights and input slot selection
         self.router = AdaptiveArityRouter(n_sources, max_arity=2)
         
-        # Operation selection via Hard Concrete
-        self.op_selector = HardConcreteOperationSelector(
-            n_unary=4,    # periodic, power, exp, log
-            n_binary=2,   # arithmetic, aggregation
-            tau=tau,
-            beta=beta,
-        )
-        
-        # Meta-operations (unary)
-        self.unary_ops = nn.ModuleList([
-            MetaPeriodic(),
-            MetaPower(),
-            MetaExp(),
-            MetaLog(),
-        ])
-        
-        # Meta-operations (binary)
-        self.binary_ops = nn.ModuleList([
-            MetaArithmetic(),
-            MetaAggregation(),
-        ])
+        if simplified_ops:
+            # SIMPLIFIED: Only power, periodic, arithmetic
+            # Research shows exp/log/agg are often incorrectly selected
+            self.op_selector = HardConcreteOperationSelector(
+                n_unary=2,    # periodic, power only
+                n_binary=1,   # arithmetic only (no aggregation)
+                tau=tau,
+                beta=beta,
+            )
+            
+            self.unary_ops = nn.ModuleList([
+                MetaPeriodic(),
+                MetaPower(),
+            ])
+            
+            self.binary_ops = nn.ModuleList([
+                MetaArithmetic(),
+            ])
+        else:
+            # FULL: All operations (original behavior)
+            self.op_selector = HardConcreteOperationSelector(
+                n_unary=4,    # periodic, power, exp, log
+                n_binary=2,   # arithmetic, aggregation
+                tau=tau,
+                beta=beta,
+            )
+            
+            self.unary_ops = nn.ModuleList([
+                MetaPeriodic(),
+                MetaPower(),
+                MetaExp(),
+                MetaLog(),
+            ])
+            
+            self.binary_ops = nn.ModuleList([
+                MetaArithmetic(),
+                MetaAggregation(),
+            ])
         
         # Output BatchNorm for gradient normalization
         self.output_norm = nn.BatchNorm1d(1, affine=False)
@@ -357,6 +378,7 @@ class OperationLayer(nn.Module):
         layer_idx: int = 0,
         tau: float = 0.5,
         use_simple_nodes: bool = False,
+        simplified_ops: bool = False,  # NEW: Use smaller op menu
     ):
         """
         Args:
@@ -365,18 +387,25 @@ class OperationLayer(nn.Module):
             layer_idx: Index of this layer
             tau: Temperature for selection
             use_simple_nodes: If True, use simplified nodes (faster)
+            simplified_ops: If True, use smaller op menu (no exp/log/agg)
         """
         super().__init__()
         self.n_sources = n_sources
         self.n_nodes = n_nodes
         self.layer_idx = layer_idx
         self.use_simple_nodes = use_simple_nodes
+        self.simplified_ops = simplified_ops
         
-        NodeClass = OperationNodeSimple if use_simple_nodes else OperationNode
-        self.nodes = nn.ModuleList([
-            NodeClass(n_sources, node_idx=i, tau=tau) if not use_simple_nodes else NodeClass(n_sources, node_idx=i)
-            for i in range(n_nodes)
-        ])
+        if use_simple_nodes:
+            self.nodes = nn.ModuleList([
+                OperationNodeSimple(n_sources, node_idx=i)
+                for i in range(n_nodes)
+            ])
+        else:
+            self.nodes = nn.ModuleList([
+                OperationNode(n_sources, node_idx=i, tau=tau, simplified_ops=simplified_ops)
+                for i in range(n_nodes)
+            ])
     
     def forward(
         self,
