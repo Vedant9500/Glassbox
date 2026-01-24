@@ -66,7 +66,9 @@ class OperationNode(nn.Module):
         node_idx: int = 0,
         tau: float = 0.5,
         beta: float = 0.1,
-        simplified_ops: bool = False,  # NEW: Use smaller op menu
+        simplified_ops: bool = False,  # Use smaller op menu
+        fair_mode: bool = False,       # FairDARTS-style independent sigmoids
+        branch_norm: bool = False,     # Apply LayerNorm inside branches (can hurt SR)
     ):
         """
         Args:
@@ -76,6 +78,12 @@ class OperationNode(nn.Module):
             beta: Stretch parameter for Hard Concrete
             simplified_ops: If True, use smaller op menu (no exp/log/agg)
                            Recommended for simple formulas - faster convergence
+            fair_mode: If True, use FairDARTS independent sigmoids
+                      Prevents operation "unfair advantage" during search
+            branch_norm: If True, apply LayerNorm inside branches before combining.
+                        WARNING: This normalizes to mean=0,std=1 which destroys
+                        scale information. Can hurt symbolic regression where
+                        actual output magnitudes matter. Disabled by default.
         """
         super().__init__()
         self.n_sources = n_sources
@@ -83,6 +91,8 @@ class OperationNode(nn.Module):
         self.tau = tau
         self.beta = beta
         self.simplified_ops = simplified_ops
+        self.fair_mode = fair_mode
+        self.branch_norm_enabled = branch_norm
         
         # Routing: handles edge weights and input slot selection
         self.router = AdaptiveArityRouter(n_sources, max_arity=2)
@@ -95,6 +105,7 @@ class OperationNode(nn.Module):
                 n_binary=1,   # arithmetic only (no aggregation)
                 tau=tau,
                 beta=beta,
+                fair_mode=fair_mode,
             )
             
             self.unary_ops = nn.ModuleList([
@@ -112,6 +123,7 @@ class OperationNode(nn.Module):
                 n_binary=2,   # arithmetic, aggregation
                 tau=tau,
                 beta=beta,
+                fair_mode=fair_mode,
             )
             
             self.unary_ops = nn.ModuleList([
@@ -128,6 +140,21 @@ class OperationNode(nn.Module):
         
         # Output BatchNorm for gradient normalization
         self.output_norm = nn.BatchNorm1d(1, affine=False)
+        
+        # Branch-level LayerNorm to prevent gradient starvation (OPTIONAL)
+        # Multiplicative gradients scale with 1/x (explode near 0, vanish for large x)
+        # Additive gradients are constant. This imbalance causes additive to dominate.
+        # LayerNorm inside each branch equalizes gradient magnitudes before combining.
+        # WARNING: Disabled by default because normalizing to mean=0,std=1
+        # destroys scale information, which hurts symbolic regression tasks
+        # where the actual output magnitude matters (e.g., y = x^2).
+        # Reference: research3.md Section 4.2
+        if branch_norm:
+            self.unary_norm = nn.LayerNorm(1, elementwise_affine=False)
+            self.binary_norm = nn.LayerNorm(1, elementwise_affine=False)
+        else:
+            self.unary_norm = None
+            self.binary_norm = None
         
         # Learnable output scale
         self.output_scale = nn.Parameter(torch.ones(1))
@@ -152,6 +179,7 @@ class OperationNode(nn.Module):
         """
         batch_size = sources.shape[0]
         device = sources.device
+        dtype = sources.dtype
         
         # Get operation selection weights
         type_weights, unary_weights, binary_weights = self.op_selector(hard=hard)
@@ -162,20 +190,24 @@ class OperationNode(nn.Module):
         compute_unary = type_weights[0].abs() > eps
         compute_binary = type_weights[1].abs() > eps
         
-        output = torch.zeros(batch_size, device=device)
+        output = torch.zeros(batch_size, device=device, dtype=dtype)
         
         # Compute unary outputs only if needed
         if compute_unary:
             unary_input = self.router.forward_unary(sources, tau=self.tau, hard=hard)
-            unary_result = torch.zeros(batch_size, device=device)
+            unary_result = torch.zeros(batch_size, device=device, dtype=dtype)
             for i, op in enumerate(self.unary_ops):
                 if unary_weights[i].abs() > eps:
                     unary_result = unary_result + op(unary_input) * unary_weights[i]
+            # Optional branch-level LayerNorm to prevent gradient starvation
+            # Only apply if explicitly enabled (disabled by default for SR)
+            if self.branch_norm_enabled and self.unary_norm is not None and batch_size > 1:
+                unary_result = self.unary_norm(unary_result.unsqueeze(-1)).squeeze(-1)
             output = output + type_weights[0] * unary_result
         
         # Compute binary outputs only if needed
         if compute_binary:
-            binary_result = torch.zeros(batch_size, device=device)
+            binary_result = torch.zeros(batch_size, device=device, dtype=dtype)
             
             # Arithmetic operation (always index 0)
             if binary_weights[0].abs() > eps:
@@ -187,6 +219,9 @@ class OperationNode(nn.Module):
                 agg_input = self.router.forward_aggregation(sources)
                 binary_result = binary_result + self.binary_ops[1](agg_input, dim=-1) * binary_weights[1]
             
+            # Optional branch-level LayerNorm to prevent gradient starvation
+            if self.branch_norm_enabled and self.binary_norm is not None and batch_size > 1:
+                binary_result = self.binary_norm(binary_result.unsqueeze(-1)).squeeze(-1)
             output = output + type_weights[1] * binary_result
         
         # Normalize output
@@ -260,6 +295,14 @@ class OperationNode(nn.Module):
     def entropy_regularization(self) -> torch.Tensor:
         """Entropy of operation selection (lower = more discrete)."""
         return self.op_selector.entropy_regularization()
+    
+    def zero_one_loss(self) -> torch.Tensor:
+        """Zero-One Loss (FairDARTS) to close discretization gap."""
+        return self.op_selector.zero_one_loss()
+    
+    def gate_regularization(self) -> torch.Tensor:
+        """Gate regularization to force binary gates."""
+        return self.op_selector.gate_regularization()
 
 
 class OperationNodeSimple(nn.Module):
@@ -378,7 +421,8 @@ class OperationLayer(nn.Module):
         layer_idx: int = 0,
         tau: float = 0.5,
         use_simple_nodes: bool = False,
-        simplified_ops: bool = False,  # NEW: Use smaller op menu
+        simplified_ops: bool = False,  # Use smaller op menu
+        fair_mode: bool = False,       # FairDARTS-style independent sigmoids
     ):
         """
         Args:
@@ -388,6 +432,7 @@ class OperationLayer(nn.Module):
             tau: Temperature for selection
             use_simple_nodes: If True, use simplified nodes (faster)
             simplified_ops: If True, use smaller op menu (no exp/log/agg)
+            fair_mode: If True, use FairDARTS independent sigmoids
         """
         super().__init__()
         self.n_sources = n_sources
@@ -395,6 +440,7 @@ class OperationLayer(nn.Module):
         self.layer_idx = layer_idx
         self.use_simple_nodes = use_simple_nodes
         self.simplified_ops = simplified_ops
+        self.fair_mode = fair_mode
         
         if use_simple_nodes:
             self.nodes = nn.ModuleList([
@@ -403,7 +449,7 @@ class OperationLayer(nn.Module):
             ])
         else:
             self.nodes = nn.ModuleList([
-                OperationNode(n_sources, node_idx=i, tau=tau, simplified_ops=simplified_ops)
+                OperationNode(n_sources, node_idx=i, tau=tau, simplified_ops=simplified_ops, fair_mode=fair_mode)
                 for i in range(n_nodes)
             ])
     
@@ -444,3 +490,11 @@ class OperationLayer(nn.Module):
     def entropy_regularization(self) -> torch.Tensor:
         """Sum of entropy across nodes."""
         return sum(node.entropy_regularization() for node in self.nodes)
+    
+    def zero_one_loss(self) -> torch.Tensor:
+        """Sum of Zero-One Loss across nodes (FairDARTS discretization)."""
+        return sum(node.zero_one_loss() for node in self.nodes)
+    
+    def gate_regularization(self) -> torch.Tensor:
+        """Sum of gate regularization across nodes."""
+        return sum(node.gate_regularization() for node in self.nodes)

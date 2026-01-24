@@ -59,7 +59,8 @@ class OperationDAG(nn.Module):
         n_outputs: int = 1,
         tau: float = 0.5,
         use_simple_nodes: bool = False,
-        simplified_ops: bool = False,  # NEW: Use smaller op menu
+        simplified_ops: bool = False,  # Use smaller op menu
+        fair_mode: bool = False,       # FairDARTS-style independent sigmoids
     ):
         """
         Args:
@@ -71,6 +72,8 @@ class OperationDAG(nn.Module):
             use_simple_nodes: If True, use simplified nodes (faster)
             simplified_ops: If True, use smaller op menu (no exp/log/agg)
                            Reduces search space for faster/more reliable convergence
+            fair_mode: If True, use FairDARTS independent sigmoids
+                      Prevents operation "crowding out" during search
         """
         super().__init__()
         self.n_inputs = n_inputs
@@ -80,6 +83,7 @@ class OperationDAG(nn.Module):
         self.tau = tau
         self.use_simple_nodes = use_simple_nodes
         self.simplified_ops = simplified_ops
+        self.fair_mode = fair_mode
         
         # Build layers
         self.layers = nn.ModuleList()
@@ -92,7 +96,8 @@ class OperationDAG(nn.Module):
                 layer_idx=layer_idx,
                 tau=tau,
                 use_simple_nodes=use_simple_nodes,
-                simplified_ops=simplified_ops,  # Pass through
+                simplified_ops=simplified_ops,
+                fair_mode=fair_mode,  # FairDARTS: prevent op crowding
             )
             self.layers.append(layer)
             current_n_sources += nodes_per_layer  # Add this layer's outputs
@@ -431,6 +436,7 @@ class OperationDAG(nn.Module):
                     'routing': routing,
                     'edge_weights': edge_weights,
                     'output_scale': node.output_scale.detach().clone(),
+                    'output_norm': node.output_norm,  # Cache BatchNorm for consistent inference
                 })
             self._compiled_ops.append(layer_ops)
         
@@ -482,6 +488,10 @@ class OperationDAG(nn.Module):
                 else:  # aggregation
                     out = op(weighted, dim=-1)
                 
+                # Apply output normalization (same as regular forward)
+                if batch_size > 1 and 'output_norm' in node_info and node_info['output_norm'] is not None:
+                    out = node_info['output_norm'](out.unsqueeze(-1)).squeeze(-1)
+                
                 # Apply output scale and clamp
                 out = out * node_info['output_scale']
                 out = torch.clamp(out, -100, 100)
@@ -503,6 +513,14 @@ class OperationDAG(nn.Module):
     def entropy_regularization(self) -> torch.Tensor:
         """Total entropy regularization."""
         return sum(layer.entropy_regularization() for layer in self.layers)
+    
+    def zero_one_loss(self) -> torch.Tensor:
+        """Total Zero-One Loss across all layers (FairDARTS discretization)."""
+        return sum(layer.zero_one_loss() for layer in self.layers)
+    
+    def gate_regularization(self) -> torch.Tensor:
+        """Total gate regularization across all layers."""
+        return sum(layer.gate_regularization() for layer in self.layers)
 
 
 class OperationDAGSimple(nn.Module):
@@ -550,7 +568,8 @@ class OperationDAGSimple(nn.Module):
         """
         outputs = []
         for node in self.nodes:
-            outputs.append(node(x, tau=tau))
+            out, _ = node(x, tau=tau)  # Unpack tuple (output, info)
+            outputs.append(out)
         
         hidden = torch.stack(outputs, dim=-1)  # (batch, n_hidden)
         return self.output_proj(hidden)
@@ -571,7 +590,14 @@ class ONNLoss(nn.Module):
     """
     Complete loss function for Operation-Based Neural Networks.
     
-    L = L_mse + λ1·L1(edges) + λ2·Entropy + λ3·Complexity
+    L = L_mse + λ1·L1(edges) + λ2·Entropy + λ3·L0 + λ4·ZeroOne + λ5·Gate
+    
+    New loss terms (FairDARTS):
+    - Zero-One Loss: Pushes architecture weights toward binary {0, 1}
+    - Gate Regularization: Penalizes ambiguous gates (near 0.5)
+    
+    These help close the "discretization gap" - the performance drop
+    when snapping continuous params to discrete at inference.
     """
     
     def __init__(
@@ -579,11 +605,25 @@ class ONNLoss(nn.Module):
         lambda_l1: float = 0.01,
         lambda_entropy: float = 0.1,
         lambda_l0: float = 0.01,
+        lambda_zero_one: float = 0.0,   # FairDARTS recommends ~10
+        lambda_gate: float = 0.0,        # Alternative to zero_one
     ):
+        """
+        Args:
+            lambda_l1: Weight for L1 edge sparsity
+            lambda_entropy: Weight for entropy (penalize soft selection)
+            lambda_l0: Weight for L0 regularization
+            lambda_zero_one: Weight for Zero-One Loss (FairDARTS).
+                            Recommended: 10.0 to close discretization gap.
+            lambda_gate: Weight for Gate Regularization.
+                        Alternative to zero_one (use one or the other).
+        """
         super().__init__()
         self.lambda_l1 = lambda_l1
         self.lambda_entropy = lambda_entropy
         self.lambda_l0 = lambda_l0
+        self.lambda_zero_one = lambda_zero_one
+        self.lambda_gate = lambda_gate
         self.mse = nn.MSELoss()
     
     def forward(
@@ -610,17 +650,32 @@ class ONNLoss(nn.Module):
                     l1_loss = l1_loss + node.router.edge_weights.abs().sum()
         
         # Entropy regularization (encourage discrete selection)
-        entropy_loss = -model.entropy_regularization()  # Negative because we minimize
+        # Higher entropy = more uncertain/softer selection -> penalize it
+        entropy_loss = model.entropy_regularization()
         
         # L0 regularization (sparsity in selection)
         l0_loss = model.l0_regularization()
+        
+        # Zero-One Loss (FairDARTS) - push toward binary {0, 1}
+        # Returns negative value (we want to maximize distance from 0.5)
+        zero_one_loss = torch.tensor(0.0, device=pred.device)
+        if self.lambda_zero_one > 0:
+            zero_one_loss = model.zero_one_loss()
+        
+        # Gate regularization - penalize ambiguous gates
+        # g * (1 - g) is minimized at g ∈ {0, 1}
+        gate_loss = torch.tensor(0.0, device=pred.device)
+        if self.lambda_gate > 0:
+            gate_loss = model.gate_regularization()
         
         # Total loss
         total_loss = (
             mse_loss +
             self.lambda_l1 * l1_loss +
             self.lambda_entropy * entropy_loss +
-            self.lambda_l0 * l0_loss
+            self.lambda_l0 * l0_loss +
+            self.lambda_zero_one * zero_one_loss +
+            self.lambda_gate * gate_loss
         )
         
         loss_components = {
@@ -628,6 +683,8 @@ class ONNLoss(nn.Module):
             'l1': l1_loss.item(),
             'entropy': entropy_loss.item(),
             'l0': l0_loss.item(),
+            'zero_one': zero_one_loss.item() if self.lambda_zero_one > 0 else 0.0,
+            'gate': gate_loss.item() if self.lambda_gate > 0 else 0.0,
             'total': total_loss.item(),
         }
         

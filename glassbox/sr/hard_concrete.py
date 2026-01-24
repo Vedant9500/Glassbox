@@ -196,7 +196,9 @@ class HardConcreteGate(nn.Module):
         """
         # Probability that gate is non-zero (not clipped to 0)
         # P(z > 0) = sigmoid(logits - beta * tau)
-        prob_nonzero = torch.sigmoid(self.logits - self.beta * self.tau)
+        # Use tau_tensor to preserve gradients when tau is learnable
+        tau = self.tau_tensor if self._learn_tau else self.tau
+        prob_nonzero = torch.sigmoid(self.logits - self.beta * tau)
         return prob_nonzero.sum()
     
     def expected_gates(self) -> torch.Tensor:
@@ -315,6 +317,16 @@ class HardConcreteOperationSelector(nn.Module):
     2. Select specific operation within type
     
     OPTIMIZED: Batches all logits into a single hard_concrete_sample call.
+    
+    FairDARTS Mode (fair_mode=True):
+    - Uses independent sigmoids instead of competing softmax
+    - Prevents any single operation from "crowding out" others
+    - Better exploration of the operation space
+    
+    Normalization Control (normalize_gates=True, default):
+    - When True: gates are normalized to sum to 1 (approximate one-hot)
+    - When False: raw Hard Concrete values allow all-off sparsity
+    - Set to False for true L0 behavior where all gates can be zero
     """
     
     def __init__(
@@ -323,12 +335,16 @@ class HardConcreteOperationSelector(nn.Module):
         n_binary: int = 2,     # arithmetic, aggregation
         tau: float = 0.5,
         beta: float = 0.1,
+        fair_mode: bool = False,  # FairDARTS-style independent sigmoids
+        normalize_gates: bool = True,  # Whether to normalize gates during training
     ):
         super().__init__()
         self.n_unary = n_unary
         self.n_binary = n_binary
         self.tau = tau
         self.beta = beta
+        self.fair_mode = fair_mode
+        self.normalize_gates = normalize_gates
         
         # Batch all logits together: [type(2), unary(n_unary), binary(n_binary)]
         total = 2 + n_unary + n_binary
@@ -371,8 +387,15 @@ class HardConcreteOperationSelector(nn.Module):
         unary_weights = all_gates[self._type_end:self._unary_end]
         binary_weights = all_gates[self._unary_end:]
         
-        if hard and self.training:
+        if self.fair_mode:
+            # FairDARTS: Independent sigmoids - no normalization
+            # Each op has its own gate that doesn't compete with others
+            # This prevents "unfair advantage" where one op crowds out others
+            # The weights can all be high or all be low independently
+            pass  # Keep raw Hard Concrete values
+        elif hard and self.training and self.normalize_gates:
             # Normalize to approximate one-hot while allowing zeros
+            # Only when normalize_gates=True (default for backward compatibility)
             type_weights = type_weights / (type_weights.sum() + 1e-8)
             unary_weights = unary_weights / (unary_weights.sum() + 1e-8)
             binary_weights = binary_weights / (binary_weights.sum() + 1e-8)
@@ -412,6 +435,57 @@ class HardConcreteOperationSelector(nn.Module):
         binary_ent = -(binary_probs * torch.log(binary_probs + 1e-10)).sum()
         
         return type_ent + unary_ent + binary_ent
+    
+    def zero_one_loss(self) -> torch.Tensor:
+        """
+        Zero-One Loss (FairDARTS) to close the discretization gap.
+        
+        L_{0-1} = Σ(σ(α) - 0.5)²
+        
+        This loss is MINIMIZED when σ(α) ∈ {0, 1} (pushed to extremes)
+        and MAXIMIZED when σ(α) = 0.5 (ambiguous).
+        
+        The loss encourages architecture weights to be binary during training,
+        so there's no "shock" when snapping to discrete values at inference.
+        
+        Recommended weight: ~10 (per FairDARTS paper)
+        
+        Reference: FairDARTS (Chu et al., 2019) Section 2.3.2
+        """
+        # Apply sigmoid to get soft selection probabilities
+        soft_weights = torch.sigmoid(self.logits)
+        
+        # Penalize being close to 0.5 (ambiguous)
+        # (σ(α) - 0.5)² is minimized at σ(α) ∈ {0, 1}
+        zero_one = ((soft_weights - 0.5) ** 2).sum()
+        
+        # We want to MAXIMIZE this (push away from 0.5)
+        # So we return negative to minimize in the loss
+        return -zero_one
+    
+    def gate_regularization(self) -> torch.Tensor:
+        """
+        Gate Regularization to force gates toward binary values.
+        
+        L_gate = Σ g_i * (1 - g_i)
+        
+        This is minimized when g_i ∈ {0, 1} (binary gates)
+        and maximized when g_i = 0.5 (ambiguous half-add/half-multiply).
+        
+        Unlike zero_one_loss which operates on logits, this operates on
+        the actual gate values used in computation.
+        
+        The product g*(1-g) has gradient:
+        - ∂L/∂g = 1 - 2g, which pushes g away from 0.5
+        
+        Reference: research3.md Section 5.4
+        """
+        soft_weights = torch.sigmoid(self.logits)
+        
+        # g * (1 - g) is minimized at g ∈ {0, 1}
+        gate_reg = (soft_weights * (1 - soft_weights)).sum()
+        
+        return gate_reg
 
 
 # ============================================================================

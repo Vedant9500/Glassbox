@@ -61,33 +61,36 @@ def test_evolutionary_training():
         x_val = x_val.to(device)
         y_val = y_val.to(device)
         
-        # Model factory - compact architecture for speed
+        # Model factory - more nodes for multi-term formulas
         def make_model():
             return OperationDAG(
                 n_inputs=1,
-                n_hidden_layers=1,   # Single layer (faster)
-                nodes_per_layer=4,   # 4 nodes is enough for simple formulas
+                n_hidden_layers=1,   # Single layer is enough
+                nodes_per_layer=6,   # More nodes for diversity  
                 n_outputs=1,
                 tau=0.5,
                 simplified_ops=True,  # Only power, periodic, arithmetic (no exp/log)
+                fair_mode=True,       # FairDARTS: independent sigmoids (prevent op crowding)
             )
         
-        # Evolutionary training - smaller budget for faster iteration
+        # Evolutionary training - tuned with explorers
         result = train_onn_evolutionary(
             make_model,
             x_train, y_train,
-            population_size=15,      # Smaller population
-            generations=30,          # Fewer generations
+            population_size=15,      # Main population
+            generations=30,          # Enough generations
             device=device,
             fitness_x=x_val,
             fitness_y=y_val,
             normalize_data=False,
-            constant_refine_hard=False,
+            constant_refine_hard=True,   # Use hard mode for consistency with evaluation
+            constant_refine_steps=50,    # More steps for better constant tuning
             elite_fraction=0.2,
-            mutation_rate=0.4,
-            prune_coefficients=True,   # Enable coefficient pruning
-            prune_threshold=0.15,      # Aggressive pruning (15% of max)
-            use_adaptive_pruning=True, # Use MSE-based pruning
+            mutation_rate=0.4,       # Main population mutation
+            prune_coefficients=False,  # No pruning
+            use_explorers=True,        # Enable explorer subpopulation!
+            explorer_fraction=0.2,     # 20% as explorers
+            explorer_mutation_rate=0.85,  # High mutation for exploration
         )
         
         # Evaluate on validation using compiled inference (faster & consistent)

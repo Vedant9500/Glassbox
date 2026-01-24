@@ -157,10 +157,12 @@ class Individual:
         model: nn.Module,
         fitness: float = float('inf'),
         generation: int = 0,
+        is_explorer: bool = False,
     ):
         self.model = model
         self.fitness = fitness
         self.generation = generation
+        self.is_explorer = is_explorer  # Explorer subpopulation flag
         self.structure_hash = self._compute_structure_hash()
     
     def _compute_structure_hash(self) -> str:
@@ -174,11 +176,13 @@ class Individual:
     def clone(self) -> 'Individual':
         """Deep copy this individual."""
         new_model = copy.deepcopy(self.model)
-        return Individual(
+        ind = Individual(
             model=new_model,
             fitness=self.fitness,
             generation=self.generation + 1,
+            is_explorer=self.is_explorer,
         )
+        return ind
 
 
 def random_operation_init(model: nn.Module, bias_strength: float = 2.0):
@@ -420,7 +424,7 @@ def refine_constants(
         
         # If scales_only, only include output_scale, edge_weights, output_proj
         if scales_only:
-            if 'output_scale' in name or 'edge_weight' in name or 'output_proj' in name:
+            if 'output_scale' in name or 'edge_weights' in name or 'output_proj' in name:
                 if param.requires_grad:
                     constant_params.append(param)
                     param_names.append(name)
@@ -683,6 +687,188 @@ def adaptive_coefficient_pruning(
     return len(pruned_indices), final_mse
 
 
+def check_structure_quality(
+    model: nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    corr_threshold: float = 0.99,
+) -> Tuple[bool, float, float]:
+    """
+    Check if the model has found the correct STRUCTURE (high correlation)
+    even if coefficients are wrong (imperfect MSE).
+    
+    High correlation + imperfect MSE = right structure, wrong coefficients
+    
+    Args:
+        model: The ONN model
+        x, y: Data
+        corr_threshold: Correlation threshold to consider structure "locked"
+    
+    Returns:
+        (structure_is_good, correlation, mse)
+    """
+    model.eval()
+    with torch.no_grad():
+        pred, _ = model(x, hard=True)
+        pred = pred.squeeze()
+        y_sq = y.squeeze()
+        
+        mse = F.mse_loss(pred, y_sq).item()
+        
+        if math.isnan(mse) or math.isinf(mse):
+            return False, 0.0, float('inf')
+        
+        # Compute correlation
+        corr_matrix = torch.corrcoef(torch.stack([pred.cpu(), y_sq.cpu()]))
+        corr = corr_matrix[0, 1].item()
+        
+        if math.isnan(corr):
+            corr = 0.0
+        
+        structure_is_good = abs(corr) >= corr_threshold
+        
+        return structure_is_good, corr, mse
+
+
+def intensive_coefficient_refinement(
+    model: nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    max_steps: int = 1000,
+    target_mse: float = 0.001,
+    lr_start: float = 0.01,
+    patience: int = 200,
+) -> Tuple[float, int]:
+    """
+    Two-phase coefficient refinement when structure is locked.
+    
+    Phase 1: Tune output_proj only (safe, won't break structure)
+    Phase 2: Very gently tune scale parameters (risky, may break structure)
+    
+    Returns:
+        (final_mse, steps_taken)
+    """
+    model.eval()
+    y_sq = y.squeeze()
+    with torch.no_grad():
+        pred, _ = model(x, hard=True)
+        initial_mse = F.mse_loss(pred.squeeze(), y_sq).item()
+    
+    if initial_mse < target_mse:
+        return initial_mse, 0
+    
+    total_steps = 0
+    best_overall_mse = initial_mse
+    best_overall_state = {name: param.detach().clone() for name, param in model.named_parameters()}
+    
+    # ===== PHASE 1: Output projection only (safe) =====
+    output_proj_params = [p for n, p in model.named_parameters() if 'output_proj' in n]
+    if output_proj_params:
+        model.train()
+        optimizer = Adam(output_proj_params, lr=0.05)  # Higher LR ok for output_proj
+        
+        phase1_best_mse = initial_mse
+        phase1_best_state = {n: p.detach().clone() for n, p in model.named_parameters() if 'output_proj' in n}
+        no_improve = 0
+        
+        for step in range(max_steps // 2):
+            total_steps += 1
+            optimizer.zero_grad()
+            pred, _ = model(x, hard=True)
+            loss = F.mse_loss(pred.squeeze(), y_sq)
+            
+            if torch.isnan(loss):
+                break
+            
+            mse = loss.item()
+            if mse < phase1_best_mse - 1e-8:
+                phase1_best_mse = mse
+                phase1_best_state = {n: p.detach().clone() for n, p in model.named_parameters() if 'output_proj' in n}
+                no_improve = 0
+            else:
+                no_improve += 1
+            
+            if mse < target_mse or no_improve > patience // 2:
+                break
+            
+            loss.backward()
+            optimizer.step()
+        
+        # Restore phase 1 best
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if name in phase1_best_state:
+                    param.copy_(phase1_best_state[name])
+        
+        if phase1_best_mse < best_overall_mse:
+            best_overall_mse = phase1_best_mse
+            best_overall_state = {name: param.detach().clone() for name, param in model.named_parameters()}
+    
+    # ===== PHASE 2: Scale params with TINY LR (risky) =====
+    model.eval()
+    with torch.no_grad():
+        pred, _ = model(x, hard=True)
+        current_mse = F.mse_loss(pred.squeeze(), y_sq).item()
+    
+    if current_mse > target_mse:
+        # Only tune scales if we haven't reached target
+        scale_params = [p for n, p in model.named_parameters() if 'scale' in n and 'alpha' not in n]
+        if scale_params:
+            model.train()
+            optimizer = Adam(scale_params, lr=0.001)  # Very tiny LR
+            
+            phase2_best_mse = current_mse
+            phase2_best_state = {n: p.detach().clone() for n, p in model.named_parameters() if 'scale' in n}
+            no_improve = 0
+            
+            for step in range(max_steps // 2):
+                total_steps += 1
+                optimizer.zero_grad()
+                pred, _ = model(x, hard=True)
+                loss = F.mse_loss(pred.squeeze(), y_sq)
+                
+                if torch.isnan(loss):
+                    break
+                
+                mse = loss.item()
+                if mse < phase2_best_mse - 1e-8:
+                    phase2_best_mse = mse
+                    phase2_best_state = {n: p.detach().clone() for n, p in model.named_parameters() if 'scale' in n}
+                    no_improve = 0
+                else:
+                    no_improve += 1
+                
+                if mse < target_mse or no_improve > patience // 2:
+                    break
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(scale_params, max_norm=0.1)
+                optimizer.step()
+            
+            # Restore phase 2 best
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    if name in phase2_best_state:
+                        param.copy_(phase2_best_state[name])
+            
+            if phase2_best_mse < best_overall_mse:
+                best_overall_mse = phase2_best_mse
+                best_overall_state = {name: param.detach().clone() for name, param in model.named_parameters()}
+    
+    # Restore absolute best
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name in best_overall_state:
+                param.copy_(best_overall_state[name])
+    
+    model.eval()
+    with torch.no_grad():
+        pred, _ = model(x, hard=True)
+        final_mse = F.mse_loss(pred.squeeze(), y_sq).item()
+    
+    return final_mse, total_steps
+
+
 def hoyer_sparsity(weights: torch.Tensor) -> torch.Tensor:
     """
     Compute Hoyer sparsity measure (ratio of L1 to L2 norms).
@@ -751,6 +937,7 @@ class EvolutionaryONNTrainer:
     - Lamarckian inheritance: children inherit parent weights
     - Gradient-informed mutations: bias toward impactful changes
     - Coefficient pruning: remove low-impact terms for cleaner formulas
+    - Explorer subpopulation: high-mutation scouts that find new basins
     """
     
     def __init__(
@@ -779,6 +966,10 @@ class EvolutionaryONNTrainer:
         prune_every: int = 5,  # Prune every N generations
         prune_threshold: float = 0.15,  # Prune if |coef| < 15% of max (more aggressive)
         use_adaptive_pruning: bool = True,  # Use MSE-based pruning (smarter)
+        # NEW: Explorer subpopulation
+        use_explorers: bool = True,
+        explorer_fraction: float = 0.2,  # 20% of population are explorers
+        explorer_mutation_rate: float = 0.8,  # High mutation for exploration
     ):
         self.model_factory = model_factory
         self.population_size = population_size
@@ -812,27 +1003,48 @@ class EvolutionaryONNTrainer:
         self.prune_threshold = prune_threshold
         self.use_adaptive_pruning = use_adaptive_pruning
         
+        # NEW: Explorer subpopulation
+        self.use_explorers = use_explorers
+        self.explorer_fraction = explorer_fraction
+        self.explorer_mutation_rate = explorer_mutation_rate
+        self.n_explorers = max(2, int(population_size * explorer_fraction))
+        
         self.population: List[Individual] = []
+        self.explorers: List[Individual] = []  # Separate explorer population
         self.generation = 0
         self.best_ever: Optional[Individual] = None
+        self.best_explorer: Optional[Individual] = None  # Best found by explorers
         self.history = []
     
     def initialize_population(self):
-        """Create diverse initial population."""
+        """Create diverse initial population + explorer subpopulation."""
         self.population = []
+        self.explorers = []
         
+        # Main population
         for i in range(self.population_size):
             model = self.model_factory().to(self.device)
             random_operation_init(model, bias_strength=2.0 + i * 0.1)
             individual = Individual(model, generation=0)
             self.population.append(individual)
         
-        print(f"Initialized population of {self.population_size} individuals")
+        # Explorer subpopulation (high mutation scouts)
+        if self.use_explorers:
+            for i in range(self.n_explorers):
+                model = self.model_factory().to(self.device)
+                # Initialize explorers with MORE random bias (broader search)
+                random_operation_init(model, bias_strength=3.0 + i * 0.2)
+                explorer = Individual(model, generation=0)
+                explorer.is_explorer = True  # Tag as explorer
+                self.explorers.append(explorer)
+            print(f"Initialized population of {self.population_size} individuals + {self.n_explorers} explorers")
+        else:
+            print(f"Initialized population of {self.population_size} individuals")
     
     def evaluate_fitness(self, x: torch.Tensor, y: torch.Tensor, 
                          generation: int = 0, total_generations: int = 50):
         """
-        Evaluate fitness of all individuals.
+        Evaluate fitness of all individuals (main population + explorers).
         
         Includes annealed penalties that change over generations:
         - Entropy: mild early (exploration), strong late (force discrete)
@@ -847,7 +1059,10 @@ class EvolutionaryONNTrainer:
             self.entropy_weight_start, self.entropy_weight_end
         )
         
-        for ind in self.population:
+        # Evaluate all individuals (main + explorers)
+        all_individuals = self.population + (self.explorers if self.use_explorers else [])
+        
+        for ind in all_individuals:
             ind.model.eval()
             try:
                 with torch.no_grad():
@@ -888,10 +1103,87 @@ class EvolutionaryONNTrainer:
             except Exception:
                 ind.fitness = float('inf')
         
-        # Track best ever
+        # Track best ever (from main population)
         best_current = min(self.population, key=lambda ind: ind.fitness)
         if self.best_ever is None or best_current.fitness < self.best_ever.fitness:
             self.best_ever = best_current.clone()
+        
+        # Track best explorer and handle migration
+        if self.use_explorers and self.explorers:
+            best_explorer = min(self.explorers, key=lambda ind: ind.fitness)
+            
+            # Check if explorer found something better than main population
+            if best_explorer.fitness < best_current.fitness:
+                # MIGRATION: Explorer found a better basin!
+                # Inject the explorer's solution into main population
+                if self.best_explorer is None or best_explorer.fitness < self.best_explorer.fitness:
+                    self.best_explorer = best_explorer.clone()
+                    
+                    # Replace worst individuals in main population with 
+                    # copies of the explorer's discovery
+                    sorted_pop = sorted(self.population, key=lambda ind: ind.fitness)
+                    n_migrate = min(3, len(sorted_pop) // 4)  # Migrate up to 3 or 25%
+                    
+                    for i in range(n_migrate):
+                        # Clone explorer and add slight variation
+                        migrant = best_explorer.clone()
+                        migrant.is_explorer = False
+                        # Replace worst individual
+                        self.population[-(i+1)] = migrant
+                    
+                    # Also update best_ever if explorer beat it
+                    if best_explorer.fitness < self.best_ever.fitness:
+                        self.best_ever = best_explorer.clone()
+    
+    def evolve_explorers(self, x: torch.Tensor, y: torch.Tensor):
+        """
+        Evolve the explorer subpopulation with HIGH mutation.
+        
+        Explorers are scouts that search for new promising regions.
+        They have very high mutation rate and less constant refinement.
+        """
+        if not self.use_explorers or not self.explorers:
+            return
+        
+        x = x.to(self.device)
+        y = y.to(self.device)
+        
+        # Sort explorers by fitness
+        sorted_explorers = sorted(self.explorers, key=lambda ind: ind.fitness)
+        
+        new_explorers = []
+        
+        # Keep best explorer
+        new_explorers.append(sorted_explorers[0])
+        
+        # Generate new explorers through heavy mutation
+        while len(new_explorers) < self.n_explorers:
+            # Pick a random parent from top half
+            parent = random.choice(sorted_explorers[:max(1, len(sorted_explorers)//2)])
+            
+            # HIGH mutation - explorers move a LOT
+            if random.random() < 0.3:
+                # Sometimes create completely random explorer (injection)
+                model = self.model_factory().to(self.device)
+                random_operation_init(model, bias_strength=4.0)
+                child = Individual(model, generation=self.generation)
+            else:
+                # Heavy mutation of parent
+                child = mutate_operations(parent, mutation_rate=self.explorer_mutation_rate)
+            
+            child.is_explorer = True
+            
+            # Light refinement (explorers don't over-optimize)
+            refine_constants(
+                child.model, x, y,
+                steps=5,  # Very few steps - just enough to evaluate
+                lr=0.03,
+                hard=self.constant_refine_hard,
+            )
+            
+            new_explorers.append(child)
+        
+        self.explorers = new_explorers
     
     def select_and_reproduce(self, x: torch.Tensor, y: torch.Tensor, diversity: int = 10):
         """
@@ -1028,7 +1320,7 @@ class EvolutionaryONNTrainer:
         # Initialize
         self.initialize_population()
         
-        # Initial constant refinement for all
+        # Initial constant refinement for main population
         print("Refining initial constants...")
         for ind in self.population:
             refine_constants(
@@ -1037,7 +1329,17 @@ class EvolutionaryONNTrainer:
                 hard=self.constant_refine_hard,
             )
         
+        # Light initial refinement for explorers (they stay mobile)
+        if self.use_explorers:
+            for explorer in self.explorers:
+                refine_constants(
+                    explorer.model, x, y,
+                    steps=5,  # Very light - explorers stay mobile
+                    hard=self.constant_refine_hard,
+                )
+        
         start_time = time.time()
+        structure_locked = False  # Flag to skip mutations once structure is found
         
         for gen in range(generations):
             # Anneal tau for all individuals (early soft, late hard)
@@ -1045,8 +1347,23 @@ class EvolutionaryONNTrainer:
             for ind in self.population:
                 set_model_tau(ind.model, current_tau)
             
+            # Explorers keep HIGHER tau (stay soft for more exploration)
+            if self.use_explorers and not structure_locked:
+                explorer_tau = max(current_tau, 0.5)  # Explorers never go below 0.5
+                for explorer in self.explorers:
+                    set_model_tau(explorer.model, explorer_tau)
+            
             # Evaluate with annealed entropy weight (pass generation info)
             self.evaluate_fitness(fit_x, fit_y, generation=gen, total_generations=generations)
+            
+            # Check for early structure lock (high correlation)
+            if not structure_locked and self.best_ever and gen >= 5:
+                is_good, corr, _ = check_structure_quality(
+                    self.best_ever.model, x, y, corr_threshold=0.995
+                )
+                if is_good:
+                    structure_locked = True
+                    print(f"Gen {gen:3d} | STRUCTURE LOCKED (corr={corr:.4f}) - switching to coefficient-only refinement")
             
             # Stats
             fitnesses = [ind.fitness for ind in self.population if ind.fitness < float('inf')]
@@ -1074,9 +1391,13 @@ class EvolutionaryONNTrainer:
             })
             
             if gen % print_every == 0 or gen == generations - 1:
+                explorer_info = ""
+                if self.use_explorers and self.explorers:
+                    best_explorer_fit = min(e.fitness for e in self.explorers if e.fitness < float('inf'))
+                    explorer_info = f" | Explorer: {best_explorer_fit:.4f}"
                 print(f"Gen {gen:3d} | Best: {best_fit:.4f} | "
                       f"Mean: {mean_fit:.4f} | Diversity: {diversity} | "
-                      f"Best Ever: {self.best_ever.fitness:.4f}")
+                      f"Best Ever: {self.best_ever.fitness:.4f}{explorer_info}")
             
             # NEW: Coefficient pruning - remove low-impact terms periodically
             # This cleans up formulas by zeroing small coefficients
@@ -1084,9 +1405,10 @@ class EvolutionaryONNTrainer:
                 for ind in self.population:
                     if self.use_adaptive_pruning:
                         # Adaptive pruning: uses MSE contribution (smarter)
+                        # Conservative: only prune if MSE increase < 2%
                         n_pruned, new_mse = adaptive_coefficient_pruning(
                             ind.model, fit_x, fit_y,
-                            prune_ratio=0.05  # Prune if MSE increase < 5% 
+                            prune_ratio=0.02  # Prune if MSE increase < 2% 
                         )
                     else:
                         # Simple threshold pruning
@@ -1107,7 +1429,17 @@ class EvolutionaryONNTrainer:
             
             # Reproduce (skip on last generation)
             if gen < generations - 1:
-                self.select_and_reproduce(x, y, diversity=diversity)
+                if structure_locked:
+                    # Structure locked: STOP all mutations and exploration
+                    # Don't modify best_ever here - save refinement for the end
+                    # Just skip this generation's reproduction
+                    pass
+                else:
+                    # Normal evolution with mutations
+                    self.select_and_reproduce(x, y, diversity=diversity)
+                    
+                    # Evolve explorers in parallel (if enabled)
+                    self.evolve_explorers(x, y)
         
         elapsed = time.time() - start_time
         
@@ -1115,9 +1447,10 @@ class EvolutionaryONNTrainer:
         if self.prune_coefficients and self.best_ever:
             if self.use_adaptive_pruning:
                 # Adaptive: prune terms that don't contribute much to MSE
+                # Conservative final prune: only 1% MSE tolerance
                 n_final_pruned, _ = adaptive_coefficient_pruning(
                     self.best_ever.model, x, y,
-                    prune_ratio=0.03  # More aggressive final prune (3% MSE tolerance)
+                    prune_ratio=0.01  # Conservative final prune (1% MSE tolerance)
                 )
             else:
                 n_final_pruned = prune_small_coefficients(
@@ -1127,6 +1460,92 @@ class EvolutionaryONNTrainer:
                 )
             if n_final_pruned > 0:
                 print(f"Final pruning removed {n_final_pruned} small coefficients")
+        
+        # STRUCTURE-LOCK REFINEMENT
+        # If correlation is high but MSE is imperfect, we have the right structure
+        # but wrong coefficients. Lock structure and do intensive coefficient tuning.
+        if self.best_ever:
+            import copy
+            
+            # Check if structure is good (high correlation)
+            structure_good, corr, mse_before = check_structure_quality(
+                self.best_ever.model, x, y, corr_threshold=0.99
+            )
+            
+            print(f"Structure check: corr={corr:.4f}, MSE={mse_before:.4f}")
+            
+            if structure_good and mse_before > 0.01:
+                # Structure is good - refinement historically hurts more than helps
+                # The evolutionary process with constant_refine_steps already tunes coefficients
+                # Additional refinement tends to destabilize the model
+                print(f"Structure LOCKED (corr={corr:.4f}). MSE={mse_before:.4f} (skipping refinement - evolution already tuned)")
+                
+                # Optionally do VERY gentle output_proj-only refinement
+                # This is the safest as it only affects the final linear combination
+                backup_state = copy.deepcopy(self.best_ever.model.state_dict())
+                
+                output_proj_params = [p for n, p in self.best_ever.model.named_parameters() if 'output_proj' in n]
+                if output_proj_params:
+                    self.best_ever.model.train()
+                    optimizer = Adam(output_proj_params, lr=0.02)
+                    y_sq = y.squeeze()
+                    
+                    best_mse = mse_before
+                    best_out_state = {n: p.detach().clone() for n, p in self.best_ever.model.named_parameters() if 'output_proj' in n}
+                    
+                    for _ in range(200):
+                        optimizer.zero_grad()
+                        pred, _ = self.best_ever.model(x, hard=True)
+                        loss = F.mse_loss(pred.squeeze(), y_sq)
+                        if torch.isnan(loss):
+                            break
+                        if loss.item() < best_mse:
+                            best_mse = loss.item()
+                            best_out_state = {n: p.detach().clone() for n, p in self.best_ever.model.named_parameters() if 'output_proj' in n}
+                        loss.backward()
+                        optimizer.step()
+                    
+                    # Restore best output_proj state
+                    with torch.no_grad():
+                        for n, p in self.best_ever.model.named_parameters():
+                            if n in best_out_state:
+                                p.copy_(best_out_state[n])
+                    
+                    self.best_ever.model.eval()
+                    with torch.no_grad():
+                        pred_after, _ = self.best_ever.model(x, hard=True)
+                        mse_after = F.mse_loss(pred_after.squeeze(), y.squeeze()).item()
+                    
+                    if mse_after < mse_before:
+                        print(f"  Output-proj refinement: MSE {mse_before:.4f} -> {mse_after:.4f}")
+                    else:
+                        # Revert entirely
+                        self.best_ever.model.load_state_dict(backup_state)
+            
+            elif mse_before > 0.01:
+                # Structure not locked, try gentle refinement
+                print("Structure not locked, trying gentle refinement...")
+                backup_state = copy.deepcopy(self.best_ever.model.state_dict())
+                
+                refine_constants(
+                    self.best_ever.model, x, y,
+                    steps=200,
+                    lr=0.005,
+                    use_lbfgs=False,
+                    scales_only=True,
+                    hard=True,
+                )
+                
+                self.best_ever.model.eval()
+                with torch.no_grad():
+                    pred_after, _ = self.best_ever.model(x, hard=True)
+                    mse_after = F.mse_loss(pred_after.squeeze(), y.squeeze()).item()
+                
+                if mse_after > mse_before * 1.1:
+                    print(f"  Refinement hurt (MSE {mse_before:.4f} -> {mse_after:.4f}), reverting...")
+                    self.best_ever.model.load_state_dict(backup_state)
+                else:
+                    print(f"  Refinement: MSE {mse_before:.4f} -> {mse_after:.4f}")
         
         # Final evaluation
         print("-"*60)
@@ -1228,6 +1647,10 @@ def train_onn_evolutionary(
     prune_coefficients: bool = True,
     prune_threshold: float = 0.15,
     use_adaptive_pruning: bool = True,
+    # Explorer subpopulation
+    use_explorers: bool = True,
+    explorer_fraction: float = 0.2,
+    explorer_mutation_rate: float = 0.8,
 ) -> Dict:
     """
     Convenience function for evolutionary ONN training.
@@ -1258,6 +1681,9 @@ def train_onn_evolutionary(
         prune_coefficients: If True, periodically prune small coefficients
         prune_threshold: Threshold for coefficient pruning (ratio of max)
         use_adaptive_pruning: If True, use MSE-based pruning (smarter)
+        use_explorers: If True, maintain a high-mutation explorer subpopulation
+        explorer_fraction: Fraction of population size for explorers
+        explorer_mutation_rate: Mutation rate for explorers (high for exploration)
     """
     elite_size = max(2, int(population_size * elite_fraction))
     
@@ -1275,6 +1701,9 @@ def train_onn_evolutionary(
         prune_coefficients=prune_coefficients,
         prune_threshold=prune_threshold,
         use_adaptive_pruning=use_adaptive_pruning,
+        use_explorers=use_explorers,
+        explorer_fraction=explorer_fraction,
+        explorer_mutation_rate=explorer_mutation_rate,
     )
     return trainer.train(
         x, y,
