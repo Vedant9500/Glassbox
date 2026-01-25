@@ -19,11 +19,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam, LBFGS
-from typing import Optional, Dict, List, Tuple, Callable
+from typing import Optional, Dict, List, Tuple, Callable, Any
 import copy
 import random
 import math
 import time
+import numpy as np
 
 
 def set_model_tau(model: nn.Module, tau: float):
@@ -869,6 +870,271 @@ def intensive_coefficient_refinement(
     return final_mse, total_steps
 
 
+def finalize_model_coefficients(
+    model: nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    max_steps: int = 500,
+    target_mse: float = 0.01,
+    sparsity_threshold: float = 0.15,
+    l1_weight: float = 0.01,
+) -> Tuple[float, str]:
+    """
+    ROBUST post-evolution coefficient finalization.
+    
+    Simplified approach: Just do L-BFGS on output_proj weights to find
+    the best coefficients. Skip BatchNorm fusion (too error-prone).
+    
+    Args:
+        model: The trained ONN model
+        x, y: Training data
+        max_steps: Max L-BFGS iterations
+        target_mse: Stop when MSE is below this
+        sparsity_threshold: Prune coefficients below this ratio of max
+        l1_weight: L1 regularization weight for sparsity
+        
+    Returns:
+        (final_mse, formula_string)
+    """
+    import gc
+    
+    device = next(model.parameters()).device
+    x = x.to(device)
+    y = y.to(device)
+    y_sq = y.squeeze()
+    
+    model.eval()
+    with torch.no_grad():
+        pred, _ = model(x, hard=True)
+        initial_mse = F.mse_loss(pred.squeeze(), y_sq).item()
+    
+    # Just do L-BFGS refinement on output_proj WITH L1 SPARSITY
+    output_params = [p for n, p in model.named_parameters() if 'output_proj' in n and p.requires_grad]
+    
+    if output_params and initial_mse > target_mse:
+        try:
+            def closure():
+                optimizer.zero_grad()
+                pred, _ = model(x, hard=True)
+                mse_loss = F.mse_loss(pred.squeeze(), y_sq)
+                # Add L1 sparsity penalty
+                l1_loss = sum(p.abs().sum() for p in output_params)
+                loss = mse_loss + l1_weight * l1_loss
+                if not torch.isnan(loss):
+                    loss.backward()
+                return loss
+            
+            optimizer = LBFGS(output_params, lr=1.0, max_iter=max_steps, line_search_fn='strong_wolfe')
+            optimizer.step(closure)
+        except Exception:
+            pass
+    
+    # Prune small coefficients
+    prune_small_coefficients(model, threshold_ratio=sparsity_threshold, absolute_threshold=0.1)
+    
+    # Second L-BFGS pass (pure fitting, no L1)
+    model.eval()
+    with torch.no_grad():
+        pred, _ = model(x, hard=True)
+        post_prune_mse = F.mse_loss(pred.squeeze(), y_sq).item()
+    
+    if output_params and post_prune_mse > target_mse:
+        try:
+            def closure2():
+                optimizer2.zero_grad()
+                pred, _ = model(x, hard=True)
+                loss = F.mse_loss(pred.squeeze(), y_sq)
+                if not torch.isnan(loss):
+                    loss.backward()
+                return loss
+            
+            optimizer2 = LBFGS(output_params, lr=1.0, max_iter=max_steps // 2, line_search_fn='strong_wolfe')
+            optimizer2.step(closure2)
+        except Exception:
+            pass
+    
+    # Final pruning
+    prune_small_coefficients(model, threshold_ratio=0.08, absolute_threshold=0.05)
+    
+    model.eval()
+    with torch.no_grad():
+        pred, _ = model(x, hard=True)
+        final_mse = F.mse_loss(pred.squeeze(), y_sq).item()
+    
+    formula = model.get_formula() if hasattr(model, 'get_formula') else "?"
+    
+    gc.collect()
+    return final_mse, formula
+
+
+def ablate_and_select_terms(
+    model: nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    mse_tolerance: float = 2.0,
+    max_terms: int = 6,
+    verbose: bool = True,
+) -> Tuple[float, str, List[int]]:
+    """
+    Combinatorial term selection: try subsets of discovered operations.
+    
+    Once evolution finds candidate operations (e.g., x², x, sin(x)), this function
+    tries all subsets to find the SIMPLEST formula that fits the data well.
+    
+    Algorithm:
+    1. Get current output_proj weights to identify active terms
+    2. For each subset of active terms (from smallest to largest):
+       a. Zero out non-selected terms
+       b. L-BFGS fine-tune the selected coefficients
+       c. If MSE is acceptable, prefer this simpler formula
+    3. Return the simplest formula that achieves good MSE
+    
+    Args:
+        model: The trained ONN model (should be finalized first)
+        x, y: Training data
+        mse_tolerance: Accept simpler formula if MSE < baseline_mse * mse_tolerance
+        max_terms: Maximum number of terms to consider (for speed)
+        verbose: Print progress
+        
+    Returns:
+        (best_mse, best_formula, selected_indices)
+    """
+    from itertools import combinations
+    import copy
+    
+    device = next(model.parameters()).device
+    x = x.to(device)
+    y = y.to(device)
+    y_sq = y.squeeze()
+    
+    # Get current weights and identify significant terms
+    if not hasattr(model, 'output_proj'):
+        return float('inf'), "?", []
+    
+    with torch.no_grad():
+        weights = model.output_proj.weight.data.clone().squeeze()
+        bias = model.output_proj.bias.data.clone() if model.output_proj.bias is not None else torch.zeros(1)
+    
+    # Find indices of non-zero weights (active terms)
+    active_mask = weights.abs() > 0.01
+    active_indices = torch.where(active_mask)[0].tolist()
+    
+    if len(active_indices) == 0:
+        return float('inf'), "?", []
+    
+    if verbose:
+        print(f"\n--- TERM ABLATION ---")
+        print(f"Active terms: {len(active_indices)} indices: {active_indices}")
+    
+    # Limit number of terms to try
+    if len(active_indices) > max_terms:
+        sorted_idx = sorted(active_indices, key=lambda i: abs(weights[i].item()), reverse=True)
+        active_indices = sorted_idx[:max_terms]
+        if verbose:
+            print(f"Limiting to top {max_terms} terms: {active_indices}")
+    
+    # Save original state
+    original_state = copy.deepcopy(model.state_dict())
+    
+    # Get baseline MSE with all terms
+    model.eval()
+    with torch.no_grad():
+        pred, _ = model(x, hard=True)
+        baseline_mse = F.mse_loss(pred.squeeze(), y_sq).item()
+    
+    if verbose:
+        print(f"Baseline MSE (all terms): {baseline_mse:.6f}")
+    
+    # Track best results - prefer FEWER terms
+    best_results = {}  # n_terms -> (mse, formula, indices, state)
+    best_results[len(active_indices)] = (baseline_mse, model.get_formula() if hasattr(model, 'get_formula') else "?", active_indices.copy(), copy.deepcopy(model.state_dict()))
+    
+    # Try subsets from smallest (1 term) to largest (all - 1)
+    for n_terms in range(1, len(active_indices)):
+        best_for_n = None
+        
+        for subset in combinations(active_indices, n_terms):
+            subset = list(subset)
+            
+            # Reset to original state
+            model.load_state_dict(copy.deepcopy(original_state))
+            
+            # Zero out non-selected terms
+            with torch.no_grad():
+                mask = torch.zeros_like(model.output_proj.weight.data)
+                for idx in subset:
+                    mask[0, idx] = 1.0
+                model.output_proj.weight.data *= mask
+            
+            # L-BFGS fine-tune the selected coefficients
+            output_params = [model.output_proj.weight, model.output_proj.bias] if model.output_proj.bias is not None else [model.output_proj.weight]
+            try:
+                def closure():
+                    for p in output_params:
+                        if p.grad is not None:
+                            p.grad.zero_()
+                    pred, _ = model(x, hard=True)
+                    loss = F.mse_loss(pred.squeeze(), y_sq)
+                    if not torch.isnan(loss):
+                        loss.backward()
+                    return loss
+                
+                optimizer = LBFGS(output_params, lr=1.0, max_iter=200, line_search_fn='strong_wolfe')
+                optimizer.step(closure)
+                
+                # Re-apply mask after optimization
+                with torch.no_grad():
+                    model.output_proj.weight.data *= mask
+            except Exception:
+                continue
+            
+            # Evaluate
+            model.eval()
+            with torch.no_grad():
+                pred, _ = model(x, hard=True)
+                mse = F.mse_loss(pred.squeeze(), y_sq).item()
+            
+            if math.isnan(mse) or math.isinf(mse):
+                continue
+            
+            # Track best for this n_terms
+            if best_for_n is None or mse < best_for_n[0]:
+                best_for_n = (mse, model.get_formula() if hasattr(model, 'get_formula') else "?", subset.copy(), copy.deepcopy(model.state_dict()))
+        
+        if best_for_n is not None:
+            best_results[n_terms] = best_for_n
+            if verbose:
+                print(f"  [{n_terms} terms] best MSE={best_for_n[0]:.6f} formula={best_for_n[1]}")
+    
+    # Select the simplest formula with acceptable MSE
+    # Acceptable = within mse_tolerance of the baseline
+    max_acceptable_mse = baseline_mse * mse_tolerance
+    
+    best_mse = baseline_mse
+    best_formula = best_results[len(active_indices)][1]
+    best_indices = active_indices
+    best_state = best_results[len(active_indices)][3]
+    
+    # Try from fewest terms to most
+    for n_terms in sorted(best_results.keys()):
+        mse, formula, indices, state = best_results[n_terms]
+        if mse <= max_acceptable_mse:
+            best_mse = mse
+            best_formula = formula
+            best_indices = indices
+            best_state = state
+            break  # Take the first (simplest) acceptable solution
+    
+    # Restore best state
+    model.load_state_dict(best_state)
+    
+    if verbose:
+        print(f"\nSelected: {len(best_indices)} terms, MSE={best_mse:.6f}")
+        print(f"Formula: {best_formula}")
+    
+    return best_mse, best_formula, best_indices
+
+
 def hoyer_sparsity(weights: torch.Tensor) -> torch.Tensor:
     """
     Compute Hoyer sparsity measure (ratio of L1 to L2 norms).
@@ -970,6 +1236,11 @@ class EvolutionaryONNTrainer:
         use_explorers: bool = True,
         explorer_fraction: float = 0.2,  # 20% of population are explorers
         explorer_mutation_rate: float = 0.8,  # High mutation for exploration
+        # NEW: Risk-seeking selection (Tier 2)
+        risk_seeking: bool = False,  # Optimize top-k percentile instead of mean
+        risk_seeking_percentile: float = 0.1,  # Top 10% fitness
+        # NEW: Visualization
+        visualizer: Optional[Any] = None,  # LiveTrainingVisualizer instance
     ):
         self.model_factory = model_factory
         self.population_size = population_size
@@ -1009,6 +1280,13 @@ class EvolutionaryONNTrainer:
         self.explorer_mutation_rate = explorer_mutation_rate
         self.n_explorers = max(2, int(population_size * explorer_fraction))
         
+        # NEW: Risk-seeking selection (research Tier 2)
+        self.risk_seeking = risk_seeking
+        self.risk_seeking_percentile = risk_seeking_percentile
+        
+        # NEW: Visualization
+        self.visualizer = visualizer
+        
         self.population: List[Individual] = []
         self.explorers: List[Individual] = []  # Separate explorer population
         self.generation = 0
@@ -1040,6 +1318,15 @@ class EvolutionaryONNTrainer:
             print(f"Initialized population of {self.population_size} individuals + {self.n_explorers} explorers")
         else:
             print(f"Initialized population of {self.population_size} individuals")
+        
+        # Initialize visualizer if provided
+        if self.visualizer is not None:
+            # Get model dimensions from a sample model
+            sample_model = self.population[0].model
+            n_inputs = sample_model.n_inputs if hasattr(sample_model, 'n_inputs') else 1
+            n_layers = sample_model.n_hidden_layers if hasattr(sample_model, 'n_hidden_layers') else 2
+            nodes_per_layer = sample_model.nodes_per_layer if hasattr(sample_model, 'nodes_per_layer') else 4
+            self.visualizer.initialize(n_inputs, n_layers, nodes_per_layer)
     
     def evaluate_fitness(self, x: torch.Tensor, y: torch.Tensor, 
                          generation: int = 0, total_generations: int = 50):
@@ -1078,8 +1365,9 @@ class EvolutionaryONNTrainer:
                         fitness = mse + self.complexity_penalty * complexity
                         
                         # Coefficient sparsity penalty (Hoyer-inspired)
+                        # INCREASED: Stronger sparsity encourages fewer output terms
                         sparsity = coefficient_sparsity_loss(ind.model).item()
-                        fitness = fitness + 0.01 * sparsity
+                        fitness = fitness + 0.05 * sparsity
                         
                         # Entropy regularization with ANNEALED weight (Tier 1)
                         # Mild early (allow exploration), strong late (force discrete)
@@ -1189,15 +1477,23 @@ class EvolutionaryONNTrainer:
         """
         Selection and reproduction with Lamarckian inheritance.
         
-        Tier 2 feature: Lamarckian inheritance passes optimized continuous
-        weights from parent to child, then fine-tunes. This dramatically
-        speeds convergence by reusing learned weights.
+        Tier 2 features:
+        - Lamarckian inheritance: passes optimized weights from parent to child
+        - Risk-seeking selection: bias toward top performers (for SR we want 
+          the BEST formula, not average performance)
         """
         x = x.to(self.device)
         y = y.to(self.device)
         
         # Sort by fitness
         sorted_pop = sorted(self.population, key=lambda ind: ind.fitness)
+        
+        # Risk-seeking selection: only consider top percentile for reproduction
+        if self.risk_seeking:
+            top_k = max(2, int(len(sorted_pop) * self.risk_seeking_percentile))
+            selection_pool = sorted_pop[:top_k]
+        else:
+            selection_pool = sorted_pop[:self.population_size//2]
         
         new_population = []
         
@@ -1238,9 +1534,8 @@ class EvolutionaryONNTrainer:
             
             # Fill rest with mutations of top performers
             while len(new_population) < self.population_size:
-                # Tournament selection
-                candidates = random.sample(sorted_pop[:self.population_size//2], 
-                                           min(3, len(sorted_pop)))
+                # Tournament selection from selection pool
+                candidates = random.sample(selection_pool, min(3, len(selection_pool)))
                 parent = min(candidates, key=lambda ind: ind.fitness)
                 
                 # Lamarckian mutation: clone preserves all parent weights
@@ -1398,6 +1693,42 @@ class EvolutionaryONNTrainer:
                 print(f"Gen {gen:3d} | Best: {best_fit:.4f} | "
                       f"Mean: {mean_fit:.4f} | Diversity: {diversity} | "
                       f"Best Ever: {self.best_ever.fitness:.4f}{explorer_info}")
+            
+            # Update visualization if available
+            if self.visualizer is not None and self.best_ever is not None:
+                # Get formula and correlation for visualization
+                formula = ""
+                correlation = 0.0
+                if hasattr(self.best_ever.model, 'get_formula'):
+                    try:
+                        formula = self.best_ever.model.get_formula()
+                    except Exception:
+                        formula = "?"
+                
+                # Compute correlation
+                try:
+                    self.best_ever.model.eval()
+                    with torch.no_grad():
+                        pred, _ = self.best_ever.model(x, hard=True)
+                        pred_np = pred.squeeze().cpu().numpy()
+                        y_np = y.squeeze().cpu().numpy()
+                        import numpy as np
+                        correlation = float(np.corrcoef(pred_np.flatten(), y_np.flatten())[0, 1])
+                        if math.isnan(correlation):
+                            correlation = 0.0
+                except Exception:
+                    correlation = 0.0
+                
+                self.visualizer.on_generation(
+                    generation=gen,
+                    model=self.best_ever.model,
+                    x=x,
+                    y=y,
+                    history=self.history,
+                    formula=formula,
+                    best_fitness=self.best_ever.fitness,
+                    correlation=correlation,
+                )
             
             # NEW: Coefficient pruning - remove low-impact terms periodically
             # This cleans up formulas by zeroing small coefficients

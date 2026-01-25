@@ -521,6 +521,107 @@ class OperationDAG(nn.Module):
     def gate_regularization(self) -> torch.Tensor:
         """Total gate regularization across all layers."""
         return sum(layer.gate_regularization() for layer in self.layers)
+    
+    def beta_decay_loss(self) -> torch.Tensor:
+        """Total Beta-Decay regularization across all layers."""
+        return sum(layer.beta_decay_loss() for layer in self.layers)
+    
+    def finalize_coefficients(self, x: torch.Tensor) -> 'OperationDAG':
+        """
+        Finalize model coefficients by fusing BatchNorm statistics into output weights.
+        
+        CRITICAL for coefficient accuracy:
+        After training, each node's output goes through:
+        1. BatchNorm: normalized = (raw - μ) / σ  
+        2. output_scale: output = normalized * scale
+        
+        The output projection sees: output = (raw - μ) / σ * scale
+        
+        To get equivalent result WITHOUT normalization:
+        - New formula: y = W' @ raw_outputs + b'
+        - W'[i] = W[i] * scale[i] / σ[i]
+        - b' = b - Σ(W[i] * scale[i] * μ[i] / σ[i])
+        
+        Returns self for chaining: model.finalize_coefficients(x).eval()
+        """
+        # IMPORTANT: Store MSE before finalization to verify we didn't break anything
+        self.eval()
+        with torch.no_grad():
+            pred_before, _ = self(x, hard=True)
+            y_mean = pred_before.mean().item()
+        
+        # Run forward passes to update BatchNorm running statistics
+        with torch.no_grad():
+            for _ in range(5):  # More passes for stable stats
+                self.train()
+                self(x, hard=True)
+            self.eval()
+        
+        # Collect BatchNorm stats for each node
+        bn_stats = []  # List of (mean, std, scale) for each node
+        
+        for layer in self.layers:
+            for node in layer.nodes:
+                bn = node.output_norm
+                if bn is not None and hasattr(bn, 'running_mean') and bn.running_mean is not None:
+                    mean = bn.running_mean.item()
+                    var = bn.running_var.item()
+                    std = max((var + 1e-5) ** 0.5, 1e-6)  # Prevent division by zero
+                    scale = node.output_scale.item()
+                    bn_stats.append((mean, std, scale))
+                else:
+                    bn_stats.append((0.0, 1.0, 1.0))
+        
+        # First, disable normalization on all nodes (so forward pass gives raw outputs)
+        for layer in self.layers:
+            for node in layer.nodes:
+                node._skip_output_norm = True
+                node.output_scale.data.fill_(1.0)
+        
+        # Now compute what the raw outputs are
+        self.eval()
+        with torch.no_grad():
+            # Get raw outputs (no normalization now)
+            pred_raw, info = self(x, hard=True, return_all_outputs=True)
+        
+        # Fuse BatchNorm into output_proj
+        with torch.no_grad():
+            W = self.output_proj.weight.data  # (n_outputs, n_inputs + n_nodes)
+            b = self.output_proj.bias.data if self.output_proj.bias is not None else torch.zeros(1, device=W.device)
+            
+            n_inputs = self.n_inputs
+            
+            # Adjust weights and bias for each node
+            # Original: y = W @ normalized_outputs + b
+            # normalized_output[i] = (raw[i] - mean[i]) / std[i] * scale[i]
+            # 
+            # We want: y = W' @ raw_outputs + b'
+            # W'[i] = W[i] * scale[i] / std[i]
+            # b' = b - Σ W[i] * mean[i] * scale[i] / std[i]
+            
+            bias_correction = torch.zeros_like(b)
+            for i, (mean, std, scale) in enumerate(bn_stats):
+                col_idx = n_inputs + i  # Skip input columns
+                if col_idx < W.shape[1]:
+                    old_w = W[:, col_idx].clone()
+                    # New weight: multiply by scale/std
+                    W[:, col_idx] = old_w * scale / std
+                    # Bias correction: subtract W * mean * scale / std
+                    bias_correction = bias_correction + old_w * mean * scale / std
+            
+            if self.output_proj.bias is not None:
+                self.output_proj.bias.data = b - bias_correction
+        
+        # Verify the fusion worked (predictions should be similar)
+        self.eval()
+        with torch.no_grad():
+            pred_after, _ = self(x, hard=True)
+            diff = (pred_after.mean() - y_mean).abs().item()
+            if diff > 1.0:
+                print(f"WARNING: finalize_coefficients changed predictions significantly (diff={diff:.4f})")
+        
+        self._coefficients_finalized = True
+        return self
 
 
 class OperationDAGSimple(nn.Module):
@@ -590,11 +691,12 @@ class ONNLoss(nn.Module):
     """
     Complete loss function for Operation-Based Neural Networks.
     
-    L = L_mse + λ1·L1(edges) + λ2·Entropy + λ3·L0 + λ4·ZeroOne + λ5·Gate
+    L = L_mse + λ1·L1(edges) + λ2·Entropy + λ3·L0 + λ4·ZeroOne + λ5·Gate + λ6·BetaDecay
     
     New loss terms (FairDARTS):
     - Zero-One Loss: Pushes architecture weights toward binary {0, 1}
     - Gate Regularization: Penalizes ambiguous gates (near 0.5)
+    - Beta-Decay: Prevents premature convergence to single operation
     
     These help close the "discretization gap" - the performance drop
     when snapping continuous params to discrete at inference.
@@ -607,6 +709,7 @@ class ONNLoss(nn.Module):
         lambda_l0: float = 0.01,
         lambda_zero_one: float = 0.0,   # FairDARTS recommends ~10
         lambda_gate: float = 0.0,        # Alternative to zero_one
+        lambda_beta_decay: float = 0.0,  # Prevents premature convergence (~0.01)
     ):
         """
         Args:
@@ -617,6 +720,8 @@ class ONNLoss(nn.Module):
                             Recommended: 10.0 to close discretization gap.
             lambda_gate: Weight for Gate Regularization.
                         Alternative to zero_one (use one or the other).
+            lambda_beta_decay: Weight for Beta-Decay regularization.
+                              Prevents premature convergence. Recommended: 0.01
         """
         super().__init__()
         self.lambda_l1 = lambda_l1
@@ -624,6 +729,7 @@ class ONNLoss(nn.Module):
         self.lambda_l0 = lambda_l0
         self.lambda_zero_one = lambda_zero_one
         self.lambda_gate = lambda_gate
+        self.lambda_beta_decay = lambda_beta_decay
         self.mse = nn.MSELoss()
     
     def forward(
@@ -668,6 +774,12 @@ class ONNLoss(nn.Module):
         if self.lambda_gate > 0:
             gate_loss = model.gate_regularization()
         
+        # Beta-Decay regularization - prevent premature convergence
+        # Penalizes large magnitude architecture weights
+        beta_decay_loss = torch.tensor(0.0, device=pred.device)
+        if self.lambda_beta_decay > 0:
+            beta_decay_loss = model.beta_decay_loss()
+        
         # Total loss
         total_loss = (
             mse_loss +
@@ -675,7 +787,8 @@ class ONNLoss(nn.Module):
             self.lambda_entropy * entropy_loss +
             self.lambda_l0 * l0_loss +
             self.lambda_zero_one * zero_one_loss +
-            self.lambda_gate * gate_loss
+            self.lambda_gate * gate_loss +
+            self.lambda_beta_decay * beta_decay_loss
         )
         
         loss_components = {
@@ -685,6 +798,7 @@ class ONNLoss(nn.Module):
             'l0': l0_loss.item(),
             'zero_one': zero_one_loss.item() if self.lambda_zero_one > 0 else 0.0,
             'gate': gate_loss.item() if self.lambda_gate > 0 else 0.0,
+            'beta_decay': beta_decay_loss.item() if self.lambda_beta_decay > 0 else 0.0,
             'total': total_loss.item(),
         }
         

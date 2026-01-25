@@ -184,48 +184,46 @@ class OperationNode(nn.Module):
         # Get operation selection weights
         type_weights, unary_weights, binary_weights = self.op_selector(hard=hard)
         
-        # OPTIMIZATION: Short-circuit evaluation based on weights
-        # Skip computation paths with near-zero weights (threshold 1e-6)
-        eps = 1e-6
-        compute_unary = type_weights[0].abs() > eps
-        compute_binary = type_weights[1].abs() > eps
+        # torch.compile COMPATIBILITY: Use torch.where() masking instead of if/else branching
+        # This avoids data-dependent control flow that breaks compilation.
+        # We compute both paths but mask with weights (which are ~0 for unused paths).
+        # Reference: todo.md Tier 2 - torch.compile compatibility
         
-        output = torch.zeros(batch_size, device=device, dtype=dtype)
+        # --- UNARY BRANCH ---
+        # Always compute (multiplication by near-zero weight effectively skips)
+        unary_input = self.router.forward_unary(sources, tau=self.tau, hard=hard)
+        unary_result = torch.zeros(batch_size, device=device, dtype=dtype)
+        for i, op in enumerate(self.unary_ops):
+            # Weight-masked accumulation (near-zero weights = effectively skipped)
+            unary_result = unary_result + op(unary_input) * unary_weights[i]
         
-        # Compute unary outputs only if needed
-        if compute_unary:
-            unary_input = self.router.forward_unary(sources, tau=self.tau, hard=hard)
-            unary_result = torch.zeros(batch_size, device=device, dtype=dtype)
-            for i, op in enumerate(self.unary_ops):
-                if unary_weights[i].abs() > eps:
-                    unary_result = unary_result + op(unary_input) * unary_weights[i]
-            # Optional branch-level LayerNorm to prevent gradient starvation
-            # Only apply if explicitly enabled (disabled by default for SR)
-            if self.branch_norm_enabled and self.unary_norm is not None and batch_size > 1:
-                unary_result = self.unary_norm(unary_result.unsqueeze(-1)).squeeze(-1)
-            output = output + type_weights[0] * unary_result
+        # Optional branch-level LayerNorm to prevent gradient starvation
+        # Only apply if explicitly enabled (disabled by default for SR)
+        if self.branch_norm_enabled and self.unary_norm is not None and batch_size > 1:
+            unary_result = self.unary_norm(unary_result.unsqueeze(-1)).squeeze(-1)
         
-        # Compute binary outputs only if needed
-        if compute_binary:
-            binary_result = torch.zeros(batch_size, device=device, dtype=dtype)
-            
-            # Arithmetic operation (always index 0)
-            if binary_weights[0].abs() > eps:
-                x, y = self.router.forward_binary(sources, tau=self.tau, hard=hard)
-                binary_result = binary_result + self.binary_ops[0](x, y) * binary_weights[0]
-            
-            # Aggregation operation (only if we have more than 1 binary op)
-            if len(self.binary_ops) > 1 and binary_weights[1].abs() > eps:
-                agg_input = self.router.forward_aggregation(sources)
-                binary_result = binary_result + self.binary_ops[1](agg_input, dim=-1) * binary_weights[1]
-            
-            # Optional branch-level LayerNorm to prevent gradient starvation
-            if self.branch_norm_enabled and self.binary_norm is not None and batch_size > 1:
-                binary_result = self.binary_norm(binary_result.unsqueeze(-1)).squeeze(-1)
-            output = output + type_weights[1] * binary_result
+        # --- BINARY BRANCH ---
+        binary_result = torch.zeros(batch_size, device=device, dtype=dtype)
         
-        # Normalize output
-        if normalize and batch_size > 1:
+        # Arithmetic operation (always index 0)
+        x, y = self.router.forward_binary(sources, tau=self.tau, hard=hard)
+        binary_result = binary_result + self.binary_ops[0](x, y) * binary_weights[0]
+        
+        # Aggregation operation (only if we have more than 1 binary op)
+        if len(self.binary_ops) > 1:
+            agg_input = self.router.forward_aggregation(sources)
+            binary_result = binary_result + self.binary_ops[1](agg_input, dim=-1) * binary_weights[1]
+        
+        # Optional branch-level LayerNorm to prevent gradient starvation
+        if self.branch_norm_enabled and self.binary_norm is not None and batch_size > 1:
+            binary_result = self.binary_norm(binary_result.unsqueeze(-1)).squeeze(-1)
+        
+        # --- COMBINE WITH TYPE WEIGHTS ---
+        output = type_weights[0] * unary_result + type_weights[1] * binary_result
+        
+        # Normalize output (skip if coefficients have been finalized)
+        skip_norm = getattr(self, '_skip_output_norm', False)
+        if normalize and batch_size > 1 and not skip_norm:
             output = self.output_norm(output.unsqueeze(-1)).squeeze(-1)
         
         # Apply output scale
@@ -303,6 +301,10 @@ class OperationNode(nn.Module):
     def gate_regularization(self) -> torch.Tensor:
         """Gate regularization to force binary gates."""
         return self.op_selector.gate_regularization()
+    
+    def beta_decay_loss(self) -> torch.Tensor:
+        """Beta-Decay regularization to prevent premature convergence."""
+        return self.op_selector.beta_decay_loss()
 
 
 class OperationNodeSimple(nn.Module):
@@ -498,3 +500,7 @@ class OperationLayer(nn.Module):
     def gate_regularization(self) -> torch.Tensor:
         """Sum of gate regularization across nodes."""
         return sum(node.gate_regularization() for node in self.nodes)
+    
+    def beta_decay_loss(self) -> torch.Tensor:
+        """Sum of Beta-Decay regularization across nodes."""
+        return sum(node.beta_decay_loss() for node in self.nodes)

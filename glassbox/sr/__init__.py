@@ -101,6 +101,14 @@ from .evolution import (
     refine_constants,
 )
 
+# v2: Visualization
+from .visualization import (
+    ONNVisualizer,
+    LiveTrainingVisualizer,
+    create_network_diagram,
+    visualize_evolution,
+)
+
 
 
 
@@ -168,5 +176,11 @@ __all__ = [
     'BenchmarkRunner',
     'run_all_benchmarks',
     'quick_comparison',
+    
+    # v2: Visualization
+    'ONNVisualizer',
+    'LiveTrainingVisualizer',
+    'create_network_diagram',
+    'visualize_evolution',
 ]
 

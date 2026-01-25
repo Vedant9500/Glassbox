@@ -486,6 +486,33 @@ class HardConcreteOperationSelector(nn.Module):
         gate_reg = (soft_weights * (1 - soft_weights)).sum()
         
         return gate_reg
+    
+    def beta_decay_loss(self) -> torch.Tensor:
+        """
+        Beta-Decay Regularization to prevent premature convergence.
+        
+        L_beta = Σ |α_i|² + λ_var * Var(|α_i|)
+        
+        This acts as a "speed limit" on entropy collapse by:
+        1. Penalizing large magnitude architecture weights (L2)
+        2. Penalizing variance to keep all options viable longer
+        
+        Without this, strong initial biases can cause one operation
+        to dominate before the network has explored alternatives.
+        
+        Reference: research3.md Section 2.3.3
+        
+        Returns:
+            Beta-decay loss (scalar tensor)
+        """
+        # L2 penalty on architecture parameters
+        l2_penalty = (self.logits ** 2).sum()
+        
+        # Variance penalty - keep logits similar in magnitude
+        logit_var = self.logits.var()
+        
+        # Combined: mostly L2 with small variance term
+        return l2_penalty + 0.1 * logit_var
 
 
 # ============================================================================

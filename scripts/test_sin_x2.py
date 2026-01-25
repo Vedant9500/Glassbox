@@ -131,6 +131,26 @@ def test_sin_x2():
     model = result['model']
     model.eval()
     
+    # NEW: Properly finalize coefficients (L-BFGS with sparsity)
+    from glassbox.sr.evolution import finalize_model_coefficients, ablate_and_select_terms
+    print("\n--- FINALIZING COEFFICIENTS ---")
+    # Use lower L1 weight to avoid destroying the model
+    final_mse, final_formula = finalize_model_coefficients(model, x_train, y_train, l1_weight=0.001)
+    print(f"Final MSE after coefficient finalization: {final_mse:.6f}")
+    print(f"Final formula: {final_formula}")
+    
+    # NEW: Try term ablation to find simplest formula
+    # Lower tolerance (1.5x) to avoid dropping important terms
+    ablation_mse, ablation_formula, selected_terms = ablate_and_select_terms(
+        model, x_train, y_train, 
+        mse_tolerance=1.5,  # Accept up to 1.5x MSE for simpler formula
+        verbose=True
+    )
+    
+    # Update result with best formula
+    result['formula'] = ablation_formula
+    result['train_mse'] = ablation_mse
+    
     # Diagnose the model
     diagnose_model(model, x_val, y_val)
     
