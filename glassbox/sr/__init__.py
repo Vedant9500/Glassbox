@@ -109,6 +109,13 @@ from .visualization import (
     visualize_evolution,
 )
 
+# v2: Post-Training Pruning
+from .pruning import (
+    PostTrainingPruner,
+    prune_model,
+    analyze_model_sensitivity,
+)
+
 
 
 
@@ -182,5 +189,10 @@ __all__ = [
     'LiveTrainingVisualizer',
     'create_network_diagram',
     'visualize_evolution',
+    
+    # v2: Post-Training Pruning
+    'PostTrainingPruner',
+    'prune_model',
+    'analyze_model_sensitivity',
 ]
 

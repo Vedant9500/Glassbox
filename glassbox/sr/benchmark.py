@@ -138,7 +138,8 @@ def generate_polynomial_data(
     formula: str = 'x^2',
 ) -> Tuple[torch.Tensor, torch.Tensor, str]:
     """Generate polynomial function data."""
-    x = torch.linspace(-3, 3, n_samples).unsqueeze(-1)
+    # Use wider range [-6, 6] to force learning true structure, not local approximation
+    x = torch.linspace(-6, 6, n_samples).unsqueeze(-1)
     
     if formula == 'x^2':
         y = x ** 2

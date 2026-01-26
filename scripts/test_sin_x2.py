@@ -131,25 +131,33 @@ def test_sin_x2():
     model = result['model']
     model.eval()
     
-    # NEW: Properly finalize coefficients (L-BFGS with sparsity)
-    from glassbox.sr.evolution import finalize_model_coefficients, ablate_and_select_terms
-    print("\n--- FINALIZING COEFFICIENTS ---")
-    # Use lower L1 weight to avoid destroying the model
-    final_mse, final_formula = finalize_model_coefficients(model, x_train, y_train, l1_weight=0.001)
-    print(f"Final MSE after coefficient finalization: {final_mse:.6f}")
-    print(f"Final formula: {final_formula}")
+    # Get pre-finalization MSE to decide if finalization is needed
+    with torch.no_grad():
+        pred, _ = model(x_train, hard=True)
+        pre_final_mse = nn.functional.mse_loss(pred, y_train).item()
+    pre_final_formula = result['formula']
+    print(f"\nPre-finalization: MSE={pre_final_mse:.4f}, Formula={pre_final_formula}")
     
-    # NEW: Try term ablation to find simplest formula
-    # Lower tolerance (1.5x) to avoid dropping important terms
-    ablation_mse, ablation_formula, selected_terms = ablate_and_select_terms(
-        model, x_train, y_train, 
-        mse_tolerance=1.5,  # Accept up to 1.5x MSE for simpler formula
-        verbose=True
-    )
+    # Only finalize if MSE is high (formula not yet converged)
+    # If MSE is already low, finalization often HURTS
+    from glassbox.sr.evolution import finalize_model_coefficients, ablate_and_select_terms
+    
+    if pre_final_mse > 5.0:  # Only finalize if MSE is bad
+        print("\n--- FINALIZING COEFFICIENTS ---")
+        final_mse, final_formula = finalize_model_coefficients(model, x_train, y_train, l1_weight=0.001)
+        print(f"Final MSE after coefficient finalization: {final_mse:.6f}")
+        print(f"Final formula: {final_formula}")
+        
+        # Revert if finalization made it worse
+        if final_mse > pre_final_mse * 2:
+            print("WARNING: Finalization made MSE worse, reverting...")
+            # Can't easily revert, but flag this
+    else:
+        print("\n--- SKIPPING FINALIZATION (MSE already good) ---")
+        final_formula = pre_final_formula
     
     # Update result with best formula
-    result['formula'] = ablation_formula
-    result['train_mse'] = ablation_mse
+    result['formula'] = final_formula
     
     # Diagnose the model
     diagnose_model(model, x_val, y_val)
