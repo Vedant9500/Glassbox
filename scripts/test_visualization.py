@@ -33,10 +33,12 @@ def main_phased(lite_mode: bool = False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     
-    # Create test data: y = sin(x) + x²
-    print("\nTarget function: y = sin(x) + x²")
+    # Create test data: y = x*sin(x) + cos(x)
+    # This is HARD because it requires discovering x*sin(x) (multiply between input and periodic)
+    print("\nTarget function: y = x*sin(x) + cos(x)")
+    print("Challenge: Requires multiply operation between x and sin(x)")
     x = torch.linspace(-6, 6, 300).reshape(-1, 1)
-    y = torch.sin(x) + x**2
+    y = x * torch.sin(x) + torch.cos(x)
     
     print(f"Data range: x ∈ [{x.min().item():.1f}, {x.max().item():.1f}]")
     print(f"Target range: y ∈ [{y.min().item():.2f}, {y.max().item():.2f}]")
@@ -79,7 +81,7 @@ def main_phased(lite_mode: bool = False):
         device=device,
         lamarckian=True,
         use_explorers=True,
-        explorer_fraction=0.25,
+        explorer_fraction=0.40,  # Boosted from 0.25 to find periodic functions
         explorer_mutation_rate=0.85,
         prune_coefficients=False,  # No pruning during structure search
         constant_refine_hard=True,
@@ -93,8 +95,8 @@ def main_phased(lite_mode: bool = False):
     
     results = trainer.train(
         x, y,
-        generations=40,
-        print_every=5,
+        generations=80,  # Increased from 40 for better structure discovery
+        print_every=10,
     )
     
     phase1_model = results['model']
@@ -202,7 +204,7 @@ def main_phased(lite_mode: bool = False):
     print("-" * 50)
     
     for x_val in test_points:
-        y_true = np.sin(x_val) + x_val**2
+        y_true = x_val * np.sin(x_val) + np.cos(x_val)
         
         # Compute using discovered coefficients
         # y = w1*x + w2*x² + w3*x³ + w4*sin(x) + w5*cos(x) + bias
@@ -227,21 +229,34 @@ def main_phased(lite_mode: bool = False):
     print(f"\n{'='*70}")
     print("FINAL RESULTS")
     print(f"{'='*70}")
-    print(f"TARGET FORMULA:     sin(x) + x²")
+    print(f"TARGET FORMULA:     x*sin(x) + cos(x)")
     print(f"DISCOVERED FORMULA: {final_formula}")
     print(f"Phase 1 MSE:        {phase1_mse:.4f} (structure discovery)")
     print(f"Phase 2 MSE:        {phase2_mse:.6f} (coefficient extraction)")
     
-    # Check if we found the right operations
-    has_sin = any('sin' in name for name, w in zip(feature_names, weights[:-1]) if abs(w.item()) > 0.5)
-    has_square = any('²' in name for name, w in zip(feature_names, weights[:-1]) if abs(w.item()) > 0.5)
+    # Check if we found the right operations with approximately correct coefficients
+    # Expected: sin coefficient ≈ π (3.14159), x² coefficient ≈ 1/π (0.31831)
+    sin_coef = None
+    square_coef = None
+    for name, w in zip(feature_names, weights[:-1]):
+        if 'sin' in name:
+            sin_coef = w.item()
+        elif '²' in name:
+            square_coef = w.item()
+    
+    has_sin = sin_coef is not None and abs(sin_coef) > 0.5
+    has_square = square_coef is not None and abs(square_coef) > 0.1
     
     if has_sin and has_square:
-        print("\n✓ SUCCESS: Found BOTH sin(x) and x² with correct coefficients!")
+        sin_error = abs(sin_coef - PI) / PI * 100 if sin_coef else 100
+        square_error = abs(square_coef - 1/PI) / (1/PI) * 100 if square_coef else 100
+        print(f"\n✓ SUCCESS: Found BOTH sin(x) and x²!")
+        print(f"  sin(x) coefficient: {sin_coef:.4f} (expected π ≈ {PI:.4f}, error: {sin_error:.1f}%)")
+        print(f"  x² coefficient:     {square_coef:.4f} (expected 1/π ≈ {1/PI:.4f}, error: {square_error:.1f}%)")
     elif has_sin:
-        print("\n~ PARTIAL: Found sin(x) but not x²")
+        print(f"\n~ PARTIAL: Found sin(x) (coef={sin_coef:.4f}) but not x²")
     elif has_square:
-        print("\n~ PARTIAL: Found x² but not sin(x)")
+        print(f"\n~ PARTIAL: Found x² (coef={square_coef:.4f}) but not sin(x)")
     else:
         print("\n✗ FAILED: Did not find the target structure")
     
