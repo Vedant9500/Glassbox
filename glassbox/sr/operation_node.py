@@ -23,8 +23,79 @@ from .meta_ops import (
     MetaExp,
     MetaLog,
 )
-from .routing import AdaptiveArityRouter
 from .hard_concrete import HardConcreteOperationSelector, hard_concrete_sample
+
+
+class AdaptiveArityRouter(nn.Module):
+    """
+    Router that selects inputs for operations with variable arity.
+    
+    Handles:
+    - Input selection (routing)
+    - Edge weights (scaling)
+    - Unary vs Binary input routing
+    """
+    
+    def __init__(self, n_sources: int, max_arity: int = 2):
+        super().__init__()
+        self.n_sources = n_sources
+        self.max_arity = max_arity
+        
+        # Learnable edge weights (scaling factors for inputs)
+        # Initialize near 1.0
+        self.edge_weights = nn.Parameter(torch.ones(n_sources))
+        
+        # Routing logits for selecting inputs
+        # Shape: (max_arity, n_sources)
+        # Row 0: Input for unary op / First input for binary op
+        # Row 1: Second input for binary op
+        self.route_logits = nn.Parameter(torch.randn(max_arity, n_sources) * 0.1)
+        
+    def forward_unary(self, sources: torch.Tensor, tau: float = 1.0, hard: bool = False) -> torch.Tensor:
+        """Select input for unary operation (uses slot 0)."""
+        # Apply edge weights
+        weighted_sources = sources * self.edge_weights
+        
+        # Select input 0
+        if hard:
+            # Hard selection (argmax)
+            idx = self.route_logits[0].argmax()
+            selected = weighted_sources[:, idx]
+        else:
+            # Soft selection (softmax)
+            probs = F.softmax(self.route_logits[0] / tau, dim=-1)
+            selected = (weighted_sources * probs).sum(dim=-1)
+            
+        return selected
+        
+    def forward_binary(self, sources: torch.Tensor, tau: float = 1.0, hard: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Select two inputs for binary operation."""
+        # Apply edge weights
+        weighted_sources = sources * self.edge_weights
+        
+        if hard:
+            # Hard selection
+            idx0 = self.route_logits[0].argmax()
+            idx1 = self.route_logits[1].argmax()
+            x = weighted_sources[:, idx0]
+            y = weighted_sources[:, idx1]
+        else:
+            # Soft selection
+            probs = F.softmax(self.route_logits / tau, dim=-1)
+            # (batch, sources) * (arity, sources) -> (arity, batch)
+            selected = torch.matmul(probs, weighted_sources.t())
+            x = selected[0]
+            y = selected[1]
+            
+        return x, y
+    
+    def forward_aggregation(self, sources: torch.Tensor) -> torch.Tensor:
+        """Forward all sources for aggregation optimization."""
+        return sources * self.edge_weights
+        
+    def get_primary_sources(self) -> List[int]:
+        """Get indices of selected inputs."""
+        return self.route_logits.argmax(dim=-1).tolist()
 
 
 class OperationNode(nn.Module):

@@ -1,23 +1,5 @@
 # Symbolic Regression Module
 
-from .tree import DiffTreeNode, SymbolicTree, UNARY_OPS, BINARY_OPS
-from .searcher import SymbolicSearcher
-
-# v1: Operation-based RNN (legacy)
-from .operation_rnn import (
-    OperationCell,
-    OperationRNN,
-    OperationLSTM,
-    OperationLSTMCell,
-    set_global_temperature,
-    set_global_hard_mode,
-    anneal_temperature,
-    compute_regularized_loss,
-    UNARY_OPS as OP_RNN_UNARY_OPS,
-    BINARY_OPS as OP_RNN_BINARY_OPS,
-    AGGREGATION_OPS as OP_RNN_AGGREGATION_OPS,
-)
-
 # v2: Meta-Operations (continuous parametric)
 from .meta_ops import (
     MetaPeriodic,
@@ -29,14 +11,6 @@ from .meta_ops import (
     MetaLog,
     MetaOperationLibrary,
     create_meta_op,
-)
-
-# v2: Differentiable Routing
-from .routing import (
-    DifferentiableRouter,
-    EdgeWeights,
-    RoutedOperationInput,
-    AdaptiveArityRouter,
 )
 
 # v2: Hard Concrete Distribution
@@ -83,15 +57,6 @@ from .benchmark import (
     get_device,
 )
 
-# v2: Improved Training
-from .training import (
-    ImprovedONNTrainer,
-    train_onn_improved,
-    curriculum_schedule,
-    normalize_data,
-    initialize_for_identity,
-)
-
 # v2: Evolutionary Training (PROPER approach)
 from .evolution import (
     EvolutionaryONNTrainer,
@@ -117,25 +82,7 @@ from .pruning import (
 )
 
 
-
-
-
 __all__ = [
-    # Tree-based symbolic regression
-    'DiffTreeNode',
-    'SymbolicTree',
-    'SymbolicSearcher',
-    
-    # v1: Operation-based RNN (legacy)
-    'OperationCell',
-    'OperationRNN',
-    'OperationLSTM',
-    'OperationLSTMCell',
-    'set_global_temperature',
-    'set_global_hard_mode',
-    'anneal_temperature',
-    'compute_regularized_loss',
-    
     # v2: Meta-Operations
     'MetaPeriodic',
     'MetaPower',
@@ -146,12 +93,6 @@ __all__ = [
     'MetaLog',
     'MetaOperationLibrary',
     'create_meta_op',
-    
-    # v2: Routing
-    'DifferentiableRouter',
-    'EdgeWeights',
-    'RoutedOperationInput',
-    'AdaptiveArityRouter',
     
     # v2: Hard Concrete
     'hard_concrete_sample',
@@ -183,6 +124,14 @@ __all__ = [
     'BenchmarkRunner',
     'run_all_benchmarks',
     'quick_comparison',
+    
+    # v2: Evolutionary Training
+    'EvolutionaryONNTrainer',
+    'train_onn_evolutionary',
+
+    'random_operation_init',
+    'mutate_operations',
+    'refine_constants',
     
     # v2: Visualization
     'ONNVisualizer',
