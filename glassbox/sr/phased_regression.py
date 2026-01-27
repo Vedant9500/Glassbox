@@ -18,6 +18,13 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional, Callable
 import copy
 
+# Import BFGS optimizer for better coefficient fitting
+try:
+    from .bfgs_optimizer import fit_coefficients_bfgs, build_formula_from_weights
+    BFGS_AVAILABLE = True
+except ImportError:
+    BFGS_AVAILABLE = False
+
 
 class PhasedSymbolicRegressor:
     """
@@ -41,9 +48,26 @@ class PhasedSymbolicRegressor:
         self,
         model_factory: Callable[[], nn.Module],
         device: Optional[torch.device] = None,
+        # BFGS optimization parameters
+        use_bfgs: bool = True,  # Use BFGS instead of least squares
+        bfgs_method: str = 'iterative',  # 'simple', 'multistart', or 'iterative'
+        bfgs_n_starts: int = 5,  # Number of random starts for multistart
+        bfgs_n_iterations: int = 3,  # Number of prune-refit iterations
+        bfgs_l1_weight: float = 0.01,  # L1 sparsity regularization
+        bfgs_l2_weight: float = 0.001,  # L2 smoothness regularization
+        bfgs_prune_threshold: float = 0.05,  # Prune coefficients below this
     ):
         self.model_factory = model_factory
         self.device = device or torch.device('cpu')
+        
+        # BFGS parameters
+        self.use_bfgs = use_bfgs and BFGS_AVAILABLE
+        self.bfgs_method = bfgs_method
+        self.bfgs_n_starts = bfgs_n_starts
+        self.bfgs_n_iterations = bfgs_n_iterations
+        self.bfgs_l1_weight = bfgs_l1_weight
+        self.bfgs_l2_weight = bfgs_l2_weight
+        self.bfgs_prune_threshold = bfgs_prune_threshold
         
         # Results from each phase
         self.phase1_model = None
@@ -333,39 +357,66 @@ class PhasedSymbolicRegressor:
             torch.ones(n_samples, 1, device=self.device)
         ], dim=1)
         
-        # Solve least squares
-        try:
-            solution = torch.linalg.lstsq(features_with_bias, y.unsqueeze(1))
-            weights = solution.solution.squeeze()
-        except:
-            weights = torch.pinverse(features_with_bias) @ y
-        
-        # Compute MSE
-        pred = features_with_bias @ weights
-        mse = F.mse_loss(pred.squeeze(), y).item()
-        
-        if verbose:
-            print(f"\nOptimal coefficients:")
+        # Use BFGS or least squares based on configuration
+        if self.use_bfgs:
+            if verbose:
+                print(f"\nUsing BFGS optimization (method={self.bfgs_method}, n_starts={self.bfgs_n_starts})")
+            
+            # Use the new BFGS optimizer
+            weights, mse, formula = fit_coefficients_bfgs(
+                features_with_bias,
+                y,
+                feature_names=feature_names + ['bias'],
+                method=self.bfgs_method,
+                n_starts=self.bfgs_n_starts,
+                n_iterations=self.bfgs_n_iterations,
+                l1_weight=self.bfgs_l1_weight,
+                l2_weight=self.bfgs_l2_weight,
+                prune_threshold=self.bfgs_prune_threshold,
+                verbose=verbose,
+            )
+            
+            if verbose:
+                print(f"\nBFGS optimal coefficients:")
+                for name, w in zip(feature_names, weights[:-1]):
+                    if abs(w.item()) > self.bfgs_prune_threshold:
+                        print(f"  {w.item():+.4f} * {name}")
+                print(f"  {weights[-1].item():+.4f} (bias)")
+                print(f"\nBFGS MSE: {mse:.6f}")
+        else:
+            # Fallback to least squares
+            try:
+                solution = torch.linalg.lstsq(features_with_bias, y.unsqueeze(1))
+                weights = solution.solution.squeeze()
+            except:
+                weights = torch.pinverse(features_with_bias) @ y
+            
+            # Compute MSE
+            pred = features_with_bias @ weights
+            mse = F.mse_loss(pred.squeeze(), y).item()
+            
+            if verbose:
+                print(f"\nOptimal coefficients (least squares):")
+                for name, w in zip(feature_names, weights[:-1]):
+                    print(f"  {w.item():+.4f} * {name}")
+                print(f"  {weights[-1].item():+.4f} (bias)")
+                print(f"\nPure basis MSE: {mse:.6f}")
+            
+            # Build formula string
+            formula_parts = []
             for name, w in zip(feature_names, weights[:-1]):
-                print(f"  {w.item():+.4f} * {name}")
-            print(f"  {weights[-1].item():+.4f} (bias)")
-            print(f"\nPure basis MSE: {mse:.6f}")
-        
-        # Build formula string
-        formula_parts = []
-        for name, w in zip(feature_names, weights[:-1]):
-            w_val = w.item()
-            if abs(w_val) > 0.01:
-                formula_parts.append(f"{w_val:.2f}*{name}")
-        
-        bias = weights[-1].item()
-        if abs(bias) > 0.01:
-            formula_parts.append(f"{bias:.2f}")
-        
-        formula = " + ".join(formula_parts) if formula_parts else "0"
+                w_val = w.item()
+                if abs(w_val) > 0.01:
+                    formula_parts.append(f"{w_val:.2f}*{name}")
+            
+            bias = weights[-1].item()
+            if abs(bias) > 0.01:
+                formula_parts.append(f"{bias:.2f}")
+            
+            formula = " + ".join(formula_parts) if formula_parts else "0"
         
         if verbose:
-            print(f"\nPure formula: {formula}")
+            print(f"\nFormula: {formula}")
         
         return weights, mse, formula
     

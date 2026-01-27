@@ -81,6 +81,23 @@ from .pruning import (
     analyze_model_sensitivity,
 )
 
+# v2: Risk-Seeking Policy Gradient
+from .risk_seeking_policy_gradient import (
+    GradientMonitor,
+    RiskSeekingEvolutionMixin,
+    compute_risk_seeking_fitness,
+    compute_selection_probabilities_rspg,
+)
+
+# v2: Multi-Start BFGS Optimizer
+from .bfgs_optimizer import (
+    RegularizedBFGS,
+    MultiStartBFGS,
+    IterativeBFGSRefiner,
+    fit_coefficients_bfgs,
+    build_formula_from_weights,
+)
+
 
 __all__ = [
     # v2: Meta-Operations
@@ -143,5 +160,18 @@ __all__ = [
     'PostTrainingPruner',
     'prune_model',
     'analyze_model_sensitivity',
+    
+    # v2: Risk-Seeking Policy Gradient
+    'GradientMonitor',
+    'RiskSeekingEvolutionMixin',
+    'compute_risk_seeking_fitness',
+    'compute_selection_probabilities_rspg',
+    
+    # v2: Multi-Start BFGS Optimizer
+    'RegularizedBFGS',
+    'MultiStartBFGS',
+    'IterativeBFGSRefiner',
+    'fit_coefficients_bfgs',
+    'build_formula_from_weights',
 ]
 

@@ -33,12 +33,14 @@ def main_phased(lite_mode: bool = False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     
-    # Create test data: y = x*sin(x) + cos(x)
-    # This is HARD because it requires discovering x*sin(x) (multiply between input and periodic)
-    print("\nTarget function: y = x*sin(x) + cos(x)")
-    print("Challenge: Requires multiply operation between x and sin(x)")
+    # Create test data: y = π*sin(x) + x²/π
+    # This tests coefficient discovery with π constant
+    import math
+    PI = math.pi
+    print("\nTarget function: y = π*sin(x) + x²/π")
+    print(f"Challenge: Discover coefficients π ≈ {PI:.4f} and 1/π ≈ {1/PI:.4f}")
     x = torch.linspace(-6, 6, 300).reshape(-1, 1)
-    y = x * torch.sin(x) + torch.cos(x)
+    y = PI * torch.sin(x) + (x ** 2) / PI
     
     print(f"Data range: x ∈ [{x.min().item():.1f}, {x.max().item():.1f}]")
     print(f"Target range: y ∈ [{y.min().item():.2f}, {y.max().item():.2f}]")
@@ -204,7 +206,7 @@ def main_phased(lite_mode: bool = False):
     print("-" * 50)
     
     for x_val in test_points:
-        y_true = x_val * np.sin(x_val) + np.cos(x_val)
+        y_true = PI * np.sin(x_val) + (x_val ** 2) / PI
         
         # Compute using discovered coefficients
         # y = w1*x + w2*x² + w3*x³ + w4*sin(x) + w5*cos(x) + bias
@@ -229,7 +231,7 @@ def main_phased(lite_mode: bool = False):
     print(f"\n{'='*70}")
     print("FINAL RESULTS")
     print(f"{'='*70}")
-    print(f"TARGET FORMULA:     x*sin(x) + cos(x)")
+    print(f"TARGET FORMULA:     π*sin(x) + x²/π")
     print(f"DISCOVERED FORMULA: {final_formula}")
     print(f"Phase 1 MSE:        {phase1_mse:.4f} (structure discovery)")
     print(f"Phase 2 MSE:        {phase2_mse:.6f} (coefficient extraction)")

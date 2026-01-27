@@ -102,6 +102,7 @@ class FormulaTester:
         self.n_samples = n_samples
         self.explorer_fraction = explorer_fraction
         self.mutation_rate = mutation_rate
+        self.use_simplified_ops = False  # Set to False for formulas with exp/log
         
         self.phase1_model = None
         self.phase1_formula = ""
@@ -116,7 +117,7 @@ class FormulaTester:
             n_hidden_layers=self.n_hidden_layers,
             nodes_per_layer=self.nodes_per_layer,
             n_outputs=1,
-            simplified_ops=True,
+            simplified_ops=self.use_simplified_ops,
             fair_mode=True,
         )
     
@@ -142,6 +143,9 @@ class FormulaTester:
             prune_coefficients=False,
             constant_refine_hard=True,
             visualizer=visualizer,
+            # Enable risk-seeking policy gradient for stuck detection
+            risk_seeking=True,
+            risk_seeking_percentile=0.1,  # Focus on top 10%
         )
         
         x = x.to(self.device)

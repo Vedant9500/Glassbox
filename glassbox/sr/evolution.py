@@ -24,7 +24,66 @@ import copy
 import random
 import math
 import time
+import logging
+from itertools import combinations
 import numpy as np
+
+# Configure module-level logger
+logger = logging.getLogger(__name__)
+
+# ============================================================================
+# Constants (replacing magic numbers for maintainability)
+# ============================================================================
+
+# Population initialization
+DEFAULT_BIAS_STRENGTH = 2.0
+EXPLORER_BIAS_STRENGTH = 3.0
+BIAS_INCREMENT = 0.1
+EXPLORER_BIAS_INCREMENT = 0.2
+
+# Mutation and selection
+MUTATION_LOGIT_STRENGTH = 3.0
+MUTATION_NOISE_SCALE = 0.5
+LAMARCKIAN_NOISE_SCALE = 0.5
+
+# Optimization
+OUTPUT_PROJ_LR = 0.05
+SCALE_PARAMS_LR = 0.001
+GENTLE_REFINEMENT_LR = 0.005
+POST_LOCK_LR = 0.02
+GRADIENT_CLIP_NORM = 1.0
+SCALE_GRADIENT_CLIP_NORM = 0.1
+
+# Temperature and annealing
+MIN_EXPLORER_TAU = 0.5
+STRUCTURE_LOCK_CORR_THRESHOLD = 0.995
+FINAL_STRUCTURE_CHECK_CORR = 0.99
+
+# Pruning
+FINAL_PRUNE_RATIO = 0.01
+FINAL_PRUNE_THRESHOLD_RATIO = 0.08
+FINAL_PRUNE_ABSOLUTE = 0.05
+PRUNE_MSE_TOLERANCE = 0.02
+
+# Refinement
+POST_LOCK_REFINEMENT_STEPS = 200
+GENTLE_REFINEMENT_STEPS = 200
+MSE_IMPROVEMENT_THRESHOLD = 1e-8
+MSE_DEGRADATION_TOLERANCE = 1.1
+TARGET_MSE_THRESHOLD = 0.01
+
+# Risk-Seeking Policy Gradient (RSPG)
+try:
+    from .risk_seeking_policy_gradient import (
+        RiskSeekingEvolutionMixin,
+        GradientMonitor,
+        compute_risk_seeking_fitness,
+        compute_selection_probabilities_rspg,
+    )
+    RSPG_AVAILABLE = True
+except ImportError:
+    RSPG_AVAILABLE = False
+    RiskSeekingEvolutionMixin = object  # Dummy base class
 
 
 def set_model_tau(model: nn.Module, tau: float):
@@ -128,7 +187,9 @@ def progressive_round_loss(model: nn.Module, target_params: List[str] = None) ->
     if target_params is None:
         target_params = ['.p', '.omega']
     
-    loss = torch.tensor(0.0)
+    # Get device from model parameters to avoid device mismatch
+    device = next((p.device for p in model.parameters()), torch.device('cpu'))
+    loss = torch.tensor(0.0, device=device)
     count = 0
     
     for name, param in model.named_parameters():
@@ -184,6 +245,208 @@ class Individual:
             is_explorer=self.is_explorer,
         )
         return ind
+
+
+class StructureConfidenceTracker:
+    """
+    Graduated confidence-based structure locking.
+    
+    Instead of a binary "locked/unlocked" state, this tracks confidence
+    in the current structure based on multiple criteria:
+    
+    1. Correlation stability - high correlation maintained over generations
+    2. MSE quality - low MSE indicates good fit
+    3. Improvement trend - still improving or plateaued
+    4. Validation consistency - if validation data available
+    
+    The confidence score (0.0 to 1.0) is used to:
+    - Gradually reduce mutation rate (more refinement, less exploration)
+    - Switch to refinement-only mode at very high confidence
+    - Provide escape hatch if confidence drops (bad lock detected)
+    
+    Benefits over binary lock:
+    - Smooth transition from exploration to exploitation
+    - Can partially recover from premature locking
+    - Uses multiple criteria, not just correlation
+    """
+    
+    # Constants for confidence calculation
+    CORR_THRESHOLD_LOW = 0.95       # Start gaining confidence
+    CORR_THRESHOLD_HIGH = 0.995     # High confidence threshold
+    MSE_THRESHOLD_GOOD = 0.01       # Good MSE (adjust per problem)
+    STABILITY_GENERATIONS = 3       # Generations to be stable for lock
+    REFINEMENT_ONLY_CONFIDENCE = 0.95  # Confidence to switch to refinement-only
+    MIN_MUTATION_FRACTION = 0.1     # Never reduce mutation below 10%
+    
+    def __init__(
+        self,
+        mse_threshold: float = 0.01,
+        stability_generations: int = 3,
+        min_mutation_fraction: float = 0.1,
+    ):
+        """
+        Args:
+            mse_threshold: MSE below this is considered "good"
+            stability_generations: Consecutive good generations needed for high confidence
+            min_mutation_fraction: Minimum mutation rate fraction (0.1 = 10% of original)
+        """
+        self.mse_threshold = mse_threshold
+        self.stability_generations = stability_generations
+        self.min_mutation_fraction = min_mutation_fraction
+        
+        # Tracking state
+        self.history: List[Dict[str, float]] = []
+        self.confidence = 0.0
+        self.best_mse_seen = float('inf')
+        self.generations_stable = 0
+        self.last_improvement_gen = 0
+        
+        # Escape hatch state
+        self.refinement_mse_before = None
+        self.refinement_failures = 0
+    
+    def update(
+        self,
+        generation: int,
+        correlation: float,
+        mse: float,
+        validation_corr: Optional[float] = None,
+    ) -> float:
+        """
+        Update confidence based on current generation metrics.
+        
+        Args:
+            generation: Current generation number
+            correlation: Training correlation
+            mse: Training MSE
+            validation_corr: Validation correlation (optional)
+        
+        Returns:
+            Updated confidence score (0.0 to 1.0)
+        """
+        # Track history
+        self.history.append({
+            'gen': generation,
+            'corr': correlation,
+            'mse': mse,
+            'val_corr': validation_corr,
+        })
+        
+        # Track improvement
+        if mse < self.best_mse_seen * 0.99:  # 1% improvement
+            self.best_mse_seen = mse
+            self.last_improvement_gen = generation
+        
+        # Compute individual confidence components
+        corr_confidence = self._correlation_confidence(correlation)
+        mse_confidence = self._mse_confidence(mse)
+        stability_confidence = self._stability_confidence(generation)
+        
+        # Validation bonus (if available)
+        val_bonus = 0.0
+        if validation_corr is not None and validation_corr > 0.98:
+            val_bonus = 0.1  # Extra confidence if validation is good
+        
+        # Combined confidence (weighted average)
+        # Correlation is most important, MSE and stability are bonuses
+        self.confidence = (
+            0.5 * corr_confidence +
+            0.25 * mse_confidence +
+            0.25 * stability_confidence +
+            val_bonus
+        )
+        self.confidence = min(1.0, self.confidence)  # Cap at 1.0
+        
+        # Update stability counter
+        if correlation > self.CORR_THRESHOLD_HIGH and mse < self.mse_threshold:
+            self.generations_stable += 1
+        else:
+            self.generations_stable = max(0, self.generations_stable - 1)
+        
+        return self.confidence
+    
+    def _correlation_confidence(self, corr: float) -> float:
+        """Map correlation to confidence. 0.95-0.995 maps to 0.0-1.0."""
+        if corr < self.CORR_THRESHOLD_LOW:
+            return 0.0
+        if corr >= self.CORR_THRESHOLD_HIGH:
+            return 1.0
+        # Linear interpolation
+        return (corr - self.CORR_THRESHOLD_LOW) / (self.CORR_THRESHOLD_HIGH - self.CORR_THRESHOLD_LOW)
+    
+    def _mse_confidence(self, mse: float) -> float:
+        """Map MSE to confidence. Lower is better."""
+        if mse >= self.mse_threshold * 10:
+            return 0.0
+        if mse <= self.mse_threshold:
+            return 1.0
+        # Log scale for MSE (since it varies by orders of magnitude)
+        import math
+        log_mse = math.log10(mse + 1e-10)
+        log_threshold = math.log10(self.mse_threshold)
+        log_high = math.log10(self.mse_threshold * 10)
+        return (log_high - log_mse) / (log_high - log_threshold)
+    
+    def _stability_confidence(self, generation: int) -> float:
+        """Confidence from stability (consecutive good generations)."""
+        if self.generations_stable >= self.stability_generations:
+            return 1.0
+        return self.generations_stable / self.stability_generations
+    
+    def get_effective_mutation_rate(self, base_mutation_rate: float) -> float:
+        """
+        Get effective mutation rate based on confidence.
+        
+        High confidence = low mutation (more refinement)
+        Low confidence = normal mutation (more exploration)
+        """
+        # Scale mutation: 1.0 at confidence=0, min_mutation_fraction at confidence=1
+        scale = 1.0 - self.confidence * (1.0 - self.min_mutation_fraction)
+        return base_mutation_rate * scale
+    
+    def should_refine_only(self) -> bool:
+        """Check if we should switch to refinement-only mode (no mutations)."""
+        return (
+            self.confidence >= self.REFINEMENT_ONLY_CONFIDENCE and
+            self.generations_stable >= self.stability_generations
+        )
+    
+    def start_refinement_tracking(self, current_mse: float):
+        """Call before intensive refinement to track if it helps."""
+        self.refinement_mse_before = current_mse
+    
+    def end_refinement_tracking(self, new_mse: float) -> bool:
+        """
+        Call after intensive refinement. Returns True if refinement helped.
+        
+        If refinement makes things worse, reduces confidence (escape hatch).
+        """
+        if self.refinement_mse_before is None:
+            return True
+        
+        improvement = self.refinement_mse_before - new_mse
+        improvement_pct = improvement / (self.refinement_mse_before + 1e-10)
+        
+        if improvement_pct < -0.2:  # MSE got 20% worse
+            # Refinement hurt - reduce confidence
+            self.refinement_failures += 1
+            self.confidence *= 0.5  # Halve confidence
+            self.generations_stable = 0
+            return False
+        
+        self.refinement_mse_before = None
+        return True
+    
+    def get_status(self) -> str:
+        """Get human-readable status string."""
+        if self.should_refine_only():
+            return f"REFINEMENT-ONLY (conf={self.confidence:.2f}, stable={self.generations_stable})"
+        elif self.confidence > 0.5:
+            return f"HIGH-CONFIDENCE (conf={self.confidence:.2f}, stable={self.generations_stable})"
+        elif self.confidence > 0.2:
+            return f"BUILDING-CONFIDENCE (conf={self.confidence:.2f})"
+        else:
+            return f"EXPLORING (conf={self.confidence:.2f})"
 
 
 def random_operation_init(model: nn.Module, bias_strength: float = 2.0):
@@ -313,7 +576,8 @@ def compute_param_sensitivity(
         pred, _ = model(x, hard=False)  # Soft forward for gradients
         loss = F.mse_loss(pred.squeeze(), y.squeeze())
         loss.backward()
-    except Exception:
+    except Exception as e:
+        logger.debug(f"compute_param_sensitivity failed: {e}")
         return {}
     
     sensitivities = {}
@@ -411,13 +675,10 @@ def refine_constants(
         use_lbfgs: If True, use L-BFGS (better for symbolic regression constants)
         scales_only: If True, only tune output_scale and edge_weights (use after snap)
     """
-    import gc
-    
     model.train()
     
     # Identify constant parameters (not selection logits)
     constant_params = []
-    param_names = []  # DEBUG
     for name, param in model.named_parameters():
         # Skip selection logits
         if 'logit' in name or 'selector' in name:
@@ -428,17 +689,12 @@ def refine_constants(
             if 'output_scale' in name or 'edge_weights' in name or 'output_proj' in name:
                 if param.requires_grad:
                     constant_params.append(param)
-                    param_names.append(name)
         else:
             # Skip meta-op core parameters (p, omega, phi, beta) - these are snapped
             if any(x in name for x in ['.p', '.omega', '.phi', '.beta', 'amplitude']):
                 continue
             if param.requires_grad:
                 constant_params.append(param)
-                param_names.append(name)
-    
-    # DEBUG: Print what we're optimizing
-    # print(f"  [refine_constants] Optimizing {len(constant_params)} params: {param_names[:5]}...")
     
     if not constant_params:
         return float('inf')
@@ -449,6 +705,9 @@ def refine_constants(
         if use_lbfgs:
             # L-BFGS: Better for finding exact constants (recommended by research)
             y_squeezed = y.squeeze()
+            # Create optimizer first, then define closure
+            optimizer = LBFGS(constant_params, lr=1.0, max_iter=steps, line_search_fn='strong_wolfe')
+            
             def closure():
                 nonlocal best_loss
                 optimizer.zero_grad()
@@ -461,11 +720,10 @@ def refine_constants(
                 best_loss = min(best_loss, loss.item())
                 return loss
             
-            optimizer = LBFGS(constant_params, lr=1.0, max_iter=steps, line_search_fn='strong_wolfe')
             try:
                 optimizer.step(closure)
-            except Exception:
-                pass  # L-BFGS can fail, that's ok
+            except Exception as e:
+                logger.debug(f"L-BFGS step failed: {e}")
         else:
             # Adam: Faster but less precise
             optimizer = Adam(constant_params, lr=lr)
@@ -479,27 +737,21 @@ def refine_constants(
                 loss = F.mse_loss(pred, y_squeezed)
                 
                 if torch.isnan(loss):
-                    del optimizer
-                    gc.collect()
                     return float('inf')
                 
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(constant_params, max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(constant_params, max_norm=GRADIENT_CLIP_NORM)
                 optimizer.step()
                 
                 best_loss = min(best_loss, loss.item())
     except (MemoryError, RuntimeError) as e:
-        gc.collect()
+        logger.debug(f"refine_constants memory/runtime error: {e}")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         return float('inf')
-    except Exception:
-        gc.collect()
+    except Exception as e:
+        logger.debug(f"refine_constants failed: {e}")
         return float('inf')
-    
-    # Cleanup
-    del optimizer
-    gc.collect()
     
     return best_loss
 
@@ -749,8 +1001,10 @@ def intensive_coefficient_refinement(
     Returns:
         (final_mse, steps_taken)
     """
-    model.eval()
     y_sq = y.squeeze()
+    
+    # Get initial MSE
+    model.eval()
     with torch.no_grad():
         pred, _ = model(x, hard=True)
         initial_mse = F.mse_loss(pred.squeeze(), y_sq).item()
@@ -766,7 +1020,7 @@ def intensive_coefficient_refinement(
     output_proj_params = [p for n, p in model.named_parameters() if 'output_proj' in n]
     if output_proj_params:
         model.train()
-        optimizer = Adam(output_proj_params, lr=0.05)  # Higher LR ok for output_proj
+        optimizer = Adam(output_proj_params, lr=OUTPUT_PROJ_LR)
         
         phase1_best_mse = initial_mse
         phase1_best_state = {n: p.detach().clone() for n, p in model.named_parameters() if 'output_proj' in n}
@@ -781,8 +1035,13 @@ def intensive_coefficient_refinement(
             if torch.isnan(loss):
                 break
             
+            # Perform backward and step FIRST
+            loss.backward()
+            optimizer.step()
+            
+            # THEN check improvement and break conditions
             mse = loss.item()
-            if mse < phase1_best_mse - 1e-8:
+            if mse < phase1_best_mse - MSE_IMPROVEMENT_THRESHOLD:
                 phase1_best_mse = mse
                 phase1_best_state = {n: p.detach().clone() for n, p in model.named_parameters() if 'output_proj' in n}
                 no_improve = 0
@@ -791,9 +1050,6 @@ def intensive_coefficient_refinement(
             
             if mse < target_mse or no_improve > patience // 2:
                 break
-            
-            loss.backward()
-            optimizer.step()
         
         # Restore phase 1 best
         with torch.no_grad():
@@ -816,7 +1072,7 @@ def intensive_coefficient_refinement(
         scale_params = [p for n, p in model.named_parameters() if 'scale' in n and 'alpha' not in n]
         if scale_params:
             model.train()
-            optimizer = Adam(scale_params, lr=0.001)  # Very tiny LR
+            optimizer = Adam(scale_params, lr=SCALE_PARAMS_LR)
             
             phase2_best_mse = current_mse
             phase2_best_state = {n: p.detach().clone() for n, p in model.named_parameters() if 'scale' in n}
@@ -831,8 +1087,14 @@ def intensive_coefficient_refinement(
                 if torch.isnan(loss):
                     break
                 
+                # Perform backward and step FIRST
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(scale_params, max_norm=SCALE_GRADIENT_CLIP_NORM)
+                optimizer.step()
+                
+                # THEN check improvement and break conditions
                 mse = loss.item()
-                if mse < phase2_best_mse - 1e-8:
+                if mse < phase2_best_mse - MSE_IMPROVEMENT_THRESHOLD:
                     phase2_best_mse = mse
                     phase2_best_state = {n: p.detach().clone() for n, p in model.named_parameters() if 'scale' in n}
                     no_improve = 0
@@ -841,10 +1103,6 @@ def intensive_coefficient_refinement(
                 
                 if mse < target_mse or no_improve > patience // 2:
                     break
-                
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(scale_params, max_norm=0.1)
-                optimizer.step()
             
             # Restore phase 2 best
             with torch.no_grad():
@@ -862,6 +1120,7 @@ def intensive_coefficient_refinement(
             if name in best_overall_state:
                 param.copy_(best_overall_state[name])
     
+    # Return model in eval mode
     model.eval()
     with torch.no_grad():
         pred, _ = model(x, hard=True)
@@ -896,8 +1155,6 @@ def finalize_model_coefficients(
     Returns:
         (final_mse, formula_string)
     """
-    import gc
-    
     device = next(model.parameters()).device
     x = x.to(device)
     y = y.to(device)
@@ -913,6 +1170,9 @@ def finalize_model_coefficients(
     
     if output_params and initial_mse > target_mse:
         try:
+            # Create optimizer first, then define closure
+            optimizer = LBFGS(output_params, lr=1.0, max_iter=max_steps, line_search_fn='strong_wolfe')
+            
             def closure():
                 optimizer.zero_grad()
                 pred, _ = model(x, hard=True)
@@ -924,10 +1184,9 @@ def finalize_model_coefficients(
                     loss.backward()
                 return loss
             
-            optimizer = LBFGS(output_params, lr=1.0, max_iter=max_steps, line_search_fn='strong_wolfe')
             optimizer.step(closure)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"finalize_model_coefficients L-BFGS pass 1 failed: {e}")
     
     # Prune small coefficients
     prune_small_coefficients(model, threshold_ratio=sparsity_threshold, absolute_threshold=0.1)
@@ -940,6 +1199,9 @@ def finalize_model_coefficients(
     
     if output_params and post_prune_mse > target_mse:
         try:
+            # Create optimizer first, then define closure
+            optimizer2 = LBFGS(output_params, lr=1.0, max_iter=max_steps // 2, line_search_fn='strong_wolfe')
+            
             def closure2():
                 optimizer2.zero_grad()
                 pred, _ = model(x, hard=True)
@@ -948,13 +1210,12 @@ def finalize_model_coefficients(
                     loss.backward()
                 return loss
             
-            optimizer2 = LBFGS(output_params, lr=1.0, max_iter=max_steps // 2, line_search_fn='strong_wolfe')
             optimizer2.step(closure2)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"finalize_model_coefficients L-BFGS pass 2 failed: {e}")
     
     # Final pruning
-    prune_small_coefficients(model, threshold_ratio=0.08, absolute_threshold=0.05)
+    prune_small_coefficients(model, threshold_ratio=FINAL_PRUNE_THRESHOLD_RATIO, absolute_threshold=FINAL_PRUNE_ABSOLUTE)
     
     model.eval()
     with torch.no_grad():
@@ -963,7 +1224,6 @@ def finalize_model_coefficients(
     
     formula = model.get_formula() if hasattr(model, 'get_formula') else "?"
     
-    gc.collect()
     return final_mse, formula
 
 
@@ -999,8 +1259,7 @@ def ablate_and_select_terms(
     Returns:
         (best_mse, best_formula, selected_indices)
     """
-    from itertools import combinations
-    import copy
+    # Note: itertools.combinations and copy are imported at module level
     
     device = next(model.parameters()).device
     x = x.to(device)
@@ -1056,8 +1315,8 @@ def ablate_and_select_terms(
         for subset in combinations(active_indices, n_terms):
             subset = list(subset)
             
-            # Reset to original state
-            model.load_state_dict(copy.deepcopy(original_state))
+            # Reset to original state (no need for deepcopy - load_state_dict handles copying)
+            model.load_state_dict(original_state)
             
             # Zero out non-selected terms
             with torch.no_grad():
@@ -1147,14 +1406,16 @@ def hoyer_sparsity(weights: torch.Tensor) -> torch.Tensor:
     than L1 penalty alone.
     """
     n = weights.numel()
+    device = weights.device
+    
     if n <= 1:
-        return torch.tensor(0.0)
+        return torch.tensor(0.0, device=device)
     
     l1 = weights.abs().sum()
     l2 = weights.norm(2)
     
     if l2 < 1e-8:
-        return torch.tensor(0.0)
+        return torch.tensor(0.0, device=device)
     
     sqrt_n = math.sqrt(n)
     # Hoyer sparsity (higher = sparser)
@@ -1171,7 +1432,8 @@ def coefficient_sparsity_loss(model: nn.Module) -> torch.Tensor:
     by pushing small coefficients toward zero.
     """
     if not hasattr(model, 'output_proj'):
-        return torch.tensor(0.0)
+        device = next((p.device for p in model.parameters()), torch.device('cpu'))
+        return torch.tensor(0.0, device=device)
     
     weights = model.output_proj.weight
     
@@ -1185,7 +1447,7 @@ def coefficient_sparsity_loss(model: nn.Module) -> torch.Tensor:
     return 0.5 * l1_loss + 0.5 * hoyer_loss
 
 
-class EvolutionaryONNTrainer:
+class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
     """
     Proper evolutionary training for ONN.
     
@@ -1284,8 +1546,26 @@ class EvolutionaryONNTrainer:
         self.risk_seeking = risk_seeking
         self.risk_seeking_percentile = risk_seeking_percentile
         
+        # Initialize RSPG if available and enabled
+        if RSPG_AVAILABLE and risk_seeking:
+            self.init_risk_seeking(
+                enable_rspg=True,
+                rspg_percentile=risk_seeking_percentile * 100,  # Convert to percentage
+                rspg_temperature=0.5,
+                monitor_window_size=10,
+            )
+        else:
+            self.gradient_monitor = None
+        
         # NEW: Visualization
         self.visualizer = visualizer
+        
+        # NEW: Graduated structure confidence tracker (replaces binary lock)
+        self.confidence_tracker = StructureConfidenceTracker(
+            mse_threshold=0.01,
+            stability_generations=3,
+            min_mutation_fraction=0.1,
+        )
         
         self.population: List[Individual] = []
         self.explorers: List[Individual] = []  # Separate explorer population
@@ -1302,7 +1582,7 @@ class EvolutionaryONNTrainer:
         # Main population
         for i in range(self.population_size):
             model = self.model_factory().to(self.device)
-            random_operation_init(model, bias_strength=2.0 + i * 0.1)
+            random_operation_init(model, bias_strength=DEFAULT_BIAS_STRENGTH + i * BIAS_INCREMENT)
             individual = Individual(model, generation=0)
             self.population.append(individual)
         
@@ -1311,7 +1591,7 @@ class EvolutionaryONNTrainer:
             for i in range(self.n_explorers):
                 model = self.model_factory().to(self.device)
                 # Initialize explorers with MORE random bias (broader search)
-                random_operation_init(model, bias_strength=3.0 + i * 0.2)
+                random_operation_init(model, bias_strength=EXPLORER_BIAS_STRENGTH + i * EXPLORER_BIAS_INCREMENT)
                 explorer = Individual(model, generation=0)
                 explorer.is_explorer = True  # Tag as explorer
                 self.explorers.append(explorer)
@@ -1473,7 +1753,7 @@ class EvolutionaryONNTrainer:
         
         self.explorers = new_explorers
     
-    def select_and_reproduce(self, x: torch.Tensor, y: torch.Tensor, diversity: int = 10):
+    def select_and_reproduce(self, x: torch.Tensor, y: torch.Tensor, diversity: int = 10, mutation_rate: float = None):
         """
         Selection and reproduction with Lamarckian inheritance.
         
@@ -1481,7 +1761,14 @@ class EvolutionaryONNTrainer:
         - Lamarckian inheritance: passes optimized weights from parent to child
         - Risk-seeking selection: bias toward top performers (for SR we want 
           the BEST formula, not average performance)
+        
+        Args:
+            x, y: Training data
+            diversity: Current population diversity (used for mass mutation)
+            mutation_rate: Override mutation rate (None = use self.mutation_rate)
         """
+        # Use provided mutation rate or default to self.mutation_rate
+        effective_rate = mutation_rate if mutation_rate is not None else self.mutation_rate
         x = x.to(self.device)
         y = y.to(self.device)
         
@@ -1534,17 +1821,26 @@ class EvolutionaryONNTrainer:
             
             # Fill rest with mutations of top performers
             while len(new_population) < self.population_size:
-                # Tournament selection from selection pool
-                candidates = random.sample(selection_pool, min(3, len(selection_pool)))
-                parent = min(candidates, key=lambda ind: ind.fitness)
+                # Check if RSPG should be used
+                use_rspg = self.gradient_monitor is not None and self.should_use_rspg()
+                
+                if use_rspg:
+                    # Risk-seeking selection: use probabilities that favor top performers
+                    fitnesses = [ind.fitness for ind in selection_pool]
+                    parents = self.select_parents_rspg(selection_pool, fitnesses, n_parents=1)
+                    parent = parents[0]
+                else:
+                    # Normal tournament selection
+                    candidates = random.sample(selection_pool, min(3, len(selection_pool)))
+                    parent = min(candidates, key=lambda ind: ind.fitness)
                 
                 # Lamarckian mutation: clone preserves all parent weights
                 # Mutation only changes discrete structure (operation selection)
                 # Continuous weights (p, omega, etc.) are inherited!
                 if self.lamarckian:
-                    child = mutate_operations_lamarckian(parent, self.mutation_rate)
+                    child = mutate_operations_lamarckian(parent, effective_rate)
                 else:
-                    child = mutate_operations(parent, self.mutation_rate)
+                    child = mutate_operations(parent, effective_rate)
                 
                 # Refine constants (shorter if Lamarckian since weights are pre-tuned)
                 steps = self.constant_refine_steps // 2 if self.lamarckian else self.constant_refine_steps
@@ -1634,7 +1930,7 @@ class EvolutionaryONNTrainer:
                 )
         
         start_time = time.time()
-        structure_locked = False  # Flag to skip mutations once structure is found
+        # Note: structure_locked is now handled by self.confidence_tracker
         
         for gen in range(generations):
             # Anneal tau for all individuals (early soft, late hard)
@@ -1643,22 +1939,41 @@ class EvolutionaryONNTrainer:
                 set_model_tau(ind.model, current_tau)
             
             # Explorers keep HIGHER tau (stay soft for more exploration)
-            if self.use_explorers and not structure_locked:
-                explorer_tau = max(current_tau, 0.5)  # Explorers never go below 0.5
+            # Only apply when not in refinement-only mode
+            if self.use_explorers and not self.confidence_tracker.should_refine_only():
+                explorer_tau = max(current_tau, MIN_EXPLORER_TAU)  # Explorers never go below min
                 for explorer in self.explorers:
                     set_model_tau(explorer.model, explorer_tau)
             
             # Evaluate with annealed entropy weight (pass generation info)
             self.evaluate_fitness(fit_x, fit_y, generation=gen, total_generations=generations)
             
-            # Check for early structure lock (high correlation)
-            if not structure_locked and self.best_ever and gen >= 5:
-                is_good, corr, _ = check_structure_quality(
-                    self.best_ever.model, x, y, corr_threshold=0.995
+            # Update gradient monitor if RSPG is enabled
+            if self.gradient_monitor is not None and self.best_ever is not None:
+                self.update_gradient_monitor(
+                    loss=self.best_ever.fitness,
+                    model=self.best_ever.model,
                 )
-                if is_good:
-                    structure_locked = True
-                    print(f"Gen {gen:3d} | STRUCTURE LOCKED (corr={corr:.4f}) - switching to coefficient-only refinement")
+            
+            # Update structure confidence tracker (replaces binary lock)
+            if self.best_ever and gen >= 3:
+                # Compute correlation for confidence tracking
+                self.best_ever.model.eval()
+                with torch.no_grad():
+                    pred, _ = self.best_ever.model(x, hard=True)
+                    pred_sq = pred.squeeze()
+                    y_sq = y.squeeze()
+                    corr = torch.corrcoef(torch.stack([pred_sq.cpu(), y_sq.cpu()]))[0, 1].item()
+                    mse = F.mse_loss(pred_sq, y_sq).item()
+                    if math.isnan(corr):
+                        corr = 0.0
+                
+                # Update confidence tracker
+                self.confidence_tracker.update(gen, corr, mse)
+                
+                # Log status changes
+                if self.confidence_tracker.should_refine_only() and gen % 5 == 0:
+                    print(f"Gen {gen:3d} | {self.confidence_tracker.get_status()}")
             
             # Stats
             fitnesses = [ind.fitness for ind in self.population if ind.fitness < float('inf')]
@@ -1690,9 +2005,26 @@ class EvolutionaryONNTrainer:
                 if self.use_explorers and self.explorers:
                     best_explorer_fit = min(e.fitness for e in self.explorers if e.fitness < float('inf'))
                     explorer_info = f" | Explorer: {best_explorer_fit:.4f}"
+                
+                # Add RSPG status
+                rspg_info = ""
+                if self.gradient_monitor is not None:
+                    rspg_stats = self.get_rspg_stats()
+                    if rspg_stats.get('is_rspg_active', 0.0) > 0.5:
+                        stuck = "STUCK" if rspg_stats.get('is_stuck', 0.0) > 0.5 else ""
+                        explode = "EXPLODE" if rspg_stats.get('is_exploding', 0.0) > 0.5 else ""
+                        status = f"{stuck}{explode}".strip() or "ACTIVE"
+                        rspg_info = f" | RSPG:{status}"
+                
+                # Add confidence tracker info
+                conf_info = ""
+                if hasattr(self, 'confidence_tracker') and self.confidence_tracker.confidence > 0:
+                    eff_rate = self.confidence_tracker.get_effective_mutation_rate(self.mutation_rate)
+                    conf_info = f" | Conf:{self.confidence_tracker.confidence:.2f} MutRate:{eff_rate:.2f}"
+                
                 print(f"Gen {gen:3d} | Best: {best_fit:.4f} | "
                       f"Mean: {mean_fit:.4f} | Diversity: {diversity} | "
-                      f"Best Ever: {self.best_ever.fitness:.4f}{explorer_info}")
+                      f"Best Ever: {self.best_ever.fitness:.4f}{explorer_info}{rspg_info}{conf_info}")
             
             # Update visualization if available
             if self.visualizer is not None and self.best_ever is not None:
@@ -1736,10 +2068,10 @@ class EvolutionaryONNTrainer:
                 for ind in self.population:
                     if self.use_adaptive_pruning:
                         # Adaptive pruning: uses MSE contribution (smarter)
-                        # Conservative: only prune if MSE increase < 2%
+                        # Conservative: only prune if MSE increase < tolerance
                         n_pruned, new_mse = adaptive_coefficient_pruning(
                             ind.model, fit_x, fit_y,
-                            prune_ratio=0.02  # Prune if MSE increase < 2% 
+                            prune_ratio=PRUNE_MSE_TOLERANCE
                         )
                     else:
                         # Simple threshold pruning
@@ -1760,17 +2092,19 @@ class EvolutionaryONNTrainer:
             
             # Reproduce (skip on last generation)
             if gen < generations - 1:
-                if structure_locked:
-                    # Structure locked: STOP all mutations and exploration
-                    # Don't modify best_ever here - save refinement for the end
-                    # Just skip this generation's reproduction
+                if self.confidence_tracker.should_refine_only():
+                    # High confidence: refinement-only mode, skip mutations
                     pass
                 else:
-                    # Normal evolution with mutations
-                    self.select_and_reproduce(x, y, diversity=diversity)
+                    # Get effective mutation rate based on confidence
+                    effective_mutation_rate = self.confidence_tracker.get_effective_mutation_rate(self.mutation_rate)
                     
-                    # Evolve explorers in parallel (if enabled)
-                    self.evolve_explorers(x, y)
+                    # Normal evolution with (possibly reduced) mutations
+                    self.select_and_reproduce(x, y, diversity=diversity, mutation_rate=effective_mutation_rate)
+                    
+                    # Evolve explorers in parallel (if enabled and not high confidence)
+                    if self.confidence_tracker.confidence < 0.8:
+                        self.evolve_explorers(x, y)
         
         elapsed = time.time() - start_time
         
@@ -1806,62 +2140,81 @@ class EvolutionaryONNTrainer:
             print(f"Structure check: corr={corr:.4f}, MSE={mse_before:.4f}")
             
             if structure_good and mse_before > 0.01:
-                # Structure is good - refinement historically hurts more than helps
-                # The evolutionary process with constant_refine_steps already tunes coefficients
-                # Additional refinement tends to destabilize the model
-                print(f"Structure LOCKED (corr={corr:.4f}). MSE={mse_before:.4f} (skipping refinement - evolution already tuned)")
+                # Structure is good but coefficients need work
+                # Phase 2: Run intensive coefficient refinement
+                print(f"Structure LOCKED (corr={corr:.4f}). MSE={mse_before:.4f} - running intensive coefficient refinement...")
                 
-                # Optionally do VERY gentle output_proj-only refinement
-                # This is the safest as it only affects the final linear combination
                 backup_state = copy.deepcopy(self.best_ever.model.state_dict())
                 
-                output_proj_params = [p for n, p in self.best_ever.model.named_parameters() if 'output_proj' in n]
-                if output_proj_params:
-                    self.best_ever.model.train()
-                    optimizer = Adam(output_proj_params, lr=0.02)
-                    y_sq = y.squeeze()
+                # Run intensive coefficient refinement (Phase 2)
+                final_mse, steps = intensive_coefficient_refinement(
+                    self.best_ever.model, x, y,
+                    target_mse=0.001,  # Aim for very low MSE
+                    max_steps=500,
+                    patience=100,
+                )
+                
+                # Check if refinement helped or hurt
+                self.best_ever.model.eval()
+                with torch.no_grad():
+                    pred_after, _ = self.best_ever.model(x, hard=True)
+                    mse_after = F.mse_loss(pred_after.squeeze(), y.squeeze()).item()
+                
+                if mse_after < mse_before * 0.8:  # Improved by at least 20%
+                    print(f"  Phase 2 refinement: MSE {mse_before:.4f} -> {mse_after:.4f} ({steps} steps)")
+                else:
+                    # Refinement didn't help much, try output_proj only as fallback
+                    print(f"  Phase 2 refinement didn't improve enough ({mse_before:.4f} -> {mse_after:.4f})")
+                    self.best_ever.model.load_state_dict(backup_state)
                     
-                    best_mse = mse_before
-                    best_out_state = {n: p.detach().clone() for n, p in self.best_ever.model.named_parameters() if 'output_proj' in n}
-                    
-                    for _ in range(200):
-                        optimizer.zero_grad()
-                        pred, _ = self.best_ever.model(x, hard=True)
-                        loss = F.mse_loss(pred.squeeze(), y_sq)
-                        if torch.isnan(loss):
-                            break
-                        if loss.item() < best_mse:
-                            best_mse = loss.item()
-                            best_out_state = {n: p.detach().clone() for n, p in self.best_ever.model.named_parameters() if 'output_proj' in n}
-                        loss.backward()
-                        optimizer.step()
-                    
-                    # Restore best output_proj state
-                    with torch.no_grad():
-                        for n, p in self.best_ever.model.named_parameters():
-                            if n in best_out_state:
-                                p.copy_(best_out_state[n])
-                    
-                    self.best_ever.model.eval()
-                    with torch.no_grad():
-                        pred_after, _ = self.best_ever.model(x, hard=True)
-                        mse_after = F.mse_loss(pred_after.squeeze(), y.squeeze()).item()
-                    
-                    if mse_after < mse_before:
-                        print(f"  Output-proj refinement: MSE {mse_before:.4f} -> {mse_after:.4f}")
-                    else:
-                        # Revert entirely
-                        self.best_ever.model.load_state_dict(backup_state)
+                    # Fallback: gentle output_proj-only refinement
+                    output_proj_params = [p for n, p in self.best_ever.model.named_parameters() if 'output_proj' in n]
+                    if output_proj_params:
+                        self.best_ever.model.train()
+                        optimizer = Adam(output_proj_params, lr=0.02)
+                        y_sq = y.squeeze()
+                        
+                        best_mse = mse_before
+                        best_out_state = {n: p.detach().clone() for n, p in self.best_ever.model.named_parameters() if 'output_proj' in n}
+                        
+                        for _ in range(200):
+                            optimizer.zero_grad()
+                            pred, _ = self.best_ever.model(x, hard=True)
+                            loss = F.mse_loss(pred.squeeze(), y_sq)
+                            if torch.isnan(loss):
+                                break
+                            if loss.item() < best_mse:
+                                best_mse = loss.item()
+                                best_out_state = {n: p.detach().clone() for n, p in self.best_ever.model.named_parameters() if 'output_proj' in n}
+                            loss.backward()
+                            optimizer.step()
+                        
+                        # Restore best output_proj state
+                        with torch.no_grad():
+                            for n, p in self.best_ever.model.named_parameters():
+                                if n in best_out_state:
+                                    p.copy_(best_out_state[n])
+                        
+                        self.best_ever.model.eval()
+                        with torch.no_grad():
+                            pred_fallback, _ = self.best_ever.model(x, hard=True)
+                            mse_fallback = F.mse_loss(pred_fallback.squeeze(), y.squeeze()).item()
+                        
+                        if mse_fallback < mse_before:
+                            print(f"  Fallback output-proj refinement: MSE {mse_before:.4f} -> {mse_fallback:.4f}")
+                        else:
+                            # Revert entirely
+                            self.best_ever.model.load_state_dict(backup_state)
             
-            elif mse_before > 0.01:
+            elif mse_before > TARGET_MSE_THRESHOLD:
                 # Structure not locked, try gentle refinement
                 print("Structure not locked, trying gentle refinement...")
                 backup_state = copy.deepcopy(self.best_ever.model.state_dict())
                 
                 refine_constants(
                     self.best_ever.model, x, y,
-                    steps=200,
-                    lr=0.005,
+                    steps=GENTLE_REFINEMENT_STEPS,
+                    lr=GENTLE_REFINEMENT_LR,
                     use_lbfgs=False,
                     scales_only=True,
                     hard=True,
@@ -1872,25 +2225,22 @@ class EvolutionaryONNTrainer:
                     pred_after, _ = self.best_ever.model(x, hard=True)
                     mse_after = F.mse_loss(pred_after.squeeze(), y.squeeze()).item()
                 
-                if mse_after > mse_before * 1.1:
-                    print(f"  Refinement hurt (MSE {mse_before:.4f} -> {mse_after:.4f}), reverting...")
+                if mse_after > mse_before * MSE_DEGRADATION_TOLERANCE:
+                    logger.info(f"  Refinement hurt (MSE {mse_before:.4f} -> {mse_after:.4f}), reverting...")
                     self.best_ever.model.load_state_dict(backup_state)
                 else:
-                    print(f"  Refinement: MSE {mse_before:.4f} -> {mse_after:.4f}")
+                    logger.info(f"  Refinement: MSE {mse_before:.4f} -> {mse_after:.4f}")
         
         # Final evaluation
-        print("-"*60)
-        print(f"Training complete in {elapsed:.1f}s")
+        logger.info("-"*60)
+        logger.info(f"Training complete in {elapsed:.1f}s")
         
         # Get best model
         best_model = self.best_ever.model if self.best_ever else self.population[0].model
         
-        # IMPORTANT: Do NOT snap_to_discrete - it destroys model performance
-        # The continuous parameters are more expressive and give better results
-        # Formula extraction still works with continuous values
-        # 
-        # if hasattr(best_model, 'snap_to_discrete'):
-        #     best_model.snap_to_discrete()
+        # Note: snap_to_discrete is intentionally NOT called here.
+        # The continuous parameters are more expressive and give better results.
+        # Formula extraction still works correctly with continuous values.
         
         # CRITICAL: Put model in eval mode for deterministic behavior
         best_model.eval()
@@ -1908,14 +2258,8 @@ class EvolutionaryONNTrainer:
                 mse_val = F.mse_loss(pred_val.squeeze(), fit_y.squeeze()).item()
                 print(f"  Val MSE: {mse_val:.4f}")
         
-        # DISABLED: Compiled inference path (has bugs causing MSE discrepancy)
+        # Note: Compiled inference path is disabled due to MSE discrepancy bugs.
         use_compiled = False
-        # if hasattr(best_model, 'compile_for_inference'):
-        #     try:
-        #         best_model.compile_for_inference()
-        #         use_compiled = True
-        #     except Exception:
-        #         pass
         
         # Squeeze y for consistent shape
         y_eval = y.squeeze()
@@ -1927,9 +2271,9 @@ class EvolutionaryONNTrainer:
                 pred, _ = best_model(x, hard=True)
             pred = pred.squeeze()
             
-            # DEBUG: Check MSE before denorm
+            # Log MSE before denormalization for debugging
             final_mse_raw = F.mse_loss(pred, y_eval).item()
-            print(f"  DEBUG: MSE raw (before denorm): {final_mse_raw:.4f}")
+            logger.debug(f"MSE raw (before denorm): {final_mse_raw:.4f}")
             
             if self.normalize_data and self.norm_stats:
                 pred = pred * self.norm_stats['y_std'] + self.norm_stats['y_mean']
