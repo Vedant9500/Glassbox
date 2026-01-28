@@ -55,6 +55,8 @@ class GradientMonitor:
         # State
         self.iteration = 0
         self.is_rspg_active = False
+        self.cooldown_steps = 0
+        self.cooldown_limit = 10
     
     def update(self, loss: float, grad_norm: Optional[float] = None):
         """Update monitoring statistics."""
@@ -108,14 +110,18 @@ class GradientMonitor:
         should_activate = stuck or exploding
         
         # Update state
-        if should_activate and not self.is_rspg_active:
+        # Update state
+        if should_activate:
             self.is_rspg_active = True
-        elif not should_activate and self.is_rspg_active:
-            # Deactivate after some cooldown
-            # For now, stay in RSPG once activated
-            pass
+            self.cooldown_steps = 0
+        elif self.is_rspg_active:
+            # Cooldown logic
+            self.cooldown_steps += 1
+            if self.cooldown_steps >= self.cooldown_limit:
+                self.is_rspg_active = False
+                self.cooldown_steps = 0
         
-        return should_activate
+        return self.is_rspg_active
     
     def get_stats(self) -> Dict[str, float]:
         """Return current statistics."""
@@ -262,14 +268,11 @@ class RiskSeekingEvolutionMixin:
     def _compute_grad_norm(self, model: nn.Module) -> float:
         """Compute L2 norm of all gradients."""
         total_norm = 0.0
-        param_count = 0
-        
         for param in model.parameters():
             if param.grad is not None:
                 total_norm += param.grad.norm(2).item() ** 2
-                param_count += 1
         
-        if param_count == 0:
+        if total_norm == 0.0:
             return 0.0
         
         return (total_norm ** 0.5)

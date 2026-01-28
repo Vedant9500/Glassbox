@@ -381,7 +381,6 @@ class StructureConfidenceTracker:
         if mse <= self.mse_threshold:
             return 1.0
         # Log scale for MSE (since it varies by orders of magnitude)
-        import math
         log_mse = math.log10(mse + 1e-10)
         log_threshold = math.log10(self.mse_threshold)
         log_high = math.log10(self.mse_threshold * 10)
@@ -1182,6 +1181,8 @@ def finalize_model_coefficients(
                 loss = mse_loss + l1_weight * l1_loss
                 if not torch.isnan(loss):
                     loss.backward()
+                else:
+                    return torch.tensor(float('inf'), requires_grad=True)
                 return loss
             
             optimizer.step(closure)
@@ -1329,9 +1330,7 @@ def ablate_and_select_terms(
             output_params = [model.output_proj.weight, model.output_proj.bias] if model.output_proj.bias is not None else [model.output_proj.weight]
             try:
                 def closure():
-                    for p in output_params:
-                        if p.grad is not None:
-                            p.grad.zero_()
+                    optimizer.zero_grad()
                     pred, _ = model(x, hard=True)
                     loss = F.mse_loss(pred.squeeze(), y_sq)
                     if not torch.isnan(loss):
@@ -1822,7 +1821,7 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             # Fill rest with mutations of top performers
             while len(new_population) < self.population_size:
                 # Check if RSPG should be used
-                use_rspg = self.gradient_monitor is not None and self.should_use_rspg()
+                use_rspg = self.gradient_monitor is not None and hasattr(self, 'should_use_rspg') and self.should_use_rspg()
                 
                 if use_rspg:
                     # Risk-seeking selection: use probabilities that favor top performers
@@ -2044,7 +2043,6 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                         pred, _ = self.best_ever.model(x, hard=True)
                         pred_np = pred.squeeze().cpu().numpy()
                         y_np = y.squeeze().cpu().numpy()
-                        import numpy as np
                         correlation = float(np.corrcoef(pred_np.flatten(), y_np.flatten())[0, 1])
                         if math.isnan(correlation):
                             correlation = 0.0
@@ -2130,8 +2128,7 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         # If correlation is high but MSE is imperfect, we have the right structure
         # but wrong coefficients. Lock structure and do intensive coefficient tuning.
         if self.best_ever:
-            import copy
-            
+
             # Check if structure is good (high correlation)
             structure_good, corr, mse_before = check_structure_quality(
                 self.best_ever.model, x, y, corr_threshold=0.99

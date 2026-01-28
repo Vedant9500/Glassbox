@@ -140,12 +140,19 @@ class MetaPower(nn.Module):
         # Safe power for negative inputs
         abs_x = torch.abs(x) + self.eps
         sign_x = torch.sign(x)
+        abs_pow = torch.pow(abs_x, p)
         
-        # For even-ish powers (p close to 2, 4, ...), output should be positive
-        # For odd-ish powers (p close to 1, 3, ...), preserve sign
-        # We use: sign(x)^(round(p) mod 2) * |x|^p as approximation
-        # Simpler: always preserve sign for continuous gradient flow
-        result = sign_x * torch.pow(abs_x, p)
+        # Determine even/odd symmetry based on p
+        # p=0, 2, 4... -> Even (cos(p*pi) = 1)
+        # p=1, 3...    -> Odd  (cos(p*pi) = -1)
+        # Smooth blend: is_even = 0.5 * (1 + cos(p*pi))
+        # Note: This aligns perfectly with integers.
+        is_even = 0.5 * (1.0 + torch.cos(p * math.pi))
+        
+        # Result blends between odd (preserves sign) and even (absolute) behavior
+        # odd_result = sign(x) * |x|^p
+        # even_result = |x|^p
+        result = (1.0 - is_even) * (sign_x * abs_pow) + is_even * abs_pow
         
         # Clamp output to prevent explosion
         return torch.clamp(result, -100, 100)
@@ -281,20 +288,43 @@ class MetaArithmeticExtended(nn.Module):
     
     def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """Apply extended arithmetic operation."""
-        beta = torch.clamp(self.beta, 1.0, 2.0)
-        gamma = torch.tanh(self.gamma)  # Soft -1 to 1
+        # Use simple parameters to control mix of Add, Mul, Div
+        # We interpret beta/gamma to maintain backward compatibility with 'learnable' init
+        # But we implement a cleaner logic:
+        # beta: 1->Add, 2->Mul/Div
+        # gamma: >0 -> Mul, <0 -> Div
         
-        # Flip y based on gamma
-        y_effective = gamma * y
+        beta_val = self.beta.item() if isinstance(self.beta, nn.Parameter) else self.beta
+        gamma_val = self.gamma.item() if isinstance(self.gamma, nn.Parameter) else self.gamma
         
-        # For division, we need 1/y when beta=2, gamma=-1
-        # Use: (1-|gamma|)*y + |gamma|*sign(gamma)*(1/(|y|+eps))
-        # This is complex; for now just use linear interp
+        # Calculate mixing weights based on beta/gamma distance
+        # Target points: Add(1, 1), Mul(2, 1), Div(2, -1), Sub(1, -1)
         
-        add_result = x + y_effective
-        mul_result = x * y_effective
+        # Differentiable soft selection
+        # We transform (beta, gamma) into a 4-way classification
+        # Distances to prototypes:
+        d_add = (self.beta - 1.0)**2 + (self.gamma - 1.0)**2
+        d_mul = (self.beta - 2.0)**2 + (self.gamma - 1.0)**2
+        d_div = (self.beta - 2.0)**2 + (self.gamma + 1.0)**2
+        d_sub = (self.beta - 1.0)**2 + (self.gamma + 1.0)**2
         
-        result = (2 - beta) * add_result + (beta - 1) * mul_result
+        # Logits = -distance (closer is higher logit)
+        logits = torch.stack([-d_add, -d_mul, -d_div, -d_sub])
+        weights = F.softmax(logits * 5.0, dim=0) # Temperature 5 for sharpness
+        
+        # Compute all 4 results
+        res_add = x + y
+        res_sub = x - y
+        res_mul = x * y
+        res_div = x / (torch.abs(y) + 1e-6) * torch.sign(y) # Safe division
+        
+        # Weighted sum
+        result = (
+            weights[0] * res_add + 
+            weights[1] * res_mul + 
+            weights[2] * res_div + 
+            weights[3] * res_sub
+        )
         
         return torch.clamp(result, -100, 100)
     
@@ -373,7 +403,7 @@ class MetaAggregation(nn.Module):
             if isinstance(self.tau, torch.nn.Parameter):
                 self.tau.copy_(torch.tensor(tau))
             else:
-                self.tau = torch.tensor(tau)
+                self.tau = torch.tensor(tau, device=self.tau.device)
     
     def get_discrete_op(self, threshold: float = 0.2) -> str:
         tau = self.tau.item()
@@ -476,7 +506,7 @@ class MetaLog(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply safe logarithm."""
         base = torch.exp(self.log_base)
-        log_base_val = torch.log(base)
+        log_base_val = torch.log(base) + 1e-8  # Prevent division by zero
         
         # Safe log
         safe_x = torch.abs(x) + self.eps
