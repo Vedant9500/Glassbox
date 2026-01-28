@@ -184,6 +184,56 @@ class PostTrainingPruner:
             dead = sum(1 for s in self.sensitivity_scores.values() if s <= 0.01)
             print(f"\nSummary: {critical} critical, {important} important, {minor} minor, {dead} dead")
         
+        
+        return self.sensitivity_scores
+
+    def gradient_sensitivity_analysis(self, verbose: bool = True) -> Dict[str, float]:
+        """
+        Estimate importance using gradients (Taylor expansion approximation).
+        Importance ~ |grad * weight|
+        Much faster than ablation (O(1) backward pass vs O(N) forward passes).
+        """
+        if verbose:
+            print("\\n" + "="*60)
+            print("GRADIENT SENSITIVITY ANALYSIS")
+            print("="*60)
+            
+        self.model.train()
+        self.model.zero_grad()
+        
+        try:
+            pred, _ = self.model(self.x, hard=True)
+            loss = F.mse_loss(pred.squeeze(), self.y_sq)
+            loss.backward()
+        except Exception as e:
+            if verbose:
+                print(f"Gradient computation failed: {e}")
+            return {}
+            
+        self.sensitivity_scores = {}
+        
+        # Analyze nodes
+        if hasattr(self.model, 'layers'):
+            for layer_idx, layer in enumerate(self.model.layers):
+                for node_idx, node in enumerate(layer.nodes):
+                    if hasattr(node, 'output_proj'):
+                        w = node.output_proj.weight
+                        if w.grad is not None:
+                            # Importance = mean(|w * g|)
+                            importance = (w * w.grad).abs().mean().item()
+                            self.sensitivity_scores[f"L{layer_idx}_N{node_idx}"] = importance
+        
+        # Analyze output channels
+        if hasattr(self.model, 'output_proj'):
+            w = self.model.output_proj.weight
+            if w.grad is not None:
+                for i in range(w.shape[1]):
+                    importance = (w[0, i] * w.grad[0, i]).abs().item()
+                    self.sensitivity_scores[f"output_ch_{i}"] = importance
+
+        if verbose:
+             print(f"Computed sensitivity for {len(self.sensitivity_scores)} components via gradients.")
+             
         return self.sensitivity_scores
     
     # =========================================================================
@@ -459,8 +509,9 @@ class PostTrainingPruner:
                                 # This depends on the architecture
                                 weight = 1.0  # Default
                                 node_formulas[formula].append((layer_idx, node_idx, weight))
-                    except:
-                        pass
+                    except Exception as e:
+                        if verbose:
+                            print(f"Error reading formula: {e}")
         
         if verbose:
             print(f"Found {len(node_formulas)} unique formula patterns:")
@@ -486,6 +537,16 @@ class PostTrainingPruner:
                         if node_idx < len(layer.nodes):
                             node = layer.nodes[node_idx]
                             if hasattr(node, 'output_proj'):
+                                # Add weights to primary node before zeroing out
+                                primary_node_obj = self.model.layers[primary_layer].nodes[primary_node]
+                                if hasattr(primary_node_obj, 'output_proj'):
+                                    with torch.no_grad():
+                                        # Add weights
+                                        primary_node_obj.output_proj.weight.data.add_(node.output_proj.weight.data)
+                                        # Add bias if both exist
+                                        if primary_node_obj.output_proj.bias is not None and node.output_proj.bias is not None:
+                                            primary_node_obj.output_proj.bias.data.add_(node.output_proj.bias.data)
+                                
                                 with torch.no_grad():
                                     # Zero out duplicate
                                     node.output_proj.weight.data.zero_()
@@ -546,8 +607,8 @@ class PostTrainingPruner:
         total_pruned = 0
         
         for iteration in range(max_iterations):
-            # Fresh sensitivity analysis
-            self.sensitivity_analysis(verbose=False)
+            # Gradient-based sensitivity (O(1)) instead of ablation (O(N))
+            self.gradient_sensitivity_analysis(verbose=False)
             
             # Find least important node that's still above zero
             candidates = [(name, score) for name, score in self.sensitivity_scores.items()
