@@ -659,6 +659,7 @@ def refine_constants(
     use_lbfgs: bool = False,
     scales_only: bool = False,
     hard: bool = True,
+    refine_internal: bool = False, # NEW: Allow refining p, omega
 ) -> float:
     """
     Use gradient descent to optimize ONLY the constants.
@@ -673,6 +674,7 @@ def refine_constants(
         lr: Learning rate (for Adam)
         use_lbfgs: If True, use L-BFGS (better for symbolic regression constants)
         scales_only: If True, only tune output_scale and edge_weights (use after snap)
+        refine_internal: If True, ALSO tune p, omega, phi, etc. (use for final polish)
     """
     model.train()
     
@@ -689,9 +691,12 @@ def refine_constants(
                 if param.requires_grad:
                     constant_params.append(param)
         else:
-            # Skip meta-op core parameters (p, omega, phi, beta) - these are snapped
-            if any(x in name for x in ['.p', '.omega', '.phi', '.beta', 'amplitude']):
-                continue
+            # Check for meta-op core parameters
+            is_internal = any(x in name for x in ['.p', '.omega', '.phi', '.beta', 'amplitude'])
+            
+            if is_internal and not refine_internal:
+                continue # Skip internal if not requested
+                
             if param.requires_grad:
                 constant_params.append(param)
     
@@ -1136,6 +1141,7 @@ def finalize_model_coefficients(
     target_mse: float = 0.01,
     sparsity_threshold: float = 0.15,
     l1_weight: float = 0.01,
+    refine_internal_constants: bool = True,  # NEW: Enable internal constant refinement
 ) -> Tuple[float, str]:
     """
     ROBUST post-evolution coefficient finalization.
@@ -1150,6 +1156,7 @@ def finalize_model_coefficients(
         target_mse: Stop when MSE is below this
         sparsity_threshold: Prune coefficients below this ratio of max
         l1_weight: L1 regularization weight for sparsity
+        refine_internal_constants: If True, run L-BFGS on ALL parameters (p, omega) first
         
     Returns:
         (final_mse, formula_string)
@@ -1163,6 +1170,25 @@ def finalize_model_coefficients(
     with torch.no_grad():
         pred, _ = model(x, hard=True)
         initial_mse = F.mse_loss(pred.squeeze(), y_sq).item()
+    
+    # 0. Refine INTERNAL constants first (p, omega, etc.)
+    # This fixes problems like sin(3.5x) where 3.5 was missed
+    if refine_internal_constants:
+        print("Refining internal constants (frequencies, powers)...")
+        refine_constants(
+            model, x, y,
+            steps=50,  # Short burst of L-BFGS
+            use_lbfgs=True,
+            scales_only=False,
+            hard=True,  # Optimize the HARD discrete structure
+            refine_internal=True # Enable tuning of p, omega, etc.
+        )
+        
+        # Re-evaluate MSE
+        with torch.no_grad():
+            pred, _ = model(x, hard=True)
+            initial_mse = F.mse_loss(pred.squeeze(), y_sq).item()
+        print(f"MSE after internal refinement: {initial_mse:.6f}")
     
     # Just do L-BFGS refinement on output_proj WITH L1 SPARSITY
     output_params = [p for n, p in model.named_parameters() if 'output_proj' in n and p.requires_grad]
@@ -2024,6 +2050,19 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 print(f"Gen {gen:3d} | Best: {best_fit:.4f} | "
                       f"Mean: {mean_fit:.4f} | Diversity: {diversity} | "
                       f"Best Ever: {self.best_ever.fitness:.4f}{explorer_info}{rspg_info}{conf_info}")
+
+            # EARLY STOPPING CHECK
+            # If we have a very good solution and it's stable, stop early
+            if self.best_ever and self.best_ever.fitness < 1e-4:
+                # Require 3 generations of stability to confirm it's not a fluke
+                if hasattr(self, 'confidence_tracker') and self.confidence_tracker.generations_stable > 2:
+                    print(f"\nEARLY STOPPING: Reached target accuracy (MSE < 1e-4) at Gen {gen}")
+                    break
+            
+            # Stop if we are "Refining Only" and haven't improved for a long time
+            if hasattr(self, 'confidence_tracker') and self.confidence_tracker.should_refine_only() and self.confidence_tracker.generations_stable > 10:
+                 print(f"\nEARLY STOPPING: Converged (Structure Locked for 10+ gens) at Gen {gen}")
+                 break
             
             # Update visualization if available
             if self.visualizer is not None and self.best_ever is not None:

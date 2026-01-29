@@ -144,7 +144,7 @@ def test_sin_x2():
     
     if pre_final_mse > 5.0:  # Only finalize if MSE is bad
         print("\n--- FINALIZING COEFFICIENTS ---")
-        final_mse, final_formula = finalize_model_coefficients(model, x_train, y_train, l1_weight=0.001)
+        final_mse, final_formula = finalize_model_coefficients(model, x_train, y_train, l1_weight=0.001, refine_internal_constants=True)
         print(f"Final MSE after coefficient finalization: {final_mse:.6f}")
         print(f"Final formula: {final_formula}")
         

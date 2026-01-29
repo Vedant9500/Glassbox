@@ -49,7 +49,7 @@ def main_phased(lite_mode: bool = False):
     def make_model():
         return OperationDAG(
             n_inputs=1,
-            n_hidden_layers=1,   # Single layer for interpretability
+            n_hidden_layers=2,   # Single layer for interpretability
             nodes_per_layer=6,   # More nodes for diversity
             n_outputs=1,
             simplified_ops=True,  # Only power, periodic, arithmetic
@@ -61,7 +61,7 @@ def main_phased(lite_mode: bool = False):
     if lite_mode:
         print("Using LITE mode (faster, no network diagram)")
     visualizer = LiveTrainingVisualizer(
-        update_every=2,  # Update every 2 generations
+        update_every=1,  # Update every 2 generations
         figsize=(14, 8),
         lite_mode=lite_mode,
     )
@@ -75,10 +75,10 @@ def main_phased(lite_mode: bool = False):
     # Create trainer with visualizer for Phase 1
     trainer = EvolutionaryONNTrainer(
         model_factory=make_model,
-        population_size=20,
+        population_size=30,
         elite_size=4,
-        mutation_rate=0.4,
-        constant_refine_steps=30,
+        mutation_rate=0.5,
+        constant_refine_steps=50,
         complexity_penalty=0.01,
         device=device,
         lamarckian=True,
@@ -112,37 +112,40 @@ def main_phased(lite_mode: bool = False):
     print(f"Phase 1 MSE: {phase1_mse:.4f}")
     print("(Note: Coefficients may be off due to internal normalization)")
     
-    # Phase 2: Pure Basis Regression
+    # Phase 2: Coefficient Finalization (Hybrid Approach)
     print(f"\n{'='*70}")
-    print("PHASE 2: PURE BASIS REGRESSION")
+    print("PHASE 2: HYBRID COEFFICIENT REFINEMENT")
     print(f"{'='*70}")
-    print("Goal: Get EXACT coefficients using linear regression on pure basis functions")
+    print("Strategy: Compete two methods and pick the winner:")
+    print("  A. Gradient Refinement (good for internal constants like sin(3.5x))")
+    print("  B. Pure Basis Regression (good for standard functions like x^2)")
     print("-"*70)
     
-    # Identify which operations the model discovered by PARSING THE FORMULA
-    # This is much more reliable than checking internal model state
+    # --- Method A: Gradient Refinement ---
+    print("\n>>> Method A: Gradient Refinement (optimizing internal constants)...")
+    from glassbox.sr.evolution import finalize_model_coefficients
+    
+    # Create a copy for Method A to avoid disrupting Method B
+    import copy
+    model_a = copy.deepcopy(phase1_model)
+    
+    mse_a, formula_a = finalize_model_coefficients(
+        model_a, x, y, 
+        refine_internal_constants=True
+    )
+    print(f"Method A Result: MSE={mse_a:.6f}, Formula={formula_a}")
+    
+    # --- Method B: Pure Basis Regression ---
+    print("\n>>> Method B: Pure Basis Regression (standard functions)...")
+    
+    # Parse operations from the discovered formula
     formula_lower = phase1_formula.lower()
     discovered_ops = set()
+    if 'sin' in formula_lower or 'cos' in formula_lower: discovered_ops.add('periodic')
+    if '^2' in formula_lower or '^3' in formula_lower or '**' in formula_lower: discovered_ops.add('power')
+    if '*' in formula_lower and 'x' in formula_lower: discovered_ops.add('multiply')
     
-    # Check for periodic functions
-    if 'sin' in formula_lower or 'cos' in formula_lower:
-        discovered_ops.add('periodic')
-    
-    # Check for power functions (x^2, x^3, x0^2, etc.)
-    if '^2' in formula_lower or '^3' in formula_lower or '**' in formula_lower:
-        discovered_ops.add('power')
-    
-    # Check for multiplication (x*x, or explicit multiply)
-    if '*' in formula_lower and 'x' in formula_lower:
-        # Check if it's x*x pattern (not just coefficient*x)
-        import re
-        if re.search(r'x\d?\s*\*\s*x\d?', formula_lower):
-            discovered_ops.add('multiply')
-    
-    print(f"Discovered operations from formula: {discovered_ops}")
-    print(f"Phase 1 formula: {phase1_formula}")
-    
-    # Build pure basis functions based on discovered operations
+    # Build pure basis functions
     features = [x]
     feature_names = ['x']
     
@@ -158,43 +161,62 @@ def main_phased(lite_mode: bool = False):
         features.append(torch.cos(x))
         feature_names.append('cos(x)')
     
-    print(f"Pure basis functions: {feature_names}")
-    
-    # Stack features and solve least squares
+    # Solve least squares
     features_matrix = torch.cat(features, dim=1)
     n_samples = features_matrix.shape[0]
-    features_with_bias = torch.cat([
-        features_matrix,
-        torch.ones(n_samples, 1)
-    ], dim=1)
+    features_with_bias = torch.cat([features_matrix, torch.ones(n_samples, 1, device=x.device)], dim=1)
     
-    # Solve: y = X @ w
-    solution = torch.linalg.lstsq(features_with_bias, y)
-    weights = solution.solution.squeeze()
+    try:
+        solution = torch.linalg.lstsq(features_with_bias, y)
+        weights = solution.solution.squeeze()
+        
+        # Compute MSE
+        pred = features_with_bias @ weights
+        mse_b = torch.nn.functional.mse_loss(pred.squeeze(), y.squeeze()).item()
+        
+        # Build formula string for B
+        formula_parts = []
+        for name, w in zip(feature_names, weights[:-1]):
+            if abs(w.item()) > 0.01:
+                formula_parts.append(f"{w.item():.2f}*{name}")
+        if abs(weights[-1].item()) > 0.01:
+            formula_parts.append(f"{weights[-1].item():.2f}")
+        formula_b = " + ".join(formula_parts) if formula_parts else "0"
+        
+        print(f"Method B Result: MSE={mse_b:.6f}")
+        print(f"Method B Formula: {formula_b}")
+        
+    except Exception as e:
+        print(f"Method B failed: {e}")
+        mse_b = float('inf')
+        formula_b = "ERROR"
+        weights = None
+
+    # --- Pick Winner ---
+    print(f"\n{'-'*70}")
     
-    # Compute MSE
-    pred = features_with_bias @ weights
-    phase2_mse = torch.nn.functional.mse_loss(pred.squeeze(), y.squeeze()).item()
+    # Handle NaN - treat as infinity (failed method)
+    import math
+    if math.isnan(mse_a):
+        mse_a = float('inf')
+        print("Warning: Method A returned NaN, treating as failure")
+    if math.isnan(mse_b):
+        mse_b = float('inf')
+        print("Warning: Method B returned NaN, treating as failure")
     
-    print(f"\nOptimal coefficients (least squares):")
-    for name, w in zip(feature_names, weights[:-1]):
-        if abs(w.item()) > 0.01:
-            print(f"  {w.item():+.4f} * {name}")
-    print(f"  {weights[-1].item():+.4f} (bias)")
-    
-    # Build final formula string
-    formula_parts = []
-    for name, w in zip(feature_names, weights[:-1]):
-        w_val = w.item()
-        if abs(w_val) > 0.01:
-            formula_parts.append(f"{w_val:.2f}*{name}")
-    bias = weights[-1].item()
-    if abs(bias) > 0.01:
-        formula_parts.append(f"{bias:.2f}")
-    final_formula = " + ".join(formula_parts) if formula_parts else "0"
-    
-    print(f"\nPhase 2 MSE: {phase2_mse:.6f}")
-    print(f"Final formula: {final_formula}")
+    if mse_b < mse_a:
+        print(f"WINNER: Method B (Pure Basis) - MSE {mse_b:.6f} vs {mse_a:.6f}")
+        final_mse = mse_b
+        final_formula = formula_b
+        # Use simple weights for validation check
+        used_method_b = True
+    else:
+        print(f"WINNER: Method A (Gradient Refinement) - MSE {mse_a:.6f} vs {mse_b:.6f}")
+        final_mse = mse_a
+        final_formula = formula_a
+        # Use refined model for validation check
+        phase1_model = model_a # Update main model to refined version
+        used_method_b = False
     
     # Validation
     print(f"\n{'='*70}")
@@ -209,20 +231,21 @@ def main_phased(lite_mode: bool = False):
         y_true = PI * np.sin(x_val) + (x_val ** 2) / PI
         
         # Compute using discovered coefficients
-        # y = w1*x + w2*x² + w3*x³ + w4*sin(x) + w5*cos(x) + bias
-        y_pred = 0.0
-        for i, (name, w) in enumerate(zip(feature_names, weights[:-1])):
-            if name == 'x':
-                y_pred += w.item() * x_val
-            elif name == 'x²':
-                y_pred += w.item() * x_val**2
-            elif name == 'x³':
-                y_pred += w.item() * x_val**3
-            elif name == 'sin(x)':
-                y_pred += w.item() * np.sin(x_val)
-            elif name == 'cos(x)':
-                y_pred += w.item() * np.cos(x_val)
-        y_pred += weights[-1].item()  # bias
+        # Compute using discovered coefficients
+        if used_method_b:
+            # METHOD B: Use weights and basis functions explicitly
+            y_pred = 0.0
+            for i, (name, w) in enumerate(zip(feature_names, weights[:-1])):
+                if name == 'x': y_pred += w.item() * x_val
+                elif name == 'x²': y_pred += w.item() * x_val**2
+                elif name == 'x³': y_pred += w.item() * x_val**3
+                elif name == 'sin(x)': y_pred += w.item() * np.sin(x_val)
+                elif name == 'cos(x)': y_pred += w.item() * np.cos(x_val)
+            y_pred += weights[-1].item() # bias
+        else:
+            # METHOD A: Use model prediction
+            model_input = torch.tensor([[x_val]], device=device)
+            y_pred = phase1_model(model_input, hard=True)[0].item()
         
         error = abs(y_true - y_pred)
         print(f"{x_val:>6.1f} | {y_true:>10.4f} | {y_pred:>10.4f} | {error:>12.6f}")
@@ -234,17 +257,28 @@ def main_phased(lite_mode: bool = False):
     print(f"TARGET FORMULA:     π*sin(x) + x²/π")
     print(f"DISCOVERED FORMULA: {final_formula}")
     print(f"Phase 1 MSE:        {phase1_mse:.4f} (structure discovery)")
-    print(f"Phase 2 MSE:        {phase2_mse:.6f} (coefficient extraction)")
+    print(f"Phase 2 MSE:        {final_mse:.6f} (coefficient extraction)")
     
     # Check if we found the right operations with approximately correct coefficients
     # Expected: sin coefficient ≈ π (3.14159), x² coefficient ≈ 1/π (0.31831)
     sin_coef = None
     square_coef = None
-    for name, w in zip(feature_names, weights[:-1]):
-        if 'sin' in name:
-            sin_coef = w.item()
-        elif '²' in name:
-            square_coef = w.item()
+    # Check if we found the right operations with approximately correct coefficients
+    # Expected: sin coefficient ≈ π (3.14159), x² coefficient ≈ 1/π (0.31831)
+    # We parse the string to find coefficients
+    import re
+    sin_coef = None
+    square_coef = None
+    
+    # Look for "3.14*sin"
+    sin_match = re.search(r'([\d\.-]+)\s*\*\s*sin', final_formula)
+    if sin_match:
+        sin_coef = float(sin_match.group(1))
+        
+    # Look for "0.32*x0^2" or similar
+    sq_match = re.search(r'([\d\.-]+)\s*\*\s*x\d?\^2', final_formula)
+    if sq_match:
+        square_coef = float(sq_match.group(1))
     
     has_sin = sin_coef is not None and abs(sin_coef) > 0.5
     has_square = square_coef is not None and abs(square_coef) > 0.1
@@ -318,9 +352,9 @@ def main_simple(lite_mode: bool = False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
     
-    print("\nTarget function: y = x²")
-    x = torch.linspace(-3, 3, 100).reshape(-1, 1)
-    y = x.pow(2)
+    print("\nTarget function: y = 2.5 * sin(3.2 * x) + 5")
+    x = torch.linspace(-5, 5, 100).reshape(-1, 1)
+    y = 2.5 * torch.sin(3.2 * x) + 5.0
     
     def make_model():
         return OperationDAG(
@@ -356,7 +390,7 @@ def main_simple(lite_mode: bool = False):
     print("\nStarting evolution with visualization...")
     print("-"*60)
     
-    results = trainer.train(x, y, generations=30, print_every=5)
+    results = trainer.train(x, y, generations=50, print_every=5)
     
     print("\n" + "="*60)
     print("TRAINING COMPLETE")
@@ -367,6 +401,76 @@ def main_simple(lite_mode: bool = False):
     
     if hasattr(best_model, 'get_formula'):
         print(f"Discovered formula: {best_model.get_formula()}")
+
+    # --- Phase 2: Hybrid Coefficient Finalization ---
+    print(f"\n{'='*60}")
+    print("PHASE 2: HYBRID COEFFICIENT REFINEMENT")
+    print(f"{'='*60}")
+    
+    # 1. Gradient Refinement
+    print("\n>>> Method A: Gradient Refinement...")
+    from glassbox.sr.evolution import finalize_model_coefficients
+    import copy
+    
+    model_a = copy.deepcopy(best_model)
+    mse_a, formula_a = finalize_model_coefficients(
+        model_a, x, y,
+        refine_internal_constants=True
+    )
+    print(f"Method A Result: MSE={mse_a:.6f}, Formula={formula_a}")
+    
+    # 2. Pure Basis Regression
+    print("\n>>> Method B: Pure Basis Regression...")
+    formula_lower = results['formula'].lower()
+    discovered_ops = set()
+    if 'sin' in formula_lower or 'cos' in formula_lower: discovered_ops.add('periodic')
+    if '^2' in formula_lower or '^3' in formula_lower or '**' in formula_lower: discovered_ops.add('power')
+    if '*' in formula_lower and 'x' in formula_lower: discovered_ops.add('multiply')
+    
+    features = [x]
+    feature_names = ['x']
+    if 'power' in discovered_ops:
+        features.append(x**2)
+        feature_names.append('x²')
+        features.append(x**3)
+        feature_names.append('x³')
+    if 'periodic' in discovered_ops:
+        features.append(torch.sin(x))
+        feature_names.append('sin(x)')
+        features.append(torch.cos(x))
+        feature_names.append('cos(x)')
+        
+    features_matrix = torch.cat(features, dim=1)
+    features_with_bias = torch.cat([features_matrix, torch.ones(features_matrix.shape[0], 1, device=x.device)], dim=1)
+    
+    try:
+        sol = torch.linalg.lstsq(features_with_bias, y)
+        w = sol.solution.squeeze()
+        pred_b = features_with_bias @ w
+        # Squeeze y to match pred_b if necessary (pred_b is [N, 1] or [N])
+        mse_b = torch.nn.functional.mse_loss(pred_b.squeeze(), y.squeeze()).item()
+        
+        # Build formula string for B
+        formula_parts = []
+        for name, weight in zip(feature_names, w):
+            if abs(weight.item()) > 0.01:
+                formula_parts.append(f"{weight.item():.2f}*{name}")
+        
+        # Check if list is empty (all weights ~0)
+        formula_b = " + ".join(formula_parts) if formula_parts else "0 (all weights ~0)"
+        
+        print(f"Method B Result: MSE={mse_b:.6f}")
+        print(f"Method B Formula: {formula_b}")
+    except Exception as e:
+        print(f"Method B failed: {e}")
+        mse_b = float('inf')
+    
+    # Pick winner
+    print(f"\n{'-'*60}")
+    if mse_b < mse_a:
+        print(f"WINNER: Method B (Pure Basis) - MSE {mse_b:.6f}")
+    else:
+        print(f"WINNER: Method A (Gradient Refinement) - MSE {mse_a:.6f}")
     
     print("\nVisualization window will stay open. Close it to exit.")
     import matplotlib.pyplot as plt
