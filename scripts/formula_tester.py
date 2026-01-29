@@ -102,7 +102,7 @@ class FormulaTester:
         self.n_samples = n_samples
         self.explorer_fraction = explorer_fraction
         self.mutation_rate = mutation_rate
-        self.use_simplified_ops = False  # Set to False for formulas with exp/log
+        self.use_simplified_ops = True  # Set to False for formulas with exp/log
         
         self.phase1_model = None
         self.phase1_formula = ""

@@ -99,6 +99,112 @@ def set_model_tau(model: nn.Module, tau: float):
             module.tau = tau
 
 
+def detect_dominant_frequency(
+    x: torch.Tensor, 
+    y: torch.Tensor,
+    n_frequencies: int = 3,
+) -> List[float]:
+    """
+    Use FFT to detect dominant frequencies in the target data.
+    
+    This helps seed omega values for individuals, enabling faster
+    discovery of formulas like sin(3.2*x).
+    
+    Args:
+        x: Input tensor (N,) or (N, 1)
+        y: Target tensor (N,) or (N, 1)
+        n_frequencies: Number of top frequencies to return
+        
+    Returns:
+        List of detected omega values (angular frequencies)
+    """
+    try:
+        x_np = x.squeeze().cpu().numpy()
+        y_np = y.squeeze().cpu().numpy()
+        
+        # Sort by x for proper FFT analysis
+        sort_idx = np.argsort(x_np)
+        x_sorted = x_np[sort_idx]
+        y_sorted = y_np[sort_idx]
+        
+        # Remove DC offset (mean)
+        y_centered = y_sorted - np.mean(y_sorted)
+        
+        # Compute FFT
+        n_samples = len(y_centered)
+        fft_result = np.fft.rfft(y_centered)
+        
+        # Get frequencies (assume uniform spacing based on x range)
+        x_min, x_max = x_sorted.min(), x_sorted.max()
+        x_range = x_max - x_min
+        if x_range < 1e-6:
+            return [1.0]  # Default fallback
+            
+        # Sample spacing estimate
+        dx = x_range / (n_samples - 1)
+        freqs = np.fft.rfftfreq(n_samples, dx)
+        
+        # Get magnitudes (skip DC component at index 0)
+        magnitudes = np.abs(fft_result[1:])
+        freqs = freqs[1:]
+        
+        if len(magnitudes) == 0:
+            return [1.0]
+        
+        # Find top N frequency peaks
+        top_indices = np.argsort(magnitudes)[-n_frequencies:][::-1]
+        
+        # Convert frequencies to angular frequencies (omega = 2π*f)
+        detected_omegas = []
+        for idx in top_indices:
+            if idx < len(freqs):
+                freq = freqs[idx]
+                omega = 2 * np.pi * freq
+                # Only accept reasonable omega values
+                if 0.3 < omega < 10.0:
+                    detected_omegas.append(float(omega))
+        
+        # Ensure we return at least one value
+        if not detected_omegas:
+            detected_omegas = [1.0]
+            
+        return detected_omegas
+        
+    except Exception as e:
+        logger.debug(f"FFT frequency detection failed: {e}")
+        return [1.0]  # Safe fallback
+
+
+def seed_omega_from_fft(
+    model: nn.Module,
+    detected_omegas: List[float],
+    individual_idx: int = 0,
+):
+    """
+    Seed omega parameters in a model with FFT-detected frequencies.
+    
+    Different individuals get different detected frequencies for diversity.
+    
+    Args:
+        model: The model to seed
+        detected_omegas: List of detected omega values from FFT
+        individual_idx: Which individual this is (for diversity)
+    """
+    if not detected_omegas:
+        return
+        
+    # Pick which omega to use based on individual index
+    omega_to_use = detected_omegas[individual_idx % len(detected_omegas)]
+    
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if 'omega' in name:
+                # 75% chance to use detected frequency (aggressive seeding)
+                if random.random() < 0.75:
+                    param.fill_(omega_to_use)
+                # Otherwise keep the random initialization
+
+
 def anneal_tau(generation: int, total_generations: int, 
                tau_start: float = 1.0, tau_end: float = 0.2) -> float:
     """
@@ -463,8 +569,8 @@ def random_operation_init(model: nn.Module, bias_strength: float = 2.0):
                 # Random power: 0.5 to 3.0
                 param.fill_(random.uniform(0.5, 3.0))
             elif 'omega' in name:
-                # Random frequency: 0.5 to 2.0
-                param.fill_(random.uniform(0.5, 2.0))
+                # Random frequency: 0.3 to 6.0 (wide range for frequency discovery)
+                param.fill_(random.uniform(0.3, 6.0))
             elif 'beta' in name and 'selector' not in name:
                 # Random arithmetic blend
                 param.fill_(random.uniform(0.5, 2.5))
@@ -508,9 +614,14 @@ def mutate_operations(individual: Individual, mutation_rate: float = 0.3) -> Ind
                         param.clamp_(0.1, 4.0)
                 
                 elif 'omega' in name:
-                    # Mutate frequency
-                    param.mul_(random.uniform(0.8, 1.2))
-                    param.clamp_(0.1, 5.0)
+                    # Mutate frequency - discrete jumps or continuous perturbation
+                    if random.random() < 0.3:
+                        # Discrete jump to common frequencies (expanded list)
+                        param.fill_(random.choice([0.5, 1.0, 2.0, math.pi, 3.0, 3.5, 4.0, 5.0, 6.0]))
+                    else:
+                        # Continuous perturbation with wider range
+                        param.add_(random.uniform(-0.8, 0.8))
+                        param.clamp_(0.1, 8.0)
                 
                 elif 'R' in name:
                     # Mutate routing
@@ -757,6 +868,80 @@ def refine_constants(
         logger.debug(f"refine_constants failed: {e}")
         return float('inf')
     
+    return best_loss
+
+
+def quick_refine_internal(
+    model: nn.Module,
+    x: torch.Tensor,
+    y: torch.Tensor,
+    steps: int = 5,
+) -> float:
+    """
+    Quick L-BFGS refinement on INTERNAL constants only (omega, phi, p).
+    
+    This is a lightweight version of refine_constants() designed for
+    per-candidate optimization during evolutionary fitness evaluation.
+    
+    Key differences from refine_constants():
+    - Only optimizes internal parameters (omega, phi, p, amplitude)
+    - Does NOT optimize output_proj, edge_weights, or output_scale
+    - Uses fewer steps (default 5) for speed
+    - Always uses L-BFGS
+    
+    Args:
+        model: The model to refine
+        x: Input data
+        y: Target data (should match x shape expectations)
+        steps: Number of L-BFGS iterations (keep low for speed)
+        
+    Returns:
+        Best MSE achieved (float('inf') on failure)
+    """
+    model.train()
+    
+    # Collect ONLY internal constant parameters
+    internal_params = []
+    for name, param in model.named_parameters():
+        # Skip selection logits
+        if 'logit' in name or 'selector' in name:
+            continue
+        
+        # Only include internal meta-op parameters
+        is_internal = any(x in name for x in ['.p', '.omega', '.phi', 'amplitude'])
+        
+        if is_internal and param.requires_grad:
+            internal_params.append(param)
+    
+    if not internal_params:
+        # No internal params to optimize
+        return float('inf')
+    
+    best_loss = float('inf')
+    y_squeezed = y.squeeze()
+    
+    try:
+        optimizer = LBFGS(internal_params, lr=1.0, max_iter=steps, line_search_fn='strong_wolfe')
+        
+        def closure():
+            nonlocal best_loss
+            optimizer.zero_grad()
+            pred, _ = model(x, hard=True)
+            pred = pred.squeeze()
+            loss = F.mse_loss(pred, y_squeezed)
+            if torch.isnan(loss) or torch.isinf(loss):
+                return torch.tensor(float('inf'), requires_grad=True, device=x.device)
+            loss.backward()
+            best_loss = min(best_loss, loss.item())
+            return loss
+        
+        optimizer.step(closure)
+        
+    except Exception as e:
+        logger.debug(f"quick_refine_internal failed: {e}")
+        return float('inf')
+    
+    model.eval()
     return best_loss
 
 
@@ -1249,6 +1434,10 @@ def finalize_model_coefficients(
         pred, _ = model(x, hard=True)
         final_mse = F.mse_loss(pred.squeeze(), y_sq).item()
     
+    # Safeguard: never return NaN - it breaks comparisons
+    if math.isnan(final_mse) or math.isinf(final_mse):
+        final_mse = float('inf')
+    
     formula = model.get_formula() if hasattr(model, 'get_formula') else "?"
     
     return final_mse, formula
@@ -1528,6 +1717,10 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         risk_seeking_percentile: float = 0.1,  # Top 10% fitness
         # NEW: Visualization
         visualizer: Optional[Any] = None,  # LiveTrainingVisualizer instance
+        # NEW: Nested BFGS for internal constants (omega, phi, p)
+        nested_bfgs: bool = True,           # Enable per-candidate internal refinement
+        nested_bfgs_steps: int = 5,         # L-BFGS iterations per candidate
+        nested_bfgs_every: int = 1,         # Refine every N generations
     ):
         self.model_factory = model_factory
         self.population_size = population_size
@@ -1584,6 +1777,11 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         
         # NEW: Visualization
         self.visualizer = visualizer
+        
+        # NEW: Nested BFGS for internal constants
+        self.nested_bfgs = nested_bfgs
+        self.nested_bfgs_steps = nested_bfgs_steps
+        self.nested_bfgs_every = nested_bfgs_every
         
         # NEW: Graduated structure confidence tracker (replaces binary lock)
         self.confidence_tracker = StructureConfidenceTracker(
@@ -1655,6 +1853,17 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         all_individuals = self.population + (self.explorers if self.use_explorers else [])
         
         for ind in all_individuals:
+            # NESTED BFGS: Refine internal constants (omega, phi, p) before evaluation
+            # This enables discovering formulas like sin(3.2*x) or x^2.5
+            if self.nested_bfgs and generation % self.nested_bfgs_every == 0:
+                # Only refine if not already refined this generation
+                if not getattr(ind, '_refined_this_gen', False):
+                    # Need y with proper shape for quick_refine_internal
+                    y_for_refine = y.unsqueeze(-1) if y.dim() == 1 else y
+                    quick_refine_internal(ind.model, x, y_for_refine, 
+                                         steps=self.nested_bfgs_steps)
+                    ind._refined_this_gen = True
+            
             ind.model.eval()
             try:
                 with torch.no_grad():
@@ -1936,6 +2145,17 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         # Initialize
         self.initialize_population()
         
+        # FFT-based frequency detection for omega seeding
+        detected_omegas = detect_dominant_frequency(x, y, n_frequencies=3)
+        if detected_omegas and detected_omegas[0] != 1.0:
+            print(f"FFT detected frequencies (omega): {[f'{o:.2f}' for o in detected_omegas]}")
+            # Seed some individuals with detected frequencies
+            for i, ind in enumerate(self.population):
+                seed_omega_from_fft(ind.model, detected_omegas, individual_idx=i)
+            if self.use_explorers:
+                for i, explorer in enumerate(self.explorers):
+                    seed_omega_from_fft(explorer.model, detected_omegas, individual_idx=i)
+        
         # Initial constant refinement for main population
         print("Refining initial constants...")
         for ind in self.population:
@@ -1969,6 +2189,15 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 explorer_tau = max(current_tau, MIN_EXPLORER_TAU)  # Explorers never go below min
                 for explorer in self.explorers:
                     set_model_tau(explorer.model, explorer_tau)
+            
+            # Reset nested BFGS refinement flags for all individuals
+            # This ensures each individual is refined once per generation
+            if self.nested_bfgs:
+                for ind in self.population:
+                    ind._refined_this_gen = False
+                if self.use_explorers:
+                    for explorer in self.explorers:
+                        explorer._refined_this_gen = False
             
             # Evaluate with annealed entropy weight (pass generation info)
             self.evaluate_fitness(fit_x, fit_y, generation=gen, total_generations=generations)
@@ -2052,16 +2281,23 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                       f"Best Ever: {self.best_ever.fitness:.4f}{explorer_info}{rspg_info}{conf_info}")
 
             # EARLY STOPPING CHECK
-            # If we have a very good solution and it's stable, stop early
-            if self.best_ever and self.best_ever.fitness < 1e-4:
-                # Require 3 generations of stability to confirm it's not a fluke
+            # Phase 1 doesn't need perfect MSE - Phase 2 refinement will fix coefficients
+            # Stop if we have a good structure (high correlation) and stable MSE
+            if self.best_ever and self.best_ever.fitness < 0.01:
+                # MSE below 0.01 is good enough for Phase 1
                 if hasattr(self, 'confidence_tracker') and self.confidence_tracker.generations_stable > 2:
-                    print(f"\nEARLY STOPPING: Reached target accuracy (MSE < 1e-4) at Gen {gen}")
+                    print(f"\nEARLY STOPPING: Reached target accuracy (MSE < 0.01) at Gen {gen}")
+                    break
+            
+            # Also stop if correlation is very high (structure is correct, coefficients need polish)
+            if hasattr(self, 'confidence_tracker') and self.confidence_tracker.confidence > 0.95:
+                if self.confidence_tracker.generations_stable > 5:
+                    print(f"\nEARLY STOPPING: High confidence structure found at Gen {gen}")
                     break
             
             # Stop if we are "Refining Only" and haven't improved for a long time
-            if hasattr(self, 'confidence_tracker') and self.confidence_tracker.should_refine_only() and self.confidence_tracker.generations_stable > 10:
-                 print(f"\nEARLY STOPPING: Converged (Structure Locked for 10+ gens) at Gen {gen}")
+            if hasattr(self, 'confidence_tracker') and self.confidence_tracker.should_refine_only() and self.confidence_tracker.generations_stable > 8:
+                 print(f"\nEARLY STOPPING: Converged (Structure Locked for 8+ gens) at Gen {gen}")
                  break
             
             # Update visualization if available

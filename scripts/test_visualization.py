@@ -97,8 +97,8 @@ def main_phased(lite_mode: bool = False):
     
     results = trainer.train(
         x, y,
-        generations=80,  # Increased from 40 for better structure discovery
-        print_every=10,
+        generations=40,  # Increased from 40 for better structure discovery
+        print_every=5,
     )
     
     phase1_model = results['model']
@@ -353,7 +353,7 @@ def main_simple(lite_mode: bool = False):
     print(f"Device: {device}")
     
     print("\nTarget function: y = 2.5 * sin(3.2 * x) + 5")
-    x = torch.linspace(-5, 5, 100).reshape(-1, 1)
+    x = torch.linspace(-15, 15, 600).reshape(-1, 1)  # Wider range for FFT detection
     y = 2.5 * torch.sin(3.2 * x) + 5.0
     
     def make_model():
@@ -465,8 +465,16 @@ def main_simple(lite_mode: bool = False):
         print(f"Method B failed: {e}")
         mse_b = float('inf')
     
-    # Pick winner
+    # Pick winner - handle NaN
     print(f"\n{'-'*60}")
+    import math
+    if math.isnan(mse_a):
+        mse_a = float('inf')
+        print("Warning: Method A returned NaN, treating as failure")
+    if math.isnan(mse_b):
+        mse_b = float('inf')
+        print("Warning: Method B returned NaN, treating as failure")
+        
     if mse_b < mse_a:
         print(f"WINNER: Method B (Pure Basis) - MSE {mse_b:.6f}")
     else:

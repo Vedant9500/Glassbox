@@ -228,16 +228,31 @@ class OperationDAG(nn.Module):
                             new_expr = f"pow({src1_expr})"
                             
                 elif 'periodic:' in op_lower:
-                    if 'sin' in op_lower and '-sin' not in op_lower:
-                        new_expr = f"sin({src1_expr})"
-                    elif 'cos' in op_lower and '-cos' not in op_lower:
-                        new_expr = f"cos({src1_expr})"
-                    elif '-sin' in op_lower:
-                        new_expr = f"-sin({src1_expr})"
-                    elif '-cos' in op_lower:
-                        new_expr = f"-cos({src1_expr})"
+                    # Extract omega if present (format: "ω=3.20")
+                    import re
+                    omega_match = re.search(r'ω=([0-9.-]+)', op_str)
+                    omega_val = float(omega_match.group(1)) if omega_match else 1.0
+                    
+                    # Check if omega is non-standard (not close to 1.0)
+                    omega_is_standard = abs(omega_val - 1.0) < 0.15
+                    
+                    # Build the inner expression with omega multiplier if needed
+                    if omega_is_standard:
+                        inner_expr = src1_expr
                     else:
-                        new_expr = f"periodic({src1_expr})"
+                        inner_expr = f"{omega_val:.1f}*{src1_expr}"
+                    
+                    if 'sin' in op_lower and '-sin' not in op_lower:
+                        new_expr = f"sin({inner_expr})"
+                    elif 'cos' in op_lower and '-cos' not in op_lower:
+                        new_expr = f"cos({inner_expr})"
+                    elif '-sin' in op_lower:
+                        new_expr = f"-sin({inner_expr})"
+                    elif '-cos' in op_lower:
+                        new_expr = f"-cos({inner_expr})"
+                    else:
+                        # Non-standard omega/phi combination
+                        new_expr = f"sin({inner_expr})"
                         
                 elif 'exp:' in op_lower:
                     if 'constant' in op_lower:
