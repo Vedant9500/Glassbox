@@ -115,9 +115,11 @@ The Hard Concrete distribution (also known as the Rectified Gumbel-Softmax) is a
 
 Standard Gumbel-Softmax samples values in the open interval $(0, 1)$; it never produces exact zeros or ones. The Hard Concrete distribution stretches the underlying Gumbel distribution to the interval $(-\beta, 1+\beta)$ (where $\beta > 0$) and then clips samples to
 
-$$via a hard sigmoid:$$
+via a hard sigmoid:
 
-z = \text{clip}\left( \text{Sigmoid}(\log \alpha + \text{Gumbel}) \cdot (1 + 2\beta) - \beta, 0, 1 \right) $$
+$$
+z = \text{clip}\left( \text{Sigmoid}(\log \alpha + \text{Gumbel}) \cdot (1 + 2\beta) - \beta, 0, 1 \right)
+$$
 
 Why this helps: This allows the network to assign exact zero probability to certain operations during the forward pass. This means the network actually experiences the discrete removal of operations during training, rather than just attenuating them. This closes the gap between training (soft) and inference (hard).
 
