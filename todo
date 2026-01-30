@@ -1,18 +1,3 @@
-if it finds the formula then remove the weights and test it with the data
+for optimization if the population that didnt mutate but just are back proping keep them in chache and reuse them
 edges has activation constant like a attention mechanism 
 a map of operators 
-
-DONE:
-[x] Real-time visualization for ONN evolution
-    - Network architecture diagram showing operations
-    - Training progress curves (MSE over generations)
-    - Formula display with metrics (MSE, correlation)
-    - Prediction vs target scatter plot
-    - Dark mode theme (green on black like matrix)
-    - LiveTrainingVisualizer for easy integration
-    
-[x] Coefficient accuracy - finalize_coefficients() fuses BatchNorm into output weights
-[x] Sparsity - L1 penalty during finalization + aggressive pruning
-[x] Post-evolution coefficient refinement - L-BFGS with proper BatchNorm handling
-    
-TODO:
