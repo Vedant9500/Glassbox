@@ -89,9 +89,9 @@ class Config:
         self.risk_seeking_percentile: float = 0.1
         
         # Data Generation
-        self.x_min: float = -15.0
-        self.x_max: float = 15.0
-        self.n_samples: int = 600
+        self.x_min: float = -10.0
+        self.x_max: float = 10.0
+        self.n_samples: int = 300
         self.noise_std: float = 0.0
         
         # Other

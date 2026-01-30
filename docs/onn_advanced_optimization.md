@@ -12,21 +12,21 @@ The synthesis of these insights suggests that overcoming the performance ceiling
 
 ## 2\. The Discretization Gap and Entropy Collapse in Differentiable Search
 
-The prevailing paradigm for discovering optimal ONN architectures has been Differentiable Architecture Search (DARTS). By relaxing the discrete search space into a continuous one, DARTS allows the use of standard gradient descent to optimize architecture parameters ($\\alpha$) alongside model weights ($w$). While theoretically elegant, this relaxation introduces a severe misalignment between the training objective and the inference constraint, leading to the Discretization Gap.
+The prevailing paradigm for discovering optimal ONN architectures has been Differentiable Architecture Search (DARTS). By relaxing the discrete search space into a continuous one, DARTS allows the use of standard gradient descent to optimize architecture parameters ($\alpha$) alongside model weights ($w$). While theoretically elegant, this relaxation introduces a severe misalignment between the training objective and the inference constraint, leading to the Discretization Gap.
 
 ### 2.1 The Mechanics of the Discretization Gap
 
 In a typical ONN supernet, the output of a specific edge is computed as a weighted sum of all candidate operations (e.g., add, multiply, sine, identity). This is formally expressed as a Softmax-weighted mixture:
 
-$$\\bar{o}^{(i,j)}(x) = \\sum\_{o \\in \\mathcal{O}} \\frac{\\exp(\\alpha\_o^{(i,j)})}{\\sum\_{o' \\in \\mathcal{O}} \\exp(\\alpha\_{o'}^{(i,j)})} o(x)$$
+$$\bar{o}^{(i,j)}(x) = \sum_{o \in \mathcal{O}} \frac{\exp(\alpha_o^{(i,j)})}{\sum_{o' \in \mathcal{O}} \exp(\alpha_{o'}^{(i,j)})} o(x)$$
 
-During the search phase, the network learns to utilize this ensemble. A convolution operation might extract features, while a parallel skip connection preserves high-frequency information and gradient magnitude. The weights $w$ are optimized under the assumption that _both_ paths exist. However, at the conclusion of the search, the architecture must be discretized. The standard approach is to apply an argmax to the architecture parameters $\\alpha$, retaining only the single operation with the highest weight and discarding the rest.
+During the search phase, the network learns to utilize this ensemble. A convolution operation might extract features, while a parallel skip connection preserves high-frequency information and gradient magnitude. The weights $w$ are optimized under the assumption that _both_ paths exist. However, at the conclusion of the search, the architecture must be discretized. The standard approach is to apply an argmax to the architecture parameters $\alpha$, retaining only the single operation with the highest weight and discarding the rest.
 
 This projection from the continuous simplex to a one-hot vector is the source of the Discretization Gap. The removal of the "cooperative" operations creates a shock to the system. The weights $w$ of the retained operation were trained in the presence of the discarded operations and often rely on them for error correction or feature augmentation. Consequently, the performance of the discrete architecture drops precipitously compared to the continuous supernet. This gap is not merely a loss of accuracy; it fundamentally hinders real-world deployment, as the ranking of architectures in the continuous space correlates poorly with their ranking in the discrete space. The optimization trajectory effectively hallucinates a solution that cannot exist under the constraints of the final hardware or symbolic requirement.
 
 ### 2.2 Entropy Collapse: The "Unfair Advantage" Pathology
 
-Compounding the discretization gap is the phenomenon of Entropy Collapse. Ideally, the distribution of $\\alpha$ values would remain high-entropy (uncertain) during the early exploration phase and gradually sharpen as the network gathers evidence. In practice, DARTS suffers from a premature collapse where the distribution spikes towards specific operations long before the model weights $w$ have converged.
+Compounding the discretization gap is the phenomenon of Entropy Collapse. Ideally, the distribution of $\alpha$ values would remain high-entropy (uncertain) during the early exploration phase and gradually sharpen as the network gathers evidence. In practice, DARTS suffers from a premature collapse where the distribution spikes towards specific operations long before the model weights $w$ have converged.
 
 #### 2.2.1 The Hegemony of Skip Connections
 
@@ -34,11 +34,11 @@ The most common manifestation of entropy collapse in image-based or recurrent ta
 
 When the supernet is initialized, parameterized operations like convolutions or arithmetic layers (e.g., Linear, Conv2d, NALU) have random weights. They produce noise and obscure the gradient signal, especially in deep networks. Skip connections, being parameter-free, provide a direct path for gradient backpropagation, resembling the mechanics of ResNets. In the early epochs, the path of least resistance for minimizing the loss is simply to forward the input directly to the output.
 
-The Softmax function used in standard DARTS enforces an "Exclusive Competition." Because the sum of weights must equal 1, increasing the architecture weight $\\alpha\_{skip}$ for the skip connection mathematically _requires_ decreasing the weights for all other operations.
+The Softmax function used in standard DARTS enforces an "Exclusive Competition." Because the sum of weights must equal 1, increasing the architecture weight $\alpha_{skip}$ for the skip connection mathematically _requires_ decreasing the weights for all other operations.
 
-$$\\frac{\\partial \\mathcal{L}}{\\partial \\alpha\_{conv}} \\approx \\text{negative, because } \\alpha\_{skip} \\text{ is increasing}$$
+$$\frac{\partial \mathcal{L}}{\partial \alpha_{conv}} \approx \text{negative, because } \alpha_{skip} \text{ is increasing}$$
 
-This creates a "Rich-Get-Richer" feedback loop. The optimizer increases $\\alpha\_{skip}$ to improve gradient flow; this suppresses $\\alpha\_{conv}$; the convolution layer receives smaller gradient updates because its weight in the weighted sum is reduced; the convolution fails to learn useful features; the model relies even more on the skip connection. The system collapses into a monopoly state where the final architecture is a degenerate, shallow network composed almost entirely of identity mappings. This collapse is a primary driver of the "Performance Ceiling," as the network effectively prunes away its own capacity to learn complex operators.
+This creates a "Rich-Get-Richer" feedback loop. The optimizer increases $\alpha_{skip}$ to improve gradient flow; this suppresses $\alpha_{conv}$; the convolution layer receives smaller gradient updates because its weight in the weighted sum is reduced; the convolution fails to learn useful features; the model relies even more on the skip connection. The system collapses into a monopoly state where the final architecture is a degenerate, shallow network composed almost entirely of identity mappings. This collapse is a primary driver of the "Performance Ceiling," as the network effectively prunes away its own capacity to learn complex operators.
 
 ### 2.3 Architectural Remedies: From Exclusive to Collaborative Competition
 
@@ -46,31 +46,31 @@ To break the performance ceiling, we must structurally alter the competition dyn
 
 #### 2.3.1 FairDARTS and the Sigmoid Relaxation
 
-The FairDARTS framework proposes replacing the Softmax activation with a Sigmoid activation, transitioning from exclusive to **Collaborative Competition**. In this regime, the weight of an operation is defined as $\\sigma(\\alpha\_o)$, where $\\sigma$ is the logistic sigmoid function.
+The FairDARTS framework proposes replacing the Softmax activation with a Sigmoid activation, transitioning from exclusive to **Collaborative Competition**. In this regime, the weight of an operation is defined as $\sigma(\alpha_o)$, where $\sigma$ is the logistic sigmoid function.
 
-$$\\sigma(\\alpha) = \\frac{1}{1 + e^{-\\alpha}}$$
+$$\sigma(\alpha) = \frac{1}{1 + e^{-\alpha}}$$
 
 Crucially, this allows multiple operations to be active simultaneously without suppressing one another. If the skip connection is useful, its weight can approach 1. If the convolution becomes useful later in training, its weight can _also_ approach 1. This breaks the zero-sum game that leads to the monopoly of skip connections. The "unfair advantage" is neutralized because the success of the identity path does not structurally penalize the learning rate of the parameterized path.
 
-#### 2.3.2 The Zero-One Loss ($L\_{0-1}$)
+#### 2.3.2 The Zero-One Loss ($L_{0-1}$)
 
-While Sigmoid allows collaborative learning, it does not inherently solve the discretization gap; in fact, it might exacerbate it by allowing the network to use _all_ operations, making the final pruning even more destructive. To counter this, FairDARTS introduces a **Zero-One Loss** term ($L\_{0-1}$) designed to force the continuous weights towards the binary extremes of 0 and 1.
+While Sigmoid allows collaborative learning, it does not inherently solve the discretization gap; in fact, it might exacerbate it by allowing the network to use _all_ operations, making the final pruning even more destructive. To counter this, FairDARTS introduces a **Zero-One Loss** term ($L_{0-1}$) designed to force the continuous weights towards the binary extremes of 0 and 1.
 
-$$L\_{0-1} = -\\frac{1}{N} \\sum (\\sigma(\\alpha) - 0.5)^2$$
+$$L_{0-1} = -\frac{1}{N} \sum (\sigma(\alpha) - 0.5)^2$$
 
 _or effectively minimizing the distance to the nearest integer._
 
-This auxiliary loss acts as a differentiable pressure towards discreteness. By penalizing values in the ambiguous range (e.g., 0.3 to 0.7), it ensures that by the end of the search, the network has naturally discretized itself. A sensitivity weight of $w\_{0-1} \\approx 10$ has been empirically found to balance the primary task loss and the discretization objective. This "soft" discretization allows the weights $w$ to adapt to the sparse structure gradually, rather than suffering a sudden shock at the end.
+This auxiliary loss acts as a differentiable pressure towards discreteness. By penalizing values in the ambiguous range (e.g., 0.3 to 0.7), it ensures that by the end of the search, the network has naturally discretized itself. A sensitivity weight of $w_{0-1} \approx 10$ has been empirically found to balance the primary task loss and the discretization objective. This "soft" discretization allows the weights $w$ to adapt to the sparse structure gradually, rather than suffering a sudden shock at the end.
 
 #### 2.3.3 Beta-Decay Regularization
 
-An alternative approach to stabilizing the search is **Beta-Decay Regularization**. This method imposes constraints on the magnitude and variance of the architecture parameters $\\alpha$. By penalizing the norm of activated parameters, Beta-Decay prevents any single operation from growing too dominant too quickly. This acts as a "speed limit" on entropy collapse, forcing the network to maintain a high-entropy exploration state for longer. Theoretical analysis suggests that Beta-Decay improves the transferability of architectures by preventing overfitting to the specific noise patterns of the proxy dataset used during search.
+An alternative approach to stabilizing the search is **Beta-Decay Regularization**. This method imposes constraints on the magnitude and variance of the architecture parameters $\alpha$. By penalizing the norm of activated parameters, Beta-Decay prevents any single operation from growing too dominant too quickly. This acts as a "speed limit" on entropy collapse, forcing the network to maintain a high-entropy exploration state for longer. Theoretical analysis suggests that Beta-Decay improves the transferability of architectures by preventing overfitting to the specific noise patterns of the proxy dataset used during search.
 
 #### 2.3.4 Implicit Hessian Regularization via Gumbel-Matching
 
 Another potent strategy for closing the discretization gap is **Gumbel-Matching**. This technique involves injecting Gumbel noise into the logits of the architecture parameters before applying the Softmax (or Sigmoid).
 
-$$\\alpha'\_{o} = \\alpha\_o + g\_o, \\quad g\_o \\sim \\text{Gumbel}(0, 1)$$
+$$\alpha'_{o} = \alpha_o + g_o, \quad g_o \sim \text{Gumbel}(0, 1)$$
 
 Using the Straight-Through Estimator (STE) allows gradients to flow through this stochastic process. The theoretical insight here is that the noise injection acts as an **Implicit Hessian Regularization**. It forces the optimization to find minima that are "flat" (low curvature). In a sharp minimum, a small change in architecture weights (like the shift from 0.9 to 1.0 during discretization) can cause a massive jump in loss. In a flat minimum, the loss surface is robust to these perturbations. Gumbel-Matching has been shown to reduce the discretization gap by up to 98% and effectively eliminate unused gates, leading to a significant speedup in training wall-clock time.
 
@@ -89,11 +89,11 @@ In the domain of symbolic regression and operator learning, the choice of the fu
 
 ### 3.1 The ONN Paradigm: Fragility in Log-Space
 
-The Neural Arithmetic Logic Unit (NALU) and its predecessor, the Neural Accumulator (NAC), attempt to learn arithmetic operations by parameterizing the weight matrices to represent discrete values $\\{-1, 0, 1\\}$. The NAC uses a transformation $W = \\tanh(\\hat{W}) \\odot \\sigma(\\hat{M})$ to accumulate inputs additively. To achieve multiplication, the NALU lifts the inputs into log-space:
+The Neural Arithmetic Logic Unit (NALU) and its predecessor, the Neural Accumulator (NAC), attempt to learn arithmetic operations by parameterizing the weight matrices to represent discrete values $\{-1, 0, 1\}$. The NAC uses a transformation $W = \tanh(\hat{W}) \odot \sigma(\hat{M})$ to accumulate inputs additively. To achieve multiplication, the NALU lifts the inputs into log-space:
 
-$$y = \\exp( W(\\log(|x| + \\epsilon)) )$$
+$$y = \exp( W(\log(|x| + \epsilon)) )$$
 
-While theoretically capable of representing $x\_1 \\cdot x\_2$ (as $\\exp(\\log x\_1 + \\log x\_2)$), this architecture suffers from severe gradient instability.
+While theoretically capable of representing $x_1 \cdot x_2$ (as $\exp(\log x_1 + \log x_2)$), this architecture suffers from severe gradient instability.
 
 **1\. The Log-Space Singularity:** The reliance on logarithms makes the network fundamentally incapable of handling mixed-sign data naturally. The trick of using $|x|$ and learning a separate sign path is brittle and often fails to converge because the sign information is decoupled from the magnitude gradient. **2\. Gate Ambiguity:** NALU uses a learned gate $g$ to switch between the additive (NAC) and multiplicative (log-space) paths. The gradient of this gate often vanishes, or the gate converges to 0.5, resulting in a hybrid operation (half-add, half-multiply) that has no physical meaning and high error. **3\. Gradient Starvation:** The gradients through the multiplicative path scale with the inverse of the input ($1/x$), while additive gradients are constant. For inputs near zero, the multiplicative gradients explode; for large inputs, they vanish. This imbalance leads to "Gradient Starvation," where the stable additive path dominates the learning dynamics even if the underlying relationship is multiplicative.
 
@@ -103,13 +103,13 @@ Kolmogorov-Arnold Networks (KANs) are based on the Kolmogorov-Arnold representat
 
 #### 3.2.1 B-Splines and Local Support
 
-The key innovation in KANs is the use of B-splines to parameterize these univariate edge functions. A function $\\phi(x)$ on an edge is learned as:
+The key innovation in KANs is the use of B-splines to parameterize these univariate edge functions. A function $\phi(x)$ on an edge is learned as:
 
-$$\\phi(x) = \\sum\_i c\_i B\_i(x)$$
+$$\phi(x) = \sum_i c_i B_i(x)$$
 
-where $B\_i(x)$ are basis functions and $c\_i$ are learnable coefficients.
+where $B_i(x)$ are basis functions and $c_i$ are learnable coefficients.
 
-**Gradient Stability Advantage:** The primary advantage of B-splines regarding gradient stability is **Local Support**. In a standard MLP or ONN with global activation functions (like Sigmoid or Tanh), adjusting a weight to fix an error for input $x=5$ can disastrously impact the prediction for input $x=-5$ ("Catastrophic Interference"). In a B-spline, modifying a coefficient $c\_i$ only affects the function in the narrow interval where basis function $B\_i(x)$ is non-zero. This locality creates a well-conditioned optimization landscape. The gradients are decoupled across the input domain, allowing the network to fine-tune different regions of the function independently. This is particularly vital for symbolic regression, where the "shape" of the function (e.g., a sudden asymptotic rise in $1/x$) requires precise local control that global weights struggle to capture without destabilizing the rest of the manifold.
+**Gradient Stability Advantage:** The primary advantage of B-splines regarding gradient stability is **Local Support**. In a standard MLP or ONN with global activation functions (like Sigmoid or Tanh), adjusting a weight to fix an error for input $x=5$ can disastrously impact the prediction for input $x=-5$ ("Catastrophic Interference"). In a B-spline, modifying a coefficient $c_i$ only affects the function in the narrow interval where basis function $B_i(x)$ is non-zero. This locality creates a well-conditioned optimization landscape. The gradients are decoupled across the input domain, allowing the network to fine-tune different regions of the function independently. This is particularly vital for symbolic regression, where the "shape" of the function (e.g., a sudden asymptotic rise in $1/x$) requires precise local control that global weights struggle to capture without destabilizing the rest of the manifold.
 
 #### 3.2.2 Fast-KAN and Computational Efficiency
 
@@ -123,10 +123,10 @@ The ultimate test of these architectures is their ability to yield interpretable
 
 ONNs rely on a post-training discretization where gates are snapped to 0 or 1. As discussed, the Discretization Gap often renders the resulting formula inaccurate.
 
-**KAN Symbolification:** KANs enable a more robust "Symbolification" process. Since every edge learns a univariate function $y = \\phi(x)$, we can inspect these functions individually.
+**KAN Symbolification:** KANs enable a more robust "Symbolification" process. Since every edge learns a univariate function $y = \phi(x)$, we can inspect these functions individually.
 
-*   **Visual Inspection:** We can plot $\\phi(x)$ and visually recognize it as a parabola ($x^2$), a sinusoid ($\\sin x$), or an exponential.
-*   **Automatic Snapping (fix\_symbolic):** KANs support an interactive or automated refinement mode. If an edge function correlates highly with a symbolic candidate (e.g., $R^2 > 0.99$ for $\\sin(x)$), we can replace the spline with the exact symbolic function $\\sin(x)$ and freeze it.
+*   **Visual Inspection:** We can plot $\phi(x)$ and visually recognize it as a parabola ($x^2$), a sinusoid ($\sin x$), or an exponential.
+*   **Automatic Snapping (fix_symbolic):** KANs support an interactive or automated refinement mode. If an edge function correlates highly with a symbolic candidate (e.g., $R^2 > 0.99$ for $\sin(x)$), we can replace the spline with the exact symbolic function $\sin(x)$ and freeze it.
 *   **Online Refinement:** Unlike ONN's global snap, KAN allows for partial symbolification. We can fix one layer to symbolic functions and continue training the remaining spline layers to compensate for the residual error. This iterative "locking in" of the equation avoids the catastrophic performance drop of global discretization.
 
 ## 4\. Meta-Arithmetic Optimization: Saddle Points and Gradient Starvation
@@ -135,9 +135,9 @@ When an ONN attempts to learn a "Meta-Arithmetic" operation—interpolating betw
 
 ### 4.1 The Add-Multiply Interpolation Landscape
 
-Consider a learnable unit $y = \\beta(x\_1 + x\_2) + (1-\\beta)(x\_1 \\cdot x\_2)$. The mixing parameter $\\beta$ is optimized via gradient descent. Theoretical analysis of this landscape reveals the presence of **Saddle Points** at the transition boundaries.
+Consider a learnable unit $y = \beta(x_1 + x_2) + (1-\beta)(x_1 \cdot x_2)$. The mixing parameter $\beta$ is optimized via gradient descent. Theoretical analysis of this landscape reveals the presence of **Saddle Points** at the transition boundaries.
 
-If the true function is multiplicative ($y=x\_1 x\_2$) but the network initializes in the additive regime ($\\beta \\approx 1$), the gradient for the multiplicative component might be obscured. The transition region often behaves as a saddle point where the curvature (Hessian) has mixed signs.
+If the true function is multiplicative ($y=x_1 x_2$) but the network initializes in the additive regime ($\beta \approx 1$), the gradient for the multiplicative component might be obscured. The transition region often behaves as a saddle point where the curvature (Hessian) has mixed signs.
 
 *   **The Strict Saddle Property:** Fortunately, many of these saddle points satisfy the "Strict Saddle" property, meaning there is at least one direction of negative curvature (an escape route).
 *   **Escape Mechanisms:** Standard Gradient Descent can stall at saddle points for exponential time. However, algorithms that inject isotropic noise (like Perturbed SGD or zeroth-order methods with randomized smoothing) are theoretically guaranteed to escape strict saddle points in polynomial time. This validates the use of stochastic search methods (like Gumbel-Matching or Langevin dynamics) over pure deterministic SGD for ONN training.
@@ -146,7 +146,7 @@ If the true function is multiplicative ($y=x\_1 x\_2$) but the network initializ
 
 A more pervasive issue is **Gradient Dominance** (often termed Gradient Starvation in this context). This occurs when different competing operations produce gradients of vastly different magnitudes.
 
-In an ONN, the magnitude of the gradient through a multiplication gate depends on the input values: $\\nabla\_{x\_1} (x\_1 x\_2) = x\_2$. If the input features have a large variance or non-normalized scale, the multiplicative path can generate gradients that are orders of magnitude larger than the additive path (where $\\nabla = 1$).
+In an ONN, the magnitude of the gradient through a multiplication gate depends on the input values: $\nabla_{x_1} (x_1 x_2) = x_2$. If the input features have a large variance or non-normalized scale, the multiplicative path can generate gradients that are orders of magnitude larger than the additive path (where $\nabla = 1$).
 
 *   **The Starvation Mechanism:** In a competitive Softmax/Sigmoid setup, the optimizer will follow the largest gradient. If the multiplicative path provides a "louder" signal (even if it's just fitting noise or transient correlations), the optimizer will rapidly increase its weight, effectively "starving" the additive path before it can demonstrate its utility.
 *   **Spectral Decoupling:** To mitigate this, one must employ Spectral Regularization or specific normalization schemes (like LayerNorm applied _inside_ the operator branches) to ensure that the gradient norms of candidate operations are comparable. "Gradient Starvation" theory suggests that decoupling the learning dynamics of features (or operators) is essential to prevent the dominant high-frequency features from suppressing the learning of robust low-frequency laws.
@@ -163,13 +163,13 @@ While Gumbel-Softmax is the standard for differentiable discretization, it is in
 
 Standard Reinforcement Learning (REINFORCE) optimizes the _expected_ reward:
 
-$$J(\\theta) = \\mathbb{E}\_{\\tau \\sim p\_\\theta}$$
+$$J(\theta) = \mathbb{E}_{\tau \sim p_\theta}$$
 
 This creates a perverse incentive in symbolic regression. A policy that generates one perfect formula ($R=1.0$) and 99 invalid ones ($R=0.0$) has a mean reward of 0.01. A policy that generates 100 mediocre approximations ($R=0.5$) has a mean reward of 0.5. Standard RL would prefer the mediocre policy. However, in scientific discovery, we only care about the _single best_ formula found; the failed attempts are irrelevant.
 
 **Risk-Seeking Policy Gradient:** DSR addresses this by optimizing for the "Best-Case" scenario using a **Risk-Seeking Policy Gradient**.
 
-$$\\nabla J\_{risk} \\approx \\frac{1}{| \\mathcal{T}\_{top} |} \\sum\_{\\tau \\in \\mathcal{T}\_{top}} (R(\\tau) - b) \\nabla \\log p\_\\theta(\\tau)$$
+$$\nabla J_{risk} \approx \frac{1}{| \mathcal{T}_{top} |} \sum_{\tau \in \mathcal{T}_{top}} (R(\tau) - b) \nabla \log p_\theta(\tau)$$
 
 Instead of updating the controller based on the entire batch of sampled expressions, DSR filters the batch to retain only the top $k$-percentile (e.g., top 5%) of expressions based on their fitness (reward). The gradient is computed solely from these high-performers.
 
@@ -190,22 +190,22 @@ This "Lamarckian" mechanism (inheritance of acquired characteristics) smooths th
 
 ### 5.3 Hoyer Regularization: Scale-Invariant Sparsity
 
-For both ONN and KAN, enforcing sparsity is essential for interpretability. Standard $L\_1$ regularization is scale-dependent: shrinking the weights reduces the $L\_1$ norm without necessarily setting them to zero. **Hoyer Regularization** (or $L\_1/L\_2$ regularization) provides a scale-invariant alternative.
+For both ONN and KAN, enforcing sparsity is essential for interpretability. Standard $L_1$ regularization is scale-dependent: shrinking the weights reduces the $L_1$ norm without necessarily setting them to zero. **Hoyer Regularization** (or $L_1/L_2$ regularization) provides a scale-invariant alternative.
 
-$$H(w) = \\frac{ \\|w\\|\_1 }{ \\|w\\|\_2 }$$
+$$H(w) = \frac{ \|w\|_1 }{ \|w\|_2 }$$
 
 The Hoyer measure reflects the "peakedness" of the weight vector.
 
-*   **Mechanism:** Minimizing $H(w)$ encourages the mass of the vector to concentrate in as few elements as possible. Unlike $L\_1$, scaling the vector $w \\to \\lambda w$ does not change $H(w)$.
-*   **Result:** This forces the optimizer to drive non-essential weights to exactly zero to minimize the ratio, rather than just shrinking them. In ONN architecture search, applying Hoyer regularization to the $\\alpha$ vector results in sharper decisions and a smaller discretization gap compared to Lasso ($L\_1$).
+*   **Mechanism:** Minimizing $H(w)$ encourages the mass of the vector to concentrate in as few elements as possible. Unlike $L_1$, scaling the vector $w \to \lambda w$ does not change $H(w)$.
+*   **Result:** This forces the optimizer to drive non-essential weights to exactly zero to minimize the ratio, rather than just shrinking them. In ONN architecture search, applying Hoyer regularization to the $\alpha$ vector results in sharper decisions and a smaller discretization gap compared to Lasso ($L_1$).
 
 ### 5.4 Gate Regularization
 
 In architectures with explicit gating mechanisms (like Gated Continuous Logic Networks), **Gate Regularization** is employed to force gates to be binary.
 
-$$L\_{gate} = \\sum\_i \\min(g\_i, 1-g\_i) \\quad \\text{or} \\quad \\sum\_i g\_i(1-g\_i)$$
+$$L_{gate} = \sum_i \min(g_i, 1-g_i) \quad \text{or} \quad \sum_i g_i(1-g_i)$$
 
-This loss is minimized when $g\_i \\in \\{0, 1\\}$. It is critical for ensuring that the logic learned by the network is Boolean and not fuzzy. Without this, a gate value of $0.5$ represents a logical ambiguity that destroys the symbolic validity of the extracted rule.
+This loss is minimized when $g_i \in \{0, 1\}$. It is critical for ensuring that the logic learned by the network is Boolean and not fuzzy. Without this, a gate value of $0.5$ represents a logical ambiguity that destroys the symbolic validity of the extracted rule.
 
 ## 6\. Engineering Optimizations: Dynamic Graphs and torch.compile
 
@@ -231,15 +231,15 @@ To leverage torch.compile for ONN/KAN, we must refactor the code to be "compiler
 
 #### 6.2.1 From Branching to Masking
 
-The most common issue in ONNs is gating: if gate > 0.5: run\_op1() else: run\_op2().
+The most common issue in ONNs is gating: if gate > 0.5: run_op1() else: run_op2().
 
 *   **Problem:** This causes a graph break because the path is data-dependent.
 *   **Solution:** Use **Masking** or torch.where.
 *   Python
 
 1.  \# Compiler Friendly
-2.  res1 = run\_op1(x)
-3.  res2 = run\_op2(x)
+2.  res1 = run_op1(x)
+3.  res2 = run_op2(x)
 4.  output = torch.where(gate > 0.5, res1, res2)
 
 *   While this appears to do more work (computing both branches), torch.compile can often fuse these operations into a single kernel, avoiding the massive overhead of CPU-GPU synchronization required to check the if condition on the host.
