@@ -305,6 +305,13 @@ class OperationDAG(nn.Module):
         output_weights = self.output_proj.weight.data[0].cpu()  # First output
         output_bias = self.output_proj.bias.data[0].item() if self.output_proj.bias is not None else 0
         
+        # Import constant snapping utilities
+        try:
+            from .meta_ops import get_constant_symbol
+            use_constants = True
+        except ImportError:
+            use_constants = False
+        
         # Build formula from weighted contributions
         formula_parts = []
         weight_threshold = 0.05  # Lower threshold to catch more contributions
@@ -329,10 +336,22 @@ class OperationDAG(nn.Module):
                 if has_better:
                     continue
             
+            # Try to represent weight as a known constant
+            if use_constants:
+                weight_sym = get_constant_symbol(weight, threshold=0.05)
+            else:
+                weight_sym = None
+            
             if abs(weight - 1.0) < 0.1:
                 formula_parts.append(expr)
             elif abs(weight + 1.0) < 0.1:
                 formula_parts.append(f"-{expr}")
+            elif weight_sym is not None and weight_sym not in [str(int(round(weight))), f"{weight:.2g}"]:
+                # Use symbolic constant (π, e, √2, etc.)
+                if weight > 0:
+                    formula_parts.append(f"{weight_sym}*{expr}")
+                else:
+                    formula_parts.append(f"({weight_sym})*{expr}")
             elif weight > 0:
                 formula_parts.append(f"{weight:.2f}*{expr}")
             else:
@@ -340,7 +359,14 @@ class OperationDAG(nn.Module):
         
         # Add bias if significant
         if abs(output_bias) > weight_threshold:
-            if output_bias > 0:
+            if use_constants:
+                bias_sym = get_constant_symbol(output_bias, threshold=0.05)
+            else:
+                bias_sym = None
+            
+            if bias_sym is not None and bias_sym not in [str(int(round(output_bias))), f"{output_bias:.2g}"]:
+                formula_parts.append(bias_sym)
+            elif output_bias > 0:
                 formula_parts.append(f"{output_bias:.2f}")
             else:
                 formula_parts.append(f"({output_bias:.2f})")

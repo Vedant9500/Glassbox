@@ -429,6 +429,8 @@ def build_formula_from_weights(
     weights: torch.Tensor,
     feature_names: Optional[List[str]] = None,
     threshold: float = 0.01,
+    snap_constants: bool = True,
+    snap_threshold: float = 0.05,
 ) -> str:
     """
     Build a formula string from weights.
@@ -437,10 +439,18 @@ def build_formula_from_weights(
         weights: Coefficient weights (n_features,)
         feature_names: Feature names (e.g., ['x', 'x²', 'sin(x)'])
         threshold: Only include terms with |weight| > threshold
+        snap_constants: If True, snap weights to known constants (π, e, etc.)
+        snap_threshold: Threshold for constant snapping (default 5%)
     
     Returns:
-        Formula string (e.g., "3.14*sin(x) + 0.32*x²")
+        Formula string (e.g., "π*sin(x) + (1/π)*x²")
     """
+    # Import constant snapping utilities
+    try:
+        from .meta_ops import snap_to_constant, get_constant_symbol
+    except ImportError:
+        snap_constants = False
+    
     if feature_names is None:
         feature_names = [f"f{i}" for i in range(len(weights))]
     
@@ -449,10 +459,23 @@ def build_formula_from_weights(
     for i, (w, name) in enumerate(zip(weights, feature_names)):
         w_val = w.item()
         if abs(w_val) > threshold:
+            # Try to snap to known constant
+            if snap_constants:
+                coef_str = get_constant_symbol(w_val, snap_threshold)
+            else:
+                coef_str = None
+            
+            # Format the term
             if abs(w_val - 1.0) < 0.01:
                 terms.append(name)
             elif abs(w_val + 1.0) < 0.01:
                 terms.append(f"-{name}")
+            elif coef_str is not None and coef_str not in [str(int(round(w_val))), f"{w_val:.4g}"]:
+                # Use symbolic constant (π, e, etc.)
+                if w_val > 0:
+                    terms.append(f"{coef_str}*{name}")
+                else:
+                    terms.append(f"({coef_str})*{name}")
             elif w_val > 0:
                 terms.append(f"{w_val:.4f}*{name}")
             else:
@@ -462,6 +485,7 @@ def build_formula_from_weights(
     
     # Clean up
     formula = formula.replace("+ -", "- ")
+    formula = formula.replace("+ (-", "- (")
     
     return formula
 

@@ -11,6 +11,14 @@ from .meta_ops import (
     MetaLog,
     MetaOperationLibrary,
     create_meta_op,
+    # Constant snapping utilities
+    KNOWN_CONSTANTS,
+    snap_to_constant,
+    snap_tensor_to_constants,
+    get_constant_symbol,
+    snap_edge_weights,
+    snap_value_to_constant,
+    ConstantAwareLinear,
 )
 
 # v2: Hard Concrete Distribution
@@ -110,6 +118,15 @@ __all__ = [
     'MetaLog',
     'MetaOperationLibrary',
     'create_meta_op',
+    
+    # v2: Constant Snapping
+    'KNOWN_CONSTANTS',
+    'snap_to_constant',
+    'snap_tensor_to_constants',
+    'get_constant_symbol',
+    'snap_edge_weights',
+    'snap_value_to_constant',
+    'ConstantAwareLinear',
     
     # v2: Hard Concrete
     'hard_concrete_sample',

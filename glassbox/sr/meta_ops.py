@@ -22,8 +22,154 @@ After training, parameters can be "snapped" to recover discrete operations:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Union
 import math
+
+
+# ============================================================================
+# Known Mathematical Constants for Edge Weight Snapping
+# ============================================================================
+
+KNOWN_CONSTANTS: Dict[str, float] = {
+    # Fundamental constants
+    "π": math.pi,                          # 3.141592653589793
+    "e": math.e,                           # 2.718281828459045
+    "φ": (1 + math.sqrt(5)) / 2,          # Golden ratio: 1.618033988749895
+    "√2": math.sqrt(2),                    # 1.4142135623730951
+    "√3": math.sqrt(3),                    # 1.7320508075688772
+    "√5": math.sqrt(5),                    # 2.23606797749979
+    
+    # Common fractions of pi
+    "π/2": math.pi / 2,                    # 1.5707963267948966
+    "π/3": math.pi / 3,                    # 1.0471975511965976
+    "π/4": math.pi / 4,                    # 0.7853981633974483
+    "π/6": math.pi / 6,                    # 0.5235987755982988
+    "2π": 2 * math.pi,                     # 6.283185307179586
+    
+    # Logarithmic constants
+    "ln(2)": math.log(2),                  # 0.6931471805599453
+    "ln(10)": math.log(10),                # 2.302585092994046
+    "log₂(e)": math.log2(math.e),          # 1.4426950408889634
+    "log₁₀(e)": math.log10(math.e),        # 0.4342944819032518
+    
+    # Other useful constants
+    "1/π": 1 / math.pi,                    # 0.3183098861837907
+    "1/e": 1 / math.e,                     # 0.36787944117144233
+    "2/π": 2 / math.pi,                    # 0.6366197723675814
+    "π²": math.pi ** 2,                    # 9.869604401089358
+    "e²": math.e ** 2,                     # 7.3890560989306495
+    
+    # Simple integers and fractions (commonly appearing)
+    "1/2": 0.5,
+    "1/3": 1/3,
+    "2/3": 2/3,
+    "1/4": 0.25,
+    "3/4": 0.75,
+}
+
+# Also include negative versions
+_negative_constants = {f"-{k}": -v for k, v in KNOWN_CONSTANTS.items()}
+KNOWN_CONSTANTS.update(_negative_constants)
+
+
+def snap_to_constant(
+    value: float,
+    threshold: float = 0.05,
+    constants: Optional[Dict[str, float]] = None,
+) -> Tuple[float, Optional[str]]:
+    """
+    Check if a value is close to a known mathematical constant and snap to it.
+    
+    Args:
+        value: The value to check
+        threshold: Maximum relative or absolute difference to consider "close"
+                   Uses relative difference for values > 1, absolute for smaller values
+        constants: Dictionary of {name: value} constants to check against.
+                   Defaults to KNOWN_CONSTANTS.
+    
+    Returns:
+        Tuple of (snapped_value, constant_name) if a match is found,
+        or (original_value, None) if no match.
+    
+    Example:
+        >>> snap_to_constant(3.14)
+        (3.141592653589793, 'π')
+        >>> snap_to_constant(2.72)
+        (2.718281828459045, 'e')
+        >>> snap_to_constant(1.23)
+        (1.23, None)
+    """
+    if constants is None:
+        constants = KNOWN_CONSTANTS
+    
+    best_match = None
+    best_distance = float('inf')
+    
+    for name, const_value in constants.items():
+        # Calculate distance (relative for larger values, absolute for small)
+        if abs(const_value) > 1:
+            distance = abs(value - const_value) / abs(const_value)
+        else:
+            distance = abs(value - const_value)
+        
+        if distance < threshold and distance < best_distance:
+            best_distance = distance
+            best_match = (const_value, name)
+    
+    if best_match is not None:
+        return best_match
+    return (value, None)
+
+
+def snap_tensor_to_constants(
+    tensor: torch.Tensor,
+    threshold: float = 0.05,
+    constants: Optional[Dict[str, float]] = None,
+) -> Tuple[torch.Tensor, Dict[int, str]]:
+    """
+    Snap all values in a tensor to known constants where applicable.
+    
+    Args:
+        tensor: Input tensor
+        threshold: Snapping threshold
+        constants: Constants dictionary
+    
+    Returns:
+        Tuple of (snapped_tensor, mapping) where mapping is {flat_index: constant_name}
+    """
+    result = tensor.clone()
+    mapping = {}
+    
+    flat = result.flatten()
+    for i in range(flat.numel()):
+        val = flat[i].item()
+        snapped, name = snap_to_constant(val, threshold, constants)
+        if name is not None:
+            flat[i] = snapped
+            mapping[i] = name
+    
+    return result.view_as(tensor), mapping
+
+
+def get_constant_symbol(value: float, threshold: float = 0.05) -> str:
+    """
+    Get the symbolic representation of a value if it matches a known constant.
+    
+    Args:
+        value: The value to check
+        threshold: Matching threshold
+    
+    Returns:
+        Symbolic string (e.g., "π", "e", "√2") or formatted number
+    """
+    _, name = snap_to_constant(value, threshold)
+    if name is not None:
+        return name
+    
+    # Format as a clean number
+    if abs(value - round(value)) < 0.001:
+        return str(int(round(value)))
+    return f"{value:.4g}"
 
 
 class MetaPeriodic(nn.Module):
@@ -652,3 +798,129 @@ def create_meta_op(op_type: str, **kwargs) -> nn.Module:
         raise ValueError(f"Unknown op_type: {op_type}. Choose from {list(ops.keys())}")
     
     return ops[op_type](**kwargs)
+
+
+# ============================================================================
+# Edge Weight Snapping Utilities
+# ============================================================================
+
+def snap_edge_weights(
+    module: nn.Module,
+    threshold: float = 0.05,
+    constants: Optional[Dict[str, float]] = None,
+    verbose: bool = False,
+) -> Dict[str, str]:
+    """
+    Snap all learnable parameters in a module to known mathematical constants.
+    
+    This is useful after training to make discovered formulas more interpretable.
+    For example, if training discovers a coefficient of 3.14159, this will snap
+    it to π for cleaner formula representation.
+    
+    Args:
+        module: PyTorch module containing parameters to snap
+        threshold: Maximum distance to snap (default 0.05 = 5%)
+        constants: Custom constants dict, or None to use KNOWN_CONSTANTS
+        verbose: If True, print each snap operation
+    
+    Returns:
+        Dictionary mapping parameter names to their snapped constant names
+    
+    Example:
+        >>> model = SomeModel()
+        >>> # After training...
+        >>> snapped = snap_edge_weights(model, threshold=0.05)
+        >>> print(snapped)
+        {'layer.weight[0]': 'π', 'layer.bias[1]': 'e'}
+    """
+    snapped_params = {}
+    
+    with torch.no_grad():
+        for name, param in module.named_parameters():
+            if param.numel() == 0:
+                continue
+            
+            flat = param.data.flatten()
+            for i in range(flat.numel()):
+                val = flat[i].item()
+                snapped_val, const_name = snap_to_constant(val, threshold, constants)
+                
+                if const_name is not None:
+                    flat[i] = snapped_val
+                    key = f"{name}[{i}]" if flat.numel() > 1 else name
+                    snapped_params[key] = const_name
+                    
+                    if verbose:
+                        print(f"Snapped {key}: {val:.6f} -> {const_name} ({snapped_val:.6f})")
+            
+            # Write back reshaped data
+            param.data = flat.view_as(param.data)
+    
+    return snapped_params
+
+
+def snap_value_to_constant(
+    value: Union[float, torch.Tensor],
+    threshold: float = 0.05,
+) -> Tuple[Union[float, torch.Tensor], Optional[str]]:
+    """
+    Convenience wrapper that handles both float and single-element tensors.
+    
+    Args:
+        value: Float or single-element tensor
+        threshold: Snapping threshold
+    
+    Returns:
+        Tuple of (snapped_value, constant_name)
+    """
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise ValueError("snap_value_to_constant only works with scalar tensors")
+        val = value.item()
+        snapped, name = snap_to_constant(val, threshold)
+        if name is not None:
+            return torch.tensor(snapped, dtype=value.dtype, device=value.device), name
+        return value, None
+    else:
+        return snap_to_constant(value, threshold)
+
+
+class ConstantAwareLinear(nn.Linear):
+    """
+    A Linear layer that can snap its weights/bias to known constants.
+    
+    Extends nn.Linear with constant-snapping capability for more
+    interpretable coefficient discovery.
+    """
+    
+    def snap_to_constants(self, threshold: float = 0.05, verbose: bool = False) -> Dict[str, str]:
+        """Snap weights and bias to known constants."""
+        snapped = {}
+        
+        with torch.no_grad():
+            # Snap weights
+            for i in range(self.weight.numel()):
+                val = self.weight.data.flatten()[i].item()
+                snapped_val, name = snap_to_constant(val, threshold)
+                if name is not None:
+                    self.weight.data.flatten()[i] = snapped_val
+                    snapped[f"weight[{i}]"] = name
+                    if verbose:
+                        print(f"weight[{i}]: {val:.6f} -> {name}")
+            
+            # Snap bias if present
+            if self.bias is not None:
+                for i in range(self.bias.numel()):
+                    val = self.bias.data[i].item()
+                    snapped_val, name = snap_to_constant(val, threshold)
+                    if name is not None:
+                        self.bias.data[i] = snapped_val
+                        snapped[f"bias[{i}]"] = name
+                        if verbose:
+                            print(f"bias[{i}]: {val:.6f} -> {name}")
+        
+        return snapped
+    
+    def get_symbolic_weights(self, threshold: float = 0.05) -> List[str]:
+        """Get symbolic representation of weights."""
+        return [get_constant_symbol(w.item(), threshold) for w in self.weight.flatten()]

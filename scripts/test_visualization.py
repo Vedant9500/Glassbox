@@ -39,7 +39,7 @@ def main_phased(lite_mode: bool = False):
     PI = math.pi
     print("\nTarget function: y = π*sin(x) + x²/π")
     print(f"Challenge: Discover coefficients π ≈ {PI:.4f} and 1/π ≈ {1/PI:.4f}")
-    x = torch.linspace(-6, 6, 300).reshape(-1, 1)
+    x = torch.linspace(-15, 15, 600).reshape(-1, 1)
     y = PI * torch.sin(x) + (x ** 2) / PI
     
     print(f"Data range: x ∈ [{x.min().item():.1f}, {x.max().item():.1f}]")
@@ -50,7 +50,7 @@ def main_phased(lite_mode: bool = False):
         return OperationDAG(
             n_inputs=1,
             n_hidden_layers=2,   # Single layer for interpretability
-            nodes_per_layer=6,   # More nodes for diversity
+            nodes_per_layer=4,   # More nodes for diversity
             n_outputs=1,
             simplified_ops=True,  # Only power, periodic, arithmetic
             fair_mode=True,       # FairDARTS independent sigmoids
@@ -174,14 +174,38 @@ def main_phased(lite_mode: bool = False):
         pred = features_with_bias @ weights
         mse_b = torch.nn.functional.mse_loss(pred.squeeze(), y.squeeze()).item()
         
-        # Build formula string for B
+        # Build formula string for B with constant snapping
+        from glassbox.sr.meta_ops import get_constant_symbol
+        
         formula_parts = []
         for name, w in zip(feature_names, weights[:-1]):
-            if abs(w.item()) > 0.01:
-                formula_parts.append(f"{w.item():.2f}*{name}")
-        if abs(weights[-1].item()) > 0.01:
-            formula_parts.append(f"{weights[-1].item():.2f}")
+            w_val = w.item()
+            if abs(w_val) > 0.01:
+                coef_sym = get_constant_symbol(w_val, threshold=0.05)
+                # Check if it's a known constant (not just a plain number)
+                is_symbolic = coef_sym not in [str(int(round(w_val))), f"{w_val:.2g}", f"{w_val:.4g}"]
+                
+                if abs(w_val - 1.0) < 0.02:
+                    formula_parts.append(name)
+                elif abs(w_val + 1.0) < 0.02:
+                    formula_parts.append(f"-{name}")
+                elif is_symbolic:
+                    formula_parts.append(f"{coef_sym}*{name}")
+                else:
+                    formula_parts.append(f"{w_val:.4f}*{name}")
+        
+        # Handle bias term
+        bias_val = weights[-1].item()
+        if abs(bias_val) > 0.01:
+            bias_sym = get_constant_symbol(bias_val, threshold=0.05)
+            is_symbolic = bias_sym not in [str(int(round(bias_val))), f"{bias_val:.2g}", f"{bias_val:.4g}"]
+            if is_symbolic:
+                formula_parts.append(bias_sym)
+            else:
+                formula_parts.append(f"{bias_val:.4f}")
+        
         formula_b = " + ".join(formula_parts) if formula_parts else "0"
+        formula_b = formula_b.replace("+ -", "- ")
         
         print(f"Method B Result: MSE={mse_b:.6f}")
         print(f"Method B Formula: {formula_b}")
@@ -450,14 +474,28 @@ def main_simple(lite_mode: bool = False):
         # Squeeze y to match pred_b if necessary (pred_b is [N, 1] or [N])
         mse_b = torch.nn.functional.mse_loss(pred_b.squeeze(), y.squeeze()).item()
         
-        # Build formula string for B
+        # Build formula string for B with constant snapping
+        from glassbox.sr.meta_ops import get_constant_symbol
+        
         formula_parts = []
         for name, weight in zip(feature_names, w):
-            if abs(weight.item()) > 0.01:
-                formula_parts.append(f"{weight.item():.2f}*{name}")
+            w_val = weight.item()
+            if abs(w_val) > 0.01:
+                coef_sym = get_constant_symbol(w_val, threshold=0.05)
+                is_symbolic = coef_sym not in [str(int(round(w_val))), f"{w_val:.2g}", f"{w_val:.4g}"]
+                
+                if abs(w_val - 1.0) < 0.02:
+                    formula_parts.append(name)
+                elif abs(w_val + 1.0) < 0.02:
+                    formula_parts.append(f"-{name}")
+                elif is_symbolic:
+                    formula_parts.append(f"{coef_sym}*{name}")
+                else:
+                    formula_parts.append(f"{w_val:.4f}*{name}")
         
         # Check if list is empty (all weights ~0)
         formula_b = " + ".join(formula_parts) if formula_parts else "0 (all weights ~0)"
+        formula_b = formula_b.replace("+ -", "- ")
         
         print(f"Method B Result: MSE={mse_b:.6f}")
         print(f"Method B Formula: {formula_b}")
