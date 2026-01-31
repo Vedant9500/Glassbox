@@ -1,0 +1,49 @@
+scripts/sr_tester.py --mode single --formula "x^2" --hidden-layers 1 --nodes-per-layer 6 --simplified-ops --fair-mode --generations 40 --population 20 --mutation-rate 0.5 --explorer-fraction 0.4 --no-refine-internal --no-viz --compare-mlp
+
+after tier 1 and 4 implementation:
+
+trial 1 -
+best MSE :0.9113
+found formula : yes
+time :425.92 seconds
+generation restarts = ..
+
+after minor changes in code related to confidence, low diversity trigger and RSP detection:
+
+trial 2 -
+best MSE :1.6930
+found formula :yes
+time : 456.03
+generation restarts = 4
+
+trial 3 -
+best MSE : 0.6355
+found formula :yes
+time : 470.05
+generation restarts = 6
+
+
+after tier 3 implementation:
+
+trial 1 -
+best MSE : 0.0336
+found formula : yes
+time : 373.25
+generation restarts = 5
+
+
+trial 2 -
+best MSE : 0.0066
+found formula : yes
+time : 364.67
+generation restarts = 3
+
+
+trial 3 -
+best MSE : 0.8005
+found formula : yes
+time : 359.21
+generation restarts = 3
+
+
+

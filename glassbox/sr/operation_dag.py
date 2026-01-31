@@ -61,6 +61,9 @@ class OperationDAG(nn.Module):
         use_simple_nodes: bool = False,
         simplified_ops: bool = False,  # Use smaller op menu
         fair_mode: bool = False,       # FairDARTS-style independent sigmoids
+        sparse_routing: bool = False,  # Use sparse top-K routing for scalability
+        sparse_topk: int = 5,          # Top-K sources for sparse routing
+        source_window: int = -1,       # NEW: Limit sources to inputs + last N layers (-1 = unlimited)
     ):
         """
         Args:
@@ -74,6 +77,14 @@ class OperationDAG(nn.Module):
                            Reduces search space for faster/more reliable convergence
             fair_mode: If True, use FairDARTS independent sigmoids
                       Prevents operation "crowding out" during search
+            sparse_routing: If True, use SparseArityRouter which only considers
+                           top-K sources. Helps with very large n_sources.
+            sparse_topk: Number of sources to consider when sparse_routing=True.
+            source_window: Limit each layer to connect only to inputs + outputs
+                          from the last N layers. -1 means unlimited (dense).
+                          Setting to 1 means each layer only sees inputs + previous layer.
+                          This caps n_sources at: n_inputs + source_window * nodes_per_layer
+                          SCALABILITY: Reduces O(L²) to O(L) for deep networks.
         """
         super().__init__()
         self.n_inputs = n_inputs
@@ -84,12 +95,23 @@ class OperationDAG(nn.Module):
         self.use_simple_nodes = use_simple_nodes
         self.simplified_ops = simplified_ops
         self.fair_mode = fair_mode
+        self.sparse_routing = sparse_routing
+        self.sparse_topk = sparse_topk
+        self.source_window = source_window
         
         # Build layers
         self.layers = nn.ModuleList()
         
-        current_n_sources = n_inputs
+        # Calculate n_sources for each layer based on window
         for layer_idx in range(n_hidden_layers):
+            if source_window < 0:
+                # Dense: all previous sources
+                current_n_sources = n_inputs + layer_idx * nodes_per_layer
+            else:
+                # Windowed: only recent layers
+                n_visible_layers = min(layer_idx, source_window)
+                current_n_sources = n_inputs + n_visible_layers * nodes_per_layer
+            
             layer = OperationLayer(
                 n_sources=current_n_sources,
                 n_nodes=nodes_per_layer,
@@ -97,12 +119,13 @@ class OperationDAG(nn.Module):
                 tau=tau,
                 use_simple_nodes=use_simple_nodes,
                 simplified_ops=simplified_ops,
-                fair_mode=fair_mode,  # FairDARTS: prevent op crowding
+                fair_mode=fair_mode,
+                sparse_routing=sparse_routing,
+                sparse_topk=sparse_topk,
             )
             self.layers.append(layer)
-            current_n_sources += nodes_per_layer  # Add this layer's outputs
         
-        # Output projection from all hidden nodes
+        # Output projection: always from all hidden nodes (for expressiveness)
         total_hidden = n_hidden_layers * nodes_per_layer
         self.output_proj = nn.Linear(total_hidden + n_inputs, n_outputs)
     
@@ -126,29 +149,37 @@ class OperationDAG(nn.Module):
         """
         batch_size = x.shape[0]
         
-        # Collect all available sources (starts with inputs)
-        all_sources = [x]
+        # Collect all layer outputs (starts with inputs)
+        all_outputs = [x]  # Index 0 = inputs, index i+1 = layer i output
         layer_infos = []
         
-        for layer in self.layers:
-            # Concatenate all sources so far
-            sources = torch.cat(all_sources, dim=-1)  # (batch, current_n_sources)
+        for layer_idx, layer in enumerate(self.layers):
+            # Build sources based on window setting
+            if self.source_window < 0:
+                # Dense: concatenate all previous outputs
+                sources = torch.cat(all_outputs, dim=-1)
+            else:
+                # Windowed: only inputs + last N layers
+                # Always include inputs (index 0)
+                window_start = max(1, len(all_outputs) - self.source_window)
+                sources_to_cat = [all_outputs[0]] + all_outputs[window_start:]
+                sources = torch.cat(sources_to_cat, dim=-1)
             
             # Forward through layer
             layer_output, layer_info = layer(sources, hard=hard)
             
-            # Add to available sources
-            all_sources.append(layer_output)
+            # Add to available outputs
+            all_outputs.append(layer_output)
             layer_infos.append(layer_info)
         
-        # Final output: project from all sources
-        final_sources = torch.cat(all_sources, dim=-1)
+        # Final output: project from ALL outputs (for expressiveness)
+        final_sources = torch.cat(all_outputs, dim=-1)
         output = self.output_proj(final_sources)
         
         if return_all_outputs:
             info = {
                 'layer_infos': layer_infos,
-                'all_sources': [s.detach() for s in all_sources],
+                'all_sources': [s.detach() for s in all_outputs],
             }
             return output, info
         

@@ -21,6 +21,7 @@ import os
 import re
 import math
 import copy
+import time
 import argparse
 from typing import Callable, Dict, Tuple, Optional, List
 
@@ -325,6 +326,8 @@ class SRTester:
 
 def run_single_mode(config: Config):
     """Test a single formula."""
+    start_time = time.time()
+    
     print("=" * 70)
     print("SINGLE FORMULA TEST")
     print("=" * 70)
@@ -422,7 +425,13 @@ def run_single_mode(config: Config):
         print("\nClose visualization window to exit.")
         plt.show(block=True)
     
-    return {'formula': final_formula, 'mse': final_mse}
+    # Output total time
+    elapsed_time = time.time() - start_time
+    print("\n" + "=" * 70)
+    print(f"TOTAL TIME: {elapsed_time:.2f} seconds")
+    print("=" * 70)
+    
+    return {'formula': final_formula, 'mse': final_mse, 'time_seconds': elapsed_time}
 
 
 def run_evolution_mode(config: Config):

@@ -26,6 +26,7 @@ import math
 import time
 import logging
 from itertools import combinations
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 # Configure module-level logger
@@ -1795,6 +1796,8 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         self.generation = 0
         self.best_ever: Optional[Individual] = None
         self.best_explorer: Optional[Individual] = None  # Best found by explorers
+        self.stuck_generations = 0  # Track consecutive stuck generations
+        self.last_best_ever_fitness = float('inf')  # Track if best_ever improved
         self.history = []
     
     def initialize_population(self):
@@ -1853,6 +1856,10 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         all_individuals = self.population + (self.explorers if self.use_explorers else [])
         
         for ind in all_individuals:
+            # TIER 3: Skip re-evaluation of elite individuals that weren't mutated
+            # Elites keep their fitness from previous generation (small speedup)
+            if hasattr(ind, '_is_elite') and ind._is_elite and ind.fitness < float('inf'):
+                continue
             # NESTED BFGS: Refine internal constants (omega, phi, p) before evaluation
             # This enables discovering formulas like sin(3.2*x) or x^2.5
             if self.nested_bfgs and generation % self.nested_bfgs_every == 0:
@@ -2049,8 +2056,9 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         else:
             # Normal Evolution
             
-            # Keep elite unchanged
+            # Keep elite unchanged and mark them to skip re-evaluation
             for elite in sorted_pop[:self.elite_size]:
+                elite._is_elite = True  # TIER 3: Mark elite for evaluation skip
                 new_population.append(elite)
             
             # Fill rest with mutations of top performers
@@ -2076,15 +2084,27 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 else:
                     child = mutate_operations(parent, effective_rate)
                 
-                # Refine constants (shorter if Lamarckian since weights are pre-tuned)
-                steps = self.constant_refine_steps // 2 if self.lamarckian else self.constant_refine_steps
+                # TIER 3: Progressive refinement reduction
+                # Early: full refinement (finding structure)
+                # Late: minimal refinement (structure stable, just tune coefficients)
+                base_steps = self.constant_refine_steps // 2 if self.lamarckian else self.constant_refine_steps
+                
+                # Reduce steps based on confidence (0.0->1.0 maps to 1.0->0.3)
+                confidence_factor = 1.0 - 0.7 * self.confidence_tracker.confidence
+                adaptive_steps = max(15, int(base_steps * confidence_factor))
+                
+                # TIER 3: Use L-BFGS when confidence is high (faster convergence)
+                use_lbfgs = self.confidence_tracker.confidence > 0.4
+                
                 refine_constants(
                     child.model, x, y,
-                    steps=max(10, steps),
+                    steps=adaptive_steps,
                     lr=0.02,
                     hard=self.constant_refine_hard,
+                    use_lbfgs=use_lbfgs,
                 )
                 
+                child._is_elite = False  # Mark as new individual, needs evaluation
                 new_population.append(child)
         
         self.population = new_population
@@ -2239,6 +2259,39 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 best_fit = mean_fit = float('inf')
                 diversity = 0
             
+            # Track stuck generations and trigger population restart
+            if self.best_ever is not None:
+                # Check if best_ever improved this generation
+                if self.best_ever.fitness < self.last_best_ever_fitness - 0.001:
+                    # Improved! Reset stuck counter
+                    self.stuck_generations = 0
+                    self.last_best_ever_fitness = self.best_ever.fitness
+                else:
+                    # No improvement
+                    self.stuck_generations += 1
+                
+                # POPULATION RESTART: If stuck for too long, reinject fresh individuals
+                if self.stuck_generations >= 5 and diversity <= 3:
+                    print(f"POPULATION RESTART: Stuck for {self.stuck_generations} gens, injecting fresh individuals")
+                    
+                    # Keep only top 2 elites
+                    sorted_pop = sorted(self.population, key=lambda ind: ind.fitness)
+                    new_population = sorted_pop[:2]
+                    
+                    # Fill rest with fresh random individuals
+                    while len(new_population) < self.population_size:
+                        model = self.model_factory().to(self.device)
+                        random_operation_init(model, bias_strength=random.uniform(1.0, 5.0))
+                        child = Individual(model, generation=gen)
+                        # Quick refine
+                        refine_constants(child.model, x, y, steps=20, lr=0.02, hard=self.constant_refine_hard)
+                        new_population.append(child)
+                    
+                    self.population = new_population
+                    self.stuck_generations = 0
+                    # Re-evaluate fitness
+                    self.evaluate_fitness(fit_x, fit_y, generation=gen, total_generations=generations)
+            
             # Compute current entropy weight for logging
             current_entropy_weight = anneal_entropy_weight(
                 gen, generations, self.entropy_weight_start, self.entropy_weight_end
@@ -2372,7 +2425,18 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                     # Get effective mutation rate based on confidence
                     effective_mutation_rate = self.confidence_tracker.get_effective_mutation_rate(self.mutation_rate)
                     
-                    # Normal evolution with (possibly reduced) mutations
+                    # STUCK BOOST: If RSPG detects stuck, boost mutation significantly!
+                    if self.gradient_monitor is not None:
+                        rspg_stats = self.get_rspg_stats()
+                        if rspg_stats.get('is_stuck', 0.0) > 0.5:
+                            # Boost mutation to escape local minima
+                            effective_mutation_rate = min(0.9, effective_mutation_rate * 2.5)
+                            # Also reset confidence to allow more exploration
+                            if self.confidence_tracker.confidence > 0.3:
+                                self.confidence_tracker.confidence *= 0.5
+                                self.confidence_tracker.generations_stable = 0
+                    
+                    # Normal evolution with (possibly boosted) mutations
                     self.select_and_reproduce(x, y, diversity=diversity, mutation_rate=effective_mutation_rate)
                     
                     # Evolve explorers in parallel (if enabled and not high confidence)

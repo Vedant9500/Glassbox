@@ -98,6 +98,119 @@ class AdaptiveArityRouter(nn.Module):
         return self.route_logits.argmax(dim=-1).tolist()
 
 
+class SparseArityRouter(nn.Module):
+    """
+    Sparse router that only considers top-K sources for routing.
+    
+    Key optimization: Instead of softmax over ALL n_sources,
+    we only compute over the top-K most important sources.
+    This reduces routing complexity from O(n_sources) to O(K).
+    
+    OPTIMIZED VERSION:
+    - Caches top-K indices to avoid repeated topk() calls
+    - Uses direct indexing in hard mode (no matmul)
+    - Invalidates cache only when importance_logits change significantly
+    """
+    
+    def __init__(self, n_sources: int, max_arity: int = 2, top_k: int = 5):
+        """
+        Args:
+            n_sources: Total number of available source inputs
+            max_arity: Maximum number of inputs per operation (1=unary, 2=binary)
+            top_k: Number of sources to consider for routing (default 5)
+        """
+        super().__init__()
+        self.n_sources = n_sources
+        self.max_arity = max_arity
+        self.top_k = min(top_k, n_sources)
+        
+        # Learnable importance scores (determines which sources are in top-K)
+        self.importance_logits = nn.Parameter(torch.randn(n_sources) * 0.1)
+        
+        # Edge weights for all sources (indexed into for top-K)
+        self.edge_weights = nn.Parameter(torch.ones(n_sources))
+        
+        # Routing within top-K: which of the K sources to actually use
+        self.route_logits = nn.Parameter(torch.randn(max_arity, top_k) * 0.1)
+        
+        # Cached indices for fast inference - register as buffer (not parameter)
+        self.register_buffer('_topk_indices', torch.arange(min(top_k, n_sources)))
+        self._cache_valid = False
+    
+    def _update_topk_cache(self) -> None:
+        """Update cached top-K indices from importance logits."""
+        with torch.no_grad():
+            _, indices = torch.topk(self.importance_logits, self.top_k, dim=-1)
+            self._topk_indices.copy_(indices.sort().values)
+        self._cache_valid = True
+    
+    def invalidate_cache(self) -> None:
+        """Call after modifying importance_logits to refresh cache."""
+        self._cache_valid = False
+    
+    def forward_unary(self, sources: torch.Tensor, tau: float = 1.0, hard: bool = False) -> torch.Tensor:
+        """Select input for unary operation from top-K sources."""
+        # Update cache if needed (only during training when weights change)
+        if self.training or not self._cache_valid:
+            self._update_topk_cache()
+        
+        # Fast path for hard mode: direct indexing
+        if hard:
+            # Get best source within top-K
+            local_idx = self.route_logits[0, :self.top_k].argmax().item()
+            global_idx = self._topk_indices[local_idx]
+            return sources[:, global_idx] * self.edge_weights[global_idx]
+        
+        # Soft mode: gather top-K and do weighted sum
+        topk_sources = sources[:, self._topk_indices]  # (batch, K)
+        topk_weights = self.edge_weights[self._topk_indices]  # (K,)
+        weighted = topk_sources * topk_weights
+        
+        probs = F.softmax(self.route_logits[0, :self.top_k] / tau, dim=-1)
+        return (weighted * probs).sum(dim=-1)
+    
+    def forward_binary(self, sources: torch.Tensor, tau: float = 1.0, hard: bool = False) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Select two inputs for binary operation from top-K sources."""
+        if self.training or not self._cache_valid:
+            self._update_topk_cache()
+        
+        # Fast path for hard mode
+        if hard:
+            local_idx0 = self.route_logits[0, :self.top_k].argmax().item()
+            local_idx1 = self.route_logits[1, :self.top_k].argmax().item()
+            global_idx0 = self._topk_indices[local_idx0]
+            global_idx1 = self._topk_indices[local_idx1]
+            x = sources[:, global_idx0] * self.edge_weights[global_idx0]
+            y = sources[:, global_idx1] * self.edge_weights[global_idx1]
+            return x, y
+        
+        # Soft mode
+        topk_sources = sources[:, self._topk_indices]
+        topk_weights = self.edge_weights[self._topk_indices]
+        weighted = topk_sources * topk_weights
+        
+        probs = F.softmax(self.route_logits[:, :self.top_k] / tau, dim=-1)
+        selected = torch.matmul(probs, weighted.t())
+        return selected[0], selected[1]
+    
+    def forward_aggregation(self, sources: torch.Tensor) -> torch.Tensor:
+        """Forward top-K sources for aggregation."""
+        if self.training or not self._cache_valid:
+            self._update_topk_cache()
+        
+        topk_sources = sources[:, self._topk_indices]
+        topk_weights = self.edge_weights[self._topk_indices]
+        return topk_sources * topk_weights
+    
+    def get_primary_sources(self) -> List[int]:
+        """Get global indices of selected inputs."""
+        if not self._cache_valid:
+            self._update_topk_cache()
+        
+        local_selections = self.route_logits[:, :self.top_k].argmax(dim=-1)
+        return [self._topk_indices[idx].item() for idx in local_selections]
+
+
 class OperationNode(nn.Module):
     """
     A single node in the Operation-Based Neural Network.
@@ -140,6 +253,8 @@ class OperationNode(nn.Module):
         simplified_ops: bool = False,  # Use smaller op menu
         fair_mode: bool = False,       # FairDARTS-style independent sigmoids
         branch_norm: bool = False,     # Apply LayerNorm inside branches (can hurt SR)
+        sparse_routing: bool = False,  # NEW: Use sparse top-K routing for scalability
+        sparse_topk: int = 5,          # NEW: Number of sources to consider when sparse
     ):
         """
         Args:
@@ -155,6 +270,12 @@ class OperationNode(nn.Module):
                         WARNING: This normalizes to mean=0,std=1 which destroys
                         scale information. Can hurt symbolic regression where
                         actual output magnitudes matter. Disabled by default.
+            sparse_routing: If True, use SparseArityRouter which only considers
+                           top-K sources. Dramatically improves scaling for large
+                           networks (O(K) vs O(n_sources) routing).
+            sparse_topk: Number of sources to consider when sparse_routing=True.
+                        Default 5 works well for most formulas (typically depend
+                        on few inputs).
         """
         super().__init__()
         self.n_sources = n_sources
@@ -164,9 +285,14 @@ class OperationNode(nn.Module):
         self.simplified_ops = simplified_ops
         self.fair_mode = fair_mode
         self.branch_norm_enabled = branch_norm
+        self.sparse_routing = sparse_routing
+        self.sparse_topk = sparse_topk
         
         # Routing: handles edge weights and input slot selection
-        self.router = AdaptiveArityRouter(n_sources, max_arity=2)
+        if sparse_routing:
+            self.router = SparseArityRouter(n_sources, max_arity=2, top_k=sparse_topk)
+        else:
+            self.router = AdaptiveArityRouter(n_sources, max_arity=2)
         
         if simplified_ops:
             # SIMPLIFIED: Only power, periodic, arithmetic
@@ -496,6 +622,8 @@ class OperationLayer(nn.Module):
         use_simple_nodes: bool = False,
         simplified_ops: bool = False,  # Use smaller op menu
         fair_mode: bool = False,       # FairDARTS-style independent sigmoids
+        sparse_routing: bool = False,  # NEW: Use sparse top-K routing
+        sparse_topk: int = 5,          # NEW: Top-K sources for sparse routing
     ):
         """
         Args:
@@ -506,6 +634,8 @@ class OperationLayer(nn.Module):
             use_simple_nodes: If True, use simplified nodes (faster)
             simplified_ops: If True, use smaller op menu (no exp/log/agg)
             fair_mode: If True, use FairDARTS independent sigmoids
+            sparse_routing: If True, use SparseArityRouter for O(K) routing
+            sparse_topk: Number of sources to consider when sparse_routing=True
         """
         super().__init__()
         self.n_sources = n_sources
@@ -514,6 +644,8 @@ class OperationLayer(nn.Module):
         self.use_simple_nodes = use_simple_nodes
         self.simplified_ops = simplified_ops
         self.fair_mode = fair_mode
+        self.sparse_routing = sparse_routing
+        self.sparse_topk = sparse_topk
         
         if use_simple_nodes:
             self.nodes = nn.ModuleList([
@@ -522,7 +654,15 @@ class OperationLayer(nn.Module):
             ])
         else:
             self.nodes = nn.ModuleList([
-                OperationNode(n_sources, node_idx=i, tau=tau, simplified_ops=simplified_ops, fair_mode=fair_mode)
+                OperationNode(
+                    n_sources, 
+                    node_idx=i, 
+                    tau=tau, 
+                    simplified_ops=simplified_ops, 
+                    fair_mode=fair_mode,
+                    sparse_routing=sparse_routing,
+                    sparse_topk=sparse_topk,
+                )
                 for i in range(n_nodes)
             ])
     
