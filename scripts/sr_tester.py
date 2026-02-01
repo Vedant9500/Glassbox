@@ -202,6 +202,7 @@ class SRTester:
             visualizer=visualizer,
             risk_seeking=self.config.risk_seeking,
             risk_seeking_percentile=self.config.risk_seeking_percentile,
+            use_curve_classifier=getattr(self.config, 'use_curve_classifier', False),
         )
         
         x = x.to(self.device)
@@ -350,7 +351,45 @@ def run_single_mode(config: Config):
             lite_mode=config.lite_mode,
         )
     
-    # Phase 1: Structure Discovery
+    # Try Fast Path first (classifier-guided direct regression)
+    fast_path_result = None
+    if getattr(config, 'use_curve_classifier', False):
+        try:
+            from scripts.classifier_fast_path import run_fast_path
+            from glassbox.sr.evolution import detect_dominant_frequency
+            
+            x_tensor = x.to(tester.device)
+            y_tensor = y.to(tester.device)
+            
+            # Get FFT frequencies for better basis
+            detected_omegas = detect_dominant_frequency(x_tensor, y_tensor, n_frequencies=3)
+            
+            fast_path_result = run_fast_path(
+                x_tensor, y_tensor,
+                classifier_path="models/curve_classifier.pt",
+                detected_omegas=detected_omegas,
+            )
+            
+            if fast_path_result and fast_path_result['mse'] < 0.01:
+                # Fast path succeeded with very low MSE - we're done!
+                elapsed = time.time() - start_time
+                print("\n" + "=" * 70)
+                print("FINAL RESULTS (FAST PATH)")
+                print("=" * 70)
+                print(f"TARGET:     {config.formula}")
+                print(f"DISCOVERED: {fast_path_result['formula']}")
+                print(f"FINAL MSE:  {fast_path_result['mse']:.6f}")
+                print()
+                print("=" * 70)
+                print(f"TOTAL TIME: {elapsed:.2f} seconds (FAST PATH)")
+                print("=" * 70)
+                return
+            elif fast_path_result:
+                print(f"\nFast path MSE ({fast_path_result['mse']:.4f}) > 0.01, falling back to evolution...")
+        except Exception as e:
+            print(f"Fast path error: {e}, falling back to evolution...")
+    
+    # Phase 1: Structure Discovery (if fast path didn't succeed)
     print("\n" + "=" * 70)
     print("PHASE 1: STRUCTURE DISCOVERY")
     print("=" * 70)
@@ -692,6 +731,9 @@ Examples:
     evo.add_argument('--risk-seeking', dest='risk_seeking', action='store_true', default=True,
                      help='Enable risk-seeking policy gradient for stuck detection')
     evo.add_argument('--no-risk-seeking', dest='risk_seeking', action='store_false')
+    evo.add_argument('--curve-classifier', dest='use_curve_classifier', action='store_true', default=False,
+                     help='Use curve classifier to warm-start operator selection')
+    evo.add_argument('--no-curve-classifier', dest='use_curve_classifier', action='store_false')
     
     # Data
     data = parser.add_argument_group('Data Generation')
@@ -740,6 +782,7 @@ def main():
     config.refine_internal = args.refine_internal
     config.lamarckian = args.lamarckian
     config.risk_seeking = args.risk_seeking
+    config.use_curve_classifier = args.use_curve_classifier
     config.x_min = args.x_min
     config.x_max = args.x_max
     config.n_samples = args.n_samples

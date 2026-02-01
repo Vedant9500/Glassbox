@@ -1722,6 +1722,9 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         nested_bfgs: bool = True,           # Enable per-candidate internal refinement
         nested_bfgs_steps: int = 5,         # L-BFGS iterations per candidate
         nested_bfgs_every: int = 1,         # Refine every N generations
+        # NEW: Curve classifier warm-start
+        use_curve_classifier: bool = False,  # Use curve shape to predict operators
+        curve_classifier_path: str = "models/curve_classifier.pt",
     ):
         self.model_factory = model_factory
         self.population_size = population_size
@@ -1783,6 +1786,10 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         self.nested_bfgs = nested_bfgs
         self.nested_bfgs_steps = nested_bfgs_steps
         self.nested_bfgs_every = nested_bfgs_every
+        
+        # NEW: Curve classifier warm-start
+        self.use_curve_classifier = use_curve_classifier
+        self.curve_classifier_path = curve_classifier_path
         
         # NEW: Graduated structure confidence tracker (replaces binary lock)
         self.confidence_tracker = StructureConfidenceTracker(
@@ -2143,6 +2150,10 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         y = y.to(self.device)
         fit_x = fitness_x.to(self.device) if fitness_x is not None else x
         fit_y = fitness_y.to(self.device) if fitness_y is not None else y
+        
+        # Store original data for curve classifier (before normalization)
+        x_original = x.clone()
+        y_original = y.clone()
 
         # Optional normalization (improves stability on complex targets)
         if self.normalize_data:
@@ -2175,6 +2186,47 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             if self.use_explorers:
                 for i, explorer in enumerate(self.explorers):
                     seed_omega_from_fft(explorer.model, detected_omegas, individual_idx=i)
+        
+        # Curve classifier warm-start: predict operators from curve shape
+        if self.use_curve_classifier:
+            print("Running curve classifier for operator prediction...")
+            try:
+                from scripts.curve_classifier_integration import predict_operators, bias_onn_from_predictions
+                
+                # Use ORIGINAL (unnormalized) data for classifier
+                x_np = x_original.cpu().numpy().flatten()
+                y_np = y_original.cpu().numpy().flatten()
+                
+                # Predict operators
+                predictions = predict_operators(x_np, y_np, self.curve_classifier_path, threshold=0.3)
+                
+                if predictions:
+                    print(f"Curve classifier predictions: {[(k, f'{v:.2f}') for k, v in sorted(predictions.items(), key=lambda x: -x[1])]}")
+                    
+                    # Bias all individuals in population (only print once)
+                    n_biased_total = 0
+                    for i, ind in enumerate(self.population):
+                        bias_onn_from_predictions(ind.model, predictions, threshold=0.4, boost_factor=1.5, verbose=False)
+                        n_biased_total += 1
+                    
+                    # Less aggressive bias for explorers (they should explore)
+                    if self.use_explorers:
+                        for explorer in self.explorers[:len(self.explorers)//2]:
+                            bias_onn_from_predictions(explorer.model, predictions, threshold=0.5, boost_factor=1.0, verbose=False)
+                            n_biased_total += 1
+                    
+                    print(f"Biased operation logits in {n_biased_total} individuals")
+                else:
+                    print("Curve classifier: No operators predicted above threshold")
+                            
+            except ImportError as e:
+                print(f"Curve classifier not available: {e}")
+            except FileNotFoundError:
+                print(f"Curve classifier model not found at {self.curve_classifier_path}")
+            except Exception as e:
+                import traceback
+                print(f"Curve classifier error: {e}")
+                traceback.print_exc()
         
         # Initial constant refinement for main population
         print("Refining initial constants...")
