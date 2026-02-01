@@ -255,6 +255,7 @@ class OperationNode(nn.Module):
         branch_norm: bool = False,     # Apply LayerNorm inside branches (can hurt SR)
         sparse_routing: bool = False,  # NEW: Use sparse top-K routing for scalability
         sparse_topk: int = 5,          # NEW: Number of sources to consider when sparse
+        op_constraints: Optional[Dict[str, bool]] = None,  # Operator constraints
     ):
         """
         Args:
@@ -276,6 +277,10 @@ class OperationNode(nn.Module):
             sparse_topk: Number of sources to consider when sparse_routing=True.
                         Default 5 works well for most formulas (typically depend
                         on few inputs).
+            op_constraints: Dict of operator constraints. Keys:
+                           'periodic', 'power', 'exp', 'log', 'arithmetic', 'aggregation'
+                           True = enabled, False = disabled.
+                           Disabled ops get large negative logits (effectively masked).
         """
         super().__init__()
         self.n_sources = n_sources
@@ -287,6 +292,7 @@ class OperationNode(nn.Module):
         self.branch_norm_enabled = branch_norm
         self.sparse_routing = sparse_routing
         self.sparse_topk = sparse_topk
+        self.op_constraints = op_constraints or {}
         
         # Routing: handles edge weights and input slot selection
         if sparse_routing:
@@ -313,6 +319,10 @@ class OperationNode(nn.Module):
             self.binary_ops = nn.ModuleList([
                 MetaArithmetic(),
             ])
+            
+            # Op names for constraint mapping (simplified mode)
+            self._unary_op_names = ['periodic', 'power']
+            self._binary_op_names = ['arithmetic']
         else:
             # FULL: All operations (original behavior)
             self.op_selector = HardConcreteOperationSelector(
@@ -334,6 +344,13 @@ class OperationNode(nn.Module):
                 MetaArithmetic(),
                 MetaAggregation(),
             ])
+            
+            # Op names for constraint mapping (full mode)
+            self._unary_op_names = ['periodic', 'power', 'exp', 'log']
+            self._binary_op_names = ['arithmetic', 'aggregation']
+        
+        # Apply operator constraints by setting large negative logits for disabled ops
+        self._apply_op_constraints()
         
         # Output BatchNorm for gradient normalization
         self.output_norm = nn.BatchNorm1d(1, affine=False)
@@ -356,6 +373,52 @@ class OperationNode(nn.Module):
         # Learnable output scale
         self.output_scale = nn.Parameter(torch.ones(1))
     
+    def _apply_op_constraints(self):
+        """
+        Apply operator constraints by setting large negative logits for disabled ops.
+        
+        This effectively masks out disabled operators by making them extremely
+        unlikely to be selected during Hard Concrete sampling.
+        """
+        if not self.op_constraints:
+            return
+        
+        MASK_VALUE = -100.0  # Large negative logit = effectively disabled
+        
+        # Logits layout: [type(2), unary(n_unary), binary(n_binary)]
+        n_type = 2
+        n_unary = len(self._unary_op_names)
+        n_binary = len(self._binary_op_names)
+        
+        with torch.no_grad():
+            # Check if all unary ops are disabled
+            all_unary_disabled = all(
+                self.op_constraints.get(name, True) is False 
+                for name in self._unary_op_names
+            )
+            # Check if all binary ops are disabled
+            all_binary_disabled = all(
+                self.op_constraints.get(name, True) is False 
+                for name in self._binary_op_names
+            )
+            
+            # Mask type selector if all of one type is disabled
+            if all_unary_disabled:
+                self.op_selector.logits.data[0] = MASK_VALUE  # type[0] = unary
+            if all_binary_disabled:
+                self.op_selector.logits.data[1] = MASK_VALUE  # type[1] = binary
+            
+            # Mask individual unary ops
+            for i, op_name in enumerate(self._unary_op_names):
+                if self.op_constraints.get(op_name, True) is False:
+                    self.op_selector.logits.data[n_type + i] = MASK_VALUE
+            
+            # Mask individual binary ops
+            unary_end = n_type + n_unary
+            for i, op_name in enumerate(self._binary_op_names):
+                if self.op_constraints.get(op_name, True) is False:
+                    self.op_selector.logits.data[unary_end + i] = MASK_VALUE
+
     def forward(
         self,
         sources: torch.Tensor,
@@ -624,6 +687,7 @@ class OperationLayer(nn.Module):
         fair_mode: bool = False,       # FairDARTS-style independent sigmoids
         sparse_routing: bool = False,  # NEW: Use sparse top-K routing
         sparse_topk: int = 5,          # NEW: Top-K sources for sparse routing
+        op_constraints: Optional[Dict[str, bool]] = None,  # Operator constraints
     ):
         """
         Args:
@@ -636,6 +700,7 @@ class OperationLayer(nn.Module):
             fair_mode: If True, use FairDARTS independent sigmoids
             sparse_routing: If True, use SparseArityRouter for O(K) routing
             sparse_topk: Number of sources to consider when sparse_routing=True
+            op_constraints: Operator constraints dict
         """
         super().__init__()
         self.n_sources = n_sources
@@ -646,6 +711,7 @@ class OperationLayer(nn.Module):
         self.fair_mode = fair_mode
         self.sparse_routing = sparse_routing
         self.sparse_topk = sparse_topk
+        self.op_constraints = op_constraints
         
         if use_simple_nodes:
             self.nodes = nn.ModuleList([
@@ -662,6 +728,7 @@ class OperationLayer(nn.Module):
                     fair_mode=fair_mode,
                     sparse_routing=sparse_routing,
                     sparse_topk=sparse_topk,
+                    op_constraints=op_constraints,
                 )
                 for i in range(n_nodes)
             ])

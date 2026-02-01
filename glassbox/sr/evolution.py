@@ -1725,6 +1725,9 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         # NEW: Curve classifier warm-start
         use_curve_classifier: bool = False,  # Use curve shape to predict operators
         curve_classifier_path: str = "models/curve_classifier.pt",
+        # NEW: Early stopping on exact match
+        early_stop_mse: float = 1e-6,  # Stop if MSE below this (exact match)
+        early_stop_corr: float = 0.9999,  # Stop if correlation above this
     ):
         self.model_factory = model_factory
         self.population_size = population_size
@@ -1790,6 +1793,10 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         # NEW: Curve classifier warm-start
         self.use_curve_classifier = use_curve_classifier
         self.curve_classifier_path = curve_classifier_path
+        
+        # NEW: Early stopping thresholds
+        self.early_stop_mse = early_stop_mse
+        self.early_stop_corr = early_stop_corr
         
         # NEW: Graduated structure confidence tracker (replaces binary lock)
         self.confidence_tracker = StructureConfidenceTracker(
@@ -2362,8 +2369,12 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             if gen % print_every == 0 or gen == generations - 1:
                 explorer_info = ""
                 if self.use_explorers and self.explorers:
-                    best_explorer_fit = min(e.fitness for e in self.explorers if e.fitness < float('inf'))
-                    explorer_info = f" | Explorer: {best_explorer_fit:.4f}"
+                    valid_explorer_fits = [e.fitness for e in self.explorers if e.fitness < float('inf')]
+                    if valid_explorer_fits:
+                        best_explorer_fit = min(valid_explorer_fits)
+                        explorer_info = f" | Explorer: {best_explorer_fit:.4f}"
+                    else:
+                        explorer_info = " | Explorer: inf"
                 
                 # Add RSPG status
                 rspg_info = ""
@@ -2386,6 +2397,24 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                       f"Best Ever: {self.best_ever.fitness:.4f}{explorer_info}{rspg_info}{conf_info}")
 
             # EARLY STOPPING CHECK
+            # Check for exact match (very low MSE)
+            if self.best_ever and self.best_ever.fitness < self.early_stop_mse:
+                print(f"\n*** EXACT MATCH FOUND! MSE={self.best_ever.fitness:.2e} at Gen {gen} ***")
+                break
+            
+            # Check for near-perfect correlation (structure is correct)
+            if hasattr(self, 'confidence_tracker') and self.confidence_tracker.confidence > 0:
+                # Get current correlation
+                self.best_ever.model.eval()
+                with torch.no_grad():
+                    pred, _ = self.best_ever.model(x, hard=True)
+                    pred_sq = pred.squeeze()
+                    y_sq = y.squeeze()
+                    current_corr = torch.corrcoef(torch.stack([pred_sq.cpu(), y_sq.cpu()]))[0, 1].item()
+                    if not math.isnan(current_corr) and current_corr > self.early_stop_corr:
+                        print(f"\n*** NEAR-EXACT MATCH! Corr={current_corr:.6f} at Gen {gen} ***")
+                        break
+            
             # Phase 1 doesn't need perfect MSE - Phase 2 refinement will fix coefficients
             # Stop if we have a good structure (high correlation) and stable MSE
             if self.best_ever and self.best_ever.fitness < 0.01:
@@ -2677,9 +2706,22 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         elif hasattr(best_model, 'get_graph_summary'):
             formula = best_model.get_graph_summary()
         
+        # Sanitize formula for Windows console (replace Unicode chars)
+        formula_display = (formula
+            .replace('π', 'pi')
+            .replace('²', '^2')
+            .replace('³', '^3')
+            .replace('√', 'sqrt')
+            .replace('·', '*')
+            .replace('φ', 'phi')
+            .replace('ω', 'omega')
+        )
+        # Remove any other problematic Unicode
+        formula_display = formula_display.encode('ascii', 'replace').decode('ascii')
+        
         print(f"Final MSE: {final_mse:.4f}")
         print(f"Correlation: {corr:.4f}")
-        print(f"Formula: {formula}")
+        print(f"Formula: {formula_display}")
         
         return {
             'model': best_model,
@@ -2927,11 +2969,23 @@ def train_onn_hybrid(
     if hasattr(best_model, 'get_formula'):
         formula = best_model.get_formula()
     
+    # Sanitize formula for Windows console
+    formula_display = (formula
+        .replace('π', 'pi')
+        .replace('²', '^2')
+        .replace('³', '^3')
+        .replace('√', 'sqrt')
+        .replace('·', '*')
+        .replace('φ', 'phi')
+        .replace('ω', 'omega')
+    )
+    formula_display = formula_display.encode('ascii', 'replace').decode('ascii')
+    
     print("-"*60)
     print(f"Training complete in {elapsed:.1f}s")
     print(f"Final MSE: {final_mse:.6f}")
     print(f"Correlation: {corr:.4f}")
-    print(f"Formula: {formula}")
+    print(f"Formula: {formula_display}")
     
     return {
         'model': best_model,

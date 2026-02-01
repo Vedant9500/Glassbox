@@ -52,7 +52,7 @@ class CurveClassifierMLP(nn.Module):
 class CurveClassifierCNN(nn.Module):
     """1D CNN that operates on the raw curve portion of features."""
     
-    def __init__(self, n_classes: int = 11):
+    def __init__(self, n_classes: int = 11, n_features: int = 334):
         super().__init__()
         
         # CNN for raw curve (first 128 features)
@@ -71,8 +71,9 @@ class CurveClassifierCNN(nn.Module):
         )
         
         # MLP for other features (FFT, derivatives, stats)
+        other_dim = max(1, n_features - 128)
         self.other_mlp = nn.Sequential(
-            nn.Linear(297 - 128, 128),
+            nn.Linear(other_dim, 128),
             nn.ReLU(),
             nn.Dropout(0.3),
         )
@@ -307,7 +308,7 @@ def main():
     if args.model == "mlp":
         model = CurveClassifierMLP(n_features, n_classes, args.hidden)
     else:
-        model = CurveClassifierCNN(n_classes)
+        model = CurveClassifierCNN(n_classes=n_classes, n_features=n_features)
     
     model = model.to(device)
     print(f"\nModel: {args.model.upper()}")

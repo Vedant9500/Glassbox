@@ -32,6 +32,24 @@ import torch
 import torch.nn as nn
 import numpy as np
 
+
+def sanitize_formula(formula: str) -> str:
+    """Sanitize formula for Windows console output (replace Unicode chars)."""
+    if not formula:
+        return formula
+    result = (formula
+        .replace('π', 'pi')
+        .replace('²', '^2')
+        .replace('³', '^3')
+        .replace('√', 'sqrt')
+        .replace('·', '*')
+        .replace('φ', 'phi')
+        .replace('ω', 'omega')
+    )
+    # Remove any other problematic Unicode
+    return result.encode('ascii', 'replace').decode('ascii')
+
+
 # Check for Rich TUI library
 try:
     from rich.console import Console
@@ -94,6 +112,9 @@ class Config:
         self.x_max: float = 10.0
         self.n_samples: int = 300
         self.noise_std: float = 0.0
+        self.precision: int = 32
+        self.normalize_data: bool = False
+        self.auto_domain: bool = True
         
         # Other
         self.formula: str = ""
@@ -103,6 +124,22 @@ class Config:
         self.seed: Optional[int] = None
         self.compare_mlp: bool = False
         self.enable_pruning: bool = False
+        
+        # Operator Constraints (None = use default based on simplified_ops)
+        self.ops_periodic: Optional[bool] = None  # sin, cos
+        self.ops_power: Optional[bool] = None     # x^n, sqrt
+        self.ops_exp: Optional[bool] = None       # exp(x)
+        self.ops_log: Optional[bool] = None       # log(x)
+        self.ops_arithmetic: Optional[bool] = None  # +, *
+        self.ops_aggregation: Optional[bool] = None  # sum, mean, max
+        
+        # Domain-Aware Sampling
+        self.sample_avoid: Optional[List[float]] = None  # Singular points to avoid
+        self.sample_epsilon: float = 0.1                 # Distance to stay from singular points
+        self.use_sample_weights: bool = False            # Use sample weights in fitness
+
+        # Fast-path only mode
+        self.fast_path_only: bool = False
     
     def get_device(self) -> torch.device:
         if self.device == "auto":
@@ -129,6 +166,10 @@ def parse_formula(formula_str: str) -> Callable[[torch.Tensor], torch.Tensor]:
     formula = formula.replace('tan(', 'torch.tan(')
     formula = formula.replace('exp(', 'torch.exp(')
     formula = formula.replace('log(', 'torch.log(')
+    # Handle sqrt of numeric constants before tensor sqrt
+    formula = re.sub(r'sqrt\(\s*([0-9\.]+)\s*\)', lambda m: str(math.sqrt(float(m.group(1)))), formula)
+    formula = re.sub(r'sqrt\(\s*pi\s*\)', str(math.sqrt(math.pi)), formula)
+    formula = re.sub(r'sqrt\(\s*e\s*\)', str(math.sqrt(math.e)), formula)
     formula = formula.replace('sqrt(', 'torch.sqrt(')
     formula = formula.replace('abs(', 'torch.abs(')
     formula = formula.replace('pi', str(math.pi))
@@ -165,23 +206,117 @@ class SRTester:
     
     def make_model(self) -> OperationDAG:
         """Create model with current config."""
-        return OperationDAG(
+        # Build operator constraints dict
+        op_constraints = None
+        if any(x is not None for x in [
+            self.config.ops_periodic, self.config.ops_power,
+            self.config.ops_exp, self.config.ops_log,
+            self.config.ops_arithmetic, self.config.ops_aggregation
+        ]):
+            op_constraints = {
+                'periodic': self.config.ops_periodic,
+                'power': self.config.ops_power,
+                'exp': self.config.ops_exp,
+                'log': self.config.ops_log,
+                'arithmetic': self.config.ops_arithmetic,
+                'aggregation': self.config.ops_aggregation,
+            }
+            # Remove None values (use default)
+            op_constraints = {k: v for k, v in op_constraints.items() if v is not None}
+        
+        model = OperationDAG(
             n_inputs=1,
             n_hidden_layers=self.config.hidden_layers,
             nodes_per_layer=self.config.nodes_per_layer,
             n_outputs=1,
             simplified_ops=self.config.simplified_ops,
             fair_mode=self.config.fair_mode,
+            op_constraints=op_constraints,
         )
+        if self.config.precision == 64:
+            model = model.double()
+        return model
     
-    def generate_data(self, formula_str: str) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Generate training data from formula."""
+    def generate_data(self, formula_str: str) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Generate training data from formula.
+        
+        Returns:
+            x: Input tensor
+            y: Output tensor
+            weights: Optional sample weights (1.0 = normal, <1.0 = downweighted near singularities)
+        """
         target_fn = parse_formula(formula_str)
-        x = torch.linspace(self.config.x_min, self.config.x_max, self.config.n_samples).reshape(-1, 1)
-        y = target_fn(x)
+        dtype = torch.float64 if self.config.precision == 64 else torch.float32
+        
+        # Generate x values, optionally avoiding singular points
+        if self.config.sample_avoid:
+            # Create x values that avoid singular points
+            x_list = []
+            avoid_points = self.config.sample_avoid
+            eps = self.config.sample_epsilon
+            
+            # Build valid ranges
+            sorted_avoid = sorted(avoid_points)
+            ranges = []
+            current_start = self.config.x_min
+            
+            for avoid_pt in sorted_avoid:
+                if current_start < avoid_pt - eps:
+                    ranges.append((current_start, avoid_pt - eps))
+                current_start = avoid_pt + eps
+            
+            if current_start < self.config.x_max:
+                ranges.append((current_start, self.config.x_max))
+            
+            # Calculate samples per range (proportional to range size)
+            total_range = sum(r[1] - r[0] for r in ranges)
+            if total_range > 0:
+                for r_start, r_end in ranges:
+                    n_in_range = max(1, int(self.config.n_samples * (r_end - r_start) / total_range))
+                    x_list.append(torch.linspace(r_start, r_end, n_in_range, dtype=dtype))
+                x = torch.cat(x_list).reshape(-1, 1)
+            else:
+                # Fallback if all ranges are invalid
+                x = torch.linspace(self.config.x_min, self.config.x_max, self.config.n_samples, dtype=dtype).reshape(-1, 1)
+        else:
+            x = torch.linspace(self.config.x_min, self.config.x_max, self.config.n_samples, dtype=dtype).reshape(-1, 1)
+        
+        # Auto-domain filtering/shrinking if invalid values
+        if self.config.auto_domain:
+            x_try = x
+            y = None
+            for _ in range(4):
+                y_try = target_fn(x_try)
+                finite_mask = torch.isfinite(y_try).squeeze()
+                if finite_mask.float().mean().item() > 0.9:
+                    x = x_try[finite_mask].reshape(-1, 1)
+                    y = y_try[finite_mask].reshape(-1, 1)
+                    break
+                mid = (x_try.min() + x_try.max()) / 2
+                half = (x_try.max() - x_try.min()) / 2 * 0.75
+                x_try = torch.linspace((mid - half).item(), (mid + half).item(), self.config.n_samples, dtype=dtype).reshape(-1, 1)
+            if y is None:
+                y_try = target_fn(x)
+                finite_mask = torch.isfinite(y_try).squeeze()
+                x = x[finite_mask].reshape(-1, 1)
+                y = y_try[finite_mask].reshape(-1, 1)
+        else:
+            y = target_fn(x)
         if self.config.noise_std > 0:
             y = y + torch.randn_like(y) * self.config.noise_std
-        return x, y
+        
+        # Compute sample weights if requested
+        weights = None
+        if self.config.use_sample_weights and self.config.sample_avoid:
+            eps = self.config.sample_epsilon
+            weights = torch.ones(x.shape[0], dtype=x.dtype)
+            for avoid_pt in self.config.sample_avoid:
+                # Weight = min(1, |x - avoid_pt| / eps)
+                dist = torch.abs(x.squeeze() - avoid_pt)
+                weights = torch.minimum(weights, torch.clamp(dist / eps, min=0.1, max=1.0))
+        
+        return x, y, weights
     
     def run_evolution(self, x: torch.Tensor, y: torch.Tensor, visualizer=None) -> Dict:
         """Run evolutionary training."""
@@ -203,6 +338,7 @@ class SRTester:
             risk_seeking=self.config.risk_seeking,
             risk_seeking_percentile=self.config.risk_seeking_percentile,
             use_curve_classifier=getattr(self.config, 'use_curve_classifier', False),
+            normalize_data=self.config.normalize_data,
         )
         
         x = x.to(self.device)
@@ -339,8 +475,10 @@ def run_single_mode(config: Config):
     print("-" * 70)
     
     # Generate data
-    x, y = tester.generate_data(config.formula)
-    print(f"Data range: x ∈ [{config.x_min:.1f}, {config.x_max:.1f}], {config.n_samples} samples")
+    x, y, weights = tester.generate_data(config.formula)
+    print(f"Data range: x in [{config.x_min:.1f}, {config.x_max:.1f}], {len(x)} samples")
+    if weights is not None:
+        print(f"Using sample weights (domain-aware)")
     
     # Setup visualizer
     visualizer = None
@@ -355,7 +493,7 @@ def run_single_mode(config: Config):
     fast_path_result = None
     if getattr(config, 'use_curve_classifier', False):
         try:
-            from scripts.classifier_fast_path import run_fast_path
+            from scripts.classifier_fast_path import run_fast_path, run_guided_evolution
             from glassbox.sr.evolution import detect_dominant_frequency
             
             x_tensor = x.to(tester.device)
@@ -364,30 +502,117 @@ def run_single_mode(config: Config):
             # Get FFT frequencies for better basis
             detected_omegas = detect_dominant_frequency(x_tensor, y_tensor, n_frequencies=3)
             
+            # Pass operator constraints to fast path (honor --no-ops-* flags)
+            op_constraints = None
+            if any(x is not None for x in [
+                config.ops_periodic, config.ops_power,
+                config.ops_exp, config.ops_log,
+                config.ops_arithmetic, config.ops_aggregation
+            ]):
+                op_constraints = {
+                    'periodic': config.ops_periodic,
+                    'power': config.ops_power,
+                    'exp': config.ops_exp,
+                    'log': config.ops_log,
+                    'arithmetic': config.ops_arithmetic,
+                    'aggregation': config.ops_aggregation,
+                }
+                op_constraints = {k: v for k, v in op_constraints.items() if v is not None}
+
             fast_path_result = run_fast_path(
                 x_tensor, y_tensor,
                 classifier_path="models/curve_classifier.pt",
                 detected_omegas=detected_omegas,
+                op_constraints=op_constraints,
+                auto_expand=True,
             )
             
             if fast_path_result and fast_path_result['mse'] < 0.01:
-                # Fast path succeeded with very low MSE - we're done!
-                elapsed = time.time() - start_time
-                print("\n" + "=" * 70)
-                print("FINAL RESULTS (FAST PATH)")
-                print("=" * 70)
-                print(f"TARGET:     {config.formula}")
-                print(f"DISCOVERED: {fast_path_result['formula']}")
-                print(f"FINAL MSE:  {fast_path_result['mse']:.6f}")
-                print()
-                print("=" * 70)
-                print(f"TOTAL TIME: {elapsed:.2f} seconds (FAST PATH)")
-                print("=" * 70)
-                return
+                # Check if this is an EXACT symbolic match or approximation
+                is_exact = fast_path_result.get('details', {}).get('exact_match', False)
+                
+                if is_exact:
+                    # Fast path found exact symbolic match - we're done!
+                    elapsed = time.time() - start_time
+                    print("\n" + "=" * 70)
+                    print("FINAL RESULTS (FAST PATH - EXACT MATCH)")
+                    print("=" * 70)
+                    print(f"TARGET:     {config.formula}")
+                    print(f"DISCOVERED: {fast_path_result['formula']}")
+                    print(f"FINAL MSE:  {fast_path_result['mse']:.6f}")
+                    print()
+                    print("=" * 70)
+                    print(f"TOTAL TIME: {elapsed:.2f} seconds (FAST PATH)")
+                    print("=" * 70)
+                    return
+
+                # Fast-path only: return after printing best fast-path result
+                if config.fast_path_only:
+                    print("\n" + "=" * 70)
+                    print("FINAL RESULTS (FAST PATH ONLY)")
+                    print("=" * 70)
+                    print(f"TARGET:     {config.formula}")
+                    print(f"DISCOVERED: {fast_path_result['formula']}")
+                    print(f"FINAL MSE:  {fast_path_result['mse']:.6f}")
+                    print("(Note: Fast-path only mode; evolution skipped)")
+                    print("\n" + "=" * 70)
+                    return
+
+                # Fast path found approximation - try guided evolution for exact form
+                print(f"\nFast path found APPROXIMATION (MSE={fast_path_result['mse']:.4f})")
+                print("Attempting GUIDED EVOLUTION to find exact symbolic form...")
+                
+                operator_hints = fast_path_result.get('operator_hints', {})
+                if operator_hints and operator_hints.get('operators'):
+                    guided_result = run_guided_evolution(
+                        x_tensor, y_tensor,
+                        operator_hints,
+                        generations=30,
+                        population_size=25,
+                        device=str(tester.device),
+                        visualizer=visualizer,
+                    )
+                    
+                    if guided_result and guided_result['mse'] < fast_path_result['mse']:
+                        # Guided evolution found better result
+                        elapsed = time.time() - start_time
+                        print("\n" + "=" * 70)
+                        print("FINAL RESULTS (GUIDED EVOLUTION)")
+                        print("=" * 70)
+                        print(f"TARGET:     {config.formula}")
+                        print(f"FAST-PATH:  {fast_path_result['formula']}")
+                        print(f"EVOLVED:    {guided_result['formula']}")
+                        print(f"FINAL MSE:  {guided_result['mse']:.6f}")
+                        print()
+                        print("=" * 70)
+                        print(f"TOTAL TIME: {elapsed:.2f} seconds (GUIDED)")
+                        print("=" * 70)
+                        return
+                    else:
+                        # Guided evolution didn't improve - use fast-path result
+                        elapsed = time.time() - start_time
+                        print("\n" + "=" * 70)
+                        print("FINAL RESULTS (FAST PATH - APPROXIMATION)")
+                        print("=" * 70)
+                        print(f"TARGET:     {config.formula}")
+                        print(f"DISCOVERED: {fast_path_result['formula']}")
+                        print(f"FINAL MSE:  {fast_path_result['mse']:.6f}")
+                        print("(Note: This is an approximation, not exact symbolic form)")
+                        print()
+                        print("=" * 70)
+                        print(f"TOTAL TIME: {elapsed:.2f} seconds (FAST PATH)")
+                        print("=" * 70)
+                        return
+                else:
+                    # No operator hints - fall through to full evolution
+                    print("No operator hints extracted, falling back to full evolution...")
             elif fast_path_result:
                 print(f"\nFast path MSE ({fast_path_result['mse']:.4f}) > 0.01, falling back to evolution...")
         except Exception as e:
-            print(f"Fast path error: {e}, falling back to evolution...")
+            import traceback
+            print(f"Fast path error: {e}")
+            traceback.print_exc()
+            print("Falling back to evolution...")
     
     # Phase 1: Structure Discovery (if fast path didn't succeed)
     print("\n" + "=" * 70)
@@ -399,26 +624,26 @@ def run_single_mode(config: Config):
     phase1_formula = results['formula']
     phase1_mse = results['final_mse']
     
-    print(f"\nPhase 1 Result: {phase1_formula}")
+    print(f"\\nPhase 1 Result: {sanitize_formula(phase1_formula)}")
     print(f"Phase 1 MSE: {phase1_mse:.4f}")
     
     # Phase 2: Coefficient Refinement (Hybrid)
-    print("\n" + "=" * 70)
+    print("\\n" + "=" * 70)
     print("PHASE 2: HYBRID COEFFICIENT REFINEMENT")
     print("=" * 70)
     
     # Method A: Gradient
-    print("\n>>> Method A: Gradient Refinement...")
+    print("\\n>>> Method A: Gradient Refinement...")
     model_a = copy.deepcopy(phase1_model)
     mse_a, formula_a = tester.run_gradient_refinement(model_a, x.to(tester.device), y.to(tester.device))
-    print(f"Method A: MSE={mse_a:.6f}, Formula={formula_a}")
+    print(f"Method A: MSE={mse_a:.6f}, Formula={sanitize_formula(formula_a)}")
     
     # Method B: Basis Regression
-    print("\n>>> Method B: Pure Basis Regression...")
+    print("\\n>>> Method B: Pure Basis Regression...")
     result_b = tester.run_phase2_regression(x.to(tester.device), y.to(tester.device), phase1_formula)
     mse_b = result_b['mse']
     formula_b = result_b['formula']
-    print(f"Method B: MSE={mse_b:.6f}, Formula={formula_b}")
+    print(f"Method B: MSE={mse_b:.6f}, Formula={sanitize_formula(formula_b)}")
     
     # Pick winner
     if math.isnan(mse_a): mse_a = float('inf')
@@ -440,14 +665,14 @@ def run_single_mode(config: Config):
         pruner = PostTrainingPruner(phase1_model, x.to(tester.device), y.to(tester.device))
         pruner.sensitivity_analysis(verbose=True)
         pruner.recursive_graph_prune(importance_threshold=0.01, verbose=True)
-        print(f"Pruned formula: {pruner.get_formula()}")
+        print(f"Pruned formula: {sanitize_formula(pruner.get_formula())}")
     
     # Final summary
     print("\n" + "=" * 70)
     print("FINAL RESULTS")
     print("=" * 70)
     print(f"TARGET:     {config.formula}")
-    print(f"DISCOVERED: {final_formula}")
+    print(f"DISCOVERED: {sanitize_formula(final_formula)}")
     print(f"FINAL MSE:  {final_mse:.6f}")
     
     # MLP comparison
@@ -495,9 +720,11 @@ def run_evolution_mode(config: Config):
         print(f"TASK: {name}")
         print("=" * 70)
         
-        x, y = tester.generate_data(formula)
+        x, y, weights = tester.generate_data(formula)
         perm = torch.randperm(x.shape[0])
         x, y = x[perm], y[perm]
+        if weights is not None:
+            weights = weights[perm]
         
         n_train = int(0.8 * len(x))
         x_train, x_val = x[:n_train], x[n_train:]
@@ -550,7 +777,7 @@ def run_pruning_mode(config: Config):
     tester = SRTester(config)
     formula = config.formula or "sin(x) + x^2"
     
-    x, y = tester.generate_data(formula)
+    x, y, weights = tester.generate_data(formula)
     x = x.to(tester.device)
     y = y.to(tester.device)
     
@@ -710,6 +937,38 @@ Examples:
                       help='Enable FairDARTS independent sigmoids')
     arch.add_argument('--no-fair-mode', dest='fair_mode', action='store_false')
     
+    # Operator Constraints
+    ops = parser.add_argument_group('Operator Constraints (override defaults)')
+    ops.add_argument('--ops-periodic', dest='ops_periodic', action='store_true', default=None,
+                     help='Enable periodic ops (sin, cos)')
+    ops.add_argument('--no-ops-periodic', dest='ops_periodic', action='store_false',
+                     help='Disable periodic ops')
+    ops.add_argument('--ops-power', dest='ops_power', action='store_true', default=None,
+                     help='Enable power ops (x^n, sqrt)')
+    ops.add_argument('--no-ops-power', dest='ops_power', action='store_false',
+                     help='Disable power ops')
+    ops.add_argument('--ops-exp', dest='ops_exp', action='store_true', default=None,
+                     help='Enable exp op')
+    ops.add_argument('--no-ops-exp', dest='ops_exp', action='store_false',
+                     help='Disable exp op')
+    ops.add_argument('--ops-log', dest='ops_log', action='store_true', default=None,
+                     help='Enable log op')
+    ops.add_argument('--no-ops-log', dest='ops_log', action='store_false',
+                     help='Disable log op')
+    ops.add_argument('--ops-arithmetic', dest='ops_arithmetic', action='store_true', default=None,
+                     help='Enable arithmetic ops (+, *)')
+    ops.add_argument('--no-ops-arithmetic', dest='ops_arithmetic', action='store_false',
+                     help='Disable arithmetic ops')
+    ops.add_argument('--ops-aggregation', dest='ops_aggregation', action='store_true', default=None,
+                     help='Enable aggregation ops (sum, mean, max)')
+    ops.add_argument('--no-ops-aggregation', dest='ops_aggregation', action='store_false',
+                     help='Disable aggregation ops')
+
+    # Fast Path Control
+    fp = parser.add_argument_group('Fast Path Control')
+    fp.add_argument('--fast-path-only', action='store_true', default=False,
+                    help='Only run fast-path; do not run evolution fallback')
+    
     # Evolution
     evo = parser.add_argument_group('Evolution Hyperparameters')
     evo.add_argument('--population', '-p', type=int, default=30, help='Population size (10-100)')
@@ -741,6 +1000,23 @@ Examples:
     data.add_argument('--x-max', type=float, default=6.0, help='Maximum x value')
     data.add_argument('--n-samples', type=int, default=300, help='Number of data points')
     data.add_argument('--noise-std', type=float, default=0.0, help='Noise standard deviation')
+    data.add_argument('--precision', type=int, choices=[32, 64], default=32,
+                      help='Numeric precision for data (32 or 64)')
+    data.add_argument('--normalize-data', dest='normalize_data', action='store_true', default=False,
+                      help='Normalize data before evolution training')
+    data.add_argument('--no-normalize-data', dest='normalize_data', action='store_false')
+    data.add_argument('--auto-domain', dest='auto_domain', action='store_true', default=True,
+                      help='Auto-shrink domain if formula invalid in range')
+    data.add_argument('--no-auto-domain', dest='auto_domain', action='store_false')
+    
+    # Domain-Aware Sampling
+    domain = parser.add_argument_group('Domain-Aware Sampling')
+    domain.add_argument('--sample-avoid', type=float, nargs='*', default=None,
+                        help='Singular points to avoid (e.g., --sample-avoid 1 -1 for 1/(1-x^2))')
+    domain.add_argument('--sample-epsilon', type=float, default=0.1,
+                        help='Distance to stay from singular points (default: 0.1)')
+    domain.add_argument('--use-sample-weights', action='store_true', default=False,
+                        help='Use sample weights to downweight points near singularities')
     
     # Other
     other = parser.add_argument_group('Other Options')
@@ -787,12 +1063,31 @@ def main():
     config.x_max = args.x_max
     config.n_samples = args.n_samples
     config.noise_std = args.noise_std
+    config.precision = args.precision
+    config.normalize_data = args.normalize_data
+    config.auto_domain = args.auto_domain
     config.lite_mode = args.lite
     config.no_viz = args.no_viz
     config.device = args.device
     config.seed = args.seed
     config.compare_mlp = args.compare_mlp
     config.enable_pruning = args.pruning
+    
+    # Operator constraints
+    config.ops_periodic = args.ops_periodic
+    config.ops_power = args.ops_power
+    config.ops_exp = args.ops_exp
+    config.ops_log = args.ops_log
+    config.ops_arithmetic = args.ops_arithmetic
+    config.ops_aggregation = args.ops_aggregation
+    
+    # Domain-aware sampling
+    config.sample_avoid = args.sample_avoid
+    config.sample_epsilon = args.sample_epsilon
+    config.use_sample_weights = args.use_sample_weights
+
+    # Fast path only
+    config.fast_path_only = args.fast_path_only
     
     # Run selected mode
     if config.mode == "single":

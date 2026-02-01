@@ -64,6 +64,7 @@ class OperationDAG(nn.Module):
         sparse_routing: bool = False,  # Use sparse top-K routing for scalability
         sparse_topk: int = 5,          # Top-K sources for sparse routing
         source_window: int = -1,       # NEW: Limit sources to inputs + last N layers (-1 = unlimited)
+        op_constraints: Optional[Dict[str, bool]] = None,  # Operator constraints
     ):
         """
         Args:
@@ -85,6 +86,10 @@ class OperationDAG(nn.Module):
                           Setting to 1 means each layer only sees inputs + previous layer.
                           This caps n_sources at: n_inputs + source_window * nodes_per_layer
                           SCALABILITY: Reduces O(L²) to O(L) for deep networks.
+            op_constraints: Dict of operator constraints, e.g.:
+                           {'periodic': False, 'exp': True, 'log': False}
+                           Keys: 'periodic', 'power', 'exp', 'log', 'arithmetic', 'aggregation'
+                           True = enabled, False = disabled, missing = use default
         """
         super().__init__()
         self.n_inputs = n_inputs
@@ -98,6 +103,7 @@ class OperationDAG(nn.Module):
         self.sparse_routing = sparse_routing
         self.sparse_topk = sparse_topk
         self.source_window = source_window
+        self.op_constraints = op_constraints
         
         # Build layers
         self.layers = nn.ModuleList()
@@ -122,6 +128,7 @@ class OperationDAG(nn.Module):
                 fair_mode=fair_mode,
                 sparse_routing=sparse_routing,
                 sparse_topk=sparse_topk,
+                op_constraints=op_constraints,
             )
             self.layers.append(layer)
         

@@ -3,3 +3,5 @@ matplotlib
 graphviz
 torch
 rich
+scipy
+tqdm

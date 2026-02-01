@@ -13,8 +13,34 @@ import argparse
 import random
 from typing import List, Tuple, Dict, Set
 from pathlib import Path
-from scipy.stats import skew, kurtosis
-from tqdm import tqdm
+
+# Make scipy optional - provide fallbacks
+try:
+    from scipy.stats import skew, kurtosis
+except ImportError:
+    # Fallback implementations
+    def skew(x):
+        """Simple skewness calculation."""
+        m = np.mean(x)
+        s = np.std(x)
+        if s < 1e-10:
+            return 0.0
+        return np.mean(((x - m) / s) ** 3)
+    
+    def kurtosis(x):
+        """Simple kurtosis calculation."""
+        m = np.mean(x)
+        s = np.std(x)
+        if s < 1e-10:
+            return 0.0
+        return np.mean(((x - m) / s) ** 4) - 3.0
+
+# Make tqdm optional
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(x, **kwargs):
+        return x  # Just pass through
 
 
 # =============================================================================
@@ -38,6 +64,9 @@ OPERATOR_CLASSES = {
     # Binary indicators
     'addition': 9,       # Terms added
     'multiplication': 10, # Terms multiplied
+    
+    # NEW: Rational functions
+    'rational': 11,      # 1/(x+c), x/(x²+c) type
 }
 
 N_CLASSES = len(OPERATOR_CLASSES)
@@ -118,7 +147,28 @@ COMPOUND_TEMPLATES = [
     ("np.log(np.abs(x) + 1) + np.sin(x)", {'log', 'sin', 'periodic', 'exponential', 'addition'}),
 ]
 
-ALL_TEMPLATES = SIMPLE_TEMPLATES + COMPOUND_TEMPLATES
+# NEW: Rational function templates
+RATIONAL_TEMPLATES = [
+    # Simple rational (1/x type)
+    ("1 / (np.abs(x) + {c})", {'rational', 'power'}),
+    ("{a} / (np.abs(x) + {c})", {'rational', 'power', 'multiplication'}),
+    
+    # Quadratic denominator (Lorentzian type)
+    ("1 / (x**2 + {c})", {'rational', 'power'}),
+    ("{a} / (x**2 + {c})", {'rational', 'power', 'multiplication'}),
+    ("x / (x**2 + {c})", {'rational', 'power'}),
+    
+    # Mixed rational
+    ("(x + {a}) / (x**2 + {b})", {'rational', 'power', 'addition'}),
+    ("x**2 / (x**2 + {c})", {'rational', 'power'}),
+    ("(x**2 + {a}) / (x**2 + {b})", {'rational', 'power', 'addition'}),
+    
+    # Rational + other
+    ("1 / (x**2 + 1) + np.sin(x)", {'rational', 'sin', 'periodic', 'addition'}),
+    ("x / (x**2 + 1) + {a}", {'rational', 'power', 'addition'}),
+]
+
+ALL_TEMPLATES = SIMPLE_TEMPLATES + COMPOUND_TEMPLATES + RATIONAL_TEMPLATES
 
 
 # =============================================================================
@@ -204,14 +254,57 @@ def extract_stat_features(y: np.ndarray) -> np.ndarray:
     return np.array(features)
 
 
+def extract_curvature_features(y: np.ndarray, n_points: int = 32) -> np.ndarray:
+    """
+    Extract curvature features to distinguish rational from exponential decay.
+    Rational functions have distinct acceleration profiles.
+    """
+    # First derivative (velocity)
+    dy = np.gradient(y)
+    
+    # Second derivative (acceleration)
+    ddy = np.gradient(dy)
+    
+    # Curvature: κ = y'' / (1 + y'^2)^1.5
+    curvature = ddy / (1 + dy**2)**1.5
+    
+    # Handle infinities
+    curvature = np.clip(curvature, -100, 100)
+    curvature = np.nan_to_num(curvature, nan=0.0, posinf=100, neginf=-100)
+    
+    # Resample to fixed size
+    curvature_resampled = np.interp(
+        np.linspace(0, 1, n_points),
+        np.linspace(0, 1, len(curvature)),
+        curvature
+    )
+    
+    # Normalize
+    curv_max = np.abs(curvature_resampled).max()
+    if curv_max > 1e-10:
+        curvature_resampled = curvature_resampled / curv_max
+    
+    # Additional curvature statistics
+    curvature_stats = np.array([
+        np.mean(curvature_resampled),
+        np.std(curvature_resampled),
+        np.min(curvature_resampled),
+        np.max(curvature_resampled),
+        np.sum(np.diff(np.sign(curvature_resampled)) != 0),  # Sign changes
+    ])
+    
+    return np.concatenate([curvature_resampled, curvature_stats])
+
+
 def extract_all_features(y: np.ndarray) -> np.ndarray:
     """Combine all features into single vector."""
     raw = extract_raw_features(y, n_points=128)      # 128
     fft = extract_fft_features(y, n_freqs=32)        # 32
     deriv = extract_derivative_features(y, n_points=64)  # 128
     stats = extract_stat_features(y)                  # 9
+    curv = extract_curvature_features(y, n_points=32) # 37 (32 + 5)
     
-    return np.concatenate([raw, fft, deriv, stats])   # Total: 297
+    return np.concatenate([raw, fft, deriv, stats, curv])  # Total: 334
 
 
 # =============================================================================
@@ -237,7 +330,9 @@ def generate_random_formula() -> Tuple[str, Set[str]]:
 def evaluate_formula(formula: str, x: np.ndarray) -> np.ndarray:
     """Safely evaluate a formula string."""
     try:
-        y = eval(formula, {"x": x, "np": np})
+        # Suppress warnings during evaluation (domain errors are expected)
+        with np.errstate(all='ignore'):
+            y = eval(formula, {"x": x, "np": np})
         
         # Check for invalid values
         if np.any(np.isnan(y)) or np.any(np.isinf(y)):
@@ -266,6 +361,7 @@ def generate_dataset(
     x_range: Tuple[float, float] = (-5, 5),
     n_points: int = 256,
     show_progress: bool = True,
+    templates: List[Tuple[str, Set[str]]] = ALL_TEMPLATES,
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
     Generate labeled curve dataset.
@@ -282,15 +378,96 @@ def generate_dataset(
     formulas_list = []
     
     iterator = range(n_samples * 2)  # Generate extra to account for failures
-    if show_progress:
-        iterator = tqdm(iterator, desc="Generating curves")
     
-    for _ in iterator:
-        if len(features_list) >= n_samples:
-            break
+    # Multiprocessing for speed
+    import multiprocessing
+    from functools import partial
+    
+    # Determine number of processes
+    n_workers = max(1, multiprocessing.cpu_count() - 1)
+    
+    # Split workload
+    chunk_size = n_samples // n_workers
+    chunks = [chunk_size] * n_workers
+    # Add remainder to last chunk
+    chunks[-1] += n_samples - sum(chunks)
+    
+    print(f"Generating data using {n_workers} workers...")
+    
+    with multiprocessing.Pool(n_workers) as pool:
+        # Create partial function with fixed arguments
+        worker_func = partial(
+            generate_chunk, 
+            x_range=x_range, 
+            n_points=n_points,
+            templates=templates,
+        )
         
-        # Generate random formula
-        formula, operators = generate_random_formula()
+        # Run workers
+        results = list(tqdm(
+            pool.imap(worker_func, chunks), 
+            total=n_workers, 
+            desc="Generating chunks"
+        ))
+    
+    # Combine results
+    features_list = []
+    labels_list = []
+    formulas_list = []
+    
+    for feats, lbls, forms in results:
+        features_list.extend(feats)
+        labels_list.extend(lbls)
+        formulas_list.extend(forms)
+    
+    # Shuffle
+    indices = np.random.permutation(len(features_list))
+    features = np.array(features_list, dtype=np.float32)[indices]
+    labels = np.array(labels_list, dtype=np.float32)[indices]
+    formulas = [formulas_list[i] for i in indices]
+    
+    # Trim to exact size
+    features = features[:n_samples]
+    labels = labels[:n_samples]
+    formulas = formulas[:n_samples]
+    
+    return features, labels, formulas
+
+
+def generate_chunk(
+    n: int,
+    x_range: Tuple[float, float],
+    n_points: int,
+    templates: List[Tuple[str, Set[str]]],
+) -> Tuple[List, List, List]:
+    """Generate a chunk of samples (worker function)."""
+    # Re-seed for each process to ensure diversity
+    np.random.seed()
+    random.seed()
+    
+    x = np.linspace(x_range[0], x_range[1], n_points)
+    
+    features_local = []
+    labels_local = []
+    formulas_local = []
+    
+    # Generate batch with some buffer for failures
+    target = n
+    attempts = 0
+    max_attempts = n * 5
+    
+    while len(features_local) < target and attempts < max_attempts:
+        attempts += 1
+        
+        # Generate random formula from selected template pool
+        template, operators = random.choice(templates)
+        formula = template.format(
+            a=np.random.uniform(-3, 3),
+            b=np.random.uniform(0.5, 3),
+            c=np.random.uniform(-2, 2),
+            d=np.random.uniform(0.5, 3),
+            p=np.random.choice([0.5, 2, 3, 4, -1, -0.5]),
+        )
         
         # Evaluate
         y = evaluate_formula(formula, x)
@@ -308,15 +485,11 @@ def generate_dataset(
         # Create labels
         labels = operators_to_labels(operators)
         
-        features_list.append(features)
-        labels_list.append(labels)
-        formulas_list.append(formula)
-    
-    return (
-        np.array(features_list, dtype=np.float32),
-        np.array(labels_list, dtype=np.float32),
-        formulas_list,
-    )
+        features_local.append(features)
+        labels_local.append(labels)
+        formulas_local.append(formula)
+            
+    return features_local, labels_local, formulas_local
 
 
 def save_dataset(
@@ -358,6 +531,8 @@ def main():
                         help="Maximum x value (default: 5)")
     parser.add_argument("--n-points", type=int, default=256,
                         help="Number of points per curve (default: 256)")
+    parser.add_argument("--rational-ratio", type=float, default=0.0,
+                        help="Fraction of samples forced to be rational P/Q (0-1). Example: 0.5 = half rational")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
     
@@ -374,16 +549,46 @@ def main():
     print(f"Generating {args.n_samples} curves...")
     print(f"  x range: [{args.x_min}, {args.x_max}]")
     print(f"  n_points: {args.n_points}")
+    if args.rational_ratio > 0:
+        print(f"  rational_ratio: {args.rational_ratio:.2f}")
     print(f"  n_classes: {N_CLASSES}")
     print(f"  Operators: {list(OPERATOR_CLASSES.keys())}")
     print()
     
-    # Generate
-    features, labels, formulas = generate_dataset(
-        n_samples=args.n_samples,
-        x_range=(args.x_min, args.x_max),
-        n_points=args.n_points,
-    )
+    # Generate (optionally balanced with rational-heavy subset)
+    if args.rational_ratio > 0:
+        n_rational = int(args.n_samples * args.rational_ratio)
+        n_general = args.n_samples - n_rational
+        print(f"  Generating {n_rational} rational + {n_general} general samples")
+        
+        feats_r, labels_r, forms_r = generate_dataset(
+            n_samples=n_rational,
+            x_range=(args.x_min, args.x_max),
+            n_points=args.n_points,
+            templates=RATIONAL_TEMPLATES,
+        )
+        feats_g, labels_g, forms_g = generate_dataset(
+            n_samples=n_general,
+            x_range=(args.x_min, args.x_max),
+            n_points=args.n_points,
+            templates=ALL_TEMPLATES,
+        )
+        
+        features = np.concatenate([feats_r, feats_g], axis=0)
+        labels = np.concatenate([labels_r, labels_g], axis=0)
+        formulas = forms_r + forms_g
+        
+        # Shuffle combined
+        indices = np.random.permutation(len(features))
+        features = features[indices]
+        labels = labels[indices]
+        formulas = [formulas[i] for i in indices]
+    else:
+        features, labels, formulas = generate_dataset(
+            n_samples=args.n_samples,
+            x_range=(args.x_min, args.x_max),
+            n_points=args.n_points,
+        )
     
     # Stats
     print(f"\nGenerated {len(features)} valid samples")

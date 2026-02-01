@@ -80,9 +80,14 @@ def load_classifier(model_path: str = "models/curve_classifier.pt") -> nn.Module
     _cached_operator_classes = checkpoint.get('operator_classes', list(OPERATOR_CLASSES.keys()))
     n_classes = len(_cached_operator_classes)
     
+    # Determine input features from checkpoint weights
+    state_dict = checkpoint['model_state_dict']
+    input_weights = state_dict['net.0.weight']
+    n_features = input_weights.shape[1]
+    
     # Create model
-    model = CurveClassifierMLP(n_features=297, n_classes=n_classes, hidden=256)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model = CurveClassifierMLP(n_features=n_features, n_classes=n_classes, hidden=256)
+    model.load_state_dict(state_dict)
     model.eval()
     
     _cached_classifier = model
@@ -182,12 +187,14 @@ def bias_onn_from_predictions(
         unary_map = {
             'sin': 0, 'cos': 0, 'periodic': 0,  # MetaPeriodic
             'power': 1, 'polynomial': 1, 'identity': 1,  # MetaPower
+            'rational': 1,  # Bias toward reciprocal via MetaPower
         }
         n_unary = 2
     else:
         unary_map = {
             'sin': 0, 'cos': 0, 'periodic': 0,  # MetaPeriodic
             'power': 1, 'polynomial': 1, 'identity': 1,  # MetaPower
+            'rational': 1,  # Bias toward reciprocal via MetaPower
             'exp': 2, 'exponential': 2,  # MetaExp
             'log': 3,  # MetaLog
         }
