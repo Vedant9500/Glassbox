@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional
 import urllib.request
@@ -7,7 +8,13 @@ import urllib.request
 import numpy as np
 import torch
 
-from scripts.classifier_fast_path import run_fast_path
+# Add repo root and scripts dir to path for imports
+repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+scripts_dir = os.path.join(repo_root, "scripts")
+sys.path.insert(0, repo_root)
+sys.path.insert(0, scripts_dir)
+
+from classifier_fast_path import run_fast_path
 from glassbox.sr.evolution import detect_dominant_frequency
 
 
@@ -60,6 +67,10 @@ def run_dataset(
     sample: Optional[int],
     seed: Optional[int],
     auto_expand: bool,
+    device: Optional[str],
+    exact_match_threads: int,
+    exact_match_enabled: bool,
+    exact_match_max_basis: int,
 ) -> Dict[str, object]:
     name = dataset["name"]
     url = dataset["url"]
@@ -76,15 +87,17 @@ def run_dataset(
 
     x = data[:, :-1]
     y = data[:, -1]
-    if x.shape[1] != 1:
-        print(f"SKIP {name}: expects 1D inputs, got {x.shape[1]}D")
-        return {"name": name, "status": "skip", "reason": "multi_dim_inputs"}
+    if x.shape[1] < 1:
+        print(f"SKIP {name}: expected at least 1 input, got {x.shape[1]}")
+        return {"name": name, "status": "skip", "reason": "no_inputs"}
 
     dtype = torch.float64 if precision == 64 else torch.float32
-    x_t = torch.tensor(x.squeeze(), dtype=dtype).reshape(-1, 1)
+    x_t = torch.tensor(x, dtype=dtype)
     y_t = torch.tensor(y, dtype=dtype).reshape(-1, 1)
 
-    detected_omegas = detect_dominant_frequency(x_t, y_t, n_frequencies=3)
+    detected_omegas = None
+    if x_t.shape[1] == 1:
+        detected_omegas = detect_dominant_frequency(x_t, y_t, n_frequencies=3)
 
     print("\n" + "=" * 72)
     print(f"DATASET: {name} | rows={x_t.shape[0]} | precision={precision}")
@@ -97,6 +110,10 @@ def run_dataset(
         detected_omegas=detected_omegas,
         op_constraints=None,
         auto_expand=auto_expand,
+        device=device,
+        exact_match_threads=exact_match_threads,
+        exact_match_enabled=exact_match_enabled,
+        exact_match_max_basis=exact_match_max_basis,
     )
 
     if result is None:
@@ -158,6 +175,30 @@ def main() -> None:
         action="store_true",
         help="Disable auto basis expansion",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="Device for classifier/refinement (auto uses CUDA if available)",
+    )
+    parser.add_argument(
+        "--exact-match-threads",
+        type=int,
+        default=1,
+        help="Threads for exact-match search (pairs/triples); 1 disables threading",
+    )
+    parser.add_argument(
+        "--skip-exact-match",
+        action="store_true",
+        help="Skip exact-match combinatorial search",
+    )
+    parser.add_argument(
+        "--exact-match-max-basis",
+        type=int,
+        default=150,
+        help="Skip exact-match search when basis exceeds this size",
+    )
 
     args = parser.parse_args()
 
@@ -168,6 +209,10 @@ def main() -> None:
     sample = args.sample if args.sample and args.sample > 0 else None
     seed = args.seed
     auto_expand = not args.no_auto_expand
+    device = args.device
+    exact_match_threads = max(1, args.exact_match_threads)
+    exact_match_enabled = not args.skip_exact_match
+    exact_match_max_basis = args.exact_match_max_basis
 
     results = []
     for dataset in DATASETS:
@@ -181,6 +226,10 @@ def main() -> None:
                 sample,
                 seed,
                 auto_expand,
+                device,
+                exact_match_threads,
+                exact_match_enabled,
+                exact_match_max_basis,
             )
         )
 

@@ -36,16 +36,16 @@ BENCHMARKS = [
         "formula": "x**3 / (exp(x) - 1)",
         "args": "--x-min 0.2 --x-max 5 --n-samples 400 --full-ops --generations 50 --population 30 --no-ops-periodic --ops-exp --sample-avoid 0 --sample-epsilon 0.2"
     },
-    {
-        "name": "Damped Oscillator",
-        "formula": "exp(-0.1*x) * cos(2*x)",
-        "args": "--x-min 0 --x-max 10 --n-samples 400 --full-ops --ops-periodic --ops-exp"
-    },
-    {
-        "name": "Nesting Doll",
-        "formula": "sin(cos(x)) + exp(sin(x))",
-        "args": "--x-min -3.14 --x-max 3.14 --n-samples 500 --full-ops --generations 60 --population 40 --ops-periodic --ops-exp"
-    },
+    # {
+    #     "name": "Damped Oscillator",
+    #     "formula": "exp(-0.1*x) * cos(2*x)",
+    #     "args": "--x-min 0 --x-max 10 --n-samples 400 --full-ops --ops-periodic --ops-exp"
+    # },
+    # {
+    #     "name": "Nesting Doll",
+    #     "formula": "sin(cos(x)) + exp(sin(x))",
+    #     "args": "--x-min -3.14 --x-max 3.14 --n-samples 500 --full-ops --generations 60 --population 40 --ops-periodic --ops-exp"
+    # },
     {
         "name": "Constant Hunter",
         "formula": "pi * x**2 + sqrt(2) * sin(x) - 1.618",

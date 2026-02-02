@@ -8,10 +8,29 @@ This can reduce solve time from ~300s to <10s for well-predicted formulas.
 """
 
 import re
+import math
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import torch
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
+_warned_no_cuda = False
+
+
+def _resolve_device(device: Optional[str] = None) -> torch.device:
+    global _warned_no_cuda
+    if device is None or device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and not torch.cuda.is_available():
+        if not _warned_no_cuda:
+            print("CUDA requested but not available; falling back to CPU.")
+            _warned_no_cuda = True
+        return torch.device("cpu")
+
+    return resolved
 
 
 def lasso_coordinate_descent(
@@ -100,8 +119,12 @@ def build_basis_from_predictions(
         basis: (N, n_basis) matrix
         names: List of basis function names
     """
-    x = x.flatten()
-    n = len(x)
+    if x.ndim == 1:
+        x = x.reshape(-1, 1)
+    elif x.ndim != 2:
+        raise ValueError(f"Expected x to be 1D or 2D, got shape {x.shape}")
+
+    n, n_vars = x.shape
     
     basis_list = []
     names = []
@@ -116,23 +139,27 @@ def build_basis_from_predictions(
     allow_periodic = constraints.get('periodic', True)
     allow_exp = constraints.get('exp', True)
     allow_log = constraints.get('log', True)
+    allow_arithmetic = constraints.get('arithmetic', True)
+
+    def var_name(i: int) -> str:
+        return "x" if n_vars == 1 else f"x{i+1}"
 
     # Polynomial terms (always include in universal mode)
     include_polynomial = allow_power and (
-        universal_basis or 
-        predictions.get('power', 0) >= threshold or 
+        universal_basis or
+        predictions.get('power', 0) >= threshold or
         predictions.get('polynomial', 0) >= threshold
     )
-    
+
     if include_polynomial:
-        # Linear term
-        basis_list.append(x)
-        names.append("x")
-        
-        # Higher powers
-        for p in range(2, max_power + 1):
-            basis_list.append(x ** p)
-            names.append(f"x^{p}")
+        for i in range(n_vars):
+            xi = x[:, i]
+            basis_list.append(xi)
+            names.append(var_name(i))
+
+            for p in range(2, max_power + 1):
+                basis_list.append(xi ** p)
+                names.append(f"{var_name(i)}^{p}")
     
     # Periodic operations - build comprehensive omega list
     # Always include common frequencies: 1.0, 2.0, 0.5
@@ -146,35 +173,37 @@ def build_basis_from_predictions(
     # Periodic terms (always include in universal mode)
     include_periodic = allow_periodic and (
         universal_basis or
-        predictions.get('sin', 0) >= threshold or 
-        predictions.get('cos', 0) >= threshold or 
+        predictions.get('sin', 0) >= threshold or
+        predictions.get('cos', 0) >= threshold or
         predictions.get('periodic', 0) >= threshold
     )
-    
+
     if include_periodic:
-        # Sin terms
-        for omega in omegas[:4]:  # Top 4 frequencies
-            basis_list.append(np.sin(omega * x))
-            if omega == 1.0:
-                names.append("sin(x)")
-            elif omega == 2.0:
-                names.append("sin(2*x)")
-            elif omega == 0.5:
-                names.append("sin(x/2)")
-            else:
-                names.append(f"sin({omega:.2f}*x)")
-        
-        # Cos terms
-        for omega in omegas[:4]:
-            basis_list.append(np.cos(omega * x))
-            if omega == 1.0:
-                names.append("cos(x)")
-            elif omega == 2.0:
-                names.append("cos(2*x)")
-            elif omega == 0.5:
-                names.append("cos(x/2)")
-            else:
-                names.append(f"cos({omega:.2f}*x)")
+        for i in range(n_vars):
+            xi = x[:, i]
+            name = var_name(i)
+
+            for omega in omegas[:4]:  # Top 4 frequencies
+                basis_list.append(np.sin(omega * xi))
+                if omega == 1.0:
+                    names.append(f"sin({name})")
+                elif omega == 2.0:
+                    names.append(f"sin(2*{name})")
+                elif omega == 0.5:
+                    names.append(f"sin({name}/2)")
+                else:
+                    names.append(f"sin({omega:.2f}*{name})")
+
+            for omega in omegas[:4]:
+                basis_list.append(np.cos(omega * xi))
+                if omega == 1.0:
+                    names.append(f"cos({name})")
+                elif omega == 2.0:
+                    names.append(f"cos(2*{name})")
+                elif omega == 0.5:
+                    names.append(f"cos({name}/2)")
+                else:
+                    names.append(f"cos({omega:.2f}*{name})")
     
     # Exponential operations (only if predicted OR universal)
     include_exp = allow_exp and (
@@ -183,139 +212,150 @@ def build_basis_from_predictions(
         predictions.get('exponential', 0) >= threshold
     )
     if include_exp:
-        # Clamp to prevent overflow
-        x_clamp = np.clip(x, -10, 10)
-        exp_x = np.exp(x_clamp)
-        basis_list.append(exp_x)
-        names.append("exp(x)")
-        basis_list.append(np.exp(-x_clamp))
-        names.append("exp(-x)")
-        # Gaussian
-        basis_list.append(np.exp(-x**2))
-        names.append("exp(-x^2)")
-        
-        # Planck-style terms: x^n / (exp(x) - 1)
-        denom = np.maximum(exp_x - 1.0, 1e-6)
-        basis_list.append(1.0 / denom)
-        names.append("1/(exp(x)-1)")
-        basis_list.append(x / denom)
-        names.append("x/(exp(x)-1)")
-        basis_list.append((x ** 2) / denom)
-        names.append("x^2/(exp(x)-1)")
-        basis_list.append((x ** 3) / denom)
-        names.append("x^3/(exp(x)-1)")
+        for i in range(n_vars):
+            xi = x[:, i]
+            name = var_name(i)
+            x_clamp = np.clip(xi, -10, 10)
+            exp_x = np.exp(x_clamp)
+            basis_list.append(exp_x)
+            names.append(f"exp({name})")
+            basis_list.append(np.exp(-x_clamp))
+            names.append(f"exp(-{name})")
+            basis_list.append(np.exp(-xi**2))
+            names.append(f"exp(-{name}^2)")
+
+            denom = np.maximum(exp_x - 1.0, 1e-6)
+            basis_list.append(1.0 / denom)
+            names.append(f"1/(exp({name})-1)")
+            basis_list.append(xi / denom)
+            names.append(f"{name}/(exp({name})-1)")
+            basis_list.append((xi ** 2) / denom)
+            names.append(f"{name}^2/(exp({name})-1)")
+            basis_list.append((xi ** 3) / denom)
+            names.append(f"{name}^3/(exp({name})-1)")
     
     # Logarithmic operations (always include in universal mode for Nguyen-7 etc.)
     if allow_log and (universal_basis or predictions.get('log', 0) >= threshold):
-        # Avoid log(0) issues
-        x_safe = np.maximum(np.abs(x), 1e-10)
-        basis_list.append(np.log(x_safe + 1))
-        names.append("log(x+1)")
-        basis_list.append(np.log(x_safe**2 + 1))
-        names.append("log(x^2+1)")
+        for i in range(n_vars):
+            xi = x[:, i]
+            name = var_name(i)
+            x_safe = np.maximum(np.abs(xi), 1e-10)
+            basis_list.append(np.log(x_safe + 1))
+            names.append(f"log({name}+1)")
+            basis_list.append(np.log(x_safe**2 + 1))
+            names.append(f"log({name}^2+1)")
     
     # Composition terms (for sin(x²), etc. - covers Nguyen-10)
     if universal_basis and allow_periodic:
-        # sin/cos of x²
-        basis_list.append(np.sin(x**2))
-        names.append("sin(x^2)")
-        basis_list.append(np.cos(x**2))
-        names.append("cos(x^2)")
+        for i in range(n_vars):
+            xi = x[:, i]
+            name = var_name(i)
+            basis_list.append(np.sin(xi**2))
+            names.append(f"sin({name}^2)")
+            basis_list.append(np.cos(xi**2))
+            names.append(f"cos({name}^2)")
+
+            # Topologist's sine curve terms: sin(1/x)
+            # Avoid division by zero
+            x_safe_div = xi.copy()
+            mask_zero = np.abs(x_safe_div) < 1e-3
+            x_safe_div[mask_zero] = 1e-3 * np.sign(x_safe_div[mask_zero] + 1e-9) # Keep sign
+            
+            basis_list.append(np.sin(1.0 / x_safe_div))
+            names.append(f"sin(1/{name})")
+            basis_list.append(np.cos(1.0 / x_safe_div))
+            names.append(f"cos(1/{name})")
 
     # Power/rational families should be available even if periodic is disabled
     if universal_basis and allow_power:
-        # sqrt and reciprocal (positive x only parts)
-        x_safe = np.maximum(np.abs(x), 1e-3)  # Increased safety margin
-        basis_list.append(np.sqrt(x_safe))
-        names.append("sqrt(|x|)")
-        basis_list.append(1.0 / x_safe)
-        names.append("1/|x|")
-        
-        # Relativistic / elliptic forms: 1/sqrt(1-x^2), sqrt(1-x^2)
-        # These are critical for physics formulas
-        x2 = x**2
-        safe_denom = np.maximum(1 - x2, 1e-6)  # Avoid division by zero near |x|=1
-        basis_list.append(1.0 / np.sqrt(safe_denom))
-        names.append("1/sqrt(1-x^2)")
-        basis_list.append(np.sqrt(safe_denom))
-        names.append("sqrt(1-x^2)")
-        basis_list.append(x / np.sqrt(safe_denom))
-        names.append("x/sqrt(1-x^2)")
-        # Also 1/(1-x^2) without sqrt
-        basis_list.append(1.0 / safe_denom)
-        names.append("1/(1-x^2)")
-        
-        # Planck/exp-denominator terms (critical for x^3 / (exp(x)-1))
-        if include_exp:
-            x_clamp = np.clip(x, -10, 10)
-            expm1 = np.expm1(x_clamp)  # exp(x)-1, more stable near 0
-            expm1 = np.where(np.abs(expm1) < 1e-6, np.sign(expm1) * 1e-6, expm1)
-            basis_list.append(1.0 / expm1)
-            names.append("1/(exp(x)-1)")
-            basis_list.append(x / expm1)
-            names.append("x/(exp(x)-1)")
-            basis_list.append(x**2 / expm1)
-            names.append("x^2/(exp(x)-1)")
-            basis_list.append(x**3 / expm1)
-            names.append("x^3/(exp(x)-1)")
+        for i in range(n_vars):
+            xi = x[:, i]
+            name = var_name(i)
+            x_safe = np.maximum(np.abs(xi), 1e-3)
+            basis_list.append(np.sqrt(x_safe))
+            names.append(f"sqrt(|{name}|)")
+            basis_list.append(1.0 / x_safe)
+            names.append(f"1/|{name}|")
 
-        # Rational function terms (Lorentzian, Cauchy type)
-        for c in [0.5, 1.0, 2.0]:
-            # Quadratic denominator
-            denom_q = x**2 + c
-            basis_list.append(1.0 / denom_q)
-            names.append(f"1/(x^2+{c})")
-            basis_list.append(x / denom_q)
-            names.append(f"x/(x^2+{c})")
-            
-            # Linear denominator (1/(x+c)) - handle singularity
-            # Use softplus-like smooth denominator or just offset
-            basis_list.append(1.0 / (np.abs(x) + c))
-            names.append(f"1/(|x|+{c})")
+            x2 = xi**2
+            safe_denom = np.maximum(1 - x2, 1e-6)
+            basis_list.append(1.0 / np.sqrt(safe_denom))
+            names.append(f"1/sqrt(1-{name}^2)")
+            basis_list.append(np.sqrt(safe_denom))
+            names.append(f"sqrt(1-{name}^2)")
+            basis_list.append(xi / np.sqrt(safe_denom))
+            names.append(f"{name}/sqrt(1-{name}^2)")
+            basis_list.append(1.0 / safe_denom)
+            names.append(f"1/(1-{name}^2)")
 
-        # Automatic cross-terms: periodic / rational
-        # Enable when periodic + power/rational are plausible
-        if allow_periodic and (
-            predictions.get('rational', 0) >= threshold or
-            predictions.get('power', 0) >= threshold or
-            predictions.get('periodic', 0) >= threshold
-        ):
+            if include_exp:
+                x_clamp = np.clip(xi, -10, 10)
+                expm1 = np.expm1(x_clamp)
+                expm1 = np.where(np.abs(expm1) < 1e-6, np.sign(expm1) * 1e-6, expm1)
+                basis_list.append(1.0 / expm1)
+                names.append(f"1/(exp({name})-1)")
+                basis_list.append(xi / expm1)
+                names.append(f"{name}/(exp({name})-1)")
+                basis_list.append(xi**2 / expm1)
+                names.append(f"{name}^2/(exp({name})-1)")
+                basis_list.append(xi**3 / expm1)
+                names.append(f"{name}^3/(exp({name})-1)")
+
+    # Pairwise interaction terms for multi-input formulas
+    if universal_basis and allow_arithmetic and n_vars > 1:
+        for i in range(n_vars):
+            for j in range(i + 1, n_vars):
+                basis_list.append(x[:, i] * x[:, j])
+                names.append(f"{var_name(i)}*{var_name(j)}")
+
+    # Rational and cross terms (per-variable)
+    if universal_basis and allow_power:
+        for i in range(n_vars):
+            xi = x[:, i]
+            name = var_name(i)
             for c in [0.5, 1.0, 2.0]:
-                denom_q = x**2 + c
-                for omega in omegas[:4]:
-                    basis_list.append(np.sin(omega * x) / denom_q)
-                    names.append(f"sin({omega:.2f}*x)/(x^2+{c})")
-                    basis_list.append(np.cos(omega * x) / denom_q)
-                    names.append(f"cos({omega:.2f}*x)/(x^2+{c})")
-        
-        # x*sin(x), x*cos(x) - product terms
-        basis_list.append(x * np.sin(x))
-        names.append("x·sin(x)")
-        basis_list.append(x * np.cos(x))
-        names.append("x·cos(x)")
-        
-        # Damped oscillator terms: exp(-αx)*sin(ωx), exp(-αx)*cos(ωx)
-        # Only include when exp and periodic are both allowed
-        if include_exp and allow_periodic:
-            # Use fewer decay rates but include ALL frequencies (including FFT-detected)
-            decay_rates = [0.2, 0.5]  # Most common decay rates
-        
-            for alpha in decay_rates:
-                decay = np.exp(-alpha * np.abs(x))
-            
-                # Use ALL omega frequencies (including FFT-detected ones like 5.01)
-                for omega in omegas:
-                    basis_list.append(decay * np.sin(omega * x))
-                    if abs(omega - 1.0) < 0.1:
-                        names.append(f"e^(-{alpha}x)·sin(x)")
-                    else:
-                        names.append(f"e^(-{alpha}x)·sin({omega:.2f}x)")
-                
-                    basis_list.append(decay * np.cos(omega * x))
-                    if abs(omega - 1.0) < 0.1:
-                        names.append(f"e^(-{alpha}x)·cos(x)")
-                    else:
-                        names.append(f"e^(-{alpha}x)·cos({omega:.2f}x)")
+                denom_q = xi**2 + c
+                basis_list.append(1.0 / denom_q)
+                names.append(f"1/({name}^2+{c})")
+                basis_list.append(xi / denom_q)
+                names.append(f"{name}/({name}^2+{c})")
+                basis_list.append(1.0 / (np.abs(xi) + c))
+                names.append(f"1/(|{name}|+{c})")
+
+            if allow_periodic and (
+                predictions.get('rational', 0) >= threshold or
+                predictions.get('power', 0) >= threshold or
+                predictions.get('periodic', 0) >= threshold
+            ):
+                for c in [0.5, 1.0, 2.0]:
+                    denom_q = xi**2 + c
+                    for omega in omegas[:4]:
+                        basis_list.append(np.sin(omega * xi) / denom_q)
+                        names.append(f"sin({omega:.2f}*{name})/({name}^2+{c})")
+                        basis_list.append(np.cos(omega * xi) / denom_q)
+                        names.append(f"cos({omega:.2f}*{name})/({name}^2+{c})")
+
+            basis_list.append(xi * np.sin(xi))
+            names.append(f"{name}·sin({name})")
+            basis_list.append(xi * np.cos(xi))
+            names.append(f"{name}·cos({name})")
+
+            if include_exp and allow_periodic:
+                decay_rates = [0.2, 0.5]
+                for alpha in decay_rates:
+                    decay = np.exp(-alpha * np.abs(xi))
+                    for omega in omegas:
+                        basis_list.append(decay * np.sin(omega * xi))
+                        if abs(omega - 1.0) < 0.1:
+                            names.append(f"e^(-{alpha}*{name})·sin({name})")
+                        else:
+                            names.append(f"e^(-{alpha}*{name})·sin({omega:.2f}*{name})")
+
+                        basis_list.append(decay * np.cos(omega * xi))
+                        if abs(omega - 1.0) < 0.1:
+                            names.append(f"e^(-{alpha}*{name})·cos({name})")
+                        else:
+                            names.append(f"e^(-{alpha}*{name})·cos({omega:.2f}*{name})")
     
     basis = np.column_stack(basis_list)
     
@@ -334,6 +374,7 @@ def find_exact_symbolic_match(
     y: np.ndarray,
     max_terms: int = 3,
     tolerance: float = 1e-6,
+    num_threads: int = 1,
 ) -> Optional[Tuple[str, float, np.ndarray]]:
     """
     Search for exact symbolic matches before falling back to LASSO.
@@ -409,77 +450,102 @@ def find_exact_symbolic_match(
                 except:
                     pass
     
+    def chunk_ranges(n: int, chunks: int) -> List[Tuple[int, int]]:
+        if chunks <= 1 or n <= 1:
+            return [(0, n)]
+        size = max(1, math.ceil(n / chunks))
+        return [(i, min(i + size, n)) for i in range(0, n, size)]
+
+    def build_formula(indices: List[int], coeffs: np.ndarray) -> Tuple[str, np.ndarray]:
+        terms = []
+        full_coeffs = np.zeros(n_basis)
+        for idx, c in zip(indices, coeffs):
+            if abs(c) < 1e-6:
+                continue
+            name = names[idx]
+            if name == "1":
+                terms.append(f"{c:.4g}")
+            elif abs(c - 1.0) < 0.01:
+                terms.append(name)
+            elif abs(c + 1.0) < 0.01:
+                terms.append(f"-{name}")
+            elif abs(c - round(c)) < 0.01 and abs(c) < 100:
+                terms.append(f"{int(round(c))}*{name}")
+            else:
+                terms.append(f"{c:.4g}*{name}")
+            full_coeffs[idx] = c
+
+        formula = " + ".join(terms).replace("+ -", "- ")
+        return formula, full_coeffs
+
+    def search_pairs_range(start_i: int, end_i: int, stop_event: threading.Event):
+        for i in range(start_i, end_i):
+            if stop_event.is_set():
+                return None
+            for j in range(i + 1, n_basis):
+                X = basis[:, [i, j]]
+                try:
+                    coeffs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+                    y_pred = X @ coeffs
+                    mse = np.mean((y - y_pred) ** 2)
+                    if mse < tolerance:
+                        formula, full_coeffs = build_formula([i, j], coeffs)
+                        stop_event.set()
+                        return formula, mse, full_coeffs
+                except:
+                    pass
+        return None
+
+    def search_triples_range(start_i: int, end_i: int, stop_event: threading.Event):
+        for i in range(start_i, end_i):
+            if stop_event.is_set():
+                return None
+            for j in range(i + 1, n_basis):
+                for k in range(j + 1, n_basis):
+                    X = basis[:, [i, j, k]]
+                    try:
+                        coeffs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+                        y_pred = X @ coeffs
+                        mse = np.mean((y - y_pred) ** 2)
+                        if mse < tolerance:
+                            formula, full_coeffs = build_formula([i, j, k], coeffs)
+                            stop_event.set()
+                            return formula, mse, full_coeffs
+                    except:
+                        pass
+        return None
+
     # Try pairs of basis functions (including constant)
     if max_terms >= 2:
-        indices_all = list(range(n_basis))
-        from itertools import combinations
-        
-        for (i, j) in combinations(indices_all, 2):
-            X = basis[:, [i, j]]
-            try:
-                coeffs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
-                y_pred = X @ coeffs
-                mse = np.mean((y - y_pred) ** 2)
-                if mse < tolerance:
-                    terms = []
-                    for idx, (k, c) in enumerate([(i, coeffs[0]), (j, coeffs[1])]):
-                        if abs(c) < 1e-6:
-                            continue
-                        if names[k] == "1":
-                            terms.append(f"{c:.4g}")
-                        elif abs(c - 1.0) < 0.01:
-                            terms.append(names[k])
-                        elif abs(c + 1.0) < 0.01:
-                            terms.append(f"-{names[k]}")
-                        elif abs(c - round(c)) < 0.01 and abs(c) < 100:
-                            terms.append(f"{int(round(c))}*{names[k]}")
-                        else:
-                            terms.append(f"{c:.4g}*{names[k]}")
-                    
-                    formula = " + ".join(terms).replace("+ -", "- ")
-                    full_coeffs = np.zeros(n_basis)
-                    full_coeffs[i] = coeffs[0]
-                    full_coeffs[j] = coeffs[1]
-                    return formula, mse, full_coeffs
-            except:
-                pass
+        if num_threads and num_threads > 1:
+            stop_event = threading.Event()
+            ranges = chunk_ranges(n_basis, num_threads)
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                futures = [executor.submit(search_pairs_range, start, end, stop_event) for start, end in ranges]
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result is not None:
+                        return result
+        else:
+            result = search_pairs_range(0, n_basis, threading.Event())
+            if result is not None:
+                return result
     
     # Try triples of basis functions (including constant)
     if max_terms >= 3:
-        indices_all = list(range(n_basis))
-        
-        for (i, j, k) in combinations(indices_all, 3):
-            X = basis[:, [i, j, k]]
-            try:
-                coeffs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
-                y_pred = X @ coeffs
-                mse = np.mean((y - y_pred) ** 2)
-                if mse < tolerance:
-                    terms = []
-                    indices = [i, j, k]
-                    for idx, c in enumerate(coeffs):
-                        if abs(c) < 1e-6:
-                            continue
-                        name = names[indices[idx]]
-                        if name == "1":
-                            terms.append(f"{c:.4g}")
-                        elif abs(c - 1.0) < 0.01:
-                            terms.append(name)
-                        elif abs(c + 1.0) < 0.01:
-                            terms.append(f"-{name}")
-                        elif abs(c - round(c)) < 0.01 and abs(c) < 100:
-                            terms.append(f"{int(round(c))}*{name}")
-                        else:
-                            terms.append(f"{c:.4g}*{name}")
-                    
-                    formula = " + ".join(terms).replace("+ -", "- ")
-                    full_coeffs = np.zeros(n_basis)
-                    full_coeffs[i] = coeffs[0]
-                    full_coeffs[j] = coeffs[1]
-                    full_coeffs[k] = coeffs[2]
-                    return formula, mse, full_coeffs
-            except:
-                pass
+        if num_threads and num_threads > 1:
+            stop_event = threading.Event()
+            ranges = chunk_ranges(n_basis, num_threads)
+            with ThreadPoolExecutor(max_workers=num_threads) as executor:
+                futures = [executor.submit(search_triples_range, start, end, stop_event) for start, end in ranges]
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result is not None:
+                        return result
+        else:
+            result = search_triples_range(0, n_basis, threading.Event())
+            if result is not None:
+                return result
     
     return None
 
@@ -492,6 +558,9 @@ def fast_path_regression(
     sparsity_threshold: float = 0.01,
     op_constraints: Optional[Dict[str, bool]] = None,
     universal_basis: bool = True,
+    exact_match_threads: int = 1,
+    exact_match_enabled: bool = True,
+    exact_match_max_basis: int = 150,
 ) -> Tuple[str, float, Dict]:
     """
     Directly solve for coefficients using least squares regression.
@@ -510,7 +579,12 @@ def fast_path_regression(
         mse: Mean squared error
         details: Dict with coefficients and basis names
     """
-    x = x.flatten()
+    if x.ndim == 1:
+        x = x.flatten()
+    elif x.ndim == 2:
+        pass
+    else:
+        raise ValueError(f"Expected x to be 1D or 2D, got shape {x.shape}")
     y = y.flatten()
     
     # Build basis
@@ -538,18 +612,26 @@ def fast_path_regression(
     # If only power is allowed, enable 4-term exact match for polynomials
     exact_max_terms = 4 if (allow_power and not allow_periodic and not allow_exp and not allow_log) else 3
 
-    exact_match = find_exact_symbolic_match(
-        basis, names, y, max_terms=exact_max_terms, tolerance=1e-5
-    )
-    if exact_match:
-        formula, mse, coeffs = exact_match
-        print(f"  Found EXACT symbolic match: {formula} (MSE={mse:.2e})")
-        return formula, mse, {
-            'coefficients': coeffs,
-            'basis_names': names,
-            'n_nonzero': sum(1 for c in coeffs if abs(c) >= sparsity_threshold),
-            'exact_match': True,
-        }
+    if exact_match_enabled and (exact_match_max_basis is None or basis.shape[1] <= exact_match_max_basis):
+        exact_match = find_exact_symbolic_match(
+            basis,
+            names,
+            y,
+            max_terms=exact_max_terms,
+            tolerance=1e-5,
+            num_threads=exact_match_threads,
+        )
+        if exact_match:
+            formula, mse, coeffs = exact_match
+            print(f"  Found EXACT symbolic match: {formula} (MSE={mse:.2e})")
+            return formula, mse, {
+                'coefficients': coeffs,
+                'basis_names': names,
+                'n_nonzero': sum(1 for c in coeffs if abs(c) >= sparsity_threshold),
+                'exact_match': True,
+            }
+    elif exact_match_enabled:
+        print(f"  Skipping exact-match search (basis={basis.shape[1]} > {exact_match_max_basis})")
     
     # Normalize basis for numerical stability
     basis_std = np.std(basis, axis=0, keepdims=True)
@@ -671,6 +753,7 @@ def refine_frequencies(
     initial_omegas: List[float],
     n_steps: int = 100,
     lr: float = 0.1,
+    device: Optional[str] = None,
 ) -> Tuple[List[float], float]:
     """
     Refine frequency parameters using gradient descent.
@@ -691,8 +774,9 @@ def refine_frequencies(
     import torch
     import torch.nn as nn
     
-    x_t = torch.tensor(x, dtype=torch.float32)
-    y_t = torch.tensor(y, dtype=torch.float32)
+    resolved_device = _resolve_device(device)
+    x_t = torch.tensor(x, dtype=torch.float32, device=resolved_device)
+    y_t = torch.tensor(y, dtype=torch.float32, device=resolved_device)
     
     # Learnable parameters: constant, linear coef, and sin/cos for each omega
     # Model: c0 + c1*x + sum_i [a_i*sin(omega_i*x) + b_i*cos(omega_i*x)]
@@ -719,7 +803,7 @@ def refine_frequencies(
             
             return result
     
-    model = FrequencyModel(initial_omegas)
+    model = FrequencyModel(initial_omegas).to(resolved_device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     
     best_mse = float('inf')
@@ -735,7 +819,7 @@ def refine_frequencies(
         mse = loss.item()
         if mse < best_mse:
             best_mse = mse
-            best_omegas = model.omegas.detach().numpy().tolist()
+            best_omegas = model.omegas.detach().cpu().numpy().tolist()
     
     return best_omegas, best_mse
 
@@ -747,6 +831,7 @@ def refine_periodic_rational(
     c_inits: List[float],
     steps: int = 200,
     lr: float = 0.05,
+    device: Optional[str] = None,
 ) -> Optional[Dict]:
     """
     Continuous refinement for terms like sin(ωx)/(x^2+c).
@@ -756,8 +841,9 @@ def refine_periodic_rational(
     import math
     from glassbox.sr.meta_ops import get_constant_symbol
 
-    x_t = torch.tensor(x, dtype=torch.float64)
-    y_t = torch.tensor(y, dtype=torch.float64)
+    resolved_device = _resolve_device(device)
+    x_t = torch.tensor(x, dtype=torch.float64, device=resolved_device)
+    y_t = torch.tensor(y, dtype=torch.float64, device=resolved_device)
 
     best = None
     best_mse = float('inf')
@@ -765,12 +851,12 @@ def refine_periodic_rational(
     for omega0 in omega_inits:
         for c0 in c_inits:
             # Parameters
-            omega = torch.nn.Parameter(torch.tensor(float(omega0), dtype=torch.float64))
-            c_unconstrained = torch.nn.Parameter(torch.tensor(math.log(math.exp(c0) - 1 + 1e-6), dtype=torch.float64))
-            a = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float64))
-            b = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float64))
-            d = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float64))
-            e = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float64))
+            omega = torch.nn.Parameter(torch.tensor(float(omega0), dtype=torch.float64, device=resolved_device))
+            c_unconstrained = torch.nn.Parameter(torch.tensor(math.log(math.exp(c0) - 1 + 1e-6), dtype=torch.float64, device=resolved_device))
+            a = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float64, device=resolved_device))
+            b = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float64, device=resolved_device))
+            d = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float64, device=resolved_device))
+            e = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float64, device=resolved_device))
 
             params = [omega, c_unconstrained, a, b, d, e]
             opt = torch.optim.Adam(params, lr=lr)
@@ -838,6 +924,10 @@ def fast_path_with_refinement(
     refine_steps: int = 100,
     op_constraints: Optional[Dict[str, bool]] = None,
     auto_expand: bool = True,
+    device: Optional[str] = None,
+    exact_match_threads: int = 1,
+    exact_match_enabled: bool = True,
+    exact_match_max_basis: int = 150,
 ) -> Tuple[str, float, Dict]:
     """
     Fast-path with optional frequency refinement.
@@ -858,6 +948,9 @@ def fast_path_with_refinement(
             x, y, predictions, detected_omegas,
             op_constraints=op_constraints,
             universal_basis=use_universal,
+            exact_match_threads=exact_match_threads,
+            exact_match_enabled=exact_match_enabled,
+            exact_match_max_basis=exact_match_max_basis,
         )
         if mse < best_mse:
             best_mse = mse
@@ -878,7 +971,7 @@ def fast_path_with_refinement(
         print(f"  Attempting frequency refinement (initial MSE={best_mse:.4f})...")
         
         refined_omegas, refined_mse = refine_frequencies(
-            x, y, detected_omegas, n_steps=refine_steps
+            x, y, detected_omegas, n_steps=refine_steps, device=device
         )
         
         print(f"  Refined frequencies: {[f'{o:.3f}' for o in refined_omegas]}")
@@ -890,6 +983,9 @@ def fast_path_with_refinement(
                 x, y, predictions, detected_omegas=refined_omegas,
                 op_constraints=op_constraints,
                 universal_basis=best_universal,
+                exact_match_threads=exact_match_threads,
+                exact_match_enabled=exact_match_enabled,
+                exact_match_max_basis=exact_match_max_basis,
             )
             if mse2 < best_mse:
                 return formula2, mse2, details2
@@ -901,7 +997,7 @@ def fast_path_with_refinement(
     else:
         allow_periodic = allow_power = True
 
-    if allow_periodic and allow_power and best_mse > 1e-4:
+    if x.ndim == 1 and allow_periodic and allow_power and best_mse > 1e-4:
         omega_pool = (detected_omegas or []) + [1.0, 2.0, 3.0, 5.0, 10.0]
         # Deduplicate and keep reasonable range
         omega_inits = []
@@ -915,6 +1011,7 @@ def fast_path_with_refinement(
             c_inits=[0.5, 1.0, 2.0, 3.0],
             steps=400,
             lr=0.1,
+            device=device,
         )
         if refined:
             print(f"  Periodic×Rational refinement MSE: {refined['mse']:.6f}")
@@ -957,6 +1054,10 @@ def run_fast_path(
     detected_omegas: Optional[List[float]] = None,
     op_constraints: Optional[Dict[str, bool]] = None,
     auto_expand: bool = True,
+    device: Optional[str] = None,
+    exact_match_threads: int = 1,
+    exact_match_enabled: bool = True,
+    exact_match_max_basis: int = 150,
 ) -> Optional[Dict]:
     """
     Run the complete fast-path pipeline.
@@ -966,20 +1067,32 @@ def run_fast_path(
         None if fast path not applicable
     """
     import time
-    from scripts.curve_classifier_integration import predict_operators
+    from curve_classifier_integration import predict_operators
     
     start_time = time.time()
     
     # Convert to numpy
-    x_np = x.cpu().numpy().flatten() if hasattr(x, 'cpu') else x.flatten()
-    y_np = y.cpu().numpy().flatten() if hasattr(y, 'cpu') else y.flatten()
+    if hasattr(x, 'cpu'):
+        x_np = x.cpu().numpy()
+    else:
+        x_np = x
+    if hasattr(y, 'cpu'):
+        y_np = y.cpu().numpy().flatten()
+    else:
+        y_np = y.flatten()
     
     # Get classifier predictions
     print("\n" + "="*60)
     print("FAST PATH: Classifier-Guided Regression")
     print("="*60)
     
-    predictions = predict_operators(x_np, y_np, classifier_path, threshold=0.3)
+    predictions = predict_operators(
+        x_np,
+        y_np,
+        classifier_path,
+        threshold=0.3,
+        device=device,
+    )
     
     if not predictions:
         print("  No operators predicted - falling back to evolution")
@@ -999,6 +1112,10 @@ def run_fast_path(
         refine_steps=150,  # More steps for better refinement
         op_constraints=op_constraints,
         auto_expand=auto_expand,
+        device=device,
+        exact_match_threads=exact_match_threads,
+        exact_match_enabled=exact_match_enabled,
+        exact_match_max_basis=exact_match_max_basis,
     )
     
     elapsed = time.time() - start_time

@@ -21,7 +21,7 @@ import sys
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from scripts.generate_curve_data import extract_all_features, OPERATOR_CLASSES
+from generate_curve_data import extract_all_features, OPERATOR_CLASSES
 
 
 # =============================================================================
@@ -59,16 +59,37 @@ class CurveClassifierMLP(nn.Module):
 # CLASSIFIER LOADING
 # =============================================================================
 
-_cached_classifier = None
+_cached_classifier_by_device = {}
 _cached_operator_classes = None
+_warned_no_cuda = False
 
 
-def load_classifier(model_path: str = "models/curve_classifier.pt") -> nn.Module:
+def _resolve_device(device: Optional[str] = None) -> torch.device:
+    global _warned_no_cuda
+    if device is None or device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and not torch.cuda.is_available():
+        if not _warned_no_cuda:
+            print("CUDA requested but not available; falling back to CPU.")
+            _warned_no_cuda = True
+        return torch.device("cpu")
+
+    return resolved
+
+
+def load_classifier(
+    model_path: str = "models/curve_classifier.pt",
+    device: Optional[str] = None,
+) -> nn.Module:
     """Load the trained curve classifier."""
-    global _cached_classifier, _cached_operator_classes
+    global _cached_classifier_by_device, _cached_operator_classes
     
-    if _cached_classifier is not None:
-        return _cached_classifier
+    resolved_device = _resolve_device(device)
+    cache_key = str(resolved_device)
+    if cache_key in _cached_classifier_by_device:
+        return _cached_classifier_by_device[cache_key]
     
     model_path = Path(model_path)
     if not model_path.exists():
@@ -88,11 +109,13 @@ def load_classifier(model_path: str = "models/curve_classifier.pt") -> nn.Module
     # Create model
     model = CurveClassifierMLP(n_features=n_features, n_classes=n_classes, hidden=256)
     model.load_state_dict(state_dict)
+    model.to(resolved_device)
     model.eval()
-    
-    _cached_classifier = model
+
+    _cached_classifier_by_device[cache_key] = model
     print(f"Loaded curve classifier from {model_path}")
     print(f"  Val accuracy: {checkpoint.get('val_acc', 'N/A'):.4f}")
+    print(f"  Device: {resolved_device}")
     
     return model
 
@@ -106,6 +129,7 @@ def predict_operators(
     y: np.ndarray,
     model_path: str = "models/curve_classifier.pt",
     threshold: float = 0.5,
+    device: Optional[str] = None,
 ) -> Dict[str, float]:
     """
     Predict which operators are likely present in the data.
@@ -120,15 +144,16 @@ def predict_operators(
         Dictionary mapping operator names to probabilities
     """
     # Load classifier
-    model = load_classifier(model_path)
+    model = load_classifier(model_path, device=device)
+    resolved_device = _resolve_device(device)
     
     # Extract features
     features = extract_all_features(y)
-    features_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0)
+    features_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(resolved_device)
     
     # Predict
     with torch.no_grad():
-        probs = model(features_tensor).squeeze().numpy()
+        probs = model(features_tensor).squeeze().detach().cpu().numpy()
     
     # Build result dict
     operator_classes = _cached_operator_classes or list(OPERATOR_CLASSES.keys())

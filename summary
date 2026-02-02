@@ -1,0 +1,29 @@
+Summary
+
+Added a new fast-path benchmark runner: scripts/benchmark_feynman_easy.py. It downloads AI-Feynman example1–3, samples rows, and runs fast-path only.
+Extended fast-path to support multi-input datasets:
+scripts/classifier_fast_path.py: build_basis_from_predictions now accepts 2D x and generates per-variable terms (polynomials, trig, exp/log, sqrt/reciprocal, relativistic forms, Planck terms), plus pairwise products. Rational/cross terms are now per-variable. The periodic×rational refinement is skipped for multi-input.
+run_fast_path preserves multi-dimensional x. fast_path_regression accepts 1D or 2D x.
+Fixed benchmark runner to allow multi-input and only compute FFT for 1D.
+Ran benchmark once; it failed with IndexError due to basis mismatch, then fixed by refactoring the basis to per-variable. Second run was canceled by user.
+Current state
+
+No errors outstanding from code edits, but the multi-input benchmark has not been re-run after fixes.
+The benchmark script was briefly corrupted by a bad patch; it is now clean and shows correct multi-input handling.
+Files changed
+
+benchmark_feynman_easy.py (new; then updated for multi-input/FFT).
+classifier_fast_path.py (extended to multi-input basis, adjustments to run_fast_path and refinement).
+What to do next
+
+Run the benchmark to validate multi-input support:
+python benchmark_feynman_easy.py
+If errors occur, capture traceback and adjust basis handling.
+Optional: tune sample size/precision for faster or more accurate results.
+Notes
+
+The curve classifier only uses y-features, so it still works for multi-input but is not input-aware.
+For multi-input datasets, FFT frequency detection is only applied when there is one input dimension.
+Pending task
+
+Execute the benchmark after the multi-input fast-path changes and record results.
