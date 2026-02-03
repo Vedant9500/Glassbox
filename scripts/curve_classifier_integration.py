@@ -21,7 +21,10 @@ import sys
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from generate_curve_data import extract_all_features, OPERATOR_CLASSES
+try:
+    from scripts.generate_curve_data import extract_all_features, OPERATOR_CLASSES
+except ImportError:
+    from generate_curve_data import extract_all_features, OPERATOR_CLASSES
 
 
 # =============================================================================
@@ -87,15 +90,21 @@ def load_classifier(
     global _cached_classifier_by_device, _cached_operator_classes
     
     resolved_device = _resolve_device(device)
-    cache_key = str(resolved_device)
+    # Create cache key using both device and model path
+    cache_key = f"{str(resolved_device)}:{model_path}"
     if cache_key in _cached_classifier_by_device:
         return _cached_classifier_by_device[cache_key]
     
-    model_path = Path(model_path)
-    if not model_path.exists():
+    model_path_obj = Path(model_path)
+    if not model_path_obj.exists():
+        # Clean failure if model not found
         raise FileNotFoundError(f"Classifier model not found at {model_path}")
     
-    checkpoint = torch.load(model_path, map_location='cpu')
+    try:
+        checkpoint = torch.load(model_path_obj, map_location='cpu', weights_only=False)
+    except Exception as e:
+        print(f"Error loading checkpoint from {model_path}: {e}")
+        raise
     
     # Get operator classes
     _cached_operator_classes = checkpoint.get('operator_classes', list(OPERATOR_CLASSES.keys()))
@@ -143,8 +152,18 @@ def predict_operators(
     Returns:
         Dictionary mapping operator names to probabilities
     """
+    # Check if model exists before trying to load
+    if not Path(model_path).exists():
+        print(f"Warning: Curve classifier model not found at {model_path}. Skipping prediction.")
+        return {}
+
     # Load classifier
-    model = load_classifier(model_path, device=device)
+    try:
+        model = load_classifier(model_path, device=device)
+    except Exception as e:
+        print(f"Warning: Failed to load curve classifier: {e}")
+        return {}
+        
     resolved_device = _resolve_device(device)
     
     # Extract features

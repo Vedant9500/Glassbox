@@ -866,7 +866,7 @@ def refine_constants(
             torch.cuda.empty_cache()
         return float('inf')
     except Exception as e:
-        logger.debug(f"refine_constants failed: {e}")
+        logger.warning(f"refine_constants unexpected error: {e}")
         return float('inf')
     
     return best_loss
@@ -1398,8 +1398,10 @@ def finalize_model_coefficients(
                 return loss
             
             optimizer.step(closure)
+        except (RuntimeError, ValueError) as e:
+            logger.debug(f"finalize_model_coefficients L-BFGS pass 1 failed (optimization error): {e}")
         except Exception as e:
-            logger.debug(f"finalize_model_coefficients L-BFGS pass 1 failed: {e}")
+            logger.warning(f"finalize_model_coefficients L-BFGS pass 1 failed (unexpected): {e}")
     
     # Prune small coefficients
     prune_small_coefficients(model, threshold_ratio=sparsity_threshold, absolute_threshold=0.1)
@@ -1424,8 +1426,10 @@ def finalize_model_coefficients(
                 return loss
             
             optimizer2.step(closure2)
+        except (RuntimeError, ValueError) as e:
+             logger.debug(f"finalize_model_coefficients L-BFGS pass 2 failed (optimization error): {e}")
         except Exception as e:
-            logger.debug(f"finalize_model_coefficients L-BFGS pass 2 failed: {e}")
+            logger.warning(f"finalize_model_coefficients L-BFGS pass 2 failed (unexpected): {e}")
     
     # Final pruning
     prune_small_coefficients(model, threshold_ratio=FINAL_PRUNE_THRESHOLD_RATIO, absolute_threshold=FINAL_PRUNE_ABSOLUTE)
