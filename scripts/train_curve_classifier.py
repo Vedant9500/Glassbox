@@ -29,14 +29,14 @@ class CurveClassifierMLP(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_features, hidden),
+            nn.BatchNorm1d(hidden),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.BatchNorm1d(hidden),
             
             nn.Linear(hidden, hidden),
+            nn.BatchNorm1d(hidden),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.BatchNorm1d(hidden),
             
             nn.Linear(hidden, hidden // 2),
             nn.ReLU(),
@@ -44,6 +44,17 @@ class CurveClassifierMLP(nn.Module):
             
             nn.Linear(hidden // 2, n_classes),
         )
+        
+        # Apply weight initialization
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights using Kaiming initialization."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
     
     def forward(self, x):
         return torch.sigmoid(self.net(x))
@@ -52,10 +63,13 @@ class CurveClassifierMLP(nn.Module):
 class CurveClassifierCNN(nn.Module):
     """1D CNN that operates on the raw curve portion of features."""
     
-    def __init__(self, n_classes: int = 11, n_features: int = 334):
+    def __init__(self, n_classes: int = 11, n_features: int = 334, curve_dim: int = 128):
         super().__init__()
         
-        # CNN for raw curve (first 128 features)
+        # Dynamically determine curve dimension (use min of curve_dim and n_features)
+        self.curve_dim = min(curve_dim, n_features)
+        
+        # CNN for raw curve (first curve_dim features)
         self.conv = nn.Sequential(
             nn.Conv1d(1, 32, kernel_size=7, padding=3),
             nn.ReLU(),
@@ -71,7 +85,7 @@ class CurveClassifierCNN(nn.Module):
         )
         
         # MLP for other features (FFT, derivatives, stats)
-        other_dim = max(1, n_features - 128)
+        other_dim = max(1, n_features - self.curve_dim)
         self.other_mlp = nn.Sequential(
             nn.Linear(other_dim, 128),
             nn.ReLU(),
@@ -85,14 +99,25 @@ class CurveClassifierCNN(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(256, n_classes),
         )
+        
+        # Apply weight initialization
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights using Kaiming initialization."""
+        for m in self.modules():
+            if isinstance(m, (nn.Linear, nn.Conv1d)):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
     
     def forward(self, x):
-        # Split features
-        raw_curve = x[:, :128]      # Raw curve features
-        other_features = x[:, 128:] # FFT, derivatives, stats
+        # Split features using dynamic curve dimension
+        raw_curve = x[:, :self.curve_dim]
+        other_features = x[:, self.curve_dim:]
         
         # CNN path
-        raw_curve = raw_curve.unsqueeze(1)  # (batch, 1, 128)
+        raw_curve = raw_curve.unsqueeze(1)  # (batch, 1, curve_dim)
         conv_out = self.conv(raw_curve)     # (batch, 128, 4)
         conv_out = conv_out.flatten(1)      # (batch, 512)
         
@@ -108,8 +133,8 @@ class CurveClassifierCNN(nn.Module):
 # TRAINING
 # =============================================================================
 
-def train_epoch(model, dataloader, optimizer, criterion, device):
-    """Train for one epoch."""
+def train_epoch(model, dataloader, optimizer, criterion, device, max_grad_norm: float = 1.0):
+    """Train for one epoch with gradient clipping."""
     model.train()
     total_loss = 0
     n_batches = 0
@@ -122,6 +147,10 @@ def train_epoch(model, dataloader, optimizer, criterion, device):
         pred = model(x_batch)
         loss = criterion(pred, y_batch)
         loss.backward()
+        
+        # Gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        
         optimizer.step()
         
         total_loss += loss.item()
@@ -187,8 +216,9 @@ def train_model(
     device,
     save_path: Path,
     operator_classes: list,
+    patience: int = 10,
 ):
-    """Full training loop."""
+    """Full training loop with early stopping."""
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5
@@ -197,6 +227,7 @@ def train_model(
     
     best_val_loss = float('inf')
     best_epoch = 0
+    patience_counter = 0
     
     for epoch in range(epochs):
         # Train
@@ -219,6 +250,7 @@ def train_model(
         if val_metrics['loss'] < best_val_loss:
             best_val_loss = val_metrics['loss']
             best_epoch = epoch + 1
+            patience_counter = 0
             torch.save({
                 'model_state_dict': model.state_dict(),
                 'epoch': epoch,
@@ -227,11 +259,21 @@ def train_model(
                 'operator_classes': operator_classes,
             }, save_path)
             print(f"  -> Saved best model (val_loss: {val_metrics['loss']:.4f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"\nEarly stopping at epoch {epoch+1} (no improvement for {patience} epochs)")
+                break
     
     print(f"\nBest model at epoch {best_epoch} with val_loss: {best_val_loss:.4f}")
     
-    # Final per-class report
-    print("\nPer-class F1 scores:")
+    # Reload best model for final evaluation
+    checkpoint = torch.load(save_path, weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    val_metrics = evaluate(model, val_loader, criterion, device)
+    
+    # Final per-class report using best model
+    print("\nPer-class F1 scores (best model):")
     for i, name in enumerate(operator_classes):
         print(f"  {name:15s}: {val_metrics['f1_per_class'][i]:.4f}")
     
@@ -262,8 +304,18 @@ def main():
                         help="Output model path")
     parser.add_argument("--device", type=str, default="auto",
                         help="Device (auto, cpu, cuda)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility")
+    parser.add_argument("--patience", type=int, default=10,
+                        help="Early stopping patience")
     
     args = parser.parse_args()
+    
+    # Set random seeds for reproducibility
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
     
     # Device
     if args.device == "auto":
@@ -294,12 +346,28 @@ def main():
     
     print(f"  Train: {len(train_features)}, Val: {len(val_features)}")
     
-    # Data loaders
+    # Data loaders with optimizations
     train_dataset = TensorDataset(train_features, train_labels)
     val_dataset = TensorDataset(val_features, val_labels)
     
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
+    # Use pin_memory for GPU and num_workers for parallel data loading
+    use_cuda = device.type == 'cuda'
+    loader_kwargs = {
+        'num_workers': 4 if use_cuda else 0,
+        'pin_memory': use_cuda,
+    }
+    
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=args.batch_size, 
+        shuffle=True,
+        **loader_kwargs
+    )
+    val_loader = DataLoader(
+        val_dataset, 
+        batch_size=args.batch_size,
+        **loader_kwargs
+    )
     
     # Model
     n_features = features.shape[1]
@@ -329,6 +397,7 @@ def main():
         device=device,
         save_path=output_path,
         operator_classes=operator_classes,
+        patience=args.patience,
     )
     
     print(f"\nModel saved to {output_path}")

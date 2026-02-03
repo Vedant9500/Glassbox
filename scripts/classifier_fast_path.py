@@ -13,21 +13,31 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import torch
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 from pathlib import Path
+
+# Thread-safe CUDA warning state
 _warned_no_cuda = False
+_cuda_warning_lock = threading.Lock()
+
+# Pre-compiled regex patterns for performance
+_FREQ_SIN_PATTERN = re.compile(r'sin\(([0-9.]+)\*?x', re.IGNORECASE)
+_FREQ_COS_PATTERN = re.compile(r'cos\(([0-9.]+)\*?x', re.IGNORECASE)
+_POWER_PATTERN = re.compile(r'x\^([0-9.]+)', re.IGNORECASE)
 
 
 def _resolve_device(device: Optional[str] = None) -> torch.device:
+    """Resolve device string to torch.device, with thread-safe CUDA fallback warning."""
     global _warned_no_cuda
     if device is None or device == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     resolved = torch.device(device)
     if resolved.type == "cuda" and not torch.cuda.is_available():
-        if not _warned_no_cuda:
-            print("CUDA requested but not available; falling back to CPU.")
-            _warned_no_cuda = True
+        with _cuda_warning_lock:
+            if not _warned_no_cuda:
+                print("CUDA requested but not available; falling back to CPU.")
+                _warned_no_cuda = True
         return torch.device("cpu")
 
     return resolved
@@ -44,6 +54,9 @@ def lasso_coordinate_descent(
     LASSO regression using coordinate descent.
     
     Solves: min_w ||y - X @ w||^2 + alpha * ||w||_1
+    
+    Optimized: Computes residual incrementally per-feature instead of
+    full matrix multiply, reducing complexity from O(n×m²) to O(n×m) per iteration.
     
     Args:
         X: Feature matrix (n_samples, n_features)
@@ -62,21 +75,31 @@ def lasso_coordinate_descent(
     X_sq = (X ** 2).sum(axis=0)
     X_sq[X_sq < 1e-10] = 1e-10  # Avoid division by zero
     
+    # Precompute threshold
+    threshold = alpha * n_samples
+    
     for iteration in range(max_iter):
         w_old = w.copy()
         
+        # Compute residual once per iteration (O(n×m))
+        residual = y - X @ w
+        
         for j in range(n_features):
-            # Compute residual without feature j
-            residual = y - X @ w + X[:, j] * w[j]
+            # Add back current feature contribution
+            residual_j = residual + X[:, j] * w[j]
             
             # Correlation
-            rho = X[:, j] @ residual
+            rho = X[:, j] @ residual_j
             
             # Soft thresholding
+            old_w_j = w[j]
             if alpha == 0:
                 w[j] = rho / X_sq[j]
             else:
-                w[j] = soft_threshold(rho, alpha * n_samples) / X_sq[j]
+                w[j] = soft_threshold(rho, threshold) / X_sq[j]
+            
+            # Update residual incrementally (O(n) instead of O(n×m))
+            residual = residual_j - X[:, j] * w[j]
         
         # Check convergence
         if np.max(np.abs(w - w_old)) < tol:
@@ -85,14 +108,13 @@ def lasso_coordinate_descent(
     return w
 
 
-def soft_threshold(x: float, threshold: float) -> float:
-    """Soft thresholding operator for LASSO."""
-    if x > threshold:
-        return x - threshold
-    elif x < -threshold:
-        return x + threshold
-    else:
-        return 0.0
+def soft_threshold(x: np.ndarray, threshold: float) -> np.ndarray:
+    """
+    Vectorized soft thresholding operator for LASSO.
+    
+    Works with both scalars and arrays.
+    """
+    return np.sign(x) * np.maximum(np.abs(x) - threshold, 0)
 
 
 def build_basis_from_predictions(
@@ -428,7 +450,7 @@ def find_exact_symbolic_match(
                         full_coeffs[0] = coeffs[0] if include_const else 0  # Assuming index 0 is constant
                         full_coeffs[i] = coeffs[1] if include_const else coeffs[0]
                         return formula, mse, full_coeffs
-                except:
+                except (np.linalg.LinAlgError, ValueError):
                     pass
             else:
                 X = basis[:, i:i+1]
@@ -447,7 +469,7 @@ def find_exact_symbolic_match(
                         full_coeffs = np.zeros(n_basis)
                         full_coeffs[i] = coeff[0]
                         return formula, mse, full_coeffs
-                except:
+                except (np.linalg.LinAlgError, ValueError):
                     pass
     
     def chunk_ranges(n: int, chunks: int) -> List[Tuple[int, int]]:
@@ -492,7 +514,7 @@ def find_exact_symbolic_match(
                         formula, full_coeffs = build_formula([i, j], coeffs)
                         stop_event.set()
                         return formula, mse, full_coeffs
-                except:
+                except (np.linalg.LinAlgError, ValueError):
                     pass
         return None
 
@@ -511,7 +533,7 @@ def find_exact_symbolic_match(
                             formula, full_coeffs = build_formula([i, j, k], coeffs)
                             stop_event.set()
                             return formula, mse, full_coeffs
-                    except:
+                    except (np.linalg.LinAlgError, ValueError):
                         pass
         return None
 
@@ -707,7 +729,7 @@ def fast_path_regression(
                 best_coeffs = np.zeros_like(best_coeffs)
                 best_coeffs[selected_mask] = refit_coeffs
                 best_mse = refit_mse
-        except:
+        except (np.linalg.LinAlgError, ValueError):
             pass  # Keep LASSO solution
     
     coeffs = best_coeffs
@@ -1145,7 +1167,7 @@ def extract_operator_hints(
     basis_names: List[str],
     coefficients: np.ndarray,
     threshold: float = 0.01,
-) -> Dict[str, any]:
+) -> Dict[str, Any]:
     """
     Extract operator hints from a fast-path formula for guided evolution.
     
@@ -1192,8 +1214,8 @@ def extract_operator_hints(
         if 'sin(' in name_lower:
             hints['operators'].add('sin')
             hints['operators'].add('periodic')
-            # Extract frequency if present
-            freq_match = re.search(r'sin\(([0-9.]+)\*?x', name_lower)
+            # Extract frequency if present (using precompiled pattern)
+            freq_match = _FREQ_SIN_PATTERN.search(name_lower)
             if freq_match:
                 hints['frequencies'].append(float(freq_match.group(1)))
             elif 'sin(x)' in name_lower or 'sin(x/' in name_lower:
@@ -1202,14 +1224,14 @@ def extract_operator_hints(
         if 'cos(' in name_lower:
             hints['operators'].add('cos')
             hints['operators'].add('periodic')
-            freq_match = re.search(r'cos\(([0-9.]+)\*?x', name_lower)
+            freq_match = _FREQ_COS_PATTERN.search(name_lower)
             if freq_match:
                 hints['frequencies'].append(float(freq_match.group(1)))
         
         # Power operators
         if 'x^' in name_lower:
             hints['operators'].add('power')
-            power_match = re.search(r'x\^([0-9.]+)', name_lower)
+            power_match = _POWER_PATTERN.search(name_lower)
             if power_match:
                 hints['powers'].append(float(power_match.group(1)))
         
