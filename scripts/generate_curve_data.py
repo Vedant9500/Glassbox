@@ -13,6 +13,7 @@ import argparse
 import random
 from typing import List, Tuple, Dict, Set
 from pathlib import Path
+import ast
 
 # Make scipy optional - provide fallbacks
 try:
@@ -48,28 +49,35 @@ except ImportError:
 # =============================================================================
 
 OPERATOR_CLASSES = {
-    # Unary operators (matching MetaPeriodic, MetaPower, MetaExp, MetaLog)
+    # Unary operators
     'identity': 0,       # x (implicit in many formulas)
     'sin': 1,            # sin(ωx + φ)
     'cos': 2,            # cos(ωx + φ)
     'power': 3,          # x^p (includes x, x², x³, √x, 1/x)
     'exp': 4,            # e^(βx)
     'log': 5,            # log(|x| + ε)
-    
-    # Structure indicators (higher-level patterns)
-    'periodic': 6,       # Contains sin or cos
-    'polynomial': 7,     # Pure polynomial (only power ops)
-    'exponential': 8,    # Contains exp or log
-    
+
     # Binary indicators
-    'addition': 9,       # Terms added
-    'multiplication': 10, # Terms multiplied
-    
-    # NEW: Rational functions
-    'rational': 11,      # 1/(x+c), x/(x²+c) type
+    'addition': 6,       # Terms added
+    'multiplication': 7, # Terms multiplied
+
+    # Rational functions
+    'rational': 8,       # 1/(x+c), x/(x²+c) type
 }
 
 N_CLASSES = len(OPERATOR_CLASSES)
+
+# Feature dimensionality (see extract_all_features)
+FEATURE_DIM = 334
+
+# Feature schema (slices into feature vector)
+FEATURE_SCHEMA = {
+    "raw": (0, 128),
+    "fft": (128, 160),
+    "deriv": (160, 288),
+    "stats": (288, 297),
+    "curv": (297, 334),
+}
 
 
 # =============================================================================
@@ -81,91 +89,91 @@ N_CLASSES = len(OPERATOR_CLASSES)
 
 SIMPLE_TEMPLATES = [
     # Identity / Linear
-    ("x", {'identity', 'power', 'polynomial'}),
-    ("{a} * x", {'identity', 'power', 'polynomial', 'multiplication'}),
-    ("{a} * x + {b}", {'identity', 'power', 'polynomial', 'addition', 'multiplication'}),
+    ("x", {'identity'}),
+    ("{a} * x", {'identity', 'multiplication'}),
+    ("{a} * x + {b}", {'identity', 'addition', 'multiplication'}),
     
     # Powers
-    ("x ** 2", {'power', 'polynomial'}),
-    ("x ** 3", {'power', 'polynomial'}),
-    ("x ** {p}", {'power', 'polynomial'}),
-    ("{a} * x ** 2", {'power', 'polynomial', 'multiplication'}),
-    ("{a} * x ** 2 + {b} * x + {c}", {'power', 'polynomial', 'addition', 'multiplication'}),
-    ("np.sqrt(np.abs(x) + 0.01)", {'power', 'polynomial'}),
-    ("1 / (np.abs(x) + 0.1)", {'power', 'polynomial'}),
+    ("x ** 2", {'power'}),
+    ("x ** 3", {'power'}),
+    ("x ** {p}", {'power'}),
+    ("{a} * x ** 2", {'power', 'multiplication'}),
+    ("{a} * x ** 2 + {b} * x + {c}", {'power', 'addition', 'multiplication'}),
+    ("np.sqrt(np.abs(x) + 0.01)", {'power'}),
+    ("1 / (np.abs(x) + 0.1)", {'rational'}),
     
     # Periodic
-    ("np.sin(x)", {'sin', 'periodic'}),
-    ("np.cos(x)", {'cos', 'periodic'}),
-    ("np.sin({a} * x)", {'sin', 'periodic', 'multiplication'}),
-    ("np.cos({a} * x)", {'cos', 'periodic', 'multiplication'}),
-    ("np.sin({a} * x + {b})", {'sin', 'periodic', 'addition', 'multiplication'}),
-    ("{a} * np.sin({b} * x)", {'sin', 'periodic', 'multiplication'}),
-    ("{a} * np.cos({b} * x)", {'cos', 'periodic', 'multiplication'}),
+    ("np.sin(x)", {'sin'}),
+    ("np.cos(x)", {'cos'}),
+    ("np.sin({a} * x)", {'sin', 'multiplication'}),
+    ("np.cos({a} * x)", {'cos', 'multiplication'}),
+    ("np.sin({a} * x + {b})", {'sin', 'addition', 'multiplication'}),
+    ("{a} * np.sin({b} * x)", {'sin', 'multiplication'}),
+    ("{a} * np.cos({b} * x)", {'cos', 'multiplication'}),
     
     # Exponential
-    ("np.exp({a} * x)", {'exp', 'exponential', 'multiplication'}),
-    ("np.exp(-x ** 2)", {'exp', 'power', 'exponential'}),
-    ("{a} * np.exp({b} * x)", {'exp', 'exponential', 'multiplication'}),
+    ("np.exp({a} * x)", {'exp', 'multiplication'}),
+    ("np.exp(-x ** 2)", {'exp', 'power'}),
+    ("{a} * np.exp({b} * x)", {'exp', 'multiplication'}),
     
     # Logarithmic
-    ("np.log(np.abs(x) + 1)", {'log', 'exponential'}),
-    ("{a} * np.log(np.abs(x) + 1)", {'log', 'exponential', 'multiplication'}),
+    ("np.log(np.abs(x) + 1)", {'log'}),
+    ("{a} * np.log(np.abs(x) + 1)", {'log', 'multiplication'}),
 ]
 
 COMPOUND_TEMPLATES = [
     # Polynomial combinations
-    ("x ** 2 + x", {'power', 'polynomial', 'addition'}),
-    ("x ** 3 - x", {'power', 'polynomial', 'addition'}),
-    ("{a} * x ** 3 + {b} * x ** 2 + {c} * x", {'power', 'polynomial', 'addition', 'multiplication'}),
+    ("x ** 2 + x", {'power', 'addition'}),
+    ("x ** 3 - x", {'power', 'addition'}),
+    ("{a} * x ** 3 + {b} * x ** 2 + {c} * x", {'power', 'addition', 'multiplication'}),
     
     # Periodic + Polynomial
-    ("np.sin(x) + x", {'sin', 'periodic', 'power', 'addition'}),
-    ("np.sin(x) + x ** 2", {'sin', 'periodic', 'power', 'addition'}),
-    ("np.cos(x) + x ** 2", {'cos', 'periodic', 'power', 'addition'}),
-    ("{a} * np.sin({b} * x) + {c} * x", {'sin', 'periodic', 'power', 'addition', 'multiplication'}),
-    ("x * np.sin(x)", {'sin', 'periodic', 'power', 'multiplication'}),
-    ("x ** 2 * np.cos(x)", {'cos', 'periodic', 'power', 'multiplication'}),
+    ("np.sin(x) + x", {'sin', 'power', 'addition'}),
+    ("np.sin(x) + x ** 2", {'sin', 'power', 'addition'}),
+    ("np.cos(x) + x ** 2", {'cos', 'power', 'addition'}),
+    ("{a} * np.sin({b} * x) + {c} * x", {'sin', 'power', 'addition', 'multiplication'}),
+    ("x * np.sin(x)", {'sin', 'power', 'multiplication'}),
+    ("x ** 2 * np.cos(x)", {'cos', 'power', 'multiplication'}),
     
     # Periodic combinations
-    ("np.sin(x) + np.cos(x)", {'sin', 'cos', 'periodic', 'addition'}),
-    ("np.sin(x) * np.cos(x)", {'sin', 'cos', 'periodic', 'multiplication'}),
-    ("{a} * np.sin({b} * x) + {c} * np.cos({d} * x)", {'sin', 'cos', 'periodic', 'addition', 'multiplication'}),
+    ("np.sin(x) + np.cos(x)", {'sin', 'cos', 'addition'}),
+    ("np.sin(x) * np.cos(x)", {'sin', 'cos', 'multiplication'}),
+    ("{a} * np.sin({b} * x) + {c} * np.cos({d} * x)", {'sin', 'cos', 'addition', 'multiplication'}),
     
     # Exponential combinations
-    ("np.exp(x) + np.exp(-x)", {'exp', 'exponential', 'addition'}),  # cosh-like
-    ("np.exp(x) - np.exp(-x)", {'exp', 'exponential', 'addition'}),  # sinh-like
-    ("np.exp(-x ** 2 / 2)", {'exp', 'power', 'exponential'}),  # Gaussian
-    ("x * np.exp(-x)", {'exp', 'power', 'exponential', 'multiplication'}),
+    ("np.exp(x) + np.exp(-x)", {'exp', 'addition'}),  # cosh-like
+    ("np.exp(x) - np.exp(-x)", {'exp', 'addition'}),  # sinh-like
+    ("np.exp(-x ** 2 / 2)", {'exp', 'power'}),  # Gaussian
+    ("x * np.exp(-x)", {'exp', 'power', 'multiplication'}),
     
     # Log combinations
-    ("x * np.log(np.abs(x) + 1)", {'log', 'power', 'exponential', 'multiplication'}),
-    ("np.log(np.abs(x) + 1) ** 2", {'log', 'power', 'exponential'}),
+    ("x * np.log(np.abs(x) + 1)", {'log', 'power', 'multiplication'}),
+    ("np.log(np.abs(x) + 1) ** 2", {'log', 'power'}),
     
     # Mixed
-    ("np.sin(x) * np.exp(-x ** 2)", {'sin', 'exp', 'periodic', 'exponential', 'multiplication'}),
-    ("np.log(np.abs(x) + 1) + np.sin(x)", {'log', 'sin', 'periodic', 'exponential', 'addition'}),
+    ("np.sin(x) * np.exp(-x ** 2)", {'sin', 'exp', 'multiplication'}),
+    ("np.log(np.abs(x) + 1) + np.sin(x)", {'log', 'sin', 'addition'}),
 ]
 
 # NEW: Rational function templates
 RATIONAL_TEMPLATES = [
     # Simple rational (1/x type)
-    ("1 / (np.abs(x) + {c})", {'rational', 'power'}),
-    ("{a} / (np.abs(x) + {c})", {'rational', 'power', 'multiplication'}),
+    ("1 / (np.abs(x) + {c})", {'rational'}),
+    ("{a} / (np.abs(x) + {c})", {'rational', 'multiplication'}),
     
     # Quadratic denominator (Lorentzian type)
-    ("1 / (x**2 + {c})", {'rational', 'power'}),
-    ("{a} / (x**2 + {c})", {'rational', 'power', 'multiplication'}),
-    ("x / (x**2 + {c})", {'rational', 'power'}),
+    ("1 / (x**2 + {c})", {'rational'}),
+    ("{a} / (x**2 + {c})", {'rational', 'multiplication'}),
+    ("x / (x**2 + {c})", {'rational'}),
     
     # Mixed rational
-    ("(x + {a}) / (x**2 + {b})", {'rational', 'power', 'addition'}),
-    ("x**2 / (x**2 + {c})", {'rational', 'power'}),
-    ("(x**2 + {a}) / (x**2 + {b})", {'rational', 'power', 'addition'}),
+    ("(x + {a}) / (x**2 + {b})", {'rational', 'addition'}),
+    ("x**2 / (x**2 + {c})", {'rational'}),
+    ("(x**2 + {a}) / (x**2 + {b})", {'rational', 'addition'}),
     
     # Rational + other
-    ("1 / (x**2 + 1) + np.sin(x)", {'rational', 'sin', 'periodic', 'addition'}),
-    ("x / (x**2 + 1) + {a}", {'rational', 'power', 'addition'}),
+    ("1 / (x**2 + 1) + np.sin(x)", {'rational', 'sin', 'addition'}),
+    ("x / (x**2 + 1) + {a}", {'rational', 'addition'}),
 ]
 
 ALL_TEMPLATES = SIMPLE_TEMPLATES + COMPOUND_TEMPLATES + RATIONAL_TEMPLATES
@@ -194,6 +202,12 @@ def extract_raw_features(y: np.ndarray, n_points: int = 128) -> np.ndarray:
 
 def extract_fft_features(y: np.ndarray, n_freqs: int = 32) -> np.ndarray:
     """Extract dominant frequencies - detects periodicity."""
+    # Detrend and apply a Hann window to reduce spectral leakage
+    if len(y) > 1:
+        y = y - np.mean(y)
+        window = np.hanning(len(y))
+        y = y * window
+
     fft = np.fft.rfft(y)
     magnitudes = np.abs(fft)[:n_freqs]
     
@@ -259,8 +273,16 @@ def extract_curvature_features(y: np.ndarray, n_points: int = 32) -> np.ndarray:
     Extract curvature features to distinguish rational from exponential decay.
     Rational functions have distinct acceleration profiles.
     """
+    # Smooth curve to reduce derivative noise
+    if len(y) >= 7:
+        window = np.ones(7, dtype=np.float64)
+        window = window / window.sum()
+        y_smooth = np.convolve(y, window, mode='same')
+    else:
+        y_smooth = y
+
     # First derivative (velocity)
-    dy = np.gradient(y)
+    dy = np.gradient(y_smooth)
     
     # Second derivative (acceleration)
     ddy = np.gradient(dy)
@@ -304,7 +326,10 @@ def extract_all_features(y: np.ndarray) -> np.ndarray:
     stats = extract_stat_features(y)                  # 9
     curv = extract_curvature_features(y, n_points=32) # 37 (32 + 5)
     
-    return np.concatenate([raw, fft, deriv, stats, curv])  # Total: 334
+    features = np.concatenate([raw, fft, deriv, stats, curv])
+    if features.shape[0] != FEATURE_DIM:
+        raise ValueError(f"Feature vector size mismatch: {features.shape[0]} != {FEATURE_DIM}")
+    return features  # Total: 334
 
 
 # =============================================================================
@@ -327,28 +352,152 @@ def generate_random_formula() -> Tuple[str, Set[str]]:
     return formula, operators
 
 
-def evaluate_formula(formula: str, x: np.ndarray) -> np.ndarray:
-    """Safely evaluate a formula string."""
+def _safe_eval_ast(node: ast.AST, x: np.ndarray) -> np.ndarray:
+    """Evaluate a restricted AST for numeric expressions involving x and np.*."""
+    allowed_funcs = {
+        'sin': np.sin,
+        'cos': np.cos,
+        'exp': np.exp,
+        'log': np.log,
+        'sqrt': np.sqrt,
+        'abs': np.abs,
+    }
+
+    if isinstance(node, ast.Expression):
+        return _safe_eval_ast(node.body, x)
+    if isinstance(node, ast.Constant):
+        return np.array(node.value)
+    if isinstance(node, ast.Num):  # pragma: no cover (py<3.8)
+        return np.array(node.n)
+    if isinstance(node, ast.Name):
+        if node.id == 'x':
+            return x
+        if node.id == 'np':
+            return np
+        raise ValueError("Unsafe name")
+    if isinstance(node, ast.Attribute):
+        value = _safe_eval_ast(node.value, x)
+        if value is np and node.attr in allowed_funcs:
+            return allowed_funcs[node.attr]
+        raise ValueError("Unsafe attribute")
+    if isinstance(node, ast.Call):
+        func = _safe_eval_ast(node.func, x)
+        args = [_safe_eval_ast(a, x) for a in node.args]
+        return func(*args)
+    if isinstance(node, ast.UnaryOp):
+        operand = _safe_eval_ast(node.operand, x)
+        if isinstance(node.op, ast.UAdd):
+            return operand
+        if isinstance(node.op, ast.USub):
+            return -operand
+        raise ValueError("Unsafe unary op")
+    if isinstance(node, ast.BinOp):
+        left = _safe_eval_ast(node.left, x)
+        right = _safe_eval_ast(node.right, x)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Div):
+            return left / right
+        if isinstance(node.op, ast.Pow):
+            return left ** right
+        raise ValueError("Unsafe binary op")
+    raise ValueError("Unsafe expression")
+
+
+def evaluate_formula(formula: str, x: np.ndarray, safe_eval: bool = True) -> Tuple[np.ndarray | None, str]:
+    """Safely evaluate a formula string.
+
+    Returns:
+        (y, status) where status is one of: ok, nan_or_inf, extreme, eval_fail
+    """
     try:
         # Suppress warnings during evaluation (domain errors are expected)
         with np.errstate(all='ignore'):
-            y = eval(formula, {"x": x, "np": np})
+            if safe_eval:
+                tree = ast.parse(formula, mode='eval')
+                y = _safe_eval_ast(tree, x)
+            else:
+                y = eval(formula, {"x": x, "np": np})
         
         # Check for invalid values
         if np.any(np.isnan(y)) or np.any(np.isinf(y)):
-            return None
+            return None, "nan_or_inf"
         
         # Check for extreme values
         if np.abs(y).max() > 1e6:
-            return None
+            return None, "extreme"
         
-        return y
+        return y, "ok"
     except Exception:
-        return None
+        return None, "eval_fail"
 
 
-def operators_to_labels(operators: Set[str]) -> np.ndarray:
-    """Convert operator set to multi-hot label vector."""
+def _ast_contains_x(node: ast.AST) -> bool:
+    """Return True if AST node contains variable x."""
+    if isinstance(node, ast.Name) and node.id == 'x':
+        return True
+    for child in ast.iter_child_nodes(node):
+        if _ast_contains_x(child):
+            return True
+    return False
+
+
+def derive_operators_from_formula(formula: str) -> Set[str]:
+    """Derive operator labels directly from the expression AST."""
+    ops: Set[str] = set()
+    try:
+        tree = ast.parse(formula, mode='eval')
+    except Exception:
+        return ops
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == 'x':
+            ops.add('identity')
+
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == 'np':
+                if func.attr in ('sin', 'cos', 'exp', 'log'):
+                    ops.add(func.attr)
+                elif func.attr == 'sqrt':
+                    ops.add('power')  # sqrt is x^0.5
+
+        if isinstance(node, ast.BinOp):
+            if isinstance(node.op, (ast.Add, ast.Sub)):
+                ops.add('addition')
+            if isinstance(node.op, ast.Mult):
+                ops.add('multiplication')
+            if isinstance(node.op, ast.Pow):
+                ops.add('power')
+            if isinstance(node.op, ast.Div):
+                # Mark rational if denominator depends on x
+                if _ast_contains_x(node.right):
+                    ops.add('rational')
+                else:
+                    ops.add('multiplication')  # Division by constant is just scaling
+
+    return ops
+
+
+def normalize_operators(operators: Set[str], formula: str) -> Set[str]:
+    """Normalize operator labels to reduce template noise."""
+    ops = set(operators)
+    # Keep both power and rational if both are present - they're independent features
+    return ops
+
+
+def operators_to_labels(operators: Set[str], formula: str | None = None) -> np.ndarray:
+    """Convert operator set to multi-hot label vector (optionally normalized)."""
+    if formula is not None:
+        derived = derive_operators_from_formula(formula)
+        if derived:
+            operators = derived
+        operators = normalize_operators(operators, formula)
+
     labels = np.zeros(N_CLASSES, dtype=np.float32)
     for op in operators:
         if op in OPERATOR_CLASSES:
@@ -361,36 +510,75 @@ def generate_dataset(
     x_range: Tuple[float, float] = (-5, 5),
     n_points: int = 256,
     show_progress: bool = True,
-    templates: List[Tuple[str, Set[str]]] = ALL_TEMPLATES,
+    templates: List[Tuple[str, Set[str]]] | None = None,
+    seed: int | None = None,
+    balance_templates: bool = False,
+    balance_classes: bool = False,
+    n_workers: int | None = None,
+    x_ranges: List[Tuple[float, float]] | None = None,
+    x_scale_min: float = 1.0,
+    x_scale_max: float = 1.0,
+    x_shift_std: float = 0.0,
+    noise_std: float = 0.0,
+    y_scale_min: float = 1.0,
+    y_scale_max: float = 1.0,
+    y_offset_std: float = 0.0,
+    safe_eval: bool = True,
+    signed_bd: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
     Generate labeled curve dataset.
     
     Returns:
-        features: (n_samples, 297) feature vectors
+        features: (n_samples, 334) feature vectors
         labels: (n_samples, n_classes) multi-hot labels
         formulas: list of formula strings (for debugging)
     """
+    if templates is None:
+        templates = ALL_TEMPLATES
+    
     x = np.linspace(x_range[0], x_range[1], n_points)
     
     features_list = []
     labels_list = []
     formulas_list = []
     
-    iterator = range(n_samples * 2)  # Generate extra to account for failures
-    
     # Multiprocessing for speed
     import multiprocessing
     from functools import partial
     
     # Determine number of processes
-    n_workers = max(1, multiprocessing.cpu_count() - 1)
+    if n_workers is None:
+        n_workers = max(1, min(multiprocessing.cpu_count() - 1, n_samples))
     
     # Split workload
     chunk_size = n_samples // n_workers
-    chunks = [chunk_size] * n_workers
-    # Add remainder to last chunk
-    chunks[-1] += n_samples - sum(chunks)
+    remainder = n_samples % n_workers
+    chunks = [chunk_size + (1 if i < remainder else 0) for i in range(n_workers)]
+
+    # Build class -> template index mapping for class-balanced sampling
+    class_to_templates = None
+    class_sampling_weights = None
+    if balance_classes:
+        class_to_templates = {name: [] for name in OPERATOR_CLASSES.keys()}
+        for i, (_, ops) in enumerate(templates):
+            for op in ops:
+                if op in class_to_templates:
+                    class_to_templates[op].append(i)
+        # Uniform weights across classes that have templates
+        classes = [c for c, idxs in class_to_templates.items() if idxs]
+        n_classes_with_templates = len(classes)
+        weights = [1.0 / n_classes_with_templates for _ in classes] if n_classes_with_templates > 0 else []
+        class_sampling_weights = (classes, weights)
+
+    # Deterministic worker seeds (if provided)
+    if seed is not None:
+        seed_seq = np.random.SeedSequence(seed)
+        worker_seeds = [int(s.generate_state(1)[0]) for s in seed_seq.spawn(n_workers)]
+    else:
+        worker_seeds = [None] * n_workers
+
+    work_items = list(zip(chunks, worker_seeds))
     
     print(f"Generating data using {n_workers} workers...")
     
@@ -401,24 +589,51 @@ def generate_dataset(
             x_range=x_range, 
             n_points=n_points,
             templates=templates,
+            balance_templates=balance_templates,
+            balance_classes=balance_classes,
+            class_to_templates=class_to_templates,
+            class_sampling_weights=class_sampling_weights,
+            x_ranges=x_ranges,
+            x_scale_min=x_scale_min,
+            x_scale_max=x_scale_max,
+            x_shift_std=x_shift_std,
+            noise_std=noise_std,
+            y_scale_min=y_scale_min,
+            y_scale_max=y_scale_max,
+            y_offset_std=y_offset_std,
+            safe_eval=safe_eval,
+            signed_bd=signed_bd,  # Pass signed_bd flag to worker function
         )
         
         # Run workers
-        results = list(tqdm(
-            pool.imap(worker_func, chunks), 
-            total=n_workers, 
-            desc="Generating chunks"
-        ))
+        if show_progress:
+            results = list(tqdm(
+                pool.imap(worker_func, work_items),
+                total=n_workers,
+                desc="Generating chunks"
+            ))
+        else:
+            results = list(pool.imap(worker_func, work_items))
     
     # Combine results
     features_list = []
     labels_list = []
     formulas_list = []
     
-    for feats, lbls, forms in results:
+    reject_stats = {
+        'nan_or_inf': 0,
+        'extreme': 0,
+        'feature_invalid': 0,
+        'eval_fail': 0,
+        'max_attempts': 0,
+    }
+
+    for feats, lbls, forms, stats in results:
         features_list.extend(feats)
         labels_list.extend(lbls)
         formulas_list.extend(forms)
+        for k in reject_stats:
+            reject_stats[k] += stats.get(k, 0)
     
     # Shuffle
     indices = np.random.permutation(len(features_list))
@@ -431,19 +646,196 @@ def generate_dataset(
     labels = labels[:n_samples]
     formulas = formulas[:n_samples]
     
+    if sum(reject_stats.values()) > 0:
+        print("\nRejection summary:")
+        for k, v in reject_stats.items():
+            print(f"  {k:15s}: {v}")
+
     return features, labels, formulas
 
 
+def generate_dataset_streamed(
+    n_samples: int,
+    output_path: Path,
+    x_range: Tuple[float, float] = (-5, 5),
+    n_points: int = 256,
+    show_progress: bool = True,
+    templates: List[Tuple[str, Set[str]]] | None = None,
+    seed: int | None = None,
+    balance_templates: bool = False,
+    balance_classes: bool = False,
+    n_workers: int | None = None,
+    x_ranges: List[Tuple[float, float]] | None = None,
+    x_scale_min: float = 1.0,
+    x_scale_max: float = 1.0,
+    x_shift_std: float = 0.0,
+    noise_std: float = 0.0,
+    y_scale_min: float = 1.0,
+    y_scale_max: float = 1.0,
+    y_offset_std: float = 0.0,
+    safe_eval: bool = True,
+    signed_bd: bool = False,
+    save_formulas: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """Generate dataset while streaming features/labels to disk."""
+    if templates is None:
+        templates = ALL_TEMPLATES
+    
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    features_path = output_path.with_suffix(".features.dat")
+    labels_path = output_path.with_suffix(".labels.dat")
+    formulas_path = output_path.with_suffix(".formulas.txt")
+
+    features_mm = np.memmap(features_path, dtype=np.float32, mode='w+', shape=(n_samples, FEATURE_DIM))
+    labels_mm = np.memmap(labels_path, dtype=np.float32, mode='w+', shape=(n_samples, N_CLASSES))
+    formulas_list: List[str] = []
+    
+    # Use ExitStack for proper resource management
+    from contextlib import ExitStack
+    import multiprocessing
+    from functools import partial
+    
+    exit_stack = ExitStack()
+    formulas_file = None
+    if save_formulas:
+        formulas_file = exit_stack.enter_context(open(formulas_path, "w", encoding="utf-8"))
+
+    if n_workers is None:
+        n_workers = max(1, min(multiprocessing.cpu_count() - 1, n_samples))
+
+    chunk_size = n_samples // n_workers
+    remainder = n_samples % n_workers
+    chunks = [chunk_size + (1 if i < remainder else 0) for i in range(n_workers)]
+
+    class_to_templates = None
+    class_sampling_weights = None
+    if balance_classes:
+        class_to_templates = {name: [] for name in OPERATOR_CLASSES.keys()}
+        for i, (_, ops) in enumerate(templates):
+            for op in ops:
+                if op in class_to_templates:
+                    class_to_templates[op].append(i)
+        # Uniform weights across classes that have templates
+        classes = [c for c, idxs in class_to_templates.items() if idxs]
+        n_classes_with_templates = len(classes)
+        weights = [1.0 / n_classes_with_templates for _ in classes] if n_classes_with_templates > 0 else []
+        class_sampling_weights = (classes, weights)
+
+    if seed is not None:
+        seed_seq = np.random.SeedSequence(seed)
+        worker_seeds = [int(s.generate_state(1)[0]) for s in seed_seq.spawn(n_workers)]
+    else:
+        worker_seeds = [None] * n_workers
+
+    work_items = list(zip(chunks, worker_seeds))
+
+    worker_func = partial(
+        generate_chunk,
+        x_range=x_range,
+        n_points=n_points,
+        templates=templates,
+        balance_templates=balance_templates,
+        balance_classes=balance_classes,
+        class_to_templates=class_to_templates,
+        class_sampling_weights=class_sampling_weights,
+        x_ranges=x_ranges,
+        x_scale_min=x_scale_min,
+        x_scale_max=x_scale_max,
+        x_shift_std=x_shift_std,
+        noise_std=noise_std,
+        y_scale_min=y_scale_min,
+        y_scale_max=y_scale_max,
+        y_offset_std=y_offset_std,
+        safe_eval=safe_eval,
+        signed_bd=signed_bd,
+    )
+
+    reject_stats = {
+        'nan_or_inf': 0,
+        'extreme': 0,
+        'feature_invalid': 0,
+        'eval_fail': 0,
+        'max_attempts': 0,
+    }
+
+    print(f"Generating data using {n_workers} workers...")
+    cursor = 0
+
+    with multiprocessing.Pool(n_workers) as pool:
+        if show_progress:
+            results = tqdm(pool.imap(worker_func, work_items), total=n_workers, desc="Generating chunks")
+        else:
+            results = pool.imap(worker_func, work_items)
+
+        for feats, lbls, forms, stats in results:
+            count = len(feats)
+            if count == 0:
+                continue
+            end = min(cursor + count, n_samples)
+            actual = end - cursor
+            features_mm[cursor:end] = np.array(feats[:actual], dtype=np.float32)
+            labels_mm[cursor:end] = np.array(lbls[:actual], dtype=np.float32)
+            if save_formulas:
+                for f in forms[:actual]:
+                    formulas_file.write(f + "\n")
+            cursor = end
+
+            for k in reject_stats:
+                reject_stats[k] += stats.get(k, 0)
+
+    # Close file handles via context manager
+    exit_stack.close()
+
+    if cursor < n_samples:
+        raise RuntimeError(f"Generated only {cursor} samples out of {n_samples} requested")
+
+    # Avoid loading full arrays into memory; return memmap views
+    features = features_mm
+    labels = labels_mm
+
+    formulas: List[str] = []
+    if save_formulas:
+        with open(formulas_path, "r", encoding="utf-8") as f:
+            formulas = [line.rstrip("\n") for line in f]
+
+    if sum(reject_stats.values()) > 0:
+        print("\nRejection summary:")
+        for k, v in reject_stats.items():
+            print(f"  {k:15s}: {v}")
+
+    return np.asarray(features), np.asarray(labels), formulas
+
+
 def generate_chunk(
-    n: int,
+    task: Tuple[int, int | None],
     x_range: Tuple[float, float],
     n_points: int,
     templates: List[Tuple[str, Set[str]]],
-) -> Tuple[List, List, List]:
+    balance_templates: bool,
+    balance_classes: bool,
+    class_to_templates: Dict[str, List[int]] | None,
+    class_sampling_weights: Tuple[List[str], List[float]] | None,
+    x_ranges: List[Tuple[float, float]] | None,
+    x_scale_min: float,
+    x_scale_max: float,
+    x_shift_std: float,
+    noise_std: float,
+    y_scale_min: float,
+    y_scale_max: float,
+    y_offset_std: float,
+    safe_eval: bool,
+    signed_bd: bool,
+) -> Tuple[List, List, List, Dict[str, int]]:
     """Generate a chunk of samples (worker function)."""
-    # Re-seed for each process to ensure diversity
-    np.random.seed()
-    random.seed()
+    n, seed = task
+
+    # Re-seed for each process to ensure diversity (deterministic if seed provided)
+    if seed is not None:
+        np.random.seed(seed)
+        random.seed(seed)
+    else:
+        np.random.seed()
+        random.seed()
     
     x = np.linspace(x_range[0], x_range[1], n_points)
     
@@ -456,40 +848,103 @@ def generate_chunk(
     attempts = 0
     max_attempts = n * 5
     
+    template_indices = list(range(len(templates)))
+    template_idx = 0
+    if balance_templates:
+        random.shuffle(template_indices)
+
+    stats = {
+        'nan_or_inf': 0,
+        'extreme': 0,
+        'feature_invalid': 0,
+        'eval_fail': 0,
+        'max_attempts': 0,
+    }
+
     while len(features_local) < target and attempts < max_attempts:
         attempts += 1
         
         # Generate random formula from selected template pool
-        template, operators = random.choice(templates)
+        if balance_classes and class_to_templates:
+            if class_sampling_weights is not None:
+                classes, weights = class_sampling_weights
+                target_class = np.random.choice(classes, p=weights)
+            else:
+                available = [k for k, v in class_to_templates.items() if v]
+                target_class = random.choice(available)
+            template_idx = random.choice(class_to_templates[target_class])
+            template, operators = templates[template_idx]
+        elif balance_templates:
+            if template_idx % len(templates) == 0:
+                random.shuffle(template_indices)
+            template, operators = templates[template_indices[template_idx % len(templates)]]
+            template_idx += 1
+        else:
+            template, operators = random.choice(templates)
+        b = np.random.uniform(0.5, 3)
+        d = np.random.uniform(0.5, 3)
+        if signed_bd:
+            b *= np.random.choice([-1.0, 1.0])
+            d *= np.random.choice([-1.0, 1.0])
+
         formula = template.format(
             a=np.random.uniform(-3, 3),
-            b=np.random.uniform(0.5, 3),
+            b=b,
             c=np.random.uniform(-2, 2),
-            d=np.random.uniform(0.5, 3),
+            d=d,
             p=np.random.choice([0.5, 2, 3, 4, -1, -0.5]),
         )
         
+        # Sample x-range per curve if provided
+        if x_ranges:
+            xmin, xmax = random.choice(x_ranges)
+            x = np.linspace(xmin, xmax, n_points)
+        else:
+            x = np.linspace(x_range[0], x_range[1], n_points)
+
+        # Optional x scaling and shifting
+        if x_scale_min != 1.0 or x_scale_max != 1.0:
+            x = x * np.random.uniform(x_scale_min, x_scale_max)
+        if x_shift_std > 0.0:
+            span = (x.max() - x.min())
+            x = x + np.random.normal(0.0, x_shift_std * span)
+
         # Evaluate
-        y = evaluate_formula(formula, x)
+        y, status = evaluate_formula(formula, x, safe_eval=safe_eval)
         if y is None:
+            stats[status] += 1
             continue
         
-        # Extract features
+        # Apply augmentation AFTER making a copy to preserve original for validation
+        y_aug = y.copy()
+        if y_scale_min != 1.0 or y_scale_max != 1.0:
+            y_aug = y_aug * np.random.uniform(y_scale_min, y_scale_max)
+        if y_offset_std > 0.0:
+            y_aug = y_aug + np.random.normal(0.0, y_offset_std)
+        if noise_std > 0.0:
+            y_aug = y_aug + np.random.normal(0.0, noise_std * (np.std(y_aug) + 1e-10), size=y_aug.shape)
+
+        # Extract features from augmented curve
         try:
-            features = extract_all_features(y)
+            features = extract_all_features(y_aug)
             if np.any(np.isnan(features)) or np.any(np.isinf(features)):
+                stats['feature_invalid'] += 1
                 continue
         except Exception:
+            stats['feature_invalid'] += 1
             continue
         
         # Create labels
-        labels = operators_to_labels(operators)
+        labels = operators_to_labels(operators, formula=formula)
         
         features_local.append(features)
         labels_local.append(labels)
         formulas_local.append(formula)
             
-    return features_local, labels_local, formulas_local
+    if len(features_local) < target:
+        stats['max_attempts'] += 1
+
+    return features_local, labels_local, formulas_local, stats
 
 
 def save_dataset(
@@ -505,6 +960,8 @@ def save_dataset(
         labels=labels,
         formulas=np.array(formulas, dtype=object),
         operator_classes=list(OPERATOR_CLASSES.keys()),
+        feature_dim=FEATURE_DIM,
+        feature_schema=FEATURE_SCHEMA,
     )
     print(f"Saved {len(features)} samples to {filepath}")
 
@@ -529,14 +986,57 @@ def main():
                         help="Minimum x value (default: -5)")
     parser.add_argument("--x-max", type=float, default=5,
                         help="Maximum x value (default: 5)")
+    parser.add_argument("--x-ranges", type=str, default="",
+                        help="Comma-separated x ranges like '-1:1,-5:5,-10:10' (overrides --x-min/--x-max)")
+    parser.add_argument("--x-scale-min", type=float, default=0.8,
+                        help="Minimum multiplicative scale for x (default: 0.8)")
+    parser.add_argument("--x-scale-max", type=float, default=1.2,
+                        help="Maximum multiplicative scale for x (default: 1.2)")
+    parser.add_argument("--x-shift-std", type=float, default=0.05,
+                        help="Additive shift std for x as fraction of x span (default: 0.05)")
     parser.add_argument("--n-points", type=int, default=256,
                         help="Number of points per curve (default: 256)")
     parser.add_argument("--rational-ratio", type=float, default=0.0,
                         help="Fraction of samples forced to be rational P/Q (0-1). Example: 0.5 = half rational")
+    parser.add_argument("--balance-templates", action="store_true",
+                        help="Balance sampling across templates")
+    parser.add_argument("--balance-classes", action="store_true",
+                        help="Balance sampling across operator classes (overrides --balance-templates)")
+    parser.add_argument("--no-balance-classes", action="store_true",
+                        help="Disable class-balanced sampling")
+    parser.add_argument("--n-workers", type=int, default=None,
+                        help="Number of worker processes (default: cpu_count-1)")
+    parser.add_argument("--stream", action="store_true",
+                        help="Stream generation to disk to reduce memory usage")
+    parser.add_argument("--no-formulas", action="store_true",
+                        help="Do not store formulas in the output dataset")
+    parser.add_argument("--noise-std", type=float, default=0.01,
+                        help="Additive noise std as fraction of curve std (default: 0.01)")
+    parser.add_argument("--y-scale-min", type=float, default=0.8,
+                        help="Minimum multiplicative scale for y (default: 0.8)")
+    parser.add_argument("--y-scale-max", type=float, default=1.2,
+                        help="Maximum multiplicative scale for y (default: 1.2)")
+    parser.add_argument("--y-offset-std", type=float, default=0.05,
+                        help="Additive offset std for y (default: 0.05)")
+    parser.add_argument("--safe-eval", action="store_true",
+                        help="Use restricted AST-based evaluation instead of eval")
+    parser.add_argument("--unsafe-eval", action="store_true",
+                        help="Use eval instead of the restricted AST evaluator")
+    parser.add_argument("--signed-bd", action="store_true",
+                        help="Allow b and d coefficients to be negative (default: on)")
+    parser.add_argument("--unsigned-bd", action="store_true",
+                        help="Keep b and d coefficients positive")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
     
     args = parser.parse_args()
+
+    safe_eval = not args.unsafe_eval
+    balance_classes = not args.no_balance_classes
+    if args.balance_classes:
+        balance_classes = True
+    signed_bd = not args.unsigned_bd
+    save_formulas = not args.no_formulas
     
     # Set seeds
     np.random.seed(args.seed)
@@ -555,8 +1055,24 @@ def main():
     print(f"  Operators: {list(OPERATOR_CLASSES.keys())}")
     print()
     
+    # Parse x-ranges if provided
+    x_ranges = None
+    if args.x_ranges.strip():
+        x_ranges = []
+        for part in args.x_ranges.split(','):
+            bounds = part.split(':')
+            if len(bounds) == 2:
+                xmin = float(bounds[0])
+                xmax = float(bounds[1])
+                if xmin < xmax:
+                    x_ranges.append((xmin, xmax))
+        if not x_ranges:
+            x_ranges = None
+
     # Generate (optionally balanced with rational-heavy subset)
     if args.rational_ratio > 0:
+        if args.stream:
+            raise ValueError("Streaming mode does not support --rational-ratio; generate separate datasets and merge offline.")
         n_rational = int(args.n_samples * args.rational_ratio)
         n_general = args.n_samples - n_rational
         print(f"  Generating {n_rational} rational + {n_general} general samples")
@@ -566,29 +1082,93 @@ def main():
             x_range=(args.x_min, args.x_max),
             n_points=args.n_points,
             templates=RATIONAL_TEMPLATES,
+            seed=args.seed,
+            balance_templates=args.balance_templates,
+            balance_classes=balance_classes,
+            n_workers=args.n_workers,
+            x_ranges=x_ranges,
+            x_scale_min=args.x_scale_min,
+            x_scale_max=args.x_scale_max,
+            x_shift_std=args.x_shift_std,
+            noise_std=args.noise_std,
+            y_scale_min=args.y_scale_min,
+            y_scale_max=args.y_scale_max,
+            y_offset_std=args.y_offset_std,
+            safe_eval=safe_eval,
+            signed_bd=signed_bd,
         )
         feats_g, labels_g, forms_g = generate_dataset(
             n_samples=n_general,
             x_range=(args.x_min, args.x_max),
             n_points=args.n_points,
             templates=ALL_TEMPLATES,
+            seed=args.seed + 1,
+            balance_templates=args.balance_templates,
+            balance_classes=balance_classes,
+            n_workers=args.n_workers,
+            x_ranges=x_ranges,
+            x_scale_min=args.x_scale_min,
+            x_scale_max=args.x_scale_max,
+            x_shift_std=args.x_shift_std,
+            noise_std=args.noise_std,
+            y_scale_min=args.y_scale_min,
+            y_scale_max=args.y_scale_max,
+            y_offset_std=args.y_offset_std,
+            safe_eval=safe_eval,
+            signed_bd=signed_bd,
         )
         
         features = np.concatenate([feats_r, feats_g], axis=0)
         labels = np.concatenate([labels_r, labels_g], axis=0)
         formulas = forms_r + forms_g
         
-        # Shuffle combined
         indices = np.random.permutation(len(features))
         features = features[indices]
         labels = labels[indices]
         formulas = [formulas[i] for i in indices]
     else:
-        features, labels, formulas = generate_dataset(
-            n_samples=args.n_samples,
-            x_range=(args.x_min, args.x_max),
-            n_points=args.n_points,
-        )
+        if args.stream:
+            features, labels, formulas = generate_dataset_streamed(
+                n_samples=args.n_samples,
+                output_path=output_path,
+                x_range=(args.x_min, args.x_max),
+                n_points=args.n_points,
+                seed=args.seed,
+                balance_templates=args.balance_templates,
+                balance_classes=balance_classes,
+                n_workers=args.n_workers,
+                x_ranges=x_ranges,
+                x_scale_min=args.x_scale_min,
+                x_scale_max=args.x_scale_max,
+                x_shift_std=args.x_shift_std,
+                noise_std=args.noise_std,
+                y_scale_min=args.y_scale_min,
+                y_scale_max=args.y_scale_max,
+                y_offset_std=args.y_offset_std,
+                safe_eval=safe_eval,
+                signed_bd=signed_bd,
+                save_formulas=save_formulas,
+            )
+        else:
+            features, labels, formulas = generate_dataset(
+                n_samples=args.n_samples,
+                x_range=(args.x_min, args.x_max),
+                n_points=args.n_points,
+                seed=args.seed,
+                balance_templates=args.balance_templates,
+                balance_classes=balance_classes,
+                n_workers=args.n_workers,
+                x_ranges=x_ranges,
+                x_scale_min=args.x_scale_min,
+                x_scale_max=args.x_scale_max,
+                x_shift_std=args.x_shift_std,
+                noise_std=args.noise_std,
+                y_scale_min=args.y_scale_min,
+                y_scale_max=args.y_scale_max,
+                y_offset_std=args.y_offset_std,
+                safe_eval=safe_eval,
+                signed_bd=signed_bd,
+            )
     
     # Stats
     print(f"\nGenerated {len(features)} valid samples")
@@ -606,10 +1186,11 @@ def main():
     save_dataset(output_path, features, labels, formulas)
     
     # Show some examples
-    print("\nExample formulas:")
-    for i in range(min(5, len(formulas))):
-        ops = [name for name, idx in OPERATOR_CLASSES.items() if labels[i, idx] > 0]
-        print(f"  {formulas[i][:50]:50s} -> {ops}")
+    if len(formulas) > 0:
+        print("\nExample formulas:")
+        for i in range(min(5, len(formulas))):
+            ops = [name for name, idx in OPERATOR_CLASSES.items() if labels[i, idx] > 0]
+            print(f"  {formulas[i][:50]:50s} -> {ops}")
 
 
 if __name__ == "__main__":

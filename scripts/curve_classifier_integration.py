@@ -34,18 +34,18 @@ except ImportError:
 class CurveClassifierMLP(nn.Module):
     """Simple MLP classifier for curve features."""
     
-    def __init__(self, n_features: int = 297, n_classes: int = 11, hidden: int = 256):
+    def __init__(self, n_features: int = 334, n_classes: int = 9, hidden: int = 256):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_features, hidden),
+            nn.BatchNorm1d(hidden),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.BatchNorm1d(hidden),
             
             nn.Linear(hidden, hidden),
+            nn.BatchNorm1d(hidden),
             nn.ReLU(),
             nn.Dropout(0.3),
-            nn.BatchNorm1d(hidden),
             
             nn.Linear(hidden, hidden // 2),
             nn.ReLU(),
@@ -55,7 +55,7 @@ class CurveClassifierMLP(nn.Module):
         )
     
     def forward(self, x):
-        return torch.sigmoid(self.net(x))
+        return self.net(x)
 
 
 # =============================================================================
@@ -64,6 +64,7 @@ class CurveClassifierMLP(nn.Module):
 
 _cached_classifier_by_device = {}
 _cached_operator_classes = None
+_cached_metadata_by_device = {}
 _warned_no_cuda = False
 
 
@@ -122,8 +123,14 @@ def load_classifier(
     model.eval()
 
     _cached_classifier_by_device[cache_key] = model
+    _cached_metadata_by_device[cache_key] = {
+        'thresholds': checkpoint.get('thresholds'),
+        'temperature': checkpoint.get('temperature'),
+        'feature_scaler': checkpoint.get('feature_scaler'),
+    }
     print(f"Loaded curve classifier from {model_path}")
-    print(f"  Val accuracy: {checkpoint.get('val_acc', 'N/A'):.4f}")
+    if 'val_acc' in checkpoint:
+        print(f"  Val accuracy: {checkpoint.get('val_acc'):.4f}")
     print(f"  Device: {resolved_device}")
     
     return model
@@ -168,19 +175,52 @@ def predict_operators(
     
     # Extract features
     features = extract_all_features(y)
+    metadata = _cached_metadata_by_device.get(f"{str(resolved_device)}:{model_path}", {})
+    scaler = metadata.get('feature_scaler')
+    if scaler is not None:
+        features = (features - scaler['mean']) / (scaler['std'] + 1e-8)
     features_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(resolved_device)
     
     # Predict
     with torch.no_grad():
-        probs = model(features_tensor).squeeze().detach().cpu().numpy()
+        logits = model(features_tensor).squeeze()
+        temperature = metadata.get('temperature')
+        if temperature is not None:
+            logits = logits / float(temperature)
+        probs = torch.sigmoid(logits).detach().cpu().numpy()
     
     # Build result dict
     operator_classes = _cached_operator_classes or list(OPERATOR_CLASSES.keys())
+    thresholds = metadata.get('thresholds')
+    if thresholds is None:
+        thresholds = np.full((len(operator_classes),), threshold, dtype=np.float32)
     result = {}
     for i, name in enumerate(operator_classes):
-        if probs[i] >= threshold:
+        if probs[i] >= thresholds[i]:
             result[name] = float(probs[i])
     
+    # Derived compatibility outputs
+    name_to_idx = {name: i for i, name in enumerate(operator_classes)}
+    periodic_prob = max(
+        probs[name_to_idx.get('sin', 0)] if 'sin' in name_to_idx else 0.0,
+        probs[name_to_idx.get('cos', 0)] if 'cos' in name_to_idx else 0.0,
+    )
+    exponential_prob = max(
+        probs[name_to_idx.get('exp', 0)] if 'exp' in name_to_idx else 0.0,
+        probs[name_to_idx.get('log', 0)] if 'log' in name_to_idx else 0.0,
+    )
+    polynomial_prob = max(
+        probs[name_to_idx.get('power', 0)] if 'power' in name_to_idx else 0.0,
+        probs[name_to_idx.get('identity', 0)] if 'identity' in name_to_idx else 0.0,
+    )
+
+    if periodic_prob >= threshold:
+        result['periodic'] = float(periodic_prob)
+    if exponential_prob >= threshold:
+        result['exponential'] = float(exponential_prob)
+    if polynomial_prob >= threshold:
+        result['polynomial'] = float(polynomial_prob)
+
     return result
 
 
@@ -227,19 +267,21 @@ def bias_onn_from_predictions(
     
     simplified = getattr(model, 'simplified_ops', True)
     
+    periodic_prob = max(predictions.get('sin', 0), predictions.get('cos', 0))
+
     if simplified:
         unary_map = {
-            'sin': 0, 'cos': 0, 'periodic': 0,  # MetaPeriodic
-            'power': 1, 'polynomial': 1, 'identity': 1,  # MetaPower
+            'sin': 0, 'cos': 0,  # MetaPeriodic
+            'power': 1, 'identity': 1,  # MetaPower
             'rational': 1,  # Bias toward reciprocal via MetaPower
         }
         n_unary = 2
     else:
         unary_map = {
-            'sin': 0, 'cos': 0, 'periodic': 0,  # MetaPeriodic
-            'power': 1, 'polynomial': 1, 'identity': 1,  # MetaPower
+            'sin': 0, 'cos': 0,  # MetaPeriodic
+            'power': 1, 'identity': 1,  # MetaPower
             'rational': 1,  # Bias toward reciprocal via MetaPower
-            'exp': 2, 'exponential': 2,  # MetaExp
+            'exp': 2,  # MetaExp
             'log': 3,  # MetaLog
         }
         n_unary = 4
@@ -260,8 +302,7 @@ def bias_onn_from_predictions(
                 with torch.no_grad():
                     # Bias type toward unary if sin/cos/periodic predicted
                     periodic_prob = max(predictions.get('sin', 0), 
-                                       predictions.get('cos', 0),
-                                       predictions.get('periodic', 0))
+                                       predictions.get('cos', 0))
                     if periodic_prob >= threshold:
                         selector.logits.data[0] += periodic_prob * boost_factor  # unary type
                         n_biased += 1
@@ -316,7 +357,7 @@ def main():
     print_predictions(predictions)
     
     # Show expected vs predicted
-    print("\nNote: 'periodic' = sin/cos, 'exponential' = exp/log")
+    print("\nNote: periodic/exponential are derived from sin/cos and exp/log")
 
 
 if __name__ == "__main__":

@@ -26,6 +26,19 @@ _FREQ_COS_PATTERN = re.compile(r'cos\(([0-9.]+)\*?x', re.IGNORECASE)
 _POWER_PATTERN = re.compile(r'x\^([0-9.]+)', re.IGNORECASE)
 
 
+def _with_derived_predictions(predictions: Dict[str, float]) -> Dict[str, float]:
+    """Return predictions augmented with derived periodic/exponential/polynomial keys."""
+    derived = dict(predictions)
+    periodic_prob = max(derived.get('sin', 0.0), derived.get('cos', 0.0))
+    exponential_prob = max(derived.get('exp', 0.0), derived.get('log', 0.0))
+    polynomial_prob = max(derived.get('power', 0.0), derived.get('identity', 0.0))
+
+    derived.setdefault('periodic', periodic_prob)
+    derived.setdefault('exponential', exponential_prob)
+    derived.setdefault('polynomial', polynomial_prob)
+    return derived
+
+
 def _resolve_device(device: Optional[str] = None) -> torch.device:
     """Resolve device string to torch.device, with thread-safe CUDA fallback warning."""
     global _warned_no_cuda
@@ -141,6 +154,7 @@ def build_basis_from_predictions(
         basis: (N, n_basis) matrix
         names: List of basis function names
     """
+    predictions = _with_derived_predictions(predictions)
     if x.ndim == 1:
         x = x.reshape(-1, 1)
     elif x.ndim != 2:

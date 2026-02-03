@@ -6,3 +6,6 @@ rich
 scipy
 tqdm
 scripts
+xgboost
+scikit-learn
+joblib
