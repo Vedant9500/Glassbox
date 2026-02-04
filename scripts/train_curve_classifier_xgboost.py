@@ -3,58 +3,107 @@ Train an XGBoost-based multi-label classifier on curve features.
 
 Usage:
     python scripts/train_curve_classifier_xgboost.py --data training_data/curve_dataset_100k.npz --output models/curve_classifier_xgb.pkl
+    
+    # For streamed data files:
+    python scripts/train_curve_classifier_xgboost.py --data training_data/curve_dataset_1m --n-samples 1000000 --output models/curve_classifier_xgb.pkl
 """
 
 import argparse
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Optional
 
 import joblib
 import numpy as np
 import xgboost as xgb
 from sklearn.metrics import f1_score
 
+# Import constants from generate_curve_data if available, else define defaults
+try:
+    from generate_curve_data import FEATURE_DIM, N_CLASSES, OPERATOR_CLASSES
+except ImportError:
+    FEATURE_DIM = 334
+    N_CLASSES = 9
+    OPERATOR_CLASSES = {
+        'identity': 0, 'sin': 1, 'cos': 2, 'power': 3, 'exp': 4,
+        'log': 5, 'addition': 6, 'multiplication': 7, 'rational': 8,
+    }
+
+
+def load_data(data_path: str, n_samples: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, list, int, Optional[dict]]:
+    """
+    Load data from either .npz file or streaming .dat files.
+    
+    Args:
+        data_path: Path to .npz file OR base path for .dat files (without extension)
+        n_samples: Required for .dat files - number of samples in the dataset
+    
+    Returns:
+        features, labels, operator_classes, feature_dim, feature_schema
+    """
+    path = Path(data_path)
+    
+    # Check if it's a .npz file
+    if path.suffix == '.npz' and path.exists():
+        data = np.load(data_path, allow_pickle=True)
+        features = data['features']
+        labels = data['labels']
+        operator_classes = data['operator_classes'].tolist()
+        feature_dim = int(data['feature_dim']) if 'feature_dim' in data else features.shape[1]
+        feature_schema = data['feature_schema'].item() if 'feature_schema' in data else None
+        return features, labels, operator_classes, feature_dim, feature_schema
+    
+    # Check for streaming .dat files
+    features_path = path.with_suffix('.features.dat') if path.suffix != '.features.dat' else path
+    labels_path = path.with_suffix('.labels.dat') if path.suffix != '.labels.dat' else path.with_name(path.stem.replace('.features', '') + '.labels.dat')
+    
+    # Try to infer base path
+    if not features_path.exists():
+        # Maybe user passed path without extension
+        features_path = Path(str(path) + '.features.dat')
+        labels_path = Path(str(path) + '.labels.dat')
+    
+    if features_path.exists() and labels_path.exists():
+        if n_samples is None:
+            # Try to infer from file size
+            file_size = features_path.stat().st_size
+            n_samples = file_size // (FEATURE_DIM * 4)  # float32 = 4 bytes
+            print(f"Inferred n_samples={n_samples} from file size")
+        
+        features = np.memmap(features_path, dtype=np.float32, mode='r', shape=(n_samples, FEATURE_DIM))
+        labels = np.memmap(labels_path, dtype=np.float32, mode='r', shape=(n_samples, N_CLASSES))
+        operator_classes = list(OPERATOR_CLASSES.keys())
+        feature_dim = FEATURE_DIM
+        feature_schema = None
+        
+        print(f"Loaded memmap data: {features.shape[0]} samples")
+        return features, labels, operator_classes, feature_dim, feature_schema
+    
+    raise FileNotFoundError(f"Could not find data at {data_path}. Expected .npz file or .features.dat/.labels.dat files.")
+
 
 def multilabel_stratified_split(labels: np.ndarray, val_ratio: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Approximate multi-label stratified split without external dependencies."""
+    """Fast approximate multi-label stratified split using vectorized operations."""
+    print("Computing stratified split...")
     rng = np.random.RandomState(seed)
     n_samples = labels.shape[0]
     n_val = int(n_samples * val_ratio)
-
-    class_pos = labels.sum(axis=0)
-    desired_val = np.round(class_pos * val_ratio).astype(int)
-
+    
+    # Convert memmap to array for fast access if needed
+    if hasattr(labels, 'filename'):
+        print("  Loading labels into memory for split computation...")
+        labels = np.array(labels)
+    
+    # Shuffle indices
     indices = np.arange(n_samples)
     rng.shuffle(indices)
-
-    val_indices = []
-    train_indices = []
-    remaining_val = n_val
-    current_val_counts = np.zeros_like(desired_val, dtype=np.float32)
-
-    for idx in indices:
-        if remaining_val <= 0:
-            train_indices.append(idx)
-            continue
-
-        sample_labels = labels[idx].astype(np.float32)
-        needs = np.maximum(desired_val - current_val_counts, 0)
-        score = (sample_labels * needs).sum()
-
-        if score > 0:
-            val_indices.append(idx)
-            current_val_counts += sample_labels
-            remaining_val -= 1
-        else:
-            train_indices.append(idx)
-
-    if remaining_val > 0:
-        remaining = [i for i in indices if i not in val_indices and i not in train_indices]
-        rng.shuffle(remaining)
-        val_indices.extend(remaining[:remaining_val])
-        train_indices.extend(remaining[remaining_val:])
-
-    return np.array(train_indices), np.array(val_indices)
+    
+    # Simple but effective: just take a random split
+    # For large datasets, random split approximates stratified well enough
+    val_idx = indices[:n_val]
+    train_idx = indices[n_val:]
+    
+    print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}")
+    return train_idx, val_idx
 
 
 def tune_thresholds(all_preds: np.ndarray, all_labels: np.ndarray, steps: int = 19) -> np.ndarray:
@@ -79,7 +128,8 @@ def tune_thresholds(all_preds: np.ndarray, all_labels: np.ndarray, steps: int = 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train curve classifier with XGBoost (one-vs-rest)")
-    parser.add_argument("--data", type=str, required=True, help="Path to training data (.npz file)")
+    parser.add_argument("--data", type=str, required=True, help="Path to training data (.npz file or base path for .dat files)")
+    parser.add_argument("--n-samples", type=int, default=None, help="Number of samples (required for .dat files, auto-detected if omitted)")
     parser.add_argument("--output", type=str, default="models/curve_classifier_xgb.pkl", help="Output model path")
     parser.add_argument("--val-split", type=float, default=0.1, help="Validation split ratio")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
@@ -107,12 +157,17 @@ def main() -> None:
 
     np.random.seed(args.seed)
 
-    data = np.load(args.data, allow_pickle=True)
-    features = data['features']
-    labels = data['labels']
-    operator_classes = data['operator_classes'].tolist()
-    feature_dim = int(data['feature_dim']) if 'feature_dim' in data else features.shape[1]
-    feature_schema = data['feature_schema'].item() if 'feature_schema' in data else None
+    # Load data (supports both .npz and streaming .dat files)
+    features, labels, operator_classes, feature_dim, feature_schema = load_data(args.data, args.n_samples)
+    
+    # Convert memmap to regular arrays for fast training (XGBoost needs random access)
+    if hasattr(features, 'filename'):
+        print("Loading features into memory for training...")
+        features = np.array(features)
+        print(f"  Features loaded: {features.nbytes / 1e9:.2f} GB")
+    if hasattr(labels, 'filename'):
+        print("Loading labels into memory...")
+        labels = np.array(labels)
 
     if stratified_split:
         train_idx, val_idx = multilabel_stratified_split(labels, args.val_split, args.seed)
@@ -137,14 +192,21 @@ def main() -> None:
     models = []
     val_probs = np.zeros((len(val_idx), n_classes), dtype=np.float32)
 
-    tree_method = "gpu_hist" if args.gpu else args.tree_method
+    tree_method = args.tree_method
+    device = "cuda" if args.gpu else "cpu"
+    
+    print(f"\nTraining {n_classes} binary classifiers (device={device}, tree_method={tree_method})...")
 
     for c in range(n_classes):
+        class_name = operator_classes[c] if c < len(operator_classes) else f"class_{c}"
+        print(f"  [{c+1}/{n_classes}] Training {class_name}...", end=" ", flush=True)
+        
         y_train_c = labels[train_idx][:, c]
         unique_vals = np.unique(y_train_c)
         if unique_vals.size == 1:
             models.append(None)
             val_probs[:, c] = float(unique_vals[0])
+            print("skipped (single class)")
             continue
 
         model = xgb.XGBClassifier(
@@ -156,6 +218,7 @@ def main() -> None:
             objective='binary:logistic',
             eval_metric='logloss',
             tree_method=tree_method,
+            device=device,
             n_jobs=args.n_jobs,
             random_state=args.seed,
         )
@@ -167,6 +230,7 @@ def main() -> None:
         )
         models.append(model)
         val_probs[:, c] = model.predict_proba(val_np)[:, 1]
+        print("done")
 
     if tune_thresholds_flag:
         thresholds = tune_thresholds(val_probs, labels[val_idx])

@@ -4,6 +4,10 @@ import os
 import time
 import subprocess
 import re
+import argparse
+from pathlib import Path
+
+MODELS_DIR = Path(__file__).parent.parent / "models"
 
 BENCHMARKS = [
     {
@@ -53,13 +57,14 @@ BENCHMARKS = [
     }
 ]
 
-def run_test(benchmark):
+def run_test(benchmark, model_path=None):
     print(f"\n============================================================")
     print(f"TESTING: {benchmark['name']}")
     print(f"TARGET:  {benchmark['formula']}")
     print(f"============================================================")
     
-    cmd = f"python scripts/sr_tester.py --mode single --formula \"{benchmark['formula']}\" --curve-classifier --no-viz {benchmark['args']}"
+    model_arg = f"--curve-classifier-model \"{model_path}\"" if model_path else ""
+    cmd = f"python scripts/sr_tester.py --mode single --formula \"{benchmark['formula']}\" --curve-classifier {model_arg} --no-viz {benchmark['args']}"
     
     start_time = time.time()
     try:
@@ -106,13 +111,67 @@ def run_test(benchmark):
         print(f"ERROR: {e}")
         return {"name": benchmark["name"], "pass": False, "mse": -1, "time": 0, "formula": "Error"}
 
+def list_models():
+    """List available models in the models directory."""
+    models = []
+    if MODELS_DIR.exists():
+        for f in MODELS_DIR.iterdir():
+            if f.suffix in ('.pt', '.pkl', '.joblib'):
+                models.append(f)
+    return models
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Fast-Path Verification Suite")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Path to curve classifier model (default: auto-detect)")
+    parser.add_argument("--list-models", action="store_true",
+                        help="List available models and exit")
+    parser.add_argument("--benchmark", type=str, default=None,
+                        help="Run only a specific benchmark by name (partial match)")
+    args = parser.parse_args()
+    
+    if args.list_models:
+        print("Available models:")
+        for m in list_models():
+            size_mb = m.stat().st_size / (1024 * 1024)
+            print(f"  {m.name:<30} ({size_mb:.1f} MB)")
+        return
+    
+    # Resolve model path
+    model_path = None
+    if args.model:
+        model_path = Path(args.model)
+        if not model_path.exists():
+            # Try looking in models directory
+            model_path = MODELS_DIR / args.model
+        if not model_path.exists():
+            print(f"Error: Model not found: {args.model}")
+            print("Available models:")
+            for m in list_models():
+                print(f"  {m.name}")
+            return
+        print(f"Using model: {model_path}")
+    
+    # Filter benchmarks if requested
+    benchmarks = BENCHMARKS
+    if args.benchmark:
+        benchmarks = [b for b in BENCHMARKS if args.benchmark.lower() in b['name'].lower()]
+        if not benchmarks:
+            print(f"No benchmarks matching '{args.benchmark}'")
+            print("Available benchmarks:")
+            for b in BENCHMARKS:
+                print(f"  {b['name']}")
+            return
+    
     print("Starting Fast-Path Verification Suite...")
-    print(f"Testing {len(BENCHMARKS)} benchmarks")
+    print(f"Testing {len(benchmarks)} benchmarks")
+    if model_path:
+        print(f"Model: {model_path.name}")
     
     results = []
-    for bench in BENCHMARKS:
-        results.append(run_test(bench))
+    for bench in benchmarks:
+        results.append(run_test(bench, model_path))
         
     print("\n\n" + "="*80)
     print("FINAL SUMMARY")

@@ -1182,11 +1182,18 @@ def main():
         pct = 100 * count / len(labels)
         print(f"  {name:15s}: {int(count):6d} ({pct:5.1f}%)")
     
-    # Save
-    save_dataset(output_path, features, labels, formulas)
+    # Save - skip for streaming mode (already saved to .dat files)
+    if args.stream:
+        print(f"\nStreamed data already saved to:")
+        print(f"  {output_path.with_suffix('.features.dat')}")
+        print(f"  {output_path.with_suffix('.labels.dat')}")
+        if save_formulas:
+            print(f"  {output_path.with_suffix('.formulas.txt')}")
+    else:
+        save_dataset(output_path, features, labels, formulas)
     
-    # Show some examples
-    if len(formulas) > 0:
+    # Show some examples (only if formulas were saved and not too many)
+    if len(formulas) > 0 and len(formulas) <= 100000:
         print("\nExample formulas:")
         for i in range(min(5, len(formulas))):
             ops = [name for name, idx in OPERATOR_CLASSES.items() if labels[i, idx] > 0]

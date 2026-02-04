@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import argparse
 from pathlib import Path
 from tqdm import tqdm
-from typing import Tuple
+from typing import Tuple, Optional, List
 
 
 # =============================================================================
@@ -293,6 +293,12 @@ def multilabel_stratified_split(labels: np.ndarray, val_ratio: float, seed: int)
     n_samples = labels.shape[0]
     n_val = int(n_samples * val_ratio)
 
+    # Fast path for large datasets: random split approximates stratification well
+    if n_samples >= 200_000:
+        indices = np.arange(n_samples)
+        rng.shuffle(indices)
+        return indices[n_val:], indices[:n_val]
+
     # Desired positives per class in validation set
     class_pos = labels.sum(axis=0)
     desired_val = np.round(class_pos * val_ratio).astype(int)
@@ -437,14 +443,82 @@ def train_model(
     return model
 
 
+def load_training_data(
+    data_args: List[str],
+    n_samples: Optional[int],
+    feature_dim: int,
+    n_classes: int,
+    load_into_ram: bool,
+):
+    """Load training data from .npz or streamed .dat files."""
+    # Case 1: single .npz file
+    if len(data_args) == 1 and data_args[0].endswith(".npz"):
+        data = np.load(data_args[0], allow_pickle=True)
+        features = data["features"]
+        labels = data["labels"]
+        operator_classes = data["operator_classes"].tolist()
+        detected_feature_dim = int(data["feature_dim"]) if "feature_dim" in data else features.shape[1]
+        feature_schema = data["feature_schema"].item() if "feature_schema" in data else None
+        return features, labels, operator_classes, detected_feature_dim, feature_schema
+
+    # Case 2: base path or explicit feature/label files
+    features_path = None
+    labels_path = None
+
+    if len(data_args) == 1:
+        base = Path(data_args[0])
+        features_path = base.with_suffix(".features.dat")
+        labels_path = base.with_suffix(".labels.dat")
+    else:
+        for arg in data_args:
+            if arg.endswith(".features.dat"):
+                features_path = Path(arg)
+            elif arg.endswith(".labels.dat"):
+                labels_path = Path(arg)
+
+    if features_path is None or labels_path is None or not features_path.exists() or not labels_path.exists():
+        raise FileNotFoundError(
+            "Expected either a .npz file or .features.dat and .labels.dat files."
+        )
+
+    if n_samples is None:
+        file_size = features_path.stat().st_size
+        n_samples = file_size // (feature_dim * 4)
+        print(f"Inferred n_samples={n_samples} from {features_path.name}")
+
+    features = np.memmap(features_path, dtype=np.float32, mode="r", shape=(n_samples, feature_dim))
+    labels = np.memmap(labels_path, dtype=np.float32, mode="r", shape=(n_samples, n_classes))
+
+    if load_into_ram:
+        print("Loading features into RAM...")
+        features = np.array(features)
+        print(f"  Features loaded: {features.nbytes / 1e9:.2f} GB")
+        print("Loading labels into RAM...")
+        labels = np.array(labels)
+
+    operator_classes = [
+        "identity", "sin", "cos", "power", "exp",
+        "log", "addition", "multiplication", "rational",
+    ][:n_classes]
+    return features, labels, operator_classes, feature_dim, None
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Train curve classifier")
-    parser.add_argument("--data", type=str, required=True,
-                        help="Path to training data (.npz file)")
+    parser.add_argument("--data", type=str, nargs="+", required=True,
+                        help="Path to training data (.npz file) or base path / .features.dat + .labels.dat")
+    parser.add_argument("--n-samples", type=int, default=None,
+                        help="Number of samples (required for .dat if file size cannot be inferred)")
+    parser.add_argument("--feature-dim", type=int, default=334,
+                        help="Feature dimension for .dat files (default: 334)")
+    parser.add_argument("--n-classes", type=int, default=9,
+                        help="Number of classes for .dat files (default: 9)")
+    parser.add_argument("--load-into-ram", action="store_true",
+                        help="Load memmap data into RAM for faster training")
     parser.add_argument("--model", type=str, default="mlp",
                         choices=["mlp", "cnn"], help="Model architecture")
     parser.add_argument("--epochs", type=int, default=50,
@@ -503,12 +577,13 @@ def main():
     
     # Load data
     print(f"Loading data from {args.data}...")
-    data = np.load(args.data, allow_pickle=True)
-    features = data['features']
-    labels = data['labels']
-    operator_classes = data['operator_classes'].tolist()
-    feature_dim = int(data['feature_dim']) if 'feature_dim' in data else None
-    feature_schema = data['feature_schema'].item() if 'feature_schema' in data else None
+    features, labels, operator_classes, feature_dim, feature_schema = load_training_data(
+        args.data,
+        args.n_samples,
+        args.feature_dim,
+        args.n_classes,
+        args.load_into_ram,
+    )
     
     print(f"  Features: {features.shape}")
     print(f"  Labels: {labels.shape}")

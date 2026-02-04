@@ -521,7 +521,7 @@ def run_single_mode(config: Config):
 
             fast_path_result = run_fast_path(
                 x_tensor, y_tensor,
-                classifier_path="models/curve_classifier.pt",
+                classifier_path=getattr(config, 'curve_classifier_model', None) or "models/curve_classifier.pt",
                 detected_omegas=detected_omegas,
                 op_constraints=op_constraints,
                 auto_expand=True,
@@ -993,6 +993,8 @@ Examples:
     evo.add_argument('--curve-classifier', dest='use_curve_classifier', action='store_true', default=False,
                      help='Use curve classifier to warm-start operator selection')
     evo.add_argument('--no-curve-classifier', dest='use_curve_classifier', action='store_false')
+    evo.add_argument('--curve-classifier-model', type=str, default=None,
+                     help='Path to curve classifier model (.pt or .pkl)')
     
     # Data
     data = parser.add_argument_group('Data Generation')
@@ -1059,6 +1061,7 @@ def main():
     config.lamarckian = args.lamarckian
     config.risk_seeking = args.risk_seeking
     config.use_curve_classifier = args.use_curve_classifier
+    config.curve_classifier_model = args.curve_classifier_model
     config.x_min = args.x_min
     config.x_max = args.x_max
     config.n_samples = args.n_samples

@@ -86,8 +86,8 @@ def _resolve_device(device: Optional[str] = None) -> torch.device:
 def load_classifier(
     model_path: str = "models/curve_classifier.pt",
     device: Optional[str] = None,
-) -> nn.Module:
-    """Load the trained curve classifier."""
+):
+    """Load the trained curve classifier (supports PyTorch .pt and XGBoost .pkl)."""
     global _cached_classifier_by_device, _cached_operator_classes
     
     resolved_device = _resolve_device(device)
@@ -101,8 +101,49 @@ def load_classifier(
         # Clean failure if model not found
         raise FileNotFoundError(f"Classifier model not found at {model_path}")
     
+    # Check file extension to determine model type
+    if model_path_obj.suffix in ('.pkl', '.joblib'):
+        # XGBoost model
+        return _load_xgboost_classifier(model_path_obj, cache_key)
+    else:
+        # PyTorch model
+        return _load_pytorch_classifier(model_path_obj, resolved_device, cache_key)
+
+
+def _load_xgboost_classifier(model_path: Path, cache_key: str):
+    """Load XGBoost classifier from .pkl file."""
+    global _cached_classifier_by_device, _cached_operator_classes, _cached_metadata_by_device
+    
+    import joblib
+    
+    payload = joblib.load(model_path)
+    
+    _cached_operator_classes = payload.get('operator_classes', list(OPERATOR_CLASSES.keys()))
+    
+    # Store the XGBoost models and metadata
+    _cached_classifier_by_device[cache_key] = {
+        'type': 'xgboost',
+        'models': payload['models'],
+        'thresholds': payload.get('thresholds'),
+    }
+    _cached_metadata_by_device[cache_key] = {
+        'thresholds': payload.get('thresholds'),
+        'feature_scaler': payload.get('feature_scaler'),
+        'type': 'xgboost',
+    }
+    
+    print(f"Loaded XGBoost curve classifier from {model_path}")
+    print(f"  {len([m for m in payload['models'] if m is not None])} active classifiers")
+    
+    return _cached_classifier_by_device[cache_key]
+
+
+def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, cache_key: str) -> nn.Module:
+    """Load PyTorch classifier from .pt file."""
+    global _cached_classifier_by_device, _cached_operator_classes, _cached_metadata_by_device
+    
     try:
-        checkpoint = torch.load(model_path_obj, map_location='cpu', weights_only=False)
+        checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
     except Exception as e:
         print(f"Error loading checkpoint from {model_path}: {e}")
         raise
@@ -127,8 +168,9 @@ def load_classifier(
         'thresholds': checkpoint.get('thresholds'),
         'temperature': checkpoint.get('temperature'),
         'feature_scaler': checkpoint.get('feature_scaler'),
+        'type': 'pytorch',
     }
-    print(f"Loaded curve classifier from {model_path}")
+    print(f"Loaded PyTorch curve classifier from {model_path}")
     if 'val_acc' in checkpoint:
         print(f"  Val accuracy: {checkpoint.get('val_acc'):.4f}")
     print(f"  Device: {resolved_device}")
@@ -139,6 +181,37 @@ def load_classifier(
 # =============================================================================
 # PREDICTION
 # =============================================================================
+
+def _predict_xgboost(model_dict: dict, features: np.ndarray) -> np.ndarray:
+    """Predict using XGBoost models."""
+    models = model_dict['models']
+    n_classes = len(models)
+    probs = np.zeros(n_classes, dtype=np.float32)
+    
+    features_2d = features.reshape(1, -1)
+    
+    for i, m in enumerate(models):
+        if m is None:
+            probs[i] = 0.0
+        else:
+            probs[i] = m.predict_proba(features_2d)[0, 1]
+    
+    return probs
+
+
+def _predict_pytorch(model: nn.Module, features: np.ndarray, metadata: dict, device: torch.device) -> np.ndarray:
+    """Predict using PyTorch model."""
+    features_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
+    
+    with torch.no_grad():
+        logits = model(features_tensor).squeeze()
+        temperature = metadata.get('temperature')
+        if temperature is not None:
+            logits = logits / float(temperature)
+        probs = torch.sigmoid(logits).detach().cpu().numpy()
+    
+    return probs
+
 
 def predict_operators(
     x: np.ndarray,
@@ -170,24 +243,23 @@ def predict_operators(
     except Exception as e:
         print(f"Warning: Failed to load curve classifier: {e}")
         return {}
-        
+    
+    # Get cache key for metadata lookup
     resolved_device = _resolve_device(device)
+    cache_key = f"{str(resolved_device)}:{model_path}"
+    metadata = _cached_metadata_by_device.get(cache_key, {})
     
     # Extract features
     features = extract_all_features(y)
-    metadata = _cached_metadata_by_device.get(f"{str(resolved_device)}:{model_path}", {})
     scaler = metadata.get('feature_scaler')
     if scaler is not None:
         features = (features - scaler['mean']) / (scaler['std'] + 1e-8)
-    features_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(resolved_device)
     
-    # Predict
-    with torch.no_grad():
-        logits = model(features_tensor).squeeze()
-        temperature = metadata.get('temperature')
-        if temperature is not None:
-            logits = logits / float(temperature)
-        probs = torch.sigmoid(logits).detach().cpu().numpy()
+    # Check if this is XGBoost or PyTorch model
+    if metadata.get('type') == 'xgboost':
+        probs = _predict_xgboost(model, features)
+    else:
+        probs = _predict_pytorch(model, features, metadata, resolved_device)
     
     # Build result dict
     operator_classes = _cached_operator_classes or list(OPERATOR_CLASSES.keys())
