@@ -406,30 +406,67 @@ class SRTester:
                re.search(r'(sin|cos).*\*\s*x', formula_lower):
                 discovered_ops.add('x_times_trig')
         
-        features = [x]
-        feature_names = ['x']
+        # Detect number of inputs from x tensor
+        n_inputs = x.shape[1] if x.dim() > 1 else 1
         
-        if 'power' in discovered_ops or 'x_times_trig' in discovered_ops:
-            features.append(x ** 2)
-            feature_names.append('x²')
-            features.append(x ** 3)
-            feature_names.append('x³')
+        features = []
+        feature_names = []
         
-        if 'periodic' in discovered_ops:
-            features.append(torch.sin(x))
-            feature_names.append('sin(x)')
-            features.append(torch.cos(x))
-            feature_names.append('cos(x)')
-        
-        if 'x_times_trig' in discovered_ops:
-            features.append(x * torch.sin(x))
-            feature_names.append('x·sin(x)')
-            features.append(x * torch.cos(x))
-            feature_names.append('x·cos(x)')
+        if n_inputs == 1:
+            # Single input: original behavior
+            features.append(x)
+            feature_names.append('x')
+            
+            if 'power' in discovered_ops or 'x_times_trig' in discovered_ops:
+                features.append(x ** 2)
+                feature_names.append('x²')
+                features.append(x ** 3)
+                feature_names.append('x³')
+            
+            if 'periodic' in discovered_ops:
+                features.append(torch.sin(x))
+                feature_names.append('sin(x)')
+                features.append(torch.cos(x))
+                feature_names.append('cos(x)')
+            
+            if 'x_times_trig' in discovered_ops:
+                features.append(x * torch.sin(x))
+                feature_names.append('x·sin(x)')
+                features.append(x * torch.cos(x))
+                feature_names.append('x·cos(x)')
+        else:
+            # Multi-input: generate per-variable and cross-term basis
+            # Linear terms: x0, x1, ...
+            for i in range(n_inputs):
+                features.append(x[:, i:i+1])
+                feature_names.append(f'x{i}')
+            
+            # Power terms: x0², x1², x0³, x1³, ...
+            if 'power' in discovered_ops or True:  # Always include for multi-input
+                for i in range(n_inputs):
+                    features.append(x[:, i:i+1] ** 2)
+                    feature_names.append(f'x{i}²')
+                for i in range(n_inputs):
+                    features.append(x[:, i:i+1] ** 3)
+                    feature_names.append(f'x{i}³')
+            
+            # Cross-terms: x0*x1, x0*x2, x1*x2, ...
+            for i in range(n_inputs):
+                for j in range(i+1, n_inputs):
+                    features.append(x[:, i:i+1] * x[:, j:j+1])
+                    feature_names.append(f'x{i}·x{j}')
+            
+            # Periodic terms per variable
+            if 'periodic' in discovered_ops:
+                for i in range(n_inputs):
+                    features.append(torch.sin(x[:, i:i+1]))
+                    feature_names.append(f'sin(x{i})')
+                    features.append(torch.cos(x[:, i:i+1]))
+                    feature_names.append(f'cos(x{i})')
         
         features_matrix = torch.cat(features, dim=1)
         n_samples = features_matrix.shape[0]
-        features_with_bias = torch.cat([features_matrix, torch.ones(n_samples, 1, device=x.device)], dim=1)
+        features_with_bias = torch.cat([features_matrix, torch.ones(n_samples, 1, device=x.device, dtype=x.dtype)], dim=1)
         
         try:
             solution = torch.linalg.lstsq(features_with_bias, y)
