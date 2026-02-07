@@ -772,6 +772,7 @@ def refine_constants(
     scales_only: bool = False,
     hard: bool = True,
     refine_internal: bool = False, # NEW: Allow refining p, omega
+    use_amp: bool = True,  # NEW: Use automatic mixed precision (FP16)
 ) -> float:
     """
     Use gradient descent to optimize ONLY the constants.
@@ -787,8 +788,13 @@ def refine_constants(
         use_lbfgs: If True, use L-BFGS (better for symbolic regression constants)
         scales_only: If True, only tune output_scale and edge_weights (use after snap)
         refine_internal: If True, ALSO tune p, omega, phi, etc. (use for final polish)
+        use_amp: If True, use FP16 mixed precision for ~2x speedup (CUDA only)
     """
     model.train()
+    
+    # Check if AMP is available (CUDA only)
+    amp_enabled = use_amp and x.is_cuda
+    scaler = torch.amp.GradScaler('cuda') if amp_enabled else None
     
     # Identify constant parameters (not selection logits)
     constant_params = []
@@ -820,6 +826,7 @@ def refine_constants(
     try:
         if use_lbfgs:
             # L-BFGS: Better for finding exact constants (recommended by research)
+            # Note: L-BFGS doesn't support AMP well, so we skip it here
             y_squeezed = y.squeeze()
             # Create optimizer first, then define closure
             optimizer = LBFGS(constant_params, lr=1.0, max_iter=steps, line_search_fn='strong_wolfe')
@@ -841,23 +848,38 @@ def refine_constants(
             except Exception as e:
                 logger.debug(f"L-BFGS step failed: {e}")
         else:
-            # Adam: Faster but less precise
+            # Adam with optional AMP
             optimizer = Adam(constant_params, lr=lr)
             y_squeezed = y.squeeze()
             
             for step in range(steps):
                 optimizer.zero_grad()
                 
-                pred, _ = model(x, hard=hard)
-                pred = pred.squeeze()
-                loss = F.mse_loss(pred, y_squeezed)
+                # Forward pass with autocast for FP16
+                if amp_enabled:
+                    with torch.amp.autocast('cuda'):
+                        pred, _ = model(x, hard=hard)
+                        pred = pred.squeeze()
+                        loss = F.mse_loss(pred, y_squeezed)
+                else:
+                    pred, _ = model(x, hard=hard)
+                    pred = pred.squeeze()
+                    loss = F.mse_loss(pred, y_squeezed)
                 
                 if torch.isnan(loss):
                     return float('inf')
                 
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(constant_params, max_norm=GRADIENT_CLIP_NORM)
-                optimizer.step()
+                # Backward pass with scaler for FP16
+                if amp_enabled and scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(constant_params, max_norm=GRADIENT_CLIP_NORM)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(constant_params, max_norm=GRADIENT_CLIP_NORM)
+                    optimizer.step()
                 
                 best_loss = min(best_loss, loss.item())
     except (MemoryError, RuntimeError) as e:
@@ -1181,6 +1203,7 @@ def intensive_coefficient_refinement(
     target_mse: float = 0.001,
     lr_start: float = 0.01,
     patience: int = 200,
+    use_amp: bool = True,  # NEW: Use FP16 mixed precision
 ) -> Tuple[float, int]:
     """
     Two-phase coefficient refinement when structure is locked.
@@ -1192,6 +1215,10 @@ def intensive_coefficient_refinement(
         (final_mse, steps_taken)
     """
     y_sq = y.squeeze()
+    
+    # Setup AMP if available (CUDA only)
+    amp_enabled = use_amp and x.is_cuda
+    scaler = torch.amp.GradScaler('cuda') if amp_enabled else None
     
     # Get initial MSE
     model.eval()
@@ -1219,15 +1246,27 @@ def intensive_coefficient_refinement(
         for step in range(max_steps // 2):
             total_steps += 1
             optimizer.zero_grad()
-            pred, _ = model(x, hard=True)
-            loss = F.mse_loss(pred.squeeze(), y_sq)
+            
+            # AMP forward pass
+            if amp_enabled:
+                with torch.amp.autocast('cuda'):
+                    pred, _ = model(x, hard=True)
+                    loss = F.mse_loss(pred.squeeze(), y_sq)
+            else:
+                pred, _ = model(x, hard=True)
+                loss = F.mse_loss(pred.squeeze(), y_sq)
             
             if torch.isnan(loss):
                 break
             
-            # Perform backward and step FIRST
-            loss.backward()
-            optimizer.step()
+            # AMP backward pass
+            if amp_enabled and scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                optimizer.step()
             
             # THEN check improvement and break conditions
             mse = loss.item()
@@ -1271,16 +1310,30 @@ def intensive_coefficient_refinement(
             for step in range(max_steps // 2):
                 total_steps += 1
                 optimizer.zero_grad()
-                pred, _ = model(x, hard=True)
-                loss = F.mse_loss(pred.squeeze(), y_sq)
+                
+                # AMP forward pass
+                if amp_enabled:
+                    with torch.amp.autocast('cuda'):
+                        pred, _ = model(x, hard=True)
+                        loss = F.mse_loss(pred.squeeze(), y_sq)
+                else:
+                    pred, _ = model(x, hard=True)
+                    loss = F.mse_loss(pred.squeeze(), y_sq)
                 
                 if torch.isnan(loss):
                     break
                 
-                # Perform backward and step FIRST
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(scale_params, max_norm=SCALE_GRADIENT_CLIP_NORM)
-                optimizer.step()
+                # AMP backward pass
+                if amp_enabled and scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(scale_params, max_norm=SCALE_GRADIENT_CLIP_NORM)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(scale_params, max_norm=SCALE_GRADIENT_CLIP_NORM)
+                    optimizer.step()
                 
                 # THEN check improvement and break conditions
                 mse = loss.item()

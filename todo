@@ -1,3 +1,10 @@
-for optimization if the population that didnt mutate but just are back proping keep them in chache and reuse them
-edges has activation constant like a attention mechanism 
-a map of operators 
+1. multi-inputs for the neural network
+2. Write a custom Triton or CUDA kernel that groups similar operators together to minimize warp divergence.
+    -In an ONN, if Thread A is calculating $sin(x)$ and Thread B is calculating $exp(x)$, the GPU hits Divergence. It can’t do both at once, so it serializes them—effectively pausing Thread B while A finishes, then pausing A while B finishes.
+    -This is why your scaling is horrible: As you add more nodes (and thus more variety in operators), the probability of warp divergence skyrockets.
+3. Group all "Sine" nodes and calculate them in one big block, then group all "Exponential" nodes. Don't interleave them in the same layer.
+4. Lookup Tables (LUTs): For symbolic regression, you often don't need 64-bit precision. Pre-calculate your $sin$ and $exp$ values into a 1D texture map (Lookup Table). Fetching a value from memory is often faster than calculating a 10th-order polynomial expansion.
+5. Memory Coalescing: Ensure adjacent threads access adjacent memory locations. Rearrange tensor layouts so node data is contiguous in memory.
+6. Shared Memory Caching: Cache frequently used intermediate values (like routing weights, node outputs) in shared memory to reduce global memory bandwidth.
+7. FP16/TensorCore: Use mixed precision (PyTorch AMP) where possible. TensorCores can dramatically speed up matrix operations if precision loss is acceptable.
+8. Kernel Fusion: Fuse multiple small ops into one kernel launch to reduce kernel launch overhead and intermediate memory writes.

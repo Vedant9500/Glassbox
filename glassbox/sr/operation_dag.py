@@ -164,13 +164,13 @@ class OperationDAG(nn.Module):
             # Build sources based on window setting
             if self.source_window < 0:
                 # Dense: concatenate all previous outputs
-                sources = torch.cat(all_outputs, dim=-1)
+                sources = torch.cat(all_outputs, dim=-1).contiguous()  # Memory coalescing
             else:
                 # Windowed: only inputs + last N layers
                 # Always include inputs (index 0)
                 window_start = max(1, len(all_outputs) - self.source_window)
                 sources_to_cat = [all_outputs[0]] + all_outputs[window_start:]
-                sources = torch.cat(sources_to_cat, dim=-1)
+                sources = torch.cat(sources_to_cat, dim=-1).contiguous()  # Memory coalescing
             
             # Forward through layer
             layer_output, layer_info = layer(sources, hard=hard)
@@ -180,7 +180,7 @@ class OperationDAG(nn.Module):
             layer_infos.append(layer_info)
         
         # Final output: project from ALL outputs (for expressiveness)
-        final_sources = torch.cat(all_outputs, dim=-1)
+        final_sources = torch.cat(all_outputs, dim=-1).contiguous()  # Memory coalescing
         output = self.output_proj(final_sources)
         
         if return_all_outputs:

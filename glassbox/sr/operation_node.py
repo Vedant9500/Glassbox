@@ -83,7 +83,7 @@ class AdaptiveArityRouter(nn.Module):
             # Soft selection
             probs = F.softmax(self.route_logits / tau, dim=-1)
             # (batch, sources) * (arity, sources) -> (arity, batch)
-            selected = torch.matmul(probs, weighted_sources.t())
+            selected = torch.matmul(probs, weighted_sources.t()).contiguous()  # Memory coalescing
             x = selected[0]
             y = selected[1]
             

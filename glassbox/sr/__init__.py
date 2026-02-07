@@ -106,6 +106,26 @@ from .bfgs_optimizer import (
     build_formula_from_weights,
 )
 
+# v2: GPU Optimization (Batched Kernels)
+from .batched_ops import (
+    OperatorBatch,
+    BatchedOperationRegistry,
+)
+from .gpu_optimized_dag import (
+    GPUOptimizedDAG,
+    wrap_dag_for_gpu,
+)
+# Triton kernels imported conditionally
+try:
+    from .triton_kernels import (
+        batched_periodic_forward,
+        batched_power_forward,
+        check_triton_available,
+        TRITON_AVAILABLE,
+    )
+except ImportError:
+    TRITON_AVAILABLE = False
+
 
 __all__ = [
     # v2: Meta-Operations

@@ -116,6 +116,9 @@ class Config:
         self.normalize_data: bool = False
         self.auto_domain: bool = True
         
+        # Multi-input support
+        self.n_inputs: int = 1  # Number of input variables (x0, x1, ...)
+        
         # Other
         self.formula: str = ""
         self.lite_mode: bool = False
@@ -159,8 +162,16 @@ def parse_formula(formula_str: str) -> Callable[[torch.Tensor], torch.Tensor]:
     formula = formula_str.strip().lower()
     formula = re.sub(r'\^(\d+)', r'**\1', formula)
     formula = re.sub(r'\^(\()', r'**\1', formula)
-    formula = re.sub(r'\bx(\d+)\b', r'x[:, \1:(\1+1)]', formula)
-    formula = re.sub(r'\bx\b', 'x[:, 0:1]', formula)
+    
+    # Check if multi-input pattern x0, x1, ... is used BEFORE substituting
+    has_indexed_x = re.search(r'\bx\d+\b', formula) is not None
+    
+    if has_indexed_x:
+        # Multi-input: x0 -> x[:, 0:1], x1 -> x[:, 1:2], etc.
+        formula = re.sub(r'\bx(\d+)\b', lambda m: f'x[:, {m.group(1)}:{int(m.group(1))+1}]', formula)
+    else:
+        # Single input: x -> x[:, 0:1]
+        formula = re.sub(r'\bx\b', 'x[:, 0:1]', formula)
     formula = formula.replace('sin(', 'torch.sin(')
     formula = formula.replace('cos(', 'torch.cos(')
     formula = formula.replace('tan(', 'torch.tan(')
@@ -225,7 +236,7 @@ class SRTester:
             op_constraints = {k: v for k, v in op_constraints.items() if v is not None}
         
         model = OperationDAG(
-            n_inputs=1,
+            n_inputs=self.config.n_inputs,
             n_hidden_layers=self.config.hidden_layers,
             nodes_per_layer=self.config.nodes_per_layer,
             n_outputs=1,
@@ -242,53 +253,70 @@ class SRTester:
         Generate training data from formula.
         
         Returns:
-            x: Input tensor
-            y: Output tensor
+            x: Input tensor [n_samples, n_inputs]
+            y: Output tensor [n_samples, 1]
             weights: Optional sample weights (1.0 = normal, <1.0 = downweighted near singularities)
         """
         target_fn = parse_formula(formula_str)
         dtype = torch.float64 if self.config.precision == 64 else torch.float32
+        n_inputs = self.config.n_inputs
         
-        # Generate x values, optionally avoiding singular points
-        if self.config.sample_avoid:
-            # Create x values that avoid singular points
-            x_list = []
-            avoid_points = self.config.sample_avoid
-            eps = self.config.sample_epsilon
+        # Multi-input: generate grid of points
+        if n_inputs > 1:
+            # Calculate points per dimension (cube root for balanced grid)
+            points_per_dim = max(5, int(self.config.n_samples ** (1.0 / n_inputs)))
             
-            # Build valid ranges
-            sorted_avoid = sorted(avoid_points)
-            ranges = []
-            current_start = self.config.x_min
+            # Create 1D grids for each dimension
+            grids = []
+            for _ in range(n_inputs):
+                grids.append(torch.linspace(self.config.x_min, self.config.x_max, points_per_dim, dtype=dtype))
             
-            for avoid_pt in sorted_avoid:
-                if current_start < avoid_pt - eps:
-                    ranges.append((current_start, avoid_pt - eps))
-                current_start = avoid_pt + eps
-            
-            if current_start < self.config.x_max:
-                ranges.append((current_start, self.config.x_max))
-            
-            # Calculate samples per range (proportional to range size)
-            total_range = sum(r[1] - r[0] for r in ranges)
-            if total_range > 0:
-                for r_start, r_end in ranges:
-                    n_in_range = max(1, int(self.config.n_samples * (r_end - r_start) / total_range))
-                    x_list.append(torch.linspace(r_start, r_end, n_in_range, dtype=dtype))
-                x = torch.cat(x_list).reshape(-1, 1)
-            else:
-                # Fallback if all ranges are invalid
-                x = torch.linspace(self.config.x_min, self.config.x_max, self.config.n_samples, dtype=dtype).reshape(-1, 1)
+            # Create meshgrid and flatten
+            mesh = torch.meshgrid(*grids, indexing='ij')
+            x = torch.stack([m.flatten() for m in mesh], dim=1)  # [n_samples, n_inputs]
         else:
-            x = torch.linspace(self.config.x_min, self.config.x_max, self.config.n_samples, dtype=dtype).reshape(-1, 1)
+            # Single input: original logic
+            if self.config.sample_avoid:
+                # Create x values that avoid singular points
+                x_list = []
+                avoid_points = self.config.sample_avoid
+                eps = self.config.sample_epsilon
+                
+                # Build valid ranges
+                sorted_avoid = sorted(avoid_points)
+                ranges = []
+                current_start = self.config.x_min
+                
+                for avoid_pt in sorted_avoid:
+                    if current_start < avoid_pt - eps:
+                        ranges.append((current_start, avoid_pt - eps))
+                    current_start = avoid_pt + eps
+                
+                if current_start < self.config.x_max:
+                    ranges.append((current_start, self.config.x_max))
+                
+                # Calculate samples per range (proportional to range size)
+                total_range = sum(r[1] - r[0] for r in ranges)
+                if total_range > 0:
+                    for r_start, r_end in ranges:
+                        n_in_range = max(1, int(self.config.n_samples * (r_end - r_start) / total_range))
+                        x_list.append(torch.linspace(r_start, r_end, n_in_range, dtype=dtype))
+                    x = torch.cat(x_list).reshape(-1, 1)
+                else:
+                    x = torch.linspace(self.config.x_min, self.config.x_max, self.config.n_samples, dtype=dtype).reshape(-1, 1)
+            else:
+                x = torch.linspace(self.config.x_min, self.config.x_max, self.config.n_samples, dtype=dtype).reshape(-1, 1)
         
         # Auto-domain filtering/shrinking if invalid values
-        if self.config.auto_domain:
+        if self.config.auto_domain and n_inputs == 1:
+            # Single-input: try to shrink domain if too many invalid values
             x_try = x
             y = None
             for _ in range(4):
                 y_try = target_fn(x_try)
                 finite_mask = torch.isfinite(y_try).squeeze()
+                if finite_mask.ndim == 0:
+                    finite_mask = torch.tensor([finite_mask.item()]).expand(x_try.shape[0])
                 if finite_mask.float().mean().item() > 0.9:
                     x = x_try[finite_mask].reshape(-1, 1)
                     y = y_try[finite_mask].reshape(-1, 1)
@@ -299,10 +327,27 @@ class SRTester:
             if y is None:
                 y_try = target_fn(x)
                 finite_mask = torch.isfinite(y_try).squeeze()
+                if finite_mask.ndim == 0:
+                    finite_mask = torch.tensor([finite_mask.item()]).expand(x.shape[0])
                 x = x[finite_mask].reshape(-1, 1)
                 y = y_try[finite_mask].reshape(-1, 1)
         else:
+            # Multi-input or auto_domain disabled: just evaluate and filter invalid
             y = target_fn(x)
+            # Ensure y is 2D with shape (n_samples, 1)
+            if y.ndim == 1:
+                y = y.unsqueeze(-1)
+            elif y.shape[-1] != 1:
+                y = y.reshape(-1, 1)
+            finite_mask = torch.isfinite(y).squeeze()
+            if finite_mask.ndim == 0:
+                # Scalar result - keep everything if finite
+                if not finite_mask.item():
+                    raise ValueError("All output values are NaN/Inf")
+            elif not finite_mask.all():
+                # Filter out invalid samples
+                x = x[finite_mask].reshape(-1, n_inputs)
+                y = y[finite_mask].reshape(-1, 1)
         if self.config.noise_std > 0:
             y = y + torch.randn_like(y) * self.config.noise_std
         
@@ -998,6 +1043,8 @@ Examples:
     
     # Data
     data = parser.add_argument_group('Data Generation')
+    data.add_argument('--n-inputs', type=int, default=1, 
+                      help='Number of input variables (1=x, 2=x0,x1, etc.)')
     data.add_argument('--x-min', type=float, default=-6.0, help='Minimum x value')
     data.add_argument('--x-max', type=float, default=6.0, help='Maximum x value')
     data.add_argument('--n-samples', type=int, default=300, help='Number of data points')
@@ -1065,6 +1112,7 @@ def main():
     config.x_min = args.x_min
     config.x_max = args.x_max
     config.n_samples = args.n_samples
+    config.n_inputs = args.n_inputs
     config.noise_std = args.noise_std
     config.precision = args.precision
     config.normalize_data = args.normalize_data
