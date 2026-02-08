@@ -178,7 +178,7 @@ def build_basis_from_predictions(
     allow_arithmetic = constraints.get('arithmetic', True)
 
     def var_name(i: int) -> str:
-        return "x" if n_vars == 1 else f"x{i+1}"
+        return "x" if n_vars == 1 else f"x{i}"
 
     # Polynomial terms (always include in universal mode)
     include_polynomial = allow_power and (

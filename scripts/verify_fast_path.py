@@ -40,21 +40,30 @@ BENCHMARKS = [
         "formula": "x**3 / (exp(x) - 1)",
         "args": "--x-min 0.2 --x-max 5 --n-samples 400 --full-ops --generations 50 --population 30 --no-ops-periodic --ops-exp --sample-avoid 0 --sample-epsilon 0.2"
     },
-    # {
-    #     "name": "Damped Oscillator",
-    #     "formula": "exp(-0.1*x) * cos(2*x)",
-    #     "args": "--x-min 0 --x-max 10 --n-samples 400 --full-ops --ops-periodic --ops-exp"
-    # },
-    # {
-    #     "name": "Nesting Doll",
-    #     "formula": "sin(cos(x)) + exp(sin(x))",
-    #     "args": "--x-min -3.14 --x-max 3.14 --n-samples 500 --full-ops --generations 60 --population 40 --ops-periodic --ops-exp"
-    # },
     {
         "name": "Constant Hunter",
         "formula": "pi * x**2 + sqrt(2) * sin(x) - 1.618",
         "args": "--x-min -3 --x-max 3 --n-samples 400 --generations 30 --population 25 --ops-periodic --ops-power"
-    }
+    },
+    # Multi-input benchmarks
+    {
+        "name": "2D Sum of Squares",
+        "formula": "x0^2 + x1^2",
+        "args": "--x-min -3 --x-max 3 --n-samples 400 --generations 10 --population 20",
+        "n_inputs": 2
+    },
+    {
+        "name": "2D Cross Term",
+        "formula": "x0*x1 + x0 + x1",
+        "args": "--x-min -3 --x-max 3 --n-samples 400 --generations 10 --population 20",
+        "n_inputs": 2
+    },
+    {
+        "name": "2D Mixed Polynomial",
+        "formula": "x0^2 + 2*x0*x1 + x1^2",
+        "args": "--x-min -2 --x-max 2 --n-samples 400 --generations 15 --population 25",
+        "n_inputs": 2
+    },
 ]
 
 def run_test(benchmark, model_path=None):
@@ -64,7 +73,8 @@ def run_test(benchmark, model_path=None):
     print(f"============================================================")
     
     model_arg = f"--curve-classifier-model \"{model_path}\"" if model_path else ""
-    cmd = f"python scripts/sr_tester.py --mode single --formula \"{benchmark['formula']}\" --curve-classifier {model_arg} --no-viz {benchmark['args']}"
+    n_inputs_arg = f"--n-inputs {benchmark.get('n_inputs', 1)}"
+    cmd = f"python scripts/sr_tester.py --mode single --formula \"{benchmark['formula']}\" --curve-classifier {model_arg} {n_inputs_arg} --no-viz {benchmark['args']}"
     
     start_time = time.time()
     try:
