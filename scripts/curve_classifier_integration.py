@@ -223,8 +223,13 @@ def predict_operators(
     """
     Predict which operators are likely present in the data.
     
+    For multi-input data (n_vars > 1), uses per-variable 1D slicing:
+    - Takes 1D cross-sections through the data (fixing other vars at midpoint)
+    - Runs classifier on each slice
+    - Aggregates predictions across all variables
+    
     Args:
-        x: Input values (1D array)
+        x: Input values - 1D array (N,) or 2D array (N, n_vars)
         y: Output values (1D array)
         model_path: Path to trained classifier
         threshold: Probability threshold for reporting
@@ -249,7 +254,23 @@ def predict_operators(
     cache_key = f"{str(resolved_device)}:{model_path}"
     metadata = _cached_metadata_by_device.get(cache_key, {})
     
-    # Extract features
+    # Detect multi-input
+    x = np.asarray(x)
+    y = np.asarray(y).flatten()
+    
+    if x.ndim == 1:
+        n_vars = 1
+        x = x.reshape(-1, 1)
+    else:
+        n_vars = x.shape[1]
+    
+    # For multi-input: use per-variable slicing
+    if n_vars > 1:
+        return _predict_operators_multi_input(
+            x, y, model, metadata, resolved_device, threshold, n_vars
+        )
+    
+    # Single-input: standard prediction
     features = extract_all_features(y)
     scaler = metadata.get('feature_scaler')
     if scaler is not None:
@@ -261,14 +282,102 @@ def predict_operators(
     else:
         probs = _predict_pytorch(model, features, metadata, resolved_device)
     
-    # Build result dict
+    return _build_result_dict(probs, threshold, metadata)
+
+
+def _predict_operators_multi_input(
+    x: np.ndarray,
+    y: np.ndarray,
+    model,
+    metadata: dict,
+    device: torch.device,
+    threshold: float,
+    n_vars: int,
+) -> Dict[str, float]:
+    """
+    Predict operators for multi-input data using per-variable 1D slicing.
+    
+    For each variable:
+    1. Fix all other variables at their median value
+    2. Vary the target variable across its range
+    3. Compute y values for this slice
+    4. Run classifier on the 1D slice
+    5. Aggregate predictions across all variables (max probability)
+    """
+    from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
+    
+    # Create interpolator for y values
+    try:
+        # Try linear interpolation first
+        interp = LinearNDInterpolator(x, y, fill_value=np.nan)
+    except Exception:
+        # Fall back to nearest neighbor
+        interp = NearestNDInterpolator(x, y)
+    
+    operator_classes = _cached_operator_classes or list(OPERATOR_CLASSES.keys())
+    all_probs = np.zeros((n_vars, len(operator_classes)), dtype=np.float32)
+    
+    scaler = metadata.get('feature_scaler')
+    
+    for var_idx in range(n_vars):
+        # Create 1D slice: fix other variables at median, vary this one
+        x_medians = np.median(x, axis=0)
+        x_min_var = x[:, var_idx].min()
+        x_max_var = x[:, var_idx].max()
+        
+        # Sample points along this variable
+        n_slice_points = min(256, len(y))
+        x_slice_1d = np.linspace(x_min_var, x_max_var, n_slice_points)
+        
+        # Build full query points (other vars at median)
+        x_query = np.tile(x_medians, (n_slice_points, 1))
+        x_query[:, var_idx] = x_slice_1d
+        
+        # Get y values for this slice
+        y_slice = interp(x_query)
+        
+        # Handle NaN values from interpolation
+        valid_mask = np.isfinite(y_slice)
+        if valid_mask.sum() < 10:
+            # Not enough valid points, skip this variable
+            continue
+        
+        y_slice_valid = y_slice[valid_mask]
+        
+        # Extract features and predict
+        try:
+            features = extract_all_features(y_slice_valid)
+            if scaler is not None:
+                features = (features - scaler['mean']) / (scaler['std'] + 1e-8)
+            
+            if metadata.get('type') == 'xgboost':
+                probs = _predict_xgboost(model, features)
+            else:
+                probs = _predict_pytorch(model, features, metadata, device)
+            
+            all_probs[var_idx] = probs
+        except Exception as e:
+            # Skip this variable if feature extraction fails
+            print(f"  Warning: Slice {var_idx} failed: {e}")
+            continue
+    
+    # Aggregate: use max probability across all variables
+    # This captures operators that appear in ANY variable
+    aggregated_probs = np.max(all_probs, axis=0)
+    
+    return _build_result_dict(aggregated_probs, threshold, metadata)
+
+
+def _build_result_dict(probs: np.ndarray, threshold: float, metadata: dict) -> Dict[str, float]:
+    """Build result dictionary from probability array."""
     operator_classes = _cached_operator_classes or list(OPERATOR_CLASSES.keys())
     thresholds = metadata.get('thresholds')
     if thresholds is None:
         thresholds = np.full((len(operator_classes),), threshold, dtype=np.float32)
+    
     result = {}
     for i, name in enumerate(operator_classes):
-        if probs[i] >= thresholds[i]:
+        if i < len(probs) and probs[i] >= thresholds[i]:
             result[name] = float(probs[i])
     
     # Derived compatibility outputs

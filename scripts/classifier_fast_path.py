@@ -327,14 +327,15 @@ def build_basis_from_predictions(
             if include_exp:
                 x_clamp = np.clip(xi, -10, 10)
                 expm1 = np.expm1(x_clamp)
-                expm1 = np.where(np.abs(expm1) < 1e-6, np.sign(expm1) * 1e-6, expm1)
-                basis_list.append(1.0 / expm1)
+                # Protect against divide by zero (expm1=0 when x=0)
+                expm1_safe = np.where(np.abs(expm1) < 1e-6, 1e-6, expm1)
+                basis_list.append(1.0 / expm1_safe)
                 names.append(f"1/(exp({name})-1)")
-                basis_list.append(xi / expm1)
+                basis_list.append(xi / expm1_safe)
                 names.append(f"{name}/(exp({name})-1)")
-                basis_list.append(xi**2 / expm1)
+                basis_list.append(xi**2 / expm1_safe)
                 names.append(f"{name}^2/(exp({name})-1)")
-                basis_list.append(xi**3 / expm1)
+                basis_list.append(xi**3 / expm1_safe)
                 names.append(f"{name}^3/(exp({name})-1)")
 
     # Pairwise interaction terms for multi-input formulas
@@ -343,6 +344,77 @@ def build_basis_from_predictions(
             for j in range(i + 1, n_vars):
                 basis_list.append(x[:, i] * x[:, j])
                 names.append(f"{var_name(i)}*{var_name(j)}")
+    
+    # Product-ratio terms for physics formulas (e.g., G*m1*m2/r²)
+    if universal_basis and allow_arithmetic and n_vars >= 2:
+        epsilon = 1e-8  # Prevent division by zero
+        
+        # Triple products: a*b*c
+        if n_vars >= 3:
+            for i in range(n_vars):
+                for j in range(i + 1, n_vars):
+                    for k in range(j + 1, n_vars):
+                        basis_list.append(x[:, i] * x[:, j] * x[:, k])
+                        names.append(f"{var_name(i)}*{var_name(j)}*{var_name(k)}")
+        
+        # Product-ratio terms: a*b/c, a*b/c²
+        for i in range(n_vars):
+            for j in range(n_vars):
+                if i == j:
+                    continue
+                xi, xj = x[:, i], x[:, j]
+                
+                # a*b/c for all pairs
+                for k in range(n_vars):
+                    if k == i or k == j:
+                        continue
+                    xk = x[:, k]
+                    # a*b/c
+                    denom = np.abs(xk) + epsilon
+                    basis_list.append((xi * xj) / denom)
+                    names.append(f"{var_name(i)}*{var_name(j)}/|{var_name(k)}|")
+                    
+                    # a*b/c² - critical for gravitational/inverse-square laws
+                    denom_sq = xk**2 + epsilon
+                    basis_list.append((xi * xj) / denom_sq)
+                    names.append(f"{var_name(i)}*{var_name(j)}/{var_name(k)}²")
+        
+        # Ratio terms: a/b, a/b²
+        for i in range(n_vars):
+            for j in range(n_vars):
+                if i == j:
+                    continue
+                xi, xj = x[:, i], x[:, j]
+                
+                # a/b
+                denom = np.abs(xj) + epsilon
+                basis_list.append(xi / denom)
+                names.append(f"{var_name(i)}/|{var_name(j)}|")
+                
+                # a/b²
+                denom_sq = xj**2 + epsilon
+                basis_list.append(xi / denom_sq)
+                names.append(f"{var_name(i)}/{var_name(j)}²")
+                
+                # a²/b
+                basis_list.append((xi**2) / denom)
+                names.append(f"{var_name(i)}²/|{var_name(j)}|")
+        
+        # Square root ratio terms: sqrt(a)/b, a/sqrt(b) - for relativistic mechanics
+        for i in range(n_vars):
+            for j in range(n_vars):
+                if i == j:
+                    continue
+                xi, xj = x[:, i], x[:, j]
+                
+                sqrt_xi = np.sqrt(np.abs(xi) + epsilon)
+                sqrt_xj = np.sqrt(np.abs(xj) + epsilon)
+                
+                basis_list.append(sqrt_xi / (np.abs(xj) + epsilon))
+                names.append(f"√|{var_name(i)}|/|{var_name(j)}|")
+                
+                basis_list.append(xi / sqrt_xj)
+                names.append(f"{var_name(i)}/√|{var_name(j)}|")
 
     # Rational and cross terms (per-variable)
     if universal_basis and allow_power:

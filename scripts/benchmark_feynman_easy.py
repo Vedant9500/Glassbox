@@ -15,20 +15,29 @@ sys.path.insert(0, repo_root)
 sys.path.insert(0, scripts_dir)
 
 from classifier_fast_path import run_fast_path
-from glassbox.sr.evolution import detect_dominant_frequency
+from glassbox.sr.evolution import detect_dominant_frequency, EvolutionaryONNTrainer
+from glassbox.sr.operation_dag import OperationDAG
 
+
+# Feynman equations reference (for verification):
+# example1: I.6.2a  -> f = exp(-theta^2/2)/sqrt(2*pi)
+# example2: I.9.18  -> F = G*m1*m2/((x2-x1)^2+(y2-y1)^2+(z2-z1)^2)
+# example3: I.10.7  -> m = m0/sqrt(1-v^2/c^2)
 
 DATASETS: List[Dict[str, str]] = [
     {
         "name": "example1.txt",
+        "formula": "exp(-theta^2/2)/sqrt(2*pi)",  # I.6.2a: Gaussian
         "url": "https://raw.githubusercontent.com/SJ001/AI-Feynman/master/example_data/example1.txt",
     },
     {
         "name": "example2.txt",
+        "formula": "G*m1*m2/r^2",  # I.9.18: Gravitational force (simplified)
         "url": "https://raw.githubusercontent.com/SJ001/AI-Feynman/master/example_data/example2.txt",
     },
     {
         "name": "example3.txt",
+        "formula": "m0/sqrt(1-v^2/c^2)",  # I.10.7: Relativistic mass
         "url": "https://raw.githubusercontent.com/SJ001/AI-Feynman/master/example_data/example3.txt",
     },
 ]
@@ -71,6 +80,10 @@ def run_dataset(
     exact_match_threads: int,
     exact_match_enabled: bool,
     exact_match_max_basis: int,
+    mse_threshold: float,
+    use_evolution_fallback: bool,
+    evolution_generations: int,
+    evolution_population: int,
 ) -> Dict[str, object]:
     name = dataset["name"]
     url = dataset["url"]
@@ -93,15 +106,21 @@ def run_dataset(
 
     dtype = torch.float64 if precision == 64 else torch.float32
     x_t = torch.tensor(x, dtype=dtype)
-    y_t = torch.tensor(y, dtype=dtype).reshape(-1, 1)
+    y_t = torch.tensor(y, dtype=dtype)  # 1D tensor, run_fast_path handles reshaping
 
     detected_omegas = None
     if x_t.shape[1] == 1:
         detected_omegas = detect_dominant_frequency(x_t, y_t, n_frequencies=3)
 
+    import time
+    
     print("\n" + "=" * 72)
-    print(f"DATASET: {name} | rows={x_t.shape[0]} | precision={precision}")
+    print(f"DATASET: {name} | rows={x_t.shape[0]} | n_inputs={x_t.shape[1]} | precision={precision}")
+    if dataset.get('formula'):
+        print(f"TARGET:  {dataset['formula']}")
     print("=" * 72)
+    
+    start_time = time.time()
 
     result = run_fast_path(
         x_t,
@@ -116,16 +135,68 @@ def run_dataset(
         exact_match_max_basis=exact_match_max_basis,
     )
 
+    elapsed = time.time() - start_time
+    
     if result is None:
-        print("FAST PATH: not applicable")
-        return {"name": name, "status": "no_fast_path"}
+        print(f"FAST PATH: not applicable (took {elapsed:.2f}s)")
+        mse = float('inf')
+    else:
+        mse = result.get("mse", float('inf'))
+        print(f"FAST PATH: MSE={mse:.6f} | formula={result.get('formula', '')[:60]}...")
+    
+    # Fallback to evolution if MSE too high
+    if use_evolution_fallback and mse > mse_threshold:
+        print(f"\nFAST PATH MSE ({mse:.6f}) > threshold ({mse_threshold}), falling back to evolution...")
+        
+        # Reshape for evolution
+        y_evo = y_t.reshape(-1, 1) if y_t.ndim == 1 else y_t
+        
+        # Create model factory (trainer needs callable, not instance)
+        n_inputs = x_t.shape[1]
+        resolved_device = device if device and device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+        
+        def model_factory():
+            return OperationDAG(
+                n_inputs=n_inputs,
+                n_hidden_layers=2,
+                nodes_per_layer=4,
+                simplified_ops=False,  # Full ops for complex formulas
+            )
+        
+        # Run evolution
+        trainer = EvolutionaryONNTrainer(
+            model_factory,
+            population_size=evolution_population,
+            mutation_rate=0.5,
+            elite_size=4,
+            explorer_fraction=0.3,
+            device=resolved_device,
+        )
+        
+        evo_start = time.time()
+        evo_result = trainer.train(
+            x_t.to(resolved_device),
+            y_evo.to(resolved_device),
+            generations=evolution_generations,
+            print_every=10,
+        )
+        evo_elapsed = time.time() - evo_start
+        
+        return {
+            "name": name,
+            "status": "evolution",
+            "mse": evo_result.get("final_mse", float('inf')),
+            "time": elapsed + evo_elapsed,
+            "formula": evo_result.get("formula", ""),
+            "fast_path_mse": mse,
+        }
 
     return {
         "name": name,
-        "status": "ok",
-        "mse": result.get("mse"),
-        "time": result.get("time"),
-        "formula": result.get("formula"),
+        "status": "ok" if mse < mse_threshold else "approx",
+        "mse": mse,
+        "time": result.get("time") if result else elapsed,
+        "formula": result.get("formula", "") if result else "",
     }
 
 
@@ -199,6 +270,35 @@ def main() -> None:
         default=150,
         help="Skip exact-match search when basis exceeds this size",
     )
+    parser.add_argument(
+        "--mse-threshold",
+        type=float,
+        default=0.001,
+        help="MSE threshold below which to consider success (default: 0.001)",
+    )
+    parser.add_argument(
+        "--evolution-fallback",
+        action="store_true",
+        help="Fall back to evolution when fast path MSE exceeds threshold",
+    )
+    parser.add_argument(
+        "--evolution-generations",
+        type=int,
+        default=40,
+        help="Generations for evolution fallback (default: 40)",
+    )
+    parser.add_argument(
+        "--evolution-population",
+        type=int,
+        default=30,
+        help="Population size for evolution fallback (default: 30)",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Run only specific dataset by name (e.g., 'example2')",
+    )
 
     args = parser.parse_args()
 
@@ -213,9 +313,21 @@ def main() -> None:
     exact_match_threads = max(1, args.exact_match_threads)
     exact_match_enabled = not args.skip_exact_match
     exact_match_max_basis = args.exact_match_max_basis
+    mse_threshold = args.mse_threshold
+    use_evolution_fallback = args.evolution_fallback
+    evolution_generations = args.evolution_generations
+    evolution_population = args.evolution_population
+
+    # Filter datasets if --dataset specified
+    datasets_to_run = DATASETS
+    if args.dataset:
+        datasets_to_run = [d for d in DATASETS if args.dataset.lower() in d['name'].lower()]
+        if not datasets_to_run:
+            print(f"No dataset matching '{args.dataset}'. Available: {[d['name'] for d in DATASETS]}")
+            return
 
     results = []
-    for dataset in DATASETS:
+    for dataset in datasets_to_run:
         results.append(
             run_dataset(
                 dataset,
@@ -230,6 +342,10 @@ def main() -> None:
                 exact_match_threads,
                 exact_match_enabled,
                 exact_match_max_basis,
+                mse_threshold,
+                use_evolution_fallback,
+                evolution_generations,
+                evolution_population,
             )
         )
 
@@ -238,14 +354,14 @@ def main() -> None:
     print("=" * 72)
     for r in results:
         status = r.get("status")
-        if status != "ok":
+        if status not in ("ok", "evolution", "approx"):
             print(f"{r['name']}: {status}")
             continue
         mse = r.get("mse", float("nan"))
         t = r.get("time", float("nan"))
         f = r.get("formula", "")
         f_disp = (f[:60] + "...") if len(f) > 60 else f
-        print(f"{r['name']}: mse={mse:.6f} time={t:.2f}s formula={f_disp}")
+        print(f"{r['name']}: [{status}] mse={mse:.6f} time={t:.2f}s formula={f_disp}")
 
 
 if __name__ == "__main__":
