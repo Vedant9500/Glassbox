@@ -176,7 +176,139 @@ RATIONAL_TEMPLATES = [
     ("x / (x**2 + 1) + {a}", {'rational', 'addition'}),
 ]
 
-ALL_TEMPLATES = SIMPLE_TEMPLATES + COMPOUND_TEMPLATES + RATIONAL_TEMPLATES
+# NEW: Nested composition templates (sin(x²), exp(sin(x)), etc.)
+NESTED_TEMPLATES = [
+    # sin/cos of polynomial (CRITICAL - currently missing!)
+    ("np.sin(x ** 2)", {'sin', 'power'}),
+    ("np.cos(x ** 2)", {'cos', 'power'}),
+    ("np.sin({a} * x ** 2)", {'sin', 'power', 'multiplication'}),
+    ("np.cos({a} * x ** 2)", {'cos', 'power', 'multiplication'}),
+    ("np.sin(x ** 2 + {a} * x)", {'sin', 'power', 'addition'}),
+    
+    # exp of trig
+    ("np.exp(np.sin(x))", {'exp', 'sin'}),
+    ("np.exp(np.cos(x))", {'exp', 'cos'}),
+    ("np.exp(-np.cos(x))", {'exp', 'cos'}),
+    ("{a} * np.exp(np.sin({b} * x))", {'exp', 'sin', 'multiplication'}),
+    
+    # log of polynomial
+    ("np.log(x ** 2 + 1)", {'log', 'power'}),
+    ("np.log(np.abs(x ** 2 + {a}) + 0.01)", {'log', 'power'}),
+    ("np.log(x ** 2 + {a} * x + 1)", {'log', 'power', 'addition'}),
+    
+    # trig of exp (complex oscillations)
+    ("np.sin(np.exp(-x ** 2))", {'sin', 'exp', 'power'}),
+    ("np.cos(np.exp(-np.abs(x)))", {'cos', 'exp'}),
+    
+    # Double trig
+    ("np.sin(np.sin(x))", {'sin'}),
+    ("np.sin(np.cos(x))", {'sin', 'cos'}),
+    
+    # Power of trig
+    ("np.sin(x) ** 2", {'sin', 'power'}),
+    ("np.cos(x) ** 2", {'cos', 'power'}),
+    ("{a} * np.sin(x) ** 2 + {b} * np.cos(x) ** 2", {'sin', 'cos', 'power', 'addition', 'multiplication'}),
+]
+
+# NEW: Product/modulated terms (amplitude modulation, damped oscillations)
+PRODUCT_TEMPLATES = [
+    # Linear modulation
+    ("x * np.sin(x)", {'power', 'sin', 'multiplication'}),
+    ("x * np.cos(x)", {'power', 'cos', 'multiplication'}),
+    ("x * np.sin({a} * x)", {'power', 'sin', 'multiplication'}),
+    
+    # Quadratic modulation
+    ("x ** 2 * np.sin(x)", {'power', 'sin', 'multiplication'}),
+    ("x ** 2 * np.cos(x)", {'power', 'cos', 'multiplication'}),
+    
+    # Exponential damping (damped oscillations - common in physics!)
+    ("np.exp(-x) * np.sin({a} * x)", {'exp', 'sin', 'multiplication'}),
+    ("np.exp(-np.abs(x)) * np.cos({a} * x)", {'exp', 'cos', 'multiplication'}),
+    ("np.exp(-x ** 2) * np.sin({a} * x)", {'exp', 'sin', 'power', 'multiplication'}),
+    ("{a} * np.exp(-{b} * x ** 2) * np.sin({c} * x)", {'exp', 'sin', 'power', 'multiplication'}),
+    
+    # Gaussian-modulated
+    ("x * np.exp(-x ** 2)", {'power', 'exp', 'multiplication'}),
+    ("x ** 2 * np.exp(-x ** 2)", {'power', 'exp', 'multiplication'}),
+    
+    # Product of trig
+    ("np.sin(x) * np.cos(x)", {'sin', 'cos', 'multiplication'}),
+    ("np.sin({a} * x) * np.cos({b} * x)", {'sin', 'cos', 'multiplication'}),
+]
+
+# NEW: Irrational constant templates (π, e, √2)
+IRRATIONAL_TEMPLATES = [
+    # Pi-related
+    ("np.pi * x", {'identity', 'multiplication'}),
+    ("np.sin(np.pi * x)", {'sin', 'multiplication'}),
+    ("np.cos(np.pi * x)", {'cos', 'multiplication'}),
+    ("np.sin(2 * np.pi * x)", {'sin', 'multiplication'}),
+    ("{a} * np.sin(np.pi * x) + {b}", {'sin', 'addition', 'multiplication'}),
+    
+    # e-related (np.e = 2.718...)
+    ("np.e * x", {'identity', 'multiplication'}),
+    ("np.e ** x", {'exp'}),  # Same as exp(x)
+    ("{a} * np.e ** (-x ** 2)", {'exp', 'power', 'multiplication'}),
+    
+    # sqrt(2) related
+    ("np.sqrt(2) * x", {'identity', 'multiplication'}),
+    ("x ** np.sqrt(2)", {'power'}),
+    ("np.sin(np.sqrt(2) * x)", {'sin', 'multiplication'}),
+]
+
+# NEW: Hyperbolic functions (common in ML activations and physics)
+HYPERBOLIC_TEMPLATES = [
+    ("np.sinh(x)", {'exp', 'addition'}),
+    ("np.cosh(x)", {'exp', 'addition'}),
+    ("np.tanh(x)", {'exp', 'rational'}),
+    ("{a} * np.tanh({b} * x)", {'exp', 'rational', 'multiplication'}),
+    ("np.sinh({a} * x)", {'exp', 'addition', 'multiplication'}),
+    ("np.cosh({a} * x)", {'exp', 'addition', 'multiplication'}),
+    
+    # Hyperbolic + polynomial
+    ("np.tanh(x) + {a} * x", {'exp', 'rational', 'addition'}),
+    ("x * np.tanh(x)", {'exp', 'rational', 'power', 'multiplication'}),
+    
+    # Sigmoid-like (logistic function)
+    ("1 / (1 + np.exp(-x))", {'exp', 'rational'}),
+    ("1 / (1 + np.exp(-{a} * x))", {'exp', 'rational', 'multiplication'}),
+]
+
+# NEW: Physics-inspired templates (common in scientific formulas)
+PHYSICS_TEMPLATES = [
+    # Coulomb/gravitational-like (1/r, 1/r²)
+    ("1 / np.sqrt(x**2 + {c})", {'power', 'rational'}),
+    ("{a} / np.sqrt(x**2 + {c})", {'power', 'rational', 'multiplication'}),
+    
+    # Radioactive decay / charging curves
+    ("np.exp(-x) * (1 + x)", {'exp', 'power', 'addition', 'multiplication'}),
+    ("1 - np.exp(-{a} * x)", {'exp', 'addition', 'multiplication'}),
+    ("{a} * (1 - np.exp(-{b} * x))", {'exp', 'addition', 'multiplication'}),
+    
+    # Michaelis-Menten / saturation kinetics
+    ("x / (x + {c})", {'rational'}),
+    ("{a} * x / (x + {c})", {'rational', 'multiplication'}),
+    ("x / ({a} + x)", {'rational'}),
+    
+    # Gaussian / bell curve
+    ("np.exp(-x**2 / {c})", {'exp', 'power'}),
+    ("{a} * np.exp(-(x - {b})**2 / {c})", {'exp', 'power', 'multiplication'}),
+    
+    # Power-law decay
+    ("1 / (1 + x**2)", {'rational'}),
+    ("1 / (1 + np.abs(x))", {'rational'}),
+]
+
+ALL_TEMPLATES = (
+    SIMPLE_TEMPLATES + 
+    COMPOUND_TEMPLATES + 
+    RATIONAL_TEMPLATES + 
+    NESTED_TEMPLATES + 
+    PRODUCT_TEMPLATES + 
+    IRRATIONAL_TEMPLATES +
+    HYPERBOLIC_TEMPLATES +
+    PHYSICS_TEMPLATES
+)
 
 
 # =============================================================================
@@ -881,18 +1013,25 @@ def generate_chunk(
             template_idx += 1
         else:
             template, operators = random.choice(templates)
-        b = np.random.uniform(0.5, 3)
-        d = np.random.uniform(0.5, 3)
+        b = np.random.uniform(0.3, 6.0)  # Wider frequency range
+        d = np.random.uniform(0.3, 6.0)
         if signed_bd:
             b *= np.random.choice([-1.0, 1.0])
             d *= np.random.choice([-1.0, 1.0])
 
+        # Expanded power choices: includes fractional powers (1.5, 2.3, etc.)
+        POWER_CHOICES = [
+            0.25, 0.33, 0.5, 0.67,  # Fractional roots
+            1.0, 1.5, 2.0, 2.3, 2.5, 3.0, 4.0,  # Positive powers (including fractional)
+            -0.5, -1.0, -2.0,  # Negative powers
+        ]
+        
         formula = template.format(
-            a=np.random.uniform(-3, 3),
+            a=np.random.uniform(-5, 5),  # Wider amplitude
             b=b,
-            c=np.random.uniform(-2, 2),
+            c=np.random.uniform(-3, 3),  # Slightly wider
             d=d,
-            p=np.random.choice([0.5, 2, 3, 4, -1, -0.5]),
+            p=np.random.choice(POWER_CHOICES),
         )
         
         # Sample x-range per curve if provided

@@ -580,6 +580,84 @@ def random_operation_init(model: nn.Module, bias_strength: float = 2.0):
                 param.normal_(0, 1.0)
 
 
+def seed_population_from_classifier(
+    model: nn.Module,
+    predictions: Dict[str, float],
+    detected_omegas: Optional[List[float]] = None,
+    bias_strength: float = 3.0,
+    individual_idx: int = 0,
+    seed_fraction: float = 0.9,
+):
+    """
+    Probabilistically bias model toward operators predicted by curve classifier.
+    
+    Key insight: Instead of biasing ALL individuals the same way, we use
+    the classifier probabilities to decide PER-INDIVIDUAL whether to bias.
+    
+    If sin=0.95, then ~95% of individuals start biased toward sin.
+    If exp=0.10, then only ~10% get exp-biased.
+    
+    This maintains diversity while focusing search on likely operators.
+    
+    Args:
+        model: The ONN model to seed
+        predictions: Dict from predict_operators() {op_name: probability}
+        detected_omegas: FFT-detected frequencies for omega seeding
+        bias_strength: How strongly to bias logits (higher = more deterministic)
+        individual_idx: Index of this individual (for omega diversity)
+        seed_fraction: Overall fraction of population to seed (default 90%)
+    """
+    # First check if we should seed this individual at all
+    if random.random() > seed_fraction:
+        # Leave as random initialization for diversity
+        return
+    
+    # Mapping from classifier classes to ONN meta-op indices
+    # For simplified_ops=True: n_unary=2 [MetaPeriodic(0), MetaPower(1)]
+    # For simplified_ops=False: n_unary=4 [MetaPeriodic(0), MetaPower(1), MetaExp(2), MetaLog(3)]
+    simplified = getattr(model, 'simplified_ops', True)
+    
+    if simplified:
+        unary_map = {
+            'sin': 0, 'cos': 0, 'periodic': 0,  # MetaPeriodic
+            'power': 1, 'identity': 1, 'polynomial': 1, 'rational': 1,  # MetaPower
+        }
+    else:
+        unary_map = {
+            'sin': 0, 'cos': 0, 'periodic': 0,  # MetaPeriodic
+            'power': 1, 'identity': 1, 'polynomial': 1, 'rational': 1,  # MetaPower
+            'exp': 2, 'exponential': 2,  # MetaExp
+            'log': 3,  # MetaLog
+        }
+    
+    with torch.no_grad():
+        # Bias operation selectors based on probabilistic sampling
+        for layer in model.layers:
+            for node in layer.nodes:
+                if not hasattr(node, 'op_selector'):
+                    continue
+                
+                selector = node.op_selector
+                
+                # HardConcreteOperationSelector layout: [type(2), unary(n), binary(m)]
+                if hasattr(selector, 'logits') and hasattr(selector, '_type_end'):
+                    # For each predicted operator, sample whether to bias this node
+                    for op_name, prob in predictions.items():
+                        if op_name in unary_map:
+                            # Probabilistic: bias node if random < probability
+                            if random.random() < prob:
+                                unary_idx = unary_map[op_name]
+                                logit_idx = 2 + unary_idx  # Skip 2 type logits
+                                if logit_idx < len(selector.logits):
+                                    selector.logits.data[logit_idx] += bias_strength
+                                    # Also bias toward unary type (index 0)
+                                    selector.logits.data[0] += bias_strength * 0.5
+        
+        # Seed omega parameters with FFT-detected frequencies
+        if detected_omegas:
+            seed_omega_from_fft(model, detected_omegas, individual_idx)
+
+
 def mutate_operations(individual: Individual, mutation_rate: float = 0.3) -> Individual:
     """
     Mutate operation selections DISCRETELY.
@@ -1871,19 +1949,76 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         self.last_best_ever_fitness = float('inf')  # Track if best_ever improved
         self.history = []
     
-    def initialize_population(self):
-        """Create diverse initial population + explorer subpopulation."""
+    def initialize_population(self, x: torch.Tensor = None, y: torch.Tensor = None):
+        """
+        Create diverse initial population + explorer subpopulation.
+        
+        If use_curve_classifier is True and x, y data provided, uses CNN predictions
+        to probabilistically seed the population toward high-confidence operators.
+        
+        Args:
+            x: Optional input data for classifier prediction
+            y: Optional target data for classifier prediction
+        """
         self.population = []
         self.explorers = []
+        
+        # Get classifier predictions if enabled and data provided
+        classifier_predictions = None
+        detected_omegas = None
+        
+        if self.use_curve_classifier and x is not None and y is not None:
+            try:
+                # Import here to avoid circular dependency
+                import sys
+                from pathlib import Path
+                sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'scripts'))
+                from curve_classifier_integration import predict_operators
+                
+                # Get classifier predictions
+                x_np = x.cpu().numpy() if hasattr(x, 'cpu') else x
+                y_np = y.cpu().numpy().flatten() if hasattr(y, 'cpu') else y.flatten()
+                
+                classifier_predictions = predict_operators(
+                    x_np, y_np, 
+                    model_path=self.curve_classifier_path,
+                    threshold=0.3,
+                )
+                
+                if classifier_predictions:
+                    logger.info(f"CNN seeding with predictions: {classifier_predictions}")
+                    print(f"🧠 CNN-seeded initialization: {list(classifier_predictions.keys())}")
+                
+                # Also get FFT frequencies for omega seeding
+                detected_omegas = detect_dominant_frequency(x, y, n_frequencies=3)
+                
+            except Exception as e:
+                logger.warning(f"Classifier prediction failed, using random init: {e}")
+                classifier_predictions = None
         
         # Main population
         for i in range(self.population_size):
             model = self.model_factory().to(self.device)
-            random_operation_init(model, bias_strength=DEFAULT_BIAS_STRENGTH + i * BIAS_INCREMENT)
+            
+            if classifier_predictions:
+                # CNN-seeded initialization: probabilistically bias toward predictions
+                random_operation_init(model, bias_strength=DEFAULT_BIAS_STRENGTH + i * BIAS_INCREMENT)
+                seed_population_from_classifier(
+                    model, 
+                    classifier_predictions, 
+                    detected_omegas=detected_omegas,
+                    individual_idx=i,
+                    seed_fraction=0.9,  # 90% of population gets seeded
+                )
+            else:
+                # Standard random initialization
+                random_operation_init(model, bias_strength=DEFAULT_BIAS_STRENGTH + i * BIAS_INCREMENT)
+            
             individual = Individual(model, generation=0)
             self.population.append(individual)
         
         # Explorer subpopulation (high mutation scouts)
+        # Note: Explorers are NOT CNN-seeded - they explore randomly
         if self.use_explorers:
             for i in range(self.n_explorers):
                 model = self.model_factory().to(self.device)
@@ -1892,7 +2027,11 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 explorer = Individual(model, generation=0)
                 explorer.is_explorer = True  # Tag as explorer
                 self.explorers.append(explorer)
-            print(f"Initialized population of {self.population_size} individuals + {self.n_explorers} explorers")
+            
+            if classifier_predictions:
+                print(f"Initialized CNN-seeded population of {self.population_size} individuals + {self.n_explorers} explorers (random)")
+            else:
+                print(f"Initialized population of {self.population_size} individuals + {self.n_explorers} explorers")
         else:
             print(f"Initialized population of {self.population_size} individuals")
         
@@ -2237,8 +2376,8 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             fit_x = (fit_x - x_mean) / x_std
             fit_y = (fit_y - y_mean) / y_std
         
-        # Initialize
-        self.initialize_population()
+        # Initialize population (with CNN seeding if curve classifier enabled)
+        self.initialize_population(x_original, y_original)
         
         # FFT-based frequency detection for omega seeding
         detected_omegas = detect_dominant_frequency(x, y, n_frequencies=3)

@@ -350,13 +350,20 @@ def train_model(
     early_stop_metric: str = "f1",
     tune_thresholds_flag: bool = True,
     calibrate_flag: bool = False,
+    class_weights: Optional[torch.Tensor] = None,
 ):
     """Full training loop with early stopping."""
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5
     )
-    criterion = nn.BCEWithLogitsLoss()
+    
+    # Use class weights for imbalanced labels if provided
+    if class_weights is not None:
+        criterion = nn.BCEWithLogitsLoss(pos_weight=class_weights.to(device))
+        print(f"Using class weights: {class_weights.numpy()}")
+    else:
+        criterion = nn.BCEWithLogitsLoss()
     
     best_val_loss = float('inf')
     best_val_f1 = -1.0
@@ -527,8 +534,8 @@ def main():
                         help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="Learning rate")
-    parser.add_argument("--hidden", type=int, default=256,
-                        help="Hidden layer size (MLP only)")
+    parser.add_argument("--hidden", type=int, default=512,
+                        help="Hidden layer size (MLP only, default: 512)")
     parser.add_argument("--val-split", type=float, default=0.1,
                         help="Validation split ratio")
     parser.add_argument("--output", type=str, default="models/curve_classifier.pt",
@@ -555,6 +562,8 @@ def main():
                         help="Disable stratified split")
     parser.add_argument("--calibrate", action="store_true",
                         help="Calibrate probabilities with temperature scaling")
+    parser.add_argument("--class-weights", action="store_true",
+                        help="Use inverse frequency class weights for imbalanced labels")
     
     args = parser.parse_args()
 
@@ -667,6 +676,20 @@ def main():
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
+    # Compute class weights if requested
+    class_weights = None
+    if args.class_weights:
+        # Inverse frequency weighting: weight = total / (n_classes * class_count)
+        pos_counts = train_labels.sum(dim=0).numpy()
+        neg_counts = len(train_labels) - pos_counts
+        # pos_weight is applied to positive samples: weight = neg/pos
+        pos_weights = neg_counts / (pos_counts + 1e-6)
+        # Normalize to reasonable range
+        pos_weights = np.clip(pos_weights, 0.5, 5.0)
+        class_weights = torch.tensor(pos_weights, dtype=torch.float32)
+        print(f"Class label counts: {pos_counts.astype(int)}")
+        print(f"Computed pos_weights: {pos_weights.round(2)}")
+    
     # Train
     print(f"\nTraining for {args.epochs} epochs...")
     train_model(
@@ -682,6 +705,7 @@ def main():
         early_stop_metric=args.early_stop,
         tune_thresholds_flag=tune_thresholds_flag,
         calibrate_flag=args.calibrate,
+        class_weights=class_weights,
     )
 
     # Persist scaler and schema metadata

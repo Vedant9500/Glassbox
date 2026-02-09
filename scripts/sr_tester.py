@@ -573,7 +573,7 @@ def run_single_mode(config: Config):
     
     # Try Fast Path first (classifier-guided direct regression)
     fast_path_result = None
-    if getattr(config, 'use_curve_classifier', False):
+    if getattr(config, 'use_curve_classifier', False) or getattr(config, 'fast_path_only', False):
         try:
             from scripts.classifier_fast_path import run_fast_path, run_guided_evolution
             from glassbox.sr.evolution import detect_dominant_frequency

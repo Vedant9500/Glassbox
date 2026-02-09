@@ -1,5 +1,0 @@
-wsl -d Ubuntu
-cd /mnt/d/Glassbox
-python3 -m venv venv && source venv/bin/activate
-
-python scripts/benchmark_gpu_dag.py

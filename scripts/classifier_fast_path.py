@@ -193,8 +193,16 @@ def build_basis_from_predictions(
             basis_list.append(xi)
             names.append(var_name(i))
 
+            # Integer powers (2, 3, 4)
             for p in range(2, max_power + 1):
                 basis_list.append(xi ** p)
+                names.append(f"{var_name(i)}^{p}")
+            
+            # Fractional powers - critical for formulas like x^2.3, x^1.5
+            # Use absolute value to handle negative x values
+            xi_safe = np.abs(xi) + 1e-10  # Avoid 0^fractional
+            for p in [0.5, 1.5, 2.5, 0.33, 0.67, 1.33, 2.33]:
+                basis_list.append(np.sign(xi) * (xi_safe ** p))
                 names.append(f"{var_name(i)}^{p}")
     
     # Periodic operations - build comprehensive omega list
