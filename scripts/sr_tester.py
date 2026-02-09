@@ -163,6 +163,9 @@ def parse_formula(formula_str: str) -> Callable[[torch.Tensor], torch.Tensor]:
     formula = re.sub(r'\^(\d+)', r'**\1', formula)
     formula = re.sub(r'\^(\()', r'**\1', formula)
     
+    # Strip numpy prefix - convert np.sin to sin, np.exp to exp, etc.
+    formula = formula.replace('np.', '')
+    
     # Check if multi-input pattern x0, x1, ... is used BEFORE substituting
     has_indexed_x = re.search(r'\bx\d+\b', formula) is not None
     
@@ -575,7 +578,7 @@ def run_single_mode(config: Config):
     fast_path_result = None
     if getattr(config, 'use_curve_classifier', False) or getattr(config, 'fast_path_only', False):
         try:
-            from scripts.classifier_fast_path import run_fast_path, run_guided_evolution
+            from classifier_fast_path import run_fast_path, run_guided_evolution
             from glassbox.sr.evolution import detect_dominant_frequency
             
             x_tensor = x.to(tester.device)

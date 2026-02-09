@@ -152,13 +152,14 @@ def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, ca
     _cached_operator_classes = checkpoint.get('operator_classes', list(OPERATOR_CLASSES.keys()))
     n_classes = len(_cached_operator_classes)
     
-    # Determine input features from checkpoint weights
+    # Determine input features and hidden size from checkpoint weights
     state_dict = checkpoint['model_state_dict']
     input_weights = state_dict['net.0.weight']
     n_features = input_weights.shape[1]
+    hidden_size = input_weights.shape[0]  # Infer hidden size from first layer
     
-    # Create model
-    model = CurveClassifierMLP(n_features=n_features, n_classes=n_classes, hidden=256)
+    # Create model with matching architecture
+    model = CurveClassifierMLP(n_features=n_features, n_classes=n_classes, hidden=hidden_size)
     model.load_state_dict(state_dict)
     model.to(resolved_device)
     model.eval()
