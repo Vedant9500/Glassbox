@@ -573,6 +573,7 @@ def find_exact_symbolic_match(
         return [(i, min(i + size, n)) for i in range(0, n, size)]
 
     def build_formula(indices: List[int], coeffs: np.ndarray) -> Tuple[str, np.ndarray]:
+        from glassbox.sr.meta_ops import get_constant_symbol
         terms = []
         full_coeffs = np.zeros(n_basis)
         for idx, c in zip(indices, coeffs):
@@ -580,7 +581,7 @@ def find_exact_symbolic_match(
                 continue
             name = names[idx]
             if name == "1":
-                terms.append(f"{c:.4g}")
+                terms.append(get_constant_symbol(c, 0.05))
             elif abs(c - 1.0) < 0.01:
                 terms.append(name)
             elif abs(c + 1.0) < 0.01:
@@ -588,7 +589,8 @@ def find_exact_symbolic_match(
             elif abs(c - round(c)) < 0.01 and abs(c) < 100:
                 terms.append(f"{int(round(c))}*{name}")
             else:
-                terms.append(f"{c:.4g}*{name}")
+                coef_sym = get_constant_symbol(c, 0.05)
+                terms.append(f"{coef_sym}*{name}")
             full_coeffs[idx] = c
 
         formula = " + ".join(terms).replace("+ -", "- ")
@@ -1032,6 +1034,306 @@ def refine_periodic_rational(
     return best
 
 
+def refine_powers(
+    x: np.ndarray,
+    y: np.ndarray,
+    initial_powers: Optional[List[float]] = None,
+    detected_omegas: Optional[List[float]] = None,
+    n_steps: int = 200,
+    lr: float = 0.05,
+    device: Optional[str] = None,
+) -> Tuple[Optional[Dict], float]:
+    """
+    Refine power exponent parameters using gradient descent.
+
+    Handles non-integer powers like x^2.3, x^0.7 where the basis
+    only has integer powers (x^2, x^3). Can also include periodic terms.
+
+    Model: y ≈ Σ aᵢ·sign(x)·|x|^pᵢ + Σ (bⱼ·sin(ωⱼx) + dⱼ·cos(ωⱼx)) + c₀ + c₁·x
+
+    Args:
+        x: Input values (N,)
+        y: Target values (N,)
+        initial_powers: Starting power guesses (default: [0.5, 1.5, 2.5, 3.5])
+        detected_omegas: Optional list of frequencies to include
+        n_steps: Gradient descent steps
+        lr: Learning rate
+
+    Returns:
+        (result_dict, mse) where result_dict has 'formula', 'powers', 'coefficients'
+    """
+    import torch
+    import torch.nn as nn
+    from glassbox.sr.meta_ops import get_constant_symbol
+
+    # Ensure 1D inputs
+    if x.ndim > 1: x = x.flatten()
+    if y.ndim > 1: y = y.flatten()
+
+    if initial_powers is None:
+        initial_powers = [0.5, 1.5, 2.5, 3.5]
+
+    resolved_device = _resolve_device(device)
+    x_t = torch.tensor(x, dtype=torch.float64, device=resolved_device)
+    y_t = torch.tensor(y, dtype=torch.float64, device=resolved_device)
+
+    # Filter out x <= 0 for safe power operations
+    valid_mask = x_t.abs() > 1e-8
+    if valid_mask.sum() < 10:
+        return None, float('inf')
+    x_valid = x_t[valid_mask]
+    y_valid = y_t[valid_mask]
+
+    class PowerModel(nn.Module):
+        def __init__(self, powers, omegas=None):
+            super().__init__()
+            n_pow = len(powers)
+            self.powers = nn.Parameter(torch.tensor(powers, dtype=torch.float64))
+            self.coeffs = nn.Parameter(torch.zeros(n_pow, dtype=torch.float64))
+            self.constant = nn.Parameter(torch.tensor(0.0, dtype=torch.float64))
+            self.linear = nn.Parameter(torch.tensor(0.0, dtype=torch.float64))
+            
+            self.omegas = omegas
+            if omegas:
+                self.periodic_coeffs = nn.Parameter(torch.zeros(2 * len(omegas), dtype=torch.float64))
+            else:
+                self.periodic_coeffs = None
+
+        def forward(self, x):
+            abs_x = torch.abs(x) + 1e-10
+            sign_x = torch.sign(x)
+            result = self.constant + self.linear * x
+            
+            # Power terms
+            for i, p in enumerate(self.powers):
+                # Even/odd symmetry based on p
+                is_even = 0.5 * (1.0 + torch.cos(p * math.pi))
+                abs_pow = torch.pow(abs_x, p)
+                term = (1.0 - is_even) * (sign_x * abs_pow) + is_even * abs_pow
+                result = result + self.coeffs[i] * term
+                
+            # Periodic terms
+            if self.periodic_coeffs is not None:
+                for i, omega in enumerate(self.omegas):
+                    result = result + self.periodic_coeffs[2*i] * torch.sin(omega * x)
+                    result = result + self.periodic_coeffs[2*i+1] * torch.cos(omega * x)
+                    
+            return result
+
+    best_result = None
+    best_mse = float('inf')
+
+    # Stage 1: Fit powers (and initial omegas if provided)
+    # We try different power combinations
+    stage1_models = []
+    
+    for n_powers in range(1, min(4, len(initial_powers) + 1)):
+        for start_idx in range(max(1, len(initial_powers) - n_powers + 1)):
+            powers_subset = initial_powers[start_idx:start_idx + n_powers]
+
+            model = PowerModel(powers_subset, detected_omegas).to(resolved_device)
+            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+            for step in range(n_steps):
+                optimizer.zero_grad()
+                pred = model(x_valid)
+                loss = ((pred - y_valid) ** 2).mean()
+                with torch.no_grad():
+                    model.powers.data.clamp_(-2.0, 5.0)
+                loss.backward()
+                optimizer.step()
+            
+            mse = ((model(x_valid) - y_valid) ** 2).mean().item()
+            stage1_models.append((mse, model, powers_subset))
+    
+    # Sort by MSE and pick best Stage 1 model
+    stage1_models.sort(key=lambda x: x[0])
+    best_stage1_mse, best_stage1_model, best_powers = stage1_models[0]
+    
+    # Stage 2: Check residuals for hidden frequencies (if not already found)
+    # Only if we have a trend (MSE is low but maybe not perfect, or just to be safe)
+    # We assume the main trend handles the non-periodic part.
+    final_model = best_stage1_model
+    final_mse = best_stage1_mse
+    
+    # detected_omegas is local variable, update it if we find more
+    current_omegas = detected_omegas
+    
+    from glassbox.sr.evolution import detect_dominant_frequency
+    
+    with torch.no_grad():
+        pred_stage1 = best_stage1_model(x_valid)
+        residuals = y_valid - pred_stage1
+        
+        # Run FFT on residuals
+        # We need to reshape for detect_dominant_frequency
+        res_omegas = detect_dominant_frequency(x_valid, residuals, n_frequencies=2)
+        
+        # Filter new omegas - ignore if close to existing ones or 0
+        new_omegas = []
+        existing_omegas = current_omegas or []
+        for o in res_omegas:
+            if o < 0.1: continue
+            if any(abs(o - eo) < 0.2 for eo in existing_omegas): continue
+            new_omegas.append(o)
+    
+    if new_omegas:
+        # Refit with new omegas
+        # print(f"  [Refine] Found hidden frequencies in residuals: {new_omegas}")
+        combined_omegas = (current_omegas or []) + new_omegas
+        
+        # Create new model with best powers + combined omegas
+        # Initialize with learned powers/coeffs to speed up
+        new_model = PowerModel(best_powers, combined_omegas).to(resolved_device)
+        
+        # Copy learned params
+        with torch.no_grad():
+            new_model.powers.data.copy_(best_stage1_model.powers.data)
+            new_model.coeffs.data.copy_(best_stage1_model.coeffs.data)
+            new_model.constant.data.copy_(best_stage1_model.constant.data)
+            new_model.linear.data.copy_(best_stage1_model.linear.data)
+            if best_stage1_model.periodic_coeffs is not None:
+                # Copy existing periodic coeffs to the beginning
+                n_old = len(best_stage1_model.periodic_coeffs)
+                new_model.periodic_coeffs.data[:n_old].copy_(best_stage1_model.periodic_coeffs.data)
+        
+        optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
+        
+        for step in range(n_steps):
+            optimizer.zero_grad()
+            pred = new_model(x_valid)
+            loss = ((pred - y_valid) ** 2).mean()
+            with torch.no_grad():
+                new_model.powers.data.clamp_(-2.0, 5.0)
+            loss.backward()
+            optimizer.step()
+            
+        mse2 = ((new_model(x_valid) - y_valid) ** 2).mean().item()
+        
+        if mse2 < final_mse:
+            final_model = new_model
+            final_mse = mse2
+            # Update detected_omegas for reporting
+            current_omegas = combined_omegas
+
+    # Final extraction from winning model
+    best_mse = final_mse
+    with torch.no_grad():
+        refined_powers = final_model.powers.detach().cpu().numpy().tolist()
+        refined_coeffs = final_model.coeffs.detach().cpu().numpy().tolist()
+        const_val = final_model.constant.item()
+        linear_val = final_model.linear.item()
+        per_coeffs = []
+        if final_model.periodic_coeffs is not None:
+            per_coeffs = final_model.periodic_coeffs.detach().cpu().numpy().tolist()
+
+    # Build formula
+    terms = []
+    # Power terms
+    for p, c in zip(refined_powers, refined_coeffs):
+        if abs(c) < 1e-3:
+            continue
+        coef_str = get_constant_symbol(c, 0.05)
+        p_snapped = _snap_power(p)
+        if p_snapped == '1':
+            terms.append(f"{coef_str}*x")
+        else:
+            terms.append(f"{coef_str}*x^{p_snapped}")
+    
+    # Periodic terms
+    if per_coeffs and current_omegas:
+        for i, omega in enumerate(current_omegas):
+            if 2*i+1 < len(per_coeffs):
+                sin_c = per_coeffs[2*i]
+                cos_c = per_coeffs[2*i+1]
+                
+                if abs(sin_c) > 1e-3:
+                    sym = get_constant_symbol(sin_c, 0.05)
+                    terms.append(f"{sym}*sin({omega:.3g}*x)")
+                if abs(cos_c) > 1e-3:
+                    sym = get_constant_symbol(cos_c, 0.05)
+                    terms.append(f"{sym}*cos({omega:.3g}*x)")
+    
+    if abs(linear_val) > 1e-3:
+        terms.append(f"{get_constant_symbol(linear_val, 0.05)}*x")
+    if abs(const_val) > 1e-3:
+        terms.append(get_constant_symbol(const_val, 0.05))
+
+    formula = " + ".join(terms) if terms else "0"
+    formula = formula.replace("+ -", "- ")
+
+    best_result = {
+        'formula': formula,
+        'powers': refined_powers,
+        'coefficients': refined_coeffs,
+        'mse': best_mse,
+    }
+
+    return best_result, best_mse
+
+
+def _snap_power(p: float, tol: float = 0.08) -> str:
+    """Snap a power exponent to a clean value if close."""
+    # Integer check
+    if abs(p - round(p)) < tol:
+        return str(int(round(p)))
+    # Common fractions
+    fractions = {0.5: '0.5', 1.5: '1.5', 2.5: '2.5', 3.5: '3.5',
+                 1/3: '1/3', 2/3: '2/3', 4/3: '4/3', 5/3: '5/3',
+                 0.25: '0.25', 0.75: '0.75', 1.25: '1.25', 1.75: '1.75'}
+    for frac_val, frac_str in fractions.items():
+        if abs(p - frac_val) < tol:
+            return frac_str
+    return f"{p:.3g}"
+
+
+def refine_constants(
+    x: np.ndarray,
+    y: np.ndarray,
+    detected_omegas: Optional[List[float]] = None,
+    predictions: Optional[Dict[str, float]] = None,
+    device: Optional[str] = None,
+) -> Dict:
+    """
+    Unified constant refinement: runs both ω and p gradient refinement.
+
+    Returns the best result from either frequency or power refinement.
+    """
+    results = {}
+
+    # 1. Frequency refinement (if periodic detected)
+    has_periodic = False
+    if predictions:
+        for key in ['sin', 'cos', 'periodic']:
+            if predictions.get(key, 0) > 0.3:
+                has_periodic = True
+                break
+
+    if has_periodic and detected_omegas:
+        refined_omegas, freq_mse = refine_frequencies(
+            x, y, detected_omegas, n_steps=150, device=device
+        )
+        results['frequency'] = {
+            'omegas': refined_omegas,
+            'mse': freq_mse,
+        }
+
+    # 2. Power refinement (if power predicted)
+    has_power = False
+    if predictions:
+        if predictions.get('power', 0) > 0.3 or predictions.get('polynomial', 0) > 0.3:
+            has_power = True
+
+    if has_power:
+        power_result, power_mse = refine_powers(
+            x, y, detected_omegas=detected_omegas, device=device
+        )
+        if power_result is not None:
+            results['power'] = power_result
+
+    return results
+
+
 def fast_path_with_refinement(
     x: np.ndarray,
     y: np.ndarray,
@@ -1074,12 +1376,15 @@ def fast_path_with_refinement(
             best_details = details
             best_universal = use_universal
 
-        # If exact match or good enough, return immediately
-        if details.get('exact_match', False) or mse < 1e-6:
+        # If exact match or good enough AND simple, return immediately
+        n_current = details.get('n_nonzero', 0)
+        is_exact = details.get('exact_match', False)
+        if (is_exact or mse < 1e-6) and n_current <= 4:
             return formula, mse, details
 
-    # If good enough and exact, return best
-    if best_mse < 0.01 and best_details.get('exact_match', False) and best_formula is not None:
+    # If good enough and exact AND simple, return best
+    n_best = best_details.get('n_nonzero', 0)
+    if best_mse < 0.01 and best_details.get('exact_match', False) and best_formula is not None and n_best <= 4:
         return best_formula, best_mse, best_details
     
     # If moderate MSE and periodic terms were used, try refinement
@@ -1113,7 +1418,7 @@ def fast_path_with_refinement(
     else:
         allow_periodic = allow_power = True
 
-    if x.ndim == 1 and allow_periodic and allow_power and best_mse > 1e-4:
+    if (x.ndim == 1 or (x.ndim == 2 and x.shape[1] == 1)) and allow_periodic and allow_power and best_mse > 1e-4:
         omega_pool = (detected_omegas or []) + [1.0, 2.0, 3.0, 5.0, 10.0]
         # Deduplicate and keep reasonable range
         omega_inits = []
@@ -1133,6 +1438,36 @@ def fast_path_with_refinement(
             print(f"  Periodic×Rational refinement MSE: {refined['mse']:.6f}")
             if refined['mse'] < best_mse - 1e-4:
                 return refined['formula'], refined['mse'], refined['details']
+
+    # Complexity check
+    n_terms = best_details.get('n_nonzero', 0)
+    is_complex = n_terms > 4
+    
+    # Power exponent refinement for non-integer powers
+    # Trigger if MSE is moderate OR if formula is complex (likely overfitted)
+    if (x.ndim == 1 or (x.ndim == 2 and x.shape[1] == 1)) and allow_power and (best_mse > 1e-4 or is_complex):
+        print(f"  Attempting power refinement (MSE={best_mse:.4f}, Terms={n_terms})...")
+        power_result, power_mse = refine_powers(
+            x, y, detected_omegas=detected_omegas, device=device
+        )
+        
+        if power_result is not None:
+            # Acceptance logic:
+            # 1. Much better MSE (classic case)
+            # 2. Good MSE (< 1e-3) and Much Simpler (prevent overfitting)
+            
+            is_better_mse = power_mse < best_mse - 1e-4
+            is_good_and_simpler = (power_mse < 1e-3) and (len(power_result['powers']) + 2 < n_terms)
+            
+            if is_better_mse or is_good_and_simpler:
+                print(f"  Power refinement SUCCESS (MSE: {power_mse:.6f}, Terms: {len(power_result['powers'])})")
+                print(f"  Power formula: {power_result['formula']}")
+                return power_result['formula'], power_mse, {
+                    'coefficients': np.array(power_result['coefficients']),
+                    'basis_names': [f"x^{_snap_power(p)}" for p in power_result['powers']],
+                    'n_nonzero': sum(1 for c in power_result['coefficients'] if abs(c) > 1e-8),
+                    'exact_match': power_mse < 1e-6,
+                }
 
     return best_formula, best_mse, best_details
 

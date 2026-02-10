@@ -64,6 +64,22 @@ BENCHMARKS = [
         "args": "--x-min -2 --x-max 2 --n-samples 400 --generations 15 --population 25",
         "n_inputs": 2
     },
+    # Phase 1 constant detection benchmarks
+    {
+        "name": "Non-Integer Power",
+        "formula": "x**2.5 + sin(x)",
+        "args": "--x-min 0.1 --x-max 5 --n-samples 400 --ops-periodic --ops-power"
+    },
+    {
+        "name": "Symbolic Coefficients",
+        "formula": "sqrt(2)*sin(x) + pi*x",
+        "args": "--x-min -3 --x-max 3 --n-samples 400 --ops-periodic --ops-power"
+    },
+    {
+        "name": "Multi-Frequency FFT",
+        "formula": "sin(3*x) + sin(7*x)",
+        "args": "--x-min -5 --x-max 5 --n-samples 500 --ops-periodic --no-ops-exp --no-ops-log"
+    },
 ]
 
 def run_test(benchmark, model_path=None):

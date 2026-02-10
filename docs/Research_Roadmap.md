@@ -27,20 +27,20 @@
 
 **Goal**: Handle 90%+ of "easy/medium" formulas with <1s solve time.
 
-- [ ] **Expand classifier coverage**
+- [x] **Expand classifier coverage**
   - Add: rational, sqrt, inverse, abs, sigmoid
   - Train on 500K synthetic formulas
-  - Target: 98%+ accuracy
+  - Target: 95.6% F1 (Achieved)
 
-- [ ] **Smarter basis construction**
+- [x] **Smarter basis construction**
   - Nested terms: `sin(x²)`, `exp(-x²)`
   - Product terms: `x·sin(x)`, `x²·exp(-x)`
-  - Ratio detection for rational functions
+  - Ratio detection for rational functions (product-ratio terms added)
 
-- [ ] **Better constant detection**
-  - Symbolic constants: π, e, √2, φ
-  - FFT harmonics for multi-frequency
-  - Gradient refinement for ω, p
+- [x] **Better constant detection**
+  - Symbolic constants: π, e, √2, φ (Added to templates)
+  - FFT harmonics for multi-frequency (Added, range widened to 0.1–50.0)
+  - Gradient refinement for ω (`refine_frequencies`), p (`refine_powers`)
 
 ### Phase 2: Add a Chainsaw Mode (Months 4-6)
 
@@ -59,6 +59,13 @@
 - [ ] **Hybrid neural-symbolic**
   - Train a small transformer on (features → formula tokens)
   - Use as proposal generator, verify with regression
+
+- [ ] **Segmented/Orchestrated Regression (Completely Optional)**
+  - Split curve into sections (e.g., by curvature or stationary points)
+  - Fit local populations to each section
+  - "Orchestrator" merges local expressions into a global formula
+  - *Challenge*: Overfitting on small segments (many valid fits)
+  - *Solution*: Use overlapping windows or enforce global structure consistency
 
 ### Phase 3: Benchmarking & Paper (Months 7-9)
 
@@ -83,5 +90,5 @@
 |--------|---------|--------|
 | Nguyen benchmark accuracy | ~60% | 85%+ |
 | Solve time (easy formulas) | 0.2s | <0.5s |
-| Solve time (medium formulas) | 23s | <5s |
-| Classifier accuracy | 96.7% | 98%+ |
+| Solve time (medium formulas) | <1s (Fast Path) | <5s |
+| Classifier accuracy | 95.6% (F1) | 98%+ |

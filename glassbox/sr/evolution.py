@@ -123,27 +123,33 @@ def detect_dominant_frequency(
         x_np = x.squeeze().cpu().numpy()
         y_np = y.squeeze().cpu().numpy()
         
-        # Sort by x for proper FFT analysis
+        # Sort by x for interpolation
         sort_idx = np.argsort(x_np)
         x_sorted = x_np[sort_idx]
         y_sorted = y_np[sort_idx]
         
-        # Remove DC offset (mean)
-        y_centered = y_sorted - np.mean(y_sorted)
-        
-        # Compute FFT
-        n_samples = len(y_centered)
-        fft_result = np.fft.rfft(y_centered)
-        
-        # Get frequencies (assume uniform spacing based on x range)
+        # Interpolate to uniform grid for FFT
+        n_samples = len(x_sorted)
         x_min, x_max = x_sorted.min(), x_sorted.max()
         x_range = x_max - x_min
+        
         if x_range < 1e-6:
-            return [1.0]  # Default fallback
-            
-        # Sample spacing estimate
-        dx = x_range / (n_samples - 1)
-        freqs = np.fft.rfftfreq(n_samples, dx)
+            return [1.0]
+
+        # Use refined sampling for better resolution (2x original points if possible)
+        n_interp = max(n_samples, 1024)
+        x_uniform = np.linspace(x_min, x_max, n_interp)
+        y_uniform = np.interp(x_uniform, x_sorted, y_sorted)
+        
+        # Remove DC offset (mean)
+        y_centered = y_uniform - np.mean(y_uniform)
+        
+        # Compute FFT
+        fft_result = np.fft.rfft(y_centered)
+        
+        # Sample spacing
+        dx = x_range / (n_interp - 1)
+        freqs = np.fft.rfftfreq(n_interp, dx)
         
         # Get magnitudes (skip DC component at index 0)
         magnitudes = np.abs(fft_result[1:])
@@ -153,6 +159,8 @@ def detect_dominant_frequency(
             return [1.0]
         
         # Find top N frequency peaks
+        # Simple peak finding to avoid side-lobes?
+        # For now just max magnitude logic
         top_indices = np.argsort(magnitudes)[-n_frequencies:][::-1]
         
         # Convert frequencies to angular frequencies (omega = 2π*f)
@@ -162,7 +170,7 @@ def detect_dominant_frequency(
                 freq = freqs[idx]
                 omega = 2 * np.pi * freq
                 # Only accept reasonable omega values
-                if 0.3 < omega < 10.0:
+                if 0.1 < omega < 50.0:
                     detected_omegas.append(float(omega))
         
         # Ensure we return at least one value
