@@ -1984,7 +1984,7 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 from curve_classifier_integration import predict_operators
                 
                 # Get classifier predictions
-                x_np = x.cpu().numpy() if hasattr(x, 'cpu') else x
+                x_np = x.cpu().numpy().flatten() if hasattr(x, 'cpu') else np.asarray(x).flatten()
                 y_np = y.cpu().numpy().flatten() if hasattr(y, 'cpu') else y.flatten()
                 
                 classifier_predictions = predict_operators(
