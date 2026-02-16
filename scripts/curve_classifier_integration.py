@@ -58,6 +58,52 @@ class CurveClassifierMLP(nn.Module):
         return self.net(x)
 
 
+class CurveClassifierCNN(nn.Module):
+    """1D CNN classifier matching training architecture."""
+
+    def __init__(self, n_classes: int = 9, n_features: int = 334, curve_dim: int = 128):
+        super().__init__()
+        self.curve_dim = min(curve_dim, n_features)
+
+        self.conv = nn.Sequential(
+            nn.Conv1d(1, 32, kernel_size=7, padding=3),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(32, 64, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.MaxPool1d(2),
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool1d(4),
+        )
+
+        other_dim = max(1, n_features - self.curve_dim)
+        self.other_mlp = nn.Sequential(
+            nn.Linear(other_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(128 * 4 + 128, 256),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, n_classes),
+        )
+
+    def forward(self, x):
+        raw_curve = x[:, :self.curve_dim]
+        other_features = x[:, self.curve_dim:]
+
+        raw_curve = raw_curve.unsqueeze(1)
+        conv_out = self.conv(raw_curve)
+        conv_out = conv_out.flatten(1)
+        other_out = self.other_mlp(other_features)
+
+        combined = torch.cat([conv_out, other_out], dim=1)
+        return self.classifier(combined)
+
+
 # =============================================================================
 # CLASSIFIER LOADING
 # =============================================================================
@@ -152,14 +198,42 @@ def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, ca
     _cached_operator_classes = checkpoint.get('operator_classes', list(OPERATOR_CLASSES.keys()))
     n_classes = len(_cached_operator_classes)
     
-    # Determine input features and hidden size from checkpoint weights
     state_dict = checkpoint['model_state_dict']
-    input_weights = state_dict['net.0.weight']
-    n_features = input_weights.shape[1]
-    hidden_size = input_weights.shape[0]  # Infer hidden size from first layer
-    
-    # Create model with matching architecture
-    model = CurveClassifierMLP(n_features=n_features, n_classes=n_classes, hidden=hidden_size)
+    model_type = checkpoint.get('model_type')
+    model_config = checkpoint.get('model_config') or {}
+
+    # Backward-compatible architecture detection for older checkpoints
+    if model_type is None:
+        if any(k.startswith('conv.') for k in state_dict.keys()):
+            model_type = 'cnn'
+        elif any(k.startswith('net.') for k in state_dict.keys()):
+            model_type = 'mlp'
+        else:
+            raise ValueError(
+                "Unable to infer classifier architecture from checkpoint; "
+                "expected MLP keys ('net.*') or CNN keys ('conv.*')."
+            )
+
+    if model_type == 'cnn':
+        if 'n_features' in model_config:
+            n_features = int(model_config['n_features'])
+        else:
+            # Derive from first conv classifier layer input: 128*4 + 128(other)
+            classifier_in = state_dict['classifier.0.weight'].shape[1]
+            n_features = int(max(1, classifier_in - (128 * 4)))
+
+        curve_dim = int(model_config.get('curve_dim', min(128, n_features)))
+        model = CurveClassifierCNN(
+            n_classes=int(model_config.get('n_classes', n_classes)),
+            n_features=n_features,
+            curve_dim=curve_dim,
+        )
+    else:
+        input_weights = state_dict['net.0.weight']
+        n_features = int(model_config.get('n_features', input_weights.shape[1]))
+        hidden_size = int(model_config.get('hidden', input_weights.shape[0]))
+        model = CurveClassifierMLP(n_features=n_features, n_classes=n_classes, hidden=hidden_size)
+
     model.load_state_dict(state_dict)
     model.to(resolved_device)
     model.eval()
@@ -170,6 +244,7 @@ def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, ca
         'temperature': checkpoint.get('temperature'),
         'feature_scaler': checkpoint.get('feature_scaler'),
         'type': 'pytorch',
+        'model_type': model_type,
     }
     print(f"Loaded PyTorch curve classifier from {model_path}")
     if 'val_acc' in checkpoint:

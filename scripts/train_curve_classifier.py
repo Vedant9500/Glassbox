@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset
 import argparse
 from pathlib import Path
 from tqdm import tqdm
@@ -128,6 +128,62 @@ class CurveClassifierCNN(nn.Module):
         # Combine
         combined = torch.cat([conv_out, other_out], dim=1)
         return self.classifier(combined)
+
+
+class IndexedFeatureDataset(Dataset):
+    """Dataset view over feature/label arrays using explicit indices."""
+
+    def __init__(
+        self,
+        features: np.ndarray,
+        labels: np.ndarray,
+        indices: np.ndarray,
+        scaler: Optional[dict] = None,
+    ):
+        self.features = features
+        self.labels = labels
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.scaler = scaler
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, idx: int):
+        sample_idx = int(self.indices[idx])
+        x = np.asarray(self.features[sample_idx], dtype=np.float32)
+        if self.scaler is not None:
+            x = (x - self.scaler['mean']) / (self.scaler['std'] + 1e-8)
+        y = np.asarray(self.labels[sample_idx], dtype=np.float32)
+        return torch.from_numpy(x), torch.from_numpy(y)
+
+
+def compute_feature_stats(
+    features: np.ndarray,
+    indices: np.ndarray,
+    chunk_size: int = 65536,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute feature mean/std on selected rows without full subset materialization."""
+    indices = np.asarray(indices, dtype=np.int64)
+    if len(indices) == 0:
+        raise ValueError("Cannot compute feature stats for empty indices")
+
+    n_features = int(features.shape[1])
+    total_count = 0
+    sum_x = np.zeros(n_features, dtype=np.float64)
+    sum_x2 = np.zeros(n_features, dtype=np.float64)
+
+    for start in range(0, len(indices), chunk_size):
+        batch_idx = indices[start:start + chunk_size]
+        batch = np.asarray(features[batch_idx], dtype=np.float64)
+        sum_x += batch.sum(axis=0)
+        sum_x2 += np.square(batch).sum(axis=0)
+        total_count += batch.shape[0]
+
+    mean = sum_x / max(total_count, 1)
+    var = (sum_x2 / max(total_count, 1)) - np.square(mean)
+    var = np.maximum(var, 0.0)
+    std = np.sqrt(var) + 1e-8
+    return mean.astype(np.float32), std.astype(np.float32)
 
 
 # =============================================================================
@@ -346,6 +402,8 @@ def train_model(
     device,
     save_path: Path,
     operator_classes: list,
+    model_type: str,
+    model_config: dict,
     patience: int = 10,
     early_stop_metric: str = "f1",
     tune_thresholds_flag: bool = True,
@@ -406,6 +464,8 @@ def train_model(
                 'val_acc': val_metrics['accuracy'],
                 'val_f1': val_metrics['f1_mean'],
                 'operator_classes': operator_classes,
+                'model_type': model_type,
+                'model_config': model_config,
             }, save_path)
             print(f"  -> Saved best model (val_loss: {val_metrics['loss']:.4f}, val_f1: {val_metrics['f1_mean']:.4f})")
         else:
@@ -613,27 +673,16 @@ def main():
         val_idx = indices[:n_val]
         train_idx = indices[n_val:]
 
-    train_np = features[train_idx]
-    val_np = features[val_idx]
-
     scaler = None
     if standardize:
-        mean = train_np.mean(axis=0)
-        std = train_np.std(axis=0) + 1e-8
-        train_np = (train_np - mean) / std
-        val_np = (val_np - mean) / std
+        mean, std = compute_feature_stats(features, train_idx)
         scaler = {'mean': mean, 'std': std}
 
-    train_features = torch.tensor(train_np, dtype=torch.float32)
-    train_labels = torch.tensor(labels[train_idx], dtype=torch.float32)
-    val_features = torch.tensor(val_np, dtype=torch.float32)
-    val_labels = torch.tensor(labels[val_idx], dtype=torch.float32)
+    print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}")
     
-    print(f"  Train: {len(train_features)}, Val: {len(val_features)}")
-    
-    # Data loaders with optimizations
-    train_dataset = TensorDataset(train_features, train_labels)
-    val_dataset = TensorDataset(val_features, val_labels)
+    # Data loaders with optimizations and lazy memmap-backed access
+    train_dataset = IndexedFeatureDataset(features, labels, train_idx, scaler=scaler)
+    val_dataset = IndexedFeatureDataset(features, labels, val_idx, scaler=scaler)
     
     # Use pin_memory for GPU and num_workers for parallel data loading
     use_cuda = device.type == 'cuda'
@@ -660,6 +709,11 @@ def main():
     
     if args.model == "mlp":
         model = CurveClassifierMLP(n_features, n_classes, args.hidden)
+        model_config = {
+            'n_features': int(n_features),
+            'n_classes': int(n_classes),
+            'hidden': int(args.hidden),
+        }
     else:
         curve_dim = 128
         if feature_schema is not None and "raw" in feature_schema:
@@ -667,6 +721,11 @@ def main():
             if isinstance(raw_slice, (list, tuple)) and len(raw_slice) == 2:
                 curve_dim = int(raw_slice[1] - raw_slice[0])
         model = CurveClassifierCNN(n_classes=n_classes, n_features=n_features, curve_dim=curve_dim)
+        model_config = {
+            'n_classes': int(n_classes),
+            'n_features': int(n_features),
+            'curve_dim': int(curve_dim),
+        }
     
     model = model.to(device)
     print(f"\nModel: {args.model.upper()}")
@@ -680,8 +739,9 @@ def main():
     class_weights = None
     if args.class_weights:
         # Inverse frequency weighting: weight = total / (n_classes * class_count)
-        pos_counts = train_labels.sum(dim=0).numpy()
-        neg_counts = len(train_labels) - pos_counts
+        train_labels_np = np.asarray(labels[train_idx], dtype=np.float32)
+        pos_counts = train_labels_np.sum(axis=0)
+        neg_counts = len(train_idx) - pos_counts
         # pos_weight is applied to positive samples: weight = neg/pos
         pos_weights = neg_counts / (pos_counts + 1e-6)
         # Normalize to reasonable range
@@ -701,6 +761,8 @@ def main():
         device=device,
         save_path=output_path,
         operator_classes=operator_classes,
+        model_type=args.model,
+        model_config=model_config,
         patience=args.patience,
         early_stop_metric=args.early_stop,
         tune_thresholds_flag=tune_thresholds_flag,
