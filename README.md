@@ -8,6 +8,7 @@
 - **Meta-Operations**: Parametric operations (MetaPower, MetaPeriodic, MetaExp) that smoothly interpolate between functions
 - **Hybrid Optimization**: Combines evolutionary search (topology) with gradient-based fitting (constants)
 - **Curve Classifier Fast-Path**: Pre-trained classifier predicts likely operators, enabling direct regression without evolution
+- **Flexible Classifier Inference**: Runtime supports PyTorch checkpoints (MLP/CNN auto-detected) and XGBoost payloads
 - **GPU Acceleration**: CUDA support for classifier inference and refinement
 - **Multi-threaded Search**: Parallel exact-match combinatorial search
 

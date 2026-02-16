@@ -385,7 +385,9 @@ def multilabel_stratified_split(labels: np.ndarray, val_ratio: float, seed: int)
 
     # If we didn't fill validation set, top up randomly
     if remaining_val > 0:
-        remaining = [i for i in indices if i not in val_indices and i not in train_indices]
+        assigned = set(val_indices)
+        assigned.update(train_indices)
+        remaining = [i for i in indices if i not in assigned]
         rng.shuffle(remaining)
         val_indices.extend(remaining[:remaining_val])
         train_indices.extend(remaining[remaining_val:])

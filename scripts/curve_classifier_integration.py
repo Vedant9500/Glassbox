@@ -15,7 +15,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import sys
 
 # Add parent to path for imports
@@ -109,8 +109,9 @@ class CurveClassifierCNN(nn.Module):
 # =============================================================================
 
 _cached_classifier_by_device = {}
-_cached_operator_classes = None
+_cached_operator_classes_by_key = {}
 _cached_metadata_by_device = {}
+_cached_interpolators_by_signature: Dict[Tuple, Tuple[Optional[object], object]] = {}
 _warned_no_cuda = False
 
 
@@ -129,16 +130,20 @@ def _resolve_device(device: Optional[str] = None) -> torch.device:
     return resolved
 
 
+def _make_cache_key(model_path: str, resolved_device: torch.device) -> str:
+    return f"{str(resolved_device)}:{str(Path(model_path).resolve())}"
+
+
 def load_classifier(
     model_path: str = "models/curve_classifier.pt",
     device: Optional[str] = None,
 ):
     """Load the trained curve classifier (supports PyTorch .pt and XGBoost .pkl)."""
-    global _cached_classifier_by_device, _cached_operator_classes
+    global _cached_classifier_by_device
     
     resolved_device = _resolve_device(device)
-    # Create cache key using both device and model path
-    cache_key = f"{str(resolved_device)}:{model_path}"
+    # Create cache key using both device and absolute model path
+    cache_key = _make_cache_key(model_path, resolved_device)
     if cache_key in _cached_classifier_by_device:
         return _cached_classifier_by_device[cache_key]
     
@@ -158,13 +163,14 @@ def load_classifier(
 
 def _load_xgboost_classifier(model_path: Path, cache_key: str):
     """Load XGBoost classifier from .pkl file."""
-    global _cached_classifier_by_device, _cached_operator_classes, _cached_metadata_by_device
+    global _cached_classifier_by_device, _cached_operator_classes_by_key, _cached_metadata_by_device
     
     import joblib
     
     payload = joblib.load(model_path)
     
-    _cached_operator_classes = payload.get('operator_classes', list(OPERATOR_CLASSES.keys()))
+    operator_classes = payload.get('operator_classes', list(OPERATOR_CLASSES.keys()))
+    _cached_operator_classes_by_key[cache_key] = operator_classes
     
     # Store the XGBoost models and metadata
     _cached_classifier_by_device[cache_key] = {
@@ -176,6 +182,7 @@ def _load_xgboost_classifier(model_path: Path, cache_key: str):
         'thresholds': payload.get('thresholds'),
         'feature_scaler': payload.get('feature_scaler'),
         'type': 'xgboost',
+        'operator_classes': operator_classes,
     }
     
     print(f"Loaded XGBoost curve classifier from {model_path}")
@@ -186,7 +193,7 @@ def _load_xgboost_classifier(model_path: Path, cache_key: str):
 
 def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, cache_key: str) -> nn.Module:
     """Load PyTorch classifier from .pt file."""
-    global _cached_classifier_by_device, _cached_operator_classes, _cached_metadata_by_device
+    global _cached_classifier_by_device, _cached_operator_classes_by_key, _cached_metadata_by_device
     
     try:
         checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
@@ -195,8 +202,9 @@ def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, ca
         raise
     
     # Get operator classes
-    _cached_operator_classes = checkpoint.get('operator_classes', list(OPERATOR_CLASSES.keys()))
-    n_classes = len(_cached_operator_classes)
+    operator_classes = checkpoint.get('operator_classes', list(OPERATOR_CLASSES.keys()))
+    _cached_operator_classes_by_key[cache_key] = operator_classes
+    n_classes = len(operator_classes)
     
     state_dict = checkpoint['model_state_dict']
     model_type = checkpoint.get('model_type')
@@ -245,6 +253,7 @@ def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, ca
         'feature_scaler': checkpoint.get('feature_scaler'),
         'type': 'pytorch',
         'model_type': model_type,
+        'operator_classes': operator_classes,
     }
     print(f"Loaded PyTorch curve classifier from {model_path}")
     if 'val_acc' in checkpoint:
@@ -327,7 +336,7 @@ def predict_operators(
     
     # Get cache key for metadata lookup
     resolved_device = _resolve_device(device)
-    cache_key = f"{str(resolved_device)}:{model_path}"
+    cache_key = _make_cache_key(model_path, resolved_device)
     metadata = _cached_metadata_by_device.get(cache_key, {})
     
     # Detect multi-input
@@ -343,7 +352,7 @@ def predict_operators(
     # For multi-input: use per-variable slicing
     if n_vars > 1:
         return _predict_operators_multi_input(
-            x, y, model, metadata, resolved_device, threshold, n_vars
+            x, y, model, metadata, resolved_device, threshold, n_vars, cache_key
         )
     
     # Single-input: standard prediction
@@ -358,7 +367,7 @@ def predict_operators(
     else:
         probs = _predict_pytorch(model, features, metadata, resolved_device)
     
-    return _build_result_dict(probs, threshold, metadata)
+    return _build_result_dict(probs, threshold, metadata, cache_key)
 
 
 def _predict_operators_multi_input(
@@ -369,6 +378,7 @@ def _predict_operators_multi_input(
     device: torch.device,
     threshold: float,
     n_vars: int,
+    cache_key: str,
 ) -> Dict[str, float]:
     """
     Predict operators for multi-input data using per-variable 1D slicing.
@@ -382,22 +392,48 @@ def _predict_operators_multi_input(
     """
     from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
     
-    # Create interpolator for y values
-    try:
-        # Try linear interpolation first
-        interp = LinearNDInterpolator(x, y, fill_value=np.nan)
-    except Exception:
-        # Fall back to nearest neighbor
-        interp = NearestNDInterpolator(x, y)
-    
-    operator_classes = _cached_operator_classes or list(OPERATOR_CLASSES.keys())
+    # Build/reuse interpolators for y values (hot path for repeated calls)
+    interp_signature = (
+        int(x.__array_interface__['data'][0]),
+        tuple(x.shape),
+        str(x.dtype),
+        int(y.__array_interface__['data'][0]),
+        tuple(y.shape),
+        str(y.dtype),
+    )
+    interpolators = _cached_interpolators_by_signature.get(interp_signature)
+    if interpolators is None:
+        linear_interp = None
+        nearest_interp = None
+        try:
+            linear_interp = LinearNDInterpolator(x, y, fill_value=np.nan)
+        except Exception:
+            linear_interp = None
+        try:
+            nearest_interp = NearestNDInterpolator(x, y)
+        except Exception:
+            nearest_interp = None
+        if linear_interp is None and nearest_interp is None:
+            raise RuntimeError("Failed to build interpolation models for multi-input prediction.")
+        interpolators = (linear_interp, nearest_interp)
+        _cached_interpolators_by_signature[interp_signature] = interpolators
+        if len(_cached_interpolators_by_signature) > 8:
+            _cached_interpolators_by_signature.pop(next(iter(_cached_interpolators_by_signature)))
+
+    linear_interp, nearest_interp = interpolators
+
+    operator_classes = (
+        metadata.get('operator_classes')
+        or _cached_operator_classes_by_key.get(cache_key)
+        or list(OPERATOR_CLASSES.keys())
+    )
     all_probs = np.zeros((n_vars, len(operator_classes)), dtype=np.float32)
     
     scaler = metadata.get('feature_scaler')
+    x_medians = np.median(x, axis=0)
     
     for var_idx in range(n_vars):
         # Create 1D slice: fix other variables at median, vary this one
-        x_medians = np.median(x, axis=0)
         x_min_var = x[:, var_idx].min()
         x_max_var = x[:, var_idx].max()
         
@@ -410,7 +446,14 @@ def _predict_operators_multi_input(
         x_query[:, var_idx] = x_slice_1d
         
         # Get y values for this slice
-        y_slice = interp(x_query)
+        if linear_interp is not None:
+            y_slice = linear_interp(x_query)
+            if nearest_interp is not None:
+                nan_mask = ~np.isfinite(y_slice)
+                if np.any(nan_mask):
+                    y_slice[nan_mask] = nearest_interp(x_query[nan_mask])
+        else:
+            y_slice = nearest_interp(x_query)
         
         # Handle NaN values from interpolation
         valid_mask = np.isfinite(y_slice)
@@ -441,12 +484,16 @@ def _predict_operators_multi_input(
     # This captures operators that appear in ANY variable
     aggregated_probs = np.max(all_probs, axis=0)
     
-    return _build_result_dict(aggregated_probs, threshold, metadata)
+    return _build_result_dict(aggregated_probs, threshold, metadata, cache_key)
 
 
-def _build_result_dict(probs: np.ndarray, threshold: float, metadata: dict) -> Dict[str, float]:
+def _build_result_dict(probs: np.ndarray, threshold: float, metadata: dict, cache_key: str) -> Dict[str, float]:
     """Build result dictionary from probability array."""
-    operator_classes = _cached_operator_classes or list(OPERATOR_CLASSES.keys())
+    operator_classes = (
+        metadata.get('operator_classes')
+        or _cached_operator_classes_by_key.get(cache_key)
+        or list(OPERATOR_CLASSES.keys())
+    )
     thresholds = metadata.get('thresholds')
     if thresholds is None:
         thresholds = np.full((len(operator_classes),), threshold, dtype=np.float32)

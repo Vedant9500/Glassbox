@@ -2398,46 +2398,8 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 for i, explorer in enumerate(self.explorers):
                     seed_omega_from_fft(explorer.model, detected_omegas, individual_idx=i)
         
-        # Curve classifier warm-start: predict operators from curve shape
-        if self.use_curve_classifier:
-            print("Running curve classifier for operator prediction...")
-            try:
-                from scripts.curve_classifier_integration import predict_operators, bias_onn_from_predictions
-                
-                # Use ORIGINAL (unnormalized) data for classifier
-                x_np = x_original.cpu().numpy().flatten()
-                y_np = y_original.cpu().numpy().flatten()
-                
-                # Predict operators
-                predictions = predict_operators(x_np, y_np, self.curve_classifier_path, threshold=0.3)
-                
-                if predictions:
-                    print(f"Curve classifier predictions: {[(k, f'{v:.2f}') for k, v in sorted(predictions.items(), key=lambda x: -x[1])]}")
-                    
-                    # Bias all individuals in population (only print once)
-                    n_biased_total = 0
-                    for i, ind in enumerate(self.population):
-                        bias_onn_from_predictions(ind.model, predictions, threshold=0.4, boost_factor=1.5, verbose=False)
-                        n_biased_total += 1
-                    
-                    # Less aggressive bias for explorers (they should explore)
-                    if self.use_explorers:
-                        for explorer in self.explorers[:len(self.explorers)//2]:
-                            bias_onn_from_predictions(explorer.model, predictions, threshold=0.5, boost_factor=1.0, verbose=False)
-                            n_biased_total += 1
-                    
-                    print(f"Biased operation logits in {n_biased_total} individuals")
-                else:
-                    print("Curve classifier: No operators predicted above threshold")
-                            
-            except ImportError as e:
-                print(f"Curve classifier not available: {e}")
-            except FileNotFoundError:
-                print(f"Curve classifier model not found at {self.curve_classifier_path}")
-            except Exception as e:
-                import traceback
-                print(f"Curve classifier error: {e}")
-                traceback.print_exc()
+        # Curve-classifier warm-start is applied in initialize_population()
+        # to avoid duplicate prediction and bias passes.
         
         # Initial constant refinement for main population
         print("Refining initial constants...")
