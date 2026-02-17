@@ -316,6 +316,261 @@ ALL_TEMPLATES = (
 
 
 # =============================================================================
+# PCFG-BASED FORMULA GENERATION
+# =============================================================================
+
+class PCFGFormulaGenerator:
+    """Probabilistic Context-Free Grammar formula generator.
+    
+    Generates formulas of arbitrary depth using recursive grammar rules,
+    covering compositions (e.g. sin(cos(x²))) that fixed templates cannot.
+    
+    Grammar:
+        EXPR → UNARY(EXPR) | BINARY(EXPR, EXPR) | TERM
+        UNARY → sin | cos | exp | log | sqrt | abs | sinh | cosh | tanh
+        BINARY → + | - | * | /
+        TERM → x | CONST | CONST*x | x**POWER | CONST*x**POWER
+    
+    Uses Lample & Charton-style depth budget splitting for balanced
+    depth distribution in binary nodes.
+    """
+    
+    # Production probabilities (at non-terminal depth)
+    DEFAULT_WEIGHTS = {
+        'unary': 0.30,
+        'binary': 0.25,
+        'term': 0.45,
+    }
+    
+    UNARY_OPS = [
+        ('np.sin',  'sin'),
+        ('np.cos',  'cos'),
+        ('np.exp',  'exp'),
+        ('np.log',  'log'),
+        ('np.sqrt', 'power'),
+        ('np.abs',  'identity'),
+        ('np.sinh', 'exp'),       # sinh decomposes to exp
+        ('np.cosh', 'exp'),       # cosh decomposes to exp
+        ('np.tanh', 'exp'),       # tanh decomposes to exp/rational
+    ]
+    
+    BINARY_OPS = [
+        ('+', 'addition'),
+        ('-', 'addition'),
+        ('*', 'multiplication'),
+    ]
+    
+    POWER_CHOICES = [0.5, 2, 3, 4, -1, -0.5, 1.5, 2.5, 0.33]
+    
+    def __init__(self, max_depth: int = 4, weights: Dict | None = None):
+        self.max_depth = max_depth
+        self.weights = weights or self.DEFAULT_WEIGHTS.copy()
+        # Normalize weights
+        total = sum(self.weights.values())
+        self.weights = {k: v / total for k, v in self.weights.items()}
+    
+    def generate(self) -> Tuple[str, Set[str]]:
+        """Generate a random formula and its operator set.
+        
+        Returns:
+            (formula_string, operator_set) matching template interface.
+        """
+        ops: Set[str] = set()
+        formula = self._generate_expr(self.max_depth, ops)
+        return formula, ops
+    
+    def _generate_expr(self, depth_budget: int, ops: Set[str]) -> str:
+        """Recursively generate an expression with given depth budget."""
+        if depth_budget <= 1:
+            return self._generate_term(ops)
+        
+        # Choose production rule
+        r = random.random()
+        cumulative = 0.0
+        choice = 'term'
+        for rule, prob in self.weights.items():
+            cumulative += prob
+            if r < cumulative:
+                choice = rule
+                break
+        
+        if choice == 'unary':
+            return self._generate_unary(depth_budget - 1, ops)
+        elif choice == 'binary':
+            return self._generate_binary(depth_budget - 1, ops)
+        else:
+            return self._generate_term(ops)
+    
+    def _generate_unary(self, child_budget: int, ops: Set[str]) -> str:
+        """Generate UNARY(EXPR)."""
+        func_str, op_class = random.choice(self.UNARY_OPS)
+        ops.add(op_class)
+        
+        child = self._generate_expr(child_budget, ops)
+        
+        # Safety wrapping for dangerous functions
+        if func_str == 'np.log':
+            return f"{func_str}(np.abs({child}) + 0.01)"
+        elif func_str == 'np.exp':
+            # Clip argument to prevent overflow
+            return f"{func_str}(np.clip({child}, -10, 10))"
+        elif func_str == 'np.sqrt':
+            return f"{func_str}(np.abs({child}) + 0.01)"
+        elif func_str == 'np.tanh':
+            ops.add('rational')  # tanh = (e^x - e^-x)/(e^x + e^-x)
+            return f"{func_str}({child})"
+        else:
+            return f"{func_str}({child})"
+    
+    def _generate_binary(self, depth_budget: int, ops: Set[str]) -> str:
+        """Generate BINARY(EXPR, EXPR) with Lample & Charton depth split."""
+        op_str, op_class = random.choice(self.BINARY_OPS)
+        ops.add(op_class)
+        
+        # Split depth budget randomly between children (Lample & Charton style)
+        if depth_budget <= 1:
+            left_budget = 1
+            right_budget = 1
+        else:
+            split = random.randint(1, depth_budget)
+            left_budget = split
+            right_budget = depth_budget - split + 1
+        
+        left = self._generate_expr(left_budget, ops)
+        right = self._generate_expr(right_budget, ops)
+        
+        if op_str == '/' :
+            # Division: protect denominator from zero
+            ops.add('rational')
+            return f"(({left}) / (({right}) ** 2 + 0.1))"
+        else:
+            return f"(({left}) {op_str} ({right}))"
+    
+    def _generate_term(self, ops: Set[str]) -> str:
+        """Generate a terminal expression."""
+        choice = random.random()
+        
+        if choice < 0.30:
+            # Just x
+            ops.add('identity')
+            return "x"
+        elif choice < 0.45:
+            # Constant
+            c = self._random_const()
+            return str(c)
+        elif choice < 0.65:
+            # c * x
+            c = self._random_const()
+            ops.add('identity')
+            ops.add('multiplication')
+            return f"({c} * x)"
+        elif choice < 0.85:
+            # x ** p
+            p = random.choice(self.POWER_CHOICES)
+            ops.add('power')
+            if p < 0:
+                # Negative power = rational-like
+                return f"(np.abs(x) + 0.01) ** {p}"
+            elif p == int(p):
+                return f"x ** {int(p)}"
+            else:
+                return f"np.abs(x) ** {p}"
+        else:
+            # c * x ** p
+            c = self._random_const()
+            p = random.choice(self.POWER_CHOICES)
+            ops.add('power')
+            ops.add('multiplication')
+            if p < 0:
+                return f"({c} * (np.abs(x) + 0.01) ** {p})"
+            elif p == int(p):
+                return f"({c} * x ** {int(p)})"
+            else:
+                return f"({c} * np.abs(x) ** {p})"
+    
+    def _random_const(self) -> float:
+        """Generate a random constant, biased toward 'nice' values."""
+        if random.random() < 0.3:
+            # Nice constants
+            return random.choice([
+                1.0, -1.0, 2.0, -2.0, 0.5, -0.5,
+                3.14159, 2.71828, 1.41421,  # π, e, √2
+            ])
+        else:
+            return round(np.random.uniform(-5, 5), 4)
+
+
+# =============================================================================
+# MULTI-SNR NOISE INJECTION
+# =============================================================================
+
+def apply_noise_augmentation(y: np.ndarray, noise_profile: str = 'multi') -> np.ndarray:
+    """Apply noise augmentation to a curve.
+    
+    Args:
+        y: Clean curve values.
+        noise_profile: 'multi' for randomized multi-SNR noise,
+                       'legacy' for backward-compatible fixed Gaussian.
+    
+    Returns:
+        Noisy curve (copy of input, original is not modified).
+    """
+    y_noisy = y.copy()
+    y_std = np.std(y_noisy) + 1e-10
+    
+    if noise_profile == 'legacy':
+        # Legacy: single additive Gaussian (backward compat)
+        y_noisy += np.random.normal(0.0, 0.01 * y_std, size=y_noisy.shape)
+        return y_noisy
+    
+    # Multi-SNR: randomly pick a noise type
+    r = random.random()
+    
+    if r < 0.20:
+        # Clean — no noise
+        pass
+    elif r < 0.45:
+        # White Gaussian, low noise (SNR ~30-40 dB → std ≈ 0.3-1% of signal std)
+        snr_std = np.random.uniform(0.003, 0.01) * y_std
+        y_noisy += np.random.normal(0.0, snr_std, size=y_noisy.shape)
+    elif r < 0.65:
+        # White Gaussian, medium noise (SNR ~15-25 dB → std ≈ 1-5%)
+        snr_std = np.random.uniform(0.01, 0.05) * y_std
+        y_noisy += np.random.normal(0.0, snr_std, size=y_noisy.shape)
+    elif r < 0.75:
+        # White Gaussian, high noise (SNR ~5-10 dB → std ≈ 10-30%)
+        snr_std = np.random.uniform(0.1, 0.3) * y_std
+        y_noisy += np.random.normal(0.0, snr_std, size=y_noisy.shape)
+    elif r < 0.85:
+        # Pink (1/f) noise — correlated, common in physical sensors
+        n = len(y_noisy)
+        white = np.random.randn(n)
+        fft_white = np.fft.rfft(white)
+        freqs = np.fft.rfftfreq(n, d=1.0)
+        freqs[0] = 1.0  # Avoid division by zero
+        fft_pink = fft_white / np.sqrt(freqs)
+        pink = np.fft.irfft(fft_pink, n=n)
+        pink_std = np.random.uniform(0.01, 0.05) * y_std
+        pink = pink / (np.std(pink) + 1e-10) * pink_std
+        y_noisy += pink
+    elif r < 0.95:
+        # Quantization noise — round to N levels (simulates ADC)
+        n_levels = random.choice([16, 32, 64, 128, 256])
+        y_min, y_max = y_noisy.min(), y_noisy.max()
+        span = y_max - y_min + 1e-10
+        y_noisy = np.round((y_noisy - y_min) / span * n_levels) / n_levels * span + y_min
+    else:
+        # Outlier spikes — random point corruption (1-5% of points)
+        n = len(y_noisy)
+        frac = np.random.uniform(0.01, 0.05)
+        n_outliers = max(1, int(n * frac))
+        indices = np.random.choice(n, size=n_outliers, replace=False)
+        y_noisy[indices] += np.random.normal(0.0, 3.0 * y_std, size=n_outliers)
+    
+    return y_noisy
+
+
+# =============================================================================
 # FEATURE EXTRACTION
 # =============================================================================
 
@@ -501,17 +756,20 @@ def extract_stat_features(y: np.ndarray) -> np.ndarray:
     # Normalize for consistent stats
     y_norm = (y - y.mean()) / (y.std() + 1e-10)
     
-    features = [
-        np.mean(y_norm),
-        np.std(y_norm),
-        np.min(y_norm),
-        np.max(y_norm),
-        np.median(y_norm),
-        float(skew(y_norm)),              # Asymmetry
-        float(kurtosis(y_norm)),          # Peakedness
-        np.sum(np.diff(np.sign(y_norm)) != 0),    # Zero crossings
-        np.sum(np.diff(np.sign(np.diff(y_norm))) != 0),  # Extrema count
-    ]
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        features = [
+            np.mean(y_norm),
+            np.std(y_norm),
+            np.min(y_norm),
+            np.max(y_norm),
+            np.median(y_norm),
+            float(skew(y_norm)),              # Asymmetry
+            float(kurtosis(y_norm)),          # Peakedness
+            np.sum(np.diff(np.sign(y_norm)) != 0),    # Zero crossings
+            np.sum(np.diff(np.sign(np.diff(y_norm))) != 0),  # Extrema count
+        ]
     
     result = np.array(features)
     # scipy skew/kurtosis return NaN for constant signals — replace with 0
@@ -615,6 +873,10 @@ def _safe_eval_ast(node: ast.AST, x: np.ndarray) -> np.ndarray:
         'log': np.log,
         'sqrt': np.sqrt,
         'abs': np.abs,
+        'sinh': np.sinh,
+        'cosh': np.cosh,
+        'tanh': np.tanh,
+        'clip': np.clip,
     }
 
     if isinstance(node, ast.Expression):
@@ -633,6 +895,11 @@ def _safe_eval_ast(node: ast.AST, x: np.ndarray) -> np.ndarray:
         value = _safe_eval_ast(node.value, x)
         if value is np and node.attr in allowed_funcs:
             return allowed_funcs[node.attr]
+        # Allow np.pi, np.e constants
+        if value is np and node.attr == 'pi':
+            return np.pi
+        if value is np and node.attr == 'e':
+            return np.e
         raise ValueError("Unsafe attribute")
     if isinstance(node, ast.Call):
         func = _safe_eval_ast(node.func, x)
@@ -676,6 +943,11 @@ def evaluate_formula(formula: str, x: np.ndarray, safe_eval: bool = True) -> Tup
                 y = _safe_eval_ast(tree, x)
             else:
                 y = eval(formula, {"x": x, "np": np})
+            
+            # Broadcast scalar results (e.g. from constant PCFG formulas)
+            y = np.asarray(y, dtype=np.float64)
+            if y.ndim == 0:
+                y = np.broadcast_to(y, x.shape).copy()
         
         # Check for invalid values
         if np.any(np.isnan(y)) or np.any(np.isinf(y)):
@@ -719,6 +991,12 @@ def derive_operators_from_formula(formula: str) -> Set[str]:
                     ops.add(func.attr)
                 elif func.attr == 'sqrt':
                     ops.add('power')  # sqrt is x^0.5
+                elif func.attr in ('sinh', 'cosh'):
+                    ops.add('exp')    # hyperbolic = exp composition
+                    ops.add('addition')
+                elif func.attr == 'tanh':
+                    ops.add('exp')
+                    ops.add('rational')
 
         if isinstance(node, ast.BinOp):
             if isinstance(node.op, (ast.Add, ast.Sub)):
@@ -779,6 +1057,9 @@ def generate_dataset(
     y_offset_std: float = 0.0,
     safe_eval: bool = True,
     signed_bd: bool = False,
+    pcfg_ratio: float = 0.0,
+    pcfg_max_depth: int = 4,
+    noise_profile: str = 'legacy',
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
     Generate labeled curve dataset.
@@ -856,7 +1137,10 @@ def generate_dataset(
             y_scale_max=y_scale_max,
             y_offset_std=y_offset_std,
             safe_eval=safe_eval,
-            signed_bd=signed_bd,  # Pass signed_bd flag to worker function
+            signed_bd=signed_bd,
+            pcfg_ratio=pcfg_ratio,
+            pcfg_max_depth=pcfg_max_depth,
+            noise_profile=noise_profile,
         )
         
         # Run workers
@@ -930,6 +1214,9 @@ def generate_dataset_streamed(
     safe_eval: bool = True,
     signed_bd: bool = False,
     save_formulas: bool = False,
+    pcfg_ratio: float = 0.0,
+    pcfg_max_depth: int = 4,
+    noise_profile: str = 'legacy',
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """Generate dataset while streaming features/labels to disk."""
     if templates is None:
@@ -1002,6 +1289,9 @@ def generate_dataset_streamed(
         y_offset_std=y_offset_std,
         safe_eval=safe_eval,
         signed_bd=signed_bd,
+        pcfg_ratio=pcfg_ratio,
+        pcfg_max_depth=pcfg_max_depth,
+        noise_profile=noise_profile,
     )
 
     reject_stats = {
@@ -1079,6 +1369,9 @@ def generate_chunk(
     y_offset_std: float,
     safe_eval: bool,
     signed_bd: bool,
+    pcfg_ratio: float = 0.0,
+    pcfg_max_depth: int = 4,
+    noise_profile: str = 'legacy',
 ) -> Tuple[List, List, List, Dict[str, int]]:
     """Generate a chunk of samples (worker function)."""
     n, seed = task
@@ -1115,11 +1408,19 @@ def generate_chunk(
         'max_attempts': 0,
     }
 
+    # Create PCFG generator if needed
+    pcfg_gen = PCFGFormulaGenerator(max_depth=pcfg_max_depth) if pcfg_ratio > 0 else None
+
     while len(features_local) < target and attempts < max_attempts:
         attempts += 1
         
-        # Generate random formula from selected template pool
-        if balance_classes and class_to_templates:
+        # Decide: PCFG or template-based generation
+        use_pcfg = pcfg_gen is not None and random.random() < pcfg_ratio
+        
+        if use_pcfg:
+            # PCFG-based generation
+            formula, operators = pcfg_gen.generate()
+        elif balance_classes and class_to_templates:
             if class_sampling_weights is not None:
                 classes, weights = class_sampling_weights
                 target_class = np.random.choice(classes, p=weights)
@@ -1135,26 +1436,29 @@ def generate_chunk(
             template_idx += 1
         else:
             template, operators = random.choice(templates)
-        b = np.random.uniform(0.3, 6.0)  # Wider frequency range
-        d = np.random.uniform(0.3, 6.0)
-        if signed_bd:
-            b *= np.random.choice([-1.0, 1.0])
-            d *= np.random.choice([-1.0, 1.0])
-
-        # Expanded power choices: includes fractional powers (1.5, 2.3, etc.)
-        POWER_CHOICES = [
-            0.25, 0.33, 0.5, 0.67,  # Fractional roots
-            1.0, 1.5, 2.0, 2.3, 2.5, 3.0, 4.0,  # Positive powers (including fractional)
-            -0.5, -1.0, -2.0,  # Negative powers
-        ]
         
-        formula = template.format(
-            a=np.random.uniform(-5, 5),  # Wider amplitude
-            b=b,
-            c=np.random.uniform(-3, 3),  # Slightly wider
-            d=d,
-            p=np.random.choice(POWER_CHOICES),
-        )
+        # Fill in template coefficients (only for template-based formulas)
+        if not use_pcfg:
+            b = np.random.uniform(0.3, 6.0)  # Wider frequency range
+            d = np.random.uniform(0.3, 6.0)
+            if signed_bd:
+                b *= np.random.choice([-1.0, 1.0])
+                d *= np.random.choice([-1.0, 1.0])
+
+            # Expanded power choices: includes fractional powers (1.5, 2.3, etc.)
+            POWER_CHOICES = [
+                0.25, 0.33, 0.5, 0.67,  # Fractional roots
+                1.0, 1.5, 2.0, 2.3, 2.5, 3.0, 4.0,  # Positive powers (including fractional)
+                -0.5, -1.0, -2.0,  # Negative powers
+            ]
+            
+            formula = template.format(
+                a=np.random.uniform(-5, 5),  # Wider amplitude
+                b=b,
+                c=np.random.uniform(-3, 3),  # Slightly wider
+                d=d,
+                p=np.random.choice(POWER_CHOICES),
+            )
         
         # Sample x-range per curve if provided
         if x_ranges:
@@ -1182,7 +1486,11 @@ def generate_chunk(
             y_aug = y_aug * np.random.uniform(y_scale_min, y_scale_max)
         if y_offset_std > 0.0:
             y_aug = y_aug + np.random.normal(0.0, y_offset_std)
-        if noise_std > 0.0:
+        
+        # Noise injection: multi-SNR or legacy
+        if noise_profile == 'multi':
+            y_aug = apply_noise_augmentation(y_aug, noise_profile='multi')
+        elif noise_std > 0.0:
             y_aug = y_aug + np.random.normal(0.0, noise_std * (np.std(y_aug) + 1e-10), size=y_aug.shape)
 
         # Extract features from augmented curve
@@ -1289,6 +1597,13 @@ def main():
                         help="Keep b and d coefficients positive")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
+    parser.add_argument("--pcfg-ratio", type=float, default=0.0,
+                        help="Fraction of samples generated via PCFG grammar (0-1, default: 0)")
+    parser.add_argument("--pcfg-max-depth", type=int, default=4,
+                        help="Maximum tree depth for PCFG formulas (default: 4)")
+    parser.add_argument("--noise-profile", type=str, default='legacy',
+                        choices=['legacy', 'multi'],
+                        help="Noise injection mode: 'legacy' (fixed Gaussian) or 'multi' (randomized multi-SNR)")
     
     args = parser.parse_args()
 
@@ -1312,6 +1627,9 @@ def main():
     print(f"  n_points: {args.n_points}")
     if args.rational_ratio > 0:
         print(f"  rational_ratio: {args.rational_ratio:.2f}")
+    if args.pcfg_ratio > 0:
+        print(f"  pcfg_ratio: {args.pcfg_ratio:.2f} (max_depth={args.pcfg_max_depth})")
+    print(f"  noise_profile: {args.noise_profile}")
     print(f"  n_classes: {N_CLASSES}")
     print(f"  Operators: {list(OPERATOR_CLASSES.keys())}")
     print()
@@ -1357,6 +1675,9 @@ def main():
             y_offset_std=args.y_offset_std,
             safe_eval=safe_eval,
             signed_bd=signed_bd,
+            pcfg_ratio=args.pcfg_ratio,
+            pcfg_max_depth=args.pcfg_max_depth,
+            noise_profile=args.noise_profile,
         )
         feats_g, labels_g, forms_g = generate_dataset(
             n_samples=n_general,
@@ -1377,6 +1698,9 @@ def main():
             y_offset_std=args.y_offset_std,
             safe_eval=safe_eval,
             signed_bd=signed_bd,
+            pcfg_ratio=args.pcfg_ratio,
+            pcfg_max_depth=args.pcfg_max_depth,
+            noise_profile=args.noise_profile,
         )
         
         features = np.concatenate([feats_r, feats_g], axis=0)
@@ -1409,6 +1733,9 @@ def main():
                 safe_eval=safe_eval,
                 signed_bd=signed_bd,
                 save_formulas=save_formulas,
+                pcfg_ratio=args.pcfg_ratio,
+                pcfg_max_depth=args.pcfg_max_depth,
+                noise_profile=args.noise_profile,
             )
         else:
             features, labels, formulas = generate_dataset(
@@ -1429,6 +1756,9 @@ def main():
                 y_offset_std=args.y_offset_std,
                 safe_eval=safe_eval,
                 signed_bd=signed_bd,
+                pcfg_ratio=args.pcfg_ratio,
+                pcfg_max_depth=args.pcfg_max_depth,
+                noise_profile=args.noise_profile,
             )
     
     # Stats
