@@ -52,18 +52,7 @@ from .hybrid_optimizer import (
 )
 
 # v2: Benchmarking
-from .benchmark import (
-    BaselineMLP,
-    BaselineLSTM,
-    BaselineCNN,
-    BenchmarkRunner,
-    run_all_benchmarks,
-    quick_comparison,
-    generate_polynomial_data,
-    generate_time_series_data,
-    generate_multivariate_data,
-    get_device,
-)
+
 
 # v2: Evolutionary Training (PROPER approach)
 from .evolution import (
@@ -107,11 +96,7 @@ from .bfgs_optimizer import (
 )
 
 # v2: GPU Optimization
-from .gpu_optimized_dag import (
-    GPUOptimizedDAG,
-    wrap_dag_for_gpu,
-)
-# Batched ops and Triton kernels removed (minimal benefit, Windows incompatible)
+
 
 
 __all__ = [
@@ -157,14 +142,6 @@ __all__ = [
     'EvolutionaryOptimizer',
     'HybridOptimizer',
     'GradientGuidedEvolution',
-    
-    # v2: Benchmarking
-    'BaselineMLP',
-    'BaselineLSTM',
-    'BaselineCNN',
-    'BenchmarkRunner',
-    'run_all_benchmarks',
-    'quick_comparison',
     
     # v2: Evolutionary Training
     'EvolutionaryONNTrainer',
