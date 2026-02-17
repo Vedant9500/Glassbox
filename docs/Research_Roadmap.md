@@ -30,7 +30,7 @@
 - [x] **Expand classifier coverage**
   - Add: rational, sqrt, inverse, abs, sigmoid
   - Train on 500K synthetic formulas
-  - Target: 95.6% F1 (Achieved)
+  - Target: 96.0% F1 (Achieved — v3 model)
 
 - [x] **Smarter basis construction**
   - Nested terms: `sin(x²)`, `exp(-x²)`
@@ -48,24 +48,23 @@
 
 **Goal**: Fix known fragilities in feature extraction and search, without a full rewrite. These are high-value, low-disruption changes.
 
-#### 2A — Feature Extraction Fixes
+#### 2A — Feature Extraction Fixes ✅
 
-- [ ] **Add FFT phase features** *(from §1.1.1)*
-  - Current: `np.abs(fft)` discards phase entirely
-  - Fix: Include phase spectrum `np.angle(fft)` as additional features
-  - Adds ~32 dims → feature vector grows from 334 to ~366
+- [x] **Add FFT phase features** *(from §1.1.1)*
+  - Added `extract_fft_phase_features()` — 32 phase bins normalized to [-1, 1]
+  - Zeroes out phase for low-magnitude bins (<1% of max)
+  - Feature vector grew from 334 to 366 dims
   - Rationale: Phase carries structural info (distinguishes `sin(x)+sin(3x)` from `sin(x)·sin(3x)`)
 
-- [ ] **Smooth derivative features** *(from §1.1.2)*
-  - Current: Raw `np.diff(y)` with zero smoothing — ill-posed and noisy
-  - Fix: Apply Savitzky-Golay filter before differentiation
-  - Alternative: Fit a local polynomial spline, differentiate analytically
-  - Retrain classifier after this change
+- [x] **Smooth derivative features** *(from §1.1.2)*
+  - Added `_smooth_signal()` — Savitzky-Golay filter (window=11, polyorder=3) with moving average fallback
+  - Applied before differentiation in `extract_derivative_features()`
+  - Classifier retrained on 500K dataset → F1=0.9603 (v3)
 
-- [ ] **Curvature-aware resampling** *(from §1.1.3)*
-  - Current: Uniform 128-point resampling misses local singularities
-  - Fix: Adaptive resampling — concentrate points near high-curvature regions
-  - Detects resonance peaks, asymptotes, discontinuities that currently vanish in uniform grids
+- [x] **Curvature-aware resampling** *(from §1.1.3)*
+  - Modified `extract_raw_features()` to concentrate samples near high-curvature regions
+  - Uses κ = |y''| / (1 + y'²)^1.5 to build non-uniform CDF
+  - Configurable via `curvature_alpha` (default=5.0, 0=uniform)
 
 #### 2B — Data Generation Improvements
 
