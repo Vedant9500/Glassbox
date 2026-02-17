@@ -68,6 +68,7 @@ exports/
 # IDEs
 .idea/
 .vscode/
+Skills/
 
 # OS
 .DS_Store

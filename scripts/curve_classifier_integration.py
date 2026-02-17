@@ -34,7 +34,7 @@ except ImportError:
 class CurveClassifierMLP(nn.Module):
     """Simple MLP classifier for curve features."""
     
-    def __init__(self, n_features: int = 334, n_classes: int = 9, hidden: int = 256):
+    def __init__(self, n_features: int = 366, n_classes: int = 9, hidden: int = 256):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_features, hidden),
@@ -61,7 +61,7 @@ class CurveClassifierMLP(nn.Module):
 class CurveClassifierCNN(nn.Module):
     """1D CNN classifier matching training architecture."""
 
-    def __init__(self, n_classes: int = 9, n_features: int = 334, curve_dim: int = 128):
+    def __init__(self, n_classes: int = 9, n_features: int = 366, curve_dim: int = 128):
         super().__init__()
         self.curve_dim = min(curve_dim, n_features)
 

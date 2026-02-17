@@ -26,7 +26,7 @@ from typing import Tuple, Optional, List
 class CurveClassifierMLP(nn.Module):
     """Simple MLP classifier for curve features."""
     
-    def __init__(self, n_features: int = 334, n_classes: int = 9, hidden: int = 256):
+    def __init__(self, n_features: int = 366, n_classes: int = 9, hidden: int = 256):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_features, hidden),
@@ -64,7 +64,7 @@ class CurveClassifierMLP(nn.Module):
 class CurveClassifierCNN(nn.Module):
     """1D CNN that operates on the raw curve portion of features."""
     
-    def __init__(self, n_classes: int = 9, n_features: int = 334, curve_dim: int = 128):
+    def __init__(self, n_classes: int = 9, n_features: int = 366, curve_dim: int = 128):
         super().__init__()
         
         # Dynamically determine curve dimension (use min of curve_dim and n_features)
@@ -582,8 +582,8 @@ def main():
                         help="Path to training data (.npz file) or base path / .features.dat + .labels.dat")
     parser.add_argument("--n-samples", type=int, default=None,
                         help="Number of samples (required for .dat if file size cannot be inferred)")
-    parser.add_argument("--feature-dim", type=int, default=334,
-                        help="Feature dimension for .dat files (default: 334)")
+    parser.add_argument("--feature-dim", type=int, default=366,
+                        help="Feature dimension for .dat files (default: 366)")
     parser.add_argument("--n-classes", type=int, default=9,
                         help="Number of classes for .dat files (default: 9)")
     parser.add_argument("--load-into-ram", action="store_true",
@@ -660,7 +660,7 @@ def main():
     print(f"  Labels: {labels.shape}")
     print(f"  Classes: {operator_classes}")
 
-    expected_features = feature_dim or 334
+    expected_features = feature_dim or 366
     if features.shape[1] != expected_features:
         print(f"Warning: expected {expected_features} features, got {features.shape[1]}. ")
     if feature_schema is not None:

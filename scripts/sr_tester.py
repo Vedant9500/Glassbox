@@ -70,7 +70,7 @@ from glassbox.sr.operation_dag import OperationDAG
 from glassbox.sr.evolution import EvolutionaryONNTrainer, train_onn_evolutionary, finalize_model_coefficients
 from glassbox.sr.visualization import LiveTrainingVisualizer
 from glassbox.sr.pruning import PostTrainingPruner, prune_model
-from glassbox.sr import generate_polynomial_data, BaselineMLP, get_device
+# Note: generate_polynomial_data, BaselineMLP, get_device were removed from glassbox.sr
 
 console = Console() if HAS_RICH else None
 

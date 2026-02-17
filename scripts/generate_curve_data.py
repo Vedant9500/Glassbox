@@ -18,7 +18,10 @@ import ast
 # Make scipy optional - provide fallbacks
 try:
     from scipy.stats import skew, kurtosis
+    from scipy.signal import savgol_filter as _savgol_filter
+    _HAS_SAVGOL = True
 except ImportError:
+    _HAS_SAVGOL = False
     # Fallback implementations
     def skew(x):
         """Simple skewness calculation."""
@@ -68,15 +71,16 @@ OPERATOR_CLASSES = {
 N_CLASSES = len(OPERATOR_CLASSES)
 
 # Feature dimensionality (see extract_all_features)
-FEATURE_DIM = 334
+FEATURE_DIM = 366
 
 # Feature schema (slices into feature vector)
 FEATURE_SCHEMA = {
     "raw": (0, 128),
     "fft": (128, 160),
-    "deriv": (160, 288),
-    "stats": (288, 297),
-    "curv": (297, 334),
+    "fft_phase": (160, 192),
+    "deriv": (192, 320),
+    "stats": (320, 329),
+    "curv": (329, 366),
 }
 
 
@@ -315,19 +319,56 @@ ALL_TEMPLATES = (
 # FEATURE EXTRACTION
 # =============================================================================
 
-def extract_raw_features(y: np.ndarray, n_points: int = 128) -> np.ndarray:
-    """Normalize and resample curve to fixed size."""
-    if len(y) != n_points:
-        x_old = np.linspace(0, 1, len(y))
-        x_new = np.linspace(0, 1, n_points)
-        y = np.interp(x_new, x_old, y)
+def extract_raw_features(y: np.ndarray, n_points: int = 128, curvature_alpha: float = 5.0) -> np.ndarray:
+    """Normalize and resample curve to fixed size with curvature-aware resampling.
+    
+    Instead of uniform resampling, concentrates sample points near
+    high-curvature regions of the curve for better shape discrimination.
+    
+    Args:
+        y: Input curve values
+        n_points: Number of output sample points
+        curvature_alpha: Curvature concentration strength (0 = uniform)
+    """
+    if len(y) < 3:
+        # Too short to compute curvature — fall back to uniform
+        if len(y) != n_points:
+            x_old = np.linspace(0, 1, len(y))
+            x_new = np.linspace(0, 1, n_points)
+            y = np.interp(x_new, x_old, y)
+        y_min, y_max = y.min(), y.max()
+        if y_max - y_min > 1e-10:
+            return (y - y_min) / (y_max - y_min)
+        return np.zeros(n_points, dtype=y.dtype)
+    
+    # Compute local curvature κ = |y''| / (1 + y'^2)^1.5
+    dy = np.gradient(y)
+    ddy = np.gradient(dy)
+    kappa = np.abs(ddy) / (1.0 + dy**2)**1.5
+    kappa = np.nan_to_num(kappa, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # Build concentration density w(i) = 1 + α·κ(i)
+    w = 1.0 + curvature_alpha * kappa
+    
+    # Accumulate CDF from w, then invert to get non-uniform sample positions
+    cdf = np.cumsum(w)
+    cdf = cdf / cdf[-1]  # normalize to [0, 1]
+    
+    # Target uniform positions in CDF space → non-uniform in original space
+    target_cdf = np.linspace(0, 1, n_points)
+    # Map to original indices (fractional)
+    x_old = np.linspace(0, 1, len(y))
+    sample_positions = np.interp(target_cdf, cdf, x_old)
+    
+    # Interpolate y at the non-uniform sample positions
+    y_resampled = np.interp(sample_positions, x_old, y)
     
     # Normalize to [0, 1] range
-    y_min, y_max = y.min(), y.max()
+    y_min, y_max = y_resampled.min(), y_resampled.max()
     if y_max - y_min > 1e-10:
-        y_norm = (y - y_min) / (y_max - y_min)
+        y_norm = (y_resampled - y_min) / (y_max - y_min)
     else:
-        y_norm = np.zeros_like(y)
+        y_norm = np.zeros_like(y_resampled)
     
     return y_norm
 
@@ -343,6 +384,10 @@ def extract_fft_features(y: np.ndarray, n_freqs: int = 32) -> np.ndarray:
     fft = np.fft.rfft(y)
     magnitudes = np.abs(fft)[:n_freqs]
     
+    # Pad if signal too short to fill n_freqs bins
+    if len(magnitudes) < n_freqs:
+        magnitudes = np.pad(magnitudes, (0, n_freqs - len(magnitudes)))
+    
     # Normalize
     mag_max = magnitudes.max()
     if mag_max > 1e-10:
@@ -351,10 +396,81 @@ def extract_fft_features(y: np.ndarray, n_freqs: int = 32) -> np.ndarray:
     return magnitudes
 
 
+def extract_fft_phase_features(y: np.ndarray, n_bins: int = 32) -> np.ndarray:
+    """Extract FFT phase features to discriminate signals with same magnitude spectrum.
+    
+    Phase captures the relative alignment of frequency components,
+    allowing the classifier to distinguish e.g. sin(x)+sin(3x) from sin(x)*sin(3x)
+    which have similar magnitude spectra but very different phase profiles.
+    
+    Args:
+        y: Input curve values
+        n_bins: Number of phase bins to extract (matching magnitude bins)
+        
+    Returns:
+        Phase features normalized to [-1, 1] range (32 values)
+    """
+    # Same preprocessing as magnitude features
+    if len(y) > 1:
+        y = y - np.mean(y)
+        window = np.hanning(len(y))
+        y = y * window
+    
+    fft = np.fft.rfft(y)
+    phases = np.angle(fft)[:n_bins]  # range [-π, π]
+    
+    # Normalize to [-1, 1] by dividing by π
+    phases = phases / np.pi
+    
+    # Zero out phase where magnitude is negligible (phase is meaningless there)
+    magnitudes = np.abs(fft)[:n_bins]
+    mag_max = magnitudes.max() if len(magnitudes) > 0 else 0.0
+    if mag_max > 1e-10:
+        insignificant = magnitudes / mag_max < 0.01
+        phases[insignificant] = 0.0
+    
+    # Pad if signal too short to fill n_bins
+    if len(phases) < n_bins:
+        phases = np.pad(phases, (0, n_bins - len(phases)))
+    
+    return phases
+
+
+def _smooth_signal(y: np.ndarray) -> np.ndarray:
+    """Smooth a signal before differentiation to reduce noise amplification.
+    
+    Uses Savitzky-Golay filter (window=11, polyorder=3) when scipy is available,
+    otherwise falls back to a simple moving average (window=7).
+    """
+    if len(y) < 11:
+        return y  # Too short to smooth
+    
+    if _HAS_SAVGOL:
+        # Savitzky-Golay preserves peaks and shape better than moving average
+        win = min(11, len(y) if len(y) % 2 == 1 else len(y) - 1)
+        return _savgol_filter(y, window_length=win, polyorder=min(3, win - 1))
+    else:
+        # Fallback: simple moving average (window=7)
+        kernel_size = min(7, len(y))
+        kernel = np.ones(kernel_size) / kernel_size
+        return np.convolve(y, kernel, mode='same')
+
+
 def extract_derivative_features(y: np.ndarray, n_points: int = 64) -> np.ndarray:
-    """First and second derivatives - detect polynomial degree, inflection points."""
-    dy = np.diff(y)   # First derivative
-    ddy = np.diff(dy) # Second derivative
+    """First and second derivatives - detect polynomial degree, inflection points.
+    
+    Applies smoothing before differentiation to reduce noise amplification,
+    producing more reliable derivative features.
+    """
+    # Smooth before differentiation to reduce noise amplification
+    y_smooth = _smooth_signal(y)
+    
+    # Handle very short signals (need at least 3 points for ddy)
+    if len(y_smooth) < 3:
+        return np.zeros(n_points * 2, dtype=np.float64)
+    
+    dy = np.diff(y_smooth)   # First derivative
+    ddy = np.diff(dy)        # Second derivative
     
     # Resample to fixed size
     dy_resampled = np.interp(
@@ -397,7 +513,9 @@ def extract_stat_features(y: np.ndarray) -> np.ndarray:
         np.sum(np.diff(np.sign(np.diff(y_norm))) != 0),  # Extrema count
     ]
     
-    return np.array(features)
+    result = np.array(features)
+    # scipy skew/kurtosis return NaN for constant signals — replace with 0
+    return np.nan_to_num(result, nan=0.0)
 
 
 def extract_curvature_features(y: np.ndarray, n_points: int = 32) -> np.ndarray:
@@ -406,6 +524,9 @@ def extract_curvature_features(y: np.ndarray, n_points: int = 32) -> np.ndarray:
     Rational functions have distinct acceleration profiles.
     """
     # Smooth curve to reduce derivative noise
+    if len(y) < 2:
+        # np.gradient needs at least 2 points; return zeros
+        return np.zeros(n_points + 5, dtype=np.float64)
     if len(y) >= 7:
         window = np.ones(7, dtype=np.float64)
         window = window / window.sum()
@@ -452,16 +573,17 @@ def extract_curvature_features(y: np.ndarray, n_points: int = 32) -> np.ndarray:
 
 def extract_all_features(y: np.ndarray) -> np.ndarray:
     """Combine all features into single vector."""
-    raw = extract_raw_features(y, n_points=128)      # 128
-    fft = extract_fft_features(y, n_freqs=32)        # 32
-    deriv = extract_derivative_features(y, n_points=64)  # 128
-    stats = extract_stat_features(y)                  # 9
-    curv = extract_curvature_features(y, n_points=32) # 37 (32 + 5)
+    raw = extract_raw_features(y, n_points=128)           # 128
+    fft = extract_fft_features(y, n_freqs=32)             # 32
+    fft_phase = extract_fft_phase_features(y, n_bins=32)  # 32  (NEW)
+    deriv = extract_derivative_features(y, n_points=64)   # 128
+    stats = extract_stat_features(y)                       # 9
+    curv = extract_curvature_features(y, n_points=32)      # 37 (32 + 5)
     
-    features = np.concatenate([raw, fft, deriv, stats, curv])
+    features = np.concatenate([raw, fft, fft_phase, deriv, stats, curv])
     if features.shape[0] != FEATURE_DIM:
         raise ValueError(f"Feature vector size mismatch: {features.shape[0]} != {FEATURE_DIM}")
-    return features  # Total: 334
+    return features  # Total: 366
 
 
 # =============================================================================
