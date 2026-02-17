@@ -1537,6 +1537,32 @@ def run_fast_path(
     print("FAST PATH: Classifier-Guided Regression")
     print("="*60)
     
+    # Early return for constant signals (e.g. y=5, sin²+cos²=1)
+    y_std = np.std(y_np)
+    if y_std < 1e-10:
+        elapsed = time.time() - start_time
+        const_val = float(np.mean(y_np))
+        # Format nicely: use integer if close to one
+        if abs(const_val - round(const_val)) < 1e-6:
+            formula = str(int(round(const_val)))
+        else:
+            formula = f"{const_val:.6g}"
+        print(f"  Constant signal detected: y ≈ {const_val}")
+        print(f"  Formula: {formula}")
+        print(f"  MSE: 0.000000")
+        print("="*60)
+        return {
+            'formula': formula,
+            'mse': 0.0,
+            'time': elapsed,
+            'details': {'n_nonzero': 1, 'exact_match': True,
+                        'basis_names': ['1'], 'coefficients': np.array([const_val])},
+            'predictions': {'identity': 1.0},
+            'operator_hints': {'operators': set(), 'frequencies': [],
+                               'powers': [], 'has_rational': False,
+                               'has_exp_decay': False, 'active_terms': ['1']},
+        }
+    
     predictions = predict_operators(
         x_np,
         y_np,
