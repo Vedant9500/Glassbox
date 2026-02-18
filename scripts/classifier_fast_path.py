@@ -685,11 +685,7 @@ def fast_path_regression(
         mse: Mean squared error
         details: Dict with coefficients and basis names
     """
-    if x.ndim == 1:
-        x = x.flatten()
-    elif x.ndim == 2:
-        pass
-    else:
+    if x.ndim > 2:
         raise ValueError(f"Expected x to be 1D or 2D, got shape {x.shape}")
     y = y.flatten()
     

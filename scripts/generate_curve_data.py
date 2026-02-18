@@ -725,8 +725,8 @@ def extract_derivative_features(y: np.ndarray, n_points: int = 64) -> np.ndarray
     if len(y_smooth) < 3:
         return np.zeros(n_points * 2, dtype=np.float64)
     
-    dy = np.diff(y_smooth)   # First derivative
-    ddy = np.diff(dy)        # Second derivative
+    dy = np.gradient(y_smooth)   # First derivative (central difference)
+    ddy = np.gradient(dy)        # Second derivative (central difference)
     
     # Resample to fixed size
     dy_resampled = np.interp(
@@ -1418,7 +1418,10 @@ def generate_chunk(
         
         if use_pcfg:
             # PCFG-based generation
-            formula, operators = pcfg_gen.generate()
+            formula, _ = pcfg_gen.generate()
+            # Deriving operators from AST ensures labels match the final string exactly
+            # (fixes issue where generator tracking missed implicit ops or drifted)
+            operators = derive_operators_from_formula(formula)
         elif balance_classes and class_to_templates:
             if class_sampling_weights is not None:
                 classes, weights = class_sampling_weights
