@@ -358,6 +358,7 @@ class PCFGFormulaGenerator:
         ('+', 'addition'),
         ('-', 'addition'),
         ('*', 'multiplication'),
+        ('/', 'rational'),
     ]
     
     POWER_CHOICES = [0.5, 2, 3, 4, -1, -0.5, 1.5, 2.5, 0.33]
@@ -432,9 +433,9 @@ class PCFGFormulaGenerator:
             left_budget = 1
             right_budget = 1
         else:
-            split = random.randint(1, depth_budget)
+            split = random.randint(1, depth_budget - 1)
             left_budget = split
-            right_budget = depth_budget - split + 1
+            right_budget = depth_budget - split
         
         left = self._generate_expr(left_budget, ops)
         right = self._generate_expr(right_budget, ops)
@@ -883,8 +884,6 @@ def _safe_eval_ast(node: ast.AST, x: np.ndarray) -> np.ndarray:
         return _safe_eval_ast(node.body, x)
     if isinstance(node, ast.Constant):
         return np.array(node.value)
-    if isinstance(node, ast.Num):  # pragma: no cover (py<3.8)
-        return np.array(node.n)
     if isinstance(node, ast.Name):
         if node.id == 'x':
             return x

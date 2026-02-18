@@ -68,13 +68,13 @@
 
 #### 2B — Data Generation Improvements
 
-- [ ] **PCFG-based formula generation** *(from §2.2)*
+- [x] **PCFG-based formula generation** *(from §2.2)*
   - Replace fixed templates with recursive grammar rules
   - Grammar: `EXPR → UNARY(EXPR) | BINARY(EXPR, EXPR) | TERM`
   - Generates compositions like `sin(cos(sin(x)))` that no template covers
   - Use uniform tree sampling (Lample & Charton style) for balanced depth distribution
 
-- [ ] **Noise-robust training data** *(from §2.1)*
+- [x] **Noise-robust training data** *(from §2.1)*
   - Add controlled noise injection at multiple SNR levels during data generation
   - Train classifier to be robust to noisy real-world data
   - Already partially done (noise_std param exists), but increase coverage

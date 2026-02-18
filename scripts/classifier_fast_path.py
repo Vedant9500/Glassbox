@@ -332,19 +332,7 @@ def build_basis_from_predictions(
             basis_list.append(1.0 / safe_denom)
             names.append(f"1/(1-{name}^2)")
 
-            if include_exp:
-                x_clamp = np.clip(xi, -10, 10)
-                expm1 = np.expm1(x_clamp)
-                # Protect against divide by zero (expm1=0 when x=0)
-                expm1_safe = np.where(np.abs(expm1) < 1e-6, 1e-6, expm1)
-                basis_list.append(1.0 / expm1_safe)
-                names.append(f"1/(exp({name})-1)")
-                basis_list.append(xi / expm1_safe)
-                names.append(f"{name}/(exp({name})-1)")
-                basis_list.append(xi**2 / expm1_safe)
-                names.append(f"{name}^2/(exp({name})-1)")
-                basis_list.append(xi**3 / expm1_safe)
-                names.append(f"{name}^3/(exp({name})-1)")
+
 
     # Pairwise interaction terms for multi-input formulas
     if universal_basis and allow_arithmetic and n_vars > 1:
@@ -1138,10 +1126,10 @@ def refine_powers(
                 optimizer.zero_grad()
                 pred = model(x_valid)
                 loss = ((pred - y_valid) ** 2).mean()
-                with torch.no_grad():
-                    model.powers.data.clamp_(-2.0, 5.0)
                 loss.backward()
                 optimizer.step()
+                with torch.no_grad():
+                    model.powers.data.clamp_(-2.0, 5.0)
             
             mse = ((model(x_valid) - y_valid) ** 2).mean().item()
             stage1_models.append((mse, model, powers_subset))
@@ -1203,10 +1191,10 @@ def refine_powers(
             optimizer.zero_grad()
             pred = new_model(x_valid)
             loss = ((pred - y_valid) ** 2).mean()
-            with torch.no_grad():
-                new_model.powers.data.clamp_(-2.0, 5.0)
             loss.backward()
             optimizer.step()
+            with torch.no_grad():
+                new_model.powers.data.clamp_(-2.0, 5.0)
             
         mse2 = ((new_model(x_valid) - y_valid) ** 2).mean().item()
         
