@@ -605,6 +605,7 @@ def extract_raw_features(y: np.ndarray, n_points: int = 128, curvature_alpha: fl
     
     # Build concentration density w(i) = 1 + α·κ(i)
     w = 1.0 + curvature_alpha * kappa
+    w = np.maximum(w, 1e-4)  # Ensure non-negative density (fixes issue if alpha < 0)
     
     # Accumulate CDF from w, then invert to get non-uniform sample positions
     cdf = np.cumsum(w)
@@ -921,7 +922,8 @@ def _safe_eval_ast(node: ast.AST, x: np.ndarray) -> np.ndarray:
         if isinstance(node.op, ast.Mult):
             return left * right
         if isinstance(node.op, ast.Div):
-            return left / right
+            with np.errstate(divide='ignore', invalid='ignore'):
+                return left / right
         if isinstance(node.op, ast.Pow):
             return left ** right
         raise ValueError("Unsafe binary op")

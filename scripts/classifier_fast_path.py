@@ -529,7 +529,8 @@ def find_exact_symbolic_match(
                         formula = formula.replace("+ -", "- ")
                         
                         full_coeffs = np.zeros(n_basis)
-                        full_coeffs[0] = coeffs[0] if include_const else 0  # Assuming index 0 is constant
+                        const_idx = names.index("1") if "1" in names else 0
+                        full_coeffs[const_idx] = coeffs[0] if include_const else 0
                         full_coeffs[i] = coeffs[1] if include_const else coeffs[0]
                         return formula, mse, full_coeffs
                 except (np.linalg.LinAlgError, ValueError):
@@ -976,7 +977,13 @@ def refine_periodic_rational(
                 loss.backward()
                 opt.step()
 
-            mse = float(loss.item())
+            # Recompute MSE with final parameters
+            pred = (
+                a * torch.sin(omega * x_t) / (x_t**2 + torch.nn.functional.softplus(c_unconstrained) + 1e-6) +
+                b * torch.cos(omega * x_t) / (x_t**2 + torch.nn.functional.softplus(c_unconstrained) + 1e-6) +
+                d * x_t + e
+            )
+            mse = float(torch.mean((pred - y_t) ** 2).item())
             if mse < best_mse:
                 best_mse = mse
                 c_val = float(torch.nn.functional.softplus(c_unconstrained).item())
@@ -1214,11 +1221,19 @@ def refine_powers(
     # Build formula
     terms = []
     # Power terms
+    # Power terms
     for p, c in zip(refined_powers, refined_coeffs):
         if abs(c) < 1e-3:
             continue
-        coef_str = get_constant_symbol(c, 0.05)
+        
         p_snapped = _snap_power(p)
+        
+        # Merge linear term if power is effectively 1
+        if p_snapped == '1':
+            c += linear_val
+            linear_val = 0.0
+            
+        coef_str = get_constant_symbol(c, 0.05)
         if p_snapped == '1':
             terms.append(f"{coef_str}*x")
         else:
