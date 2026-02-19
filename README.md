@@ -119,7 +119,7 @@ y = x**2 + torch.sin(x)
 # Train ONN
 result = train_onn_evolutionary(x, y, generations=50)
 print(f"Discovered formula: {result['formula']}")
-print(f"MSE: {result['mse']:.6f}")
+print(f"MSE: {result['final_mse']:.6f}")
 ```
 
 ### Fast-Path with Classifier
@@ -129,7 +129,7 @@ from scripts.classifier_fast_path import run_fast_path
 
 result = run_fast_path(
     x, y,
-    classifier_path="models/curve_classifier.pt",
+  classifier_path="models/curve_classifier_v3.1.pt",
     device="cuda",  # or "cpu", "auto"
 )
 print(f"Formula: {result['formula']}")
@@ -143,7 +143,7 @@ from scripts.benchmark_feynman_easy import run_dataset
 result = run_dataset(
     dataset={"name": "my_data.txt", "url": None},
     data_dir="data/",
-    classifier_path="models/curve_classifier.pt",
+  classifier_path="models/curve_classifier_v3.1.pt",
     precision=64,
     max_rows=5000,
     sample=2000,
@@ -164,14 +164,14 @@ result = run_dataset(
 python scripts/sr_tester.py [OPTIONS]
 
 Options:
-  --mode {interactive,single,evolution,visualization,pruning}
+  --mode {interactive,single,evolution,viz,pruning}
   --formula FORMULA       Target formula (for single mode)
   --generations N         Number of evolution generations
   --population N          Population size
   --hidden-layers N       ONN hidden layers
   --nodes-per-layer N     Nodes per layer
   --precision {32,64}     Float precision
-  --use-curve-classifier  Enable curve classifier warm-start
+  --curve-classifier      Enable curve classifier warm-start
   --fast-path-only        Skip evolution, use fast-path only
   --ops-periodic          Enable/disable periodic operators
   --ops-exp               Enable/disable exponential operators
@@ -218,12 +218,12 @@ glassbox/
 │   ├── generate_curve_data.py    # Training data generation
 │   └── train_curve_classifier.py # Classifier training
 ├── models/
-│   └── curve_classifier.pt       # Pre-trained classifier
+│   └── curve_classifier_v3.1.pt  # Pre-trained classifier
 ├── data/
 │   └── feynman_easy/             # Benchmark datasets
 ├── docs/
 │   ├── ONN_Architecture.md       # Technical documentation
-│   ├── implementation_plan.md    # Development roadmap
+│   ├── Research_Roadmap.md       # Development roadmap
 │   └── key_insights.md           # Research notes
 └── requirements.txt
 ```
@@ -304,10 +304,6 @@ If you use Glassbox in your research, please cite:
 }
 ```
 
-## License
-
-MIT License - see LICENSE file for details.
-
 ## Contributing
 
-Contributions welcome! Please read CONTRIBUTING.md for guidelines.
+Contributions welcome! Open an issue or pull request with a clear description and reproducible steps.
