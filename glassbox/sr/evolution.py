@@ -2448,8 +2448,9 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             self.best_ever = Individual(dummy_model, fitness=result['best_mse'])
             
             # We return early. The PyTorch loop is deprecated by the C++ core.
+            # We return early. The PyTorch loop is deprecated by the C++ core.
             
-            formula = "C++ Graph (AST Parsing TBD)"
+            formula = result.get('formula', '0')
             elapsed = end_time - start_time
             
             return {

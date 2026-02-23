@@ -401,7 +401,7 @@ class SRTester:
         
         if 'sin' in formula_lower or 'cos' in formula_lower:
             discovered_ops.add('periodic')
-        if '^2' in formula_lower or '^3' in formula_lower or '**' in formula_lower:
+        if '^2' in formula_lower or '^3' in formula_lower or '**' in formula_lower or '(x)^' in formula_lower or 'x * x' in formula_lower:
             discovered_ops.add('power')
         # Detect x*sin(x) or x*cos(x) patterns
         if '*' in formula_lower and 'x' in formula_lower:

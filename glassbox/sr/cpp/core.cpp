@@ -75,6 +75,9 @@ py::dict run_evolution_cpp(
     result["output_weights"] = weights_list;
     result["output_bias"] = best.output_bias;
     
+    // Add the parsed formula string for Python compatibility
+    result["formula"] = sr::get_formula_string(best, static_cast<int>(X.size()));
+    
     return result;
 }
 
