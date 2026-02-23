@@ -6,15 +6,18 @@
 #include "eval.h"
 #include "evolution.h"
 
-namespace py = pybind11;
+#include <omp.h>
+#include <iostream>
 
+namespace py = pybind11;
 // Pybind wrapper for the evolution engine
 py::dict run_evolution_cpp(
     py::list X_list, // List of numpy arrays (features)
     py::array_t<double> y_array,
     int pop_size,
     int generations,
-    double early_stop_mse
+    double early_stop_mse,
+    py::list seed_omegas = py::list()
 ) {
     // 1. Convert Python/Numpy to C++ Eigen
     std::vector<Eigen::ArrayXd> X;
@@ -29,13 +32,21 @@ py::dict run_evolution_cpp(
     double* y_ptr = static_cast<double*>(y_buf.ptr);
     Eigen::Map<Eigen::ArrayXd> y(y_ptr, y_buf.size);
     
+    // Parse seed omegas
+    std::vector<double> cpp_seed_omegas;
+    for (auto item : seed_omegas) {
+        cpp_seed_omegas.push_back(item.cast<double>());
+    }
+
     // 2. Configure engine
     sr::EvolutionConfig config;
     config.pop_size = pop_size;
     config.generations = generations;
     config.early_stop_mse = early_stop_mse;
     
-    sr::EvolutionEngine engine(config, X, y);
+    std::cout << "Starting C++ Evolution with " << omp_get_max_threads() << " OpenMP Threads!" << std::endl;
+    
+    sr::EvolutionEngine engine(config, X, y, cpp_seed_omegas);
     
     // 3. Run evolution loop natively in C++
     engine.run();
@@ -44,7 +55,8 @@ py::dict run_evolution_cpp(
     auto best = engine.get_best();
     
     py::dict result;
-    result["best_mse"] = best.fitness;
+    result["best_mse"] = best.raw_mse;
+    result["penalized_fitness"] = best.fitness;
     
     // Serialize graph structure
     py::list nodes_list;
@@ -85,5 +97,5 @@ PYBIND11_MODULE(_core, m) {
     m.doc() = "Fast C++ core for Glassbox Symbolic Regression";
     m.def("run_evolution", &run_evolution_cpp, "Runs the evolutionary algorithm natively in C++",
           py::arg("X_list"), py::arg("y"), py::arg("pop_size")=50, py::arg("generations")=1000, 
-          py::arg("early_stop_mse")=1e-6);
+          py::arg("early_stop_mse")=1e-6, py::arg("seed_omegas")=py::list());
 }

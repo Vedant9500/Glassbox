@@ -62,7 +62,8 @@ struct IndividualGraph {
     std::vector<double> output_weights; // Linear combination of top nodes
     double output_bias = 0.0;
     
-    double fitness = 1e9; // MSE
+    double fitness = 1e9; // Penalized fitness
+    double raw_mse = 1e9; // Actual mathematical MSE
 };
 
 } // namespace sr

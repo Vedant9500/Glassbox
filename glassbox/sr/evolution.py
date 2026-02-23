@@ -2401,6 +2401,13 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             print("🚀 USING BLAZING FAST C++ EVOLUTION BACKEND 🚀")
             print("*"*60 + "\n")
             
+            # Check for FFT frequencies before calling C++ loop
+            detected_omegas = detect_dominant_frequency(x, y, n_frequencies=3)
+            if detected_omegas and detected_omegas[0] != 1.0:
+                print(f"FFT detected frequencies (omega) for C++ seeding: {[f'{o:.2f}' for o in detected_omegas]}")
+            else:
+                detected_omegas = []
+
             # Prepare inputs for C++
             X_list = [x[:, i].cpu().numpy() for i in range(x.shape[1])] if x.dim() > 1 else [x.cpu().numpy()]
             y_arr = y.cpu().numpy()
@@ -2413,7 +2420,8 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 y=y_arr,
                 pop_size=self.population_size,
                 generations=generations,
-                early_stop_mse=self.early_stop_mse
+                early_stop_mse=self.early_stop_mse,
+                seed_omegas=detected_omegas
             )
             
             end_time = time.time()
@@ -2434,8 +2442,18 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 pass
                 
             print("\nC++ BEST FORMULA (AST NODES):")
+            unary_ops = ["Periodic(sin/cos)", "Power", "Exp", "Log"]
+            binary_ops = ["Arithmetic(+-*/)", "Aggregation"]
+            
             for idx, node in enumerate(result['nodes']):
-                op = ["Input", "Constant", "Unary", "Binary"][node['type']]
+                op_type = node.get('type', 0)
+                op = ["Input", "Constant", "Unary", "Binary"][op_type] if op_type < 4 else "Unknown"
+                
+                if op_type == 2:  # Unary
+                    op += f"[{unary_ops[node.get('unary_op', 0)]}]"
+                elif op_type == 3:  # Binary
+                    op += f"[{binary_ops[node.get('binary_op', 0)]}]"
+                    
                 val = node.get('value', 0)
                 feat = node.get('feature_idx', 0)
                 print(f"  Node {idx}: {op} (val={val:.2f}, feat={feat}) left={node.get('left_child')}, right={node.get('right_child')}")
@@ -2447,7 +2465,6 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             dummy_model = self.model_factory().to(self.device)
             self.best_ever = Individual(dummy_model, fitness=result['best_mse'])
             
-            # We return early. The PyTorch loop is deprecated by the C++ core.
             # We return early. The PyTorch loop is deprecated by the C++ core.
             
             formula = result.get('formula', '0')

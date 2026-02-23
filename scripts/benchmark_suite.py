@@ -404,6 +404,7 @@ def run_formula(
     n_samples: int = 300,
     device: Optional[str] = None,
     timeout: float = 60.0,
+    with_evolution: bool = False,
 ) -> Dict[str, Any]:
     """Run the fast-path pipeline on a single formula and return result dict."""
     x_min, x_max = x_range
@@ -457,6 +458,54 @@ def run_formula(
             result["mse"] = fp_result.get("mse", float("inf"))
             result["time"] = elapsed
             result["n_terms"] = _count_terms(result["formula_discovered"])
+            
+            # -----------------------------------------------------------------
+            # Evolution Fallback (Phase 1 + 2)
+            # -----------------------------------------------------------------
+            # If we didn't get an EXACT match, and evolution is enabled
+            if with_evolution and (result["mse"] >= 1e-6 or result["n_terms"] > 5):
+                print(f"\n  [Fallback] Fast-path approximate (MSE={result['mse']:.2e}). Running C++ Evolution...")
+                try:
+                    from glassbox.sr.evolution import EvolutionaryONNTrainer
+                    from glassbox.sr.operation_dag import OperationDAG
+                    
+                    def make_model() -> OperationDAG:
+                        return OperationDAG(
+                            n_inputs=1,
+                            n_hidden_layers=2,
+                            nodes_per_layer=4,
+                            n_outputs=1,
+                            simplified_ops=True,
+                            fair_mode=True,
+                        )
+                    
+                    trainer = EvolutionaryONNTrainer(
+                        model_factory=make_model,
+                        population_size=100,
+                        device=device or "cuda",
+                        use_curve_classifier=False, # We already ran fast-path
+                        lamarckian=True,
+                        prune_coefficients=False,
+                    )
+                    
+                    # Ensure device matches
+                    actual_device = torch.device(device if device else ('cuda' if torch.cuda.is_available() else 'cpu'))
+                    
+                    # Re-run evolution
+                    t1 = time.time()
+                    evo_results = trainer.train(x_t.reshape(-1, 1).to(actual_device), y_t.reshape(-1, 1).to(actual_device), generations=2000)
+                    
+                    # For benchmark, we just take the raw C++ output
+                    
+                    evo_mse = evo_results.get("final_mse", float("inf"))
+                    if evo_mse < result["mse"]:
+                        result["formula_discovered"] = evo_results.get("formula", "")
+                        result["mse"] = evo_mse
+                        result["time"] = elapsed + (time.time() - t1)
+                        result["n_terms"] = _count_terms(result["formula_discovered"])
+                except Exception as eval_err:
+                    print(f"  [Evolution Fallback Error: {eval_err}]", end="")
+                    pass
 
     except Exception as e:
         result["error"] = str(e)
@@ -639,8 +688,12 @@ Examples:
         """,
     )
     parser.add_argument(
-        "--classifier-model", type=str, default="models/curve_classifier.pt",
-        help="Path to the curve classifier model (default: models/curve_classifier.pt)",
+        "--classifier-model", type=str, default="models/curve_classifier_v3.1.pt",
+        help="Path to the curve classifier model (default: models/curve_classifier_v3.1.pt)",
+    )
+    parser.add_argument(
+        "--with-evolution", action="store_true",
+        help="Run evolution fallback if fast-path fails to find an exact match",
     )
     parser.add_argument(
         "--tier", type=int, action="append", default=None, dest="tiers",
@@ -740,6 +793,7 @@ Examples:
                 n_samples=args.n_samples,
                 device=device,
                 timeout=args.timeout,
+                with_evolution=args.with_evolution,
             )
             result["human_name"] = human_name
             tier_results.append(result)
