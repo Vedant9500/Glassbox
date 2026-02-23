@@ -533,9 +533,10 @@ class MetaAggregation(nn.Module):
         Returns:
             Aggregated tensor with dimension reduced
         """
-        tau = self.tau.clamp(min=0.01)  # Avoid division by zero
+        # Avoid division by zero while preserving sign (for min/max)
+        tau = torch.where(self.tau.abs() < 0.01, torch.sign(self.tau + 1e-8) * 0.01, self.tau)
         
-        # Softmax weighted aggregation (approaches max as tau→0)
+        # Softmax weighted aggregation (approaches max as tau->0+, min as tau->0-)
         weights = F.softmax(x / tau, dim=dim)
         result = (weights * x).sum(dim=dim)
         

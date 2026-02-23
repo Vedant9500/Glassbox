@@ -74,4 +74,10 @@ Skills/
 .DS_Store
 Thumbs.db
 data/
-training_data
+training_data  
+# C++ built extensions  
+*.pyd  
+glassbox/sr/cpp/build/  
+glassbox/sr/cpp/out/  
+glassbox/sr/cpp/eigen*/  
+glassbox/sr/cpp/Eigen/ 
