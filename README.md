@@ -8,9 +8,12 @@
 - **Meta-Operations**: Parametric operations (MetaPower, MetaPeriodic, MetaExp) that smoothly interpolate between functions
 - **Hybrid Optimization**: Combines evolutionary search (topology) with gradient-based fitting (constants)
 - **Curve Classifier Fast-Path**: Pre-trained classifier predicts likely operators, enabling direct regression without evolution
-- **Flexible Classifier Inference**: Runtime supports PyTorch checkpoints (MLP/CNN auto-detected) and XGBoost payloads
+- **Fast C++ Backend**: Native C++ engine for topology evolution and constant fitting
+- **Hybrid Optimization**: Combines evolutionary search (topology) with analytical SVD-based linear fitting
+- **OpenMP Multithreading**: Utilizes all CPU cores for massively parallel population evaluation
+- **Comprehensive Benchmark Suite**: 8-tier evaluation framework covering ~200 formulas
 - **GPU Acceleration**: CUDA support for classifier inference and refinement
-- **Multi-threaded Search**: Parallel exact-match combinatorial search
+- **Flexible Classifier Inference**: Supports PyTorch checkpoints (MLP/CNN) and XGBoost payloads
 
 ## Installation
 
@@ -51,6 +54,11 @@ python scripts/sr_tester.py
 
 ```bash
 python scripts/sr_tester.py --mode single --formula "x^2 + sin(x)"
+```
+
+### Comprehensive Benchmark
+```bash
+python scripts/benchmark_suite.py --with-evolution
 ```
 
 ### Fast-Path Benchmark (AI-Feynman)
@@ -122,14 +130,18 @@ print(f"Discovered formula: {result['formula']}")
 print(f"MSE: {result['final_mse']:.6f}")
 ```
 
-### Fast-Path with Classifier
+### Full Suite Benchmark
+```bash
+python scripts/benchmark_suite.py --tier 4 --with-evolution
+```
 
-```python
+### Fast-Path with Classifier
+```bash
 from scripts.classifier_fast_path import run_fast_path
 
 result = run_fast_path(
     x, y,
-  classifier_path="models/curve_classifier_v3.1.pt",
+    classifier_path="models/curve_classifier_v3.1.pt",
     device="cuda",  # or "cpu", "auto"
 )
 print(f"Formula: {result['formula']}")
@@ -179,8 +191,19 @@ Options:
   --ops-power             Enable/disable power operators
 ```
 
-### benchmark_feynman_easy.py
+### benchmark_suite.py
+```bash
+python scripts/benchmark_suite.py [OPTIONS]
 
+Options:
+  --tier N                Target specific difficulty tier (1-8)
+  --with-evolution        Enable C++ evolution fallback for failing formulas
+  --classifier-model PATH Path to curve classifier
+  --iterations N          Number of iterations per formula
+  --output-dir PATH       Results directory
+```
+
+### benchmark_feynman_easy.py
 ```bash
 python scripts/benchmark_feynman_easy.py [OPTIONS]
 
@@ -206,12 +229,17 @@ glassbox/
 │       ├── operation_dag.py      # Main ONN model
 │       ├── operation_node.py     # Individual operation nodes
 │       ├── meta_ops.py           # Parametric meta-operations
-│       ├── evolution.py          # Evolutionary trainer
+│       ├── evolution.py          # Python evolutionary trainer gateway
+│       ├── cpp/                  # High-performance C++ backend
+│       │   ├── evolution.h       # C++ Evolution Engine (OpenMP + SVD)
+│       │   ├── ast.h             # C++ Expression DAG structures
+│       │   └── core.cpp          # Pybind11 bridge
 │       ├── hard_concrete.py      # Differentiable selection
 │       ├── pruning.py            # Post-training pruning
 │       └── visualization.py      # Training visualization
 ├── scripts/
 │   ├── sr_tester.py              # Main testing tool (TUI)
+│   ├── benchmark_suite.py        # Comprehensive 8-tier benchmark
 │   ├── classifier_fast_path.py   # Fast-path regression
 │   ├── benchmark_feynman_easy.py # AI-Feynman benchmark
 │   ├── curve_classifier_integration.py  # Classifier loading
@@ -256,6 +284,12 @@ Remove inactive or redundant nodes:
 - Analyze coefficient magnitudes
 - Prune near-zero contributions
 - Simplify formula representation
+### 4. High-Performance C++ Backend (Phase 4)
+For complex formulas where the fast-path fails, Glassbox triggers a native C++ evolution engine:
+- **Topology Mutation**: Efficient DAG structural mutations beyond rigid layer formats.
+- **Analytical Constant Fitting**: Uses Eigen SVD to solve for linear parameters in O(1) time per graph.
+- **OpenMP Multithreading**: Parallelizes population evaluation across all CPU cores.
+- **Performance**: Capable of running 2,000 generations in <0.1s on modern 8-core CPUs.
 
 ## Performance Tips
 
