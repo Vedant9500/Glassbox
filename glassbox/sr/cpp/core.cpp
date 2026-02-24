@@ -17,7 +17,8 @@ py::dict run_evolution_cpp(
     int pop_size,
     int generations,
     double early_stop_mse,
-    py::list seed_omegas = py::list()
+    py::list seed_omegas = py::list(),
+    py::list op_priors = py::list()
 ) {
     // 1. Convert Python/Numpy to C++ Eigen
     std::vector<Eigen::ArrayXd> X;
@@ -38,13 +39,20 @@ py::dict run_evolution_cpp(
         cpp_seed_omegas.push_back(item.cast<double>());
     }
 
+    // Parse op priors
+    std::vector<double> cpp_op_priors;
+    for (auto item : op_priors) {
+        cpp_op_priors.push_back(item.cast<double>());
+    }
+
     // 2. Configure engine
     sr::EvolutionConfig config;
     config.pop_size = pop_size;
     config.generations = generations;
     config.early_stop_mse = early_stop_mse;
+    config.op_priors = cpp_op_priors;
     
-    std::cout << "Starting C++ Evolution with " << omp_get_max_threads() << " OpenMP Threads!" << std::endl;
+    std::cout << "[v5-ridge] Starting C++ Evolution with " << omp_get_max_threads() << " OpenMP Threads!" << std::endl;
     
     sr::EvolutionEngine engine(config, X, y, cpp_seed_omegas);
     
@@ -97,5 +105,6 @@ PYBIND11_MODULE(_core, m) {
     m.doc() = "Fast C++ core for Glassbox Symbolic Regression";
     m.def("run_evolution", &run_evolution_cpp, "Runs the evolutionary algorithm natively in C++",
           py::arg("X_list"), py::arg("y"), py::arg("pop_size")=50, py::arg("generations")=1000, 
-          py::arg("early_stop_mse")=1e-6, py::arg("seed_omegas")=py::list());
+          py::arg("early_stop_mse")=1e-6, py::arg("seed_omegas")=py::list(),
+          py::arg("op_priors")=py::list());
 }

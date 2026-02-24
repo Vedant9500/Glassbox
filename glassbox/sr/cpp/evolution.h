@@ -19,6 +19,7 @@ struct EvolutionConfig {
     
     double mutation_rate_structural = 0.3;
     double mutation_rate_parametric = 0.5;
+    double crossover_rate = 0.3; // Fraction of offspring produced via crossover
     
     // Bounds
     double p_min = -2.0, p_max = 3.0;
@@ -33,7 +34,11 @@ struct EvolutionConfig {
 
     // Search Dynamics
     double explorer_fraction = 0.2; // 20% of population are explorers
-    double explorer_mutation_multiplier = 3.0; 
+    double explorer_mutation_multiplier = 3.0;
+
+    // Classifier priors: probability weights for [Periodic, Power, Exp, Log]
+    // Empty = uniform sampling. Non-empty = sample proportionally.
+    std::vector<double> op_priors; // e.g. {0.9, 0.03, 0.03, 0.04}
 };
 
 class EvolutionEngine {
@@ -42,7 +47,22 @@ public:
                     const std::vector<Eigen::ArrayXd>& X, 
                     const Eigen::ArrayXd& y,
                     const std::vector<double>& seed_omegas = {})
-        : config_(config), X_(X), y_(y), seed_omegas_(seed_omegas), rng_(std::random_device{}()) {}
+        : config_(config), X_(X), y_(y), seed_omegas_(seed_omegas), rng_(std::random_device{}()) {
+        // Normalize op_priors if provided
+        if (!config_.op_priors.empty()) {
+            double sum = 0.0;
+            for (double p : config_.op_priors) sum += p;
+            if (sum > 0) {
+                for (double& p : config_.op_priors) p /= sum;
+            }
+            // Build CDF for weighted sampling
+            op_cdf_.resize(config_.op_priors.size());
+            op_cdf_[0] = config_.op_priors[0];
+            for (size_t i = 1; i < config_.op_priors.size(); ++i) {
+                op_cdf_[i] = op_cdf_[i-1] + config_.op_priors[i];
+            }
+        }
+    }
 
     // Main run loop
     void run() {
@@ -101,11 +121,26 @@ public:
             int num_explorers = static_cast<int>(config_.pop_size * config_.explorer_fraction);
             int main_pop_target = config_.pop_size - num_explorers;
 
-            // Fill remainder of main population with mutated offspring
+            // Fill remainder of main population with crossover + mutated offspring
             std::uniform_int_distribution<int> parent_dist(0, config_.elite_size - 1);
+            std::uniform_real_distribution<double> coin(0.0, 1.0);
             while (next_gen.size() < main_pop_target) {
-                int parent_idx = parent_dist(rng_);
-                IndividualGraph child = mutate_lamarckian(population_[parent_idx], current_structural_mutation_rate);
+                IndividualGraph child;
+
+                if (config_.elite_size >= 2 && coin(rng_) < config_.crossover_rate) {
+                    // --- Subtree Crossover ---
+                    int p1 = parent_dist(rng_);
+                    int p2 = parent_dist(rng_);
+                    while (p2 == p1) p2 = parent_dist(rng_); // ensure distinct parents
+                    child = crossover(population_[p1], population_[p2]);
+                    // Light mutation on crossover children for diversity
+                    child = mutate_lamarckian(child, current_structural_mutation_rate * 0.3);
+                } else {
+                    // --- Mutation-only ---
+                    int parent_idx = parent_dist(rng_);
+                    child = mutate_lamarckian(population_[parent_idx], current_structural_mutation_rate);
+                }
+
                 if (gen % 5 == 0 || child.fitness < best_overall_.fitness * 1.5) {
                     refine_constants(child); // Gradient refinement on constants
                 } else {
@@ -129,7 +164,18 @@ public:
             }
             
             population_ = std::move(next_gen);
+            
+            // Periodic inner-param refinement on top elite only (every 20 gens)
+            // This is where Adam refines omega/p/phi — crucial for sin(3x) etc.
+            if (gen % 20 == 19) {
+                for (int i = 0; i < std::min(5, config_.elite_size); ++i) {
+                    refine_inner_params(population_[i]);
+                }
+            }
         }
+        
+        // Post-evolution cleanup: deduplicate + prune the best graph
+        cleanup_graph(best_overall_);
     }
     
     IndividualGraph get_best() const {
@@ -144,8 +190,28 @@ private:
     
     std::vector<IndividualGraph> population_;
     IndividualGraph best_overall_;
+    SubtreeCache gen_cache_; // Per-generation subtree cache
+    std::vector<double> op_cdf_; // CDF for prior-weighted op sampling
     
     std::mt19937 rng_;
+    
+    // Sample a UnaryOp using classifier priors (if available) or uniform
+    UnaryOp sample_unary_op() {
+        std::uniform_real_distribution<double> u(0.0, 1.0);
+        if (!op_cdf_.empty()) {
+            double r = u(rng_);
+            for (size_t i = 0; i < op_cdf_.size(); ++i) {
+                if (r <= op_cdf_[i]) return static_cast<UnaryOp>(i);
+            }
+            return UnaryOp::Log; // Fallback to last
+        }
+        // Uniform: 0=Periodic, 1=Power, 2=Exp, 3=Log
+        double op_choice = u(rng_);
+        if (op_choice < 0.25) return UnaryOp::Periodic;
+        if (op_choice < 0.5) return UnaryOp::Power;
+        if (op_choice < 0.75) return UnaryOp::Exp;
+        return UnaryOp::Log;
+    }
     
     void initialize_population() {
         population_.resize(config_.pop_size);
@@ -153,7 +219,7 @@ private:
         
         for (auto& ind : population_) {
             // Random DAG generator
-            std::uniform_int_distribution<int> num_nodes_dist(5, 20); // allow slightly deeper
+            std::uniform_int_distribution<int> num_nodes_dist(3, 8); // compact graphs
             int num_nodes = num_nodes_dist(rng_);
             ind.nodes.resize(num_nodes);
             
@@ -165,38 +231,27 @@ private:
                 node.p = 1.0 + rnorm(rng_)*0.5;
                 node.omega = 1.0 + rnorm(rng_);
 
-                // 🌟 Inject seeded omegas if available 🌟
-                if (!seed_omegas_.empty() && runif(rng_) < 0.6) { // Boosted omega seeding probability
+                // Inject seeded omegas if available
+                if (!seed_omegas_.empty() && runif(rng_) < 0.6) {
                     std::uniform_int_distribution<int> seed_dist(0, seed_omegas_.size() - 1);
                     node.omega = seed_omegas_[seed_dist(rng_)];
                 }
 
                 node.phi = rnorm(rng_);
-                node.amplitude = 1.0 + rnorm(rng_)*0.5;
+                node.amplitude = 1.0;  // Fixed — SVD handles scaling via output_weights
                 node.beta = 1.5 + rnorm(rng_)*0.5;
                 node.gamma = 1.0 + rnorm(rng_)*0.5;
                 node.tau = 1.0;
                 
-                if (i == 0 || runif(rng_) < 0.1) { // Lower terminal proability for deeper trees
-                    if (runif(rng_) < 0.8 && n_inputs > 0) { // Mostly inputs rather than constants
-                        node.type = NodeType::Input;
-                        std::uniform_int_distribution<int> feat_dist(0, n_inputs - 1);
-                        node.feature_idx = feat_dist(rng_);
-                    } else {
-                        node.type = NodeType::Constant;
-                        node.value = rnorm(rng_);
-                    }
+                // ── FIX: Only node 0 is Input. All others are Unary/Binary. ──
+                // This prevents multiple collinear 'x' columns in the SVD.
+                if (i < n_inputs) {
+                    node.type = NodeType::Input;
+                    node.feature_idx = i;
                 } else {
-                    if (runif(rng_) < 0.5 || i < 2) {
+                    if (runif(rng_) < 0.6 || i < n_inputs + 1) {
                         node.type = NodeType::Unary;
-                        // 0=Periodic, 1=Power, 2=Exp, 3=Log
-                        // Uniform distribution
-                        double op_choice = runif(rng_);
-                        if (op_choice < 0.25) node.unary_op = UnaryOp::Periodic; 
-                        else if (op_choice < 0.5) node.unary_op = UnaryOp::Power; 
-                        else if (op_choice < 0.75) node.unary_op = UnaryOp::Exp;
-                        else node.unary_op = UnaryOp::Log;
-                        
+                        node.unary_op = sample_unary_op();
                         std::uniform_int_distribution<int> child_dist(0, i - 1);
                         node.left_child = child_dist(rng_);
                     } else {
@@ -207,7 +262,17 @@ private:
                         
                         std::uniform_int_distribution<int> child_dist(0, i - 1);
                         node.left_child = child_dist(rng_);
-                        node.right_child = child_dist(rng_);
+                        // Ensure different children for Binary to avoid (x+x)/2 == x
+                        if (i >= 2) {
+                            node.right_child = child_dist(rng_);
+                            int tries = 0;
+                            while (node.right_child == node.left_child && tries < 5) {
+                                node.right_child = child_dist(rng_);
+                                tries++;
+                            }
+                        } else {
+                            node.right_child = node.left_child;
+                        }
                     }
                 }
             }
@@ -222,6 +287,9 @@ private:
     
     void evaluate_population() {
         int samples = static_cast<int>(y_.size());
+        gen_cache_.clear(); // Fresh cache per generation
+        // Note: not using cache in parallel eval to avoid thread-safety issues.
+        // Each thread evaluates independently; cache is used in serial paths.
         #pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < static_cast<int>(population_.size()); ++i) {
             evaluate_fitness_with_penalty(population_[i], X_, y_, samples);
@@ -249,8 +317,13 @@ private:
             }
         }
         
-        // Parsimony pressure: penalize graph size to prevent overfitting
-        double complexity_penalty = 1e-4 * graph.nodes.size();
+        // Parsimony pressure: penalize graph size to prevent bloat
+        // Count active nodes (non-zero output weight) for stronger penalty
+        int active_nodes = 0;
+        for (size_t i = 0; i < graph.nodes.size() && i < graph.output_weights.size(); ++i) {
+            if (std::abs(graph.output_weights[i]) > 1e-4) active_nodes++;
+        }
+        double complexity_penalty = 5e-3 * active_nodes + 1e-4 * graph.nodes.size();
         
         graph.fitness = mse + complexity_penalty + config_.round_penalty_weight * penalty / std::max(1.0, (double)graph.nodes.size());
         return graph.fitness;
@@ -281,8 +354,7 @@ private:
                 } else {
                     if (runif(rng_) < 0.6 || i < 2) {
                         node.type = NodeType::Unary;
-                        std::uniform_int_distribution<int> op_dist(0, 3);
-                        node.unary_op = static_cast<UnaryOp>(op_dist(rng_));
+                        node.unary_op = sample_unary_op();
                         std::uniform_int_distribution<int> child_dist(0, i - 1);
                         node.left_child = child_dist(rng_);
                     } else {
@@ -300,7 +372,7 @@ private:
                     node.p += rnorm(rng_);
                     node.omega += rnorm(rng_);
                     node.phi += rnorm(rng_);
-                    node.amplitude += rnorm(rng_) * 0.5;
+                    // amplitude is fixed at 1.0 — SVD handles scaling
                     if (node.type == NodeType::Constant) node.value += rnorm(rng_);
                     
                     node.omega = std::clamp(node.omega, config_.omega_min, config_.omega_max);
@@ -312,59 +384,521 @@ private:
         return child;
     }
     
-    // Fast analytical solver for linear weights
+    // ── Subtree Crossover ──────────────────────────────────────────────────
+    // Swaps a contiguous subtree between two parents to produce one child.
+    // A "subtree" here is all nodes reachable from a selected crossover point.
+    IndividualGraph crossover(const IndividualGraph& parent_a, const IndividualGraph& parent_b) {
+        IndividualGraph child = parent_a; // Start from parent A
+
+        if (parent_a.nodes.size() < 3 || parent_b.nodes.size() < 3) {
+            return child; // Too small for meaningful crossover
+        }
+
+        // Pick a non-terminal crossover point in each parent (skip node 0 to preserve an input root)
+        std::uniform_int_distribution<int> dist_a(1, static_cast<int>(parent_a.nodes.size()) - 1);
+        std::uniform_int_distribution<int> dist_b(1, static_cast<int>(parent_b.nodes.size()) - 1);
+
+        int xo_a = dist_a(rng_); // Point in parent A to replace
+        int xo_b = dist_b(rng_); // Point in parent B to donate
+
+        // Collect the subtree rooted at xo_b in parent B
+        // (all nodes whose index >= xo_b that are reachable from xo_b)
+        std::vector<int> subtree_b = collect_subtree(parent_b, xo_b);
+        if (subtree_b.empty()) {
+            return child; // Degenerate, just return parent A
+        }
+
+        // Collect subtree rooted at xo_a in parent A (to remove)
+        std::vector<int> subtree_a = collect_subtree(parent_a, xo_a);
+
+        // Strategy: replace node at xo_a with the donated subtree from B.
+        // To keep things simple and avoid complex re-indexing, we do a
+        // "graft" approach: copy the subtree_b nodes into the child,
+        // adjusting child pointers by offset.
+
+        // Remove subtree_a nodes from child (replace with donated subtree_b)
+        // Build new node list: [nodes before xo_a] + [donated subtree] + [nodes after subtree_a]
+        std::vector<OpNode> new_nodes;
+        new_nodes.reserve(child.nodes.size());
+
+        // 1. Copy nodes before the crossover point
+        for (int i = 0; i < xo_a; ++i) {
+            new_nodes.push_back(child.nodes[i]);
+        }
+
+        // 2. Insert donated subtree from parent B, adjusting child pointers
+        int offset = xo_a - xo_b; // Index shift: donated node i maps to i + offset
+        for (int idx : subtree_b) {
+            OpNode donated = parent_b.nodes[idx];
+            // Adjust child pointers by the offset
+            if (donated.left_child >= 0) {
+                int new_left = donated.left_child + offset;
+                donated.left_child = std::clamp(new_left, 0, static_cast<int>(xo_a + subtree_b.size()) - 1);
+            }
+            if (donated.right_child >= 0) {
+                int new_right = donated.right_child + offset;
+                donated.right_child = std::clamp(new_right, 0, static_cast<int>(xo_a + subtree_b.size()) - 1);
+            }
+            new_nodes.push_back(donated);
+        }
+
+        // 3. Copy remaining nodes from parent A after the subtree_a region
+        int end_of_subtree_a = subtree_a.empty() ? xo_a + 1 : subtree_a.back() + 1;
+        int size_diff = static_cast<int>(subtree_b.size()) - (end_of_subtree_a - xo_a);
+        for (int i = end_of_subtree_a; i < static_cast<int>(parent_a.nodes.size()); ++i) {
+            OpNode n = parent_a.nodes[i];
+            // Adjust child pointers for the size change
+            if (n.left_child >= xo_a) {
+                n.left_child = std::clamp(n.left_child + size_diff, 0, static_cast<int>(new_nodes.size()) + static_cast<int>(parent_a.nodes.size()) - end_of_subtree_a - 1);
+            }
+            if (n.right_child >= xo_a) {
+                n.right_child = std::clamp(n.right_child + size_diff, 0, static_cast<int>(new_nodes.size()) + static_cast<int>(parent_a.nodes.size()) - end_of_subtree_a - 1);
+            }
+            new_nodes.push_back(n);
+        }
+
+        // Safety: cap graph size to prevent bloat
+        if (new_nodes.size() > 30) {
+            new_nodes.resize(30);
+        }
+
+        // Fix any dangling child pointers
+        int total = static_cast<int>(new_nodes.size());
+        for (int i = 0; i < total; ++i) {
+            auto& n = new_nodes[i];
+            if (n.left_child >= total) n.left_child = std::max(0, i - 1);
+            if (n.right_child >= total) n.right_child = std::max(0, i - 1);
+            if (n.left_child >= i && (n.type == NodeType::Unary || n.type == NodeType::Binary)) n.left_child = std::max(0, i - 1);
+            if (n.right_child >= i && n.type == NodeType::Binary) n.right_child = std::max(0, i - 1);
+        }
+
+        child.nodes = std::move(new_nodes);
+
+        // Resize output weights to match new node count
+        std::normal_distribution<double> rnorm(0.0, 0.1);
+        child.output_weights.resize(child.nodes.size());
+        for (size_t i = parent_a.output_weights.size(); i < child.output_weights.size(); ++i) {
+            child.output_weights[i] = rnorm(rng_);
+        }
+
+        child.fitness = 1e9; // Mark for re-evaluation
+        child.raw_mse = 1e9;
+        return child;
+    }
+
+    // Collect all node indices reachable from `root` via child pointers (DFS)
+    std::vector<int> collect_subtree(const IndividualGraph& graph, int root) {
+        std::vector<int> result;
+        if (root < 0 || root >= static_cast<int>(graph.nodes.size())) return result;
+
+        std::vector<bool> visited(graph.nodes.size(), false);
+        std::vector<int> stack = {root};
+
+        while (!stack.empty()) {
+            int idx = stack.back();
+            stack.pop_back();
+            if (idx < 0 || idx >= static_cast<int>(graph.nodes.size()) || visited[idx]) continue;
+            visited[idx] = true;
+            result.push_back(idx);
+
+            const auto& n = graph.nodes[idx];
+            // Children are at lower indices (DAG invariant), but we collect them anyway
+            if (n.type == NodeType::Unary || n.type == NodeType::Binary) {
+                if (n.left_child >= 0 && n.left_child < static_cast<int>(graph.nodes.size())) {
+                    stack.push_back(n.left_child);
+                }
+            }
+            if (n.type == NodeType::Binary) {
+                if (n.right_child >= 0 && n.right_child < static_cast<int>(graph.nodes.size())) {
+                    stack.push_back(n.right_child);
+                }
+            }
+        }
+
+        std::sort(result.begin(), result.end());
+        return result;
+    }
+    
+    // ── Ridge Regression solver for output weights ──────────────────────
+    // Replaces bare SVD with (A^T*A + λI)^{-1} A^T b to prevent
+    // multicollinearity from producing massive cancelling coefficients.
+    // Returns true if solve succeeded.
+    bool solve_output_weights(IndividualGraph& ind, const std::vector<Eigen::ArrayXd>& cache) {
+        int n_samples = static_cast<int>(y_.size());
+        int num_features = static_cast<int>(ind.nodes.size());
+        if (num_features == 0) return false;
+        
+        // Build Design Matrix A: [nodes | 1 (bias)]
+        Eigen::MatrixXd A(n_samples, num_features + 1);
+        for (int i = 0; i < num_features; ++i) {
+            if (cache[i].size() == n_samples && cache[i].isFinite().all()) {
+                A.col(i) = cache[i].matrix();
+            } else {
+                A.col(i).setZero();
+            }
+        }
+        A.col(num_features).setOnes();
+        
+        Eigen::VectorXd b = y_.matrix();
+        Eigen::VectorXd w;
+        
+        try {
+            // Ridge regression: w = (A^T A + λI)^{-1} A^T b
+            double lambda = 0.01;
+            Eigen::MatrixXd AtA = A.transpose() * A;
+            AtA.diagonal() += Eigen::VectorXd::Constant(num_features + 1, lambda);
+            w = AtA.ldlt().solve(A.transpose() * b);
+        } catch (...) {
+            return false;
+        }
+        
+        // Coefficient pruning: zero out weak weights
+        double max_w = 0.0;
+        for (int i = 0; i < num_features; ++i) {
+            if (std::isfinite(w(i))) {
+                max_w = std::max(max_w, std::abs(w(i)));
+            } else {
+                w(i) = 0.0;
+            }
+        }
+        
+        for (int i = 0; i < num_features; ++i) {
+            if (std::abs(w(i)) < config_.prune_threshold * max_w || std::abs(w(i)) < 1e-4) {
+                ind.output_weights[i] = 0.0;
+            } else {
+                ind.output_weights[i] = w(i);
+            }
+        }
+        
+        if (std::isfinite(w(num_features)) && std::abs(w(num_features)) >= 1e-4) {
+            ind.output_bias = w(num_features);
+        } else {
+            ind.output_bias = 0.0;
+        }
+        return true;
+    }
+    
+    // Fast analytical solver for linear weights (used during evolution)
     void refine_constants(IndividualGraph& ind) {
         int n_samples = static_cast<int>(y_.size());
         
         std::vector<Eigen::ArrayXd> cache;
-        evaluate_graph(ind, X_, n_samples, cache);
+        evaluate_graph_cached(ind, X_, n_samples, cache, gen_cache_);
         
         if (!ind.nodes.empty()) {
-            int num_features = static_cast<int>(ind.nodes.size());
-            // Build Design Matrix A: [nodes | 1 (bias)]
-            Eigen::MatrixXd A(n_samples, num_features + 1);
-            for (int i = 0; i < num_features; ++i) {
-                if (!cache[i].isFinite().all()) {
-                    cache[i] = Eigen::ArrayXd::Zero(n_samples); 
-                }
-                A.col(i) = cache[i].matrix();
-            }
-            A.col(num_features).setOnes();
-            
-            Eigen::VectorXd b = y_.matrix();
-            Eigen::VectorXd w;
-            try {
-                w = A.bdcSvd(Eigen::ComputeThinU | Eigen::ComputeThinV).solve(b);
-            } catch (...) {
-                w = Eigen::VectorXd::Zero(num_features + 1);
-            }
-            
-            // Post-SVD Hard Thresholding (Coefficient Pruning)
-            double max_w = 0.0;
-            for (int i = 0; i < num_features; ++i) {
-                if (std::isfinite(w(i))) {
-                    max_w = std::max(max_w, std::abs(w(i)));
-                } else {
-                    w(i) = 0.0;
-                }
-            }
-            
-            for (int i = 0; i < num_features; ++i) {
-                if (std::abs(w(i)) < config_.prune_threshold * max_w || std::abs(w(i)) < 1e-4) {
-                    ind.output_weights[i] = 0.0;
-                } else {
-                    ind.output_weights[i] = w(i);
-                }
-            }
-            
-            if (std::isfinite(w(num_features)) && std::abs(w(num_features)) >= 1e-4) {
-                ind.output_bias = w(num_features);
-            } else {
-                ind.output_bias = 0.0;
-            }
-            
+            solve_output_weights(ind, cache);
             evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+            // NOTE: refine_inner_params is NOT called here — too expensive
+            // for per-child use. It runs once on the best graph in cleanup_graph.
         }
+    }
+    
+    // ── Finite-Difference Adam Optimizer for Inner Parameters ────────────
+    // Alternates between: (1) Adam steps on {p, omega, phi},
+    // then (2) SVD refit of output weights. This ensures linear weights
+    // stay in sync with the refined inner parameters.
+    void refine_inner_params(IndividualGraph& ind) {
+        if (ind.nodes.empty()) return;
+        int n_samples = static_cast<int>(y_.size());
+        
+        // Collect indices of active unary nodes (non-zero output weight)
+        std::vector<int> active_unary;
+        for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
+            if (ind.nodes[i].type == NodeType::Unary && 
+                std::abs(ind.output_weights[i]) > 1e-4) {
+                active_unary.push_back(i);
+            }
+        }
+        if (active_unary.empty()) return;
+        
+        // Adam hyperparameters
+        const double lr = 0.02;
+        const double beta1 = 0.9, beta2 = 0.999, eps_adam = 1e-8;
+        const double epsilon = 1e-4; // Finite difference step
+        const int adam_steps_per_round = 10;
+        const int num_rounds = 3; // Alternate Adam → SVD this many times
+        
+        int n_params = static_cast<int>(active_unary.size()) * 3; // {p, omega, phi} — NOT amplitude (redundant with SVD output_weight)
+        std::vector<double> m(n_params, 0.0), v(n_params, 0.0);
+        
+        double best_mse = ind.raw_mse;
+        IndividualGraph best_snapshot = ind; // Keep best seen
+        int global_step = 0;
+        
+        for (int round = 0; round < num_rounds; ++round) {
+            // ── Phase 1: Adam steps on inner params ──
+            for (int step = 0; step < adam_steps_per_round; ++step) {
+                std::vector<double> grads(n_params, 0.0);
+                
+                for (int ai = 0; ai < static_cast<int>(active_unary.size()); ++ai) {
+                    int node_idx = active_unary[ai];
+                    auto& node = ind.nodes[node_idx];
+                    // Only optimize {p, omega, phi} — amplitude handled by SVD
+                    double* params[3] = {&node.p, &node.omega, &node.phi};
+                    
+                    for (int pi = 0; pi < 3; ++pi) {
+                        double original = *params[pi];
+                        
+                        *params[pi] = original + epsilon;
+                        Eigen::ArrayXd pred_plus = evaluate_graph_simple(ind, X_, n_samples);
+                        double mse_plus = (pred_plus - y_).square().mean();
+                        
+                        *params[pi] = original - epsilon;
+                        Eigen::ArrayXd pred_minus = evaluate_graph_simple(ind, X_, n_samples);
+                        double mse_minus = (pred_minus - y_).square().mean();
+                        
+                        *params[pi] = original;
+                        
+                        double grad = (mse_plus - mse_minus) / (2.0 * epsilon);
+                        if (!std::isfinite(grad)) grad = 0.0;
+                        grads[ai * 3 + pi] = grad;
+                    }
+                }
+                
+                // Adam update
+                for (int ai = 0; ai < static_cast<int>(active_unary.size()); ++ai) {
+                    int node_idx = active_unary[ai];
+                    auto& node = ind.nodes[node_idx];
+                    double* params[3] = {&node.p, &node.omega, &node.phi};
+                    
+                    for (int pi = 0; pi < 3; ++pi) {
+                        int idx = ai * 3 + pi;
+                        double g = grads[idx];
+                        
+                        m[idx] = beta1 * m[idx] + (1.0 - beta1) * g;
+                        v[idx] = beta2 * v[idx] + (1.0 - beta2) * g * g;
+                        
+                        double m_hat = m[idx] / (1.0 - std::pow(beta1, global_step + 1));
+                        double v_hat = v[idx] / (1.0 - std::pow(beta2, global_step + 1));
+                        
+                        double update = lr * m_hat / (std::sqrt(v_hat) + eps_adam);
+                        *params[pi] -= update;
+                    }
+                    
+                    node.p = std::clamp(node.p, config_.p_min, config_.p_max);
+                    node.omega = std::clamp(node.omega, config_.omega_min, config_.omega_max);
+                }
+                global_step++;
+            }
+            
+            // ── Phase 2: Ridge refit of output weights ──
+            // Inner params changed, so re-solve the linear layer analytically
+            {
+                std::vector<Eigen::ArrayXd> cache;
+                evaluate_graph(ind, X_, n_samples, cache);
+                if (!solve_output_weights(ind, cache)) continue;
+            }
+            
+            // Evaluate and track best
+            evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+            if (ind.raw_mse < best_mse) {
+                best_mse = ind.raw_mse;
+                best_snapshot = ind;
+            }
+            
+            // Early exit if already excellent
+            if (ind.raw_mse < 1e-10) break;
+        }
+        
+        // Restore best seen (in case later rounds degraded)
+        if (best_snapshot.raw_mse < ind.raw_mse) {
+            ind = best_snapshot;
+        }
+    }
+    
+    // ── Post-Evolution Graph Cleanup ─────────────────────────────────────
+    // Uses output-correlation-based deduplication (like PyTorch pruning.py):
+    // Nodes producing identical outputs get merged regardless of structure.
+    // This catches x == (x+x)/2 == (x+x+x)/3 etc.
+    void cleanup_graph(IndividualGraph& ind) {
+        if (ind.nodes.empty()) return;
+        int n_samples = static_cast<int>(y_.size());
+        
+        // ── Step 1: Evaluate all nodes to get their actual output vectors ──
+        std::vector<Eigen::ArrayXd> cache;
+        evaluate_graph(ind, X_, n_samples, cache);
+        
+        // ── Step 2: Correlation-based deduplication ──
+        // Group nodes that produce (nearly) identical outputs
+        int n_nodes = static_cast<int>(ind.nodes.size());
+        std::vector<int> canonical(n_nodes); // Maps each node to its canonical representative
+        for (int i = 0; i < n_nodes; ++i) canonical[i] = i;
+        
+        for (int i = 0; i < n_nodes; ++i) {
+            if (canonical[i] != i) continue; // Already merged
+            if (i >= static_cast<int>(ind.output_weights.size())) continue;
+            if (std::abs(ind.output_weights[i]) < 1e-8) continue; // Skip dead
+            
+            // Skip if output is all zeros or constant NaN
+            if (!cache[i].isFinite().all()) continue;
+            double var_i = (cache[i] - cache[i].mean()).square().mean();
+            
+            for (int j = i + 1; j < n_nodes; ++j) {
+                if (canonical[j] != j) continue;
+                if (j >= static_cast<int>(ind.output_weights.size())) continue;
+                if (std::abs(ind.output_weights[j]) < 1e-8) continue;
+                if (!cache[j].isFinite().all()) continue;
+                
+                // Check if outputs are identical (or proportional)
+                // Use normalized correlation: sum((a-mean(a)) * (b-mean(b))) / (std(a)*std(b)*N)
+                double var_j = (cache[j] - cache[j].mean()).square().mean();
+                
+                bool is_duplicate = false;
+                
+                if (var_i < 1e-12 && var_j < 1e-12) {
+                    // Both constant — check if same constant
+                    is_duplicate = std::abs(cache[i].mean() - cache[j].mean()) < 1e-6;
+                } else if (var_i > 1e-12 && var_j > 1e-12) {
+                    // Both non-constant — check correlation AND scale
+                    Eigen::ArrayXd diff = cache[i] - cache[j];
+                    double max_abs_diff = diff.abs().maxCoeff();
+                    double max_abs_val = cache[i].abs().maxCoeff();
+                    
+                    if (max_abs_val > 1e-10) {
+                        // Relative error check: are they the same output?
+                        double rel_err = max_abs_diff / max_abs_val;
+                        is_duplicate = (rel_err < 1e-4);
+                    } else {
+                        is_duplicate = (max_abs_diff < 1e-10);
+                    }
+                    
+                    // Also check for proportional outputs (a = k*b)
+                    // These can be merged since SVD handles the scaling
+                    if (!is_duplicate) {
+                        Eigen::ArrayXd a_norm = cache[i] - cache[i].mean();
+                        Eigen::ArrayXd b_norm = cache[j] - cache[j].mean();
+                        double corr = (a_norm * b_norm).mean() / 
+                                     (std::sqrt(var_i * var_j) + 1e-15);
+                        is_duplicate = (std::abs(corr) > 0.9999);
+                    }
+                }
+                
+                if (is_duplicate) {
+                    canonical[j] = i; // j is a duplicate of i
+                }
+            }
+        }
+        
+        // Merge: for each group, keep canonical node, zero out duplicates
+        // Don't sum weights — let SVD refit handle optimal weights
+        for (int j = 0; j < n_nodes; ++j) {
+            if (canonical[j] != j && j < static_cast<int>(ind.output_weights.size())) {
+                ind.output_weights[j] = 0.0;
+            }
+        }
+        
+        // ── Step 3: Remove dead nodes (zero output weight, not a dependency) ──
+        std::vector<bool> keep(n_nodes, false);
+        
+        // First pass: mark nodes with non-zero weight
+        for (int i = 0; i < n_nodes; ++i) {
+            if (i < static_cast<int>(ind.output_weights.size()) && 
+                std::abs(ind.output_weights[i]) > 1e-8) {
+                keep[i] = true;
+            }
+        }
+        
+        // Second pass: mark dependencies of kept nodes
+        for (int i = n_nodes - 1; i >= 0; --i) {
+            if (keep[i]) {
+                const auto& n = ind.nodes[i];
+                if (n.left_child >= 0 && n.left_child < n_nodes) keep[n.left_child] = true;
+                if (n.right_child >= 0 && n.right_child < n_nodes) keep[n.right_child] = true;
+            }
+        }
+        
+        // Build compacted graph
+        std::vector<OpNode> clean_nodes;
+        std::vector<double> clean_weights;
+        std::vector<int> old_to_new(n_nodes, -1);
+        
+        for (int i = 0; i < n_nodes; ++i) {
+            if (keep[i]) {
+                old_to_new[i] = static_cast<int>(clean_nodes.size());
+                clean_nodes.push_back(ind.nodes[i]);
+                if (i < static_cast<int>(ind.output_weights.size())) {
+                    clean_weights.push_back(ind.output_weights[i]);
+                } else {
+                    clean_weights.push_back(0.0);
+                }
+            }
+        }
+        
+        // Remap child pointers
+        for (auto& node : clean_nodes) {
+            if (node.left_child >= 0 && node.left_child < n_nodes) {
+                node.left_child = old_to_new[node.left_child];
+            }
+            if (node.right_child >= 0 && node.right_child < n_nodes) {
+                node.right_child = old_to_new[node.right_child];
+            }
+            if (node.left_child < 0 && (node.type == NodeType::Unary || node.type == NodeType::Binary)) {
+                node.type = NodeType::Constant;
+                node.value = 0.0;
+            }
+            if (node.right_child < 0 && node.type == NodeType::Binary) {
+                node.type = NodeType::Unary;
+            }
+        }
+        
+        // Only accept the cleanup if graph got smaller
+        if (clean_nodes.size() < ind.nodes.size()) {
+            ind.nodes = std::move(clean_nodes);
+            ind.output_weights = std::move(clean_weights);
+        }
+        
+        // ── Step 4: Ridge refit on clean graph ──
+        if (!ind.nodes.empty()) {
+            std::vector<Eigen::ArrayXd> new_cache;
+            evaluate_graph(ind, X_, n_samples, new_cache);
+            solve_output_weights(ind, new_cache);
+        }
+        
+        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+        double baseline_mse = ind.raw_mse;
+        
+        // ── Step 5: Iterative Backward Elimination ──
+        // Greedily remove least-important node, re-solve Ridge, repeat
+        // until removing any more node degrades MSE too much.
+        for (int elim_iter = 0; elim_iter < 10; ++elim_iter) {
+            
+            // Find least important node (smallest non-zero |output_weight|, non-Input)
+            int weakest = -1;
+            double weakest_weight = 1e18;
+            for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
+                if (ind.nodes[i].type == NodeType::Input) continue;
+                if (i >= static_cast<int>(ind.output_weights.size())) continue;
+                double w = std::abs(ind.output_weights[i]);
+                if (w < 1e-6) continue; // Skip already-dead nodes
+                if (w < weakest_weight) {
+                    weakest_weight = w;
+                    weakest = i;
+                }
+            }
+            
+            if (weakest < 0) break; // No more removable nodes
+            
+            // Try removing it
+            IndividualGraph candidate = ind;
+            candidate.output_weights[weakest] = 0.0;
+            
+            // Re-evaluate without that node and re-solve
+            std::vector<Eigen::ArrayXd> trial_cache;
+            evaluate_graph(candidate, X_, n_samples, trial_cache);
+            solve_output_weights(candidate, trial_cache);
+            evaluate_fitness_with_penalty(candidate, X_, y_, n_samples);
+            
+            // Accept if MSE is still acceptable (within 2x baseline)
+            if (candidate.raw_mse < baseline_mse * 2.0 + 1e-8) {
+                ind = candidate;
+                baseline_mse = std::max(baseline_mse, ind.raw_mse);
+            } else {
+                break; // Can't remove any more without hurting accuracy
+            }
+        }
+        
+        // Final inner param refinement on the clean graph
+        refine_inner_params(ind);
     }
 };
 
