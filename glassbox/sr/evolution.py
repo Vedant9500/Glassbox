@@ -2461,9 +2461,16 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             print(f"Output Weights: {result['output_weights']}")
             print(f"Output Bias: {result['output_bias']:.4f}")
             
-            # Create a dummy individual to satisfy the rest of the pipeline
-            dummy_model = self.model_factory().to(self.device)
-            self.best_ever = Individual(dummy_model, fitness=result['best_mse'])
+            # P8: Create a real runnable PyTorch module from the C++ AST
+            try:
+                from glassbox.sr.cpp.export_pytorch import CppGraphModule
+                cpp_model = CppGraphModule(result).to(self.device)
+                self.best_ever = Individual(cpp_model, fitness=result['best_mse'])
+                print("✅ Created CppGraphModule (runnable nn.Module)")
+            except Exception as e:
+                print(f"⚠️ CppGraphModule failed ({e}), using dummy model")
+                dummy_model = self.model_factory().to(self.device)
+                self.best_ever = Individual(dummy_model, fitness=result['best_mse'])
             
             # We return early. The PyTorch loop is deprecated by the C++ core.
             

@@ -65,6 +65,11 @@ struct IndividualGraph {
     
     double fitness = 1e9; // Penalized fitness
     double raw_mse = 1e9; // Actual mathematical MSE
+
+    // NSGA-II fields (P5)
+    int pareto_rank = 0;           // Non-domination rank (0 = Pareto front)
+    double crowding_distance = 0.0; // Crowding distance within the same rank
+    int complexity() const { return static_cast<int>(nodes.size()); } // AST node count as 2nd objective
 };
 
 // ── Structural Hashing ──────────────────────────────────────────────────

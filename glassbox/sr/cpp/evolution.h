@@ -39,6 +39,19 @@ struct EvolutionConfig {
     // Classifier priors: probability weights for [Periodic, Power, Exp, Log]
     // Empty = uniform sampling. Non-empty = sample proportionally.
     std::vector<double> op_priors; // e.g. {0.9, 0.03, 0.03, 0.04}
+
+    // P5: NSGA-II multi-objective
+    bool use_nsga2 = false;
+
+    // P6: Island Model
+    int num_islands = 1;          // 1 = single population (default)
+    int migration_interval = 25;  // Exchange elites every N generations
+    int migration_size = 2;       // Number of elites migrated per exchange
+
+    // P7: Dimensional Analysis
+    std::vector<std::vector<double>> input_units;  // Per-feature unit exponents
+    std::vector<double> output_units;              // Target variable units
+    double dim_penalty_weight = 0.1;
 };
 
 class EvolutionEngine {
@@ -80,15 +93,46 @@ public:
         for (int gen = 0; gen < config_.generations; ++gen) {
             evaluate_population();
             
-            // Sort by fitness (lowest MSE first)
-            std::sort(population_.begin(), population_.end(), 
-                      [](const IndividualGraph& a, const IndividualGraph& b) {
-                          return a.fitness < b.fitness;
-                      });
-            
-            // Track best
-            if (population_[0].fitness < best_overall_.fitness) {
-                best_overall_ = population_[0];
+            // P5: NSGA-II selection or standard sort
+            if (config_.use_nsga2) {
+                // Create offspring pool
+                std::vector<IndividualGraph> combined;
+                combined.reserve(population_.size() * 2);
+                for (auto& ind : population_) combined.push_back(ind);
+                // Generate offspring
+                std::uniform_int_distribution<int> p_dist(0, std::max(0, (int)population_.size() - 1));
+                std::uniform_real_distribution<double> co(0.0, 1.0);
+                for (int i = 0; i < config_.pop_size; ++i) {
+                    IndividualGraph child;
+                    if (config_.elite_size >= 2 && co(rng_) < config_.crossover_rate) {
+                        int p1 = p_dist(rng_), p2 = p_dist(rng_);
+                        while (p2 == p1) p2 = p_dist(rng_);
+                        child = crossover(population_[p1], population_[p2]);
+                        child = mutate_lamarckian(child, current_structural_mutation_rate * 0.3);
+                    } else {
+                        child = mutate_lamarckian(population_[p_dist(rng_)], current_structural_mutation_rate);
+                    }
+                    if (gen % 5 == 0) refine_constants(child);
+                    else evaluate_fitness_with_penalty(child, X_, y_, y_.size());
+                    combined.push_back(std::move(child));
+                }
+                // NSGA-II selection from combined pool
+                population_ = nsga2_select(combined, config_.pop_size);
+                // Track best (min MSE from front)
+                for (auto& ind : population_) {
+                    if (ind.fitness < best_overall_.fitness) best_overall_ = ind;
+                }
+            } else {
+                // Standard single-objective sort
+                std::sort(population_.begin(), population_.end(), 
+                          [](const IndividualGraph& a, const IndividualGraph& b) {
+                              return a.fitness < b.fitness;
+                          });
+                
+                // Track best
+                if (population_[0].fitness < best_overall_.fitness) {
+                    best_overall_ = population_[0];
+                }
             }
             
             // Dynamic mutation decay based on plateauing
@@ -180,6 +224,131 @@ public:
     
     IndividualGraph get_best() const {
         return best_overall_;
+    }
+
+    // P5: Return entire Pareto front (rank-0 individuals)
+    // Re-runs non_dominated_sort on the current population to get clean ranks.
+    std::vector<IndividualGraph> get_pareto_front() {
+        if (population_.empty()) {
+            return {best_overall_};
+        }
+        // Fresh sort on current population
+        non_dominated_sort(population_);
+
+        std::vector<IndividualGraph> front;
+        for (const auto& ind : population_) {
+            if (ind.pareto_rank == 0) front.push_back(ind);
+        }
+        if (front.empty()) front.push_back(best_overall_);
+
+        // Sort by MSE
+        std::sort(front.begin(), front.end(),
+                  [](const IndividualGraph& a, const IndividualGraph& b) {
+                      return a.raw_mse < b.raw_mse;
+                  });
+
+        // Deduplicate: remove solutions with identical (mse, complexity)
+        auto last = std::unique(front.begin(), front.end(),
+                                [](const IndividualGraph& a, const IndividualGraph& b) {
+                                    return std::abs(a.raw_mse - b.raw_mse) < 1e-12 &&
+                                           a.complexity() == b.complexity();
+                                });
+        front.erase(last, front.end());
+
+        return front;
+    }
+
+    // P6: Island Model run
+    void run_islands() {
+        if (config_.num_islands <= 1) { run(); return; }
+
+        int island_size = config_.pop_size / config_.num_islands;
+        if (island_size < 4) { run(); return; } // Too small for islands
+
+        // Create per-island engines with split configs
+        std::vector<EvolutionEngine> islands;
+        islands.reserve(config_.num_islands);
+        EvolutionConfig island_cfg = config_;
+        island_cfg.pop_size = island_size;
+        island_cfg.elite_size = std::max(2, config_.elite_size / config_.num_islands);
+        island_cfg.num_islands = 1; // Each island is single-population
+
+        for (int i = 0; i < config_.num_islands; ++i) {
+            islands.emplace_back(island_cfg, X_, y_, seed_omegas_);
+        }
+
+        // Initialize all islands
+        for (auto& island : islands) {
+            island.initialize_population();
+            for (auto& ind : island.population_) {
+                island.refine_constants(ind);
+            }
+        }
+
+        // Run generations with periodic migration
+        for (int gen = 0; gen < config_.generations; ++gen) {
+            // Evolve each island one generation
+            for (auto& island : islands) {
+                island.evolve_one_generation(gen);
+            }
+
+            // Migration: ring topology (island i → island i+1)
+            if (gen > 0 && gen % config_.migration_interval == 0) {
+                for (int i = 0; i < config_.num_islands; ++i) {
+                    int next = (i + 1) % config_.num_islands;
+                    auto& src = islands[i].population_;
+                    auto& dst = islands[next].population_;
+
+                    // Sort source by fitness to get top elites
+                    std::sort(src.begin(), src.end(),
+                              [](const IndividualGraph& a, const IndividualGraph& b) {
+                                  return a.fitness < b.fitness;
+                              });
+
+                    // Replace worst in destination with source elites
+                    std::sort(dst.begin(), dst.end(),
+                              [](const IndividualGraph& a, const IndividualGraph& b) {
+                                  return a.fitness < b.fitness;
+                              });
+
+                    int n_migrate = std::min(config_.migration_size, (int)src.size() / 2);
+                    for (int m = 0; m < n_migrate; ++m) {
+                        dst[dst.size() - 1 - m] = src[m];
+                    }
+                }
+            }
+
+            // Check early stop across all islands
+            bool should_stop = false;
+            for (auto& island : islands) {
+                auto best = island.get_best();
+                if (best.raw_mse < config_.early_stop_mse && best.nodes.size() <= 8) {
+                    should_stop = true;
+                }
+                if (best.fitness < best_overall_.fitness) {
+                    best_overall_ = best;
+                }
+            }
+            if (config_.use_early_stop && should_stop) break;
+        }
+
+        // Collect the best overall across all islands and run cleanup
+        for (auto& island : islands) {
+            auto best = island.get_best();
+            if (best.fitness < best_overall_.fitness) {
+                best_overall_ = best;
+            }
+        }
+
+        // Merge all island populations for Pareto front (if NSGA-II)
+        population_.clear();
+        for (auto& island : islands) {
+            for (auto& ind : island.population_) {
+                population_.push_back(std::move(ind));
+            }
+        }
+
+        cleanup_graph(best_overall_);
     }
 
 private:
@@ -326,6 +495,12 @@ private:
         double complexity_penalty = 5e-3 * active_nodes + 1e-4 * graph.nodes.size();
         
         graph.fitness = mse + complexity_penalty + config_.round_penalty_weight * penalty / std::max(1.0, (double)graph.nodes.size());
+
+        // P7: Dimensional analysis penalty (only active when input_units provided)
+        if (!config_.input_units.empty()) {
+            graph.fitness += config_.dim_penalty_weight * dimensional_penalty(graph);
+        }
+
         return graph.fitness;
     }
     
@@ -899,6 +1074,303 @@ private:
         
         // Final inner param refinement on the clean graph
         refine_inner_params(ind);
+    }
+
+    // ── P5: NSGA-II Non-Dominated Sort ────────────────────────────────────
+    // Assigns pareto_rank to each individual in the population.
+    // Objectives: minimize raw_mse, minimize complexity().
+    void non_dominated_sort(std::vector<IndividualGraph>& pop) {
+        int n = static_cast<int>(pop.size());
+        if (n == 0) return;
+
+        // domination_count[i] = how many solutions dominate i
+        std::vector<int> domination_count(n, 0);
+        // dominated_set[i] = list of solutions that i dominates
+        std::vector<std::vector<int>> dominated_set(n);
+
+        for (int i = 0; i < n; ++i) {
+            for (int j = i + 1; j < n; ++j) {
+                // Compare on two objectives: raw_mse and complexity
+                bool i_dom_j = (pop[i].raw_mse <= pop[j].raw_mse && pop[i].complexity() <= pop[j].complexity()) &&
+                               (pop[i].raw_mse < pop[j].raw_mse || pop[i].complexity() < pop[j].complexity());
+                bool j_dom_i = (pop[j].raw_mse <= pop[i].raw_mse && pop[j].complexity() <= pop[i].complexity()) &&
+                               (pop[j].raw_mse < pop[i].raw_mse || pop[j].complexity() < pop[i].complexity());
+
+                if (i_dom_j) {
+                    dominated_set[i].push_back(j);
+                    domination_count[j]++;
+                } else if (j_dom_i) {
+                    dominated_set[j].push_back(i);
+                    domination_count[i]++;
+                }
+            }
+        }
+
+        // Assign ranks front-by-front
+        std::vector<int> current_front;
+        for (int i = 0; i < n; ++i) {
+            if (domination_count[i] == 0) {
+                pop[i].pareto_rank = 0;
+                current_front.push_back(i);
+            }
+        }
+
+        int rank = 0;
+        while (!current_front.empty()) {
+            std::vector<int> next_front;
+            for (int i : current_front) {
+                for (int j : dominated_set[i]) {
+                    domination_count[j]--;
+                    if (domination_count[j] == 0) {
+                        pop[j].pareto_rank = rank + 1;
+                        next_front.push_back(j);
+                    }
+                }
+            }
+            rank++;
+            current_front = std::move(next_front);
+        }
+    }
+
+    // ── P5: Crowding Distance Assignment ──────────────────────────────────
+    // Assigns crowding_distance to individuals within the same Pareto front.
+    void crowding_distance_assignment(std::vector<IndividualGraph*>& front) {
+        int n = static_cast<int>(front.size());
+        if (n == 0) return;
+
+        for (auto* ind : front) ind->crowding_distance = 0.0;
+        if (n <= 2) {
+            for (auto* ind : front) ind->crowding_distance = 1e18;
+            return;
+        }
+
+        // For each objective, sort and compute distance
+        // Objective 0: raw_mse
+        std::sort(front.begin(), front.end(),
+                  [](const IndividualGraph* a, const IndividualGraph* b) {
+                      return a->raw_mse < b->raw_mse;
+                  });
+        front.front()->crowding_distance = 1e18;
+        front.back()->crowding_distance = 1e18;
+        double mse_range = front.back()->raw_mse - front.front()->raw_mse;
+        if (mse_range > 1e-15) {
+            for (int i = 1; i < n - 1; ++i) {
+                front[i]->crowding_distance += (front[i+1]->raw_mse - front[i-1]->raw_mse) / mse_range;
+            }
+        }
+
+        // Objective 1: complexity
+        std::sort(front.begin(), front.end(),
+                  [](const IndividualGraph* a, const IndividualGraph* b) {
+                      return a->complexity() < b->complexity();
+                  });
+        front.front()->crowding_distance = 1e18;
+        front.back()->crowding_distance = 1e18;
+        double comp_range = front.back()->complexity() - front.front()->complexity();
+        if (comp_range > 1e-15) {
+            for (int i = 1; i < n - 1; ++i) {
+                front[i]->crowding_distance += (double)(front[i+1]->complexity() - front[i-1]->complexity()) / comp_range;
+            }
+        }
+    }
+
+    // ── P5: NSGA-II Selection ─────────────────────────────────────────────
+    // Select pop_size individuals from a combined pool using NSGA-II ranking.
+    std::vector<IndividualGraph> nsga2_select(std::vector<IndividualGraph>& combined, int target_size) {
+        non_dominated_sort(combined);
+
+        // Group by rank
+        int max_rank = 0;
+        for (auto& ind : combined) max_rank = std::max(max_rank, ind.pareto_rank);
+
+        std::vector<IndividualGraph> selected;
+        selected.reserve(target_size);
+
+        for (int r = 0; r <= max_rank && static_cast<int>(selected.size()) < target_size; ++r) {
+            std::vector<IndividualGraph*> front;
+            for (auto& ind : combined) {
+                if (ind.pareto_rank == r) front.push_back(&ind);
+            }
+            crowding_distance_assignment(front);
+
+            // Sort this front by crowding distance (descending)
+            std::sort(front.begin(), front.end(),
+                      [](const IndividualGraph* a, const IndividualGraph* b) {
+                          return a->crowding_distance > b->crowding_distance;
+                      });
+
+            for (auto* ind : front) {
+                if (static_cast<int>(selected.size()) >= target_size) break;
+                selected.push_back(*ind);
+            }
+        }
+
+        return selected;
+    }
+
+    // ── P6: Single-generation evolution step (for island model) ───────────
+    void evolve_one_generation(int gen) {
+        evaluate_population();
+
+        std::sort(population_.begin(), population_.end(),
+                  [](const IndividualGraph& a, const IndividualGraph& b) {
+                      return a.fitness < b.fitness;
+                  });
+
+        if (population_[0].fitness < best_overall_.fitness) {
+            best_overall_ = population_[0];
+        }
+
+        // Create next generation (same logic as run() loop body)
+        std::vector<IndividualGraph> next_gen;
+        next_gen.reserve(config_.pop_size);
+
+        for (int i = 0; i < config_.elite_size && i < static_cast<int>(population_.size()); ++i) {
+            next_gen.push_back(population_[i]);
+        }
+
+        double current_structural_mutation_rate = config_.mutation_rate_structural;
+        std::uniform_int_distribution<int> parent_dist(0, std::max(0, config_.elite_size - 1));
+        std::uniform_real_distribution<double> coin(0.0, 1.0);
+
+        int num_explorers = static_cast<int>(config_.pop_size * config_.explorer_fraction);
+        int main_pop_target = config_.pop_size - num_explorers;
+
+        while (static_cast<int>(next_gen.size()) < main_pop_target) {
+            IndividualGraph child;
+            if (config_.elite_size >= 2 && coin(rng_) < config_.crossover_rate) {
+                int p1 = parent_dist(rng_);
+                int p2 = parent_dist(rng_);
+                while (p2 == p1) p2 = parent_dist(rng_);
+                child = crossover(population_[p1], population_[p2]);
+                child = mutate_lamarckian(child, current_structural_mutation_rate * 0.3);
+            } else {
+                int parent_idx = parent_dist(rng_);
+                child = mutate_lamarckian(population_[parent_idx], current_structural_mutation_rate);
+            }
+            if (gen % 5 == 0) {
+                refine_constants(child);
+            } else {
+                evaluate_fitness_with_penalty(child, X_, y_, y_.size());
+            }
+            next_gen.push_back(std::move(child));
+        }
+
+        while (static_cast<int>(next_gen.size()) < config_.pop_size) {
+            int parent_idx = parent_dist(rng_);
+            double explorer_rate = std::min(1.0, current_structural_mutation_rate * config_.explorer_mutation_multiplier);
+            IndividualGraph explorer = mutate_lamarckian(population_[parent_idx], explorer_rate);
+            evaluate_fitness_with_penalty(explorer, X_, y_, y_.size());
+            next_gen.push_back(std::move(explorer));
+        }
+
+        population_ = std::move(next_gen);
+
+        if (gen % 20 == 19) {
+            for (int i = 0; i < std::min(3, config_.elite_size); ++i) {
+                refine_inner_params(population_[i]);
+            }
+        }
+    }
+
+    // ── P7: Dimensional Analysis Penalty ──────────────────────────────────
+    double dimensional_penalty(const IndividualGraph& graph) {
+        if (config_.input_units.empty()) return 0.0;
+
+        int n_dims = static_cast<int>(config_.input_units[0].size());
+        int n_nodes = static_cast<int>(graph.nodes.size());
+        std::vector<std::vector<double>> node_units(n_nodes, std::vector<double>(n_dims, 0.0));
+
+        // Propagate units bottom-up
+        for (int i = 0; i < n_nodes; ++i) {
+            const auto& node = graph.nodes[i];
+            switch (node.type) {
+                case NodeType::Input:
+                    if (node.feature_idx < static_cast<int>(config_.input_units.size())) {
+                        node_units[i] = config_.input_units[node.feature_idx];
+                    }
+                    break;
+                case NodeType::Constant:
+                    // Constants are dimensionless
+                    break;
+                case NodeType::Unary: {
+                    std::vector<double> child_u(n_dims, 0.0);
+                    if (node.left_child >= 0 && node.left_child < n_nodes)
+                        child_u = node_units[node.left_child];
+
+                    if (node.unary_op == UnaryOp::Power) {
+                        // x^p: multiply units by p
+                        for (int d = 0; d < n_dims; ++d)
+                            node_units[i][d] = child_u[d] * node.p;
+                    } else {
+                        // sin, exp, log: argument must be dimensionless
+                        // Result is dimensionless too
+                        // Penalty for non-zero child units
+                        // (units stay as zero — result is dimensionless)
+                    }
+                    break;
+                }
+                case NodeType::Binary: {
+                    std::vector<double> left_u(n_dims, 0.0), right_u(n_dims, 0.0);
+                    if (node.left_child >= 0 && node.left_child < n_nodes)
+                        left_u = node_units[node.left_child];
+                    if (node.right_child >= 0 && node.right_child < n_nodes)
+                        right_u = node_units[node.right_child];
+
+                    if (node.binary_op == BinaryOp::Arithmetic) {
+                        if (node.beta < 1.5) {
+                            // Addition: units must match, result = same
+                            node_units[i] = left_u;
+                        } else {
+                            // Multiplication: add exponents
+                            for (int d = 0; d < n_dims; ++d)
+                                node_units[i][d] = left_u[d] + right_u[d];
+                        }
+                    } else {
+                        node_units[i] = left_u; // Aggregation keeps units
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Compute penalty as sum of squared unit mismatches
+        double penalty = 0.0;
+        for (int i = 0; i < n_nodes; ++i) {
+            const auto& node = graph.nodes[i];
+            if (node.type == NodeType::Unary && node.unary_op != UnaryOp::Power) {
+                // sin/exp/log argument must be dimensionless
+                if (node.left_child >= 0 && node.left_child < n_nodes) {
+                    for (int d = 0; d < n_dims; ++d)
+                        penalty += node_units[node.left_child][d] * node_units[node.left_child][d];
+                }
+            }
+            if (node.type == NodeType::Binary && node.binary_op == BinaryOp::Arithmetic && node.beta < 1.5) {
+                // Addition: left and right units must match
+                if (node.left_child >= 0 && node.right_child >= 0 &&
+                    node.left_child < n_nodes && node.right_child < n_nodes) {
+                    for (int d = 0; d < n_dims; ++d) {
+                        double diff = node_units[node.left_child][d] - node_units[node.right_child][d];
+                        penalty += diff * diff;
+                    }
+                }
+            }
+        }
+
+        // Output unit check: compare weighted sum units against target
+        if (!config_.output_units.empty()) {
+            // Check each active node's units against output units
+            for (int i = 0; i < n_nodes && i < static_cast<int>(graph.output_weights.size()); ++i) {
+                if (std::abs(graph.output_weights[i]) > 1e-4) {
+                    for (int d = 0; d < n_dims && d < static_cast<int>(config_.output_units.size()); ++d) {
+                        double diff = node_units[i][d] - config_.output_units[d];
+                        penalty += diff * diff;
+                    }
+                }
+            }
+        }
+
+        return penalty;
     }
 };
 

@@ -1,5 +1,5 @@
 """
-Test the C++ evolution engine (P1-P4 optimizations) against formulas
+Test the C++ evolution engine (P1-P8 optimizations) against formulas
 from the benchmark suite.
 """
 import numpy as np
@@ -110,3 +110,133 @@ elapsed_prior = time.perf_counter() - t0
 print(f"  MSE:     {res_prior['best_mse']:.6e}")
 print(f"  Time:    {elapsed_prior:.2f}s")
 print(f"  Formula: {res_prior['formula']}")
+
+# ── P5 TEST: NSGA-II Multi-Objective ──────────────────────────────────
+print("\n" + "=" * 72)
+print("P5 TEST: NSGA-II Multi-Objective (Pareto Front)")
+print("=" * 72)
+
+np.random.seed(42)
+X = np.linspace(-5, 5, 200)
+y = (X**2 + np.sin(X)).astype(np.float64)
+
+t0 = time.perf_counter()
+res_nsga2 = _core.run_evolution(
+    [X.astype(np.float64)], y,
+    pop_size=50,
+    generations=500,
+    early_stop_mse=1e-8,
+    use_nsga2=True,
+)
+elapsed_nsga2 = time.perf_counter() - t0
+print(f"  Best MSE:   {res_nsga2['best_mse']:.6e}")
+print(f"  Time:       {elapsed_nsga2:.2f}s")
+print(f"  Formula:    {res_nsga2['formula'][:70]}")
+
+if "pareto_front" in res_nsga2:
+    pf = res_nsga2["pareto_front"]
+    print(f"  Pareto front size: {len(pf)}")
+    for i, sol in enumerate(pf[:5]):  # Show top 5
+        print(f"    [{i}] MSE={sol['mse']:.6e}  Complexity={sol['complexity']}  → {sol['formula'][:50]}")
+    
+    # Verify non-domination: no solution should dominate another
+    dominated = False
+    for i, a in enumerate(pf):
+        for j, b in enumerate(pf):
+            if i != j:
+                if a["mse"] <= b["mse"] and a["complexity"] <= b["complexity"]:
+                    if a["mse"] < b["mse"] or a["complexity"] < b["complexity"]:
+                        dominated = True
+    print(f"  Non-domination check: {'✅ PASS' if not dominated else '❌ FAIL'}")
+else:
+    print("  ❌ No pareto_front key in result!")
+
+# ── P6 TEST: Island Model ────────────────────────────────────────────
+print("\n" + "=" * 72)
+print("P6 TEST: Island Model (4 islands)")
+print("=" * 72)
+
+np.random.seed(42)
+X = np.linspace(-5, 5, 200)
+y = (X**2 + np.sin(X)).astype(np.float64)
+
+t0 = time.perf_counter()
+res_island = _core.run_evolution(
+    [X.astype(np.float64)], y,
+    pop_size=40,  # 10 per island
+    generations=500,
+    early_stop_mse=1e-8,
+    num_islands=4,
+    migration_interval=20,
+    migration_size=2,
+)
+elapsed_island = time.perf_counter() - t0
+print(f"  MSE:     {res_island['best_mse']:.6e}")
+print(f"  Time:    {elapsed_island:.2f}s")
+print(f"  Formula: {res_island['formula'][:70]}")
+
+# Grade
+mse_island = res_island["best_mse"]
+if mse_island < 1e-6:
+    print(f"  Result:  🟢 EXACT")
+elif mse_island < 1.0:
+    print(f"  Result:  🟡 APPROX/LOOSE")
+else:
+    print(f"  Result:  🔴 FAIL")
+
+# ── P8 TEST: nn.Module Deserialization ────────────────────────────────
+print("\n" + "=" * 72)
+print("P8 TEST: CppGraphModule (nn.Module Deserialization)")
+print("=" * 72)
+
+try:
+    import torch
+    # Use the basic result from the first test
+    np.random.seed(42)
+    X = np.linspace(-5, 5, 200)
+    y = (2*X + 3).astype(np.float64)
+
+    res_p8 = _core.run_evolution(
+        [X.astype(np.float64)], y,
+        pop_size=30, generations=500, early_stop_mse=1e-8,
+    )
+
+    # Add glassbox to path for import
+    glassbox_root = Path(__file__).resolve().parent.parent
+    sys.path.insert(0, str(glassbox_root))
+    from glassbox.sr.cpp.export_pytorch import CppGraphModule, cpp_result_to_module
+
+    module = cpp_result_to_module(res_p8)
+    print(f"  Module type: {type(module).__name__}")
+    print(f"  Formula:     {module.get_formula()[:60]}")
+
+    # Test forward pass
+    x_tensor = torch.tensor(X, dtype=torch.float64).unsqueeze(1)
+    with torch.no_grad():
+        pred = module(x_tensor)
+
+    assert pred.shape == (200,), f"Output shape mismatch: {pred.shape}"
+    pred_np = pred.numpy()
+    mse_torch = np.mean((pred_np - y) ** 2)
+    print(f"  C++ MSE:     {res_p8['best_mse']:.6e}")
+    print(f"  PyTorch MSE: {mse_torch:.6e}")
+
+    # Check that PyTorch prediction roughly matches C++ MSE
+    if mse_torch < res_p8['best_mse'] * 10 + 1e-4:
+        print(f"  Parity:      ✅ PASS (PyTorch matches C++)")
+    else:
+        print(f"  Parity:      ⚠️ LOOSE (MSE diverged)")
+
+    # Test parameter count
+    n_params = sum(p.numel() for p in module.parameters())
+    n_buffers = sum(b.numel() for b in module.buffers())
+    print(f"  Parameters:  {n_params}  Buffers: {n_buffers}")
+
+except ImportError as e:
+    print(f"  ⚠️ Skipped (torch not available: {e})")
+except Exception as e:
+    print(f"  ❌ Failed: {e}")
+
+print("\n" + "=" * 72)
+print("ALL P1-P8 TESTS COMPLETE")
+print("=" * 72)
