@@ -69,15 +69,16 @@ class CppGraphModule(nn.Module):
                 self.register_buffer(f"beta_{i}", torch.tensor(node["beta"], dtype=torch.float64))
                 self.register_buffer(f"gamma_{i}", torch.tensor(node["gamma"], dtype=torch.float64))
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, hard: bool = True, **kwargs) -> torch.Tensor:
         """
         Evaluate the C++ graph using PyTorch operations.
         
         Args:
             x: Input tensor of shape (N,) for single-feature or (N, D) for multi-feature
+            hard: Ignored (compatibility with OperationDAG interface)
             
         Returns:
-            Output tensor of shape (N,)
+            Tuple of (output tensor of shape (N,), None) matching ONN signature
         """
         if x.dim() == 1:
             x = x.unsqueeze(1)  # (N,) → (N, 1)
@@ -163,7 +164,7 @@ class CppGraphModule(nn.Module):
                 result = result + self.output_weights[i] * out
         result = result + self.output_bias
         
-        return result
+        return result, None  # (prediction, entropy=None) matching ONN signature
     
     def get_formula(self) -> str:
         """Return the formula string from the C++ result."""

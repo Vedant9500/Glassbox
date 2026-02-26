@@ -1,13 +1,23 @@
 #pragma once
 
+#define _USE_MATH_DEFINES
 #include "ast.h"
 #include "eval.h"
 #include <vector>
 #include <random>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 
 #include <omp.h>
+
+// MSVC fallbacks for M_PI and M_E
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef M_E
+#define M_E 2.71828182845904523536
+#endif
 
 namespace sr {
 
@@ -98,13 +108,19 @@ public:
                 // Create offspring pool
                 std::vector<IndividualGraph> combined;
                 combined.reserve(population_.size() * 2);
-                for (auto& ind : population_) combined.push_back(ind);
+                for (auto& ind : population_) {
+                    ind.age++;  // AFPO: existing population ages
+                    combined.push_back(ind);
+                }
                 // Generate offspring
                 std::uniform_int_distribution<int> p_dist(0, std::max(0, (int)population_.size() - 1));
                 std::uniform_real_distribution<double> co(0.0, 1.0);
                 for (int i = 0; i < config_.pop_size; ++i) {
                     IndividualGraph child;
-                    if (config_.elite_size >= 2 && co(rng_) < config_.crossover_rate) {
+                    double roll = co(rng_);
+                    if (roll < 0.15) {
+                        child = macro_mutate(population_[p_dist(rng_)]);
+                    } else if (config_.elite_size >= 2 && roll < 0.15 + config_.crossover_rate) {
                         int p1 = p_dist(rng_), p2 = p_dist(rng_);
                         while (p2 == p1) p2 = p_dist(rng_);
                         child = crossover(population_[p1], population_[p2]);
@@ -112,6 +128,7 @@ public:
                     } else {
                         child = mutate_lamarckian(population_[p_dist(rng_)], current_structural_mutation_rate);
                     }
+                    child.age = 0;  // AFPO: new children start young
                     if (gen % 5 == 0) refine_constants(child);
                     else evaluate_fitness_with_penalty(child, X_, y_, y_.size());
                     combined.push_back(std::move(child));
@@ -157,9 +174,11 @@ public:
             std::vector<IndividualGraph> next_gen;
             next_gen.reserve(config_.pop_size);
             
-            // Elitism ensures top survivors pass verbatim
+            // Elitism ensures top survivors pass verbatim (age incremented)
             for (int i = 0; i < config_.elite_size; ++i) {
-                next_gen.push_back(population_[i]);
+                IndividualGraph elite = population_[i];
+                elite.age++;  // AFPO: survivors age
+                next_gen.push_back(std::move(elite));
             }
             
             int num_explorers = static_cast<int>(config_.pop_size * config_.explorer_fraction);
@@ -170,8 +189,13 @@ public:
             std::uniform_real_distribution<double> coin(0.0, 1.0);
             while (next_gen.size() < main_pop_target) {
                 IndividualGraph child;
+                double roll = coin(rng_);
 
-                if (config_.elite_size >= 2 && coin(rng_) < config_.crossover_rate) {
+                if (roll < 0.15) {
+                    // --- Macro-Mutation (15%) ---
+                    int parent_idx = parent_dist(rng_);
+                    child = macro_mutate(population_[parent_idx]);
+                } else if (config_.elite_size >= 2 && roll < 0.15 + config_.crossover_rate) {
                     // --- Subtree Crossover ---
                     int p1 = parent_dist(rng_);
                     int p2 = parent_dist(rng_);
@@ -184,6 +208,8 @@ public:
                     int parent_idx = parent_dist(rng_);
                     child = mutate_lamarckian(population_[parent_idx], current_structural_mutation_rate);
                 }
+
+                child.age = 0;  // AFPO: new children start young
 
                 if (gen % 5 == 0 || child.fitness < best_overall_.fitness * 1.5) {
                     refine_constants(child); // Gradient refinement on constants
@@ -198,7 +224,13 @@ public:
             while (next_gen.size() < config_.pop_size) {
                  int parent_idx = parent_dist(rng_); // Use elite parents, but mutate more aggressively
                  double explorer_rate = std::min(1.0, current_structural_mutation_rate * config_.explorer_mutation_multiplier);
-                 IndividualGraph explorer = mutate_lamarckian(population_[parent_idx], explorer_rate);
+                 IndividualGraph explorer;
+                 if (coin(rng_) < 0.2) {
+                     explorer = macro_mutate(population_[parent_idx]);
+                 } else {
+                     explorer = mutate_lamarckian(population_[parent_idx], explorer_rate);
+                 }
+                 explorer.age = 0;  // AFPO: explorers start young
                  if (gen % 10 == 0) {
                      refine_constants(explorer); 
                  } else {
@@ -554,6 +586,101 @@ private:
                     node.p = std::clamp(node.p, config_.p_min, config_.p_max);
                 }
             }
+        }
+        
+        return child;
+    }
+
+    // ── Macro-Mutations ────────────────────────────────────────────────────
+    // Structural mutations that preserve building blocks:
+    //   - Wrap:     f(x) → sin(f(x)) or exp(f(x)) or |f(x)|^p
+    //   - Multiply: f(x), g(x) → f(x) * g(x)
+    //   - Nest:     f(x), g(x) → f(g(x))
+    IndividualGraph macro_mutate(const IndividualGraph& parent) {
+        IndividualGraph child = parent;
+        std::uniform_real_distribution<double> runif(0.0, 1.0);
+        
+        int n = static_cast<int>(child.nodes.size());
+        if (n < 2) return mutate_lamarckian(child, 0.3); // Too small for macro
+        
+        double roll = runif(rng_);
+        
+        if (roll < 0.5) {
+            // ── Wrap Mutation ──
+            // Pick a random non-input node and wrap it with a new unary op
+            std::uniform_int_distribution<int> node_dist(1, n - 1);
+            int target = node_dist(rng_);
+            
+            // Create new unary node that takes 'target' as input
+            OpNode wrap_node;
+            wrap_node.type = NodeType::Unary;
+            wrap_node.unary_op = sample_unary_op();
+            wrap_node.left_child = target;
+            wrap_node.p = 1.0;
+            wrap_node.omega = 1.0;
+            wrap_node.phi = 0.0;
+            wrap_node.amplitude = 1.0;
+            
+            // If wrapping with Power, use interesting exponents
+            if (wrap_node.unary_op == UnaryOp::Power) {
+                double powers[] = {0.5, 2.0, 3.0, -1.0, 1.5};
+                std::uniform_int_distribution<int> pow_dist(0, 4);
+                wrap_node.p = powers[pow_dist(rng_)];
+            }
+            // If wrapping with Periodic, seed useful frequencies
+            if (wrap_node.unary_op == UnaryOp::Periodic) {
+                double freqs[] = {1.0, 2.0, 3.0, 0.5};
+                std::uniform_int_distribution<int> freq_dist(0, 3);
+                wrap_node.omega = freqs[freq_dist(rng_)];
+            }
+            
+            child.nodes.push_back(wrap_node);
+            child.output_weights.push_back(0.5); // Small initial weight
+            
+        } else if (roll < 0.8) {
+            // ── Multiply Mutation ──
+            // Pick two existing nodes and create f(x) * g(x)
+            std::uniform_int_distribution<int> node_dist(0, n - 1);
+            int left = node_dist(rng_);
+            int right = node_dist(rng_);
+            while (right == left && n > 1) right = node_dist(rng_);
+            
+            OpNode mul_node;
+            mul_node.type = NodeType::Binary;
+            mul_node.binary_op = BinaryOp::Arithmetic;
+            mul_node.beta = 2.0;  // 2.0 = multiply mode
+            mul_node.gamma = 1.0;
+            mul_node.left_child = left;
+            mul_node.right_child = right;
+            
+            child.nodes.push_back(mul_node);
+            child.output_weights.push_back(1.0);
+            
+        } else {
+            // ── Nest Mutation ──
+            // Pick a unary node f and change its input to another node g
+            // Creating f(g(x)) from f(old_input) and g(x)
+            std::vector<int> unary_indices;
+            for (int i = 0; i < n; ++i) {
+                if (child.nodes[i].type == NodeType::Unary) {
+                    unary_indices.push_back(i);
+                }
+            }
+            
+            if (unary_indices.empty()) {
+                // No unary nodes, fall back to wrap
+                return macro_mutate(parent); // Retry (will likely hit wrap/multiply)
+            }
+            
+            std::uniform_int_distribution<int> uni_dist(0, static_cast<int>(unary_indices.size()) - 1);
+            int f_idx = unary_indices[uni_dist(rng_)];
+            
+            // Pick a different node to be the new input
+            std::uniform_int_distribution<int> node_dist(0, f_idx > 0 ? f_idx - 1 : 0);
+            int g_idx = node_dist(rng_);
+            
+            // Rewire: f's input becomes g (creating f(g(x)) composition)
+            child.nodes[f_idx].left_child = g_idx;
         }
         
         return child;
@@ -1072,13 +1199,291 @@ private:
             }
         }
         
+        // ── Step 6: Parameter & Coefficient Snapping ─────────────────────────
+        // Try rounding inner parameters and output weights to clean values.
+        // This converts 0.9997*sin(2.998*x + 0.0012) → sin(3*x).
+        {
+            evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+            double snap_baseline_mse = ind.raw_mse;
+            
+            // 6a. Inner parameter snapping (p, omega, phi)
+            const double snap_candidates_p[] = {-2, -1.5, -1, -0.5, 0, 0.25, 1.0/3.0, 0.5, 2.0/3.0, 0.75, 1, 1.5, 2, 2.5, 3, 4, 5};
+            const int n_snap_p = sizeof(snap_candidates_p) / sizeof(snap_candidates_p[0]);
+            
+            const double snap_candidates_omega[] = {0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8, M_PI, 2*M_PI, M_PI/2};
+            const int n_snap_omega = sizeof(snap_candidates_omega) / sizeof(snap_candidates_omega[0]);
+            
+            const double snap_candidates_phi[] = {0.0, M_PI/4, M_PI/2, M_PI, 3*M_PI/2, -M_PI/4, -M_PI/2, -M_PI};
+            const int n_snap_phi = sizeof(snap_candidates_phi) / sizeof(snap_candidates_phi[0]);
+            
+            for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
+                if (ind.nodes[i].type != NodeType::Unary) continue;
+                if (i >= static_cast<int>(ind.output_weights.size())) continue;
+                if (std::abs(ind.output_weights[i]) < 1e-6) continue; // Skip dead nodes
+                
+                auto& node = ind.nodes[i];
+                
+                // Try snapping p
+                {
+                    double original_p = node.p;
+                    double best_snap_p = original_p;
+                    double best_snap_mse = snap_baseline_mse;
+                    
+                    for (int si = 0; si < n_snap_p; ++si) {
+                        double candidate = snap_candidates_p[si];
+                        if (std::abs(original_p - candidate) > 0.3) continue; // Only snap if close
+                        
+                        node.p = candidate;
+                        // Re-solve output weights with snapped parameter
+                        std::vector<Eigen::ArrayXd> snap_cache;
+                        evaluate_graph(ind, X_, n_samples, snap_cache);
+                        solve_output_weights(ind, snap_cache);
+                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                        
+                        if (ind.raw_mse < best_snap_mse * 1.5 + 1e-8) {
+                            best_snap_p = candidate;
+                            best_snap_mse = ind.raw_mse;
+                        }
+                    }
+                    node.p = best_snap_p;
+                    if (best_snap_p != original_p) {
+                        // Re-solve with accepted snap
+                        std::vector<Eigen::ArrayXd> snap_cache;
+                        evaluate_graph(ind, X_, n_samples, snap_cache);
+                        solve_output_weights(ind, snap_cache);
+                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                        snap_baseline_mse = ind.raw_mse;
+                    }
+                }
+                
+                // Try snapping omega
+                if (node.unary_op == UnaryOp::Periodic) {
+                    double original_omega = node.omega;
+                    double best_snap_omega = original_omega;
+                    double best_snap_mse = snap_baseline_mse;
+                    
+                    // Also try snapping to nearest integer
+                    double nearest_int = std::round(original_omega);
+                    
+                    for (int si = 0; si < n_snap_omega; ++si) {
+                        double candidate = snap_candidates_omega[si];
+                        if (std::abs(original_omega - candidate) > 0.3) continue;
+                        
+                        node.omega = candidate;
+                        std::vector<Eigen::ArrayXd> snap_cache;
+                        evaluate_graph(ind, X_, n_samples, snap_cache);
+                        solve_output_weights(ind, snap_cache);
+                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                        
+                        if (ind.raw_mse < best_snap_mse * 1.5 + 1e-8) {
+                            best_snap_omega = candidate;
+                            best_snap_mse = ind.raw_mse;
+                        }
+                    }
+                    // Try nearest integer if not already in candidates
+                    if (nearest_int >= 1.0 && nearest_int <= 10.0 && std::abs(original_omega - nearest_int) <= 0.3) {
+                        node.omega = nearest_int;
+                        std::vector<Eigen::ArrayXd> snap_cache;
+                        evaluate_graph(ind, X_, n_samples, snap_cache);
+                        solve_output_weights(ind, snap_cache);
+                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                        
+                        if (ind.raw_mse < best_snap_mse * 1.5 + 1e-8) {
+                            best_snap_omega = nearest_int;
+                            best_snap_mse = ind.raw_mse;
+                        }
+                    }
+                    
+                    node.omega = best_snap_omega;
+                    if (best_snap_omega != original_omega) {
+                        std::vector<Eigen::ArrayXd> snap_cache;
+                        evaluate_graph(ind, X_, n_samples, snap_cache);
+                        solve_output_weights(ind, snap_cache);
+                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                        snap_baseline_mse = ind.raw_mse;
+                    }
+                    
+                    // Try snapping phi
+                    double original_phi = node.phi;
+                    double best_snap_phi = original_phi;
+                    best_snap_mse = snap_baseline_mse;
+                    
+                    for (int si = 0; si < n_snap_phi; ++si) {
+                        double candidate = snap_candidates_phi[si];
+                        if (std::abs(original_phi - candidate) > 0.3) continue;
+                        
+                        node.phi = candidate;
+                        std::vector<Eigen::ArrayXd> snap_cache;
+                        evaluate_graph(ind, X_, n_samples, snap_cache);
+                        solve_output_weights(ind, snap_cache);
+                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                        
+                        if (ind.raw_mse < best_snap_mse * 1.5 + 1e-8) {
+                            best_snap_phi = candidate;
+                            best_snap_mse = ind.raw_mse;
+                        }
+                    }
+                    node.phi = best_snap_phi;
+                    if (best_snap_phi != original_phi) {
+                        std::vector<Eigen::ArrayXd> snap_cache;
+                        evaluate_graph(ind, X_, n_samples, snap_cache);
+                        solve_output_weights(ind, snap_cache);
+                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                        snap_baseline_mse = ind.raw_mse;
+                    }
+                }
+            }
+            
+            // 6a.5 Trigonometric identity simplification
+            // -sin(x + pi) = sin(x), -sin(x - pi) = sin(x)
+            // sin(x + 2*pi) = sin(x), etc.
+            for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
+                if (ind.nodes[i].type != NodeType::Unary) continue;
+                if (ind.nodes[i].unary_op != UnaryOp::Periodic) continue;
+                if (i >= static_cast<int>(ind.output_weights.size())) continue;
+                if (std::abs(ind.output_weights[i]) < 1e-6) continue;
+                
+                auto& node = ind.nodes[i];
+                double w = ind.output_weights[i];
+                
+                // Remove full 2*pi multiples from phi
+                if (std::abs(node.phi) > M_PI) {
+                    double reduced = std::fmod(node.phi, 2.0 * M_PI);
+                    if (reduced > M_PI) reduced -= 2.0 * M_PI;
+                    if (reduced < -M_PI) reduced += 2.0 * M_PI;
+                    node.phi = reduced;
+                }
+                
+                // -sin(x + pi) = sin(x): if phi ≈ ±π and weight is negative,
+                // flip weight sign and zero out phi
+                if (std::abs(std::abs(node.phi) - M_PI) < 0.05 && w < 0) {
+                    node.phi = 0.0;
+                    ind.output_weights[i] = -w;  // Flip sign
+                }
+                // sin(x + pi) with positive weight → -sin(x)
+                else if (std::abs(std::abs(node.phi) - M_PI) < 0.05 && w > 0) {
+                    node.phi = 0.0;
+                    ind.output_weights[i] = -w;  // Flip sign
+                }
+                
+                // -sin(x + pi/2) = -cos(x) ... leave as-is (no simplification needed)
+                
+                // If phi is now ~0, finalize it
+                if (std::abs(node.phi) < 0.05) {
+                    node.phi = 0.0;
+                }
+                
+                // If amplitude is negative, absorb into output weight
+                if (node.amplitude < 0) {
+                    ind.output_weights[i] = -ind.output_weights[i];
+                    node.amplitude = -node.amplitude;
+                }
+            }
+            
+            // Re-evaluate after trig simplification
+            evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+            snap_baseline_mse = ind.raw_mse;
+            
+            // 6b. Output weight snapping
+            {
+                const double snap_weight_values[] = {
+                    0.0, 0.25, 1.0/3.0, 0.5, 2.0/3.0, 0.75,
+                    1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
+                    M_PI, M_E, std::sqrt(2.0), std::sqrt(3.0)
+                };
+                const int n_snap_w = sizeof(snap_weight_values) / sizeof(snap_weight_values[0]);
+                
+                for (int i = 0; i < static_cast<int>(ind.output_weights.size()); ++i) {
+                    double w = ind.output_weights[i];
+                    if (std::abs(w) < 1e-6) continue; // Already zero
+                    
+                    double abs_w = std::abs(w);
+                    double sign_w = (w >= 0) ? 1.0 : -1.0;
+                    
+                    double best_snap_w = w;
+                    double best_snap_mse = snap_baseline_mse;
+                    
+                    for (int si = 0; si < n_snap_w; ++si) {
+                        double candidate = sign_w * snap_weight_values[si];
+                        // Also try the opposite sign for zero candidate
+                        double rel_dist = (abs_w > 1e-8) ? std::abs(abs_w - snap_weight_values[si]) / abs_w : 1.0;
+                        if (rel_dist > 0.15 && std::abs(w - candidate) > 0.3) continue; // Within 15% or 0.3 absolute
+                        
+                        double original_w = ind.output_weights[i];
+                        ind.output_weights[i] = candidate;
+                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                        
+                        if (ind.raw_mse < best_snap_mse * 1.01 + 1e-8) {
+                            best_snap_w = candidate;
+                            best_snap_mse = ind.raw_mse;
+                        }
+                        ind.output_weights[i] = original_w; // Restore
+                    }
+                    
+                    if (best_snap_w != w) {
+                        ind.output_weights[i] = best_snap_w;
+                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                        snap_baseline_mse = ind.raw_mse;
+                    }
+                }
+            }
+            
+            // 6c. Output bias snapping
+            {
+                double bias = ind.output_bias;
+                if (std::abs(bias) > 1e-6) {
+                    const double snap_bias_values[] = {
+                        0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0,
+                        -0.25, -0.5, -0.75, -1.0, -1.5, -2.0, -3.0, -4.0, -5.0,
+                        M_PI, -M_PI, M_E, -M_E
+                    };
+                    const int n_snap_b = sizeof(snap_bias_values) / sizeof(snap_bias_values[0]);
+                    
+                    double best_snap_b = bias;
+                    double best_snap_mse = snap_baseline_mse;
+                    
+                    for (int si = 0; si < n_snap_b; ++si) {
+                        double candidate = snap_bias_values[si];
+                        if (std::abs(bias - candidate) > 0.5) continue;
+                        
+                        ind.output_bias = candidate;
+                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                        
+                        if (ind.raw_mse < best_snap_mse * 1.01 + 1e-8) {
+                            best_snap_b = candidate;
+                            best_snap_mse = ind.raw_mse;
+                        }
+                    }
+                    // Also try nearest integer
+                    double nearest_int = std::round(bias);
+                    if (std::abs(bias - nearest_int) <= 0.3) {
+                        ind.output_bias = nearest_int;
+                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                        if (ind.raw_mse < best_snap_mse * 1.01 + 1e-8) {
+                            best_snap_b = nearest_int;
+                            best_snap_mse = ind.raw_mse;
+                        }
+                    }
+                    
+                    ind.output_bias = best_snap_b;
+                }
+            }
+            
+            // Final Ridge refit after all snapping
+            if (!ind.nodes.empty()) {
+                std::vector<Eigen::ArrayXd> final_cache;
+                evaluate_graph(ind, X_, n_samples, final_cache);
+                solve_output_weights(ind, final_cache);
+            }
+        }
+        
         // Final inner param refinement on the clean graph
         refine_inner_params(ind);
     }
 
     // ── P5: NSGA-II Non-Dominated Sort ────────────────────────────────────
     // Assigns pareto_rank to each individual in the population.
-    // Objectives: minimize raw_mse, minimize complexity().
+    // Objectives: minimize raw_mse, minimize complexity(), minimize age (AFPO).
     void non_dominated_sort(std::vector<IndividualGraph>& pop) {
         int n = static_cast<int>(pop.size());
         if (n == 0) return;
@@ -1090,11 +1495,18 @@ private:
 
         for (int i = 0; i < n; ++i) {
             for (int j = i + 1; j < n; ++j) {
-                // Compare on two objectives: raw_mse and complexity
-                bool i_dom_j = (pop[i].raw_mse <= pop[j].raw_mse && pop[i].complexity() <= pop[j].complexity()) &&
-                               (pop[i].raw_mse < pop[j].raw_mse || pop[i].complexity() < pop[j].complexity());
-                bool j_dom_i = (pop[j].raw_mse <= pop[i].raw_mse && pop[j].complexity() <= pop[i].complexity()) &&
-                               (pop[j].raw_mse < pop[i].raw_mse || pop[j].complexity() < pop[i].complexity());
+                // 3-objective dominance: minimize raw_mse, complexity, age
+                double mse_i = pop[i].raw_mse, mse_j = pop[j].raw_mse;
+                int comp_i = pop[i].complexity(), comp_j = pop[j].complexity();
+                int age_i = pop[i].age, age_j = pop[j].age;
+                
+                bool i_leq_j = (mse_i <= mse_j) && (comp_i <= comp_j) && (age_i <= age_j);
+                bool i_lt_j  = (mse_i < mse_j) || (comp_i < comp_j) || (age_i < age_j);
+                bool i_dom_j = i_leq_j && i_lt_j;
+                
+                bool j_leq_i = (mse_j <= mse_i) && (comp_j <= comp_i) && (age_j <= age_i);
+                bool j_lt_i  = (mse_j < mse_i) || (comp_j < comp_i) || (age_j < age_i);
+                bool j_dom_i = j_leq_i && j_lt_i;
 
                 if (i_dom_j) {
                     dominated_set[i].push_back(j);
@@ -1134,6 +1546,7 @@ private:
 
     // ── P5: Crowding Distance Assignment ──────────────────────────────────
     // Assigns crowding_distance to individuals within the same Pareto front.
+    // 3 objectives: raw_mse, complexity, age (AFPO).
     void crowding_distance_assignment(std::vector<IndividualGraph*>& front) {
         int n = static_cast<int>(front.size());
         if (n == 0) return;
@@ -1170,6 +1583,20 @@ private:
         if (comp_range > 1e-15) {
             for (int i = 1; i < n - 1; ++i) {
                 front[i]->crowding_distance += (double)(front[i+1]->complexity() - front[i-1]->complexity()) / comp_range;
+            }
+        }
+
+        // Objective 2: age (AFPO)
+        std::sort(front.begin(), front.end(),
+                  [](const IndividualGraph* a, const IndividualGraph* b) {
+                      return a->age < b->age;
+                  });
+        front.front()->crowding_distance = 1e18;
+        front.back()->crowding_distance = 1e18;
+        double age_range = static_cast<double>(front.back()->age - front.front()->age);
+        if (age_range > 0.5) {
+            for (int i = 1; i < n - 1; ++i) {
+                front[i]->crowding_distance += (double)(front[i+1]->age - front[i-1]->age) / age_range;
             }
         }
     }

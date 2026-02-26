@@ -7,6 +7,14 @@
 #include <algorithm>
 #include <iostream>
 
+// MSVC fallbacks for M_PI and M_E
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef M_E
+#define M_E 2.71828182845904523536
+#endif
+
 namespace sr {
 
 // Evaluates the output of a single graph given feature columns X
@@ -395,12 +403,58 @@ inline std::string format_node_to_string(const IndividualGraph& graph, int node_
         case NodeType::Unary: {
             std::string child_str = format_node_to_string(graph, node.left_child, n_inputs);
             switch (node.unary_op) {
-                case UnaryOp::Periodic:
-                    snprintf(buf, sizeof(buf), "%.4g*sin(%.4g*(%s) + %.4g)", node.amplitude, node.omega, child_str.c_str(), node.phi);
+                case UnaryOp::Periodic: {
+                    // Build clean periodic string: [amp*]sin([omega*]child[ + phi])
+                    std::string result = "";
+                    
+                    // Amplitude: omit if ~1.0
+                    bool has_amp = std::abs(node.amplitude - 1.0) > 1e-4;
+                    if (has_amp) {
+                        if (std::abs(node.amplitude - std::round(node.amplitude)) < 1e-6) {
+                            snprintf(buf, sizeof(buf), "%d*", (int)std::round(node.amplitude));
+                        } else {
+                            snprintf(buf, sizeof(buf), "%.4g*", node.amplitude);
+                        }
+                        result += std::string(buf);
+                    }
+                    
+                    result += "sin(";
+                    
+                    // Omega: omit if ~1.0, use integer if whole number
+                    bool has_omega = std::abs(node.omega - 1.0) > 1e-4;
+                    if (has_omega) {
+                        if (std::abs(node.omega - std::round(node.omega)) < 1e-6) {
+                            snprintf(buf, sizeof(buf), "%d*", (int)std::round(node.omega));
+                        } else {
+                            snprintf(buf, sizeof(buf), "%.4g*", node.omega);
+                        }
+                        result += std::string(buf);
+                    }
+                    result += child_str;
+                    
+                    // Phase: omit if ~0.0
+                    bool has_phi = std::abs(node.phi) > 1e-4;
+                    if (has_phi) {
+                        if (std::abs(node.phi - std::round(node.phi)) < 1e-6) {
+                            snprintf(buf, sizeof(buf), " + %d", (int)std::round(node.phi));
+                        } else {
+                            snprintf(buf, sizeof(buf), " + %.4g", node.phi);
+                        }
+                        result += std::string(buf);
+                    }
+                    
+                    result += ")";
+                    return result;
+                }
+                case UnaryOp::Power: {
+                    // Use integer if p is a whole number
+                    if (std::abs(node.p - std::round(node.p)) < 1e-6) {
+                        snprintf(buf, sizeof(buf), "(%s)^%d", child_str.c_str(), (int)std::round(node.p));
+                    } else {
+                        snprintf(buf, sizeof(buf), "(%s)^%.4g", child_str.c_str(), node.p);
+                    }
                     return std::string(buf);
-                case UnaryOp::Power:
-                    snprintf(buf, sizeof(buf), "(%s)^%.4g", child_str.c_str(), node.p);
-                    return std::string(buf);
+                }
                 case UnaryOp::Exp:
                     return "exp(" + child_str + ")";
                 case UnaryOp::Log:
@@ -457,7 +511,12 @@ inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs
             first = false;
             
             if (std::abs(std::abs(w) - 1.0) > 1e-4) {
-                snprintf(buf, sizeof(buf), "%.4g*", std::abs(w));
+                double abs_w = std::abs(w);
+                if (std::abs(abs_w - std::round(abs_w)) < 1e-6) {
+                    snprintf(buf, sizeof(buf), "%d*", (int)std::round(abs_w));
+                } else {
+                    snprintf(buf, sizeof(buf), "%.4g*", abs_w);
+                }
                 final_formula += std::string(buf) + sub_formula;
             } else {
                 final_formula += sub_formula;
@@ -471,7 +530,12 @@ inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs
         } else if (graph.output_bias < 0) {
             final_formula += "-";
         }
-        snprintf(buf, sizeof(buf), "%.4g", std::abs(graph.output_bias));
+        double abs_bias = std::abs(graph.output_bias);
+        if (std::abs(abs_bias - std::round(abs_bias)) < 1e-6) {
+            snprintf(buf, sizeof(buf), "%d", (int)std::round(abs_bias));
+        } else {
+            snprintf(buf, sizeof(buf), "%.4g", abs_bias);
+        }
         final_formula += std::string(buf);
     }
     

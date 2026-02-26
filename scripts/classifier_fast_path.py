@@ -208,6 +208,11 @@ def build_basis_from_predictions(
     # Periodic operations - build comprehensive omega list
     # Always include common frequencies: 1.0, 2.0, 0.5
     omegas = [1.0, 2.0, 0.5]  # Standard frequencies
+    
+    # If the classifier strongly predicts pi, prioritize pi-based frequencies
+    if predictions.get('const_pi', 0) >= threshold:
+        omegas.extend([math.pi, 2 * math.pi])
+        
     if detected_omegas:
         for o in detected_omegas[:3]:
             # Add if not too close to existing
@@ -227,7 +232,7 @@ def build_basis_from_predictions(
             xi = x[:, i]
             name = var_name(i)
 
-            for omega in omegas[:4]:  # Top 4 frequencies
+            for omega in omegas[:6]:  # Increased to 6 to fit pi frequencies
                 basis_list.append(np.sin(omega * xi))
                 if omega == 1.0:
                     names.append(f"sin({name})")
@@ -235,10 +240,14 @@ def build_basis_from_predictions(
                     names.append(f"sin(2*{name})")
                 elif omega == 0.5:
                     names.append(f"sin({name}/2)")
+                elif abs(omega - math.pi) < 1e-4:
+                    names.append(f"sin(pi*{name})")
+                elif abs(omega - 2*math.pi) < 1e-4:
+                    names.append(f"sin(2*pi*{name})")
                 else:
                     names.append(f"sin({omega:.2f}*{name})")
 
-            for omega in omegas[:4]:
+            for omega in omegas[:6]:
                 basis_list.append(np.cos(omega * xi))
                 if omega == 1.0:
                     names.append(f"cos({name})")
@@ -246,6 +255,10 @@ def build_basis_from_predictions(
                     names.append(f"cos(2*{name})")
                 elif omega == 0.5:
                     names.append(f"cos({name}/2)")
+                elif abs(omega - math.pi) < 1e-4:
+                    names.append(f"cos(pi*{name})")
+                elif abs(omega - 2*math.pi) < 1e-4:
+                    names.append(f"cos(2*pi*{name})")
                 else:
                     names.append(f"cos({omega:.2f}*{name})")
     
@@ -268,7 +281,6 @@ def build_basis_from_predictions(
             basis_list.append(np.exp(-xi**2))
             names.append(f"exp(-{name}^2)")
 
-            denom = np.maximum(exp_x - 1.0, 1e-6)
             basis_list.append(1.0 / denom)
             names.append(f"1/(exp({name})-1)")
             basis_list.append(xi / denom)
@@ -277,6 +289,21 @@ def build_basis_from_predictions(
             names.append(f"{name}^2/(exp({name})-1)")
             basis_list.append((xi ** 3) / denom)
             names.append(f"{name}^3/(exp({name})-1)")
+            
+            # If the classifier strongly predicts 'e' or 'pi' as a base
+            if predictions.get('const_e', 0) >= threshold:
+                exps = np.exp(x_clamp * math.e)
+                basis_list.append(exps)
+                names.append(f"exp(e*{name})")
+                basis_list.append(np.exp(-x_clamp * math.e))
+                names.append(f"exp(-e*{name})")
+                
+            if predictions.get('const_pi', 0) >= threshold:
+                exps = np.exp(x_clamp * math.pi)
+                basis_list.append(exps)
+                names.append(f"exp(pi*{name})")
+                basis_list.append(np.exp(-x_clamp * math.pi))
+                names.append(f"exp(-pi*{name})")
     
     # Logarithmic operations (always include in universal mode for Nguyen-7 etc.)
     if allow_log and (universal_basis or predictions.get('log', 0) >= threshold):
@@ -1815,6 +1842,375 @@ def bias_onn_toward_operators(model, operator_hints: Dict, bias_strength: float 
                             op.omega.data.fill_(avg_freq)
 
 
+def beam_search_evolution(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    operator_hints: Dict,
+    n_beams: int = 20,
+    n_rounds: int = 3,
+    keep_fraction: float = 0.2,
+    base_pop_size: int = 50,
+    base_generations: int = 500,
+    device: str = 'cpu',
+) -> Dict:
+    """
+    Beam search over diverse C++ evolution configurations.
+    
+    Generates K diverse beams (different op_priors, seed_omegas, graph sizes),
+    runs them in parallel via C++ backend, prunes bottom 80%, mutates top 20%,
+    and repeats for R rounds.
+    
+    Args:
+        x: Input tensor (N,) or (N,1)
+        y: Target tensor (N,) or (N,1)
+        operator_hints: From extract_operator_hints()
+        n_beams: Number of beams per round (default 20)
+        n_rounds: Number of tournament rounds (default 3)
+        keep_fraction: Fraction of beams to keep each round (default 0.2)
+        base_pop_size: Base population size for C++ runs
+        base_generations: Base generation count for C++ runs
+        device: Device string
+        
+    Returns:
+        Dict with 'formula', 'mse', 'model', 'time', or None if C++ unavailable
+    """
+    import time
+    import sys
+    from pathlib import Path
+    
+    # Try importing C++ backend
+    try:
+        cpp_dir = Path(__file__).parent.parent / 'glassbox' / 'sr' / 'cpp'
+        if str(cpp_dir) not in sys.path:
+            sys.path.insert(0, str(cpp_dir))
+        import _core
+    except ImportError:
+        # Also try relative to the glassbox package
+        try:
+            cpp_dir = Path(__file__).resolve().parent.parent / 'glassbox' / 'sr' / 'cpp'
+            if str(cpp_dir) not in sys.path:
+                sys.path.insert(0, str(cpp_dir))
+            import _core
+        except ImportError:
+            return None
+    
+    start_time = time.time()
+    
+    # Prepare data for C++
+    x_np = x.cpu().numpy().ravel()
+    y_np = y.cpu().numpy().ravel()
+    X_list = [x_np]
+    
+    # Extract hints
+    operators = operator_hints.get('operators', set())
+    frequencies = operator_hints.get('frequencies', [])
+    powers = operator_hints.get('powers', [])
+    
+    has_sin = 'sin' in operators or 'periodic' in operators or 'cos' in operators
+    has_power = 'power' in operators
+    has_exp = 'exp' in operators
+    has_log = 'log' in operators
+    
+    # Build classifier-guided op_priors base
+    # Op order: [Periodic, Power, Exp, Log]
+    classifier_priors = [
+        0.6 if has_sin else 0.1,
+        0.6 if has_power else 0.1,
+        0.4 if has_exp else 0.05,
+        0.2 if has_log else 0.05,
+    ]
+    total = sum(classifier_priors)
+    classifier_priors = [p / total for p in classifier_priors]
+    
+    # Build diverse frequency sets
+    fft_freqs = frequencies[:3] if frequencies else []
+    integer_harmonics = [[1, 2, 3], [2, 3, 5], [1, 3, 5], [3, 6, 9]]
+    pi_freqs = [3.14159, 6.28318, 1.5708]
+    
+    # ── Generate initial beam configurations ──
+    def make_beam_configs(n: int, round_idx: int = 0):
+        configs = []
+        
+        # 1. Classifier-guided (primary hypothesis)
+        configs.append({
+            'op_priors': classifier_priors,
+            'seed_omegas': fft_freqs,
+            'pop_size': base_pop_size,
+            'generations': base_generations,
+            'label': 'classifier-guided',
+        })
+        
+        # 2. Sin-heavy
+        configs.append({
+            'op_priors': [0.8, 0.1, 0.05, 0.05],
+            'seed_omegas': fft_freqs or [1.0, 2.0, 3.0],
+            'pop_size': base_pop_size,
+            'generations': base_generations,
+            'label': 'sin-heavy',
+        })
+        
+        # 3. Power-heavy
+        configs.append({
+            'op_priors': [0.1, 0.8, 0.05, 0.05],
+            'seed_omegas': [],
+            'pop_size': base_pop_size,
+            'generations': base_generations,
+            'label': 'power-heavy',
+        })
+        
+        # 4. Exp-heavy
+        configs.append({
+            'op_priors': [0.05, 0.1, 0.8, 0.05],
+            'seed_omegas': [],
+            'pop_size': base_pop_size,
+            'generations': base_generations,
+            'label': 'exp-heavy',
+        })
+        
+        # 5. Uniform exploration
+        configs.append({
+            'op_priors': [0.25, 0.25, 0.25, 0.25],
+            'seed_omegas': fft_freqs,
+            'pop_size': base_pop_size,
+            'generations': base_generations,
+            'label': 'uniform',
+        })
+        
+        # 6. Sin+Power combo (common case like x^2 + sin(x))
+        configs.append({
+            'op_priors': [0.45, 0.45, 0.05, 0.05],
+            'seed_omegas': fft_freqs or [1.0, 2.0],
+            'pop_size': base_pop_size,
+            'generations': base_generations,
+            'label': 'sin+power',
+        })
+        
+        # 7. Exp+Sin combo (damped oscillation)
+        configs.append({
+            'op_priors': [0.4, 0.1, 0.4, 0.1],
+            'seed_omegas': fft_freqs or [1.0, 3.0],
+            'pop_size': base_pop_size,
+            'generations': base_generations,
+            'label': 'exp+sin',
+        })
+        
+        # 8-11. Integer harmonic frequency variants
+        for i, harmonics in enumerate(integer_harmonics):
+            configs.append({
+                'op_priors': classifier_priors,
+                'seed_omegas': [float(h) for h in harmonics],
+                'pop_size': base_pop_size,
+                'generations': base_generations // 2,  # Quick search
+                'label': f'harmonics-{harmonics}',
+            })
+        
+        # 12. Pi-based frequencies
+        configs.append({
+            'op_priors': classifier_priors,
+            'seed_omegas': pi_freqs,
+            'pop_size': base_pop_size,
+            'generations': base_generations // 2,
+            'label': 'pi-freqs',
+        })
+        
+        # 13. No priors (pure uniform random)
+        configs.append({
+            'op_priors': [],
+            'seed_omegas': [],
+            'pop_size': base_pop_size,
+            'generations': base_generations,
+            'label': 'no-priors',
+        })
+        
+        # 14. Large population, fewer gens (breadth-first)
+        configs.append({
+            'op_priors': classifier_priors,
+            'seed_omegas': fft_freqs,
+            'pop_size': base_pop_size * 2,
+            'generations': base_generations // 3,
+            'label': 'breadth-first',
+        })
+        
+        # 15. Small population, more gens (depth-first)
+        configs.append({
+            'op_priors': classifier_priors,
+            'seed_omegas': fft_freqs,
+            'pop_size': max(15, base_pop_size // 3),
+            'generations': base_generations * 2,
+            'label': 'depth-first',
+        })
+        
+        # 16-20. Random perturbations of classifier priors
+        rng = np.random.RandomState(42 + round_idx)
+        while len(configs) < n:
+            noise = rng.dirichlet([2, 2, 1, 1])
+            blended = [0.5 * c + 0.5 * n_ for c, n_ in zip(classifier_priors, noise)]
+            total_b = sum(blended)
+            blended = [b / total_b for b in blended]
+            
+            # Random omega selection
+            all_omegas = fft_freqs + [1.0, 2.0, 3.0, 4.0, 5.0, 3.14]
+            n_pick = rng.randint(1, min(4, len(all_omegas) + 1))
+            picked = list(rng.choice(all_omegas, size=n_pick, replace=False))
+            
+            configs.append({
+                'op_priors': blended,
+                'seed_omegas': picked,
+                'pop_size': base_pop_size,
+                'generations': base_generations,
+                'label': f'random-{len(configs)}',
+            })
+        
+        return configs[:n]
+    
+    def run_single_beam(config):
+        """Run one C++ evolution beam. Returns (mse, result_dict, config)."""
+        try:
+            result = _core.run_evolution(
+                X_list=X_list,
+                y=y_np,
+                pop_size=config['pop_size'],
+                generations=config['generations'],
+                early_stop_mse=1e-10,
+                seed_omegas=config['seed_omegas'],
+                op_priors=config['op_priors'],
+            )
+            return (result['best_mse'], result, config)
+        except Exception as e:
+            return (float('inf'), None, config)
+    
+    def mutate_config(config, rng):
+        """Create a mutated variant of a winning beam config."""
+        new = dict(config)
+        new['label'] = f"mut-{config['label']}"
+        
+        # Perturb op_priors by ±20%
+        if config['op_priors']:
+            priors = list(config['op_priors'])
+            noise = rng.uniform(0.8, 1.2, size=len(priors))
+            priors = [max(0.01, p * n) for p, n in zip(priors, noise)]
+            total_p = sum(priors)
+            new['op_priors'] = [p / total_p for p in priors]
+        
+        # Randomly add/remove a frequency
+        omegas = list(config.get('seed_omegas', []))
+        if rng.random() < 0.5 and len(omegas) > 1:
+            omegas.pop(rng.randint(0, len(omegas)))
+        elif rng.random() < 0.5:
+            # Add a nearby frequency
+            new_omega = rng.choice([1, 2, 3, 4, 5, 6, 3.14, 6.28])
+            omegas.append(float(new_omega))
+        new['seed_omegas'] = omegas
+        
+        # Slight generation/pop variation
+        if rng.random() < 0.3:
+            new['generations'] = int(config['generations'] * rng.uniform(0.7, 1.5))
+        if rng.random() < 0.3:
+            new['pop_size'] = max(15, int(config['pop_size'] * rng.uniform(0.7, 1.3)))
+        
+        return new
+    
+    # ── Main beam search loop ──
+    print("\n" + "="*60)
+    print("BEAM SEARCH EVOLUTION")
+    print("="*60)
+    print(f"  Beams per round: {n_beams}")
+    print(f"  Rounds: {n_rounds}")
+    print(f"  Keep fraction: {keep_fraction}")
+    print(f"  Base config: pop={base_pop_size}, gens={base_generations}")
+    
+    best_overall_mse = float('inf')
+    best_overall_result = None
+    best_overall_config = None
+    rng = np.random.RandomState(123)
+    
+    for round_idx in range(n_rounds):
+        if round_idx == 0:
+            configs = make_beam_configs(n_beams, round_idx)
+        else:
+            # Mutate winners into new beams
+            configs = []
+            n_keep = max(1, int(n_beams * keep_fraction))
+            n_mutants_per_winner = max(1, (n_beams - n_keep) // n_keep)
+            
+            for winner_cfg in winner_configs:
+                configs.append(winner_cfg)  # Keep original
+                for _ in range(n_mutants_per_winner):
+                    configs.append(mutate_config(winner_cfg, rng))
+            
+            # Fill remaining with random configs
+            while len(configs) < n_beams:
+                configs.append(mutate_config(configs[rng.randint(0, len(configs))], rng))
+            configs = configs[:n_beams]
+        
+        # Run all beams sequentially (C++ uses OpenMP internally, so 
+        # threading would cause oversubscription and hurt performance)
+        round_start = time.time()
+        results = []
+        
+        for cfg in configs:
+            results.append(run_single_beam(cfg))
+        
+        # Sort by MSE
+        results.sort(key=lambda r: r[0])
+        round_time = time.time() - round_start
+        
+        # Report
+        best_mse = results[0][0]
+        worst_kept = results[max(0, int(n_beams * keep_fraction) - 1)][0]
+        
+        print(f"\n  Round {round_idx + 1}/{n_rounds}: "
+              f"best={best_mse:.2e}, "
+              f"worst_kept={worst_kept:.2e}, "
+              f"time={round_time:.2f}s, "
+              f"winner='{results[0][2]['label']}'")
+        
+        # Track overall best
+        if results[0][0] < best_overall_mse:
+            best_overall_mse = results[0][0]
+            best_overall_result = results[0][1]
+            best_overall_config = results[0][2]
+        
+        # Early exit if we found essentially perfect MSE
+        if best_overall_mse < 1e-10:
+            print(f"  ✅ Perfect MSE achieved, stopping early!")
+            break
+        
+        # Keep top fraction as winners for next round
+        n_keep = max(1, int(n_beams * keep_fraction))
+        winner_configs = [r[2] for r in results[:n_keep]]
+    
+    elapsed = time.time() - start_time
+    
+    if best_overall_result is None:
+        print(f"  ❌ Beam search failed (no valid results)")
+        return None
+    
+    # Build CppGraphModule from best result
+    formula = best_overall_result.get('formula', '0')
+    
+    try:
+        from glassbox.sr.cpp.export_pytorch import CppGraphModule
+        model = CppGraphModule(best_overall_result).to(device)
+    except Exception:
+        model = None
+    
+    print(f"\n  Best formula: {formula}")
+    print(f"  Best MSE: {best_overall_mse:.2e}")
+    print(f"  Best config: {best_overall_config['label']}")
+    print(f"  Total beam search time: {elapsed:.2f}s")
+    print("="*60)
+    
+    return {
+        'formula': formula,
+        'mse': best_overall_mse,
+        'model': model,
+        'time': elapsed,
+        'config': best_overall_config,
+        'cpp_ast': best_overall_result,
+    }
+
+
 def run_guided_evolution(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -1827,8 +2223,8 @@ def run_guided_evolution(
     """
     Run evolution guided by fast-path operator hints.
     
-    Creates a constrained search space based on the operators found
-    in the fast-path approximation, then evolves to find exact form.
+    Primary strategy: beam search over diverse C++ evolution configs.
+    Fallback: single PyTorch EvolutionaryONNTrainer run.
     
     Args:
         x: Input tensor
@@ -1843,10 +2239,29 @@ def run_guided_evolution(
         Dict with evolved formula, mse, and timing
     """
     import time
+    
+    # ── Primary: Beam Search (fast C++ path) ──
+    beam_result = beam_search_evolution(
+        x, y,
+        operator_hints,
+        n_beams=10,
+        n_rounds=2,
+        keep_fraction=0.3,
+        base_pop_size=30,
+        base_generations=200,
+        device=device,
+    )
+    
+    if beam_result is not None and beam_result['mse'] < float('inf'):
+        return beam_result
+    
+    # ── Fallback: Single PyTorch ONN evolution ──
+    print("\n⚠️ Beam search unavailable, falling back to single PyTorch evolution...")
+    
     from glassbox.sr.evolution import EvolutionaryONNTrainer, finalize_model_coefficients
     
     print("\n" + "="*60)
-    print("GUIDED EVOLUTION: Operator-Constrained Search")
+    print("GUIDED EVOLUTION: Operator-Constrained Search (PyTorch)")
     print("="*60)
     print(f"  Active operators: {operator_hints.get('operators', set())}")
     print(f"  Detected frequencies: {operator_hints.get('frequencies', [])}")
@@ -1867,7 +2282,7 @@ def run_guided_evolution(
         model_factory=factory,
         population_size=population_size,
         elite_size=4,
-        mutation_rate=0.4,  # Lower mutation since we're already biased
+        mutation_rate=0.4,
         constant_refine_steps=50,
         complexity_penalty=0.01,
         device=device,
@@ -1880,7 +2295,7 @@ def run_guided_evolution(
         nested_bfgs_steps=20,
     )
     
-    # Initialize and evolve using trainer.train
+    # Initialize and evolve
     trainer.initialize_population()
     results = trainer.train(x, y, generations=generations, print_every=5)
     
@@ -1911,3 +2326,4 @@ def run_guided_evolution(
         'time': elapsed,
         'model': final_model,
     }
+

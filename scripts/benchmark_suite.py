@@ -77,6 +77,11 @@ TIER_1_TRIVIAL = [
     ("10",                       "Constant 10",              (-5, 5)),
     ("pi*x",                     "πx",                       (-3, 3)),
     ("x/3",                      "x/3",                      (-5, 5)),
+    ("e",                        "Constant e",               (-5, 5)),
+    ("pi",                       "Constant π",               (-5, 5)),
+    ("2.0",                      "Constant 2.0",             (-5, 5)),
+    ("0.5",                      "Constant 0.5",             (-5, 5)),
+    ("e*x",                      "Linear e·x",               (-3, 3)),
 ]
 
 TIER_2_SIMPLE_POLY = [
@@ -516,6 +521,96 @@ def run_formula(
     return result
 
 
+def run_formula_cpp_evolution(
+    formula_str: str,
+    x_range: Tuple[float, float],
+    n_samples: int = 300,
+    pop_size: int = 100,
+    generations: int = 1000,
+    device: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run pure C++ evolution on a single formula (no classifier fast-path)."""
+    import sys
+    from pathlib import Path
+    
+    x_min, x_max = x_range
+    result = {
+        "formula_target": formula_str,
+        "x_range": list(x_range),
+        "formula_discovered": "",
+        "mse": None,
+        "time": None,
+        "score": "FAIL",
+        "error": None,
+        "n_terms": 0,
+    }
+    
+    try:
+        # Import C++ backend
+        cpp_dir = Path(__file__).resolve().parent.parent / 'glassbox' / 'sr' / 'cpp'
+        if str(cpp_dir) not in sys.path:
+            sys.path.insert(0, str(cpp_dir))
+        import _core
+        
+        # Generate data
+        x_np, y_np = _generate_data(formula_str, x_min, x_max, n_samples)
+        
+        # Early return for constant signals (evolution can't find pure constants)
+        y_std = np.std(y_np)
+        if y_std < 1e-10:
+            elapsed = 0.0
+            const_val = float(np.mean(y_np))
+            if abs(const_val - round(const_val)) < 1e-6:
+                formula = str(int(round(const_val)))
+            else:
+                formula = f"{const_val:.6g}"
+            result["formula_discovered"] = formula
+            result["mse"] = 0.0
+            result["time"] = elapsed
+            result["n_terms"] = 1
+            result["score"] = score_result(0.0, formula)
+            return result
+        
+        X_list = [x_np]
+        
+        # FFT frequency detection
+        x_t = torch.tensor(x_np, dtype=torch.float32).reshape(-1, 1)
+        y_t = torch.tensor(y_np, dtype=torch.float32).reshape(-1, 1)
+        try:
+            detected_omegas = detect_dominant_frequency(x_t, y_t, n_frequencies=3)
+            if detected_omegas and detected_omegas[0] == 1.0:
+                detected_omegas = []
+        except Exception:
+            detected_omegas = []
+        
+        # Run pure C++ evolution
+        t0 = time.time()
+        cpp_result = _core.run_evolution(
+            X_list=X_list,
+            y=y_np,
+            pop_size=pop_size,
+            generations=generations,
+            early_stop_mse=1e-10,
+            seed_omegas=detected_omegas or [],
+        )
+        elapsed = time.time() - t0
+        
+        result["formula_discovered"] = cpp_result.get("formula", "")
+        result["mse"] = cpp_result.get("best_mse", float("inf"))
+        result["time"] = elapsed
+        result["n_terms"] = _count_terms(result["formula_discovered"])
+        
+    except ImportError as e:
+        result["error"] = f"C++ backend not available: {e}"
+        result["time"] = 0.0
+    except Exception as e:
+        result["error"] = str(e)
+        result["time"] = 0.0
+    
+    result["score"] = score_result(result["mse"], result["formula_discovered"])
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Report generation
 # ---------------------------------------------------------------------------
@@ -723,6 +818,18 @@ Examples:
         "--formula", type=str, default=None,
         help="Run a single formula by searching all tiers (e.g., --formula 'sin(x)')",
     )
+    parser.add_argument(
+        "--cpp-evolution-only", action="store_true",
+        help="Skip classifier fast-path; use pure C++ evolution for every formula",
+    )
+    parser.add_argument(
+        "--pop-size", type=int, default=100,
+        help="Population size for C++ evolution (default: 100, used with --cpp-evolution-only)",
+    )
+    parser.add_argument(
+        "--generations", type=int, default=1000,
+        help="Generations for C++ evolution (default: 1000, used with --cpp-evolution-only)",
+    )
 
     args = parser.parse_args()
 
@@ -762,7 +869,13 @@ Examples:
     print("=" * 90)
     print("GLASSBOX SR BENCHMARK SUITE")
     print("=" * 90)
-    print(f"  Classifier:  {args.classifier_model}")
+    mode_str = "C++ Evolution Only" if args.cpp_evolution_only else "Classifier Fast-Path"
+    print(f"  Mode:        {mode_str}")
+    if not args.cpp_evolution_only:
+        print(f"  Classifier:  {args.classifier_model}")
+    else:
+        print(f"  Pop size:    {args.pop_size}")
+        print(f"  Generations: {args.generations}")
     print(f"  Device:      {device}")
     print(f"  Tiers:       {tiers_to_run}")
     print(f"  Formulas:    {total_formulas}")
@@ -786,15 +899,25 @@ Examples:
             if not args.quiet:
                 print(f"  [{formula_idx}/{total_formulas}] {human_name:<30} ", end="", flush=True)
 
-            result = run_formula(
-                formula_str,
-                x_range,
-                classifier_path=args.classifier_model,
-                n_samples=args.n_samples,
-                device=device,
-                timeout=args.timeout,
-                with_evolution=args.with_evolution,
-            )
+            if args.cpp_evolution_only:
+                result = run_formula_cpp_evolution(
+                    formula_str,
+                    x_range,
+                    n_samples=args.n_samples,
+                    pop_size=args.pop_size,
+                    generations=args.generations,
+                    device=device,
+                )
+            else:
+                result = run_formula(
+                    formula_str,
+                    x_range,
+                    classifier_path=args.classifier_model,
+                    n_samples=args.n_samples,
+                    device=device,
+                    timeout=args.timeout,
+                    with_evolution=args.with_evolution,
+                )
             result["human_name"] = human_name
             tier_results.append(result)
 

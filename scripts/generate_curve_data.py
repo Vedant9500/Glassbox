@@ -66,6 +66,13 @@ OPERATOR_CLASSES = {
 
     # Rational functions
     'rational': 8,       # 1/(x+c), x/(x²+c) type
+    
+    # Constants
+    'const_pi': 9,       # The constant pi (3.14159...)
+    'const_e': 10,       # The constant e (2.71828...)
+    'const_1': 11,       # The constant 1.0 or -1.0
+    'const_2': 12,       # The constant 2.0 or -2.0
+    'const_half': 13,    # The constant 0.5 or -0.5
 }
 
 N_CLASSES = len(OPERATOR_CLASSES)
@@ -600,7 +607,10 @@ def extract_raw_features(y: np.ndarray, n_points: int = 128, curvature_alpha: fl
     # Compute local curvature κ = |y''| / (1 + y'^2)^1.5
     dy = np.gradient(y)
     ddy = np.gradient(dy)
-    kappa = np.abs(ddy) / (1.0 + dy**2)**1.5
+    
+    # Clip dy to prevent overflow in dy**2
+    dy_clipped = np.clip(dy, -1e4, 1e4)
+    kappa = np.abs(ddy) / (1.0 + dy_clipped**2)**1.5
     kappa = np.nan_to_num(kappa, nan=0.0, posinf=0.0, neginf=0.0)
     
     # Build concentration density w(i) = 1 + α·κ(i)
@@ -800,8 +810,11 @@ def extract_curvature_features(y: np.ndarray, n_points: int = 32) -> np.ndarray:
     # Second derivative (acceleration)
     ddy = np.gradient(dy)
     
+    # Clip dy to prevent overflow in dy**2
+    dy_clipped = np.clip(dy, -1e4, 1e4)
+    
     # Curvature: κ = y'' / (1 + y'^2)^1.5
-    curvature = ddy / (1 + dy**2)**1.5
+    curvature = ddy / (1.0 + dy_clipped**2)**1.5
     
     # Handle infinities
     curvature = np.clip(curvature, -100, 100)
