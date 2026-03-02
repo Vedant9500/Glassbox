@@ -281,6 +281,9 @@ def build_basis_from_predictions(
             basis_list.append(np.exp(-xi**2))
             names.append(f"exp(-{name}^2)")
 
+            denom = exp_x - 1.0
+            denom = np.where(np.abs(denom) < 1e-6, np.sign(denom + 1e-12) * 1e-6, denom)
+            
             basis_list.append(1.0 / denom)
             names.append(f"1/(exp({name})-1)")
             basis_list.append(xi / denom)
