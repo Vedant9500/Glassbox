@@ -1389,6 +1389,25 @@ def fast_path_with_refinement(
     best_mse = float('inf')
     best_details: Dict = {}
     best_universal = True
+    complexity_lambda = 1e-4
+
+    def should_accept_candidate(new_mse: float, new_details: Dict) -> bool:
+        """Guardrail: avoid accepting large MSE regressions for small complexity gains."""
+
+        new_terms = new_details.get('n_nonzero', 0)
+        old_terms = best_details.get('n_nonzero', 0)
+
+        # If current fit is already very good, do not accept major relative regressions
+        # unless we cross into a materially simpler symbolic regime.
+        if best_mse <= 1e-5 and new_mse > best_mse * 5.0:
+            if not (new_mse < 1e-6 and new_terms <= 5 and old_terms > 5):
+                return False
+
+        return candidate_score(new_mse, new_details) < candidate_score(best_mse, best_details)
+
+    def candidate_score(mse_val: float, details_val: Dict) -> float:
+        n_val = details_val.get('n_nonzero', 0)
+        return mse_val + complexity_lambda * max(0, n_val - 4)
 
     for use_universal in stage_order:
         formula, mse, details = fast_path_regression(
@@ -1399,7 +1418,7 @@ def fast_path_with_refinement(
             exact_match_enabled=exact_match_enabled,
             exact_match_max_basis=exact_match_max_basis,
         )
-        if mse < best_mse:
+        if candidate_score(mse, details) < candidate_score(best_mse, best_details):
             best_mse = mse
             best_formula = formula
             best_details = details
@@ -1417,7 +1436,14 @@ def fast_path_with_refinement(
         return best_formula, best_mse, best_details
     
     # If moderate MSE and periodic terms were used, try refinement
-    if best_mse < 0.5 and detected_omegas:
+    has_periodic_signal = (
+        predictions.get('periodic', 0.0) >= 0.5 or
+        predictions.get('sin', 0.0) >= 0.5 or
+        predictions.get('cos', 0.0) >= 0.5
+    )
+    should_try_freq = bool(detected_omegas) and has_periodic_signal and (1e-4 <= best_mse <= 0.2)
+
+    if should_try_freq:
         print(f"  Attempting frequency refinement (initial MSE={best_mse:.4f})...")
         
         refined_omegas, refined_mse = refine_frequencies(
@@ -1437,7 +1463,7 @@ def fast_path_with_refinement(
                 exact_match_enabled=exact_match_enabled,
                 exact_match_max_basis=exact_match_max_basis,
             )
-            if mse2 < best_mse:
+            if should_accept_candidate(mse2, details2):
                 return formula2, mse2, details2
     
     # Additional continuous refinement for periodic×rational terms
@@ -1465,16 +1491,21 @@ def fast_path_with_refinement(
         )
         if refined:
             print(f"  Periodic×Rational refinement MSE: {refined['mse']:.6f}")
-            if refined['mse'] < best_mse - 1e-4:
-                return refined['formula'], refined['mse'], refined['details']
+            refined_details = refined.get('details', {})
+            if should_accept_candidate(refined['mse'], refined_details):
+                return refined['formula'], refined['mse'], refined_details
 
     # Complexity check
     n_terms = best_details.get('n_nonzero', 0)
-    is_complex = n_terms > 4
-    
     # Power exponent refinement for non-integer powers
     # Trigger if MSE is moderate OR if formula is complex (likely overfitted)
-    if (x.ndim == 1 or (x.ndim == 2 and x.shape[1] == 1)) and allow_power and (best_mse > 1e-4 or is_complex):
+    has_power_signal = (
+        predictions.get('power', 0.0) >= 0.4 or
+        predictions.get('polynomial', 0.0) >= 0.4
+    )
+    should_try_power = (x.ndim == 1 or (x.ndim == 2 and x.shape[1] == 1)) and allow_power and has_power_signal and (5e-5 <= best_mse <= 0.2 or n_terms > 6)
+
+    if should_try_power:
         print(f"  Attempting power refinement (MSE={best_mse:.4f}, Terms={n_terms})...")
         power_result, power_mse = refine_powers(
             x, y, detected_omegas=detected_omegas, device=device
@@ -1491,12 +1522,14 @@ def fast_path_with_refinement(
             if is_better_mse or is_good_and_simpler:
                 print(f"  Power refinement SUCCESS (MSE: {power_mse:.6f}, Terms: {len(power_result['powers'])})")
                 print(f"  Power formula: {power_result['formula']}")
-                return power_result['formula'], power_mse, {
+                power_details = {
                     'coefficients': np.array(power_result['coefficients']),
                     'basis_names': [f"x^{_snap_power(p)}" for p in power_result['powers']],
                     'n_nonzero': sum(1 for c in power_result['coefficients'] if abs(c) > 1e-8),
                     'exact_match': power_mse < 1e-6,
                 }
+                if should_accept_candidate(power_mse, power_details):
+                    return power_result['formula'], power_mse, power_details
 
     return best_formula, best_mse, best_details
 
@@ -1538,6 +1571,10 @@ def run_fast_path(
     exact_match_threads: int = 1,
     exact_match_enabled: bool = True,
     exact_match_max_basis: int = 150,
+    simplify_formula_output: bool = True,
+    simplification_int_tol: float = 1e-5,
+    simplification_zero_tol: float = 1e-8,
+    simplification_log: bool = True,
 ) -> Optional[Dict]:
     """
     Run the complete fast-path pipeline.
@@ -1623,8 +1660,71 @@ def run_fast_path(
         exact_match_enabled=exact_match_enabled,
         exact_match_max_basis=exact_match_max_basis,
     )
+
+    raw_formula = formula
+    simplification_info = {
+        'applied': False,
+        'snapped_formula': None,
+        'error': None,
+    }
+
+    if simplify_formula_output and formula:
+        if simplification_log:
+            print("  [Post] Running simplify_formula pipeline...")
+        try:
+            try:
+                from simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+            except ImportError:
+                from scripts.simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+
+            formula_len = len(formula)
+            term_estimate = max(1, len([t for t in re.split(r'\s*[+-]\s*', formula) if t.strip()]))
+            too_complex_for_symbolic = formula_len > 500 or term_estimate > 24
+
+            if too_complex_for_symbolic:
+                snapped_formula = snap_formula_floats(
+                    formula,
+                    SnapConfig(int_tol=simplification_int_tol, zero_tol=simplification_zero_tol),
+                )
+                simplified_formula = snapped_formula
+                if simplification_log:
+                    print(f"  [Post] Large formula detected (len={formula_len}, terms≈{term_estimate}); using fast snap-only mode.")
+            else:
+                snapped_formula, simplified_expr = simplify_onn_formula(
+                    formula,
+                    int_tol=simplification_int_tol,
+                    zero_tol=simplification_zero_tol,
+                    use_nsimplify=(formula_len <= 300 and term_estimate <= 16),
+                )
+                simplified_formula = str(simplified_expr)
+
+            if simplification_log:
+                print(f"  [Post] Snapped: {snapped_formula}")
+                print(f"  [Post] Simplified: {simplified_formula}")
+
+            formula = simplified_formula
+            simplification_info = {
+                'applied': True,
+                'snapped_formula': snapped_formula,
+                'error': None,
+            }
+        except Exception as simpl_err:
+            simplification_info = {
+                'applied': False,
+                'snapped_formula': None,
+                'error': str(simpl_err),
+            }
+            if simplification_log:
+                err_text = str(simpl_err).encode("ascii", errors="backslashreplace").decode("ascii")
+                if len(err_text) > 300:
+                    err_text = err_text[:297] + "..."
+                print(f"  [Post] Simplification skipped (error): {err_text}")
     
     elapsed = time.time() - start_time
+
+    # Keep a post-processed term estimate while preserving structural sparsity count.
+    final_term_count = max(1, len([t for t in re.split(r'\s*[+-]\s*', formula) if t.strip()])) if formula else 0
+    details['n_nonzero_simplified'] = final_term_count
     
     print(f"\n  Formula: {formula}")
     print(f"  MSE: {mse:.6f}")
@@ -1638,10 +1738,12 @@ def run_fast_path(
     
     return {
         'formula': formula,
+        'formula_raw': raw_formula,
         'mse': mse,
         'time': elapsed,
         'details': details,
         'predictions': predictions,
+        'simplification': simplification_info,
         'operator_hints': operator_hints,
     }
 

@@ -462,7 +462,15 @@ def run_formula(
             result["formula_discovered"] = fp_result.get("formula", "")
             result["mse"] = fp_result.get("mse", float("inf"))
             result["time"] = elapsed
-            result["n_terms"] = _count_terms(result["formula_discovered"])
+            str_term_count = _count_terms(result["formula_discovered"])
+            details = fp_result.get("details", {}) if isinstance(fp_result, dict) else {}
+            structural_terms = details.get("n_nonzero", 0)
+            simplified_terms = details.get("n_nonzero_simplified", 0)
+            result["n_terms"] = max(
+                int(str_term_count),
+                int(structural_terms) if structural_terms is not None else 0,
+                int(simplified_terms) if simplified_terms is not None else 0,
+            )
             
             # -----------------------------------------------------------------
             # Evolution Fallback (Phase 1 + 2)
@@ -830,7 +838,6 @@ Examples:
         "--generations", type=int, default=1000,
         help="Generations for C++ evolution (default: 1000, used with --cpp-evolution-only)",
     )
-
     args = parser.parse_args()
 
     # Resolve device
@@ -873,6 +880,7 @@ Examples:
     print(f"  Mode:        {mode_str}")
     if not args.cpp_evolution_only:
         print(f"  Classifier:  {args.classifier_model}")
+        print("  Strategy:    optimized")
     else:
         print(f"  Pop size:    {args.pop_size}")
         print(f"  Generations: {args.generations}")
@@ -918,6 +926,7 @@ Examples:
                     timeout=args.timeout,
                     with_evolution=args.with_evolution,
                 )
+
             result["human_name"] = human_name
             tier_results.append(result)
 

@@ -9,3 +9,4 @@ scripts
 xgboost
 scikit-learn
 joblib
+sympy
