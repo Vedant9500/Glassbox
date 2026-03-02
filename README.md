@@ -8,6 +8,8 @@
 - **Meta-Operations**: Parametric operations (MetaPower, MetaPeriodic, MetaExp) that smoothly interpolate between functions
 - **Hybrid Optimization**: Combines evolutionary search (topology) with gradient-based fitting (constants)
 - **Curve Classifier Fast-Path**: Pre-trained classifier predicts likely operators, enabling direct regression without evolution
+- **Optimized Fast-Path (Default)**: Single strategy with refinement gating and acceptance guardrails for stable runtime
+- **Formula Post-Processing**: Tolerance-based float snapping + SymPy simplification with snap-only fallback for very large expressions
 - **Fast C++ Backend**: Native C++ engine for topology evolution and constant fitting
 - **Hybrid Optimization**: Combines evolutionary search (topology) with analytical SVD-based linear fitting
 - **OpenMP Multithreading**: Utilizes all CPU cores for massively parallel population evaluation
@@ -109,7 +111,7 @@ Data (x, y)
     ↓
 [LASSO/OLS Regression] → Fit coefficients
     ↓
-[Formula Simplification] → Output: "2*x^2 + sin(x)"
+[Post-Processing] → Float snapping + symbolic simplify → Output: "2*x^2 + sin(x)"
 ```
 
 ## Usage Examples
@@ -196,11 +198,18 @@ Options:
 python scripts/benchmark_suite.py [OPTIONS]
 
 Options:
-  --tier N                Target specific difficulty tier (1-8)
-  --with-evolution        Enable C++ evolution fallback for failing formulas
-  --classifier-model PATH Path to curve classifier
-  --iterations N          Number of iterations per formula
-  --output-dir PATH       Results directory
+  --classifier-model PATH      Path to curve classifier (default: models/curve_classifier_v3.1.pt)
+  --with-evolution             Enable C++ evolution fallback for approximate fast-path results
+  --tier N                     Target specific tier(s), repeatable: --tier 2 --tier 3
+  --output-dir PATH            Results directory (default: results/)
+  --n-samples N                Number of points per formula (default: 300)
+  --device {auto,cpu,cuda}     Device for classifier inference (default: auto)
+  --timeout SEC                Timeout per formula (default: 60)
+  --quiet                      Suppress per-formula logs
+  --formula TEXT               Run only formulas matching text
+  --cpp-evolution-only         Skip fast-path and run pure C++ evolution
+  --pop-size N                 C++ evolution population size
+  --generations N              C++ evolution generations
 ```
 
 ### benchmark_feynman_easy.py
@@ -311,6 +320,10 @@ The exact-match search is slow for large bases. Solutions:
 - Use `--skip-exact-match`
 - Reduce `--exact-match-max-basis` (default: 150)
 - Use `--no-auto-expand` for smaller basis
+
+### "Stalling at [Post] Running simplify_formula pipeline..."
+
+Large symbolic expressions can be expensive to simplify. Current fast-path includes a large-expression guard that switches to snap-only mode automatically. If you still hit stalls, reduce basis growth (`--no-auto-expand` in Feynman benchmark) or test with fewer samples first.
 
 ### "CUDA not available"
 
