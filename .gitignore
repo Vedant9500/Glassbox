@@ -50,12 +50,16 @@ cover/
 
 # Environments
 .env
-.venv
+.venv/
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Python tooling caches
+.ruff_cache/
+.mypy_cache/
 
 # Project results
 *.png
@@ -69,15 +73,17 @@ exports/
 .idea/
 .vscode/
 Skills/
+.agent/
 
 # OS
 .DS_Store
 Thumbs.db
 data/
-training_data  
-# C++ built extensions  
-*.pyd  
-glassbox/sr/cpp/build/  
-glassbox/sr/cpp/out/  
-glassbox/sr/cpp/eigen*/  
-glassbox/sr/cpp/Eigen/ 
+training_data/
+
+# C++ built extensions
+*.pyd
+glassbox/sr/cpp/build/
+glassbox/sr/cpp/out/
+glassbox/sr/cpp/eigen*/
+glassbox/sr/cpp/Eigen/

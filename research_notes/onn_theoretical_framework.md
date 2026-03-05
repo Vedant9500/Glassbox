@@ -1,5 +1,7 @@
 # Operation-Based Neural Networks: A Comprehensive Research Framework for Differentiable Algorithmic Discovery
 
+> Note: This is a research note. It may discuss methods that are not implemented in the current Glassbox codebase.
+
 ## 1\. Introduction: The Paradigm Shift from Function Approximation to Algorithmic Discovery
 
 The contemporary landscape of artificial intelligence is dominated by the connectionist paradigm, specifically the Multi-Layer Perceptron (MLP) and its derivatives (CNNs, Transformers). In this regime, the fundamental unit of computation-the artificial neuron-is a static processing element, typically computing a weighted sum of inputs followed by a fixed non-linear activation function such as ReLU or Tanh. The "learning" in these systems is confined almost exclusively to the continuous modification of synaptic weights, which govern the magnitude of signal transmission between these fixed processing units. While this approach has proven unreasonably effective for function approximation in high-dimensional spaces , it operates fundamentally as a black-box manifold approximation engine. It does not learn the _algorithm_ or the _mathematical law_ governing the data; rather, it learns a statistical emulation of that law.

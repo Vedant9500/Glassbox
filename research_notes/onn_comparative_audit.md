@@ -1,5 +1,7 @@
 # Operation Neural Network (ONN) Architecture Audit
 
+> Note: This is a research note. It may discuss methods that are not implemented in the current Glassbox codebase.
+
 We compare ONN to related methods, analyze its internal dynamics, and propose fixes. Our focus is on convergence stability, interpretability, and speed.
 
 ## 1\. Comparative Analysis

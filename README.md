@@ -6,7 +6,6 @@
 
 - **Operation Neural Networks (ONN)**: Neural architecture where neurons represent mathematical operations rather than weights
 - **Meta-Operations**: Parametric operations (MetaPower, MetaPeriodic, MetaExp) that smoothly interpolate between functions
-- **Hybrid Optimization**: Combines evolutionary search (topology) with gradient-based fitting (constants)
 - **Curve Classifier Fast-Path**: Pre-trained classifier predicts likely operators, enabling direct regression without evolution
 - **Optimized Fast-Path (Default)**: Single strategy with refinement gating and acceptance guardrails for stable runtime
 - **Formula Post-Processing**: Tolerance-based float snapping + SymPy simplification with snap-only fallback for very large expressions
@@ -21,7 +20,7 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-org/glassbox.git
+git clone https://github.com/Vedant9500/Glassbox.git
 cd glassbox
 
 # Create virtual environment
@@ -157,7 +156,7 @@ from scripts.benchmark_feynman_easy import run_dataset
 result = run_dataset(
     dataset={"name": "my_data.txt", "url": None},
     data_dir="data/",
-  classifier_path="models/curve_classifier_v3.1.pt",
+    classifier_path="models/curve_classifier_v3.1.pt",
     precision=64,
     max_rows=5000,
     sample=2000,
@@ -259,9 +258,16 @@ glassbox/
 ├── data/
 │   └── feynman_easy/             # Benchmark datasets
 ├── docs/
+│   ├── README.md                 # Docs index
 │   ├── ONN_Architecture.md       # Technical documentation
 │   ├── Research_Roadmap.md       # Development roadmap
-│   └── key_insights.md           # Research notes
+│   └── onn_runbook.md            # Operational runbook
+├── research_notes/
+│   ├── README.md                 # Research note index
+│   ├── onn_advanced_optimization.md
+│   ├── onn_comparative_audit.md
+│   ├── onn_theoretical_framework.md
+│   └── sr_architectural_critique.md
 └── requirements.txt
 ```
 
@@ -347,7 +353,7 @@ If you use Glassbox in your research, please cite:
 @software{glassbox2026,
   title={Glassbox: Symbolic Regression with Operation Neural Networks},
   year={2026},
-  url={https://github.com/your-org/glassbox}
+  url={https://github.com/Vedant9500/Glassbox}
 }
 ```
 
