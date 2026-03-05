@@ -287,7 +287,25 @@ public:
                                 });
         front.erase(last, front.end());
 
-        return front;
+        // 2-objective domination filter (MSE + complexity only).
+        // Internal NSGA-II uses 3 objectives (including age) for selection,
+        // but the reported Pareto front should be clean on user-visible axes.
+        std::vector<IndividualGraph> clean_front;
+        for (size_t i = 0; i < front.size(); ++i) {
+            bool dominated = false;
+            for (size_t j = 0; j < front.size(); ++j) {
+                if (i == j) continue;
+                bool j_leq = (front[j].raw_mse <= front[i].raw_mse) &&
+                              (front[j].complexity() <= front[i].complexity());
+                bool j_lt  = (front[j].raw_mse < front[i].raw_mse) ||
+                              (front[j].complexity() < front[i].complexity());
+                if (j_leq && j_lt) { dominated = true; break; }
+            }
+            if (!dominated) clean_front.push_back(front[i]);
+        }
+        if (clean_front.empty()) clean_front.push_back(front[0]);
+
+        return clean_front;
     }
 
     // P6: Island Model run
