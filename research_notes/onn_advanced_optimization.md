@@ -1,5 +1,7 @@
 # Architectural Audit: Overcoming Performance Ceilings in Neuro-Symbolic Operator Networks
 
+> Note: This is a research note. It may discuss methods that are not implemented in the current Glassbox codebase.
+
 ## 1\. Introduction: The Neuro-Symbolic Convergence and the Optimization Cliff
 
 The pursuit of Artificial General Intelligence has increasingly converged upon the intersection of connectionist deep learning and symbolic reasoning. This domain, often termed Neuro-Symbolic AI, seeks to combine the differentiable learnability of neural networks with the interpretability, generalization, and extrapolation capabilities of symbolic logic and arithmetic. A central artifact in this domain is the Operator Neural Network (ONN), a class of architectures designed to learn explicit mathematical operations—such as addition, multiplication, and trigonometric functions—rather than merely approximating them via high-dimensional manifolds. The ultimate goal of an ONN is not just prediction, but "symbolic discovery" or "equation mining," where the trained weights can be discretized back into a human-readable physical law or mathematical formula.

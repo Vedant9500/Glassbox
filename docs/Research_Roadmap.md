@@ -169,7 +169,7 @@
 These are high-impact but highly disruptive changes from the architecture critique. They represent near-complete rewrites of subsystems and are better suited for a follow-up project.
 
 - [ ] **Dual-Encoder contrastive architecture (MMSR-style)** *(Rec. 1)*
-  - Replace 334-feature MLP with Set Transformer/PointNet++ data encoder
+  - Replace 366-feature MLP with Set Transformer/PointNet++ data encoder
   - Add skeleton encoder for expression trees
   - Train with InfoNCE contrastive loss to align data ↔ equation embeddings
   - Enables zero-shot generalization to unseen function types

@@ -447,7 +447,7 @@ class OperationNode(nn.Module):
         # torch.compile COMPATIBILITY: Use torch.where() masking instead of if/else branching
         # This avoids data-dependent control flow that breaks compilation.
         # We compute both paths but mask with weights (which are ~0 for unused paths).
-        # Reference: todo.md Tier 2 - torch.compile compatibility
+        # Keep compile checks explicit to preserve torch.compile compatibility.
         
         # --- UNARY BRANCH ---
         # Always compute (multiplication by near-zero weight effectively skips)

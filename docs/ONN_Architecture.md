@@ -196,16 +196,16 @@ class HardConcreteOperationSelector:
 
 ## Routing (Input Selection)
 
-**File:** `glassbox/sr/routing.py`
+**File:** `glassbox/sr/operation_node.py`
 
 Each node must choose which sources to use as inputs. For binary operations, it needs two inputs.
 
-### DifferentiableRouter
+### AdaptiveArityRouter
 
 Uses Gumbel-Softmax for differentiable source selection:
 
 ```python
-class DifferentiableRouter:
+class AdaptiveArityRouter:
     def __init__(self, n_sources, n_selections=2):
         self.logits = nn.Parameter(torch.randn(n_selections, n_sources))
     
@@ -579,23 +579,24 @@ def get_formula(self):
 | Operation Node | `operation_node.py` | `OperationNode` |
 | Meta Operations | `meta_ops.py` | `MetaPower`, `MetaPeriodic`, etc. |
 | Hard Concrete | `hard_concrete.py` | `HardConcreteOperationSelector` |
-| Routing | `routing.py` | `DifferentiableRouter` |
+| Routing | `operation_node.py` | `AdaptiveArityRouter` |
 | Evolution | `evolution.py` | `EvolutionaryONNTrainer` |
-| Training | `training.py` | `train_onn()` |
-| Benchmarks | `benchmark.py` | `generate_polynomial_data()` |
+| Training | `operation_dag.py` | `train_onn()` |
+| Benchmarks | `scripts/benchmark_suite.py` | CLI benchmark runner |
 
 ---
 
 ## Usage Example
 
 ```python
-from glassbox.sr import OperationDAG, get_device
+import torch
+from glassbox.sr import OperationDAG
 from glassbox.sr.evolution import train_onn_evolutionary
-from glassbox.sr import generate_polynomial_data
 
 # Generate data
-x, y, _ = generate_polynomial_data(n_samples=300, formula='x^2')
-device = get_device()
+x = torch.linspace(-3, 3, 300).reshape(-1, 1)
+y = x**2
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Model factory
 def make_model():
@@ -610,7 +611,8 @@ def make_model():
 # Train
 result = train_onn_evolutionary(
     make_model,
-    x.to(device), y.to(device),
+    x.to(device),
+    y.to(device),
     population_size=15,
     generations=30,
     device=device,

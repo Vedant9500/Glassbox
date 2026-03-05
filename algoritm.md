@@ -92,7 +92,7 @@ Input:
 - y shape (N,)
 
 Flow:
-1. Extract 334-d features from y.
+1. Extract 366-d features from y.
 2. Apply saved scaler if present.
 3. Run classifier:
    - PyTorch: logits -> sigmoid (with optional temperature)
@@ -182,7 +182,7 @@ Step 1: The TeacherRNN generates a batch of synthetic formulas via autoregressiv
 
 Step 2: Formulas are parsed into ASTs and evaluated on sampled $x$ domains to produce curves. Invalid/NaN curves receive a negative reward penalty.
 
-Step 3: Curves are augmented with multi-SNR noise, and 334 features (shape, FFT, derivatives, stats, curvature) are extracted.
+Step 3: Curves are augmented with multi-SNR noise, and 366 features (shape, FFT, derivatives, stats, curvature) are extracted.
 
 Step 4: The Teacher receives a reward based on how badly the StudentCNN misclassified the operators, minus a complexity penalty.
 

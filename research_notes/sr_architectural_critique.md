@@ -1,5 +1,7 @@
 # Technical Audit: The "GlassBox" Symbolic Regression Architecture
 
+> Note: This is a research note. It may discuss methods that are not implemented in the current Glassbox codebase.
+
 ## Critical Analysis of Feature Engineering, Generative Priors, and Search Strategies in the Era of Neuro-Symbolic Foundation Models
 
 ### Executive Summary
