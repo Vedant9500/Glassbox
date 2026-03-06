@@ -5,7 +5,7 @@ Uses the trained curve classifier to predict operators and warm-start ONN evolut
 
 Usage:
     # Test on synthetic data
-    python scripts/test_curve_classifier.py --model models/curve_classifier.pt --formula "sin(x) + x**2"
+    python scripts/curve_classifier_integration.py --model models/curve_classifier_v3.1.pt --formula "sin(x) + x**2"
     
     # Integrate with ONN (in your training script)
     from scripts.curve_classifier_integration import predict_operators, bias_onn_from_predictions
@@ -25,6 +25,9 @@ try:
     from scripts.generate_curve_data import extract_all_features, OPERATOR_CLASSES
 except ImportError:
     from generate_curve_data import extract_all_features, OPERATOR_CLASSES
+
+
+DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_v3.1.pt"
 
 
 # =============================================================================
@@ -135,7 +138,7 @@ def _make_cache_key(model_path: str, resolved_device: torch.device) -> str:
 
 
 def load_classifier(
-    model_path: str = "models/curve_classifier.pt",
+    model_path: str = DEFAULT_CURVE_CLASSIFIER_PATH,
     device: Optional[str] = None,
 ):
     """Load the trained curve classifier (supports PyTorch .pt and XGBoost .pkl)."""
@@ -301,7 +304,7 @@ def _predict_pytorch(model: nn.Module, features: np.ndarray, metadata: dict, dev
 def predict_operators(
     x: np.ndarray,
     y: np.ndarray,
-    model_path: str = "models/curve_classifier.pt",
+    model_path: str = DEFAULT_CURVE_CLASSIFIER_PATH,
     threshold: float = 0.5,
     device: Optional[str] = None,
 ) -> Dict[str, float]:
@@ -633,8 +636,8 @@ def main():
     import argparse
     
     parser = argparse.ArgumentParser(description="Test curve classifier")
-    parser.add_argument("--model", type=str, default="models/curve_classifier.pt",
-                        help="Path to trained model")
+    parser.add_argument("--model", type=str, default=DEFAULT_CURVE_CLASSIFIER_PATH,
+                        help=f"Path to trained model (default: {DEFAULT_CURVE_CLASSIFIER_PATH})")
     parser.add_argument("--formula", type=str, default="np.sin(x) + x**2",
                         help="Formula to test (uses numpy)")
     parser.add_argument("--x-min", type=float, default=-5)

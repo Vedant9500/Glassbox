@@ -71,6 +71,8 @@ public:
                     const Eigen::ArrayXd& y,
                     const std::vector<double>& seed_omegas = {})
         : config_(config), X_(X), y_(y), seed_omegas_(seed_omegas), rng_(std::random_device{}()) {
+    sanitize_config();
+
         // Normalize op_priors if provided
         if (!config_.op_priors.empty()) {
             double sum = 0.0;
@@ -413,6 +415,13 @@ private:
     std::vector<double> op_cdf_; // CDF for prior-weighted op sampling
     
     std::mt19937 rng_;
+
+    void sanitize_config() {
+        config_.pop_size = std::max(1, config_.pop_size);
+        config_.elite_size = std::max(1, std::min(config_.elite_size, config_.pop_size));
+        config_.num_islands = std::max(1, config_.num_islands);
+        config_.migration_size = std::max(1, config_.migration_size);
+    }
     
     // Sample a UnaryOp using classifier priors (if available) or uniform
     UnaryOp sample_unary_op() {

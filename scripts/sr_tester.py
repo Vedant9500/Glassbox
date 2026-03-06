@@ -32,6 +32,62 @@ import torch
 import torch.nn as nn
 import numpy as np
 
+try:
+    from simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+except ImportError:
+    from scripts.simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+
+
+def postprocess_formula(formula: str, *, label: str = "Formula", verbose: bool = False) -> str:
+    """Run the same deterministic formula cleanup used by benchmark paths."""
+    if not formula or formula in {"N/A", "ERROR", "?"}:
+        return formula
+
+    try:
+        normalized_formula = (
+            formula
+            .replace('²', '^2')
+            .replace('³', '^3')
+            .replace('·', '*')
+            .replace('⋅', '*')
+            .replace('×', '*')
+            .replace('π', 'pi')
+            .replace('√', 'sqrt')
+            .replace('φ', 'phi')
+            .replace('ω', 'omega')
+        )
+
+        formula_len = len(normalized_formula)
+        term_estimate = max(1, len([t for t in re.split(r'\s*[+-]\s*', normalized_formula) if t.strip()]))
+        too_complex_for_symbolic = formula_len > 500 or term_estimate > 24
+
+        if too_complex_for_symbolic:
+            snapped_formula = snap_formula_floats(
+                normalized_formula,
+                SnapConfig(int_tol=1e-5, zero_tol=1e-8),
+            )
+            simplified_formula = snapped_formula
+            if verbose:
+                print(f"  [Post:{label}] Large formula detected; using snap-only mode.")
+        else:
+            snapped_formula, simplified_expr = simplify_onn_formula(
+                normalized_formula,
+                int_tol=1e-5,
+                zero_tol=1e-8,
+                use_nsimplify=(formula_len <= 300 and term_estimate <= 16),
+            )
+            simplified_formula = str(simplified_expr)
+
+        if verbose:
+            print(f"  [Post:{label}] Snapped: {sanitize_formula(snapped_formula)}")
+            print(f"  [Post:{label}] Simplified: {sanitize_formula(simplified_formula)}")
+        return simplified_formula
+    except Exception as exc:
+        if verbose:
+            err_text = str(exc).encode('ascii', errors='backslashreplace').decode('ascii')
+            print(f"  [Post:{label}] Simplification skipped: {err_text}")
+        return formula
+
 
 def sanitize_formula(formula: str) -> str:
     """Sanitize formula for Windows console output (replace Unicode chars)."""
@@ -505,6 +561,7 @@ class SRTester:
             
             formula_b = " + ".join(formula_parts) if formula_parts else "0"
             formula_b = formula_b.replace("+ -", "- ")
+            formula_b = postprocess_formula(formula_b, label="Phase2-Basis", verbose=False)
             
             return {'formula': formula_b, 'mse': mse, 'weights': weights, 'feature_names': feature_names}
         except Exception as e:
@@ -706,7 +763,7 @@ def run_single_mode(config: Config):
     
     results = tester.run_evolution(x, y, visualizer=visualizer)
     phase1_model = results['model']
-    phase1_formula = results['formula']
+    phase1_formula = postprocess_formula(results['formula'], label="Phase1", verbose=True)
     phase1_mse = results['final_mse']
     
     print(f"\\nPhase 1 Result: {sanitize_formula(phase1_formula)}")
@@ -721,13 +778,14 @@ def run_single_mode(config: Config):
     print("\\n>>> Method A: Gradient Refinement...")
     model_a = copy.deepcopy(phase1_model)
     mse_a, formula_a = tester.run_gradient_refinement(model_a, x.to(tester.device), y.to(tester.device))
+    formula_a = postprocess_formula(formula_a, label="Phase2-Gradient", verbose=True)
     print(f"Method A: MSE={mse_a:.6f}, Formula={sanitize_formula(formula_a)}")
     
     # Method B: Basis Regression
     print("\\n>>> Method B: Pure Basis Regression...")
     result_b = tester.run_phase2_regression(x.to(tester.device), y.to(tester.device), phase1_formula)
     mse_b = result_b['mse']
-    formula_b = result_b['formula']
+    formula_b = postprocess_formula(result_b['formula'], label="Phase2-Basis", verbose=True)
     print(f"Method B: MSE={mse_b:.6f}, Formula={sanitize_formula(formula_b)}")
     
     # Pick winner
@@ -750,7 +808,8 @@ def run_single_mode(config: Config):
         pruner = PostTrainingPruner(phase1_model, x.to(tester.device), y.to(tester.device))
         pruner.sensitivity_analysis(verbose=True)
         pruner.recursive_graph_prune(importance_threshold=0.01, verbose=True)
-        print(f"Pruned formula: {sanitize_formula(pruner.get_formula())}")
+        pruned_formula = postprocess_formula(pruner.get_formula(), label="Pruning", verbose=True)
+        print(f"Pruned formula: {sanitize_formula(pruned_formula)}")
     
     # Final summary
     print("\n" + "=" * 70)
@@ -832,13 +891,14 @@ def run_evolution_mode(config: Config):
             ]))[0, 1].item()
         
         print(f"\nValidation MSE: {val_mse:.4f}, Corr: {val_corr:.4f}")
-        print(f"Formula: {result['formula']}")
+        display_formula = postprocess_formula(result['formula'], label=name, verbose=False)
+        print(f"Formula: {sanitize_formula(display_formula)}")
         
         results.append({
             'task': name,
             'mse': val_mse,
             'corr': val_corr,
-            'formula': result['formula'],
+            'formula': display_formula,
         })
     
     # Summary
@@ -869,7 +929,7 @@ def run_pruning_mode(config: Config):
     print(f"Target: {formula}")
     print("\n--- TRAINING ---")
     result = tester.run_evolution(x, y)
-    pre_formula = result['formula']
+    pre_formula = postprocess_formula(result['formula'], label="PrePrune", verbose=True)
     pre_mse = result['final_mse']
     
     print(f"\nPre-pruning: {pre_formula}")
@@ -881,7 +941,7 @@ def run_pruning_mode(config: Config):
     pruner.recursive_graph_prune(importance_threshold=0.01, verbose=True)
     pruner.mask_and_finetune(weight_threshold=0.05, verbose=True)
     
-    post_formula = pruner.get_formula()
+    post_formula = postprocess_formula(pruner.get_formula(), label="PostPrune", verbose=True)
     post_mse = pruner.get_mse()
     
     print("\n" + "=" * 70)
@@ -1056,8 +1116,8 @@ Examples:
     
     # Evolution
     evo = parser.add_argument_group('Evolution Hyperparameters')
-    evo.add_argument('--population', '-p', type=int, default=30, help='Population size (10-100)')
-    evo.add_argument('--generations', '-g', type=int, default=40, help='Number of generations (10-200)')
+    evo.add_argument('--population', '-p', type=int, default=50, help='Population size (10-100)')
+    evo.add_argument('--generations', '-g', type=int, default=1000, help='Number of generations (10-200)')
     evo.add_argument('--elite-size', type=int, default=4, help='Elite individuals to preserve')
     evo.add_argument('--mutation-rate', type=float, default=0.5, help='Mutation probability (0.1-0.9)')
     evo.add_argument('--explorer-fraction', type=float, default=0.40, help='Fraction of explorers (0-0.6)')

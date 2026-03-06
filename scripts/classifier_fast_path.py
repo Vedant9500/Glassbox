@@ -11,10 +11,13 @@ import re
 import math
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from itertools import permutations
 import numpy as np
 import torch
 from typing import Any, Dict, List, Tuple, Optional
 from pathlib import Path
+
+from glassbox.sr.meta_ops import get_constant_symbol, normalize_formula_ascii
 
 # Thread-safe CUDA warning state
 _warned_no_cuda = False
@@ -24,6 +27,8 @@ _cuda_warning_lock = threading.Lock()
 _FREQ_SIN_PATTERN = re.compile(r'sin\(([0-9.]+)\*?x', re.IGNORECASE)
 _FREQ_COS_PATTERN = re.compile(r'cos\(([0-9.]+)\*?x', re.IGNORECASE)
 _POWER_PATTERN = re.compile(r'x\^([0-9.]+)', re.IGNORECASE)
+
+DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_v3.1.pt"
 
 
 def _with_derived_predictions(predictions: Dict[str, float]) -> Dict[str, float]:
@@ -54,6 +59,119 @@ def _resolve_device(device: Optional[str] = None) -> torch.device:
         return torch.device("cpu")
 
     return resolved
+
+
+def _join_formula_terms(terms: List[str]) -> str:
+    """Join symbolic terms and normalize them into ASCII-safe math."""
+    filtered_terms = [term for term in terms if term]
+    formula = " + ".join(filtered_terms) if filtered_terms else "0"
+    return normalize_formula_ascii(formula.replace("+ -", "- "))
+
+
+def _format_affine_formula(base_expr: str, scale: float, offset: float) -> str:
+    """Format y ~= offset + scale * base_expr with readable symbolic coefficients."""
+    terms: List[str] = []
+
+    if abs(scale) > 1e-10:
+        if abs(scale - 1.0) < 0.01:
+            terms.append(base_expr)
+        elif abs(scale + 1.0) < 0.01:
+            terms.append(f"-({base_expr})")
+        else:
+            terms.append(f"{get_constant_symbol(scale, 0.05)}*({base_expr})")
+
+    if abs(offset) > 1e-10:
+        terms.append(get_constant_symbol(offset, 0.05))
+
+    return _join_formula_terms(terms)
+
+
+def _candidate_match_tolerance(y: np.ndarray) -> float:
+    scale = max(float(np.var(y)), float(np.mean(y ** 2)), 1.0)
+    return max(1e-10, 1e-8 * scale)
+
+
+def _maybe_match_easy_multivariate_formula(
+    x: np.ndarray,
+    y: np.ndarray,
+) -> Optional[Tuple[str, float, Dict[str, Any]]]:
+    """Check a few exact low-complexity multivariate templates before basis expansion."""
+    if x.ndim != 2 or x.shape[1] < 2:
+        return None
+
+    y = y.flatten()
+    tol = _candidate_match_tolerance(y)
+    best_match: Optional[Tuple[str, float, Dict[str, Any]]] = None
+
+    def try_candidate(base_expr: str, base_values: np.ndarray, template_name: str) -> None:
+        nonlocal best_match
+        if not np.all(np.isfinite(base_values)):
+            return
+
+        X = np.column_stack([np.ones(len(y)), base_values])
+        try:
+            coeffs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        except np.linalg.LinAlgError:
+            return
+
+        offset, scale = float(coeffs[0]), float(coeffs[1])
+        y_pred = X @ coeffs
+        mse = float(np.mean((y - y_pred) ** 2))
+        if mse >= tol:
+            return
+
+        formula = _format_affine_formula(base_expr, scale, offset)
+        details = {
+            'coefficients': np.array([offset, scale]),
+            'basis_names': [base_expr],
+            'n_nonzero': int(abs(offset) > 1e-10) + int(abs(scale) > 1e-10),
+            'exact_match': True,
+            'template_match': template_name,
+            'template_tolerance': tol,
+        }
+
+        if best_match is None or mse < best_match[1]:
+            best_match = (formula, mse, details)
+
+    n_vars = x.shape[1]
+
+    if n_vars >= 4:
+        for a, b, c, d in permutations(range(n_vars), 4):
+            dist = np.sqrt((x[:, a] - x[:, b]) ** 2 + (x[:, c] - x[:, d]) ** 2)
+            try_candidate(
+                f"sqrt((x{a}-x{b})^2 + (x{c}-x{d})^2)",
+                dist,
+                "distance_2d",
+            )
+
+    if n_vars >= 3:
+        for a, b, c in permutations(range(n_vars), 3):
+            denom_sq = x[:, c] ** 2
+            if np.any(np.abs(denom_sq) < 1e-12):
+                continue
+            inside = 1.0 - (x[:, b] ** 2) / denom_sq
+            if np.any(inside <= 1e-10):
+                continue
+
+            relativistic = x[:, a] / np.sqrt(inside)
+            try_candidate(
+                f"x{a}/sqrt(1-x{b}^2/x{c}^2)",
+                relativistic,
+                "relativistic_mass",
+            )
+
+    if n_vars >= 4:
+        for a, b, c, d in permutations(range(n_vars), 4):
+            phase = x[:, b] * x[:, c]
+            cosine = np.cos(phase)
+            envelope = x[:, a] * (cosine + x[:, d] * cosine ** 2)
+            try_candidate(
+                f"x{a}*(cos(x{b}*x{c})+x{d}*cos(x{b}*x{c})^2)",
+                envelope,
+                "cosine_envelope",
+            )
+
+    return best_match
 
 
 def lasso_coordinate_descent(
@@ -543,20 +661,7 @@ def find_exact_symbolic_match(
                     y_pred = X @ coeffs
                     mse = np.mean((y - y_pred) ** 2)
                     if mse < tolerance:
-                        # Build formula
-                        const_part = f"{coeffs[0]:.4g}" if abs(coeffs[0]) > 1e-6 else ""
-                        if abs(coeffs[1] - 1.0) < 0.01:
-                            term_part = names[i]
-                        elif abs(coeffs[1] + 1.0) < 0.01:
-                            term_part = f"-{names[i]}"
-                        else:
-                            term_part = f"{coeffs[1]:.4g}*{names[i]}"
-                        
-                        if const_part and term_part:
-                            formula = f"{const_part} + {term_part}" if coeffs[1] > 0 else f"{const_part} - {term_part[1:]}" if term_part.startswith('-') else f"{const_part} + {term_part}"
-                        else:
-                            formula = term_part or const_part
-                        formula = formula.replace("+ -", "- ")
+                        formula = _format_affine_formula(names[i], float(coeffs[1]), float(coeffs[0]))
                         
                         full_coeffs = np.zeros(n_basis)
                         const_idx = names.index("1") if "1" in names else 0
@@ -572,12 +677,7 @@ def find_exact_symbolic_match(
                     y_pred = X @ coeff
                     mse = np.mean((y - y_pred) ** 2)
                     if mse < tolerance:
-                        if abs(coeff[0] - 1.0) < 0.01:
-                            formula = names[i]
-                        elif abs(coeff[0] + 1.0) < 0.01:
-                            formula = f"-{names[i]}"
-                        else:
-                            formula = f"{coeff[0]:.4g}*{names[i]}"
+                        formula = _format_affine_formula(names[i], float(coeff[0]), 0.0)
                         
                         full_coeffs = np.zeros(n_basis)
                         full_coeffs[i] = coeff[0]
@@ -592,7 +692,6 @@ def find_exact_symbolic_match(
         return [(i, min(i + size, n)) for i in range(0, n, size)]
 
     def build_formula(indices: List[int], coeffs: np.ndarray) -> Tuple[str, np.ndarray]:
-        from glassbox.sr.meta_ops import get_constant_symbol
         terms = []
         full_coeffs = np.zeros(n_basis)
         for idx, c in zip(indices, coeffs):
@@ -612,7 +711,7 @@ def find_exact_symbolic_match(
                 terms.append(f"{coef_sym}*{name}")
             full_coeffs[idx] = c
 
-        formula = " + ".join(terms).replace("+ -", "- ")
+        formula = _join_formula_terms(terms)
         return formula, full_coeffs
 
     def search_pairs_range(start_i: int, end_i: int, stop_event: threading.Event):
@@ -719,6 +818,13 @@ def fast_path_regression(
     if x.ndim > 2:
         raise ValueError(f"Expected x to be 1D or 2D, got shape {x.shape}")
     y = y.flatten()
+
+    if x.ndim == 2 and x.shape[1] > 1:
+        easy_match = _maybe_match_easy_multivariate_formula(x, y)
+        if easy_match is not None:
+            formula, mse, details = easy_match
+            print(f"  Direct template match: {details['template_match']}")
+            return formula, mse, details
     
     # Build basis
     basis, names = build_basis_from_predictions(
@@ -847,7 +953,6 @@ def fast_path_regression(
     mse = best_mse
     
     # Build formula string (sparse)
-    from glassbox.sr.meta_ops import get_constant_symbol
     terms = []
     for i, (name, coef) in enumerate(zip(names, coeffs)):
         if abs(coef) < sparsity_threshold:
@@ -866,8 +971,7 @@ def fast_path_regression(
             coef_sym = get_constant_symbol(coef, threshold=0.05)
             terms.append(f"{coef_sym}*{name}")
     
-    formula = " + ".join(terms) if terms else "0"
-    formula = formula.replace("+ -", "- ")
+    formula = _join_formula_terms(terms)
     
     n_nonzero = sum(1 for c in coeffs if abs(c) >= sparsity_threshold)
     exact_match_flag = mse < 1e-6 and n_nonzero <= 4
@@ -972,8 +1076,6 @@ def refine_periodic_rational(
     """
     import torch
     import math
-    from glassbox.sr.meta_ops import get_constant_symbol
-
     resolved_device = _resolve_device(device)
     x_t = torch.tensor(x, dtype=torch.float64, device=resolved_device)
     y_t = torch.tensor(y, dtype=torch.float64, device=resolved_device)
@@ -1033,8 +1135,7 @@ def refine_periodic_rational(
                 if abs(e_c) > 1e-8:
                     terms.append(f"{get_constant_symbol(e_c, 0.05)}")
 
-                formula = " + ".join(terms) if terms else "0"
-                formula = formula.replace("+ -", "- ")
+                formula = _join_formula_terms(terms)
 
                 best = {
                     'formula': formula,
@@ -1085,7 +1186,6 @@ def refine_powers(
     """
     import torch
     import torch.nn as nn
-    from glassbox.sr.meta_ops import get_constant_symbol
 
     # Ensure 1D inputs
     if x.ndim > 1: x = x.flatten()
@@ -1288,8 +1388,7 @@ def refine_powers(
     if abs(const_val) > 1e-3:
         terms.append(get_constant_symbol(const_val, 0.05))
 
-    formula = " + ".join(terms) if terms else "0"
-    formula = formula.replace("+ -", "- ")
+    formula = _join_formula_terms(terms)
 
     best_result = {
         'formula': formula,
@@ -1384,7 +1483,8 @@ def fast_path_with_refinement(
     3. Re-run regression with refined frequencies
     """
     # Stage 1: Minimal basis (predicted ops only)
-    stage_order = [False, True] if auto_expand else [True]
+    # Stage 2: Optional universal basis expansion when auto_expand is enabled.
+    stage_order = [False, True] if auto_expand else [False]
     best_formula = None
     best_mse = float('inf')
     best_details: Dict = {}
@@ -1563,7 +1663,7 @@ def should_use_fast_path(
 def run_fast_path(
     x: torch.Tensor,
     y: torch.Tensor,
-    classifier_path: str = "models/curve_classifier.pt",
+    classifier_path: str = DEFAULT_CURVE_CLASSIFIER_PATH,
     detected_omegas: Optional[List[float]] = None,
     op_constraints: Optional[Dict[str, bool]] = None,
     auto_expand: bool = True,

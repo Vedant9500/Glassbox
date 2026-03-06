@@ -24,6 +24,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict, Union
 import math
+import re
 
 
 # ============================================================================
@@ -170,6 +171,52 @@ def get_constant_symbol(value: float, threshold: float = 0.05) -> str:
     if abs(value - round(value)) < 0.001:
         return str(int(round(value)))
     return f"{value:.4g}"
+
+
+def normalize_formula_ascii(formula: str) -> str:
+    """Convert pretty symbolic output into parser-safe ASCII math."""
+    normalized = formula
+
+    replacements = [
+        ("log₁₀(e)", "log(E,10)"),
+        ("log₂(e)", "log(E,2)"),
+        ("ln(10)", "log(10)"),
+        ("ln(2)", "log(2)"),
+        ("π²", "(pi^2)"),
+        ("e²", "(E^2)"),
+        ("1/π", "(1/pi)"),
+        ("2/π", "(2/pi)"),
+        ("2π", "(2*pi)"),
+        ("π/2", "(pi/2)"),
+        ("π/3", "(pi/3)"),
+        ("π/4", "(pi/4)"),
+        ("π/6", "(pi/6)"),
+        ("√2", "sqrt(2)"),
+        ("√3", "sqrt(3)"),
+        ("√5", "sqrt(5)"),
+        ("φ", "((1+sqrt(5))/2)"),
+        ("π", "pi"),
+        ("·", "*"),
+        ("⋅", "*"),
+        ("×", "*"),
+        ("−", "-"),
+        ("–", "-"),
+        ("²", "^2"),
+        ("³", "^3"),
+    ]
+    for old, new in replacements:
+        normalized = normalized.replace(old, new)
+
+    normalized = re.sub(r"√\|([^|]+)\|/\|([^|]+)\|", r"sqrt(abs(\1))/abs(\2)", normalized)
+    normalized = re.sub(r"([A-Za-z0-9_()]+)\s*/√\|([^|]+)\|", r"\1/sqrt(abs(\2))", normalized)
+    normalized = re.sub(r"√\|([^|]+)\|", r"sqrt(abs(\1))", normalized)
+    normalized = re.sub(r"\|([^|]+)\|", r"abs(\1)", normalized)
+
+    # Replace the standalone Euler constant symbol while leaving scientific notation intact.
+    normalized = re.sub(r"(?<![A-Za-z0-9_])e(?![A-Za-z0-9_])", "E", normalized)
+    normalized = normalized.replace("^", "**")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
 
 
 class MetaPeriodic(nn.Module):

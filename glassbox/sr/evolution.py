@@ -29,6 +29,9 @@ from itertools import combinations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
+
+DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_v3.1.pt"
+
 # Configure module-level logger
 logger = logging.getLogger(__name__)
 
@@ -338,6 +341,8 @@ class Individual:
     ):
         self.model = model
         self.fitness = fitness
+        self.raw_mse = float('inf')
+        self.complexity = float('inf')
         self.generation = generation
         self.is_explorer = is_explorer  # Explorer subpopulation flag
         self.structure_hash = self._compute_structure_hash()
@@ -359,7 +364,14 @@ class Individual:
             generation=self.generation + 1,
             is_explorer=self.is_explorer,
         )
+        ind.raw_mse = self.raw_mse
+        ind.complexity = self.complexity
+        ind.structure_hash = self.structure_hash
         return ind
+
+    def refresh_structure_hash(self) -> None:
+        """Recompute the discrete-structure hash after mutations."""
+        self.structure_hash = self._compute_structure_hash()
 
 
 class StructureConfidenceTracker:
@@ -716,6 +728,7 @@ def mutate_operations(individual: Individual, mutation_rate: float = 0.3) -> Ind
                         # Swap routing connections
                         param.add_(torch.randn_like(param) * 0.5)
     
+    mutant.refresh_structure_hash()
     return mutant
 
 
@@ -748,6 +761,7 @@ def mutate_operations_lamarckian(individual: Individual, mutation_rate: float = 
                         # Option 2: Add noise to soften selection
                         param.add_(torch.randn_like(param) * 0.5)
     
+    mutant.refresh_structure_hash()
     return mutant
 
 
@@ -845,6 +859,7 @@ def mutate_operations_gradient_informed(
                     else:
                         param.add_(torch.randn_like(param) * 0.5)
     
+    mutant.refresh_structure_hash()
     return mutant
 
 
@@ -1867,7 +1882,7 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         nested_bfgs_every: int = 1,         # Refine every N generations
         # NEW: Curve classifier warm-start
         use_curve_classifier: bool = False,  # Use curve shape to predict operators
-        curve_classifier_path: str = "models/curve_classifier.pt",
+        curve_classifier_path: str = DEFAULT_CURVE_CLASSIFIER_PATH,
         # NEW: Early stopping on exact match
         early_stop_mse: float = 1e-6,  # Stop if MSE below this (exact match)
         early_stop_corr: float = 0.9999,  # Stop if correlation above this
@@ -2095,12 +2110,15 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                     pred, _ = ind.model(x, hard=True)
                     pred = pred.squeeze()  # Ensure pred is 1D
                     mse = F.mse_loss(pred, y).item()
+                    ind.raw_mse = mse
                     
                     if math.isnan(mse) or math.isinf(mse):
                         ind.fitness = float('inf')
+                        ind.complexity = float('inf')
                     else:
                         # Add complexity penalty (BIC-inspired parsimony)
                         complexity = calculate_complexity(ind.model)
+                        ind.complexity = complexity
                         fitness = mse + self.complexity_penalty * complexity
                         
                         # Coefficient sparsity penalty (Hoyer-inspired)
@@ -2129,6 +2147,8 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                         ind.fitness = fitness
             except Exception:
                 ind.fitness = float('inf')
+                ind.raw_mse = float('inf')
+                ind.complexity = float('inf')
         
         # Track best ever (from main population)
         best_current = min(self.population, key=lambda ind: ind.fitness)
@@ -2401,16 +2421,18 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             print("🚀 USING BLAZING FAST C++ EVOLUTION BACKEND 🚀")
             print("*"*60 + "\n")
             
-            # Check for FFT frequencies before calling C++ loop
-            detected_omegas = detect_dominant_frequency(x, y, n_frequencies=3)
-            if detected_omegas and detected_omegas[0] != 1.0:
-                print(f"FFT detected frequencies (omega) for C++ seeding: {[f'{o:.2f}' for o in detected_omegas]}")
-            else:
-                detected_omegas = []
+            # FFT warm-start is only well-defined for univariate inputs.
+            detected_omegas = []
+            if x.dim() == 1 or (x.dim() > 1 and x.shape[1] == 1):
+                detected_omegas = detect_dominant_frequency(x, y, n_frequencies=3)
+                if detected_omegas and detected_omegas[0] != 1.0:
+                    print(f"FFT detected frequencies (omega) for C++ seeding: {[f'{o:.2f}' for o in detected_omegas]}")
+                else:
+                    detected_omegas = []
 
             # Prepare inputs for C++
             X_list = [x[:, i].cpu().numpy() for i in range(x.shape[1])] if x.dim() > 1 else [x.cpu().numpy()]
-            y_arr = y.cpu().numpy()
+            y_arr = y.reshape(-1).cpu().numpy()
             
             start_time = time.time()
             
@@ -2466,11 +2488,13 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 from glassbox.sr.cpp.export_pytorch import CppGraphModule
                 cpp_model = CppGraphModule(result).to(self.device)
                 self.best_ever = Individual(cpp_model, fitness=result['best_mse'])
+                self.best_ever.raw_mse = result['best_mse']
                 print("✅ Created CppGraphModule (runnable nn.Module)")
             except Exception as e:
                 print(f"⚠️ CppGraphModule failed ({e}), using dummy model")
                 dummy_model = self.model_factory().to(self.device)
                 self.best_ever = Individual(dummy_model, fitness=result['best_mse'])
+                self.best_ever.raw_mse = result['best_mse']
             
             # We return early. The PyTorch loop is deprecated by the C++ core.
             
@@ -2489,21 +2513,25 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             
         except ImportError as e:
             print(f"⚠️ C++ backend not available ({e}), falling back to PyTorch...")
+        except Exception as e:
+            print(f"⚠️ C++ backend failed at runtime ({e}), falling back to PyTorch...")
         # ---------------------------------------------------------------------
         
         # Initialize population (with CNN seeding if curve classifier enabled)
         self.initialize_population(x_original, y_original)
         
-        # FFT-based frequency detection for omega seeding
-        detected_omegas = detect_dominant_frequency(x, y, n_frequencies=3)
-        if detected_omegas and detected_omegas[0] != 1.0:
-            print(f"FFT detected frequencies (omega): {[f'{o:.2f}' for o in detected_omegas]}")
-            # Seed some individuals with detected frequencies
-            for i, ind in enumerate(self.population):
-                seed_omega_from_fft(ind.model, detected_omegas, individual_idx=i)
-            if self.use_explorers:
-                for i, explorer in enumerate(self.explorers):
-                    seed_omega_from_fft(explorer.model, detected_omegas, individual_idx=i)
+        # FFT-based frequency detection only applies to univariate inputs.
+        detected_omegas = []
+        if x.dim() == 1 or (x.dim() > 1 and x.shape[1] == 1):
+            detected_omegas = detect_dominant_frequency(x, y, n_frequencies=3)
+            if detected_omegas and detected_omegas[0] != 1.0:
+                print(f"FFT detected frequencies (omega): {[f'{o:.2f}' for o in detected_omegas]}")
+                # Seed some individuals with detected frequencies
+                for i, ind in enumerate(self.population):
+                    seed_omega_from_fft(ind.model, detected_omegas, individual_idx=i)
+                if self.use_explorers:
+                    for i, explorer in enumerate(self.explorers):
+                        seed_omega_from_fft(explorer.model, detected_omegas, individual_idx=i)
         
         # Curve-classifier warm-start is applied in initialize_population()
         # to avoid duplicate prediction and bias passes.
@@ -2671,8 +2699,9 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
 
             # EARLY STOPPING CHECK
             # Check for exact match (very low MSE)
-            if self.best_ever and self.best_ever.fitness < self.early_stop_mse:
-                print(f"\n*** EXACT MATCH FOUND! MSE={self.best_ever.fitness:.2e} at Gen {gen} ***")
+            best_raw_mse = getattr(self.best_ever, 'raw_mse', float('inf')) if self.best_ever else float('inf')
+            if self.best_ever and best_raw_mse < self.early_stop_mse:
+                print(f"\n*** EXACT MATCH FOUND! MSE={best_raw_mse:.2e} at Gen {gen} ***")
                 break
             
             # Check for near-perfect correlation (structure is correct)
@@ -2690,7 +2719,7 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             
             # Phase 1 doesn't need perfect MSE - Phase 2 refinement will fix coefficients
             # Stop if we have a good structure (high correlation) and stable MSE
-            if self.best_ever and self.best_ever.fitness < 0.01:
+            if self.best_ever and best_raw_mse < 0.01:
                 # MSE below 0.01 is good enough for Phase 1
                 if hasattr(self, 'confidence_tracker') and self.confidence_tracker.generations_stable > 2:
                     print(f"\nEARLY STOPPING: Reached target accuracy (MSE < 0.01) at Gen {gen}")

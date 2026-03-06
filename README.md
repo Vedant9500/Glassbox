@@ -65,7 +65,7 @@ python scripts/benchmark_suite.py --with-evolution
 ### Fast-Path Benchmark (AI-Feynman)
 
 ```bash
-python scripts/benchmark_feynman_easy.py
+python scripts/benchmark_feynman_easy.py --evolution-fallback
 ```
 
 ## Architecture Overview
@@ -150,23 +150,13 @@ print(f"Formula: {result['formula']}")
 
 ### Custom Benchmark
 
-```python
-from scripts.benchmark_feynman_easy import run_dataset
-
-result = run_dataset(
-    dataset={"name": "my_data.txt", "url": None},
-    data_dir="data/",
-    classifier_path="models/curve_classifier_v3.1.pt",
-    precision=64,
-    max_rows=5000,
-    sample=2000,
-    seed=42,
-    auto_expand=True,
-    device="cuda",
-    exact_match_threads=8,
-    exact_match_enabled=True,
-    exact_match_max_basis=150,
-)
+```bash
+python scripts/benchmark_feynman_easy.py \
+  --dataset example1 \
+  --classifier-path models/curve_classifier_v3.1.pt \
+  --sample 500 \
+  --device auto \
+  --evolution-fallback
 ```
 
 ## CLI Options
@@ -217,8 +207,9 @@ python scripts/benchmark_feynman_easy.py [OPTIONS]
 
 Options:
   --data-dir PATH         Directory for datasets
-  --classifier-path PATH  Path to curve classifier model
+  --classifier-path PATH  Path to curve classifier model (default: models/curve_classifier_v3.1.pt)
   --precision {32,64}     Float precision
+  --max-rows N            Limit loaded rows for smoke tests
   --sample N              Random sample size
   --seed N                Random seed
   --device {auto,cpu,cuda}  Device for inference
@@ -226,6 +217,11 @@ Options:
   --skip-exact-match      Skip exact-match combinatorial search
   --exact-match-threads N Threads for exact-match search
   --exact-match-max-basis N  Skip exact-match when basis exceeds this size
+  --mse-threshold FLOAT   Fallback/reporting threshold
+  --evolution-fallback    Run evolution when fast-path is insufficient
+  --evolution-generations N  Evolution generations for fallback
+  --evolution-population N   Evolution population for fallback
+  --dataset NAME          Run only a matching dataset name
 ```
 
 ## Project Structure
@@ -340,9 +336,9 @@ pip install torch --index-url https://download.pytorch.org/whl/cu118
 
 ### "Classifier model not found"
 
-Train the classifier or download pre-trained weights:
+Use the shipped checkpoint `models/curve_classifier_v3.1.pt`, or train a fresh model and point the benchmark at it:
 ```bash
-python scripts/train_curve_classifier.py
+python scripts/train_curve_classifier.py --output models/curve_classifier_v3.1.pt
 ```
 
 ## Citation
