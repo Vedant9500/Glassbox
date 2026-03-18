@@ -631,36 +631,39 @@ def run_single_mode(config: Config):
             lite_mode=config.lite_mode,
         )
     
-    # Try Fast Path first (classifier-guided direct regression)
+    # Unified latest path: optional fast-path regression + guided evolution
+    # (beam search first). This keeps formula handling on one modern path.
     fast_path_result = None
-    if getattr(config, 'use_curve_classifier', False) or getattr(config, 'fast_path_only', False):
-        try:
-            from classifier_fast_path import run_fast_path, run_guided_evolution
-            from glassbox.sr.evolution import detect_dominant_frequency
-            
-            x_tensor = x.to(tester.device)
-            y_tensor = y.to(tester.device)
-            
-            # Get FFT frequencies for better basis
-            detected_omegas = detect_dominant_frequency(x_tensor, y_tensor, n_frequencies=3)
-            
-            # Pass operator constraints to fast path (honor --no-ops-* flags)
-            op_constraints = None
-            if any(x is not None for x in [
-                config.ops_periodic, config.ops_power,
-                config.ops_exp, config.ops_log,
-                config.ops_arithmetic, config.ops_aggregation
-            ]):
-                op_constraints = {
-                    'periodic': config.ops_periodic,
-                    'power': config.ops_power,
-                    'exp': config.ops_exp,
-                    'log': config.ops_log,
-                    'arithmetic': config.ops_arithmetic,
-                    'aggregation': config.ops_aggregation,
-                }
-                op_constraints = {k: v for k, v in op_constraints.items() if v is not None}
+    x_tensor = x.to(tester.device)
+    y_tensor = y.to(tester.device)
 
+    try:
+        from classifier_fast_path import run_fast_path, run_guided_evolution
+        from glassbox.sr.evolution import detect_dominant_frequency
+
+        # Get FFT frequencies for better basis and guided priors.
+        detected_omegas = detect_dominant_frequency(x_tensor, y_tensor, n_frequencies=3)
+
+        # Pass operator constraints to fast path (honor --no-ops-* flags).
+        op_constraints = None
+        if any(v is not None for v in [
+            config.ops_periodic, config.ops_power,
+            config.ops_exp, config.ops_log,
+            config.ops_arithmetic, config.ops_aggregation
+        ]):
+            op_constraints = {
+                'periodic': config.ops_periodic,
+                'power': config.ops_power,
+                'exp': config.ops_exp,
+                'log': config.ops_log,
+                'arithmetic': config.ops_arithmetic,
+                'aggregation': config.ops_aggregation,
+            }
+            op_constraints = {k: v for k, v in op_constraints.items() if v is not None}
+
+        # Fast path is optional, but guided evolution always runs unless
+        # --fast-path-only is requested.
+        if getattr(config, 'use_curve_classifier', False) or getattr(config, 'fast_path_only', False):
             fast_path_result = run_fast_path(
                 x_tensor, y_tensor,
                 classifier_path=getattr(config, 'curve_classifier_model', None) or "models/curve_classifier_v3.1.pt",
@@ -668,13 +671,11 @@ def run_single_mode(config: Config):
                 op_constraints=op_constraints,
                 auto_expand=True,
             )
-            
+
             if fast_path_result and fast_path_result['mse'] < 0.01:
-                # Check if this is an EXACT symbolic match or approximation
                 is_exact = fast_path_result.get('details', {}).get('exact_match', False)
-                
+
                 if is_exact:
-                    # Fast path found exact symbolic match - we're done!
                     elapsed = time.time() - start_time
                     print("\n" + "=" * 70)
                     print("FINAL RESULTS (FAST PATH - EXACT MATCH)")
@@ -688,73 +689,117 @@ def run_single_mode(config: Config):
                     print("=" * 70)
                     return
 
-                # Fast-path only: return after printing best fast-path result
-                if config.fast_path_only:
+            if config.fast_path_only:
+                if fast_path_result:
                     print("\n" + "=" * 70)
                     print("FINAL RESULTS (FAST PATH ONLY)")
                     print("=" * 70)
                     print(f"TARGET:     {config.formula}")
                     print(f"DISCOVERED: {fast_path_result['formula']}")
                     print(f"FINAL MSE:  {fast_path_result['mse']:.6f}")
-                    print("(Note: Fast-path only mode; evolution skipped)")
+                    print("(Note: Fast-path only mode; guided evolution skipped)")
                     print("\n" + "=" * 70)
                     return
 
-                # Fast path found approximation - try guided evolution for exact form
-                print(f"\nFast path found APPROXIMATION (MSE={fast_path_result['mse']:.4f})")
-                print("Attempting GUIDED EVOLUTION to find exact symbolic form...")
-                
-                operator_hints = fast_path_result.get('operator_hints', {})
-                if operator_hints and operator_hints.get('operators'):
-                    guided_result = run_guided_evolution(
-                        x_tensor, y_tensor,
-                        operator_hints,
-                        generations=30,
-                        population_size=25,
-                        device=str(tester.device),
-                        visualizer=visualizer,
-                    )
-                    
-                    if guided_result and guided_result['mse'] < fast_path_result['mse']:
-                        # Guided evolution found better result
-                        elapsed = time.time() - start_time
-                        print("\n" + "=" * 70)
-                        print("FINAL RESULTS (GUIDED EVOLUTION)")
-                        print("=" * 70)
-                        print(f"TARGET:     {config.formula}")
-                        print(f"FAST-PATH:  {fast_path_result['formula']}")
-                        print(f"EVOLVED:    {guided_result['formula']}")
-                        print(f"FINAL MSE:  {guided_result['mse']:.6f}")
-                        print()
-                        print("=" * 70)
-                        print(f"TOTAL TIME: {elapsed:.2f} seconds (GUIDED)")
-                        print("=" * 70)
-                        return
-                    else:
-                        # Guided evolution didn't improve - use fast-path result
-                        elapsed = time.time() - start_time
-                        print("\n" + "=" * 70)
-                        print("FINAL RESULTS (FAST PATH - APPROXIMATION)")
-                        print("=" * 70)
-                        print(f"TARGET:     {config.formula}")
-                        print(f"DISCOVERED: {fast_path_result['formula']}")
-                        print(f"FINAL MSE:  {fast_path_result['mse']:.6f}")
-                        print("(Note: This is an approximation, not exact symbolic form)")
-                        print()
-                        print("=" * 70)
-                        print(f"TOTAL TIME: {elapsed:.2f} seconds (FAST PATH)")
-                        print("=" * 70)
-                        return
-                else:
-                    # No operator hints - fall through to full evolution
-                    print("No operator hints extracted, falling back to full evolution...")
-            elif fast_path_result:
-                print(f"\nFast path MSE ({fast_path_result['mse']:.4f}) > 0.01, falling back to evolution...")
-        except Exception as e:
-            import traceback
-            print(f"Fast path error: {e}")
-            traceback.print_exc()
-            print("Falling back to evolution...")
+                print("Fast-path only mode requested, but fast path produced no candidate.")
+                return {'formula': None, 'mse': float('inf'), 'time_seconds': time.time() - start_time}
+
+            if fast_path_result:
+                print(f"\nFast path candidate found (MSE={fast_path_result['mse']:.4f}).")
+                print("Running GUIDED EVOLUTION on the same latest path for final refinement...")
+            else:
+                print("\nFast path had no usable candidate; continuing with GUIDED EVOLUTION (latest path)...")
+
+        # Build guided hints even if fast path failed so all formulas use
+        # the same latest beam-search route.
+        operator_hints = fast_path_result.get('operator_hints', {}) if fast_path_result else {}
+        operator_hints = dict(operator_hints) if operator_hints else {}
+        operator_hints['operators'] = set(operator_hints.get('operators', set()))
+        operator_hints['frequencies'] = list(operator_hints.get('frequencies', detected_omegas or []))
+        operator_hints['powers'] = list(operator_hints.get('powers', []))
+        operator_hints['has_rational'] = bool(operator_hints.get('has_rational', False))
+        operator_hints['has_exp_decay'] = bool(operator_hints.get('has_exp_decay', False))
+        operator_hints['active_terms'] = list(operator_hints.get('active_terms', []))
+
+        # Respect explicit operator constraints for guided evolution priors.
+        ops = operator_hints['operators']
+        if config.ops_periodic is False:
+            ops.discard('periodic')
+            ops.discard('sin')
+            ops.discard('cos')
+            operator_hints['frequencies'] = []
+        elif config.ops_periodic is True:
+            ops.add('periodic')
+
+        if config.ops_power is False:
+            ops.discard('power')
+            ops.discard('sqrt')
+            ops.discard('rational')
+            operator_hints['powers'] = []
+            operator_hints['has_rational'] = False
+        elif config.ops_power is True:
+            ops.add('power')
+
+        if config.ops_exp is False:
+            ops.discard('exp')
+            operator_hints['has_exp_decay'] = False
+        elif config.ops_exp is True:
+            ops.add('exp')
+
+        if config.ops_log is False:
+            ops.discard('log')
+        elif config.ops_log is True:
+            ops.add('log')
+
+        guided_result = run_guided_evolution(
+            x_tensor, y_tensor,
+            operator_hints,
+            generations=max(20, config.generations),
+            population_size=max(20, config.population),
+            device=str(tester.device),
+            visualizer=visualizer,
+        )
+
+        if guided_result and guided_result.get('formula'):
+            elapsed = time.time() - start_time
+            guided_formula = postprocess_formula(guided_result['formula'], label="Guided", verbose=True)
+
+            print("\n" + "=" * 70)
+            print("FINAL RESULTS (GUIDED EVOLUTION)")
+            print("=" * 70)
+            print(f"TARGET:     {config.formula}")
+            if fast_path_result and fast_path_result.get('formula'):
+                print(f"FAST-PATH:  {fast_path_result['formula']}")
+            print(f"DISCOVERED: {sanitize_formula(guided_formula)}")
+            print(f"FINAL MSE:  {guided_result['mse']:.6f}")
+            print()
+            print("=" * 70)
+            print(f"TOTAL TIME: {elapsed:.2f} seconds (GUIDED)")
+            print("=" * 70)
+
+            return {'formula': guided_formula, 'mse': guided_result['mse'], 'time_seconds': elapsed}
+
+        if fast_path_result:
+            elapsed = time.time() - start_time
+            print("\nGuided evolution returned no formula; using fast-path candidate from latest pipeline.")
+            print("\n" + "=" * 70)
+            print("FINAL RESULTS (FAST PATH CANDIDATE)")
+            print("=" * 70)
+            print(f"TARGET:     {config.formula}")
+            print(f"DISCOVERED: {fast_path_result['formula']}")
+            print(f"FINAL MSE:  {fast_path_result['mse']:.6f}")
+            print()
+            print("=" * 70)
+            print(f"TOTAL TIME: {elapsed:.2f} seconds")
+            print("=" * 70)
+            return {'formula': fast_path_result['formula'], 'mse': fast_path_result['mse'], 'time_seconds': elapsed}
+
+        print("Latest guided path produced no result; falling back to legacy evolution pipeline...")
+    except Exception as e:
+        import traceback
+        print(f"Latest-path pipeline error: {e}")
+        traceback.print_exc()
+        print("Falling back to legacy evolution pipeline...")
     
     # Phase 1: Structure Discovery (if fast path didn't succeed)
     print("\n" + "=" * 70)

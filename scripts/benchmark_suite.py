@@ -8,7 +8,8 @@ formulas of increasing complexity, organized into 8 difficulty tiers.
 Usage:
   python scripts/benchmark_suite.py                                    # Full suite (fast-path only)
   python scripts/benchmark_suite.py --tier 1                           # Only tier 1
-  python scripts/benchmark_suite.py --with-evolution                   # Include evolution fallback
+    python scripts/benchmark_suite.py --with-evolution                   # Include guided evolution (latest path)
+    python scripts/benchmark_suite.py --evolution-only                   # Guided evolution only (skip fast-path)
   python scripts/benchmark_suite.py --classifier-model models/v3.pt   # Custom model
   python scripts/benchmark_suite.py --output-dir results/              # Custom output dir
 
@@ -42,7 +43,7 @@ _REPO_ROOT = _SCRIPT_DIR.parent
 sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_SCRIPT_DIR))
 
-from classifier_fast_path import run_fast_path  # noqa: E402
+from classifier_fast_path import run_fast_path, run_guided_evolution  # noqa: E402
 from glassbox.sr.evolution import detect_dominant_frequency  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -410,8 +411,9 @@ def run_formula(
     device: Optional[str] = None,
     timeout: float = 60.0,
     with_evolution: bool = False,
+    evolution_only: bool = False,
 ) -> Dict[str, Any]:
-    """Run the fast-path pipeline on a single formula and return result dict."""
+    """Run fast-path and/or guided evolution on a single formula."""
     x_min, x_max = x_range
     result = {
         "formula_target": formula_str,
@@ -440,85 +442,107 @@ def run_formula(
         except Exception:
             detected_omegas = None
 
-        # Run fast path
-        t0 = time.time()
-        fp_result = run_fast_path(
-            x_2d, y_2d,
-            classifier_path=classifier_path,
-            detected_omegas=detected_omegas,
-            op_constraints=None,
-            auto_expand=True,
-            device=device,
-            exact_match_threads=1,
-            exact_match_enabled=True,
-            exact_match_max_basis=150,
-        )
-        elapsed = time.time() - t0
-
-        if fp_result is None:
-            result["error"] = "fast_path_not_applicable"
-            result["time"] = elapsed
-        else:
-            result["formula_discovered"] = fp_result.get("formula", "")
-            result["mse"] = fp_result.get("mse", float("inf"))
-            result["time"] = elapsed
-            str_term_count = _count_terms(result["formula_discovered"])
-            details = fp_result.get("details", {}) if isinstance(fp_result, dict) else {}
-            structural_terms = details.get("n_nonzero", 0)
-            simplified_terms = details.get("n_nonzero_simplified", 0)
-            result["n_terms"] = max(
-                int(str_term_count),
-                int(structural_terms) if structural_terms is not None else 0,
-                int(simplified_terms) if simplified_terms is not None else 0,
+        # Run fast path unless evolution-only mode is requested.
+        fp_result = None
+        elapsed = 0.0
+        if not evolution_only:
+            t0 = time.time()
+            fp_result = run_fast_path(
+                x_2d, y_2d,
+                classifier_path=classifier_path,
+                detected_omegas=detected_omegas,
+                op_constraints=None,
+                auto_expand=True,
+                device=device,
+                exact_match_threads=1,
+                exact_match_enabled=True,
+                exact_match_max_basis=150,
             )
-            
-            # -----------------------------------------------------------------
-            # Evolution Fallback (Phase 1 + 2)
-            # -----------------------------------------------------------------
-            # If we didn't get an EXACT match, and evolution is enabled
-            if with_evolution and (result["mse"] >= 1e-6 or result["n_terms"] > 5):
-                print(f"\n  [Fallback] Fast-path approximate (MSE={result['mse']:.2e}). Running C++ Evolution...")
-                try:
-                    from glassbox.sr.evolution import EvolutionaryONNTrainer
-                    from glassbox.sr.operation_dag import OperationDAG
-                    
-                    def make_model() -> OperationDAG:
-                        return OperationDAG(
-                            n_inputs=1,
-                            n_hidden_layers=2,
-                            nodes_per_layer=4,
-                            n_outputs=1,
-                            simplified_ops=True,
-                            fair_mode=True,
-                        )
-                    
-                    trainer = EvolutionaryONNTrainer(
-                        model_factory=make_model,
-                        population_size=100,
-                        device=device or "cuda",
-                        use_curve_classifier=False, # We already ran fast-path
-                        lamarckian=True,
-                        prune_coefficients=False,
-                    )
-                    
-                    # Ensure device matches
-                    actual_device = torch.device(device if device else ('cuda' if torch.cuda.is_available() else 'cpu'))
-                    
-                    # Re-run evolution
-                    t1 = time.time()
-                    evo_results = trainer.train(x_t.reshape(-1, 1).to(actual_device), y_t.reshape(-1, 1).to(actual_device), generations=2000)
-                    
-                    # For benchmark, we just take the raw C++ output
-                    
-                    evo_mse = evo_results.get("final_mse", float("inf"))
-                    if evo_mse < result["mse"]:
-                        result["formula_discovered"] = evo_results.get("formula", "")
-                        result["mse"] = evo_mse
-                        result["time"] = elapsed + (time.time() - t1)
-                        result["n_terms"] = _count_terms(result["formula_discovered"])
-                except Exception as eval_err:
-                    print(f"  [Evolution Fallback Error: {eval_err}]", end="")
-                    pass
+            elapsed = time.time() - t0
+
+            if fp_result is None:
+                result["error"] = "fast_path_not_applicable"
+                result["time"] = elapsed
+            else:
+                result["formula_discovered"] = fp_result.get("formula", "")
+                result["mse"] = fp_result.get("mse", float("inf"))
+                result["time"] = elapsed
+                str_term_count = _count_terms(result["formula_discovered"])
+                details = fp_result.get("details", {}) if isinstance(fp_result, dict) else {}
+                structural_terms = details.get("n_nonzero", 0)
+                simplified_terms = details.get("n_nonzero_simplified", 0)
+                result["n_terms"] = max(
+                    int(str_term_count),
+                    int(structural_terms) if structural_terms is not None else 0,
+                    int(simplified_terms) if simplified_terms is not None else 0,
+                )
+        else:
+            result["time"] = 0.0
+
+        # -----------------------------------------------------------------
+        # Guided Evolution (latest path with beam search)
+        # -----------------------------------------------------------------
+        should_run_guided = evolution_only or (
+            with_evolution and (
+                fp_result is None or
+                result["mse"] is None or
+                not math.isfinite(result["mse"]) or
+                result["mse"] >= 1e-6 or
+                result["n_terms"] > 5
+            )
+        )
+
+        if should_run_guided:
+            if evolution_only:
+                print("\n  [Evolution Only] Skipping fast-path. Running guided evolution (beam search)...")
+            elif fp_result is None:
+                print("\n  [Latest Path] Fast-path not applicable. Running guided evolution (beam search)...")
+            else:
+                print(f"\n  [Latest Path] Fast-path candidate (MSE={result['mse']:.2e}). Running guided evolution (beam search)...")
+
+            # Build hints from fast-path output when available; otherwise,
+            # use conservative defaults and FFT frequencies.
+            operator_hints = fp_result.get("operator_hints", {}) if fp_result else {}
+            operator_hints = dict(operator_hints) if operator_hints else {}
+            operator_hints["operators"] = set(operator_hints.get("operators", set()))
+            operator_hints["frequencies"] = list(operator_hints.get("frequencies", detected_omegas or []))
+            operator_hints["powers"] = list(operator_hints.get("powers", []))
+            operator_hints["has_rational"] = bool(operator_hints.get("has_rational", False))
+            operator_hints["has_exp_decay"] = bool(operator_hints.get("has_exp_decay", False))
+            operator_hints["active_terms"] = list(operator_hints.get("active_terms", []))
+
+            t1 = time.time()
+            try:
+                guided_result = run_guided_evolution(
+                    x_2d,
+                    y_2d,
+                    operator_hints,
+                    generations=40,
+                    population_size=30,
+                    device=device or "cpu",
+                    visualizer=None,
+                )
+
+                guided_elapsed = time.time() - t1
+                base_elapsed = result["time"] if result["time"] is not None else elapsed
+                result["time"] = base_elapsed + guided_elapsed
+
+                if guided_result and guided_result.get("formula"):
+                    guided_formula = guided_result.get("formula", "")
+                    guided_mse = guided_result.get("mse", float("inf"))
+                    baseline_mse = result["mse"] if result["mse"] is not None else float("inf")
+
+                    if evolution_only or fp_result is None or guided_mse < baseline_mse:
+                        result["formula_discovered"] = guided_formula
+                        result["mse"] = guided_mse
+                        result["n_terms"] = _count_terms(guided_formula)
+                        result["error"] = None
+                elif evolution_only or fp_result is None:
+                    result["error"] = "guided_evolution_failed"
+            except Exception as guided_err:
+                if evolution_only or fp_result is None:
+                    result["error"] = f"guided_evolution_error: {guided_err}"
+                print(f"  [Guided Evolution Error: {guided_err}]", end="")
 
     except Exception as e:
         result["error"] = str(e)
@@ -796,7 +820,11 @@ Examples:
     )
     parser.add_argument(
         "--with-evolution", action="store_true",
-        help="Run evolution fallback if fast-path fails to find an exact match",
+        help="Run latest guided evolution (beam-search path) when fast-path is not exact",
+    )
+    parser.add_argument(
+        "--evolution-only", action="store_true",
+        help="Skip fast-path and run latest guided evolution (beam-search path) for every formula",
     )
     parser.add_argument(
         "--tier", type=int, action="append", default=None, dest="tiers",
@@ -840,6 +868,10 @@ Examples:
     )
     args = parser.parse_args()
 
+    if args.cpp_evolution_only and args.evolution_only:
+        print("Error: --cpp-evolution-only and --evolution-only cannot be used together.")
+        sys.exit(1)
+
     # Resolve device
     device = args.device
     if device == "auto":
@@ -876,14 +908,21 @@ Examples:
     print("=" * 90)
     print("GLASSBOX SR BENCHMARK SUITE")
     print("=" * 90)
-    mode_str = "C++ Evolution Only" if args.cpp_evolution_only else "Classifier Fast-Path"
-    print(f"  Mode:        {mode_str}")
-    if not args.cpp_evolution_only:
-        print(f"  Classifier:  {args.classifier_model}")
-        print("  Strategy:    optimized")
+    if args.cpp_evolution_only:
+        mode_str = "C++ Evolution Only"
+    elif args.evolution_only:
+        mode_str = "Guided Evolution Only (latest path)"
     else:
+        mode_str = "Classifier Fast-Path"
+    print(f"  Mode:        {mode_str}")
+    if args.cpp_evolution_only:
         print(f"  Pop size:    {args.pop_size}")
         print(f"  Generations: {args.generations}")
+    elif args.evolution_only:
+        print("  Strategy:    guided beam-search evolution")
+    else:
+        print(f"  Classifier:  {args.classifier_model}")
+        print("  Strategy:    optimized")
     print(f"  Device:      {device}")
     print(f"  Tiers:       {tiers_to_run}")
     print(f"  Formulas:    {total_formulas}")
@@ -925,6 +964,7 @@ Examples:
                     device=device,
                     timeout=args.timeout,
                     with_evolution=args.with_evolution,
+                    evolution_only=args.evolution_only,
                 )
 
             result["human_name"] = human_name
