@@ -377,6 +377,57 @@ def _count_terms(formula: str) -> int:
     return terms
 
 
+def _normalize_formula_text(formula: str) -> str:
+    """Normalize common unicode/operator variants to a parser-friendly form."""
+    if not formula:
+        return formula
+    return (
+        formula
+        .replace('²', '^2')
+        .replace('³', '^3')
+        .replace('·', '*')
+        .replace('⋅', '*')
+        .replace('×', '*')
+        .replace('π', 'pi')
+        .replace('√', 'sqrt')
+        .replace('φ', 'phi')
+        .replace('ω', 'omega')
+    )
+
+
+def _postprocess_formula(formula: str) -> str:
+    """Apply the same simplify_formula pipeline used by fast-path outputs."""
+    normalized = _normalize_formula_text(formula)
+    if not normalized or normalized in {"N/A", "ERROR", "?"}:
+        return normalized
+
+    try:
+        try:
+            from simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+        except ImportError:
+            from scripts.simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+
+        formula_len = len(normalized)
+        term_estimate = max(1, len([t for t in re.split(r'\s*[+-]\s*', normalized) if t.strip()]))
+        too_complex_for_symbolic = formula_len > 500 or term_estimate > 24
+
+        if too_complex_for_symbolic:
+            return snap_formula_floats(
+                normalized,
+                SnapConfig(int_tol=1e-5, zero_tol=1e-8),
+            )
+
+        _, simplified_expr = simplify_onn_formula(
+            normalized,
+            int_tol=1e-5,
+            zero_tol=1e-8,
+            use_nsimplify=(formula_len <= 300 and term_estimate <= 16),
+        )
+        return str(simplified_expr)
+    except Exception:
+        return normalized
+
+
 def score_result(mse: float, formula: str) -> str:
     """Classify a result as EXACT / APPROX / LOOSE / FAIL."""
     if mse is None or not math.isfinite(mse):
@@ -429,6 +480,23 @@ def run_formula(
     try:
         # Generate data
         x_np, y_np = _generate_data(formula_str, x_min, x_max, n_samples)
+
+        # Early return for constant targets. This avoids evolution-only
+        # degenerating to formula "0" on flat signals.
+        y_std = np.std(y_np)
+        if y_std < 1e-10:
+            const_val = float(np.mean(y_np))
+            if abs(const_val - round(const_val)) < 1e-6:
+                formula = str(int(round(const_val)))
+            else:
+                formula = f"{const_val:.6g}"
+            formula = _postprocess_formula(formula)
+            result["formula_discovered"] = formula
+            result["mse"] = 0.0
+            result["time"] = 0.0
+            result["n_terms"] = _count_terms(formula)
+            result["score"] = score_result(0.0, formula)
+            return result
 
         # Convert to torch
         x_t = torch.tensor(x_np, dtype=torch.float32)
@@ -528,7 +596,7 @@ def run_formula(
                 result["time"] = base_elapsed + guided_elapsed
 
                 if guided_result and guided_result.get("formula"):
-                    guided_formula = guided_result.get("formula", "")
+                    guided_formula = _postprocess_formula(guided_result.get("formula", ""))
                     guided_mse = guided_result.get("mse", float("inf"))
                     baseline_mse = result["mse"] if result["mse"] is not None else float("inf")
 
@@ -596,6 +664,7 @@ def run_formula_cpp_evolution(
                 formula = str(int(round(const_val)))
             else:
                 formula = f"{const_val:.6g}"
+            formula = _postprocess_formula(formula)
             result["formula_discovered"] = formula
             result["mse"] = 0.0
             result["time"] = elapsed
@@ -627,7 +696,7 @@ def run_formula_cpp_evolution(
         )
         elapsed = time.time() - t0
         
-        result["formula_discovered"] = cpp_result.get("formula", "")
+        result["formula_discovered"] = _postprocess_formula(cpp_result.get("formula", ""))
         result["mse"] = cpp_result.get("best_mse", float("inf"))
         result["time"] = elapsed
         result["n_terms"] = _count_terms(result["formula_discovered"])
