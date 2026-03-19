@@ -20,6 +20,9 @@ py::dict run_evolution_cpp(
     double early_stop_mse,
     py::list seed_omegas = py::list(),
     py::list op_priors = py::list(),
+    // Power exponent bounds
+    double p_min = -2.0,
+    double p_max = 3.0,
     // P5: NSGA-II
     bool use_nsga2 = false,
     // P6: Island Model
@@ -77,6 +80,8 @@ py::dict run_evolution_cpp(
     config.generations = generations;
     config.early_stop_mse = early_stop_mse;
     config.op_priors = cpp_op_priors;
+    config.p_min = p_min;
+    config.p_max = p_max;
     config.use_nsga2 = use_nsga2;
     config.num_islands = num_islands;
     config.migration_interval = migration_interval;
@@ -161,6 +166,8 @@ PYBIND11_MODULE(_core, m) {
           py::arg("X_list"), py::arg("y"), py::arg("pop_size")=50, py::arg("generations")=1000, 
           py::arg("early_stop_mse")=1e-6, py::arg("seed_omegas")=py::list(),
           py::arg("op_priors")=py::list(),
+                    py::arg("p_min")=-2.0,
+                    py::arg("p_max")=3.0,
           py::arg("use_nsga2")=false,
           py::arg("num_islands")=1,
           py::arg("migration_interval")=25,

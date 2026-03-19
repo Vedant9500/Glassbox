@@ -2115,6 +2115,66 @@ def beam_search_evolution(
     has_power = 'power' in operators
     has_exp = 'exp' in operators
     has_log = 'log' in operators
+
+    def _estimate_polynomial_signature(
+        x_values: np.ndarray,
+        y_values: np.ndarray,
+        max_degree: int = 8,
+    ) -> Tuple[bool, int, float]:
+        """Return (is_poly_like, best_degree, relative_mse) from a quick poly fit."""
+        if x_values.size < max_degree + 2:
+            return (False, 0, float('inf'))
+        try:
+            x_span = float(np.max(x_values) - np.min(x_values))
+            x_scaled = (x_values - float(np.mean(x_values))) / max(0.5 * x_span, 1e-8)
+            y_var = max(float(np.var(y_values)), 1e-12)
+
+            best_degree = 1
+            best_mse = float('inf')
+            mse_by_degree: List[Tuple[int, float]] = []
+            for degree in range(1, max_degree + 1):
+                coeffs = np.polyfit(x_scaled, y_values, degree)
+                pred = np.polyval(coeffs, x_scaled)
+                mse = float(np.mean((pred - y_values) ** 2))
+                mse_by_degree.append((degree, mse))
+                if np.isfinite(mse) and mse < best_mse:
+                    best_degree = degree
+                    best_mse = mse
+
+            # Prefer the smallest degree that is effectively exact. This avoids
+            # always returning max_degree when multiple degrees fit near machine precision.
+            effective_degree = best_degree
+            for degree, mse in mse_by_degree:
+                if (mse / y_var) < 1e-11:
+                    effective_degree = degree
+                    break
+
+            relative_mse = best_mse / y_var
+            is_poly_like = effective_degree >= 2 and relative_mse < 1e-11
+            return (is_poly_like, effective_degree, relative_mse)
+        except Exception:
+            return (False, 0, float('inf'))
+
+    hinted_max_power = 0.0
+    for power in powers:
+        try:
+            hinted_max_power = max(hinted_max_power, abs(float(power)))
+        except Exception:
+            continue
+
+    poly_like_data, poly_degree, poly_rel_mse = _estimate_polynomial_signature(x_np, y_np)
+    hint_poly_only = has_power and not (has_sin or has_exp or has_log)
+    polynomial_mode = bool(poly_like_data or hint_poly_only or hinted_max_power > 3.0)
+
+    adaptive_p_min = -2.0
+    adaptive_p_max = 3.0
+    if polynomial_mode:
+        target_power = max(float(poly_degree), hinted_max_power)
+        if target_power > 3.0:
+            # Keep one exponent of headroom so x^k can refine without clamping.
+            adaptive_p_max = min(8.0, max(4.0, float(math.ceil(target_power + 1.0))))
+        elif hint_poly_only and hinted_max_power > 0.0:
+            adaptive_p_max = min(8.0, max(4.0, float(math.ceil(hinted_max_power + 1.0))))
     
     # Build classifier-guided op_priors base
     # Op order: [Periodic, Power, Exp, Log]
@@ -2135,115 +2195,82 @@ def beam_search_evolution(
     # ── Generate initial beam configurations ──
     def make_beam_configs(n: int, round_idx: int = 0):
         configs = []
+
+        def add_config(
+            op_priors_cfg: List[float],
+            seed_omegas_cfg: List[float],
+            pop_size_cfg: int,
+            generations_cfg: int,
+            label_cfg: str,
+        ) -> None:
+            configs.append({
+                'op_priors': op_priors_cfg,
+                'seed_omegas': seed_omegas_cfg,
+                'pop_size': max(10, int(pop_size_cfg)),
+                'generations': max(10, int(generations_cfg)),
+                'p_min': adaptive_p_min,
+                'p_max': adaptive_p_max,
+                'label': label_cfg,
+            })
         
         # 1. Classifier-guided (primary hypothesis)
-        configs.append({
-            'op_priors': classifier_priors,
-            'seed_omegas': fft_freqs,
-            'pop_size': base_pop_size,
-            'generations': base_generations,
-            'label': 'classifier-guided',
-        })
+        add_config(classifier_priors, fft_freqs, base_pop_size, base_generations, 'classifier-guided')
         
         # 2. Sin-heavy
-        configs.append({
-            'op_priors': [0.8, 0.1, 0.05, 0.05],
-            'seed_omegas': fft_freqs or [1.0, 2.0, 3.0],
-            'pop_size': base_pop_size,
-            'generations': base_generations,
-            'label': 'sin-heavy',
-        })
+        add_config([0.8, 0.1, 0.05, 0.05], fft_freqs or [1.0, 2.0, 3.0], base_pop_size, base_generations, 'sin-heavy')
         
         # 3. Power-heavy
-        configs.append({
-            'op_priors': [0.1, 0.8, 0.05, 0.05],
-            'seed_omegas': [],
-            'pop_size': base_pop_size,
-            'generations': base_generations,
-            'label': 'power-heavy',
-        })
+        add_config([0.1, 0.8, 0.05, 0.05], [], base_pop_size, base_generations, 'power-heavy')
+
+        if polynomial_mode and adaptive_p_max > 3.0:
+            add_config(
+                [0.04, 0.92, 0.02, 0.02],
+                [],
+                base_pop_size,
+                int(base_generations * 1.4),
+                'poly-high-power',
+            )
+            add_config(
+                [0.02, 0.95, 0.02, 0.01],
+                [],
+                max(18, base_pop_size // 2),
+                int(base_generations * 2.0),
+                'poly-depth',
+            )
         
         # 4. Exp-heavy
-        configs.append({
-            'op_priors': [0.05, 0.1, 0.8, 0.05],
-            'seed_omegas': [],
-            'pop_size': base_pop_size,
-            'generations': base_generations,
-            'label': 'exp-heavy',
-        })
+        add_config([0.05, 0.1, 0.8, 0.05], [], base_pop_size, base_generations, 'exp-heavy')
         
         # 5. Uniform exploration
-        configs.append({
-            'op_priors': [0.25, 0.25, 0.25, 0.25],
-            'seed_omegas': fft_freqs,
-            'pop_size': base_pop_size,
-            'generations': base_generations,
-            'label': 'uniform',
-        })
+        add_config([0.25, 0.25, 0.25, 0.25], fft_freqs, base_pop_size, base_generations, 'uniform')
         
         # 6. Sin+Power combo (common case like x^2 + sin(x))
-        configs.append({
-            'op_priors': [0.45, 0.45, 0.05, 0.05],
-            'seed_omegas': fft_freqs or [1.0, 2.0],
-            'pop_size': base_pop_size,
-            'generations': base_generations,
-            'label': 'sin+power',
-        })
+        add_config([0.45, 0.45, 0.05, 0.05], fft_freqs or [1.0, 2.0], base_pop_size, base_generations, 'sin+power')
         
         # 7. Exp+Sin combo (damped oscillation)
-        configs.append({
-            'op_priors': [0.4, 0.1, 0.4, 0.1],
-            'seed_omegas': fft_freqs or [1.0, 3.0],
-            'pop_size': base_pop_size,
-            'generations': base_generations,
-            'label': 'exp+sin',
-        })
+        add_config([0.4, 0.1, 0.4, 0.1], fft_freqs or [1.0, 3.0], base_pop_size, base_generations, 'exp+sin')
         
         # 8-11. Integer harmonic frequency variants
         for i, harmonics in enumerate(integer_harmonics):
-            configs.append({
-                'op_priors': classifier_priors,
-                'seed_omegas': [float(h) for h in harmonics],
-                'pop_size': base_pop_size,
-                'generations': base_generations // 2,  # Quick search
-                'label': f'harmonics-{harmonics}',
-            })
+            add_config(
+                classifier_priors,
+                [float(h) for h in harmonics],
+                base_pop_size,
+                base_generations // 2,
+                f'harmonics-{harmonics}',
+            )
         
         # 12. Pi-based frequencies
-        configs.append({
-            'op_priors': classifier_priors,
-            'seed_omegas': pi_freqs,
-            'pop_size': base_pop_size,
-            'generations': base_generations // 2,
-            'label': 'pi-freqs',
-        })
+        add_config(classifier_priors, pi_freqs, base_pop_size, base_generations // 2, 'pi-freqs')
         
         # 13. No priors (pure uniform random)
-        configs.append({
-            'op_priors': [],
-            'seed_omegas': [],
-            'pop_size': base_pop_size,
-            'generations': base_generations,
-            'label': 'no-priors',
-        })
+        add_config([], [], base_pop_size, base_generations, 'no-priors')
         
         # 14. Large population, fewer gens (breadth-first)
-        configs.append({
-            'op_priors': classifier_priors,
-            'seed_omegas': fft_freqs,
-            'pop_size': base_pop_size * 2,
-            'generations': base_generations // 3,
-            'label': 'breadth-first',
-        })
+        add_config(classifier_priors, fft_freqs, base_pop_size * 2, base_generations // 3, 'breadth-first')
         
         # 15. Small population, more gens (depth-first)
-        configs.append({
-            'op_priors': classifier_priors,
-            'seed_omegas': fft_freqs,
-            'pop_size': max(15, base_pop_size // 3),
-            'generations': base_generations * 2,
-            'label': 'depth-first',
-        })
+        add_config(classifier_priors, fft_freqs, max(15, base_pop_size // 3), base_generations * 2, 'depth-first')
         
         # 16-20. Random perturbations of classifier priors
         rng = np.random.RandomState(42 + round_idx)
@@ -2258,13 +2285,7 @@ def beam_search_evolution(
             n_pick = rng.randint(1, min(4, len(all_omegas) + 1))
             picked = list(rng.choice(all_omegas, size=n_pick, replace=False))
             
-            configs.append({
-                'op_priors': blended,
-                'seed_omegas': picked,
-                'pop_size': base_pop_size,
-                'generations': base_generations,
-                'label': f'random-{len(configs)}',
-            })
+            add_config(blended, picked, base_pop_size, base_generations, f'random-{len(configs)}')
         
         return configs[:n]
     
@@ -2279,6 +2300,8 @@ def beam_search_evolution(
                 early_stop_mse=1e-10,
                 seed_omegas=config['seed_omegas'],
                 op_priors=config['op_priors'],
+                p_min=float(config.get('p_min', -2.0)),
+                p_max=float(config.get('p_max', 3.0)),
             )
             return (result['best_mse'], result, config)
         except Exception as e:
@@ -2312,6 +2335,12 @@ def beam_search_evolution(
             new['generations'] = int(config['generations'] * rng.uniform(0.7, 1.5))
         if rng.random() < 0.3:
             new['pop_size'] = max(15, int(config['pop_size'] * rng.uniform(0.7, 1.3)))
+
+        if polynomial_mode and rng.random() < 0.4:
+            p_max = float(new.get('p_max', adaptive_p_max))
+            p_max += float(rng.choice([-1.0, 0.0, 1.0]))
+            new['p_max'] = float(np.clip(p_max, 3.0, 8.0))
+            new['p_min'] = min(float(new.get('p_min', adaptive_p_min)), new['p_max'] - 0.5)
         
         return new
     
@@ -2323,6 +2352,12 @@ def beam_search_evolution(
     print(f"  Rounds: {n_rounds}")
     print(f"  Keep fraction: {keep_fraction}")
     print(f"  Base config: pop={base_pop_size}, gens={base_generations}")
+    print(f"  Power bounds: [{adaptive_p_min:.1f}, {adaptive_p_max:.1f}]")
+    if polynomial_mode:
+        print(
+            f"  Polynomial mode: on (deg={poly_degree}, rel={poly_rel_mse:.2e}, "
+            f"hinted_max_power={hinted_max_power:.2f})"
+        )
     
     best_overall_mse = float('inf')
     best_overall_result = None

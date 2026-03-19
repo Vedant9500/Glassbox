@@ -480,6 +480,19 @@ private:
                     if (runif(rng_) < 0.6 || i < n_inputs + 1) {
                         node.type = NodeType::Unary;
                         node.unary_op = sample_unary_op();
+                        if (node.unary_op == UnaryOp::Power && runif(rng_) < 0.7) {
+                            const double power_candidates[] = {-1.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0};
+                            std::vector<double> valid_powers;
+                            for (double candidate : power_candidates) {
+                                if (candidate >= config_.p_min && candidate <= config_.p_max) {
+                                    valid_powers.push_back(candidate);
+                                }
+                            }
+                            if (!valid_powers.empty()) {
+                                std::uniform_int_distribution<int> p_dist(0, static_cast<int>(valid_powers.size()) - 1);
+                                node.p = valid_powers[p_dist(rng_)];
+                            }
+                        }
                         std::uniform_int_distribution<int> child_dist(0, i - 1);
                         node.left_child = child_dist(rng_);
                     } else {
@@ -650,9 +663,17 @@ private:
             
             // If wrapping with Power, use interesting exponents
             if (wrap_node.unary_op == UnaryOp::Power) {
-                double powers[] = {0.5, 2.0, 3.0, -1.0, 1.5};
-                std::uniform_int_distribution<int> pow_dist(0, 4);
-                wrap_node.p = powers[pow_dist(rng_)];
+                const double power_candidates[] = {-1.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0};
+                std::vector<double> valid_powers;
+                for (double candidate : power_candidates) {
+                    if (candidate >= config_.p_min && candidate <= config_.p_max) {
+                        valid_powers.push_back(candidate);
+                    }
+                }
+                if (!valid_powers.empty()) {
+                    std::uniform_int_distribution<int> pow_dist(0, static_cast<int>(valid_powers.size()) - 1);
+                    wrap_node.p = valid_powers[pow_dist(rng_)];
+                }
             }
             // If wrapping with Periodic, seed useful frequencies
             if (wrap_node.unary_op == UnaryOp::Periodic) {
