@@ -14,6 +14,7 @@ Usage:
   python scripts/benchmark_suite.py --output-dir results/              # Custom output dir
 
 Scoring:
+    Uses displayed-formula MSE only for scoring; raw MSE is diagnostic.
   EXACT   — MSE < 1e-6  AND  ≤ 5 terms
   APPROX  — MSE < 0.01
   LOOSE   — MSE < 0.1
@@ -428,6 +429,68 @@ def _postprocess_formula(formula: str) -> str:
         return normalized
 
 
+def _evaluate_formula_mse(formula: str, x: np.ndarray, y: np.ndarray) -> Optional[float]:
+    """Evaluate displayed formula against ground truth data and return MSE."""
+    if not formula:
+        return None
+    normalized = _normalize_formula_text(formula)
+    if not normalized or normalized in {"N/A", "ERROR", "?"}:
+        return None
+
+    try:
+        fn = _parse_formula(normalized)
+        y_pred = fn(x)
+    except Exception:
+        return None
+
+    if y_pred.shape != y.shape:
+        try:
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(y.shape)
+        except Exception:
+            return None
+
+    mask = np.isfinite(y_pred) & np.isfinite(y)
+    if mask.sum() < 10:
+        return None
+
+    mse = float(np.mean((y_pred[mask] - y[mask]) ** 2))
+    if not math.isfinite(mse):
+        return None
+    return mse
+
+
+def _select_score_mse(mse_display: Optional[float]) -> Optional[float]:
+    """Choose MSE for scoring: use displayed-formula MSE only."""
+    if mse_display is not None and math.isfinite(mse_display):
+        return float(mse_display)
+    return None
+
+
+def _mse_divergence_stats(mse_display: Optional[float], mse_raw: Optional[float]) -> Dict[str, Any]:
+    """Return absolute/relative raw-vs-display MSE divergence diagnostics."""
+    out = {
+        "mse_divergence_abs": None,
+        "mse_divergence_rel": None,
+        "mse_divergence_flag": False,
+    }
+    if (
+        mse_display is None
+        or mse_raw is None
+        or not math.isfinite(mse_display)
+        or not math.isfinite(mse_raw)
+    ):
+        return out
+
+    abs_gap = abs(float(mse_raw) - float(mse_display))
+    denom = max(abs(float(mse_display)), 1e-12)
+    rel_gap = abs_gap / denom
+    out["mse_divergence_abs"] = abs_gap
+    out["mse_divergence_rel"] = rel_gap
+    # Conservative threshold: flag when discrepancy is large enough to affect ranking.
+    out["mse_divergence_flag"] = rel_gap > 0.10
+    return out
+
+
 def score_result(mse: float, formula: str) -> str:
     """Classify a result as EXACT / APPROX / LOOSE / FAIL."""
     if mse is None or not math.isfinite(mse):
@@ -471,10 +534,15 @@ def run_formula(
         "x_range": list(x_range),
         "formula_discovered": "",
         "mse": None,
+        "mse_raw": None,
+        "mse_display": None,
         "time": None,
         "score": "FAIL",
         "error": None,
         "n_terms": 0,
+        "mse_divergence_abs": None,
+        "mse_divergence_rel": None,
+        "mse_divergence_flag": False,
     }
 
     try:
@@ -492,6 +560,8 @@ def run_formula(
                 formula = f"{const_val:.6g}"
             formula = _postprocess_formula(formula)
             result["formula_discovered"] = formula
+            result["mse_raw"] = 0.0
+            result["mse_display"] = 0.0
             result["mse"] = 0.0
             result["time"] = 0.0
             result["n_terms"] = _count_terms(formula)
@@ -533,7 +603,12 @@ def run_formula(
                 result["time"] = elapsed
             else:
                 result["formula_discovered"] = fp_result.get("formula", "")
-                result["mse"] = fp_result.get("mse", float("inf"))
+                result["mse_raw"] = fp_result.get("mse", float("inf"))
+                result["mse_display"] = _evaluate_formula_mse(result["formula_discovered"], x_np, y_np)
+                result["mse"] = _select_score_mse(result["mse_display"])
+                result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
+                if result["formula_discovered"] and result["mse_display"] is None and result["error"] is None:
+                    result["error"] = "formula_eval_failed"
                 result["time"] = elapsed
                 str_term_count = _count_terms(result["formula_discovered"])
                 details = fp_result.get("details", {}) if isinstance(fp_result, dict) else {}
@@ -597,20 +672,39 @@ def run_formula(
 
                 if guided_result and guided_result.get("formula"):
                     guided_formula = _postprocess_formula(guided_result.get("formula", ""))
-                    guided_mse = guided_result.get("mse", float("inf"))
+                    guided_mse_raw = guided_result.get("mse", float("inf"))
+                    guided_mse_display = _evaluate_formula_mse(guided_formula, x_np, y_np)
+                    guided_mse_score = _select_score_mse(guided_mse_display)
+                    guided_mse_for_compare = (
+                        guided_mse_score if guided_mse_score is not None else float("inf")
+                    )
                     baseline_mse = result["mse"] if result["mse"] is not None else float("inf")
 
-                    if evolution_only or fp_result is None or guided_mse < baseline_mse:
+                    if evolution_only or fp_result is None or guided_mse_for_compare < baseline_mse:
                         result["formula_discovered"] = guided_formula
-                        result["mse"] = guided_mse
+                        result["mse_raw"] = guided_mse_raw
+                        result["mse_display"] = guided_mse_display
+                        result["mse"] = guided_mse_for_compare
+                        result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
+                        if result["formula_discovered"] and result["mse_display"] is None:
+                            result["error"] = "formula_eval_failed"
+                        else:
+                            result["error"] = None
                         result["n_terms"] = _count_terms(guided_formula)
-                        result["error"] = None
                 elif evolution_only or fp_result is None:
                     result["error"] = "guided_evolution_failed"
             except Exception as guided_err:
                 if evolution_only or fp_result is None:
                     result["error"] = f"guided_evolution_error: {guided_err}"
                 print(f"  [Guided Evolution Error: {guided_err}]", end="")
+
+        if result["formula_discovered"]:
+            if result["mse_display"] is None:
+                result["mse_display"] = _evaluate_formula_mse(result["formula_discovered"], x_np, y_np)
+            result["mse"] = _select_score_mse(result["mse_display"])
+            result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
+            if result["formula_discovered"] and result["mse_display"] is None and result["error"] is None:
+                result["error"] = "formula_eval_failed"
 
     except Exception as e:
         result["error"] = str(e)
@@ -639,10 +733,15 @@ def run_formula_cpp_evolution(
         "x_range": list(x_range),
         "formula_discovered": "",
         "mse": None,
+        "mse_raw": None,
+        "mse_display": None,
         "time": None,
         "score": "FAIL",
         "error": None,
         "n_terms": 0,
+        "mse_divergence_abs": None,
+        "mse_divergence_rel": None,
+        "mse_divergence_flag": False,
     }
     
     try:
@@ -666,6 +765,8 @@ def run_formula_cpp_evolution(
                 formula = f"{const_val:.6g}"
             formula = _postprocess_formula(formula)
             result["formula_discovered"] = formula
+            result["mse_raw"] = 0.0
+            result["mse_display"] = 0.0
             result["mse"] = 0.0
             result["time"] = elapsed
             result["n_terms"] = 1
@@ -697,7 +798,12 @@ def run_formula_cpp_evolution(
         elapsed = time.time() - t0
         
         result["formula_discovered"] = _postprocess_formula(cpp_result.get("formula", ""))
-        result["mse"] = cpp_result.get("best_mse", float("inf"))
+        result["mse_raw"] = cpp_result.get("best_mse", float("inf"))
+        result["mse_display"] = _evaluate_formula_mse(result["formula_discovered"], x_np, y_np)
+        result["mse"] = _select_score_mse(result["mse_display"])
+        result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
+        if result["formula_discovered"] and result["mse_display"] is None and result["error"] is None:
+            result["error"] = "formula_eval_failed"
         result["time"] = elapsed
         result["n_terms"] = _count_terms(result["formula_discovered"])
         
@@ -807,8 +913,8 @@ def generate_markdown_report(
         tier_name = ALL_TIERS[tier_num][0]
         results = all_results[tier_num]
         lines.append(f"\n## Tier {tier_num}: {tier_name}\n")
-        lines.append("| # | Score | Target | Discovered | MSE | Time | Terms |")
-        lines.append("|---|-------|--------|------------|-----|------|-------|")
+        lines.append("| # | Score | Target | Discovered | MSE(score) | MSE(raw) | MSE(display) | Time | Terms |")
+        lines.append("|---|-------|--------|------------|------------|----------|--------------|------|-------|")
 
         for i, r in enumerate(results, 1):
             sym = SCORE_SYMBOLS.get(r["score"], "?")
@@ -817,12 +923,20 @@ def generate_markdown_report(
             if len(disc) > 50:
                 disc = disc[:47] + "..."
             mse_s = f"{r['mse']:.2e}" if r["mse"] is not None and math.isfinite(r["mse"]) else "—"
+            mse_raw = r.get("mse_raw")
+            mse_raw_s = f"{mse_raw:.2e}" if mse_raw is not None and math.isfinite(mse_raw) else "—"
+            mse_display = r.get("mse_display")
+            mse_display_s = (
+                f"{mse_display:.2e}" if mse_display is not None and math.isfinite(mse_display) else "—"
+            )
             time_s = f"{r['time']:.2f}s" if r["time"] is not None else "—"
             n_terms = r.get("n_terms", 0)
             err = r.get("error", "")
             if err:
                 disc = f"ERROR: {err[:40]}"
-            lines.append(f"| {i} | {sym} | `{target}` | `{disc}` | {mse_s} | {time_s} | {n_terms} |")
+            lines.append(
+                f"| {i} | {sym} | `{target}` | `{disc}` | {mse_s} | {mse_raw_s} | {mse_display_s} | {time_s} | {n_terms} |"
+            )
 
     output_path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -1042,6 +1156,16 @@ Examples:
             if not args.quiet:
                 sym = SCORE_SYMBOLS.get(result["score"], "?")
                 mse_s = f"MSE={result['mse']:.2e}" if result["mse"] is not None and math.isfinite(result["mse"]) else "N/A     "
+                mse_raw = result.get("mse_raw")
+                if (
+                    mse_raw is not None and
+                    math.isfinite(mse_raw) and
+                    result["mse"] is not None and
+                    math.isfinite(result["mse"])
+                ):
+                    drift = abs(math.log10((mse_raw + 1e-30) / (result["mse"] + 1e-30)))
+                    if drift > 1.0:
+                        mse_s = f"{mse_s} (raw={mse_raw:.2e})"
                 time_s = f"{result['time']:.2f}s" if result["time"] is not None else "—    "
                 disc = result.get("formula_discovered", "")
                 if len(disc) > 40:

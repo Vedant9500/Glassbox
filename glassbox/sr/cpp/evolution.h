@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <fstream>
+#include <string>
+#include <sstream>
 
 #include <omp.h>
 
@@ -62,6 +65,11 @@ struct EvolutionConfig {
     std::vector<std::vector<double>> input_units;  // Per-feature unit exponents
     std::vector<double> output_units;              // Target variable units
     double dim_penalty_weight = 0.1;
+
+    // Trace logging (JSONL)
+    bool enable_trace = false;
+    std::string trace_path;
+    bool trace_include_formulas = false;
 };
 
 class EvolutionEngine {
@@ -72,6 +80,14 @@ public:
                     const std::vector<double>& seed_omegas = {})
         : config_(config), X_(X), y_(y), seed_omegas_(seed_omegas), rng_(std::random_device{}()) {
     sanitize_config();
+
+        if (config_.enable_trace && !config_.trace_path.empty()) {
+            trace_stream_.open(config_.trace_path, std::ios::out | std::ios::trunc);
+            if (trace_stream_.is_open()) {
+                trace_enabled_ = true;
+                trace_event("run.start", -1);
+            }
+        }
 
         // Normalize op_priors if provided
         if (!config_.op_priors.empty()) {
@@ -97,6 +113,7 @@ public:
         for (auto& ind : population_) {
             refine_constants(ind);
         }
+        trace_event("init.refined", -1);
         
         double current_structural_mutation_rate = config_.mutation_rate_structural;
         double best_mse_history = 1e9;
@@ -104,6 +121,7 @@ public:
 
         for (int gen = 0; gen < config_.generations; ++gen) {
             evaluate_population();
+            trace_event("generation.post_eval", gen);
             
             // P5: NSGA-II selection or standard sort
             if (config_.use_nsga2) {
@@ -125,7 +143,7 @@ public:
                     } else if (config_.elite_size >= 2 && roll < 0.15 + config_.crossover_rate) {
                         int p1 = p_dist(rng_), p2 = p_dist(rng_);
                         while (p2 == p1) p2 = p_dist(rng_);
-                        child = crossover(population_[p1], population_[p2]);
+                        child = crossover_with_retry(population_[p1], population_[p2], 3);
                         child = mutate_lamarckian(child, current_structural_mutation_rate * 0.3);
                     } else {
                         child = mutate_lamarckian(population_[p_dist(rng_)], current_structural_mutation_rate);
@@ -169,6 +187,7 @@ public:
             }
 
             if (config_.use_early_stop && best_overall_.raw_mse < config_.early_stop_mse && best_overall_.nodes.size() <= 8) {
+                trace_event("run.early_stop", gen);
                 break; // Exact algebraic match found that is simple
             }
             
@@ -202,7 +221,7 @@ public:
                     int p1 = parent_dist(rng_);
                     int p2 = parent_dist(rng_);
                     while (p2 == p1) p2 = parent_dist(rng_); // ensure distinct parents
-                    child = crossover(population_[p1], population_[p2]);
+                    child = crossover_with_retry(population_[p1], population_[p2], 3);
                     // Light mutation on crossover children for diversity
                     child = mutate_lamarckian(child, current_structural_mutation_rate * 0.3);
                 } else {
@@ -250,10 +269,13 @@ public:
                     refine_inner_params(population_[i]);
                 }
             }
+
+            trace_event("generation.post_reproduce", gen);
         }
         
         // Post-evolution cleanup: deduplicate + prune the best graph
         cleanup_graph(best_overall_);
+        trace_event("run.end", -1);
     }
     
     IndividualGraph get_best() const {
@@ -415,6 +437,74 @@ private:
     std::vector<double> op_cdf_; // CDF for prior-weighted op sampling
     
     std::mt19937 rng_;
+    std::ofstream trace_stream_;
+    bool trace_enabled_ = false;
+    bool last_crossover_valid_ = false;
+
+    static std::string json_escape(const std::string& s) {
+        std::string out;
+        out.reserve(s.size());
+        for (char c : s) {
+            switch (c) {
+                case '"': out += "\\\""; break;
+                case '\\': out += "\\\\"; break;
+                case '\b': out += "\\b"; break;
+                case '\f': out += "\\f"; break;
+                case '\n': out += "\\n"; break;
+                case '\r': out += "\\r"; break;
+                case '\t': out += "\\t"; break;
+                default:
+                    if (static_cast<unsigned char>(c) < 0x20) out += "?";
+                    else out += c;
+            }
+        }
+        return out;
+    }
+
+    void trace_event(const char* event, int generation) {
+        if (!trace_enabled_) return;
+
+        trace_stream_ << "{\"event\":\"" << event << "\"";
+        if (generation >= 0) trace_stream_ << ",\"generation\":" << generation;
+
+        if (!population_.empty()) {
+            const auto best_it = std::min_element(
+                population_.begin(), population_.end(),
+                [](const IndividualGraph& a, const IndividualGraph& b) { return a.fitness < b.fitness; }
+            );
+            trace_stream_ << ",\"best_fitness\":" << best_it->fitness;
+            trace_stream_ << ",\"best_raw_mse\":" << best_it->raw_mse;
+            trace_stream_ << ",\"best_complexity\":" << best_it->complexity();
+            trace_stream_ << ",\"best_nodes\":" << best_it->nodes.size();
+        }
+
+        trace_stream_ << ",\"population\":[";
+        for (size_t i = 0; i < population_.size(); ++i) {
+            const auto& ind = population_[i];
+            if (i) trace_stream_ << ",";
+            trace_stream_ << "{\"idx\":" << i
+                          << ",\"fitness\":" << ind.fitness
+                          << ",\"raw_mse\":" << ind.raw_mse
+                          << ",\"complexity\":" << ind.complexity()
+                          << ",\"nodes\":" << ind.nodes.size()
+                          << ",\"age\":" << ind.age;
+            if (config_.trace_include_formulas) {
+                std::string formula = get_formula_string(ind, static_cast<int>(X_.size()));
+                trace_stream_ << ",\"formula\":\"" << json_escape(formula) << "\"";
+            }
+            trace_stream_ << "}";
+        }
+        trace_stream_ << "]";
+
+        trace_stream_ << ",\"best_overall_fitness\":" << best_overall_.fitness;
+        trace_stream_ << ",\"best_overall_raw_mse\":" << best_overall_.raw_mse;
+        if (config_.trace_include_formulas && !best_overall_.nodes.empty()) {
+            std::string best_formula = get_formula_string(best_overall_, static_cast<int>(X_.size()));
+            trace_stream_ << ",\"best_overall_formula\":\"" << json_escape(best_formula) << "\"";
+        }
+        trace_stream_ << "}\n";
+        trace_stream_.flush();
+    }
 
     void sanitize_config() {
         config_.pop_size = std::max(1, config_.pop_size);
@@ -738,6 +828,7 @@ private:
     // Swaps a contiguous subtree between two parents to produce one child.
     // A "subtree" here is all nodes reachable from a selected crossover point.
     IndividualGraph crossover(const IndividualGraph& parent_a, const IndividualGraph& parent_b) {
+        last_crossover_valid_ = false;
         IndividualGraph child = parent_a; // Start from parent A
 
         if (parent_a.nodes.size() < 3 || parent_b.nodes.size() < 3) {
@@ -783,11 +874,17 @@ private:
             // Adjust child pointers by the offset
             if (donated.left_child >= 0) {
                 int new_left = donated.left_child + offset;
-                donated.left_child = std::clamp(new_left, 0, static_cast<int>(xo_a + subtree_b.size()) - 1);
+                if (new_left < 0 || new_left >= static_cast<int>(xo_a + subtree_b.size())) {
+                    return parent_a;
+                }
+                donated.left_child = new_left;
             }
             if (donated.right_child >= 0) {
                 int new_right = donated.right_child + offset;
-                donated.right_child = std::clamp(new_right, 0, static_cast<int>(xo_a + subtree_b.size()) - 1);
+                if (new_right < 0 || new_right >= static_cast<int>(xo_a + subtree_b.size())) {
+                    return parent_a;
+                }
+                donated.right_child = new_right;
             }
             new_nodes.push_back(donated);
         }
@@ -799,27 +896,33 @@ private:
             OpNode n = parent_a.nodes[i];
             // Adjust child pointers for the size change
             if (n.left_child >= xo_a) {
-                n.left_child = std::clamp(n.left_child + size_diff, 0, static_cast<int>(new_nodes.size()) + static_cast<int>(parent_a.nodes.size()) - end_of_subtree_a - 1);
+                int shifted = n.left_child + size_diff;
+                if (shifted < 0) return parent_a;
+                n.left_child = shifted;
             }
             if (n.right_child >= xo_a) {
-                n.right_child = std::clamp(n.right_child + size_diff, 0, static_cast<int>(new_nodes.size()) + static_cast<int>(parent_a.nodes.size()) - end_of_subtree_a - 1);
+                int shifted = n.right_child + size_diff;
+                if (shifted < 0) return parent_a;
+                n.right_child = shifted;
             }
             new_nodes.push_back(n);
         }
 
         // Safety: cap graph size to prevent bloat
         if (new_nodes.size() > 30) {
-            new_nodes.resize(30);
+            return parent_a;
         }
 
-        // Fix any dangling child pointers
+        // Reject offspring that violate DAG invariants; do not silently repair.
         int total = static_cast<int>(new_nodes.size());
         for (int i = 0; i < total; ++i) {
-            auto& n = new_nodes[i];
-            if (n.left_child >= total) n.left_child = std::max(0, i - 1);
-            if (n.right_child >= total) n.right_child = std::max(0, i - 1);
-            if (n.left_child >= i && (n.type == NodeType::Unary || n.type == NodeType::Binary)) n.left_child = std::max(0, i - 1);
-            if (n.right_child >= i && n.type == NodeType::Binary) n.right_child = std::max(0, i - 1);
+            const auto& n = new_nodes[i];
+            if ((n.type == NodeType::Unary || n.type == NodeType::Binary)) {
+                if (n.left_child < 0 || n.left_child >= i) return parent_a;
+            }
+            if (n.type == NodeType::Binary) {
+                if (n.right_child < 0 || n.right_child >= i) return parent_a;
+            }
         }
 
         child.nodes = std::move(new_nodes);
@@ -833,6 +936,21 @@ private:
 
         child.fitness = 1e9; // Mark for re-evaluation
         child.raw_mse = 1e9;
+        last_crossover_valid_ = true;
+        return child;
+    }
+
+    IndividualGraph crossover_with_retry(const IndividualGraph& parent_a,
+                                         const IndividualGraph& parent_b,
+                                         int max_attempts = 3) {
+        IndividualGraph child = parent_a;
+        int attempts = std::max(1, max_attempts);
+        for (int i = 0; i < attempts; ++i) {
+            child = crossover(parent_a, parent_b);
+            if (last_crossover_valid_) {
+                return child;
+            }
+        }
         return child;
     }
 
@@ -1717,7 +1835,7 @@ private:
                 int p1 = parent_dist(rng_);
                 int p2 = parent_dist(rng_);
                 while (p2 == p1) p2 = parent_dist(rng_);
-                child = crossover(population_[p1], population_[p2]);
+                child = crossover_with_retry(population_[p1], population_[p2], 3);
                 child = mutate_lamarckian(child, current_structural_mutation_rate * 0.3);
             } else {
                 int parent_idx = parent_dist(rng_);

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <algorithm>
 #include <iostream>
+#include <array>
 
 // MSVC fallbacks for M_PI and M_E
 #ifndef M_PI
@@ -16,6 +17,55 @@
 #endif
 
 namespace sr {
+
+inline double& arithmetic_temperature_ref() {
+    static double t = 5.0;
+    return t;
+}
+
+inline void set_arithmetic_temperature(double t) {
+    // Keep temperature in a numerically stable range.
+    arithmetic_temperature_ref() = std::clamp(t, 0.1, 100.0);
+}
+
+inline double get_arithmetic_temperature() {
+    return arithmetic_temperature_ref();
+}
+
+inline double stabilized_tau(double tau) {
+    constexpr double kMinAbsTau = 1e-3;
+    if (std::abs(tau) >= kMinAbsTau) return tau;
+    return (tau >= 0.0) ? kMinAbsTau : -kMinAbsTau;
+}
+
+inline double power_sign_blend(double p) {
+    // Only treat near-integers as parity-sensitive; otherwise use sign-preserving power.
+    double p_round = std::round(p);
+    if (std::abs(p - p_round) < 1e-6) {
+        long long p_int = static_cast<long long>(p_round);
+        return (p_int % 2 == 0) ? 1.0 : 0.0;
+    }
+    return 0.0;
+}
+
+inline std::array<double, 4> arithmetic_soft_weights(const OpNode& node) {
+    double d_add = (node.beta - 1.0) * (node.beta - 1.0) + (node.gamma - 1.0) * (node.gamma - 1.0);
+    double d_mul = (node.beta - 2.0) * (node.beta - 2.0) + (node.gamma - 1.0) * (node.gamma - 1.0);
+    double d_div = (node.beta - 2.0) * (node.beta - 2.0) + (node.gamma + 1.0) * (node.gamma + 1.0);
+    double d_sub = (node.beta - 1.0) * (node.beta - 1.0) + (node.gamma + 1.0) * (node.gamma + 1.0);
+
+    double t = get_arithmetic_temperature();
+    double max_logit = std::max({-d_add * t, -d_mul * t, -d_div * t, -d_sub * t});
+    double w_add = std::exp(-d_add * t - max_logit);
+    double w_mul = std::exp(-d_mul * t - max_logit);
+    double w_div = std::exp(-d_div * t - max_logit);
+    double w_sub = std::exp(-d_sub * t - max_logit);
+    double sum_w = w_add + w_mul + w_div + w_sub;
+    if (sum_w <= 0.0 || !std::isfinite(sum_w)) {
+        return {0.25, 0.25, 0.25, 0.25};
+    }
+    return {w_add / sum_w, w_mul / sum_w, w_div / sum_w, w_sub / sum_w};
+}
 
 // Evaluates the output of a single graph given feature columns X
 inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::vector<Eigen::ArrayXd>& X, int num_samples) {
@@ -55,10 +105,8 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                         auto abs_x = x.abs() + 1e-6;
                         auto sign_x = x.sign();
                         auto abs_pow = abs_x.pow(node.p);
-                        
-                        // MSVC sometimes misses M_PI even with _USE_MATH_DEFINES, define it explicitly
-                        const double pi = 3.14159265358979323846;
-                        double is_even = 0.5 * (1.0 + std::cos(node.p * pi));
+
+                        double is_even = power_sign_blend(node.p);
                         cache[i] = (1.0 - is_even) * (sign_x * abs_pow) + is_even * abs_pow;
                         // Clamp
                         cache[i] = cache[i].max(-100.0).min(100.0);
@@ -82,35 +130,19 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                 
                 switch (node.binary_op) {
                     case BinaryOp::Arithmetic: {
-                        // Equivalent to MetaArithmeticExtended
-                        double d_add = (node.beta - 1.0)*(node.beta - 1.0) + (node.gamma - 1.0)*(node.gamma - 1.0);
-                        double d_mul = (node.beta - 2.0)*(node.beta - 2.0) + (node.gamma - 1.0)*(node.gamma - 1.0);
-                        double d_div = (node.beta - 2.0)*(node.beta - 2.0) + (node.gamma + 1.0)*(node.gamma + 1.0);
-                        double d_sub = (node.beta - 1.0)*(node.beta - 1.0) + (node.gamma + 1.0)*(node.gamma + 1.0);
-                        
-                        // Softmax over distances
-                        double t = 5.0;
-                        double max_logit = std::max({-d_add*t, -d_mul*t, -d_div*t, -d_sub*t});
-                        double w_add = std::exp(-d_add*t - max_logit);
-                        double w_mul = std::exp(-d_mul*t - max_logit);
-                        double w_div = std::exp(-d_div*t - max_logit);
-                        double w_sub = std::exp(-d_sub*t - max_logit);
-                        double sum_w = w_add + w_mul + w_div + w_sub;
-                        
-                        w_add /= sum_w; w_mul /= sum_w; w_div /= sum_w; w_sub /= sum_w;
-                        
+                        auto w = arithmetic_soft_weights(node);
                         auto res_add = x + y;
                         auto res_sub = x - y;
                         auto res_mul = x * y;
                         auto res_div = x / (y.abs() + 1e-6) * y.sign();
-                        
-                        cache[i] = (w_add * res_add + w_mul * res_mul + w_div * res_div + w_sub * res_sub).max(-100.0).min(100.0);
+
+                        cache[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-100.0).min(100.0);
                         break;
                     }
                     case BinaryOp::Aggregation: {
                         // Simplification for MetaAggregation (just simple sum here to avoid complexity of tau-softmax)
                         // In full implementation we might need full softmax over stacked (x,y)
-                        double local_tau = std::abs(node.tau) < 0.01 ? (node.tau > 0 ? 0.01 : -0.01) : node.tau;
+                        double local_tau = stabilized_tau(node.tau);
                         auto max_val = x.max(y);
                         auto exp_x = ((x - max_val) / local_tau).exp();
                         auto exp_y = ((y - max_val) / local_tau).exp();
@@ -166,10 +198,8 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                         auto abs_x = x.abs() + 1e-6;
                         auto sign_x = x.sign();
                         auto abs_pow = abs_x.pow(node.p);
-                        
-                        // MSVC sometimes misses M_PI even with _USE_MATH_DEFINES, define it explicitly
-                        const double pi = 3.14159265358979323846;
-                        double is_even = 0.5 * (1.0 + std::cos(node.p * pi));
+
+                        double is_even = power_sign_blend(node.p);
                         cache_out[i] = (1.0 - is_even) * (sign_x * abs_pow) + is_even * abs_pow;
                         // Clamp
                         cache_out[i] = cache_out[i].max(-100.0).min(100.0);
@@ -193,35 +223,19 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                 
                 switch (node.binary_op) {
                     case BinaryOp::Arithmetic: {
-                        // Equivalent to MetaArithmeticExtended
-                        double d_add = (node.beta - 1.0)*(node.beta - 1.0) + (node.gamma - 1.0)*(node.gamma - 1.0);
-                        double d_mul = (node.beta - 2.0)*(node.beta - 2.0) + (node.gamma - 1.0)*(node.gamma - 1.0);
-                        double d_div = (node.beta - 2.0)*(node.beta - 2.0) + (node.gamma + 1.0)*(node.gamma + 1.0);
-                        double d_sub = (node.beta - 1.0)*(node.beta - 1.0) + (node.gamma + 1.0)*(node.gamma + 1.0);
-                        
-                        // Softmax over distances
-                        double t = 5.0;
-                        double max_logit = std::max({-d_add*t, -d_mul*t, -d_div*t, -d_sub*t});
-                        double w_add = std::exp(-d_add*t - max_logit);
-                        double w_mul = std::exp(-d_mul*t - max_logit);
-                        double w_div = std::exp(-d_div*t - max_logit);
-                        double w_sub = std::exp(-d_sub*t - max_logit);
-                        double sum_w = w_add + w_mul + w_div + w_sub;
-                        
-                        w_add /= sum_w; w_mul /= sum_w; w_div /= sum_w; w_sub /= sum_w;
-                        
+                        auto w = arithmetic_soft_weights(node);
                         auto res_add = x + y;
                         auto res_sub = x - y;
                         auto res_mul = x * y;
                         auto res_div = x / (y.abs() + 1e-6) * y.sign();
-                        
-                        cache_out[i] = (w_add * res_add + w_mul * res_mul + w_div * res_div + w_sub * res_sub).max(-100.0).min(100.0);
+
+                        cache_out[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-100.0).min(100.0);
                         break;
                     }
                     case BinaryOp::Aggregation: {
                         // Simplification for MetaAggregation (just simple sum here to avoid complexity of tau-softmax)
                         // In full implementation we might need full softmax over stacked (x,y)
-                        double local_tau = std::abs(node.tau) < 0.01 ? (node.tau > 0 ? 0.01 : -0.01) : node.tau;
+                        double local_tau = stabilized_tau(node.tau);
                         auto max_val = x.max(y);
                         auto exp_x = ((x - max_val) / local_tau).exp();
                         auto exp_y = ((y - max_val) / local_tau).exp();
@@ -304,8 +318,7 @@ inline Eigen::ArrayXd evaluate_graph_cached(const IndividualGraph& graph,
                         auto abs_x = x.abs() + 1e-6;
                         auto sign_x = x.sign();
                         auto abs_pow = abs_x.pow(node.p);
-                        const double pi = 3.14159265358979323846;
-                        double is_even = 0.5 * (1.0 + std::cos(node.p * pi));
+                        double is_even = power_sign_blend(node.p);
                         cache_out[i] = (1.0 - is_even) * (sign_x * abs_pow) + is_even * abs_pow;
                         cache_out[i] = cache_out[i].max(-100.0).min(100.0);
                         break;
@@ -326,27 +339,16 @@ inline Eigen::ArrayXd evaluate_graph_cached(const IndividualGraph& graph,
                 const auto& y = cache_out[node.right_child];
                 switch (node.binary_op) {
                     case BinaryOp::Arithmetic: {
-                        double d_add = (node.beta - 1.0)*(node.beta - 1.0) + (node.gamma - 1.0)*(node.gamma - 1.0);
-                        double d_mul = (node.beta - 2.0)*(node.beta - 2.0) + (node.gamma - 1.0)*(node.gamma - 1.0);
-                        double d_div = (node.beta - 2.0)*(node.beta - 2.0) + (node.gamma + 1.0)*(node.gamma + 1.0);
-                        double d_sub = (node.beta - 1.0)*(node.beta - 1.0) + (node.gamma + 1.0)*(node.gamma + 1.0);
-                        double t = 5.0;
-                        double max_logit = std::max({-d_add*t, -d_mul*t, -d_div*t, -d_sub*t});
-                        double w_add = std::exp(-d_add*t - max_logit);
-                        double w_mul = std::exp(-d_mul*t - max_logit);
-                        double w_div = std::exp(-d_div*t - max_logit);
-                        double w_sub = std::exp(-d_sub*t - max_logit);
-                        double sum_w = w_add + w_mul + w_div + w_sub;
-                        w_add /= sum_w; w_mul /= sum_w; w_div /= sum_w; w_sub /= sum_w;
+                        auto w = arithmetic_soft_weights(node);
                         auto res_add = x + y;
                         auto res_sub = x - y;
                         auto res_mul = x * y;
                         auto res_div = x / (y.abs() + 1e-6) * y.sign();
-                        cache_out[i] = (w_add * res_add + w_mul * res_mul + w_div * res_div + w_sub * res_sub).max(-100.0).min(100.0);
+                        cache_out[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-100.0).min(100.0);
                         break;
                     }
                     case BinaryOp::Aggregation: {
-                        double local_tau = std::abs(node.tau) < 0.01 ? (node.tau > 0 ? 0.01 : -0.01) : node.tau;
+                        double local_tau = stabilized_tau(node.tau);
                         auto max_val = x.max(y);
                         auto exp_x = ((x - max_val) / local_tau).exp();
                         auto exp_y = ((y - max_val) / local_tau).exp();
@@ -468,17 +470,33 @@ inline std::string format_node_to_string(const IndividualGraph& graph, int node_
             
             switch (node.binary_op) {
                 case BinaryOp::Arithmetic: {
-                    // Find largest weight
-                    double d_add = (node.beta - 1.0)*(node.beta - 1.0) + (node.gamma - 1.0)*(node.gamma - 1.0);
-                    double d_mul = (node.beta - 2.0)*(node.beta - 2.0) + (node.gamma - 1.0)*(node.gamma - 1.0);
-                    double d_div = (node.beta - 2.0)*(node.beta - 2.0) + (node.gamma + 1.0)*(node.gamma + 1.0);
-                    double d_sub = (node.beta - 1.0)*(node.beta - 1.0) + (node.gamma + 1.0)*(node.gamma + 1.0);
-                    
-                    double min_dist = std::min({d_add, d_mul, d_div, d_sub});
-                    if (min_dist == d_add) return "(" + l_str + " + " + r_str + ")";
-                    if (min_dist == d_sub) return "(" + l_str + " - " + r_str + ")";
-                    if (min_dist == d_mul) return "(" + l_str + " * " + r_str + ")";
-                    if (min_dist == d_div) return "(" + l_str + " / " + r_str + ")";
+                    auto w = arithmetic_soft_weights(node);
+                    constexpr double kNearDiscrete = 0.98;
+                    double max_w = std::max({w[0], w[1], w[2], w[3]});
+                    if (max_w >= kNearDiscrete) {
+                        if (max_w == w[0]) return "(" + l_str + " + " + r_str + ")";
+                        if (max_w == w[3]) return "(" + l_str + " - " + r_str + ")";
+                        if (max_w == w[1]) return "(" + l_str + " * " + r_str + ")";
+                        return "(" + l_str + " / " + r_str + ")";
+                    }
+
+                    std::string blend = "(";
+                    bool first = true;
+                    auto append_term = [&](double ww, const std::string& expr) {
+                        if (ww < 1e-3) return;
+                        char wbuf[64];
+                        snprintf(wbuf, sizeof(wbuf), "%.3g", ww);
+                        if (!first) blend += " + ";
+                        blend += std::string(wbuf) + "*" + expr;
+                        first = false;
+                    };
+                    append_term(w[0], "(" + l_str + " + " + r_str + ")");
+                    append_term(w[1], "(" + l_str + " * " + r_str + ")");
+                    append_term(w[2], "(" + l_str + " / " + r_str + ")");
+                    append_term(w[3], "(" + l_str + " - " + r_str + ")");
+                    if (first) return "(" + l_str + " + " + r_str + ")";
+                    blend += ")";
+                    return blend;
                     break;
                 }
                 case BinaryOp::Aggregation:

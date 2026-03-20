@@ -2087,6 +2087,13 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         
         # Evaluate all individuals (main + explorers)
         all_individuals = self.population + (self.explorers if self.use_explorers else [])
+
+        def _add_if_finite(base: float, value: float, weight: float = 1.0) -> float:
+            """Safely add a weighted scalar term only when it is finite."""
+            term = weight * value
+            if math.isfinite(term):
+                return base + term
+            return base
         
         for ind in all_individuals:
             # TIER 3: Skip re-evaluation of elite individuals that weren't mutated
@@ -2100,8 +2107,23 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 if not getattr(ind, '_refined_this_gen', False):
                     # Need y with proper shape for quick_refine_internal
                     y_for_refine = y.unsqueeze(-1) if y.dim() == 1 else y
-                    quick_refine_internal(ind.model, x, y_for_refine, 
-                                         steps=self.nested_bfgs_steps)
+                    refine_loss = quick_refine_internal(
+                        ind.model,
+                        x,
+                        y_for_refine,
+                        steps=self.nested_bfgs_steps,
+                    )
+                    # Deterministic fallback path when internal L-BFGS fails.
+                    if not math.isfinite(refine_loss):
+                        refine_constants(
+                            ind.model,
+                            x,
+                            y_for_refine,
+                            steps=max(5, self.nested_bfgs_steps),
+                            lr=0.01,
+                            use_lbfgs=False,
+                            hard=True,
+                        )
                     ind._refined_this_gen = True
             
             ind.model.eval()
@@ -2119,19 +2141,23 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                         # Add complexity penalty (BIC-inspired parsimony)
                         complexity = calculate_complexity(ind.model)
                         ind.complexity = complexity
-                        fitness = mse + self.complexity_penalty * complexity
+                        if not math.isfinite(complexity):
+                            ind.fitness = float('inf')
+                            continue
+
+                        fitness = _add_if_finite(mse, complexity, self.complexity_penalty)
                         
                         # Coefficient sparsity penalty (Hoyer-inspired)
                         # INCREASED: Stronger sparsity encourages fewer output terms
                         sparsity = coefficient_sparsity_loss(ind.model).item()
-                        fitness = fitness + 0.05 * sparsity
+                        fitness = _add_if_finite(fitness, sparsity, 0.05)
                         
                         # Entropy regularization with ANNEALED weight (Tier 1)
                         # Mild early (allow exploration), strong late (force discrete)
                         if current_entropy_weight > 0 and hasattr(ind.model, 'entropy_regularization'):
                             try:
                                 entropy = ind.model.entropy_regularization().item()
-                                fitness = fitness + current_entropy_weight * entropy
+                                fitness = _add_if_finite(fitness, entropy, current_entropy_weight)
                             except Exception:
                                 pass
                         
@@ -2140,11 +2166,11 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                         if self.progressive_round_weight > 0:
                             try:
                                 round_loss = progressive_round_loss(ind.model).item()
-                                fitness = fitness + self.progressive_round_weight * round_loss
+                                fitness = _add_if_finite(fitness, round_loss, self.progressive_round_weight)
                             except Exception:
                                 pass
-                        
-                        ind.fitness = fitness
+
+                        ind.fitness = fitness if math.isfinite(fitness) else float('inf')
             except Exception:
                 ind.fitness = float('inf')
                 ind.raw_mse = float('inf')
@@ -2499,12 +2525,49 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             # We return early. The PyTorch loop is deprecated by the C++ core.
             
             formula = result.get('formula', '0')
+            display_mse = None
+            try:
+                from sympy import Symbol, sympify
+                from sympy.utilities.lambdify import lambdify
+
+                x_np = x.detach().cpu().numpy()
+                y_np = y.detach().cpu().numpy().reshape(-1)
+                if x_np.ndim == 1:
+                    x_np = x_np.reshape(-1, 1)
+
+                n_features = x_np.shape[1]
+                local_symbols = {"x": Symbol("x")}
+                for i in range(n_features):
+                    local_symbols[f"x{i}"] = Symbol(f"x{i}")
+
+                expr = sympify(formula.replace("^", "**"), locals=local_symbols)
+                if n_features == 1:
+                    fn = lambdify(local_symbols["x"], expr, modules=["numpy"])
+                    y_pred = fn(x_np[:, 0])
+                else:
+                    args = [local_symbols[f"x{i}"] for i in range(n_features)]
+                    fn = lambdify(args, expr, modules=["numpy"])
+                    y_pred = fn(*[x_np[:, i] for i in range(n_features)])
+
+                y_pred = np.asarray(y_pred, dtype=np.float64).reshape(y_np.shape)
+                mask = np.isfinite(y_pred) & np.isfinite(y_np)
+                if mask.sum() >= 10:
+                    candidate = float(np.mean((y_pred[mask] - y_np[mask]) ** 2))
+                    if math.isfinite(candidate):
+                        display_mse = candidate
+            except Exception:
+                display_mse = None
+
+            score_mse = display_mse if display_mse is not None else float(result['best_mse'])
+            self.best_ever.fitness = score_mse
             elapsed = end_time - start_time
             
             return {
                 'model': self.best_ever.model,
                 'history': [{'generation': i, 'best_fitness': 0} for i in range(generations)],
-                'final_mse': result['best_mse'],
+                'final_mse': score_mse,
+                'final_mse_display': display_mse,
+                'final_mse_raw': float(result['best_mse']),
                 'correlation': 0.0,
                 'formula': formula,
                 'training_time': elapsed,

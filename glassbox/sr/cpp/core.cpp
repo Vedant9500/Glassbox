@@ -31,7 +31,10 @@ py::dict run_evolution_cpp(
     int migration_size = 2,
     // P7: Dimensional Analysis
     py::list input_units = py::list(),
-    py::list output_units = py::list()
+    py::list output_units = py::list(),
+    double arithmetic_temperature = 5.0,
+    std::string trace_path = "",
+    bool trace_include_formulas = false
 ) {
     // 1. Convert Python/Numpy to C++ Eigen
     std::vector<Eigen::ArrayXd> X;
@@ -88,6 +91,12 @@ py::dict run_evolution_cpp(
     config.migration_size = migration_size;
     config.input_units = cpp_input_units;
     config.output_units = cpp_output_units;
+    config.enable_trace = !trace_path.empty();
+    config.trace_path = trace_path;
+    config.trace_include_formulas = trace_include_formulas;
+
+    // Sync evaluator temperature so arithmetic blend sharpness is tunable from Python.
+    sr::set_arithmetic_temperature(arithmetic_temperature);
     
     std::cout << "[v6-nsga2] Starting C++ Evolution with " << omp_get_max_threads() << " OpenMP Threads!";
     if (use_nsga2) std::cout << " (NSGA-II mode)";
@@ -173,5 +182,8 @@ PYBIND11_MODULE(_core, m) {
           py::arg("migration_interval")=25,
           py::arg("migration_size")=2,
           py::arg("input_units")=py::list(),
-          py::arg("output_units")=py::list());
+          py::arg("output_units")=py::list(),
+          py::arg("arithmetic_temperature")=5.0,
+          py::arg("trace_path")="",
+          py::arg("trace_include_formulas")=false);
 }
