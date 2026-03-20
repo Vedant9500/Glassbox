@@ -11,6 +11,7 @@
 #include <fstream>
 #include <string>
 #include <sstream>
+#include <unordered_set>
 
 #include <omp.h>
 
@@ -48,6 +49,19 @@ struct EvolutionConfig {
     // Search Dynamics
     double explorer_fraction = 0.2; // 20% of population are explorers
     double explorer_mutation_multiplier = 3.0;
+
+    // Phase 4: reliability-first rollout controls
+    bool use_staged_schedule = true;
+    int topology_phase_generations = 40;
+    double topology_phase_mutation_boost = 1.5;
+    int topology_refine_interval = 20;
+
+    bool use_adaptive_restart = true;
+    int stagnation_window = 40;
+    double stagnation_min_improvement = 1e-5;
+    double diversity_floor = 0.25;
+    double restart_fraction = 0.2;
+    double post_restart_mutation_boost = 1.25;
 
     // Classifier priors: probability weights for [Periodic, Power, Exp, Log]
     // Empty = uniform sampling. Non-empty = sample proportionally.
@@ -118,10 +132,17 @@ public:
         double current_structural_mutation_rate = config_.mutation_rate_structural;
         double best_mse_history = 1e9;
         int plateau_counter = 0;
+        std::vector<double> recent_best;
+        recent_best.reserve(config_.stagnation_window + 2);
 
         for (int gen = 0; gen < config_.generations; ++gen) {
             evaluate_population();
             trace_event("generation.post_eval", gen);
+            bool in_topology_phase = config_.use_staged_schedule && (gen < config_.topology_phase_generations);
+            double scheduled_mutation_rate = current_structural_mutation_rate;
+            if (in_topology_phase) {
+                scheduled_mutation_rate = std::min(1.0, current_structural_mutation_rate * config_.topology_phase_mutation_boost);
+            }
             
             // P5: NSGA-II selection or standard sort
             if (config_.use_nsga2) {
@@ -144,12 +165,15 @@ public:
                         int p1 = p_dist(rng_), p2 = p_dist(rng_);
                         while (p2 == p1) p2 = p_dist(rng_);
                         child = crossover_with_retry(population_[p1], population_[p2], 3);
-                        child = mutate_lamarckian(child, current_structural_mutation_rate * 0.3);
+                        child = mutate_lamarckian(child, scheduled_mutation_rate * 0.3);
                     } else {
-                        child = mutate_lamarckian(population_[p_dist(rng_)], current_structural_mutation_rate);
+                        child = mutate_lamarckian(population_[p_dist(rng_)], scheduled_mutation_rate);
                     }
                     child.age = 0;  // AFPO: new children start young
-                    if (gen % 5 == 0) refine_constants(child);
+                    bool do_refine = in_topology_phase
+                        ? (gen % config_.topology_refine_interval == 0)
+                        : (gen % 5 == 0);
+                    if (do_refine) refine_constants(child);
                     else evaluate_fitness_with_penalty(child, X_, y_, y_.size());
                     combined.push_back(std::move(child));
                 }
@@ -184,6 +208,18 @@ public:
                 // If stuck for 50 gens, lower mutation rate to exploit
                 current_structural_mutation_rate = std::max(0.05, current_structural_mutation_rate * 0.9);
                 plateau_counter = 0; // Reset
+            }
+
+            recent_best.push_back(best_overall_.fitness);
+            if (recent_best.size() > static_cast<size_t>(config_.stagnation_window)) {
+                recent_best.erase(recent_best.begin());
+            }
+
+            bool should_restart = false;
+            if (config_.use_adaptive_restart && recent_best.size() >= static_cast<size_t>(config_.stagnation_window)) {
+                double window_improvement = recent_best.front() - recent_best.back();
+                double diversity = population_diversity_ratio(population_);
+                should_restart = (window_improvement < config_.stagnation_min_improvement) && (diversity < config_.diversity_floor);
             }
 
             if (config_.use_early_stop && best_overall_.raw_mse < config_.early_stop_mse && best_overall_.nodes.size() <= 8) {
@@ -223,16 +259,19 @@ public:
                     while (p2 == p1) p2 = parent_dist(rng_); // ensure distinct parents
                     child = crossover_with_retry(population_[p1], population_[p2], 3);
                     // Light mutation on crossover children for diversity
-                    child = mutate_lamarckian(child, current_structural_mutation_rate * 0.3);
+                    child = mutate_lamarckian(child, scheduled_mutation_rate * 0.3);
                 } else {
                     // --- Mutation-only ---
                     int parent_idx = parent_dist(rng_);
-                    child = mutate_lamarckian(population_[parent_idx], current_structural_mutation_rate);
+                    child = mutate_lamarckian(population_[parent_idx], scheduled_mutation_rate);
                 }
 
                 child.age = 0;  // AFPO: new children start young
 
-                if (gen % 5 == 0 || child.fitness < best_overall_.fitness * 1.5) {
+                bool do_refine = in_topology_phase
+                    ? (gen % config_.topology_refine_interval == 0)
+                    : (gen % 5 == 0);
+                if (do_refine) {
                     refine_constants(child); // Gradient refinement on constants
                 } else {
                     // Fast re-evaluation
@@ -244,7 +283,7 @@ public:
             // Fill explorer population
             while (next_gen.size() < config_.pop_size) {
                  int parent_idx = parent_dist(rng_); // Use elite parents, but mutate more aggressively
-                 double explorer_rate = std::min(1.0, current_structural_mutation_rate * config_.explorer_mutation_multiplier);
+                 double explorer_rate = std::min(1.0, scheduled_mutation_rate * config_.explorer_mutation_multiplier);
                  IndividualGraph explorer;
                  if (coin(rng_) < 0.2) {
                      explorer = macro_mutate(population_[parent_idx]);
@@ -261,6 +300,12 @@ public:
             }
             
             population_ = std::move(next_gen);
+
+            if (should_restart) {
+                inject_restarts(population_);
+                current_structural_mutation_rate = std::min(1.0, current_structural_mutation_rate * config_.post_restart_mutation_boost);
+                trace_event("population.restart", gen);
+            }
             
             // Periodic inner-param refinement on top elite only (every 20 gens)
             // This is where Adam refines omega/p/phi — crucial for sin(3x) etc.
@@ -511,6 +556,13 @@ private:
         config_.elite_size = std::max(1, std::min(config_.elite_size, config_.pop_size));
         config_.num_islands = std::max(1, config_.num_islands);
         config_.migration_size = std::max(1, config_.migration_size);
+        config_.topology_phase_generations = std::max(0, config_.topology_phase_generations);
+        config_.topology_refine_interval = std::max(1, config_.topology_refine_interval);
+        config_.stagnation_window = std::max(5, config_.stagnation_window);
+        config_.diversity_floor = std::clamp(config_.diversity_floor, 0.0, 1.0);
+        config_.restart_fraction = std::clamp(config_.restart_fraction, 0.0, 0.8);
+        config_.topology_phase_mutation_boost = std::max(1.0, config_.topology_phase_mutation_boost);
+        config_.post_restart_mutation_boost = std::max(1.0, config_.post_restart_mutation_boost);
     }
     
     // Sample a UnaryOp using classifier priors (if available) or uniform
@@ -531,88 +583,93 @@ private:
         return UnaryOp::Log;
     }
     
+    IndividualGraph create_random_individual(int n_inputs) {
+        IndividualGraph ind;
+        std::uniform_int_distribution<int> num_nodes_dist(3, 8); // compact graphs
+        int num_nodes = num_nodes_dist(rng_);
+        ind.nodes.resize(num_nodes);
+
+        std::uniform_real_distribution<double> runif(0.0, 1.0);
+        std::normal_distribution<double> rnorm(0.0, 1.0);
+
+        for (int i = 0; i < num_nodes; ++i) {
+            auto& node = ind.nodes[i];
+            node.p = 1.0 + rnorm(rng_)*0.5;
+            node.omega = 1.0 + rnorm(rng_);
+
+            // Inject seeded omegas if available
+            if (!seed_omegas_.empty() && runif(rng_) < 0.6) {
+                std::uniform_int_distribution<int> seed_dist(0, seed_omegas_.size() - 1);
+                node.omega = seed_omegas_[seed_dist(rng_)];
+            }
+
+            node.phi = rnorm(rng_);
+            node.amplitude = 1.0;  // Fixed — SVD handles scaling via output_weights
+            node.beta = 1.5 + rnorm(rng_)*0.5;
+            node.gamma = 1.0 + rnorm(rng_)*0.5;
+            node.tau = 1.0;
+
+            // ── FIX: Only node 0 is Input. All others are Unary/Binary. ──
+            // This prevents multiple collinear 'x' columns in the SVD.
+            if (i < n_inputs) {
+                node.type = NodeType::Input;
+                node.feature_idx = i;
+            } else {
+                if (runif(rng_) < 0.6 || i < n_inputs + 1) {
+                    node.type = NodeType::Unary;
+                    node.unary_op = sample_unary_op();
+                    if (node.unary_op == UnaryOp::Power && runif(rng_) < 0.7) {
+                        const double power_candidates[] = {-1.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0};
+                        std::vector<double> valid_powers;
+                        for (double candidate : power_candidates) {
+                            if (candidate >= config_.p_min && candidate <= config_.p_max) {
+                                valid_powers.push_back(candidate);
+                            }
+                        }
+                        if (!valid_powers.empty()) {
+                            std::uniform_int_distribution<int> p_dist(0, static_cast<int>(valid_powers.size()) - 1);
+                            node.p = valid_powers[p_dist(rng_)];
+                        }
+                    }
+                    std::uniform_int_distribution<int> child_dist(0, i - 1);
+                    node.left_child = child_dist(rng_);
+                } else {
+                    node.type = NodeType::Binary;
+                    double op_choice = runif(rng_);
+                    if (op_choice < 0.5) node.binary_op = BinaryOp::Arithmetic;
+                    else node.binary_op = BinaryOp::Aggregation;
+
+                    std::uniform_int_distribution<int> child_dist(0, i - 1);
+                    node.left_child = child_dist(rng_);
+                    // Ensure different children for Binary to avoid (x+x)/2 == x
+                    if (i >= 2) {
+                        node.right_child = child_dist(rng_);
+                        int tries = 0;
+                        while (node.right_child == node.left_child && tries < 5) {
+                            node.right_child = child_dist(rng_);
+                            tries++;
+                        }
+                    } else {
+                        node.right_child = node.left_child;
+                    }
+                }
+            }
+        }
+
+        ind.output_weights.resize(num_nodes);
+        for (int i = 0; i < num_nodes; ++i) {
+            ind.output_weights[i] = rnorm(rng_) * 0.1;
+        }
+        ind.output_bias = rnorm(rng_) * 0.1;
+        return ind;
+    }
+
     void initialize_population() {
         population_.resize(config_.pop_size);
         int n_inputs = static_cast<int>(X_.size());
         
         for (auto& ind : population_) {
-            // Random DAG generator
-            std::uniform_int_distribution<int> num_nodes_dist(3, 8); // compact graphs
-            int num_nodes = num_nodes_dist(rng_);
-            ind.nodes.resize(num_nodes);
-            
-            std::uniform_real_distribution<double> runif(0.0, 1.0);
-            std::normal_distribution<double> rnorm(0.0, 1.0);
-            
-            for (int i = 0; i < num_nodes; ++i) {
-                auto& node = ind.nodes[i];
-                node.p = 1.0 + rnorm(rng_)*0.5;
-                node.omega = 1.0 + rnorm(rng_);
-
-                // Inject seeded omegas if available
-                if (!seed_omegas_.empty() && runif(rng_) < 0.6) {
-                    std::uniform_int_distribution<int> seed_dist(0, seed_omegas_.size() - 1);
-                    node.omega = seed_omegas_[seed_dist(rng_)];
-                }
-
-                node.phi = rnorm(rng_);
-                node.amplitude = 1.0;  // Fixed — SVD handles scaling via output_weights
-                node.beta = 1.5 + rnorm(rng_)*0.5;
-                node.gamma = 1.0 + rnorm(rng_)*0.5;
-                node.tau = 1.0;
-                
-                // ── FIX: Only node 0 is Input. All others are Unary/Binary. ──
-                // This prevents multiple collinear 'x' columns in the SVD.
-                if (i < n_inputs) {
-                    node.type = NodeType::Input;
-                    node.feature_idx = i;
-                } else {
-                    if (runif(rng_) < 0.6 || i < n_inputs + 1) {
-                        node.type = NodeType::Unary;
-                        node.unary_op = sample_unary_op();
-                        if (node.unary_op == UnaryOp::Power && runif(rng_) < 0.7) {
-                            const double power_candidates[] = {-1.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0};
-                            std::vector<double> valid_powers;
-                            for (double candidate : power_candidates) {
-                                if (candidate >= config_.p_min && candidate <= config_.p_max) {
-                                    valid_powers.push_back(candidate);
-                                }
-                            }
-                            if (!valid_powers.empty()) {
-                                std::uniform_int_distribution<int> p_dist(0, static_cast<int>(valid_powers.size()) - 1);
-                                node.p = valid_powers[p_dist(rng_)];
-                            }
-                        }
-                        std::uniform_int_distribution<int> child_dist(0, i - 1);
-                        node.left_child = child_dist(rng_);
-                    } else {
-                        node.type = NodeType::Binary;
-                        double op_choice = runif(rng_);
-                        if (op_choice < 0.5) node.binary_op = BinaryOp::Arithmetic; 
-                        else node.binary_op = BinaryOp::Aggregation;
-                        
-                        std::uniform_int_distribution<int> child_dist(0, i - 1);
-                        node.left_child = child_dist(rng_);
-                        // Ensure different children for Binary to avoid (x+x)/2 == x
-                        if (i >= 2) {
-                            node.right_child = child_dist(rng_);
-                            int tries = 0;
-                            while (node.right_child == node.left_child && tries < 5) {
-                                node.right_child = child_dist(rng_);
-                                tries++;
-                            }
-                        } else {
-                            node.right_child = node.left_child;
-                        }
-                    }
-                }
-            }
-            
-            ind.output_weights.resize(num_nodes);
-            for (int i = 0; i < num_nodes; ++i) {
-                ind.output_weights[i] = rnorm(rng_) * 0.1;
-            }
-            ind.output_bias = rnorm(rng_) * 0.1;
+            ind = create_random_individual(n_inputs);
         }
     }
     
@@ -624,6 +681,54 @@ private:
         #pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < static_cast<int>(population_.size()); ++i) {
             evaluate_fitness_with_penalty(population_[i], X_, y_, samples);
+        }
+    }
+
+    uint64_t graph_signature(const IndividualGraph& graph) const {
+        if (graph.nodes.empty()) return 0ULL;
+        std::vector<uint64_t> node_hashes(graph.nodes.size(), 0ULL);
+        for (int i = 0; i < static_cast<int>(graph.nodes.size()); ++i) {
+            node_hashes[i] = compute_node_hash(graph, i, node_hashes);
+        }
+
+        uint64_t h = node_hashes.back();
+        for (double w : graph.output_weights) {
+            h = hash_combine(h, quantize(w));
+        }
+        h = hash_combine(h, quantize(graph.output_bias));
+        return h;
+    }
+
+    double population_diversity_ratio(const std::vector<IndividualGraph>& pop) const {
+        if (pop.empty()) return 0.0;
+        std::unordered_set<uint64_t> signatures;
+        signatures.reserve(pop.size());
+        for (const auto& ind : pop) {
+            signatures.insert(graph_signature(ind));
+        }
+        return static_cast<double>(signatures.size()) / static_cast<double>(pop.size());
+    }
+
+    void inject_restarts(std::vector<IndividualGraph>& pop) {
+        int budget = static_cast<int>(std::floor(config_.restart_fraction * static_cast<double>(pop.size())));
+        budget = std::max(1, std::min(budget, std::max(0, config_.pop_size - config_.elite_size)));
+        if (budget <= 0) return;
+
+        int n_inputs = static_cast<int>(X_.size());
+        std::uniform_int_distribution<int> elite_dist(0, std::max(0, config_.elite_size - 1));
+        for (int i = 0; i < budget; ++i) {
+            int idx = static_cast<int>(pop.size()) - 1 - i;
+            if (idx < config_.elite_size || idx < 0) break;
+
+            if (i % 2 == 0 && config_.elite_size > 0) {
+                int parent_idx = elite_dist(rng_);
+                pop[idx] = macro_mutate(pop[parent_idx]);
+            } else {
+                // Random immigrant for diversity reset.
+                IndividualGraph immigrant = create_random_individual(n_inputs);
+                immigrant.age = 0;
+                pop[idx] = std::move(immigrant);
+            }
         }
     }
     

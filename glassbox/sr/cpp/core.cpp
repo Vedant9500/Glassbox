@@ -34,7 +34,17 @@ py::dict run_evolution_cpp(
     py::list output_units = py::list(),
     double arithmetic_temperature = 5.0,
     std::string trace_path = "",
-    bool trace_include_formulas = false
+    bool trace_include_formulas = false,
+    bool use_staged_schedule = true,
+    int topology_phase_generations = 40,
+    double topology_phase_mutation_boost = 1.5,
+    int topology_refine_interval = 20,
+    bool use_adaptive_restart = true,
+    int stagnation_window = 40,
+    double stagnation_min_improvement = 1e-5,
+    double diversity_floor = 0.25,
+    double restart_fraction = 0.2,
+    double post_restart_mutation_boost = 1.25
 ) {
     // 1. Convert Python/Numpy to C++ Eigen
     std::vector<Eigen::ArrayXd> X;
@@ -94,6 +104,16 @@ py::dict run_evolution_cpp(
     config.enable_trace = !trace_path.empty();
     config.trace_path = trace_path;
     config.trace_include_formulas = trace_include_formulas;
+    config.use_staged_schedule = use_staged_schedule;
+    config.topology_phase_generations = topology_phase_generations;
+    config.topology_phase_mutation_boost = topology_phase_mutation_boost;
+    config.topology_refine_interval = topology_refine_interval;
+    config.use_adaptive_restart = use_adaptive_restart;
+    config.stagnation_window = stagnation_window;
+    config.stagnation_min_improvement = stagnation_min_improvement;
+    config.diversity_floor = diversity_floor;
+    config.restart_fraction = restart_fraction;
+    config.post_restart_mutation_boost = post_restart_mutation_boost;
 
     // Sync evaluator temperature so arithmetic blend sharpness is tunable from Python.
     sr::set_arithmetic_temperature(arithmetic_temperature);
@@ -185,5 +205,15 @@ PYBIND11_MODULE(_core, m) {
           py::arg("output_units")=py::list(),
           py::arg("arithmetic_temperature")=5.0,
           py::arg("trace_path")="",
-          py::arg("trace_include_formulas")=false);
+          py::arg("trace_include_formulas")=false,
+          py::arg("use_staged_schedule")=true,
+          py::arg("topology_phase_generations")=40,
+          py::arg("topology_phase_mutation_boost")=1.5,
+          py::arg("topology_refine_interval")=20,
+          py::arg("use_adaptive_restart")=true,
+          py::arg("stagnation_window")=40,
+          py::arg("stagnation_min_improvement")=1e-5,
+          py::arg("diversity_floor")=0.25,
+          py::arg("restart_fraction")=0.2,
+          py::arg("post_restart_mutation_boost")=1.25);
 }
