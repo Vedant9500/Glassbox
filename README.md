@@ -10,6 +10,9 @@
 - **Optimized Fast-Path (Default)**: Single strategy with refinement gating and acceptance guardrails for stable runtime
 - **Formula Post-Processing**: Tolerance-based float snapping + SymPy simplification with snap-only fallback for very large expressions
 - **Fast C++ Backend**: Native C++ engine for topology evolution and constant fitting
+- **Reliability-First Scoring**: Benchmarks score by displayed-formula MSE (`mse_display`) and keep engine raw MSE (`mse_raw`) as diagnostics
+- **Native C++ JSONL Tracing**: Per-run/per-generation population snapshots for the C++ evolution path
+- **Phase 4 Evolution Controls**: Staged topology-first schedule plus adaptive restart/diversity triggers in the C++ engine
 - **Hybrid Optimization**: Combines evolutionary search (topology) with analytical SVD-based linear fitting
 - **OpenMP Multithreading**: Utilizes all CPU cores for massively parallel population evaluation
 - **Comprehensive Benchmark Suite**: 8-tier evaluation framework covering ~200 formulas
@@ -67,6 +70,19 @@ python scripts/benchmark_suite.py --with-evolution
 ```bash
 python scripts/benchmark_feynman_easy.py --evolution-fallback
 ```
+
+### Native C++ Pipeline Trace
+
+```bash
+python scripts/evolution_pipeline_log.py \
+  --formula "x^2+sin(x)" \
+  --cpp-trace \
+  --generations 50 \
+  --population-size 40 \
+  --run-name cpp_trace_run
+```
+
+Output is written to `results/pipeline_logs/<run-name>.jsonl`.
 
 ## Architecture Overview
 
@@ -201,6 +217,26 @@ Options:
   --generations N              C++ evolution generations
 ```
 
+### evolution_pipeline_log.py
+```bash
+python scripts/evolution_pipeline_log.py [OPTIONS]
+
+Options:
+  --formula TEXT               Target formula, e.g. "x^2+sin(x)"
+  --data-npz PATH              NPZ dataset with X/y arrays
+  --x-min FLOAT                Formula sampling minimum
+  --x-max FLOAT                Formula sampling maximum
+  --n-samples N                Formula sampling size
+  --cpp-trace                  Run native C++ evolution and emit C++ JSONL trace
+  --include-formulas           Include formulas in each population snapshot
+  --generations N              Evolution generations
+  --population-size N          Evolution population size
+  --early-stop-mse FLOAT       C++ early stop threshold
+  --arithmetic-temperature FLOAT  C++ arithmetic softness/sharpness
+  --output-dir PATH            Trace output directory
+  --run-name TEXT              Output run name
+```
+
 ### benchmark_feynman_easy.py
 ```bash
 python scripts/benchmark_feynman_easy.py [OPTIONS]
@@ -300,7 +336,15 @@ For complex formulas where the fast-path fails, Glassbox triggers a native C++ e
 - **Topology Mutation**: Efficient DAG structural mutations beyond rigid layer formats.
 - **Analytical Constant Fitting**: Uses Eigen SVD to solve for linear parameters in O(1) time per graph.
 - **OpenMP Multithreading**: Parallelizes population evaluation across all CPU cores.
-- **Performance**: Capable of running 2,000 generations in <0.1s on modern 8-core CPUs.
+- **Staged Schedule**: Topology-first exploration with delayed/periodic refinement, then regular exploitation.
+- **Adaptive Restart**: Detects low-improvement + low-diversity windows and injects restart candidates.
+- **Traceability**: Optional JSONL trace stream records generation-level population snapshots.
+
+### 5. Reliability Contract (Benchmark + Runtime)
+
+- **Formula-honest scoring**: final benchmark score uses displayed-formula MSE when evaluable.
+- **Dual diagnostics**: both `mse_display` (score) and `mse_raw` (engine internal) are reported.
+- **Drift visibility**: benchmark output includes divergence metrics between raw and displayed errors.
 
 ## Performance Tips
 
