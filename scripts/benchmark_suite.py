@@ -306,6 +306,8 @@ ALL_TIERS = {
 def _parse_formula(formula_str: str) -> Callable[[np.ndarray], np.ndarray]:
     """Parse formula string into a numpy function."""
     formula = formula_str.strip().lower()
+    # Convert |...| notation (from C++ log display) to abs(...)
+    formula = re.sub(r'\|([^|]+)\|', r'abs(\1)', formula)
     # x^N -> x**N
     formula = re.sub(r'\^(\d+)', r'**\1', formula)
     formula = re.sub(r'\^(\()', r'**\1', formula)
@@ -397,7 +399,11 @@ def _normalize_formula_text(formula: str) -> str:
 
 
 def _postprocess_formula(formula: str) -> str:
-    """Apply the same simplify_formula pipeline used by fast-path outputs."""
+    """Apply the same simplify_formula pipeline used by fast-path outputs.
+    
+    Uses wider snap tolerances than the fast-path because evolution-produced
+    formulas have Ridge regression noise on coefficients (e.g. 0.9975 → 1.0).
+    """
     normalized = _normalize_formula_text(formula)
     if not normalized or normalized in {"N/A", "ERROR", "?"}:
         return normalized
@@ -412,16 +418,22 @@ def _postprocess_formula(formula: str) -> str:
         term_estimate = max(1, len([t for t in re.split(r'\s*[+-]\s*', normalized) if t.strip()]))
         too_complex_for_symbolic = formula_len > 500 or term_estimate > 24
 
+        # Evolution formulas need wider tolerances than fast-path:
+        # Ridge regression produces coefficients like 0.9975 instead of 1.0
+        # and small spurious bias terms like 0.0001924 instead of 0.0
+        evo_int_tol = 0.01    # snap 0.9975 → 1, 2.003 → 2, etc.
+        evo_zero_tol = 1e-3   # snap 0.0001924 → 0
+
         if too_complex_for_symbolic:
             return snap_formula_floats(
                 normalized,
-                SnapConfig(int_tol=1e-5, zero_tol=1e-8),
+                SnapConfig(int_tol=evo_int_tol, zero_tol=evo_zero_tol),
             )
 
         _, simplified_expr = simplify_onn_formula(
             normalized,
-            int_tol=1e-5,
-            zero_tol=1e-8,
+            int_tol=evo_int_tol,
+            zero_tol=evo_zero_tol,
             use_nsimplify=(formula_len <= 300 and term_estimate <= 16),
         )
         return str(simplified_expr)

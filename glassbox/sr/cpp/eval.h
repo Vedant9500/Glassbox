@@ -102,7 +102,7 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                     }
                     case UnaryOp::Power: {
                         // sign(x) * |x|^p as defined in MetaPower
-                        auto abs_x = x.abs() + 1e-6;
+                        auto abs_x = x.abs() + 1e-10;
                         auto sign_x = x.sign();
                         auto abs_pow = abs_x.pow(node.p);
 
@@ -195,7 +195,7 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                     }
                     case UnaryOp::Power: {
                         // sign(x) * |x|^p as defined in MetaPower
-                        auto abs_x = x.abs() + 1e-6;
+                        auto abs_x = x.abs() + 1e-10;
                         auto sign_x = x.sign();
                         auto abs_pow = abs_x.pow(node.p);
 
@@ -315,7 +315,7 @@ inline Eigen::ArrayXd evaluate_graph_cached(const IndividualGraph& graph,
                         break;
                     }
                     case UnaryOp::Power: {
-                        auto abs_x = x.abs() + 1e-6;
+                        auto abs_x = x.abs() + 1e-10;
                         auto sign_x = x.sign();
                         auto abs_pow = abs_x.pow(node.p);
                         double is_even = power_sign_blend(node.p);
