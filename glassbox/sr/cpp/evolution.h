@@ -307,9 +307,9 @@ public:
                 trace_event("population.restart", gen);
             }
             
-            // Periodic inner-param refinement on top elite only (every 20 gens)
-            // This is where Adam refines omega/p/phi — crucial for sin(3x) etc.
-            if (gen % 20 == 19) {
+            // Periodic inner-param refinement on top elite only (every 10 gens)
+            // This is where Adam refines omega/p/phi — crucial for sin(3x), exp(-x) etc.
+            if (gen % 10 == 9) {
                 for (int i = 0; i < std::min(5, config_.elite_size); ++i) {
                     refine_inner_params(population_[i]);
                 }
@@ -757,6 +757,16 @@ private:
                     double dist_o = std::min(frac_o, 1.0 - frac_o);
                     penalty += dist_o * dist_o;
                 }
+                // P2: Arithmetic entropy penalty — push soft binary ops toward discrete
+                // selection. Lower entropy = more committed to one operation.
+                if (node.type == NodeType::Binary && node.binary_op == BinaryOp::Arithmetic) {
+                    auto w = arithmetic_soft_weights(node);
+                    double entropy = 0.0;
+                    for (int k = 0; k < 4; ++k) {
+                        if (w[k] > 1e-10) entropy -= w[k] * std::log(w[k]);
+                    }
+                    penalty += 0.1 * entropy;  // max entropy = ln(4) ≈ 1.39
+                }
             }
         }
         
@@ -905,6 +915,15 @@ private:
             
             child.nodes.push_back(mul_node);
             child.output_weights.push_back(1.0);
+            
+            // P3: Zero out children's additive contribution so Ridge is
+            // forced to use the product node instead of decomposing additively.
+            if (left < static_cast<int>(child.output_weights.size())) {
+                child.output_weights[left] = 0.0;
+            }
+            if (right < static_cast<int>(child.output_weights.size())) {
+                child.output_weights[right] = 0.0;
+            }
             
         } else {
             // ── Nest Mutation ──
@@ -1195,7 +1214,7 @@ private:
         const double lr = 0.02;
         const double beta1 = 0.9, beta2 = 0.999, eps_adam = 1e-8;
         const double epsilon = 1e-4; // Finite difference step
-        const int adam_steps_per_round = 10;
+        const int adam_steps_per_round = 25;  // P2: boosted from 10 for better constant discovery
         const int num_rounds = 3; // Alternate Adam → SVD this many times
         
         int n_params = static_cast<int>(active_unary.size()) * 3; // {p, omega, phi} — NOT amplitude (redundant with SVD output_weight)
@@ -2062,7 +2081,7 @@ private:
 
         population_ = std::move(next_gen);
 
-        if (gen % 20 == 19) {
+        if (gen % 10 == 9) {
             for (int i = 0; i < std::min(3, config_.elite_size); ++i) {
                 refine_inner_params(population_[i]);
             }
