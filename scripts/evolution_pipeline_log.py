@@ -14,7 +14,8 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import builtins
+
+import gzip
 import json
 import math
 import time
@@ -22,7 +23,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from types import MethodType
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -42,10 +43,15 @@ from glassbox.sr.evolution import EvolutionaryONNTrainer
 
 
 class JsonlLogger:
-    def __init__(self, out_path: Path) -> None:
+    def __init__(self, out_path: Path, compress: bool = False) -> None:
         self.out_path = out_path
         self.out_path.parent.mkdir(parents=True, exist_ok=True)
-        self._fp = self.out_path.open("w", encoding="utf-8")
+        if compress or self.out_path.suffix == ".gz":
+            if not self.out_path.suffix == ".gz":
+                self.out_path = self.out_path.with_suffix(self.out_path.suffix + ".gz")
+            self._fp = gzip.open(self.out_path, "wt", encoding="utf-8")
+        else:
+            self._fp = self.out_path.open("w", encoding="utf-8")
 
     def close(self) -> None:
         self._fp.close()
@@ -60,25 +66,7 @@ class JsonlLogger:
         self._fp.flush()
 
 
-class BlockImport:
-    def __init__(self, blocked: Iterable[str]) -> None:
-        self.blocked = set(blocked)
-        self._orig_import = None
 
-    def __enter__(self):
-        self._orig_import = builtins.__import__
-
-        def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
-            root = name.split(".")[0]
-            if root in self.blocked:
-                raise ImportError(f"Import blocked by logger context: {name}")
-            return self._orig_import(name, globals, locals, fromlist, level)
-
-        builtins.__import__ = guarded_import
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        builtins.__import__ = self._orig_import
 
 
 def _to_jsonable(x: Any) -> Any:
@@ -166,7 +154,14 @@ def _individual_snapshot(ind: evo_mod.Individual, idx: int, include_formula: boo
     return snap
 
 
-def instrument_pipeline(trainer: EvolutionaryONNTrainer, logger: JsonlLogger, include_formulas: bool) -> Dict[str, Any]:
+def instrument_pipeline(
+    trainer: EvolutionaryONNTrainer,
+    logger: JsonlLogger,
+    include_formulas: bool,
+    log_pop_every: int = 1,
+    log_pop_elite_only: bool = False,
+    log_skip_formulas_non_elite: bool = False,
+) -> Dict[str, Any]:
     originals: Dict[str, Any] = {}
 
     originals["refine_constants"] = evo_mod.refine_constants
@@ -222,14 +217,37 @@ def instrument_pipeline(trainer: EvolutionaryONNTrainer, logger: JsonlLogger, in
     def eval_wrapper(self, x, y, generation=0, total_generations=50):
         t0 = time.time()
         out = originals["trainer_evaluate_fitness"](x, y, generation=generation, total_generations=total_generations)
+        
+        # Determine if we should log the full population
+        should_log_full = (generation % log_pop_every == 0) or (generation == total_generations - 1)
+        
+        pop_to_log = []
+        exp_to_log = []
+        
+        if should_log_full:
+            if log_pop_elite_only:
+                # Only log elites
+                pop_to_log = [_individual_snapshot(ind, i, include_formulas) for i, ind in enumerate(self.population) if getattr(ind, "_is_elite", False)]
+                exp_to_log = [_individual_snapshot(ind, i, include_formulas) for i, ind in enumerate(self.explorers) if getattr(ind, "_is_elite", False)]
+            else:
+                # Log everyone, but maybe skip formulas for non-elites
+                def get_snap(ind, i):
+                    is_elite = getattr(ind, "_is_elite", False)
+                    inc_f = include_formulas and (not log_skip_formulas_non_elite or is_elite)
+                    return _individual_snapshot(ind, i, inc_f)
+                
+                pop_to_log = [get_snap(ind, i) for i, ind in enumerate(self.population)]
+                exp_to_log = [get_snap(ind, i) for i, ind in enumerate(self.explorers)]
+
         logger.log(
             "generation.evaluate",
             generation=generation,
             total_generations=total_generations,
             elapsed_s=time.time() - t0,
             best_ever_fitness=(float(self.best_ever.fitness) if self.best_ever and math.isfinite(self.best_ever.fitness) else None),
-            population=[_individual_snapshot(ind, i, include_formulas) for i, ind in enumerate(self.population)],
-            explorers=[_individual_snapshot(ind, i, include_formulas) for i, ind in enumerate(self.explorers)],
+            population=pop_to_log,
+            explorers=exp_to_log,
+            is_full_snapshot=should_log_full,
         )
         return out
 
@@ -297,19 +315,27 @@ def main() -> None:
     parser.add_argument("--no-explorers", action="store_true")
     parser.add_argument("--include-formulas", action="store_true", default=True)
     parser.add_argument("--skip-formulas", action="store_true")
-    parser.add_argument("--allow-cpp-backend", action="store_true", help="Allow trainer to use C++ backend (less detailed logs)")
+    parser.add_argument("--no-cpp-backend", action="store_true", help="Disallow trainer from using C++ backend")
     parser.add_argument("--cpp-trace", action="store_true", help="Run native C++ evolution and emit C++ JSONL trace events")
     parser.add_argument("--early-stop-mse", type=float, default=1e-6)
     parser.add_argument("--arithmetic-temperature", type=float, default=5.0)
 
     parser.add_argument("--output-dir", type=str, default="results/pipeline_logs")
     parser.add_argument("--run-name", type=str, default="")
+    parser.add_argument("--compress", action="store_true", help="Compress log with gzip")
+    parser.add_argument("--log-pop-every", type=int, default=1, help="Log full population every N generations")
+    parser.add_argument("--log-pop-elite-only", action="store_true", help="In non-sampled generations, only log elites")
+    parser.add_argument("--log-skip-formulas-non-elite", action="store_true", help="Skip formulas for non-elite individuals")
     args = parser.parse_args()
 
     if args.no_explorers:
         args.use_explorers = False
     if args.skip_formulas:
         args.include_formulas = False
+    if args.no_cpp_backend:
+        args.allow_cpp_backend = False
+    else:
+        args.allow_cpp_backend = True
 
     if args.formula:
         x_t, y_t = _formula_data(args.formula, args.x_min, args.x_max, args.n_samples)
@@ -368,9 +394,17 @@ def main() -> None:
         print(f"Best MSE: {result.get('best_mse', None)}")
         return
 
-    logger = JsonlLogger(out_path)
+    logger = JsonlLogger(out_path, compress=args.compress)
+    out_path = logger.out_path # Update in case .gz was added
 
-    originals = instrument_pipeline(trainer, logger, include_formulas=args.include_formulas)
+    originals = instrument_pipeline(
+        trainer, 
+        logger, 
+        include_formulas=args.include_formulas,
+        log_pop_every=args.log_pop_every,
+        log_pop_elite_only=args.log_pop_elite_only,
+        log_skip_formulas_non_elite=args.log_skip_formulas_non_elite
+    )
     logger.log(
         "run.start",
         run_name=run_name,
@@ -392,12 +426,7 @@ def main() -> None:
 
     t0 = time.time()
     try:
-        ctx = BlockImport(["_core"]) if not args.allow_cpp_backend else None
-        if ctx is not None:
-            with ctx:
-                result = trainer.train(x_t, y_t, generations=args.generations, print_every=args.print_every)
-        else:
-            result = trainer.train(x_t, y_t, generations=args.generations, print_every=args.print_every)
+        result = trainer.train(x_t, y_t, generations=args.generations, print_every=args.print_every)
 
         logger.log("run.end", elapsed_s=time.time() - t0, result=result)
 
