@@ -43,7 +43,7 @@ from glassbox.sr.evolution import EvolutionaryONNTrainer
 
 
 class JsonlLogger:
-    def __init__(self, out_path: Path, compress: bool = False) -> None:
+    def __init__(self, out_path: Path, compress: bool = False, skip_report: bool = False) -> None:
         self.out_path = out_path
         self.out_path.parent.mkdir(parents=True, exist_ok=True)
         if compress or self.out_path.suffix == ".gz":
@@ -52,21 +52,102 @@ class JsonlLogger:
             self._fp = gzip.open(self.out_path, "wt", encoding="utf-8")
         else:
             self._fp = self.out_path.open("w", encoding="utf-8")
+        
+        self.report_path = None
+        self._report_fp = None
+        if not skip_report:
+            self.report_path = self.out_path.with_suffix(".report.txt")
+            if self.out_path.suffix == ".gz":
+                 self.report_path = self.out_path.parent / (self.out_path.stem.replace(".jsonl", "") + ".report.txt")
+            self._report_fp = self.report_path.open("w", encoding="utf-8")
 
     def close(self) -> None:
         self._fp.close()
+        if self._report_fp:
+            self._report_fp.close()
 
     def log(self, event: str, **payload: Any) -> None:
+        ts = datetime.now(timezone.utc).isoformat()
         record = {
-            "ts": datetime.now(timezone.utc).isoformat(),
+            "ts": ts,
             "event": event,
             **_to_jsonable(payload),
         }
         self._fp.write(json.dumps(record, ensure_ascii=True) + "\n")
         self._fp.flush()
+        
+        if self._report_fp:
+            self._write_report_entry(ts, event, payload)
+
+    def _write_report_entry(self, ts: str, event: str, payload: Dict[str, Any]) -> None:
+        prefix = f"[{ts}] {event.upper():<25} | "
+        if event == "section.start":
+            title = payload.get("title", "Section Start")
+            line = "=" * 80
+            self._report_fp.write(f"\n{line}\n{title.upper()}\n{line}\n")
+        elif event in ["generation.evaluate", "generation.post_eval", "generation.post_reproduce"]:
+            gen = payload.get("generation", 0)
+            best_f = payload.get("best_ever_fitness")
+            if best_f is None:
+                best_f = payload.get("best_fitness") # C++ field name
+            
+            pop = payload.get("population", [])
+            mean_f = "N/A"
+            if pop:
+                fitnesses = [ind.get("fitness") for ind in pop if ind.get("fitness") is not None]
+                if fitnesses:
+                    mean_f = f"{sum(fitnesses)/len(fitnesses):.6f}"
+            
+            best_mse = payload.get("best_raw_mse", "N/A")
+            self._report_fp.write(f"{prefix} GEN {gen:03} | Best Fit: {best_f} | Best MSE: {best_mse} | Pop Mean: {mean_f}\n")
+            
+            # If elite only or sampled, list them
+            if payload.get("is_full_snapshot") or event == "generation.post_eval":
+                for ind in pop:
+                    if ind.get("is_elite") or (event == "generation.post_eval" and ind.get("idx", 100) < 2): # Default 2 elites for C++ report
+                        idx = ind.get("idx")
+                        mse = ind.get("raw_mse")
+                        f = ind.get("formula", "N/A")
+                        self._report_fp.write(f"{' ' * len(prefix)}  > Elite {idx:2}: MSE={mse} | Formula: {f}\n")
+        elif event == "run.start":
+            self._report_fp.write(f"{prefix} evolution run started.\n")
+            cfg = payload.get("config")
+            if cfg:
+                self._report_fp.write(f"{' ' * len(prefix)} Config: {cfg}\n")
+        elif event == "run.end":
+            elapsed = payload.get("elapsed_s", 0)
+            res = payload.get("result", {})
+            self._report_fp.write(f"\n{prefix} evolution run completed in {elapsed:.2f}s.\n")
+            if res:
+                self._report_fp.write(f"{' ' * len(prefix)} Best Formula: {res.get('formula')}\n")
+                self._report_fp.write(f"{' ' * len(prefix)} Best MSE:     {res.get('best_mse')}\n")
+        elif event.startswith("opt."):
+            loss = payload.get("loss")
+            mid = payload.get("model_id")
+            self._report_fp.write(f"{prefix} Optimization ({event.split('.')[-1]}): model {mid} loss -> {loss}\n")
+        elif event == "init.refined":
+             self._report_fp.write(f"{prefix} Initial population constants refined.\n")
+        elif event == "population.restart":
+             self._report_fp.write(f"{prefix} population restart triggered at generation {payload.get('generation')}\n")
+        elif event == "run.early_stop":
+             self._report_fp.write(f"{prefix} early stop at generation {payload.get('generation')}\n")
+        elif event in ["generation.select_start", "generation.select_end"]:
+            gen = payload.get("generation", 0)
+            if event == "generation.select_start":
+                conf = payload.get("confidence", "N/A")
+                self._report_fp.write(f"{prefix} GEN {gen:03} | selection start | confidence: {conf}\n")
+            else:
+                diversity = payload.get("new_diversity", "N/A")
+                self._report_fp.write(f"{prefix} GEN {gen:03} | selection end | unique structures: {diversity}\n")
 
 
-
+def print_section(title: str, logger: Optional[Any] = None) -> None:
+    line = "=" * 80
+    print(f"\n{line}")
+    print(f"STAGE: {title.upper()}")
+    print(f"{line}\n")
+    if logger:
+        logger.log("section.start", title=title)
 
 
 def _to_jsonable(x: Any) -> Any:
@@ -326,6 +407,7 @@ def main() -> None:
     parser.add_argument("--log-pop-every", type=int, default=1, help="Log full population every N generations")
     parser.add_argument("--log-pop-elite-only", action="store_true", help="In non-sampled generations, only log elites")
     parser.add_argument("--log-skip-formulas-non-elite", action="store_true", help="Skip formulas for non-elite individuals")
+    parser.add_argument("--no-report", action="store_true", help="Disable generating a human-readable .txt report")
     args = parser.parse_args()
 
     if args.no_explorers:
@@ -337,6 +419,7 @@ def main() -> None:
     else:
         args.allow_cpp_backend = True
 
+    print_section("SETUP")
     if args.formula:
         x_t, y_t = _formula_data(args.formula, args.x_min, args.x_max, args.n_samples)
         source_desc = {"type": "formula", "formula": args.formula, "x_min": args.x_min, "x_max": args.x_max, "n_samples": args.n_samples}
@@ -356,6 +439,7 @@ def main() -> None:
             tau=0.5,
         )
 
+    print_section("INITIALIZATION")
     elite_size = max(2, args.population_size // 4)
     trainer = EvolutionaryONNTrainer(
         model_factory=model_factory,
@@ -394,9 +478,10 @@ def main() -> None:
         print(f"Best MSE: {result.get('best_mse', None)}")
         return
 
-    logger = JsonlLogger(out_path, compress=args.compress)
+    logger = JsonlLogger(out_path, compress=args.compress, skip_report=args.no_report)
     out_path = logger.out_path # Update in case .gz was added
 
+    print_section("EVOLUTION", logger=logger)
     originals = instrument_pipeline(
         trainer, 
         logger, 
@@ -425,9 +510,29 @@ def main() -> None:
     )
 
     t0 = time.time()
+    temp_trace = out_path.parent / f"{out_path.stem}.cpp_temp.jsonl"
     try:
-        result = trainer.train(x_t, y_t, generations=args.generations, print_every=args.print_every)
+        result = trainer.train(
+            x_t, y_t, 
+            generations=args.generations, 
+            print_every=args.print_every,
+            trace_path=str(temp_trace)
+        )
+        
+        # If C++ trace was generated, ingest it
+        if temp_trace.exists():
+            with open(temp_trace, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        data = json.loads(line)
+                        event = data.pop("event", "unknown")
+                        data.pop("ts", None) # Use logger's timestamp
+                        logger.log(event, **data)
+                    except Exception:
+                        continue
+            temp_trace.unlink()
 
+        print_section("FINALIZATION", logger=logger)
         logger.log("run.end", elapsed_s=time.time() - t0, result=result)
 
         print(f"Detailed pipeline log written to: {out_path}")
@@ -437,5 +542,216 @@ def main() -> None:
         logger.close()
 
 
+def analyze_trace(trace_path: str, out_path: Optional[str] = None) -> None:
+    """Post-hoc analysis of a JSONL evolution trace file.
+    
+    Produces a human-readable diagnostic report covering:
+    - MSE convergence curve (per-generation best)
+    - Stagnation window detection 
+    - Population restart events
+    - Best formula lineage across generations
+    - Elite structure changes
+    """
+    events = []
+    with open(trace_path, "r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                events.append(json.loads(line))
+            except Exception:
+                continue
+    
+    if not events:
+        print("No valid events found in trace file.")
+        return
+    
+    # Extract generation-level data
+    gen_data = {}  # gen -> {best_mse, best_formula, diversity, ...}
+    restarts = []
+    config = {}
+    run_result = {}
+    
+    for ev in events:
+        event_type = ev.get("event", "")
+        gen = ev.get("generation")
+        
+        if event_type == "run.start":
+            config = ev.get("config", {})
+        elif event_type == "run.end":
+            run_result = ev
+        elif event_type == "population.restart":
+            restarts.append(gen)
+        elif event_type in ["generation.evaluate", "generation.post_eval", 
+                            "generation.post_reproduce"]:
+            if gen is not None:
+                if gen not in gen_data:
+                    gen_data[gen] = {}
+                
+                best_mse = ev.get("best_raw_mse") or ev.get("best_mse")
+                if best_mse is not None:
+                    gen_data[gen]["best_mse"] = best_mse
+                
+                best_f = ev.get("best_ever_fitness") or ev.get("best_fitness")
+                if best_f is not None:
+                    gen_data[gen]["best_fitness"] = best_f
+                
+                pop = ev.get("population", [])
+                if pop:
+                    gen_data[gen]["pop_size"] = len(pop)
+                    fitnesses = [p["fitness"] for p in pop if "fitness" in p]
+                    if fitnesses:
+                        gen_data[gen]["mean_fitness"] = sum(fitnesses) / len(fitnesses)
+                        gen_data[gen]["worst_fitness"] = max(fitnesses)
+                    
+                    # Extract elite formulas
+                    elites = [p for p in pop if p.get("is_elite") or p.get("idx", 100) < 3]
+                    if elites:
+                        gen_data[gen]["elites"] = [
+                            {"idx": e.get("idx"), "mse": e.get("raw_mse"), 
+                             "formula": e.get("formula", "N/A")}
+                            for e in elites[:3]
+                        ]
+                    
+                    # Diversity: count unique formulas
+                    formulas = [p.get("formula", "") for p in pop if p.get("formula")]
+                    if formulas:
+                        gen_data[gen]["unique_formulas"] = len(set(formulas))
+                        gen_data[gen]["diversity_ratio"] = len(set(formulas)) / len(formulas)
+    
+    # Build sorted generation list
+    gens = sorted(gen_data.keys())
+    if not gens:
+        print("No generation data found in trace.")
+        return
+    
+    # Detect stagnation windows (best MSE unchanged for N gens)
+    stagnation_windows = []
+    if len(gens) > 1:
+        window_start = gens[0]
+        last_mse = gen_data[gens[0]].get("best_mse", float("inf"))
+        for g in gens[1:]:
+            cur_mse = gen_data[g].get("best_mse", float("inf"))
+            if cur_mse is not None and last_mse is not None:
+                if abs(cur_mse - last_mse) < 1e-12:
+                    continue  # Still stagnant
+                else:
+                    length = g - window_start
+                    if length >= 5:
+                        stagnation_windows.append((window_start, g - 1, length, last_mse))
+                    window_start = g
+                    last_mse = cur_mse
+        # Check final window
+        length = gens[-1] - window_start
+        if length >= 5:
+            stagnation_windows.append((window_start, gens[-1], length, last_mse))
+    
+    # Build report
+    lines = []
+    lines.append("=" * 80)
+    lines.append("EVOLUTION PATH ANALYSIS REPORT")
+    lines.append("=" * 80)
+    lines.append(f"Trace file: {trace_path}")
+    lines.append(f"Total events: {len(events)}")
+    lines.append(f"Generations with data: {len(gens)} (range {gens[0]}–{gens[-1]})")
+    lines.append("")
+    
+    # Config summary
+    if config:
+        lines.append("── Configuration ──")
+        for k in ["pop_size", "generations", "mutation_rate_structural", 
+                   "crossover_rate", "elite_size", "macro_mutation_prob",
+                   "explorer_fraction"]:
+            if k in config:
+                lines.append(f"  {k}: {config[k]}")
+        lines.append("")
+    
+    # MSE convergence
+    lines.append("── MSE Convergence ──")
+    last_printed_mse = None
+    for g in gens:
+        mse = gen_data[g].get("best_mse")
+        if mse is None:
+            continue
+        # Print at transitions and at regular intervals
+        should_print = (
+            last_printed_mse is None or
+            g == gens[0] or g == gens[-1] or
+            g % max(1, len(gens) // 20) == 0 or
+            (last_printed_mse is not None and abs(mse - last_printed_mse) > last_printed_mse * 0.01)
+        )
+        if should_print:
+            diversity = gen_data[g].get("diversity_ratio")
+            div_str = f" | diversity: {diversity:.2%}" if diversity else ""
+            lines.append(f"  Gen {g:4d}: MSE = {mse:.6e}{div_str}")
+            last_printed_mse = mse
+    lines.append("")
+    
+    # Stagnation windows
+    if stagnation_windows:
+        lines.append("── Stagnation Windows (≥5 gens with no improvement) ──")
+        for start, end, length, mse in stagnation_windows:
+            lines.append(f"  Gen {start:4d}–{end:4d} ({length} gens) stuck at MSE = {mse:.6e}")
+        lines.append("")
+    
+    # Population restarts
+    if restarts:
+        lines.append("── Population Restarts ──")
+        for g in restarts:
+            lines.append(f"  Restart injected at generation {g}")
+        lines.append("")
+    
+    # Best formula evolution (track when elite #0 formula changes)
+    lines.append("── Best Formula Lineage ──")
+    last_formula = None
+    for g in gens:
+        elites = gen_data[g].get("elites", [])
+        if elites:
+            top = elites[0]
+            f = top.get("formula", "N/A")
+            if f != last_formula:
+                mse_str = f"{top['mse']:.6e}" if top.get("mse") is not None else "N/A"
+                lines.append(f"  Gen {g:4d}: {f}  (MSE: {mse_str})")
+                last_formula = f
+    lines.append("")
+    
+    # Final result
+    if run_result:
+        lines.append("── Final Result ──")
+        res = run_result.get("result", {})
+        lines.append(f"  Formula: {res.get('formula', 'N/A')}")
+        lines.append(f"  MSE:     {res.get('best_mse', 'N/A')}")
+        lines.append(f"  Elapsed: {run_result.get('elapsed_s', 0):.2f}s")
+        lines.append("")
+    
+    # Summary statistics
+    lines.append("── Summary ──")
+    mse_values = [gen_data[g].get("best_mse") for g in gens if gen_data[g].get("best_mse") is not None]
+    if len(mse_values) >= 2:
+        initial_mse = mse_values[0]
+        final_mse = mse_values[-1]
+        improvement = initial_mse / max(final_mse, 1e-15)
+        lines.append(f"  Initial MSE: {initial_mse:.6e}")
+        lines.append(f"  Final MSE:   {final_mse:.6e}")
+        lines.append(f"  Improvement ratio: {improvement:.1f}x")
+        lines.append(f"  Stagnation windows: {len(stagnation_windows)}")
+        lines.append(f"  Population restarts: {len(restarts)}")
+    lines.append("")
+    
+    report = "\n".join(lines)
+    
+    if out_path:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(report)
+        print(f"Analysis report written to: {out_path}")
+    else:
+        print(report)
+
+
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--analyze":
+        if len(sys.argv) < 3:
+            print("Usage: python evolution_pipeline_log.py --analyze <trace.jsonl> [output.txt]")
+            sys.exit(1)
+        analyze_trace(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
+    else:
+        main()

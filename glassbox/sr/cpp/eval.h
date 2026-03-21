@@ -113,8 +113,8 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                         break;
                     }
                     case UnaryOp::Exp: {
-                        // We'll simplify MetaExp here: base^x
-                        cache[i] = x.exp().max(-100.0).min(100.0);
+                        // exp(omega*x + phi) — omega enables sign (exp(-x)), phi enables shift
+                        cache[i] = (node.omega * x + node.phi).exp().max(-100.0).min(100.0);
                         break;
                     }
                     case UnaryOp::Log: {
@@ -206,8 +206,8 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                         break;
                     }
                     case UnaryOp::Exp: {
-                        // We'll simplify MetaExp here: base^x
-                        cache_out[i] = x.exp().max(-100.0).min(100.0);
+                        // exp(omega*x + phi) — omega enables sign (exp(-x)), phi enables shift
+                        cache_out[i] = (node.omega * x + node.phi).exp().max(-100.0).min(100.0);
                         break;
                     }
                     case UnaryOp::Log: {
@@ -324,7 +324,7 @@ inline Eigen::ArrayXd evaluate_graph_cached(const IndividualGraph& graph,
                         break;
                     }
                     case UnaryOp::Exp: {
-                        cache_out[i] = x.exp().max(-100.0).min(100.0);
+                        cache_out[i] = (node.omega * x + node.phi).exp().max(-100.0).min(100.0);
                         break;
                     }
                     case UnaryOp::Log: {
@@ -457,8 +457,33 @@ inline std::string format_node_to_string(const IndividualGraph& graph, int node_
                     }
                     return std::string(buf);
                 }
-                case UnaryOp::Exp:
-                    return "exp(" + child_str + ")";
+                case UnaryOp::Exp: {
+                    // Build exp string: exp([omega*]child[ + phi])
+                    std::string exp_arg = "";
+                    bool has_omega_e = std::abs(node.omega - 1.0) > 1e-4;
+                    if (has_omega_e) {
+                        if (std::abs(node.omega - (-1.0)) < 1e-6) {
+                            exp_arg += "-";
+                        } else if (std::abs(node.omega - std::round(node.omega)) < 1e-6) {
+                            snprintf(buf, sizeof(buf), "%d*", (int)std::round(node.omega));
+                            exp_arg += std::string(buf);
+                        } else {
+                            snprintf(buf, sizeof(buf), "%.4g*", node.omega);
+                            exp_arg += std::string(buf);
+                        }
+                    }
+                    exp_arg += child_str;
+                    bool has_phi_e = std::abs(node.phi) > 1e-4;
+                    if (has_phi_e) {
+                        if (std::abs(node.phi - std::round(node.phi)) < 1e-6) {
+                            snprintf(buf, sizeof(buf), " + %d", (int)std::round(node.phi));
+                        } else {
+                            snprintf(buf, sizeof(buf), " + %.4g", node.phi);
+                        }
+                        exp_arg += std::string(buf);
+                    }
+                    return "exp(" + exp_arg + ")";
+                }
                 case UnaryOp::Log:
                     return "log(|" + child_str + "|)";
             }

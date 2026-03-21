@@ -2382,6 +2382,7 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         fitness_y: Optional[torch.Tensor] = None,
         generations: int = 50,
         print_every: int = 5,
+        trace_path: Optional[str] = None,
     ) -> Dict:
         """
         Full evolutionary training.
@@ -2469,7 +2470,8 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 pop_size=self.population_size,
                 generations=generations,
                 early_stop_mse=self.early_stop_mse,
-                seed_omegas=detected_omegas
+                seed_omegas=detected_omegas,
+                trace_path=trace_path
             )
             
             end_time = time.time()

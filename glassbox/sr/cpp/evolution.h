@@ -631,6 +631,13 @@ private:
                             node.p = valid_powers[p_dist(rng_)];
                         }
                     }
+                    // Seed Exp nodes with useful omega values (including negative for exp(-x))
+                    if (node.unary_op == UnaryOp::Exp) {
+                        const double exp_omega_seeds[] = {-2.0, -1.0, -0.5, 0.5, 1.0, 2.0};
+                        std::uniform_int_distribution<int> eo_dist(0, 5);
+                        node.omega = exp_omega_seeds[eo_dist(rng_)];
+                        node.phi = 0.0; // Exp shift is rarely needed at init
+                    }
                     std::uniform_int_distribution<int> child_dist(0, i - 1);
                     node.left_child = child_dist(rng_);
                 } else {
@@ -1461,8 +1468,8 @@ private:
             solve_output_weights(candidate, trial_cache);
             evaluate_fitness_with_penalty(candidate, X_, y_, n_samples);
             
-            // Accept if MSE is still acceptable (within 2x baseline)
-            if (candidate.raw_mse < baseline_mse * 2.0 + 1e-8) {
+            // Accept if MSE is still acceptable (within 5% of baseline)
+            if (candidate.raw_mse < baseline_mse * 1.05 + 1e-8) {
                 ind = candidate;
                 baseline_mse = std::max(baseline_mse, ind.raw_mse);
             } else {
@@ -1511,7 +1518,7 @@ private:
                         solve_output_weights(ind, snap_cache);
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                         
-                        if (ind.raw_mse < best_snap_mse * 1.5 + 1e-8) {
+                        if (ind.raw_mse < best_snap_mse * 1.02 + 1e-8) {
                             best_snap_p = candidate;
                             best_snap_mse = ind.raw_mse;
                         }
@@ -1546,7 +1553,7 @@ private:
                         solve_output_weights(ind, snap_cache);
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                         
-                        if (ind.raw_mse < best_snap_mse * 1.5 + 1e-8) {
+                        if (ind.raw_mse < best_snap_mse * 1.02 + 1e-8) {
                             best_snap_omega = candidate;
                             best_snap_mse = ind.raw_mse;
                         }
@@ -1559,7 +1566,7 @@ private:
                         solve_output_weights(ind, snap_cache);
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                         
-                        if (ind.raw_mse < best_snap_mse * 1.5 + 1e-8) {
+                        if (ind.raw_mse < best_snap_mse * 1.02 + 1e-8) {
                             best_snap_omega = nearest_int;
                             best_snap_mse = ind.raw_mse;
                         }
@@ -1589,7 +1596,7 @@ private:
                         solve_output_weights(ind, snap_cache);
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                         
-                        if (ind.raw_mse < best_snap_mse * 1.5 + 1e-8) {
+                        if (ind.raw_mse < best_snap_mse * 1.02 + 1e-8) {
                             best_snap_phi = candidate;
                             best_snap_mse = ind.raw_mse;
                         }
@@ -1602,6 +1609,97 @@ private:
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                         snap_baseline_mse = ind.raw_mse;
                     }
+                }
+            }
+            
+            // 6a.2 Exp omega/phi snapping: exp(omega*x + phi)
+            // Key snaps: omega ∈ {-3, -2, -1.5, -1, -0.5, 0.5, 1, 1.5, 2, 3}
+            for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
+                if (ind.nodes[i].type != NodeType::Unary) continue;
+                if (ind.nodes[i].unary_op != UnaryOp::Exp) continue;
+                if (i >= static_cast<int>(ind.output_weights.size())) continue;
+                if (std::abs(ind.output_weights[i]) < 1e-6) continue;
+                
+                auto& node = ind.nodes[i];
+                
+                // Snap omega for Exp
+                const double snap_exp_omega[] = {-3.0, -2.0, -1.5, -1.0, -0.5, 0.5, 1.0, 1.5, 2.0, 3.0};
+                const int n_snap_exp_omega = sizeof(snap_exp_omega) / sizeof(snap_exp_omega[0]);
+                
+                double original_omega = node.omega;
+                double best_snap_omega = original_omega;
+                double best_snap_mse = snap_baseline_mse;
+                
+                for (int si = 0; si < n_snap_exp_omega; ++si) {
+                    double candidate = snap_exp_omega[si];
+                    if (std::abs(original_omega - candidate) > 0.3) continue;
+                    
+                    node.omega = candidate;
+                    std::vector<Eigen::ArrayXd> snap_cache;
+                    evaluate_graph(ind, X_, n_samples, snap_cache);
+                    solve_output_weights(ind, snap_cache);
+                    evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                    
+                    if (ind.raw_mse < best_snap_mse * 1.02 + 1e-8) {
+                        best_snap_omega = candidate;
+                        best_snap_mse = ind.raw_mse;
+                    }
+                }
+                // Also try nearest integer
+                double nearest_int_e = std::round(original_omega);
+                if (std::abs(nearest_int_e) >= 1.0 && std::abs(nearest_int_e) <= 5.0 && 
+                    std::abs(original_omega - nearest_int_e) <= 0.3) {
+                    node.omega = nearest_int_e;
+                    std::vector<Eigen::ArrayXd> snap_cache;
+                    evaluate_graph(ind, X_, n_samples, snap_cache);
+                    solve_output_weights(ind, snap_cache);
+                    evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                    
+                    if (ind.raw_mse < best_snap_mse * 1.02 + 1e-8) {
+                        best_snap_omega = nearest_int_e;
+                        best_snap_mse = ind.raw_mse;
+                    }
+                }
+                
+                node.omega = best_snap_omega;
+                if (best_snap_omega != original_omega) {
+                    std::vector<Eigen::ArrayXd> snap_cache;
+                    evaluate_graph(ind, X_, n_samples, snap_cache);
+                    solve_output_weights(ind, snap_cache);
+                    evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                    snap_baseline_mse = ind.raw_mse;
+                }
+                
+                // Snap phi for Exp
+                const double snap_exp_phi[] = {0.0, -1.0, -0.5, 0.5, 1.0};
+                const int n_snap_exp_phi = sizeof(snap_exp_phi) / sizeof(snap_exp_phi[0]);
+                
+                double original_phi = node.phi;
+                double best_snap_phi = original_phi;
+                best_snap_mse = snap_baseline_mse;
+                
+                for (int si = 0; si < n_snap_exp_phi; ++si) {
+                    double candidate = snap_exp_phi[si];
+                    if (std::abs(original_phi - candidate) > 0.3) continue;
+                    
+                    node.phi = candidate;
+                    std::vector<Eigen::ArrayXd> snap_cache;
+                    evaluate_graph(ind, X_, n_samples, snap_cache);
+                    solve_output_weights(ind, snap_cache);
+                    evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                    
+                    if (ind.raw_mse < best_snap_mse * 1.02 + 1e-8) {
+                        best_snap_phi = candidate;
+                        best_snap_mse = ind.raw_mse;
+                    }
+                }
+                node.phi = best_snap_phi;
+                if (best_snap_phi != original_phi) {
+                    std::vector<Eigen::ArrayXd> snap_cache;
+                    evaluate_graph(ind, X_, n_samples, snap_cache);
+                    solve_output_weights(ind, snap_cache);
+                    evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                    snap_baseline_mse = ind.raw_mse;
                 }
             }
             
