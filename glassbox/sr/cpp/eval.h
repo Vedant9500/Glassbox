@@ -109,16 +109,16 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                         double is_even = power_sign_blend(node.p);
                         cache[i] = (1.0 - is_even) * (sign_x * abs_pow) + is_even * abs_pow;
                         // Clamp
-                        cache[i] = cache[i].max(-100.0).min(100.0);
+                        cache[i] = cache[i].max(-1e8).min(1e8);
                         break;
                     }
                     case UnaryOp::Exp: {
                         // exp(omega*x + phi) — omega enables sign (exp(-x)), phi enables shift
-                        cache[i] = (node.omega * x + node.phi).exp().max(-100.0).min(100.0);
+                        cache[i] = (node.omega * x + node.phi).exp().max(-1e6).min(1e6);
                         break;
                     }
                     case UnaryOp::Log: {
-                        cache[i] = (x.abs() + 1e-6).log().max(-100.0).min(100.0);
+                        cache[i] = (x.abs() + 1e-6).log().max(-1e6).min(1e6);
                         break;
                     }
                 }
@@ -136,7 +136,7 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                         auto res_mul = x * y;
                         auto res_div = x / (y.abs() + 1e-6) * y.sign();
 
-                        cache[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-100.0).min(100.0);
+                        cache[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-1e6).min(1e6);
                         break;
                     }
                     case BinaryOp::Aggregation: {
@@ -202,16 +202,16 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                         double is_even = power_sign_blend(node.p);
                         cache_out[i] = (1.0 - is_even) * (sign_x * abs_pow) + is_even * abs_pow;
                         // Clamp
-                        cache_out[i] = cache_out[i].max(-100.0).min(100.0);
+                        cache_out[i] = cache_out[i].max(-1e8).min(1e8);
                         break;
                     }
                     case UnaryOp::Exp: {
                         // exp(omega*x + phi) — omega enables sign (exp(-x)), phi enables shift
-                        cache_out[i] = (node.omega * x + node.phi).exp().max(-100.0).min(100.0);
+                        cache_out[i] = (node.omega * x + node.phi).exp().max(-1e6).min(1e6);
                         break;
                     }
                     case UnaryOp::Log: {
-                        cache_out[i] = (x.abs() + 1e-6).log().max(-100.0).min(100.0);
+                        cache_out[i] = (x.abs() + 1e-6).log().max(-1e6).min(1e6);
                         break;
                     }
                 }
@@ -229,7 +229,7 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                         auto res_mul = x * y;
                         auto res_div = x / (y.abs() + 1e-6) * y.sign();
 
-                        cache_out[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-100.0).min(100.0);
+                        cache_out[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-1e6).min(1e6);
                         break;
                     }
                     case BinaryOp::Aggregation: {
@@ -320,15 +320,15 @@ inline Eigen::ArrayXd evaluate_graph_cached(const IndividualGraph& graph,
                         auto abs_pow = abs_x.pow(node.p);
                         double is_even = power_sign_blend(node.p);
                         cache_out[i] = (1.0 - is_even) * (sign_x * abs_pow) + is_even * abs_pow;
-                        cache_out[i] = cache_out[i].max(-100.0).min(100.0);
+                        cache_out[i] = cache_out[i].max(-1e8).min(1e8);
                         break;
                     }
                     case UnaryOp::Exp: {
-                        cache_out[i] = (node.omega * x + node.phi).exp().max(-100.0).min(100.0);
+                        cache_out[i] = (node.omega * x + node.phi).exp().max(-1e6).min(1e6);
                         break;
                     }
                     case UnaryOp::Log: {
-                        cache_out[i] = (x.abs() + 1e-6).log().max(-100.0).min(100.0);
+                        cache_out[i] = (x.abs() + 1e-6).log().max(-1e6).min(1e6);
                         break;
                     }
                 }
@@ -344,7 +344,7 @@ inline Eigen::ArrayXd evaluate_graph_cached(const IndividualGraph& graph,
                         auto res_sub = x - y;
                         auto res_mul = x * y;
                         auto res_div = x / (y.abs() + 1e-6) * y.sign();
-                        cache_out[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-100.0).min(100.0);
+                        cache_out[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-1e6).min(1e6);
                         break;
                     }
                     case BinaryOp::Aggregation: {
