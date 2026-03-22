@@ -20,12 +20,14 @@ enum class NodeType {
 enum class UnaryOp {
     Periodic,
     Power,
+    IntPow,
     Exp,
     Log
 };
 
 enum class BinaryOp {
     Arithmetic,
+    Division,
     Aggregation  // Sum, Mean, Max
 };
 
@@ -44,7 +46,7 @@ struct OpNode {
     BinaryOp binary_op;
     
     // Meta-operation parameters
-    double p = 1.0;          // Power
+    double p = 1.0;          // Power / IntPow exponent
     double omega = 1.0;      // Periodic frequency
     double phi = 0.0;        // Periodic phase
     double amplitude = 1.0;  // Periodic amplitude

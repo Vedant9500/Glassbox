@@ -66,6 +66,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         max_power=6,
         timeout=120,
         evolution_skip_r2=0.999,
+        multi_start_runs=3,
+        adaptive_compute_budget=True,
+        min_compute_budget=10,
+        max_compute_budget=300,
         device=None,
     ):
         self.population_size = population_size
@@ -88,7 +92,37 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.max_power = max_power
         self.timeout = timeout
         self.evolution_skip_r2 = evolution_skip_r2
+        self.multi_start_runs = multi_start_runs
+        self.adaptive_compute_budget = adaptive_compute_budget
+        self.min_compute_budget = min_compute_budget
+        self.max_compute_budget = max_compute_budget
         self.device = device
+
+    def _estimate_compute_budget(self, X, current_r2, term_count):
+        """Adaptive compute budget: easy problems get short runs, hard problems get longer runs."""
+        base_timeout = float(max(1, self.timeout))
+        if not self.adaptive_compute_budget:
+            return base_timeout
+
+        n_samples = int(X.shape[0])
+        n_features = int(X.shape[1])
+
+        score = 1.0
+        score += 0.15 * max(0, n_features - 1)
+        score += 0.08 * min(1.0, np.log10(max(50, n_samples)) / 3.0)
+
+        # Fast-path confidence gates: reduce budget on easy problems.
+        if current_r2 >= 0.995 and term_count <= 5:
+            score *= 0.2
+        elif current_r2 >= 0.98 and term_count <= 8:
+            score *= 0.5
+        elif current_r2 >= 0.90:
+            score *= 0.9
+        else:
+            score *= 2.5
+
+        budget = base_timeout * score
+        return float(np.clip(budget, float(self.min_compute_budget), float(self.max_compute_budget)))
 
     def _resolve_classifier_path(self):
         """Resolve classifier model path relative to repo root."""
@@ -208,7 +242,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             term_count > 8
         )
 
-        if need_evolution and _elapsed() < self.timeout:
+        effective_timeout = self._estimate_compute_budget(X, current_r2, term_count)
+
+        if need_evolution and _elapsed() < effective_timeout:
             if not CPP_AVAILABLE:
                 if best_formula is None:
                     raise ImportError(
@@ -222,7 +258,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 # Try guided evolution (beam search) only if R² is low
                 if (self.use_guided_evolution and operator_hints
                         and current_r2 < self.evolution_skip_r2
-                        and _elapsed() < self.timeout):
+                    and _elapsed() < effective_timeout):
                     try:
                         from classifier_fast_path import run_guided_evolution
 
@@ -251,41 +287,70 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         print(f"  [Guided evolution skipped: {e}]")
 
                 # Fall back to raw C++ evolution
-                if (evo_formula is None or evo_mse >= self.early_stop_mse) and _elapsed() < self.timeout:
+                if (evo_formula is None or evo_mse >= self.early_stop_mse) and _elapsed() < effective_timeout:
                     try:
                         X_list = [X[:, i].astype(np.float64) for i in range(self.n_features_in_)]
                         y_arr = y.astype(np.float64).flatten()
 
-                        result = _core.run_evolution(
-                            X_list=X_list,
-                            y=y_arr,
-                            pop_size=self.population_size,
-                            generations=self.generations,
-                            early_stop_mse=self.early_stop_mse,
-                            seed_omegas=detected_omegas,
-                            timeout_seconds=max(1, int(self.timeout - _elapsed())),
-                            p_min=self.p_min,
-                            p_max=self.p_max,
-                            use_nsga2=self.use_nsga2,
-                            num_islands=self.num_islands,
-                            migration_interval=self.migration_interval,
-                            migration_size=self.migration_size,
-                            arithmetic_temperature=self.arithmetic_temperature,
-                        )
+                        n_runs = max(1, int(self.multi_start_runs))
+                        best_cpp_result = None
 
-                        raw_mse = result.get('best_mse', float('inf'))
-                        raw_formula = result.get('formula', '')
+                        for run_idx in range(n_runs):
+                            remaining = max(0.0, effective_timeout - _elapsed())
+                            if remaining <= 0.0:
+                                break
 
-                        if raw_mse < evo_mse:
-                            evo_formula = raw_formula
-                            evo_mse = raw_mse
+                            # Split remaining budget across yet-to-run starts.
+                            runs_left = max(1, n_runs - run_idx)
+                            run_timeout = max(1, int(remaining / runs_left))
 
-                        # Store raw C++ results for inspection
-                        self.nodes_ = result.get('nodes', [])
-                        self.output_weights_ = result.get('output_weights', [])
-                        self.output_bias_ = result.get('output_bias', 0.0)
-                        if 'pareto_front' in result:
-                            self.pareto_front_ = result['pareto_front']
+                            run_seed = -1
+                            if self.random_state is not None:
+                                run_seed = int(self.random_state) + run_idx * 9973
+
+                            result = _core.run_evolution(
+                                X_list=X_list,
+                                y=y_arr,
+                                pop_size=self.population_size,
+                                generations=self.generations,
+                                early_stop_mse=self.early_stop_mse,
+                                seed_omegas=detected_omegas,
+                                timeout_seconds=run_timeout,
+                                p_min=self.p_min,
+                                p_max=self.p_max,
+                                use_nsga2=self.use_nsga2,
+                                num_islands=self.num_islands,
+                                migration_interval=self.migration_interval,
+                                migration_size=self.migration_size,
+                                arithmetic_temperature=self.arithmetic_temperature,
+                                random_seed=run_seed,
+                            )
+
+                            raw_mse = result.get('best_mse', float('inf'))
+                            raw_formula = result.get('formula', '')
+
+                            if raw_mse < evo_mse:
+                                evo_formula = raw_formula
+                                evo_mse = raw_mse
+                                best_cpp_result = result
+
+                            if raw_mse <= self.early_stop_mse:
+                                break
+
+                        if best_cpp_result is not None:
+                            # Store best C++ result for inspection
+                            self.nodes_ = best_cpp_result.get('nodes', [])
+                            self.output_weights_ = best_cpp_result.get('output_weights', [])
+                            self.output_bias_ = best_cpp_result.get('output_bias', 0.0)
+                            self.evolution_wall_time_sec_ = best_cpp_result.get('evolution_wall_time_sec')
+                            self.time_to_first_exact_sec_ = best_cpp_result.get('time_to_first_exact_sec')
+                            self.time_to_first_acceptable_sec_ = best_cpp_result.get('time_to_first_acceptable_sec')
+                            self.generation_to_first_exact_ = best_cpp_result.get('generation_to_first_exact')
+                            self.generation_to_first_acceptable_ = best_cpp_result.get('generation_to_first_acceptable')
+                            self.openmp_threads_ = best_cpp_result.get('openmp_threads')
+                            self.evolution_random_seed_ = best_cpp_result.get('random_seed')
+                            if 'pareto_front' in best_cpp_result:
+                                self.pareto_front_ = best_cpp_result['pareto_front']
                     except Exception as e:
                         print(f"  [C++ evolution error: {e}]")
 
@@ -293,8 +358,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 if evo_formula and (evo_mse < best_mse or best_formula is None):
                     best_formula = evo_formula
                     best_mse = evo_mse
-        elif need_evolution and _elapsed() >= self.timeout:
-            print(f"  [Timeout: skipping evolution after {_elapsed():.1f}s]")
+        elif need_evolution and _elapsed() >= effective_timeout:
+            print(f"  [Timeout: skipping evolution after {_elapsed():.1f}s (budget={effective_timeout:.1f}s)]")
 
         # ── Stage 3: Formula Simplification & Noise Reduction ──
         if best_formula:

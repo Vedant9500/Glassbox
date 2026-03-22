@@ -332,6 +332,140 @@ def estimate_timeout_budget(base_timeout, n_features, n_train, adaptive_timeout)
     return int(min(max(20, budget), base_timeout * 2))
 
 
+def parse_seed_list(seed_text):
+    """Parse a comma-separated seed list and return sorted unique integers."""
+    if seed_text is None:
+        return [42]
+    parts = [p.strip() for p in str(seed_text).split(",") if p.strip()]
+    if not parts:
+        return [42]
+    seeds = []
+    for p in parts:
+        seeds.append(int(p))
+    return sorted(set(seeds))
+
+
+def compute_stability_stats(values):
+    """Compute median/IQR/std and worst-decile summary for a metric list."""
+    if not values:
+        return {
+            "median": None,
+            "iqr": None,
+            "std": None,
+            "worst_decile": None,
+        }
+    arr = np.asarray(values, dtype=np.float64)
+    q25 = float(np.percentile(arr, 25))
+    q50 = float(np.percentile(arr, 50))
+    q75 = float(np.percentile(arr, 75))
+    if arr.size >= 10:
+        worst_count = max(1, int(np.ceil(arr.size * 0.1)))
+        worst = np.sort(arr)[:worst_count]
+        worst_decile = float(np.mean(worst))
+    else:
+        worst_decile = float(np.min(arr))
+    return {
+        "median": q50,
+        "iqr": float(q75 - q25),
+        "std": float(np.std(arr)),
+        "worst_decile": worst_decile,
+    }
+
+
+def classify_failure_taxonomy(true_formula, discovered_formula, r2, mse):
+    """Heuristic failure taxonomy for closed-loop mutation/operator analysis."""
+    true_f = (true_formula or "").lower()
+    disc_f = (discovered_formula or "").lower()
+
+    if not disc_f:
+        return "no_formula"
+
+    if "exp(-" in true_f and "exp(" in disc_f and "exp(-" not in disc_f:
+        return "exp_sign_error"
+
+    if "/" in true_f and "/" not in disc_f:
+        return "rational_denominator_missing"
+
+    true_pows = [int(m.group(1)) for m in re.finditer(r"\*\*\s*(\d+)", true_f)]
+    disc_pows = [int(m.group(1)) for m in re.finditer(r"\*\*\s*(\d+)", disc_f)]
+    if true_pows:
+        true_max = max(true_pows)
+        disc_max = max(disc_pows) if disc_pows else 1
+        if true_max >= 3 and disc_max < true_max:
+            return "missing_high_order_terms"
+
+    if ("sin(" in true_f or "cos(" in true_f) and not ("sin(" in disc_f or "cos(" in disc_f):
+        return "periodic_structure_missing"
+
+    if r2 is not None and r2 >= 0.8:
+        return "near_miss_structural"
+    if mse is not None and np.isfinite(mse) and mse > 1.0:
+        return "high_error_instability"
+    return "other_structural_failure"
+
+
+def summarize_time_to_discovery(seed_runs, acceptable_r2=0.9, complexity_cap=20, exact_key="exact_match"):
+    """Compute time to first exact and first acceptable formula across seeded runs."""
+    times_exact = []
+    times_acceptable = []
+    for run in seed_runs:
+        t = run.get("time")
+        if t is None or not np.isfinite(t):
+            continue
+        is_exact = bool(run.get(exact_key, False))
+        r2 = run.get("r2")
+        size = run.get("model_size")
+        is_acceptable = (
+            is_exact
+            or (
+                r2 is not None
+                and np.isfinite(r2)
+                and r2 >= acceptable_r2
+                and size is not None
+                and size <= complexity_cap
+            )
+        )
+        if is_exact:
+            times_exact.append(float(t))
+        if is_acceptable:
+            times_acceptable.append(float(t))
+
+    return {
+        "time_to_first_exact": (min(times_exact) if times_exact else None),
+        "time_to_first_acceptable": (min(times_acceptable) if times_acceptable else None),
+    }
+
+
+def summarize_seed_runs(seed_runs):
+    """Aggregate per-seed runs into protocol-compliant stability summaries."""
+    valid = [r for r in seed_runs if r.get("r2") is not None]
+    if not valid:
+        return {
+            "seed_count": len(seed_runs),
+            "valid_seed_count": 0,
+            "r2_stats": compute_stability_stats([]),
+            "mse_stats": compute_stability_stats([]),
+            "time_stats": compute_stability_stats([]),
+            "exact_recovery_rate": None,
+            "exact_recovery_stats": compute_stability_stats([]),
+        }
+
+    r2_vals = [r["r2"] for r in valid if np.isfinite(r["r2"])]
+    mse_vals = [r["mse"] for r in valid if r.get("mse") is not None and np.isfinite(r["mse"])]
+    time_vals = [r["time"] for r in valid if r.get("time") is not None and np.isfinite(r["time"])]
+    exact_binary = [1.0 if r.get("exact_match") else 0.0 for r in valid]
+
+    return {
+        "seed_count": len(seed_runs),
+        "valid_seed_count": len(valid),
+        "r2_stats": compute_stability_stats(r2_vals),
+        "mse_stats": compute_stability_stats(mse_vals),
+        "time_stats": compute_stability_stats(time_vals),
+        "exact_recovery_rate": float(np.mean(exact_binary)) if exact_binary else None,
+        "exact_recovery_stats": compute_stability_stats(exact_binary),
+    }
+
+
 def _fit_worker(payload, queue):
     """Child-process worker for hard timeout enforcement."""
     import signal
@@ -452,6 +586,7 @@ def run_track1_blackbox(
     datasets,
     max_datasets=None,
     n_samples=500,
+    seeds=None,
     verbose=True,
     hard_timeout=True,
     adaptive_timeout=True,
@@ -473,6 +608,8 @@ def run_track1_blackbox(
     print(f"  TRACK 1: BLACK-BOX REGRESSION ({len(ds_list)} datasets)")
     print(f"{'='*70}\n")
 
+    seeds = list(seeds or [42])
+
     for idx, ds_name in enumerate(ds_list):
         try:
             X, y = fetch_data(ds_name, return_X_y=True)
@@ -493,81 +630,121 @@ def run_track1_blackbox(
         X_train, X_test = X[:n_train], X[n_train:]
         y_train, y_test = y[:n_train], y[n_train:]
 
-        t0 = time.time()
         timeout_budget = estimate_timeout_budget(
             base_timeout=est.get_params().get("timeout", 120),
             n_features=X.shape[1],
             n_train=n_train,
             adaptive_timeout=adaptive_timeout,
         )
-        try:
-            est_params = est.get_params().copy()
-            est_params["timeout"] = timeout_budget
-            
-            # If bloat-skip enabled, make evolution skip more aggressively on good fast-path results
-            if skip_evolution_if_bloated:
-                est_params["evolution_skip_r2"] = 0.95
-                est_params["use_guided_evolution"] = False
 
-            if hard_timeout:
-                run_result = run_with_hard_timeout(
-                    est_params,
-                    X_train,
-                    y_train,
-                    X_test,
-                    timeout_seconds=timeout_budget + 5,
-                )
+        seed_runs = []
+        for seed in seeds:
+            t0 = time.time()
+            try:
+                est_params = est.get_params().copy()
+                est_params["timeout"] = timeout_budget
+                est_params["random_state"] = seed
+
+                # If bloat-skip enabled, make evolution skip more aggressively on good fast-path results
+                if skip_evolution_if_bloated:
+                    est_params["evolution_skip_r2"] = 0.95
+                    est_params["use_guided_evolution"] = False
+
+                if hard_timeout:
+                    run_result = run_with_hard_timeout(
+                        est_params,
+                        X_train,
+                        y_train,
+                        X_test,
+                        timeout_seconds=timeout_budget + 5,
+                    )
+                    elapsed = time.time() - t0
+                    if run_result["status"] != "ok":
+                        seed_runs.append({
+                            "seed": seed,
+                            "r2": None,
+                            "mse": None,
+                            "time": elapsed,
+                            "error": run_result.get("error", run_result["status"]),
+                        })
+                        continue
+
+                    formula = run_result.get("formula", "")
+                    if post_simplify and formula:
+                        formula = simplify_formula_with_guard(formula, X_train, y_train)
+                    y_pred = evaluate_formula(formula, X_test)
+                else:
+                    est_copy = est.__class__(**est_params)
+                    est_copy.fit(X_train, y_train)
+                    formula = est_copy.get_formula()
+                    if post_simplify and formula:
+                        formula = simplify_formula_with_guard(formula, X_train, y_train)
+                    y_pred = evaluate_formula(formula, X_test)
+                    elapsed = time.time() - t0
+
+                r2 = r2_score(y_test, y_pred)
+                mse = mse_score(y_test, y_pred)
+                size = model_size(formula)
+                seed_runs.append({
+                    "seed": seed,
+                    "r2": r2,
+                    "mse": mse,
+                    "time": elapsed,
+                    "formula": formula,
+                    "model_size": size,
+                    "error": None,
+                })
+            except Exception as e:
                 elapsed = time.time() - t0
-                if run_result["status"] != "ok":
-                    if verbose:
-                        print(f"  [{idx+1:3d}/{len(ds_list)}] {ds_name:40s} {run_result['status'].upper()}: {run_result.get('error', 'unknown')}")
-                    results.append({
-                        "dataset": ds_name,
-                        "r2": None,
-                        "mse": None,
-                        "time": elapsed,
-                        "error": run_result.get("error", run_result["status"]),
-                    })
-                    continue
+                seed_runs.append({"seed": seed, "r2": None, "mse": None, "time": elapsed, "error": str(e)})
 
-                formula = run_result.get("formula", "")
-                if post_simplify and formula:
-                    formula = simplify_formula_with_guard(formula, X_train, y_train)
-                y_pred = evaluate_formula(formula, X_test)
-            else:
-                est_copy = est.__class__(**est_params)
-                est_copy.fit(X_train, y_train)
-                formula = est_copy.get_formula()
-                if post_simplify and formula:
-                    formula = simplify_formula_with_guard(formula, X_train, y_train)
-                y_pred = evaluate_formula(formula, X_test)
-                elapsed = time.time() - t0
-
-            r2 = r2_score(y_test, y_pred)
-            mse = mse_score(y_test, y_pred)
-            size = model_size(formula)
-
+        valid_seed_runs = [r for r in seed_runs if r.get("r2") is not None]
+        if not valid_seed_runs:
+            err_msg = "; ".join(str(r.get("error")) for r in seed_runs if r.get("error")) or "all_seeds_failed"
+            if verbose:
+                print(f"  [{idx+1:3d}/{len(ds_list)}] {ds_name:40s} ERROR: {err_msg}")
             results.append({
                 "dataset": ds_name,
-                "r2": r2,
-                "mse": mse,
-                "time": elapsed,
-                "formula": formula,
-                "model_size": size,
-                "n_train": n_train,
-                "n_test": len(y_test),
-                "n_features": X.shape[1],
-                "error": None,
+                "r2": None,
+                "mse": None,
+                "time": None,
+                "error": err_msg,
+                "seed_runs": seed_runs,
+                "stability": summarize_seed_runs(seed_runs),
+                "scoring_source": "displayed_formula",
             })
+            continue
 
-            symbol = "✅" if r2 > 0.9 else "🟡" if r2 > 0.5 else "❌"
-            if verbose:
-                print(f"  [{idx+1:3d}/{len(ds_list)}] {ds_name:40s} R²={r2:7.4f}  MSE={mse:.3e}  {elapsed:5.1f}s  {symbol}  (budget={timeout_budget}s)")
-        except Exception as e:
-            elapsed = time.time() - t0
-            if verbose:
-                print(f"  [{idx+1:3d}/{len(ds_list)}] {ds_name:40s} ERROR: {e}")
-            results.append({"dataset": ds_name, "r2": None, "mse": None, "time": elapsed, "error": str(e)})
+        stability = summarize_seed_runs(seed_runs)
+        aggregate = {
+            "dataset": ds_name,
+            "r2": stability["r2_stats"]["median"],
+            "mse": stability["mse_stats"]["median"],
+            "time": stability["time_stats"]["median"],
+            "formula": valid_seed_runs[0].get("formula", ""),
+            "model_size": valid_seed_runs[0].get("model_size"),
+            "n_train": n_train,
+            "n_test": len(y_test),
+            "n_features": X.shape[1],
+            "error": None,
+            "seed_runs": seed_runs,
+            "stability": stability,
+            "time_to_discovery": summarize_time_to_discovery(seed_runs, exact_key="exact_match"),
+            "scoring_source": "displayed_formula",
+        }
+        results.append(aggregate)
+
+        median_r2 = aggregate["r2"]
+        median_mse = aggregate["mse"]
+        median_time = aggregate["time"]
+        symbol = "✅" if median_r2 > 0.9 else "🟡" if median_r2 > 0.5 else "❌"
+        if verbose:
+            print(
+                f"  [{idx+1:3d}/{len(ds_list)}] {ds_name:40s} "
+                f"R²(med)={median_r2:7.4f}  MSE(med)={median_mse:.3e}  "
+                f"{median_time:5.1f}s  {symbol}  "
+                f"(budget={timeout_budget}s, seeds={len(seeds)})"
+            )
 
     return results
 
@@ -577,11 +754,14 @@ def run_track2_ground_truth(
     problems,
     max_problems=None,
     n_samples=500,
+    seeds=None,
     verbose=True,
     hard_timeout=True,
     adaptive_timeout=True,
     post_simplify=False,
     skip_evolution_if_bloated=False,
+    acceptable_r2=0.9,
+    complexity_cap=20,
 ):
     """Track 2: Ground-truth symbolic regression."""
     results = []
@@ -591,106 +771,168 @@ def run_track2_ground_truth(
     print(f"  TRACK 2: GROUND-TRUTH SYMBOLIC REGRESSION ({len(prob_list)} problems)")
     print(f"{'='*70}\n")
 
+    seeds = list(seeds or [42])
+
     for idx, problem in enumerate(prob_list):
         name = problem[0]
-        X, y, true_formula = generate_ground_truth_data(problem, n_samples=n_samples)
+        seed_runs = []
+        for seed in seeds:
+            X, y, true_formula = generate_ground_truth_data(problem, n_samples=n_samples, seed=seed)
 
-        if X is None:
+            if X is None:
+                seed_runs.append({"seed": seed, "r2": None, "mse": None, "time": None, "error": "bad_data"})
+                continue
+
+            # Train/test split (80/20)
+            n_train = int(0.8 * len(y))
+            X_train, X_test = X[:n_train], X[n_train:]
+            y_train, y_test = y[:n_train], y[n_train:]
+
+            timeout_budget = estimate_timeout_budget(
+                base_timeout=est.get_params().get("timeout", 120),
+                n_features=X.shape[1],
+                n_train=n_train,
+                adaptive_timeout=adaptive_timeout,
+            )
+            t0 = time.time()
+            try:
+                est_params = est.get_params().copy()
+                est_params["timeout"] = timeout_budget
+                est_params["random_state"] = seed
+
+                # If bloat-skip enabled, make evolution skip more aggressively on good fast-path results
+                if skip_evolution_if_bloated:
+                    est_params["evolution_skip_r2"] = 0.95
+                    est_params["use_guided_evolution"] = False
+
+                if hard_timeout:
+                    run_result = run_with_hard_timeout(
+                        est_params,
+                        X_train,
+                        y_train,
+                        X_test,
+                        timeout_seconds=timeout_budget + 5,
+                        X_full=X,
+                    )
+                    elapsed = time.time() - t0
+                    if run_result["status"] != "ok":
+                        seed_runs.append({
+                            "seed": seed,
+                            "r2": None,
+                            "mse": None,
+                            "time": elapsed,
+                            "error": run_result.get("error", run_result["status"]),
+                        })
+                        continue
+
+                    formula = run_result.get("formula", "")
+                    if post_simplify and formula:
+                        formula = simplify_formula_with_guard(formula, X_train, y_train)
+                    y_pred_test = evaluate_formula(formula, X_test)
+                    y_pred_all = evaluate_formula(formula, X)
+                else:
+                    est_copy = est.__class__(**est_params)
+                    est_copy.fit(X_train, y_train)
+                    formula = est_copy.get_formula()
+                    if post_simplify and formula:
+                        formula = simplify_formula_with_guard(formula, X_train, y_train)
+                    y_pred_test = evaluate_formula(formula, X_test)
+                    y_pred_all = evaluate_formula(formula, X)
+                    elapsed = time.time() - t0
+
+                r2 = r2_score(y_test, y_pred_test)
+                mse = mse_score(y_test, y_pred_test)
+                size = model_size(formula)
+
+                # Check for symbolic match (very low MSE on full data)
+                full_mse = mse_score(y, y_pred_all)
+                exact_match = full_mse < 1e-6
+
+                failure_bucket = None
+                if not exact_match:
+                    failure_bucket = classify_failure_taxonomy(true_formula, formula, r2, full_mse)
+
+                seed_runs.append({
+                    "seed": seed,
+                    "problem": name,
+                    "true_formula": true_formula,
+                    "discovered_formula": formula,
+                    "r2": r2,
+                    "mse": mse,
+                    "full_mse": full_mse,
+                    "exact_match": exact_match,
+                    "time": elapsed,
+                    "model_size": size,
+                    "failure_bucket": failure_bucket,
+                    "error": None,
+                })
+            except Exception as e:
+                elapsed = time.time() - t0
+                seed_runs.append({"seed": seed, "r2": None, "mse": None, "time": elapsed, "error": str(e)})
+
+        valid_seed_runs = [r for r in seed_runs if r.get("r2") is not None]
+        if not valid_seed_runs:
+            err_msg = "; ".join(str(r.get("error")) for r in seed_runs if r.get("error")) or "all_seeds_failed"
             if verbose:
-                print(f"  [{idx+1:3d}/{len(prob_list)}] {name:40s} SKIP (bad data)")
-            results.append({"problem": name, "r2": None, "mse": None, "error": "bad_data"})
-            continue
-
-        # Train/test split (80/20)
-        n_train = int(0.8 * len(y))
-        X_train, X_test = X[:n_train], X[n_train:]
-        y_train, y_test = y[:n_train], y[n_train:]
-
-        t0 = time.time()
-        timeout_budget = estimate_timeout_budget(
-            base_timeout=est.get_params().get("timeout", 120),
-            n_features=X.shape[1],
-            n_train=n_train,
-            adaptive_timeout=adaptive_timeout,
-        )
-        try:
-            est_params = est.get_params().copy()
-            est_params["timeout"] = timeout_budget
-            
-            # If bloat-skip enabled, make evolution skip more aggressively on good fast-path results
-            if skip_evolution_if_bloated:
-                est_params["evolution_skip_r2"] = 0.95
-                est_params["use_guided_evolution"] = False
-
-            if hard_timeout:
-                run_result = run_with_hard_timeout(
-                    est_params,
-                    X_train,
-                    y_train,
-                    X_test,
-                    timeout_seconds=timeout_budget + 5,
-                    X_full=X,
-                )
-                elapsed = time.time() - t0
-                if run_result["status"] != "ok":
-                    if verbose:
-                        print(f"  [{idx+1:3d}/{len(prob_list)}] {name:40s} {run_result['status'].upper()}: {run_result.get('error', 'unknown')}")
-                    results.append({
-                        "problem": name,
-                        "r2": None,
-                        "mse": None,
-                        "time": elapsed,
-                        "error": run_result.get("error", run_result["status"]),
-                    })
-                    continue
-
-                formula = run_result.get("formula", "")
-                if post_simplify and formula:
-                    formula = simplify_formula_with_guard(formula, X_train, y_train)
-                y_pred_test = evaluate_formula(formula, X_test)
-                y_pred_all = evaluate_formula(formula, X)
-            else:
-                est_copy = est.__class__(**est_params)
-                est_copy.fit(X_train, y_train)
-                formula = est_copy.get_formula()
-                if post_simplify and formula:
-                    formula = simplify_formula_with_guard(formula, X_train, y_train)
-                y_pred_test = evaluate_formula(formula, X_test)
-                y_pred_all = evaluate_formula(formula, X)
-                elapsed = time.time() - t0
-
-            r2 = r2_score(y_test, y_pred_test)
-            mse = mse_score(y_test, y_pred_test)
-            size = model_size(formula)
-
-            # Check for symbolic match (very low MSE on full data)
-            full_mse = mse_score(y, y_pred_all)
-            exact_match = full_mse < 1e-6
-
+                print(f"  [{idx+1:3d}/{len(prob_list)}] {name:40s} ERROR: {err_msg}")
             results.append({
                 "problem": name,
-                "true_formula": true_formula,
-                "discovered_formula": formula,
-                "r2": r2,
-                "mse": mse,
-                "full_mse": full_mse,
-                "exact_match": exact_match,
-                "time": elapsed,
-                "model_size": size,
-                "error": None,
+                "r2": None,
+                "mse": None,
+                "time": None,
+                "error": err_msg,
+                "seed_runs": seed_runs,
+                "stability": summarize_seed_runs(seed_runs),
+                "scoring_source": "displayed_formula",
             })
+            continue
 
-            symbol = "✅" if exact_match else "🟡" if r2 > 0.9 else "❌"
-            match_str = "EXACT" if exact_match else f"R²={r2:.4f}"
-            if verbose:
-                print(f"  [{idx+1:3d}/{len(prob_list)}] {name:40s} {match_str:12s}  MSE={mse:.3e}  {elapsed:5.1f}s  {symbol}  (budget={timeout_budget}s)")
-                if verbose and formula:
-                    print(f"  {'':44s} → {formula[:80]}")
-        except Exception as e:
-            elapsed = time.time() - t0
-            if verbose:
-                print(f"  [{idx+1:3d}/{len(prob_list)}] {name:40s} ERROR: {e}")
-            results.append({"problem": name, "r2": None, "mse": None, "time": elapsed, "error": str(e)})
+        stability = summarize_seed_runs(seed_runs)
+        time_to_discovery = summarize_time_to_discovery(
+            seed_runs,
+            acceptable_r2=acceptable_r2,
+            complexity_cap=complexity_cap,
+            exact_key="exact_match",
+        )
+
+        median_run = min(
+            valid_seed_runs,
+            key=lambda r: abs(float(r["r2"]) - float(stability["r2_stats"]["median"]))
+        )
+
+        aggregate = {
+            "problem": name,
+            "true_formula": median_run.get("true_formula"),
+            "discovered_formula": median_run.get("discovered_formula"),
+            "r2": stability["r2_stats"]["median"],
+            "mse": stability["mse_stats"]["median"],
+            "full_mse": float(np.median([r["full_mse"] for r in valid_seed_runs if r.get("full_mse") is not None])),
+            "exact_match": bool(stability.get("exact_recovery_rate", 0.0) == 1.0),
+            "exact_recovery_rate": stability.get("exact_recovery_rate"),
+            "time": stability["time_stats"]["median"],
+            "model_size": median_run.get("model_size"),
+            "error": None,
+            "seed_runs": seed_runs,
+            "stability": stability,
+            "time_to_discovery": time_to_discovery,
+            "scoring_source": "displayed_formula",
+        }
+        results.append(aggregate)
+
+        median_r2 = aggregate["r2"]
+        median_mse = aggregate["mse"]
+        median_time = aggregate["time"]
+        exact_rate = aggregate.get("exact_recovery_rate", 0.0) or 0.0
+        symbol = "✅" if exact_rate >= 0.8 else "🟡" if median_r2 > 0.9 else "❌"
+        if verbose:
+            print(
+                f"  [{idx+1:3d}/{len(prob_list)}] {name:40s} "
+                f"EXACT-rate={exact_rate:5.2f}  R²(med)={median_r2:7.4f}  "
+                f"MSE(med)={median_mse:.3e}  {median_time:5.1f}s  {symbol}  "
+                f"(seeds={len(seeds)})"
+            )
+            if median_run.get("discovered_formula"):
+                print(f"  {'':44s} → {median_run['discovered_formula'][:80]}")
 
     return results
 
@@ -710,12 +952,16 @@ def print_summary(track1_results, track2_results, output_dir=None):
         valid = [r for r in track1_results if r.get("r2") is not None]
         r2_vals = [r["r2"] for r in valid]
         times = [r.get("time", 0) for r in valid]
+        r2_worst_decile = compute_stability_stats(r2_vals).get("worst_decile") if r2_vals else None
         print(f"\n  TRACK 1 — Black-Box Regression")
         print(f"  {'─'*50}")
         print(f"  Datasets tested:    {len(valid)}/{len(track1_results)}")
         if r2_vals:
             print(f"  Mean R²:            {np.mean(r2_vals):.4f}")
             print(f"  Median R²:          {np.median(r2_vals):.4f}")
+            print(f"  R² IQR:             {compute_stability_stats(r2_vals)['iqr']:.4f}")
+            print(f"  R² Std:             {compute_stability_stats(r2_vals)['std']:.4f}")
+            print(f"  R² Worst-decile:    {r2_worst_decile:.4f}")
             print(f"  R² > 0.9:           {sum(1 for v in r2_vals if v > 0.9)}/{len(r2_vals)}")
             print(f"  R² > 0.5:           {sum(1 for v in r2_vals if v > 0.5)}/{len(r2_vals)}")
             print(f"  Mean time:          {np.mean(times):.2f}s")
@@ -726,7 +972,17 @@ def print_summary(track1_results, track2_results, output_dir=None):
         valid = [r for r in track2_results if r.get("r2") is not None]
         r2_vals = [r["r2"] for r in valid]
         exact = [r for r in valid if r.get("exact_match")]
+        exact_rates = [r.get("exact_recovery_rate") for r in valid if r.get("exact_recovery_rate") is not None]
+        tfe = [r.get("time_to_discovery", {}).get("time_to_first_exact") for r in valid if r.get("time_to_discovery", {}).get("time_to_first_exact") is not None]
+        tfa = [r.get("time_to_discovery", {}).get("time_to_first_acceptable") for r in valid if r.get("time_to_discovery", {}).get("time_to_first_acceptable") is not None]
         times = [r.get("time", 0) for r in valid]
+        failure_counts = {}
+        for row in valid:
+            for seed_run in row.get("seed_runs", []):
+                bucket = seed_run.get("failure_bucket")
+                if not bucket:
+                    continue
+                failure_counts[bucket] = failure_counts.get(bucket, 0) + 1
         print(f"\n  TRACK 2 — Ground-Truth Symbolic Regression")
         print(f"  {'─'*50}")
         print(f"  Problems tested:    {len(valid)}/{len(track2_results)}")
@@ -734,9 +990,22 @@ def print_summary(track1_results, track2_results, output_dir=None):
             print(f"  Exact matches:      {len(exact)}/{len(valid)}")
             print(f"  Mean R²:            {np.mean(r2_vals):.4f}")
             print(f"  Median R²:          {np.median(r2_vals):.4f}")
+            print(f"  R² IQR:             {compute_stability_stats(r2_vals)['iqr']:.4f}")
+            print(f"  R² Std:             {compute_stability_stats(r2_vals)['std']:.4f}")
+            print(f"  R² Worst-decile:    {compute_stability_stats(r2_vals)['worst_decile']:.4f}")
+            if exact_rates:
+                print(f"  Mean exact-rate:    {np.mean(exact_rates):.4f}")
             print(f"  R² > 0.9:           {sum(1 for v in r2_vals if v > 0.9)}/{len(r2_vals)}")
             print(f"  Mean time:          {np.mean(times):.2f}s")
             print(f"  Total time:         {sum(times):.1f}s")
+            if tfe:
+                print(f"  TTF exact (median): {np.median(tfe):.2f}s")
+            if tfa:
+                print(f"  TTF accept (median):{np.median(tfa):.2f}s")
+            if failure_counts:
+                top_failures = sorted(failure_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                failure_text = ", ".join([f"{k}:{v}" for k, v in top_failures])
+                print(f"  Top failures:       {failure_text}")
 
     print(f"\n{'='*70}\n")
 
@@ -788,7 +1057,15 @@ def main():
                         help="Post-simplify formulas with a fidelity guard")
     parser.add_argument("--skip-evolution-if-bloated", action="store_true",
                         help="Skip C++ evolution if fast-path formula exceeds 20 terms")
+    parser.add_argument("--seeds", type=str, default="42,1337,2027,7,11",
+                        help="Comma-separated fixed seeds for reproducible multi-seed protocol")
+    parser.add_argument("--acceptable-r2", type=float, default=0.9,
+                        help="R2 threshold for acceptable discovery metric")
+    parser.add_argument("--complexity-cap", type=int, default=20,
+                        help="Complexity cap (model size) for acceptable discovery metric")
     args = parser.parse_args()
+
+    seeds = parse_seed_list(args.seeds)
 
     est = GlassboxRegressor(
         population_size=args.pop_size,
@@ -804,6 +1081,8 @@ def main():
     adaptive_on = not args.no_adaptive_timeout
     print(f"  Adaptive timeout: {adaptive_on}  |  Post simplify: {args.post_simplify}")
     print(f"  Skip bloat: {args.skip_evolution_if_bloated}")
+    print(f"  Multi-seed protocol: {seeds}")
+    print(f"  Acceptable criteria: R2>={args.acceptable_r2:.2f}, size<={args.complexity_cap}")
 
     track1_results = []
     track2_results = []
@@ -815,11 +1094,14 @@ def main():
             est, GROUND_TRUTH_PROBLEMS,
             max_problems=args.max_datasets,
             n_samples=args.n_samples,
+            seeds=seeds,
             verbose=not args.quiet,
             hard_timeout=not args.no_hard_timeout,
             adaptive_timeout=adaptive_timeout_enabled,
             post_simplify=args.post_simplify,
             skip_evolution_if_bloated=args.skip_evolution_if_bloated,
+            acceptable_r2=args.acceptable_r2,
+            complexity_cap=args.complexity_cap,
         )
 
     if args.track is None or args.track == 1:
@@ -827,6 +1109,7 @@ def main():
             est, PMLB_DATASETS,
             max_datasets=args.max_datasets,
             n_samples=args.n_samples,
+            seeds=seeds,
             verbose=not args.quiet,
             hard_timeout=not args.no_hard_timeout,
             adaptive_timeout=adaptive_timeout_enabled,

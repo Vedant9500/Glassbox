@@ -64,9 +64,11 @@ struct EvolutionConfig {
     double restart_fraction = 0.2;
     double post_restart_mutation_boost = 1.25;
 
-    // Classifier priors: probability weights for [Periodic, Power, Exp, Log]
+    // Classifier priors: probability weights for
+    // [Periodic, Power, IntPow, Exp, Log].
+    // Legacy 4-slot priors [Periodic, Power, Exp, Log] are supported.
     // Empty = uniform sampling. Non-empty = sample proportionally.
-    std::vector<double> op_priors; // e.g. {0.9, 0.03, 0.03, 0.04}
+    std::vector<double> op_priors; // e.g. {0.8, 0.08, 0.02, 0.05, 0.05}
 
     // P5: NSGA-II multi-objective
     bool use_nsga2 = false;
@@ -81,6 +83,13 @@ struct EvolutionConfig {
     std::vector<double> output_units;              // Target variable units
     double dim_penalty_weight = 0.1;
 
+    // Reproducibility
+    int random_seed = -1; // <0 => nondeterministic random_device
+
+    // Phase 0 evaluation hooks
+    double acceptable_mse = 1e-3;
+    int acceptable_complexity = 20;
+
     // Trace logging (JSONL)
     bool enable_trace = false;
     std::string trace_path;
@@ -93,7 +102,10 @@ public:
                     const std::vector<Eigen::ArrayXd>& X, 
                     const Eigen::ArrayXd& y,
                     const std::vector<double>& seed_omegas = {})
-        : config_(config), X_(X), y_(y), seed_omegas_(seed_omegas), rng_(std::random_device{}()) {
+                : config_(config), X_(X), y_(y), seed_omegas_(seed_omegas),
+                    rng_(config.random_seed >= 0
+                            ? static_cast<unsigned int>(config.random_seed)
+                            : std::random_device{}()) {
     sanitize_config();
 
         if (config_.enable_trace && !config_.trace_path.empty()) {
@@ -106,6 +118,17 @@ public:
 
         // Normalize op_priors if provided
         if (!config_.op_priors.empty()) {
+            // Backward compatibility: old priors had 4 slots [Periodic, Power, Exp, Log].
+            if (config_.op_priors.size() == 4) {
+                std::vector<double> expanded(5, 0.0);
+                expanded[0] = config_.op_priors[0];               // Periodic
+                expanded[1] = config_.op_priors[1] * 0.75;        // Power
+                expanded[2] = config_.op_priors[1] * 0.25;        // IntPow
+                expanded[3] = config_.op_priors[2];               // Exp
+                expanded[4] = config_.op_priors[3];               // Log
+                config_.op_priors = expanded;
+            }
+
             double sum = 0.0;
             for (double p : config_.op_priors) sum += p;
             if (sum > 0) {
@@ -122,6 +145,7 @@ public:
 
     // Main run loop
     void run() {
+        auto start_time = std::chrono::steady_clock::now();
         initialize_population();
         
         // Initial Refinement
@@ -135,8 +159,6 @@ public:
         int plateau_counter = 0;
         std::vector<double> recent_best;
         recent_best.reserve(config_.stagnation_window + 2);
-
-        auto start_time = std::chrono::steady_clock::now();
 
         for (int gen = 0; gen < config_.generations; ++gen) {
             auto now = std::chrono::steady_clock::now();
@@ -234,6 +256,8 @@ public:
                 trace_event("run.early_stop", gen);
                 break; // Exact algebraic match found that is simple
             }
+
+            update_discovery_metrics(gen, start_time);
             
             // Create next generation
             std::vector<IndividualGraph> next_gen;
@@ -328,12 +352,21 @@ public:
         
         // Post-evolution cleanup: deduplicate + prune the best graph
         cleanup_graph(best_overall_);
+        update_discovery_metrics(config_.generations, start_time);
+        run_wall_time_sec_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
         trace_event("run.end", -1);
     }
     
     IndividualGraph get_best() const {
         return best_overall_;
     }
+
+    int get_first_exact_generation() const { return first_exact_generation_; }
+    double get_first_exact_time_sec() const { return first_exact_time_sec_; }
+    int get_first_acceptable_generation() const { return first_acceptable_generation_; }
+    double get_first_acceptable_time_sec() const { return first_acceptable_time_sec_; }
+    double get_run_wall_time_sec() const { return run_wall_time_sec_; }
+    int get_random_seed() const { return config_.random_seed; }
 
     // P5: Return entire Pareto front (rank-0 individuals)
     // Re-runs non_dominated_sort on the current population to get clean ranks.
@@ -464,6 +497,8 @@ public:
                 }
             }
             if (config_.use_early_stop && should_stop) break;
+
+            update_discovery_metrics(gen, start_time);
         }
 
         // Collect the best overall across all islands and run cleanup
@@ -483,6 +518,8 @@ public:
         }
 
         cleanup_graph(best_overall_);
+        update_discovery_metrics(config_.generations, start_time);
+        run_wall_time_sec_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
     }
 
 private:
@@ -500,6 +537,31 @@ private:
     std::ofstream trace_stream_;
     bool trace_enabled_ = false;
     bool last_crossover_valid_ = false;
+    int first_exact_generation_ = -1;
+    double first_exact_time_sec_ = -1.0;
+    int first_acceptable_generation_ = -1;
+    double first_acceptable_time_sec_ = -1.0;
+    double run_wall_time_sec_ = 0.0;
+
+    void update_discovery_metrics(int generation, const std::chrono::steady_clock::time_point& start_time) {
+        const bool is_exact = (best_overall_.raw_mse < config_.early_stop_mse && best_overall_.nodes.size() <= 8);
+        const bool is_acceptable =
+            (best_overall_.raw_mse < config_.acceptable_mse &&
+             static_cast<int>(best_overall_.nodes.size()) <= config_.acceptable_complexity);
+
+        if (is_exact && first_exact_generation_ < 0) {
+            first_exact_generation_ = generation;
+            first_exact_time_sec_ = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start_time
+            ).count();
+        }
+        if (is_acceptable && first_acceptable_generation_ < 0) {
+            first_acceptable_generation_ = generation;
+            first_acceptable_time_sec_ = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start_time
+            ).count();
+        }
+    }
 
     static std::string json_escape(const std::string& s) {
         std::string out;
@@ -590,12 +652,21 @@ private:
             }
             return UnaryOp::Log; // Fallback to last
         }
-        // Uniform: 0=Periodic, 1=Power, 2=Exp, 3=Log
+        // Uniform: 0=Periodic, 1=Power, 2=IntPow, 3=Exp, 4=Log
         double op_choice = u(rng_);
         if (op_choice < 0.25) return UnaryOp::Periodic;
-        if (op_choice < 0.5) return UnaryOp::Power;
-        if (op_choice < 0.75) return UnaryOp::Exp;
+        if (op_choice < 0.50) return UnaryOp::Power;
+        if (op_choice < 0.70) return UnaryOp::IntPow;
+        if (op_choice < 0.85) return UnaryOp::Exp;
         return UnaryOp::Log;
+    }
+
+    BinaryOp sample_binary_op() {
+        std::uniform_real_distribution<double> u(0.0, 1.0);
+        double r = u(rng_);
+        if (r < 0.45) return BinaryOp::Arithmetic;
+        if (r < 0.75) return BinaryOp::Division;
+        return BinaryOp::Aggregation;
     }
     
     IndividualGraph create_random_individual(int n_inputs) {
@@ -646,6 +717,11 @@ private:
                             node.p = valid_powers[p_dist(rng_)];
                         }
                     }
+                    if (node.unary_op == UnaryOp::IntPow) {
+                        const int intpow_candidates[] = {2, 3, 4, 5, 6};
+                        std::uniform_int_distribution<int> ip_dist(0, 4);
+                        node.p = static_cast<double>(intpow_candidates[ip_dist(rng_)]);
+                    }
                     // Seed Exp nodes with useful omega values (including negative for exp(-x))
                     if (node.unary_op == UnaryOp::Exp) {
                         const double exp_omega_seeds[] = {-2.0, -1.0, -0.5, 0.5, 1.0, 2.0};
@@ -657,9 +733,7 @@ private:
                     node.left_child = child_dist(rng_);
                 } else {
                     node.type = NodeType::Binary;
-                    double op_choice = runif(rng_);
-                    if (op_choice < 0.5) node.binary_op = BinaryOp::Arithmetic;
-                    else node.binary_op = BinaryOp::Aggregation;
+                    node.binary_op = sample_binary_op();
 
                     std::uniform_int_distribution<int> child_dist(0, i - 1);
                     node.left_child = child_dist(rng_);
@@ -829,12 +903,16 @@ private:
                     if (runif(rng_) < 0.6 || i < 2) {
                         node.type = NodeType::Unary;
                         node.unary_op = sample_unary_op();
+                        if (node.unary_op == UnaryOp::IntPow) {
+                            const int intpow_candidates[] = {2, 3, 4, 5, 6};
+                            std::uniform_int_distribution<int> ip_dist(0, 4);
+                            node.p = static_cast<double>(intpow_candidates[ip_dist(rng_)]);
+                        }
                         std::uniform_int_distribution<int> child_dist(0, i - 1);
                         node.left_child = child_dist(rng_);
                     } else {
                         node.type = NodeType::Binary;
-                        std::uniform_int_distribution<int> op_dist(0, 1);
-                        node.binary_op = static_cast<BinaryOp>(op_dist(rng_));
+                        node.binary_op = sample_binary_op();
                         std::uniform_int_distribution<int> child_dist(0, i - 1);
                         node.left_child = child_dist(rng_);
                         node.right_child = child_dist(rng_);
@@ -851,6 +929,9 @@ private:
                     
                     node.omega = std::clamp(node.omega, config_.omega_min, config_.omega_max);
                     node.p = std::clamp(node.p, config_.p_min, config_.p_max);
+                    if (node.type == NodeType::Unary && node.unary_op == UnaryOp::IntPow) {
+                        node.p = static_cast<double>(std::clamp(static_cast<int>(std::round(node.p)), 2, 6));
+                    }
                 }
             }
         }
@@ -901,6 +982,11 @@ private:
                     std::uniform_int_distribution<int> pow_dist(0, static_cast<int>(valid_powers.size()) - 1);
                     wrap_node.p = valid_powers[pow_dist(rng_)];
                 }
+            }
+            if (wrap_node.unary_op == UnaryOp::IntPow) {
+                const int intpow_candidates[] = {2, 3, 4, 5, 6};
+                std::uniform_int_distribution<int> ip_dist(0, 4);
+                wrap_node.p = static_cast<double>(intpow_candidates[ip_dist(rng_)]);
             }
             // If wrapping with Periodic, seed useful frequencies
             if (wrap_node.unary_op == UnaryOp::Periodic) {
@@ -2128,10 +2214,14 @@ private:
                     if (node.left_child >= 0 && node.left_child < n_nodes)
                         child_u = node_units[node.left_child];
 
-                    if (node.unary_op == UnaryOp::Power) {
+                    if (node.unary_op == UnaryOp::Power || node.unary_op == UnaryOp::IntPow) {
                         // x^p: multiply units by p
+                        double exp_val = node.p;
+                        if (node.unary_op == UnaryOp::IntPow) {
+                            exp_val = static_cast<double>(std::clamp(static_cast<int>(std::round(node.p)), 2, 6));
+                        }
                         for (int d = 0; d < n_dims; ++d)
-                            node_units[i][d] = child_u[d] * node.p;
+                            node_units[i][d] = child_u[d] * exp_val;
                     } else {
                         // sin, exp, log: argument must be dimensionless
                         // Result is dimensionless too
@@ -2156,6 +2246,10 @@ private:
                             for (int d = 0; d < n_dims; ++d)
                                 node_units[i][d] = left_u[d] + right_u[d];
                         }
+                    } else if (node.binary_op == BinaryOp::Division) {
+                        // Division: subtract exponents
+                        for (int d = 0; d < n_dims; ++d)
+                            node_units[i][d] = left_u[d] - right_u[d];
                     } else {
                         node_units[i] = left_u; // Aggregation keeps units
                     }
@@ -2168,7 +2262,7 @@ private:
         double penalty = 0.0;
         for (int i = 0; i < n_nodes; ++i) {
             const auto& node = graph.nodes[i];
-            if (node.type == NodeType::Unary && node.unary_op != UnaryOp::Power) {
+            if (node.type == NodeType::Unary && node.unary_op != UnaryOp::Power && node.unary_op != UnaryOp::IntPow) {
                 // sin/exp/log argument must be dimensionless
                 if (node.left_child >= 0 && node.left_child < n_nodes) {
                     for (int d = 0; d < n_dims; ++d)

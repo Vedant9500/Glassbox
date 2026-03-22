@@ -1,6 +1,5 @@
 high priority:
-    get feynman_easy benchmark ready 
-    native integer-power operator: IntPow(x, n) for n ∈ {2,3,4,5,6} instead of continuous Power(p) — avoids fractional p drift on high-degree polys
-    proper division node: replace soft Arithmetic blending with explicit x/y — fixes Tier 6 rational functions (1/(1+x²), sigmoid, etc.)
-    multi-start: run 3-5 independent evolutions and pick best — matches PySR's multi-run protocol
-    adaptive compute budget: spend 10s on easy formulas, 5min on hard ones (currently fixed budget per formula)
+    [x] native integer-power operator: IntPow(x, n) for n ∈ {2,3,4,5,6} instead of continuous Power(p) — avoids fractional p drift on high-degree polys
+    [x] proper division node: explicit x/y node added; soft Arithmetic remains for backward compatibility
+    [x] multi-start: run 3-5 independent evolutions and pick best — matches PySR's multi-run protocol
+    [x] adaptive compute budget: easy formulas get short budgets, hard formulas get expanded budgets (configurable min/max)

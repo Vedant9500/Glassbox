@@ -45,7 +45,10 @@ py::dict run_evolution_cpp(
     double stagnation_min_improvement = 1e-5,
     double diversity_floor = 0.25,
     double restart_fraction = 0.2,
-    double post_restart_mutation_boost = 1.25
+    double post_restart_mutation_boost = 1.25,
+    int random_seed = -1,
+    double acceptable_mse = 1e-3,
+    int acceptable_complexity = 20
 ) {
     // 1. Convert Python/Numpy to C++ Eigen
     std::vector<Eigen::ArrayXd> X;
@@ -116,6 +119,9 @@ py::dict run_evolution_cpp(
     config.diversity_floor = diversity_floor;
     config.restart_fraction = restart_fraction;
     config.post_restart_mutation_boost = post_restart_mutation_boost;
+    config.random_seed = random_seed;
+    config.acceptable_mse = acceptable_mse;
+    config.acceptable_complexity = acceptable_complexity;
 
     // Sync evaluator temperature so arithmetic blend sharpness is tunable from Python.
     sr::set_arithmetic_temperature(arithmetic_temperature);
@@ -140,6 +146,13 @@ py::dict run_evolution_cpp(
     py::dict result;
     result["best_mse"] = best.raw_mse;
     result["penalized_fitness"] = best.fitness;
+    result["time_to_first_exact_sec"] = engine.get_first_exact_time_sec();
+    result["generation_to_first_exact"] = engine.get_first_exact_generation();
+    result["time_to_first_acceptable_sec"] = engine.get_first_acceptable_time_sec();
+    result["generation_to_first_acceptable"] = engine.get_first_acceptable_generation();
+    result["evolution_wall_time_sec"] = engine.get_run_wall_time_sec();
+    result["random_seed"] = engine.get_random_seed();
+    result["openmp_threads"] = omp_get_max_threads();
     
     // Serialize graph structure
     py::list nodes_list;
@@ -218,5 +231,8 @@ PYBIND11_MODULE(_core, m) {
           py::arg("stagnation_min_improvement")=1e-5,
           py::arg("diversity_floor")=0.25,
           py::arg("restart_fraction")=0.2,
-          py::arg("post_restart_mutation_boost")=1.25);
+          py::arg("post_restart_mutation_boost")=1.25,
+          py::arg("random_seed")=-1,
+          py::arg("acceptable_mse")=1e-3,
+          py::arg("acceptable_complexity")=20);
 }

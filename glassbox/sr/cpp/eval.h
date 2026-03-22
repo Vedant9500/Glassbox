@@ -112,6 +112,12 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                         cache[i] = cache[i].max(-1e8).min(1e8);
                         break;
                     }
+                    case UnaryOp::IntPow: {
+                        int n = static_cast<int>(std::round(node.p));
+                        n = std::clamp(n, 2, 6);
+                        cache[i] = x.pow(n).max(-1e8).min(1e8);
+                        break;
+                    }
                     case UnaryOp::Exp: {
                         // exp(omega*x + phi) — omega enables sign (exp(-x)), phi enables shift
                         cache[i] = (node.omega * x + node.phi).exp().max(-1e6).min(1e6);
@@ -137,6 +143,10 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                         auto res_div = x / (y.abs() + 1e-6) * y.sign();
 
                         cache[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-1e6).min(1e6);
+                        break;
+                    }
+                    case BinaryOp::Division: {
+                        cache[i] = (x / (y.abs() + 1e-6) * y.sign()).max(-1e6).min(1e6);
                         break;
                     }
                     case BinaryOp::Aggregation: {
@@ -205,6 +215,12 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                         cache_out[i] = cache_out[i].max(-1e8).min(1e8);
                         break;
                     }
+                    case UnaryOp::IntPow: {
+                        int n = static_cast<int>(std::round(node.p));
+                        n = std::clamp(n, 2, 6);
+                        cache_out[i] = x.pow(n).max(-1e8).min(1e8);
+                        break;
+                    }
                     case UnaryOp::Exp: {
                         // exp(omega*x + phi) — omega enables sign (exp(-x)), phi enables shift
                         cache_out[i] = (node.omega * x + node.phi).exp().max(-1e6).min(1e6);
@@ -230,6 +246,10 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                         auto res_div = x / (y.abs() + 1e-6) * y.sign();
 
                         cache_out[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-1e6).min(1e6);
+                        break;
+                    }
+                    case BinaryOp::Division: {
+                        cache_out[i] = (x / (y.abs() + 1e-6) * y.sign()).max(-1e6).min(1e6);
                         break;
                     }
                     case BinaryOp::Aggregation: {
@@ -323,6 +343,12 @@ inline Eigen::ArrayXd evaluate_graph_cached(const IndividualGraph& graph,
                         cache_out[i] = cache_out[i].max(-1e8).min(1e8);
                         break;
                     }
+                    case UnaryOp::IntPow: {
+                        int n = static_cast<int>(std::round(node.p));
+                        n = std::clamp(n, 2, 6);
+                        cache_out[i] = x.pow(n).max(-1e8).min(1e8);
+                        break;
+                    }
                     case UnaryOp::Exp: {
                         cache_out[i] = (node.omega * x + node.phi).exp().max(-1e6).min(1e6);
                         break;
@@ -345,6 +371,10 @@ inline Eigen::ArrayXd evaluate_graph_cached(const IndividualGraph& graph,
                         auto res_mul = x * y;
                         auto res_div = x / (y.abs() + 1e-6) * y.sign();
                         cache_out[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-1e6).min(1e6);
+                        break;
+                    }
+                    case BinaryOp::Division: {
+                        cache_out[i] = (x / (y.abs() + 1e-6) * y.sign()).max(-1e6).min(1e6);
                         break;
                     }
                     case BinaryOp::Aggregation: {
@@ -457,6 +487,12 @@ inline std::string format_node_to_string(const IndividualGraph& graph, int node_
                     }
                     return std::string(buf);
                 }
+                case UnaryOp::IntPow: {
+                    int n = static_cast<int>(std::round(node.p));
+                    n = std::clamp(n, 2, 6);
+                    snprintf(buf, sizeof(buf), "(%s)^%d", child_str.c_str(), n);
+                    return std::string(buf);
+                }
                 case UnaryOp::Exp: {
                     // Build exp string: exp([omega*]child[ + phi])
                     std::string exp_arg = "";
@@ -524,6 +560,8 @@ inline std::string format_node_to_string(const IndividualGraph& graph, int node_
                     return blend;
                     break;
                 }
+                case BinaryOp::Division:
+                    return "(" + l_str + " / " + r_str + ")";
                 case BinaryOp::Aggregation:
                     return "(" + l_str + " + " + r_str + ")/2"; // Simplified aggregation display
             }

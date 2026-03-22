@@ -36,7 +36,7 @@
 
 **Goal**: Eliminate false progress and enforce fair, reproducible comparison before algorithmic changes.
 
-- [ ] **Standardized benchmark protocol (Glassbox vs PySR parity)**
+- [ ] **Standardized benchmark protocol (Glassbox vs PySR parity)** *(partial: fixed multi-seed set + core/thread reporting now implemented; full PySR operator/budget parity table still pending)*
   - Same operator sets, complexity limits, data ranges, noise levels, and timeout/wall-clock budgets
   - Same core/thread budget and hardware reporting
   - Fixed seed set (for example 10-20 seeds) for all comparisons
@@ -46,16 +46,16 @@
   - Keep raw internal fitness for diagnostics only
   - Add drift metric between raw and displayed MSE; do not allow exact labels from raw-only fit
 
-- [ ] **Multi-seed stability reporting by default**
+- [x] **Multi-seed stability reporting by default** *(completed March 22, 2026)*
   - Report median, IQR/std, and worst-decile performance
   - Track variance of exact recovery, not only best run
 
-- [ ] **Time-to-discovery metrics**
+- [x] **Time-to-discovery metrics** *(completed March 22, 2026)*
   - Time to first exact expression
   - Time to first acceptable expression under complexity cap
   - Track budget-to-quality curve, not just end-of-run quality
 
-- [ ] **Failure taxonomy pipeline**
+- [x] **Failure taxonomy pipeline** *(completed March 22, 2026; heuristic auto-bucketing in SRBench track 2)*
   - Auto-bucket failures: exp sign errors, product-to-sum collapse, missing high-order terms, rational denominator instability, etc.
   - Use taxonomy as a closed-loop input to mutation/operator updates
 
