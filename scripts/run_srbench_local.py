@@ -20,8 +20,10 @@ import time
 import json
 import math  # noqa: F401
 import warnings
+import re
 from pathlib import Path
 from datetime import datetime
+from multiprocessing import get_context
 
 import numpy as np
 
@@ -237,6 +239,189 @@ def model_size(formula_str):
     return ops + funcs + 1
 
 
+def evaluate_formula(formula_str, X):
+    """Evaluate a discovered formula string safely on X."""
+    if not formula_str:
+        return np.zeros(X.shape[0], dtype=np.float64)
+
+    formula = str(formula_str).strip()
+    formula = re.sub(r'\|([^|]+)\|', r'abs(\1)', formula)
+    formula = formula.replace('^', '**').replace('np.', '')
+
+    def _safe_log(x):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return np.where(np.abs(x) > 1e-300, np.log(np.abs(x) + 1e-300), -300.0)
+
+    def _safe_sqrt(x):
+        return np.sqrt(np.maximum(x, 0.0))
+
+    context = {
+        "np": np,
+        "log": _safe_log,
+        "sin": np.sin,
+        "cos": np.cos,
+        "exp": lambda x: np.exp(np.clip(x, -500, 500)),
+        "sqrt": _safe_sqrt,
+        "abs": np.abs,
+        "Abs": np.abs,
+        "pi": np.pi,
+        "E": np.e,
+    }
+    for i in range(X.shape[1]):
+        context[f"x{i}"] = X[:, i]
+    if X.shape[1] == 1:
+        context["x"] = X[:, 0]
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            y_pred = eval(formula, {"__builtins__": None}, context)
+        if isinstance(y_pred, (int, float)):
+            y_pred = np.full(X.shape[0], y_pred, dtype=np.float64)
+        else:
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+        return np.where(np.isfinite(y_pred), y_pred, 0.0)
+    except Exception:
+        return np.zeros(X.shape[0], dtype=np.float64)
+
+
+def simplify_formula_with_guard(formula, X_ref, y_ref, mse_slack=0.02):
+    """Simplify formula and keep it only if fidelity remains within tolerance."""
+    if not formula:
+        return formula
+
+    try:
+        from simplify_formula import simplify_onn_formula
+    except Exception:
+        return formula
+
+    try:
+        _, simplified_expr = simplify_onn_formula(
+            formula,
+            int_tol=0.02,
+            zero_tol=2e-3,
+            use_nsimplify=True,
+            max_passes=6,
+            use_identities=True,
+        )
+        simplified = str(simplified_expr)
+    except Exception:
+        return formula
+
+    if simplified == formula:
+        return formula
+
+    y_orig = evaluate_formula(formula, X_ref)
+    y_simpl = evaluate_formula(simplified, X_ref)
+    mse_orig = mse_score(y_ref, y_orig)
+    mse_simpl = mse_score(y_ref, y_simpl)
+
+    # Accept simplification if it preserves fit quality and is at least as compact.
+    if mse_simpl <= mse_orig * (1.0 + max(0.0, mse_slack)) and model_size(simplified) <= model_size(formula):
+        return simplified
+    return formula
+
+
+def estimate_timeout_budget(base_timeout, n_features, n_train, adaptive_timeout):
+    """Scale timeout by problem size when adaptive timeout is enabled."""
+    if not adaptive_timeout:
+        return int(base_timeout)
+    complexity = 1.0 + 0.15 * max(0, n_features - 1) + 0.08 * min(1.0, math.log10(max(50, n_train)) / 3.0)
+    budget = int(round(base_timeout * complexity))
+    return int(min(max(20, budget), base_timeout * 2))
+
+
+def _fit_worker(payload, queue):
+    """Child-process worker for hard timeout enforcement."""
+    import signal
+    import sys
+    
+    def timeout_handler(signum, frame):
+        raise TimeoutError(f"Process timeout after {payload.get('timeout_seconds', '?')}s")
+    
+    try:
+        timeout_sec = payload.get("timeout_seconds", 120)
+        if sys.platform != "win32":
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(int(timeout_sec))
+        
+        est = GlassboxRegressor(**payload["est_params"])
+        X_train = payload["X_train"]
+        y_train = payload["y_train"]
+        X_test = payload["X_test"]
+        X_full = payload.get("X_full")
+
+        t0 = time.time()
+        est.fit(X_train, y_train)
+        fit_time = time.time() - t0
+
+        if sys.platform != "win32":
+            signal.alarm(0)
+
+        formula = est.get_formula()
+        y_pred_test = est.predict(X_test)
+        y_pred_full = est.predict(X_full) if X_full is not None else None
+
+        queue.put({
+            "status": "ok",
+            "fit_time": fit_time,
+            "formula": formula,
+            "y_pred_test": y_pred_test,
+            "y_pred_full": y_pred_full,
+        })
+    except TimeoutError as te:
+        queue.put({"status": "timeout", "error": str(te)})
+    except Exception as err:
+        queue.put({"status": "error", "error": str(err)})
+
+
+def run_with_hard_timeout(est_params, X_train, y_train, X_test, timeout_seconds, X_full=None):
+    """Run fit/predict in a separate process and enforce a hard wall-clock timeout."""
+    ctx = get_context("spawn")
+    queue = ctx.Queue(maxsize=1)
+    payload = {
+        "est_params": est_params,
+        "X_train": X_train,
+        "y_train": y_train,
+        "X_test": X_test,
+        "X_full": X_full,
+        "timeout_seconds": timeout_seconds,
+    }
+
+    t0 = time.time()
+    process = ctx.Process(target=_fit_worker, args=(payload, queue), daemon=True)
+    try:
+        process.start()
+        wall_timeout = timeout_seconds + 2
+        process.join(timeout=wall_timeout)
+
+        if process.is_alive():
+            elapsed = time.time() - t0
+            try:
+                process.terminate()
+                process.join(timeout=2)
+                if process.is_alive():
+                    process.kill()
+                    process.join(timeout=1)
+            except Exception:
+                pass
+            return {"status": "timeout", "error": f"hard timeout after {elapsed:.1f}s"}
+
+        if not queue.empty():
+            result = queue.get()
+            if result.get("status") == "timeout":
+                result["error"] = f"process-level: {result['error']}"
+            return result
+
+        if process.exitcode == 0:
+            return {"status": "timeout", "error": f"no result after {time.time() - t0:.1f}s"}
+        else:
+            return {"status": "error", "error": f"worker crashed with code {process.exitcode}"}
+    except Exception as outer_err:
+        return {"status": "error", "error": f"spawn error: {outer_err}"}
+
+
 # ---------------------------------------------------------------------------
 # Runners
 # ---------------------------------------------------------------------------
@@ -262,7 +447,17 @@ def generate_ground_truth_data(problem, n_samples=500, seed=42):
     return X[mask], y[mask], formula_str
 
 
-def run_track1_blackbox(est, datasets, max_datasets=None, n_samples=500, verbose=True):
+def run_track1_blackbox(
+    est,
+    datasets,
+    max_datasets=None,
+    n_samples=500,
+    verbose=True,
+    hard_timeout=True,
+    adaptive_timeout=True,
+    post_simplify=False,
+    skip_evolution_if_bloated=True,
+):
     """Track 1: Black-box regression on PMLB datasets."""
     try:
         from pmlb import fetch_data
@@ -299,15 +494,57 @@ def run_track1_blackbox(est, datasets, max_datasets=None, n_samples=500, verbose
         y_train, y_test = y[:n_train], y[n_train:]
 
         t0 = time.time()
+        timeout_budget = estimate_timeout_budget(
+            base_timeout=est.get_params().get("timeout", 120),
+            n_features=X.shape[1],
+            n_train=n_train,
+            adaptive_timeout=adaptive_timeout,
+        )
         try:
-            est_copy = est.__class__(**est.get_params())
-            est_copy.fit(X_train, y_train)
-            y_pred = est_copy.predict(X_test)
-            elapsed = time.time() - t0
+            est_params = est.get_params().copy()
+            est_params["timeout"] = timeout_budget
+            
+            # If bloat-skip enabled, make evolution skip more aggressively on good fast-path results
+            if skip_evolution_if_bloated:
+                est_params["evolution_skip_r2"] = 0.95
+                est_params["use_guided_evolution"] = False
+
+            if hard_timeout:
+                run_result = run_with_hard_timeout(
+                    est_params,
+                    X_train,
+                    y_train,
+                    X_test,
+                    timeout_seconds=timeout_budget + 5,
+                )
+                elapsed = time.time() - t0
+                if run_result["status"] != "ok":
+                    if verbose:
+                        print(f"  [{idx+1:3d}/{len(ds_list)}] {ds_name:40s} {run_result['status'].upper()}: {run_result.get('error', 'unknown')}")
+                    results.append({
+                        "dataset": ds_name,
+                        "r2": None,
+                        "mse": None,
+                        "time": elapsed,
+                        "error": run_result.get("error", run_result["status"]),
+                    })
+                    continue
+
+                formula = run_result.get("formula", "")
+                if post_simplify and formula:
+                    formula = simplify_formula_with_guard(formula, X_train, y_train)
+                y_pred = evaluate_formula(formula, X_test)
+            else:
+                est_copy = est.__class__(**est_params)
+                est_copy.fit(X_train, y_train)
+                formula = est_copy.get_formula()
+                if post_simplify and formula:
+                    formula = simplify_formula_with_guard(formula, X_train, y_train)
+                y_pred = evaluate_formula(formula, X_test)
+                elapsed = time.time() - t0
 
             r2 = r2_score(y_test, y_pred)
             mse = mse_score(y_test, y_pred)
-            formula = est_copy.get_formula()
             size = model_size(formula)
 
             results.append({
@@ -325,7 +562,7 @@ def run_track1_blackbox(est, datasets, max_datasets=None, n_samples=500, verbose
 
             symbol = "✅" if r2 > 0.9 else "🟡" if r2 > 0.5 else "❌"
             if verbose:
-                print(f"  [{idx+1:3d}/{len(ds_list)}] {ds_name:40s} R²={r2:7.4f}  MSE={mse:.3e}  {elapsed:5.1f}s  {symbol}")
+                print(f"  [{idx+1:3d}/{len(ds_list)}] {ds_name:40s} R²={r2:7.4f}  MSE={mse:.3e}  {elapsed:5.1f}s  {symbol}  (budget={timeout_budget}s)")
         except Exception as e:
             elapsed = time.time() - t0
             if verbose:
@@ -335,7 +572,17 @@ def run_track1_blackbox(est, datasets, max_datasets=None, n_samples=500, verbose
     return results
 
 
-def run_track2_ground_truth(est, problems, max_problems=None, n_samples=500, verbose=True):
+def run_track2_ground_truth(
+    est,
+    problems,
+    max_problems=None,
+    n_samples=500,
+    verbose=True,
+    hard_timeout=True,
+    adaptive_timeout=True,
+    post_simplify=False,
+    skip_evolution_if_bloated=False,
+):
     """Track 2: Ground-truth symbolic regression."""
     results = []
     prob_list = problems[:max_problems] if max_problems else problems
@@ -360,19 +607,63 @@ def run_track2_ground_truth(est, problems, max_problems=None, n_samples=500, ver
         y_train, y_test = y[:n_train], y[n_train:]
 
         t0 = time.time()
+        timeout_budget = estimate_timeout_budget(
+            base_timeout=est.get_params().get("timeout", 120),
+            n_features=X.shape[1],
+            n_train=n_train,
+            adaptive_timeout=adaptive_timeout,
+        )
         try:
-            est_copy = est.__class__(**est.get_params())
-            est_copy.fit(X_train, y_train)
-            y_pred_test = est_copy.predict(X_test)
-            elapsed = time.time() - t0
+            est_params = est.get_params().copy()
+            est_params["timeout"] = timeout_budget
+            
+            # If bloat-skip enabled, make evolution skip more aggressively on good fast-path results
+            if skip_evolution_if_bloated:
+                est_params["evolution_skip_r2"] = 0.95
+                est_params["use_guided_evolution"] = False
+
+            if hard_timeout:
+                run_result = run_with_hard_timeout(
+                    est_params,
+                    X_train,
+                    y_train,
+                    X_test,
+                    timeout_seconds=timeout_budget + 5,
+                    X_full=X,
+                )
+                elapsed = time.time() - t0
+                if run_result["status"] != "ok":
+                    if verbose:
+                        print(f"  [{idx+1:3d}/{len(prob_list)}] {name:40s} {run_result['status'].upper()}: {run_result.get('error', 'unknown')}")
+                    results.append({
+                        "problem": name,
+                        "r2": None,
+                        "mse": None,
+                        "time": elapsed,
+                        "error": run_result.get("error", run_result["status"]),
+                    })
+                    continue
+
+                formula = run_result.get("formula", "")
+                if post_simplify and formula:
+                    formula = simplify_formula_with_guard(formula, X_train, y_train)
+                y_pred_test = evaluate_formula(formula, X_test)
+                y_pred_all = evaluate_formula(formula, X)
+            else:
+                est_copy = est.__class__(**est_params)
+                est_copy.fit(X_train, y_train)
+                formula = est_copy.get_formula()
+                if post_simplify and formula:
+                    formula = simplify_formula_with_guard(formula, X_train, y_train)
+                y_pred_test = evaluate_formula(formula, X_test)
+                y_pred_all = evaluate_formula(formula, X)
+                elapsed = time.time() - t0
 
             r2 = r2_score(y_test, y_pred_test)
             mse = mse_score(y_test, y_pred_test)
-            formula = est_copy.get_formula()
             size = model_size(formula)
 
             # Check for symbolic match (very low MSE on full data)
-            y_pred_all = est_copy.predict(X)
             full_mse = mse_score(y, y_pred_all)
             exact_match = full_mse < 1e-6
 
@@ -392,7 +683,7 @@ def run_track2_ground_truth(est, problems, max_problems=None, n_samples=500, ver
             symbol = "✅" if exact_match else "🟡" if r2 > 0.9 else "❌"
             match_str = "EXACT" if exact_match else f"R²={r2:.4f}"
             if verbose:
-                print(f"  [{idx+1:3d}/{len(prob_list)}] {name:40s} {match_str:12s}  MSE={mse:.3e}  {elapsed:5.1f}s  {symbol}")
+                print(f"  [{idx+1:3d}/{len(prob_list)}] {name:40s} {match_str:12s}  MSE={mse:.3e}  {elapsed:5.1f}s  {symbol}  (budget={timeout_budget}s)")
                 if verbose and formula:
                     print(f"  {'':44s} → {formula[:80]}")
         except Exception as e:
@@ -487,8 +778,16 @@ def main():
                         help="Output directory for results JSON")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress per-dataset output")
-    parser.add_argument("--timeout", type=int, default=120,
-                        help="Max seconds per problem (default: 120)")
+    parser.add_argument("--timeout", type=int, default=60,
+                        help="Max seconds per problem (default: 60s for PMLB)")
+    parser.add_argument("--no-hard-timeout", action="store_true",
+                        help="Disable process-level hard timeout enforcement")
+    parser.add_argument("--no-adaptive-timeout", action="store_true",
+                        help="Disable adaptive timeout scaling (now enabled by default)")
+    parser.add_argument("--post-simplify", action="store_true",
+                        help="Post-simplify formulas with a fidelity guard")
+    parser.add_argument("--skip-evolution-if-bloated", action="store_true",
+                        help="Skip C++ evolution if fast-path formula exceeds 20 terms")
     args = parser.parse_args()
 
     est = GlassboxRegressor(
@@ -501,9 +800,15 @@ def main():
     print(f"\n  Glassbox SRBench Benchmark")
     print(f"  Population: {args.pop_size}  |  Generations: {args.gens}")
     print(f"  Samples: {args.n_samples}")
+    print(f"  Timeout: {args.timeout}s  |  Hard timeout: {not args.no_hard_timeout}")
+    adaptive_on = not args.no_adaptive_timeout
+    print(f"  Adaptive timeout: {adaptive_on}  |  Post simplify: {args.post_simplify}")
+    print(f"  Skip bloat: {args.skip_evolution_if_bloated}")
 
     track1_results = []
     track2_results = []
+
+    adaptive_timeout_enabled = not args.no_adaptive_timeout
 
     if args.track is None or args.track == 2:
         track2_results = run_track2_ground_truth(
@@ -511,6 +816,10 @@ def main():
             max_problems=args.max_datasets,
             n_samples=args.n_samples,
             verbose=not args.quiet,
+            hard_timeout=not args.no_hard_timeout,
+            adaptive_timeout=adaptive_timeout_enabled,
+            post_simplify=args.post_simplify,
+            skip_evolution_if_bloated=args.skip_evolution_if_bloated,
         )
 
     if args.track is None or args.track == 1:
@@ -519,6 +828,10 @@ def main():
             max_datasets=args.max_datasets,
             n_samples=args.n_samples,
             verbose=not args.quiet,
+            hard_timeout=not args.no_hard_timeout,
+            adaptive_timeout=adaptive_timeout_enabled,
+            post_simplify=args.post_simplify,
+            skip_evolution_if_bloated=args.skip_evolution_if_bloated,
         )
 
     print_summary(track1_results, track2_results, output_dir=args.output_dir)
