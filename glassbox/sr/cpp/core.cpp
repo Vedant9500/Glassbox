@@ -19,6 +19,7 @@ py::dict run_evolution_cpp(
     int generations,
     double early_stop_mse,
     py::list seed_omegas = py::list(),
+    int timeout_seconds = 120,
     py::list op_priors = py::list(),
     // Power exponent bounds
     double p_min = -2.0,
@@ -89,6 +90,7 @@ py::dict run_evolution_cpp(
 
     // 2. Configure engine
     sr::EvolutionConfig config;
+    config.timeout_seconds = timeout_seconds;
     config.pop_size = pop_size;
     config.generations = generations;
     config.early_stop_mse = early_stop_mse;
@@ -194,6 +196,7 @@ PYBIND11_MODULE(_core, m) {
     m.def("run_evolution", &run_evolution_cpp, "Runs the evolutionary algorithm natively in C++",
           py::arg("X_list"), py::arg("y"), py::arg("pop_size")=50, py::arg("generations")=1000, 
           py::arg("early_stop_mse")=1e-6, py::arg("seed_omegas")=py::list(),
+          py::arg("timeout_seconds")=120, // NEW
           py::arg("op_priors")=py::list(),
                     py::arg("p_min")=-2.0,
                     py::arg("p_max")=3.0,

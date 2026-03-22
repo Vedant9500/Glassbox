@@ -41,6 +41,7 @@ struct EvolutionConfig {
     
     bool use_early_stop = true;
     double early_stop_mse = 1e-6;
+    int timeout_seconds = 120;
 
     // Pruning and rounding
     double prune_threshold = 0.05;
@@ -135,7 +136,14 @@ public:
         std::vector<double> recent_best;
         recent_best.reserve(config_.stagnation_window + 2);
 
+        auto start_time = std::chrono::steady_clock::now();
+
         for (int gen = 0; gen < config_.generations; ++gen) {
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() > config_.timeout_seconds) {
+                break;
+            }
+
             evaluate_population();
             trace_event("generation.post_eval", gen);
             bool in_topology_phase = config_.use_staged_schedule && (gen < config_.topology_phase_generations);
@@ -404,8 +412,15 @@ public:
             }
         }
 
+        auto start_time = std::chrono::steady_clock::now();
+
         // Run generations with periodic migration
         for (int gen = 0; gen < config_.generations; ++gen) {
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() > config_.timeout_seconds) {
+                break;
+            }
+
             // Evolve each island one generation
             for (auto& island : islands) {
                 island.evolve_one_generation(gen);

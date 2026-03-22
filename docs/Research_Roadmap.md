@@ -5,6 +5,7 @@
 - Evolution path is now the primary research focus.
 - Fast path (v3.1 MLP trained on about 500K curve-formula pairs) is retained as a baseline and optional hint source only.
 - Core objective: beat PySR on the evolution path under fair compute and complexity budgets.
+- **v2 milestone (March 21, 2026)**: Pure evolution exact recovery improved from 41% → 52% via P0-P3 fixes + clamp/epsilon corrections. See `results/v2_pure_evolution.md`.
 
 ---
 
@@ -109,34 +110,57 @@
   - Add explicit nesting constraints to block pathological expressions
   - Constrain high-risk operator compositions for better search efficiency
 
-- [ ] **Exp-decay robustness**
-  - Add targeted handling/tests for exp-decay sign and structure
-  - Introduce targeted mutation tests for `exp(-x)` families
+- [x] **Exp-decay robustness** *(completed v2)*
+  - Added `exp(omega*x + phi)` parameterization enabling `exp(-x)` discovery
+  - Seeded Exp nodes with `omega ∈ {-2,-1,-0.5,0.5,1,2}`
+  - Added Exp omega/phi snapping in cleanup_graph
+
+- [x] **Product-aware mutation** *(completed v2)*
+  - Zero out children's output weights after Multiply macro-mutation
+  - Forces Ridge to use product node instead of additive decomposition
+
+- [ ] **Native integer-power operator** *(NEW — from SOTA comparison)*
+  - Add `IntPow(x, n)` for `n ∈ {2,3,4,5,6}` instead of continuous `Power(p)`
+  - Avoids fractional p drift that causes ~0.25% coefficient error on high-degree polys
+
+- [ ] **Proper division node** *(NEW — from SOTA comparison)*
+  - Replace soft Arithmetic blending with explicit `x/y` primitive
+  - Fixes Tier 6 rational functions (`1/(1+x²)`, sigmoid, etc.) — currently 12% exact
 
 #### 2B — Objective-Formula Alignment in Search Loop
 
-- [ ] **Displayed-formula-first ranking**
-  - Re-rank hall-of-fame and beam candidates by displayed-formula MSE where available
+- [x] **Displayed-formula-first ranking** *(partially completed v2)*
+  - Widened simplification tolerances (`int_tol` 1e-5→0.01, `zero_tol` 1e-8→1e-3) for evolution output
+  - Fixed Log formula display `|x|` pipe chars breaking Python eval
 
-- [ ] **Drift-aware selection**
-  - Penalize large raw/display drift during candidate ranking
-  - Add threshold-based rejection for structurally misleading candidates
+- [x] **Drift-aware selection** *(partially completed v2)*
+  - Added arithmetic entropy penalty pushing soft ops toward discrete selection
+  - Tightened backward elimination (2.0×→1.05×) and inner-param snap (1.5×→1.02×)
 
 - [ ] **Exactness policy hardening**
   - Exact status requires displayed-formula criteria, complexity criteria, and domain check
 
 #### 2C — Constant Optimization and Numerical Robustness
 
-- [ ] **Increase constant optimization cadence/restarts**
-  - More frequent local constant tuning for top candidates
-  - Multiple restarts to avoid local minima in hard tiers
+- [x] **Increase constant optimization cadence/restarts** *(completed v2)*
+  - Boosted Adam steps per round 10→25; frequency every 20→10 generations
+  - Refine top 5 elite individuals per round (was top 3 in some paths)
 
-- [ ] **Protected operator policy audit**
-  - Verify closure behavior and numerical guards across all operators
-  - Reduce hidden domain hacks that hurt symbolic fidelity
+- [x] **Protected operator policy audit** *(completed v2)*
+  - Fixed Power output clamp ±100→±1e8 (was truncating x³ on [-5,5])
+  - Reduced Power epsilon 1e-6→1e-10 for better coefficient precision
+  - Raised Exp/Log/Arithmetic clamps to ±1e6
 
 - [ ] **Mutation schedule for constants and structure**
   - Tune relative rates for structure vs parameter changes based on failure taxonomy
+
+- [ ] **Multi-start evolution** *(NEW — from SOTA comparison)*
+  - Run 3-5 independent evolutions and pick best
+  - Matches PySR's multi-population/multi-run protocol
+
+- [ ] **Adaptive compute budget** *(NEW — from SOTA comparison)*
+  - Scale time budget to problem difficulty (10s trivial → 5min hard)
+  - Early-stop successful runs to save total benchmark time
 
 #### 2D — Decomposition and Grammar-Guided Evolution
 
@@ -260,29 +284,30 @@ These are higher-impact but more disruptive changes.
 
 ## Honest Limitations to Address in Thesis
 
-1. **Evolution is compute-heavy** compared with baseline heuristics
+1. **Evolution is compute-heavy** compared with baseline heuristics — v2 runtime 2.5× longer due to refinement budget boost
 2. **Hard composition search remains brittle** without strong structural bias
 3. **Multi-variate coupling is still the largest unresolved bottleneck**
 4. **Train-test symbolic aliasing can inflate apparent performance** without strict audits
-5. **Raw-fit vs displayed-formula drift can mislead results** unless enforced in scoring
+5. ~~**Raw-fit vs displayed-formula drift can mislead results**~~ — *partially resolved in v2 via entropy penalty and tighter tolerances, but still present in some Tier 6-8 formulas*
 6. **Synthetic-only evaluations can overstate practical utility**
 7. **Fast-path can bias priorities** unless kept explicitly as baseline-only
+8. **No native division/rational operator** — soft Arithmetic blending cannot represent exact `1/(1+x²)` *(NEW)*
 
 ---
 
 ## Success Metrics (Evolution-First)
 
-| Metric | Current | Phase 2 Target | Phase 3 Target | Phase 4 Target |
-|--------|---------|----------------|----------------|----------------|
-| Nguyen exact recovery (median over seeds) | ~41% | 60%+ | 75%+ | 85%+ |
-| Hard tiers (6-8) exact recovery | Low | 20%+ | 35%+ | 50%+ |
-| Time to first exact (median, benchmark-defined) | Untracked | Track + improve 25% | Improve 40% | Improve 50% |
-| Formula-fidelity drift rate (high-drift rows) | High | Reduce by 50% | Reduce by 70% | Reduce by 85% |
-| Stability (IQR/std of exact recovery) | Untracked | Track + reduce variance | 30% variance reduction | 50% variance reduction |
-| PySR parity score under equal budget | Below parity | Close gap significantly | Reach parity on selected suites | Beat parity on at least one major suite |
-| Multi-variate accuracy | Poor | Poor-to-moderate | 70%+ | 80%+ |
-| OOD generalization (Strogatz/Black-Box) | Untested | Baseline run complete | 50%+ | 65%+ |
-| Fast-path baseline speed (reference only) | Strong | Maintain | Maintain | Maintain |
+| Metric | Pre-v2 (March 19) | v2 (March 21) | Phase 2 Target | Phase 3 Target | Phase 4 Target |
+|--------|---------|--------|----------------|----------------|----------------|
+| Nguyen exact recovery (median over seeds) | 41% | **52%** | 65%+ | 75%+ | 85%+ |
+| Hard tiers (6-8) exact recovery | 8% | **9%** | 20%+ | 35%+ | 50%+ |
+| Time to first exact (median, benchmark-defined) | Untracked | ~20s | Track + improve 25% | Improve 40% | Improve 50% |
+| Formula-fidelity drift rate (high-drift rows) | High | **Reduced ~50%** | Reduce by 70% | Reduce by 85% | Reduce by 90% |
+| Stability (IQR/std of exact recovery) | Untracked | Untracked | Track + reduce variance | 30% variance reduction | 50% variance reduction |
+| PySR parity score under equal budget | Below parity | ~80% parity (est.) | Close gap significantly | Reach parity on selected suites | Beat parity on at least one major suite |
+| Multi-variate accuracy | Poor | Poor | Poor-to-moderate | 70%+ | 80%+ |
+| OOD generalization (Strogatz/Black-Box) | Untested | Untested | Baseline run complete | 50%+ | 65%+ |
+| Fast-path baseline speed (reference only) | Strong | Strong | Maintain | Maintain | Maintain |
 
 ---
 

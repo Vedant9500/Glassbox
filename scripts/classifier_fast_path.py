@@ -15,7 +15,6 @@ from itertools import permutations
 import numpy as np
 import torch
 from typing import Any, Dict, List, Tuple, Optional
-from pathlib import Path
 
 from glassbox.sr.meta_ops import get_constant_symbol, normalize_formula_ascii
 
@@ -223,7 +222,6 @@ def lasso_coordinate_descent(
             rho = X[:, j] @ residual_j
             
             # Soft thresholding
-            old_w_j = w[j]
             if alpha == 0:
                 w[j] = rho / X_sq[j]
             else:
@@ -252,7 +250,7 @@ def build_basis_from_predictions(
     x: np.ndarray,
     predictions: Dict[str, float],
     threshold: float = 0.5,
-    max_power: int = 4,
+    max_power: int = 6,
     detected_omegas: Optional[List[float]] = None,
     universal_basis: bool = True,  # NEW: Always include common terms
     op_constraints: Optional[Dict[str, bool]] = None,
@@ -797,6 +795,7 @@ def fast_path_regression(
     exact_match_threads: int = 1,
     exact_match_enabled: bool = True,
     exact_match_max_basis: int = 150,
+    max_power: int = 6,
 ) -> Tuple[str, float, Dict]:
     """
     Directly solve for coefficients using least squares regression.
@@ -830,6 +829,7 @@ def fast_path_regression(
     basis, names = build_basis_from_predictions(
         x, predictions, 
         threshold=0.3,  # Lower threshold to include more options
+        max_power=max_power,
         detected_omegas=detected_omegas,
         op_constraints=op_constraints,
         universal_basis=universal_basis,
@@ -848,8 +848,8 @@ def fast_path_regression(
     else:
         allow_periodic = allow_exp = allow_log = allow_power = True
 
-    # If only power is allowed, enable 4-term exact match for polynomials
-    exact_max_terms = 4 if (allow_power and not allow_periodic and not allow_exp and not allow_log) else 3
+    # If only power is allowed, enable 6-term exact match for polynomials
+    exact_max_terms = 6 if (allow_power and not allow_periodic and not allow_exp and not allow_log) else 3
 
     if exact_match_enabled and (exact_match_max_basis is None or basis.shape[1] <= exact_match_max_basis):
         exact_match = find_exact_symbolic_match(
@@ -916,7 +916,6 @@ def fast_path_regression(
             if score < best_score:
                 best_coeffs = coeffs
                 best_mse = mse
-                best_n_terms = n_terms
                 best_score = score
         except Exception as e:
             print(f"  Error with alpha={alpha}: {e}")
@@ -1188,8 +1187,10 @@ def refine_powers(
     import torch.nn as nn
 
     # Ensure 1D inputs
-    if x.ndim > 1: x = x.flatten()
-    if y.ndim > 1: y = y.flatten()
+    if x.ndim > 1:
+        x = x.flatten()
+    if y.ndim > 1:
+        y = y.flatten()
 
     if initial_powers is None:
         initial_powers = [0.5, 1.5, 2.5, 3.5]
@@ -1294,8 +1295,10 @@ def refine_powers(
         new_omegas = []
         existing_omegas = current_omegas or []
         for o in res_omegas:
-            if o < 0.1: continue
-            if any(abs(o - eo) < 0.2 for eo in existing_omegas): continue
+            if o < 0.1:
+                continue
+            if any(abs(o - eo) < 0.2 for eo in existing_omegas):
+                continue
             new_omegas.append(o)
     
     if new_omegas:
@@ -1474,6 +1477,7 @@ def fast_path_with_refinement(
     exact_match_threads: int = 1,
     exact_match_enabled: bool = True,
     exact_match_max_basis: int = 150,
+    max_power: int = 6,
 ) -> Tuple[str, float, Dict]:
     """
     Fast-path with optional frequency refinement.
@@ -1517,6 +1521,7 @@ def fast_path_with_refinement(
             exact_match_threads=exact_match_threads,
             exact_match_enabled=exact_match_enabled,
             exact_match_max_basis=exact_match_max_basis,
+            max_power=max_power,
         )
         if candidate_score(mse, details) < candidate_score(best_mse, best_details):
             best_mse = mse
@@ -1562,6 +1567,7 @@ def fast_path_with_refinement(
                 exact_match_threads=exact_match_threads,
                 exact_match_enabled=exact_match_enabled,
                 exact_match_max_basis=exact_match_max_basis,
+                max_power=max_power,
             )
             if should_accept_candidate(mse2, details2):
                 return formula2, mse2, details2
@@ -1675,6 +1681,7 @@ def run_fast_path(
     simplification_int_tol: float = 1e-5,
     simplification_zero_tol: float = 1e-8,
     simplification_log: bool = True,
+    max_power: int = 6,
 ) -> Optional[Dict]:
     """
     Run the complete fast-path pipeline.
@@ -1715,7 +1722,7 @@ def run_fast_path(
             formula = f"{const_val:.6g}"
         print(f"  Constant signal detected: y ≈ {const_val}")
         print(f"  Formula: {formula}")
-        print(f"  MSE: 0.000000")
+        print("  MSE: 0.000000")
         print("="*60)
         return {
             'formula': formula,
@@ -1759,6 +1766,7 @@ def run_fast_path(
         exact_match_threads=exact_match_threads,
         exact_match_enabled=exact_match_enabled,
         exact_match_max_basis=exact_match_max_basis,
+        max_power=max_power,
     )
 
     raw_formula = formula
@@ -2081,18 +2089,18 @@ def beam_search_evolution(
     """
     import time
     import sys
-    from pathlib import Path
+    from pathlib import Path as _Path
     
     # Try importing C++ backend
     try:
-        cpp_dir = Path(__file__).parent.parent / 'glassbox' / 'sr' / 'cpp'
+        cpp_dir = _Path(__file__).parent.parent / 'glassbox' / 'sr' / 'cpp'
         if str(cpp_dir) not in sys.path:
             sys.path.insert(0, str(cpp_dir))
         import _core
     except ImportError:
         # Also try relative to the glassbox package
         try:
-            cpp_dir = Path(__file__).resolve().parent.parent / 'glassbox' / 'sr' / 'cpp'
+            cpp_dir = _Path(__file__).resolve().parent.parent / 'glassbox' / 'sr' / 'cpp'
             if str(cpp_dir) not in sys.path:
                 sys.path.insert(0, str(cpp_dir))
             import _core
@@ -2304,7 +2312,7 @@ def beam_search_evolution(
                 p_max=float(config.get('p_max', 3.0)),
             )
             return (result['best_mse'], result, config)
-        except Exception as e:
+        except Exception:
             return (float('inf'), None, config)
     
     def mutate_config(config, rng):
@@ -2373,7 +2381,7 @@ def beam_search_evolution(
             n_keep = max(1, int(n_beams * keep_fraction))
             n_mutants_per_winner = max(1, (n_beams - n_keep) // n_keep)
             
-            for winner_cfg in winner_configs:
+            for winner_cfg in winner_configs:  # noqa: F821 - set at end of loop
                 configs.append(winner_cfg)  # Keep original
                 for _ in range(n_mutants_per_winner):
                     configs.append(mutate_config(winner_cfg, rng))
@@ -2413,7 +2421,7 @@ def beam_search_evolution(
         
         # Early exit if we found essentially perfect MSE
         if best_overall_mse < 1e-10:
-            print(f"  ✅ Perfect MSE achieved, stopping early!")
+            print("  \u2705 Perfect MSE achieved, stopping early!")
             break
         
         # Keep top fraction as winners for next round
@@ -2423,7 +2431,7 @@ def beam_search_evolution(
     elapsed = time.time() - start_time
     
     if best_overall_result is None:
-        print(f"  ❌ Beam search failed (no valid results)")
+        print("  \u274c Beam search failed (no valid results)")
         return None
     
     # Build CppGraphModule from best result
