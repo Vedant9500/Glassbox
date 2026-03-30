@@ -1886,6 +1886,11 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         # NEW: Early stopping on exact match
         early_stop_mse: float = 1e-6,  # Stop if MSE below this (exact match)
         early_stop_corr: float = 0.9999,  # Stop if correlation above this
+        # C++ backend controls (parity with sklearn_wrapper)
+        p_min: float = -2.0,  # Minimum power exponent bound for C++ evolution
+        p_max: float = 3.0,   # Maximum power exponent bound for C++ evolution
+        timeout_seconds: int = 120,  # Timeout for C++ evolution in seconds
+        random_seed: int = -1,  # Random seed for C++ evolution (-1 = nondeterministic)
     ):
         self.model_factory = model_factory
         self.population_size = population_size
@@ -1955,6 +1960,12 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         # NEW: Early stopping thresholds
         self.early_stop_mse = early_stop_mse
         self.early_stop_corr = early_stop_corr
+        
+        # C++ backend controls
+        self.p_min = p_min
+        self.p_max = p_max
+        self.timeout_seconds = timeout_seconds
+        self.random_seed = random_seed
         
         # NEW: Graduated structure confidence tracker (replaces binary lock)
         self.confidence_tracker = StructureConfidenceTracker(
@@ -2383,6 +2394,8 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         generations: int = 50,
         print_every: int = 5,
         trace_path: Optional[str] = None,
+        timeout_seconds: Optional[int] = None,
+        random_seed: Optional[int] = None,
     ) -> Dict:
         """
         Full evolutionary training.
@@ -2461,9 +2474,13 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             X_list = [x[:, i].cpu().numpy() for i in range(x.shape[1])] if x.dim() > 1 else [x.cpu().numpy()]
             y_arr = y.reshape(-1).cpu().numpy()
             
+            # Resolve C++ parameters: train() overrides take priority, then __init__ defaults
+            effective_timeout = timeout_seconds if timeout_seconds is not None else self.timeout_seconds
+            effective_seed = random_seed if random_seed is not None else self.random_seed
+            
             start_time = time.time()
             
-            # Run C++ Loop
+            # Run C++ Loop (matching sklearn_wrapper parameter parity)
             result = _core.run_evolution(
                 X_list=X_list,
                 y=y_arr,
@@ -2471,7 +2488,11 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 generations=generations,
                 early_stop_mse=self.early_stop_mse,
                 seed_omegas=detected_omegas,
-                trace_path=trace_path
+                trace_path=trace_path if trace_path else "",
+                timeout_seconds=effective_timeout,
+                random_seed=effective_seed,
+                p_min=self.p_min,
+                p_max=self.p_max,
             )
             
             end_time = time.time()
