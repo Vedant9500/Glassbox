@@ -1289,6 +1289,15 @@ def check_structure_quality(
         corr = corr_matrix[0, 1].item()
         
         if math.isnan(corr):
+            # NaN correlation usually means constant predictions (zero variance).
+            # Flag it so degenerate models don't silently pass structure checks.
+            import warnings
+            warnings.warn(
+                "check_structure_locked: NaN correlation detected (likely constant "
+                f"predictions, pred std={pred.std().item():.2e}). Treating as corr=0.0.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             corr = 0.0
         
         structure_is_good = abs(corr) >= corr_threshold
@@ -2686,6 +2695,14 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                     corr = torch.corrcoef(torch.stack([pred_sq.cpu(), y_sq.cpu()]))[0, 1].item()
                     mse = F.mse_loss(pred_sq, y_sq).item()
                     if math.isnan(corr):
+                        import warnings
+                        warnings.warn(
+                            f"Gen {gen}: NaN correlation on best_ever (likely constant "
+                            f"predictions, pred std={pred_sq.std().item():.2e}). "
+                            "Treating as corr=0.0.",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
                         corr = 0.0
                 
                 # Update confidence tracker

@@ -48,7 +48,8 @@ py::dict run_evolution_cpp(
     double post_restart_mutation_boost = 1.25,
     int random_seed = -1,
     double acceptable_mse = 1e-3,
-    int acceptable_complexity = 20
+    int acceptable_complexity = 20,
+    int early_stop_max_nodes = 8
 ) {
     // 1. Convert Python/Numpy to C++ Eigen
     std::vector<Eigen::ArrayXd> X;
@@ -122,6 +123,7 @@ py::dict run_evolution_cpp(
     config.random_seed = random_seed;
     config.acceptable_mse = acceptable_mse;
     config.acceptable_complexity = acceptable_complexity;
+    config.early_stop_max_nodes = early_stop_max_nodes;
 
     // Sync evaluator temperature so arithmetic blend sharpness is tunable from Python.
     sr::set_arithmetic_temperature(arithmetic_temperature);
@@ -234,5 +236,6 @@ PYBIND11_MODULE(_core, m) {
           py::arg("post_restart_mutation_boost")=1.25,
           py::arg("random_seed")=-1,
           py::arg("acceptable_mse")=1e-3,
-          py::arg("acceptable_complexity")=20);
+          py::arg("acceptable_complexity")=20,
+          py::arg("early_stop_max_nodes")=8);
 }

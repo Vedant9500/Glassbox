@@ -41,6 +41,7 @@ struct EvolutionConfig {
     
     bool use_early_stop = true;
     double early_stop_mse = 1e-6;
+    int early_stop_max_nodes = 8;  // Max graph nodes for early-stop eligibility
     int timeout_seconds = 120;
 
     // Pruning and rounding
@@ -252,7 +253,7 @@ public:
                 should_restart = (window_improvement < config_.stagnation_min_improvement) && (diversity < config_.diversity_floor);
             }
 
-            if (config_.use_early_stop && best_overall_.raw_mse < config_.early_stop_mse && best_overall_.nodes.size() <= 8) {
+            if (config_.use_early_stop && best_overall_.raw_mse < config_.early_stop_mse && best_overall_.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
                 trace_event("run.early_stop", gen);
                 break; // Exact algebraic match found that is simple
             }
@@ -489,7 +490,7 @@ public:
             bool should_stop = false;
             for (auto& island : islands) {
                 auto best = island.get_best();
-                if (best.raw_mse < config_.early_stop_mse && best.nodes.size() <= 8) {
+                if (best.raw_mse < config_.early_stop_mse && best.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
                     should_stop = true;
                 }
                 if (best.fitness < best_overall_.fitness) {
@@ -544,7 +545,7 @@ private:
     double run_wall_time_sec_ = 0.0;
 
     void update_discovery_metrics(int generation, const std::chrono::steady_clock::time_point& start_time) {
-        const bool is_exact = (best_overall_.raw_mse < config_.early_stop_mse && best_overall_.nodes.size() <= 8);
+        const bool is_exact = (best_overall_.raw_mse < config_.early_stop_mse && best_overall_.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes));
         const bool is_acceptable =
             (best_overall_.raw_mse < config_.acceptable_mse &&
              static_cast<int>(best_overall_.nodes.size()) <= config_.acceptable_complexity);

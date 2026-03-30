@@ -272,18 +272,26 @@ class MetaPeriodic(nn.Module):
         else:
             return f"sin(ω={omega:.2f}, φ={phi:.2f})"
     
-    def snap_to_discrete(self):
-        """Snap parameters to nearest standard values."""
+    def snap_to_discrete(self, omega_threshold: float = 0.2, phi_threshold: float = 0.15):
+        """Snap parameters to nearest standard values.
+        
+        Args:
+            omega_threshold: Absolute distance to snap omega toward 1.0.
+            phi_threshold: Absolute distance to snap phi to nearest π/2 multiple.
+        """
         with torch.no_grad():
-            # Snap omega to 1 if close
-            if abs(self.omega.item() - 1.0) < 0.2:
-                self.omega.fill_(1.0)
+            # Snap omega to nearest integer if close
+            omega_val = self.omega.item()
+            omega_rounded = round(omega_val)
+            if omega_rounded != 0 and abs(omega_val - omega_rounded) < omega_threshold:
+                self.omega.fill_(float(omega_rounded))
             
             # Snap phi to nearest multiple of π/2
             phi = self.phi.item() % (2 * math.pi)
             snap_points = [0, math.pi/2, math.pi, 3*math.pi/2]
             nearest = min(snap_points, key=lambda p: abs(phi - p))
-            self.phi.fill_(nearest)
+            if abs(phi - nearest) < phi_threshold:
+                self.phi.fill_(nearest)
             
             # Snap amplitude to ±1
             if abs(self.amplitude.item()) > 0.5:
@@ -369,13 +377,21 @@ class MetaPower(nn.Module):
         else:
             return f"power(p={p:.2f})"
     
-    def snap_to_discrete(self):
-        """Snap p to nearest standard value."""
+    def snap_to_discrete(self, snap_points=None, threshold: float = 0.3):
+        """Snap p to nearest standard value.
+        
+        Args:
+            snap_points: List of candidate values to snap to.
+                         Defaults to [-1, 0, 0.5, 1, 2, 3].
+            threshold: Maximum absolute distance for snapping.
+        """
+        if snap_points is None:
+            snap_points = [-1, 0, 0.5, 1, 2, 3]
         with torch.no_grad():
             p = self.p.item()
-            snap_points = [-1, 0, 0.5, 1, 2, 3]
             nearest = min(snap_points, key=lambda sp: abs(p - sp))
-            self.p.fill_(nearest)
+            if abs(p - nearest) < threshold:
+                self.p.fill_(nearest)
 
 
 class MetaArithmetic(nn.Module):
