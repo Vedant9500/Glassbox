@@ -119,16 +119,21 @@ class RegularizedBFGS:
             # Total loss
             loss = mse_loss + self.l1_weight * l1_loss + self.l2_weight * l2_loss
             
-            # Backward
-            if not torch.isnan(loss):
+            # Guard against both NaN and Inf to prevent poisoning the
+            # LBFGS line search with non-finite objective values.
+            if torch.isfinite(loss):
                 loss.backward()
+            else:
+                # Return a large but finite fallback so LBFGS can
+                # reject this step gracefully instead of diverging.
+                loss = torch.tensor(1e8, dtype=loss.dtype, device=loss.device)
             
             return loss
         
         try:
             optimizer.step(closure)
-        except Exception as e:
-            # BFGS can fail, return current weights
+        except Exception:
+            # BFGS can fail on ill-conditioned problems; keep current weights.
             pass
         
         # Final loss
@@ -294,6 +299,10 @@ class IterativeBFGSRefiner:
                 active_count = active_mask.sum().item()
                 print(f"Active features: {active_count}/{n_features}")
             
+            # Snapshot the mask BEFORE this iteration's pruning so we can
+            # detect true convergence (no change between iterations).
+            prev_active_mask = active_mask.clone()
+            
             # Get active features
             X_active = X[:, active_mask]
             
@@ -338,8 +347,8 @@ class IterativeBFGSRefiner:
                     if prune:
                         active_mask[active_indices[i]] = False
             
-            # Stop if no pruning happened
-            if iteration > 0 and torch.all(active_mask == (weights_full.abs() > self.prune_threshold)):
+            # Stop if active set is unchanged from prior iteration
+            if iteration > 0 and torch.all(active_mask == prev_active_mask):
                 if verbose:
                     print("  Converged (no change in active set)")
                 break

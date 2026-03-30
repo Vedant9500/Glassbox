@@ -272,10 +272,14 @@ class HardConcreteSelector(nn.Module):
         )
         
         if hard and self.training:
-            # Normalize to make it more like one-hot during training
-            # But allow zeros (if all gates are 0, output all 0)
-            total = gates.sum() + 1e-8
-            gates = gates / total
+            # Straight-through one-hot: use argmax in forward pass
+            # but keep soft gradients for backprop.  This closes the
+            # train/infer discretization gap — inference also uses
+            # one-hot argmax, so training now sees the same structure.
+            idx = gates.argmax()
+            one_hot = torch.zeros_like(gates)
+            one_hot[idx] = 1.0
+            gates = gates + (one_hot - gates).detach()
         
         return gates
     
@@ -394,11 +398,19 @@ class HardConcreteOperationSelector(nn.Module):
             # The weights can all be high or all be low independently
             pass  # Keep raw Hard Concrete values
         elif hard and self.training and self.normalize_gates:
-            # Normalize to approximate one-hot while allowing zeros
-            # Only when normalize_gates=True (default for backward compatibility)
-            type_weights = type_weights / (type_weights.sum() + 1e-8)
-            unary_weights = unary_weights / (unary_weights.sum() + 1e-8)
-            binary_weights = binary_weights / (binary_weights.sum() + 1e-8)
+            # Straight-through one-hot per group: use argmax in forward
+            # but keep soft gradients for backprop.   This closes the
+            # train/infer discretization gap — inference also uses
+            # one-hot argmax, so training now sees the same structure.
+            def _straight_through_onehot(w):
+                idx = w.argmax()
+                oh = torch.zeros_like(w)
+                oh[idx] = 1.0
+                return w + (oh - w).detach()
+            
+            type_weights = _straight_through_onehot(type_weights)
+            unary_weights = _straight_through_onehot(unary_weights)
+            binary_weights = _straight_through_onehot(binary_weights)
 
         return type_weights, unary_weights, binary_weights
     

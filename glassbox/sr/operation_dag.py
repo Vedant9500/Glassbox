@@ -623,11 +623,12 @@ class OperationDAG(nn.Module):
         
         Returns self for chaining: model.finalize_coefficients(x).eval()
         """
-        # IMPORTANT: Store MSE before finalization to verify we didn't break anything
+        # IMPORTANT: Store full predictions before finalization to verify
+        # we didn't break anything (not just the mean — also element-wise).
         self.eval()
         with torch.no_grad():
             pred_before, _ = self(x, hard=True)
-            y_mean = pred_before.mean().item()
+            pred_before = pred_before.detach().clone()
         
         # Run forward passes to update BatchNorm running statistics
         with torch.no_grad():
@@ -691,13 +692,17 @@ class OperationDAG(nn.Module):
             if self.output_proj.bias is not None:
                 self.output_proj.bias.data = b - bias_correction
         
-        # Verify the fusion worked (predictions should be similar)
+        # Verify the fusion worked: full element-wise comparison, not just mean.
         self.eval()
         with torch.no_grad():
             pred_after, _ = self(x, hard=True)
-            diff = (pred_after.mean() - y_mean).abs().item()
-            if diff > 1.0:
-                print(f"WARNING: finalize_coefficients changed predictions significantly (diff={diff:.4f})")
+            fusion_mse = (pred_after - pred_before).pow(2).mean().item()
+            fusion_max_err = (pred_after - pred_before).abs().max().item()
+            if fusion_mse > 0.1 or fusion_max_err > 1.0:
+                print(
+                    f"WARNING: finalize_coefficients changed predictions significantly "
+                    f"(fusion_mse={fusion_mse:.6f}, max_err={fusion_max_err:.4f})"
+                )
         
         self._coefficients_finalized = True
         return self
