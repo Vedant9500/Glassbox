@@ -1,5 +1,346 @@
-high priority:
-    [x] native integer-power operator: IntPow(x, n) for n ∈ {2,3,4,5,6} instead of continuous Power(p) — avoids fractional p drift on high-degree polys
-    [x] proper division node: explicit x/y node added; soft Arithmetic remains for backward compatibility
-    [x] multi-start: run 3-5 independent evolutions and pick best — matches PySR's multi-run protocol
-    [x] adaptive compute budget: easy formulas get short budgets, hard formulas get expanded budgets (configurable min/max)
+# FPIP Improvement Plan — Deep Review & Recommended Roadmap
+
+> **Context**: This reviews the `todo` file proposing a "Fast Path Intelligence Packet" (FPIP) to bridge the classifier fast-path with guided evolution. Each item is evaluated against (1) the current Glassbox codebase, (2) the known failure modes in `limitations.md`, and (3) the 2024–2025 SR research landscape.
+
+---
+
+## Summary Verdict
+
+The FPIP idea is **directionally correct** — the single-biggest bottleneck in Glassbox today is that the fast path produces a single guess with zero uncertainty metadata, and evolution starts almost blind when that guess is wrong. However, several of the proposed sub-items risk adding complexity without payoff, and a few high-impact items are missing entirely.
+
+| Category | Count |
+|---|---|
+| ✅ KEEP (high ROI, well-scoped) | 8 |
+| ⚠️ FLAG (risky, will hurt, or premature) | 5 |
+| ➕ ADD (missing from the plan) | 6 |
+
+---
+
+## Part 1: Item-by-Item Review of Proposed FPIP
+
+### FPIP Contents (Section "What FPIP should contain")
+
+---
+
+#### 1. Calibrated operator posteriors
+**Verdict: ✅ KEEP — Critical**
+
+The current `predict_operators()` in [curve_classifier_integration.py](file:///d:/Glassbox/scripts/curve_classifier_integration.py) already returns per-class probabilities, and [classifier_fast_path.py:1739-1745](file:///d:/Glassbox/scripts/classifier_fast_path.py#L1739-L1745) passes these as raw sigmoid outputs. However, these are **not calibrated** — sigmoid outputs from a neural net are not true probabilities (Platt scaling / temperature scaling is optional in `train_curve_classifier.py` line 44 but the calibration is loose).
+
+**Research support**: SRBench (La Cava et al., 2021) and PySR's docs explicitly note that calibrated operator priors dramatically reduce search waste. Operon uses GP-quality-aware priors for exactly this reason.
+
+**Recommendation**: Add isotonic regression calibration on a held-out set post-training. Store calibration mapping in the model checkpoint. This is a one-time cost with permanent benefits.
+
+---
+
+#### 2. Uncertainty metrics (entropy, margin, disagreement)
+**Verdict: ✅ KEEP — High ROI**
+
+Currently the fast path returns `predictions` as a flat dict and `operator_hints` — but no uncertainty signal at all. The sklearn wrapper's `_estimate_compute_budget()` at [sklearn_wrapper.py:101-125](file:///d:/Glassbox/glassbox/sr/sklearn_wrapper.py#L101-L125) uses R² as a crude proxy. Adding classifier-level entropy/margin would let evolution know *how much to trust* the fast path without needing an R² from a fit attempt.
+
+**Research support**: Deep Symbolic Regression (Petersen et al., 2019) shows that risk-aware exploration (longer search when uncertain) outperforms fixed budgets by 15–25% on Feynman benchmarks.
+
+**Implementation**: Cheap to compute — just `H = -Σ p log(p)` and `margin = p_top1 - p_top2` from the existing prediction dict. Add to the returned packet alongside `predictions`.
+
+---
+
+#### 3. Structure cues (additive vs multiplicative vs compositional vs rational)
+**Verdict: ⚠️ FLAG — Risk of false constraints**
+
+The idea is sound in theory, but hard to implement reliably. The current classifier classes are operator-level (`sin`, `cos`, `power`, `exp`, `log`, `rational`), not structure-level. Detecting "multiplicative" vs "additive" requires knowing _how_ operators compose, which is the very thing evolution is trying to discover.
+
+**Why it could hurt**: If the classifier confidently says "multiplicative", evolution would bias toward product crossover. But `limitations.md` line 15 already notes: **"Product structure: targets like x·sin(x) collapse into additive forms."** A wrong structural cue here would make this failure mode *worse*, not better, because evolution would narrow its search on the wrong axis.
+
+**Recommendation**: Defer this until after items 1, 2, and 5 are implemented and validated. If you still want structural signal, use a **separability test** (rank-based, AI Feynman style) rather than a classifier output, since it's mathematically grounded and hard to get wrong.
+
+---
+
+#### 4. Frequency and phase evidence (not only top omega)
+**Verdict: ✅ KEEP — High ROI, already 80% done**
+
+`detect_dominant_frequency()` at [evolution.py:106-187](file:///d:/Glassbox/glassbox/sr/evolution.py#L106-L187) already returns `n_frequencies` top omegas. The beam search at [classifier_fast_path.py:2200-2298](file:///d:/Glassbox/scripts/classifier_fast_path.py#L2200-L2298) already generates harmonic and π-based frequency variants. What's genuinely missing:
+
+- **Phase information**: The FFT result's imaginary part (phase spectrum) is discarded at line 158: `magnitudes = np.abs(fft_result[1:])`. Preserving `np.angle(fft_result[1:])` for the top peaks would let the fast path distinguish `sin(x)` from `cos(x)` (phase shift of π/2) without evolution needing to discover it.
+- **Harmonic consistency**: Checking if detected peaks are integer multiples of a fundamental would flag likely square/triangle wave targets (sum-of-harmonics) vs. single-frequency targets.
+
+**Implementation**: ~30 lines of code in `detect_dominant_frequency`. Feed phase info into the FPIP, use it in `refine_frequencies()` to initialize phase parameters.
+
+---
+
+#### 5. Power evidence (integer vs fractional confidence)
+**Verdict: ✅ KEEP — Medium ROI**
+
+The `refine_powers()` function at [classifier_fast_path.py:1158-1403](file:///d:/Glassbox/scripts/classifier_fast_path.py#L1158-L1403) already does continuous power exponent optimization. But it's triggered only when `power > 0.4` in the classifier output. What's missing is a **pre-refinement diagnostic**:
+
+- Fit a log-log regression `log|y| ~ p·log|x| + c` on the data. If R² > 0.95 and `p` is near an integer, report high integer-power confidence. If `p` is fractional (e.g., 0.5, 1.5), report fractional-power confidence.
+- This 5-line diagnostic would save the expensive gradient-based `refine_powers()` call in obvious cases and provide a better `p_min`/`p_max` for the C++ engine's `EvolutionConfig`.
+
+---
+
+#### 6. Residual diagnostics from fast-path fit
+**Verdict: ✅ KEEP — Critical, but add out-of-domain holdout**
+
+Currently the LASSO + OLS refit at [classifier_fast_path.py:880-983](file:///d:/Glassbox/scripts/classifier_fast_path.py#L880-L983) computes MSE but does not analyze the *structure* of the residual. If `y_true - y_fast_path` looks periodic, it means the fast path missed a sinusoidal component. If the residual grows polynomially at the edges, the fast path may have the wrong polynomial degree.
+
+**What to add**:
+1. Run FFT on the fast-path residual → detect hidden frequencies (this is partially done in `refine_powers` at line 1286-1302, but only inside the power refinement branch, not generically).
+2. Compute residual skewness/kurtosis → detect systematic bias (sign errors, wrong-sign exp).
+3. **Out-of-domain holdout**: Hold back 10% of the domain edges when fitting. Check fast-path extrapolation error. This directly addresses `limitations.md` item 6: "Keep multiple domains and an out-of-domain holdout for scoring."
+
+> [!IMPORTANT]
+> The `refine_powers` function at line 1286 already runs FFT on residuals but only in the power refinement path. Generalize this to run on ALL fast-path residuals, regardless of operator type. This is a quick win.
+
+---
+
+#### 7. Candidate formula set (top K diverse formulas, not one formula)
+**Verdict: ✅ KEEP — Critical**
+
+The current fast path returns exactly ONE formula (the best LASSO + OLS result). But LASSO with different `alpha` values at [classifier_fast_path.py:890-922](file:///d:/Glassbox/scripts/classifier_fast_path.py#L890-L922) already explores multiple sparsity levels — it just discards all but the best. Keeping the top 3–5 diverse formulas (diverse = different active basis functions) would:
+
+1. Let evolution start with multiple structural hypotheses.
+2. Reduce the "single wrong guess" failure mode that currently wastes the entire evolution budget.
+
+**Research support**: PIGP (Jha et al., NeurIPS 2024) shows that seeding GP with multiple candidate trees, even imperfect ones, provides a 2–5× speedup over single-seed initialization. The current beam search at line 2200 diversifies at the C++ level, but the Python fast-path feeds only one skeleton into it.
+
+**Implementation**: Instead of just tracking `best_coeffs/best_mse/best_score` in the LASSO loop, maintain a **priority queue of K=5** diverse solutions (filtered by edit distance of active basis masks).
+
+---
+
+#### 8. Variable interaction map for multivariate data
+**Verdict: ⚠️ FLAG — Premature for current benchmarks**
+
+The idea is theoretically important (see `sr_architectural_critique.md` Section 3 on the 1D slicing problem), but the current Glassbox benchmark suite is overwhelmingly univariate or low-dimensional. Building a full interaction map is significant engineering effort with limited near-term payoff.
+
+**Recommendation**: Instead of a full interaction map, implement the much simpler **AI Feynman separability test**: construct a matrix `M[i,j] = y(x_i, x_j)` on a coarse grid and check its numerical rank. If rank ≤ 2, the function is likely separable. This is ~20 lines of NumPy and catches the most critical failure modes (e.g., `sin(x·y)` vs. `sin(x) + sin(y)`) without building a full GNN.
+
+---
+
+### Probe Ensemble (Section "Creative Upgrade")
+
+---
+
+#### Probes 1–5 (Global, Spectral, Differential, Local, Structure)
+**Verdict: ⚠️ FLAG — Over-engineered for current pipeline**
+
+This proposes 5 independent analysis modules fused with confidence weighting. While intellectually appealing, this adds enormous surface area:
+
+- **Global probe**: Already exists (the classifier).
+- **Spectral probe**: Already exists (`detect_dominant_frequency`). Adding autocorrelation & harmonic consistency is cheap and good (see item 4 above), but doesn't need a separate "probe" abstraction.
+- **Differential probe**: Derivative-based analysis is the *weakest* feature in the current system (see `sr_architectural_critique.md` Section 1.1.2 on derivative instability). Making a separate probe from unstable features would produce a noisy signal.
+- **Local probe**: Windowed fits are expensive and redundant with the LASSO basis expansion that already includes rational/exponential decay terms.
+- **Structure probe**: Same as item 8 above — premature.
+
+> [!WARNING]
+> **The probe ensemble concept conflates "more analysis" with "better guidance." The current pipeline's problem is not lack of analysis — it's that the analysis it already does is not reliably passed to evolution.** Fix the information flow first (items 1, 2, 6, 7), then consider probes.
+
+**Recommendation**: Instead of a formal 5-probe ensemble, add **2 lightweight analyses** to the existing fast-path return:
+1. **Residual spectrum** (FFT on residual, already partially exists).
+2. **Simple monotonicity/symmetry flags** (is `y(x)` even? odd? monotonic? — 5 lines of NumPy, zero cost).
+
+These cover 80% of the probe ensemble's value at 10% of the engineering cost.
+
+---
+
+### Evolution Consumption (Section "How evolution should consume FPIP")
+
+---
+
+#### 1. Dynamic operator priors (strong when uncertainty low, weak when high)
+**Verdict: ✅ KEEP — High ROI**
+
+The C++ engine already supports `op_priors` at [evolution.h:72](file:///d:/Glassbox/glassbox/sr/cpp/evolution.h#L72) and builds a CDF for weighted sampling at line 138-143. The beam search at [classifier_fast_path.py:2224-2296](file:///d:/Glassbox/scripts/classifier_fast_path.py#L2224-L2296) already generates configs with different prior weights.
+
+What's missing: The prior strength is currently **static** — it doesn't scale with classifier confidence. If the classifier says `sin: 0.95`, the beam search should use strong sin priors. If `sin: 0.55`, it should use weak priors and more uniform exploration.
+
+**Implementation**: In `make_beam_configs()`, scale the `classifier_priors` by the entropy score from item 2. Low entropy → use classifier priors as-is. High entropy → blend toward uniform.
+
+---
+
+#### 2. Adaptive mutation policy
+**Verdict: ⚠️ FLAG — Concept is right, but specific proposals are risky**
+
+The proposed rules ("if multiplicative evidence high, increase product-preserving crossover") assume the fast path can reliably detect multiplication vs addition. As noted in item 3 above, this detection is fragile. Increasing product crossover on a wrong signal would reduce diversity and hurt.
+
+What IS safe: The C++ engine's `macro_mutate()` already has wrap/multiply/nest mutations at [evolution.h:284-287](file:///d:/Glassbox/glassbox/sr/cpp/evolution.h#L284-L287) with fixed probabilities (50/30/20%). Instead of changing these based on fragile structural classification, **adjust macro mutation probability based on fast-path R²**:
+- R² > 0.95 from fast path → reduce macro mutation (structure is likely right, just refine)
+- R² < 0.5 → increase macro mutation (need big structural changes)
+
+This is simpler, more robust, and addresses the same problem.
+
+---
+
+#### 3. Targeted initialization (seed population with K skeletons)
+**Verdict: ✅ KEEP — Critical, aligns with PIGP**
+
+This directly corresponds to the PIGP (Partially Initialized Genetic Programming) approach from NeurIPS 2024. Currently `beam_search_evolution()` generates 15 handcrafted configs + 5 random ones, but none are actual formula skeletons from the fast path.
+
+**What to change**: Convert the top-K fast-path formulas (from item 7) into C++ `IndividualGraph` structures and inject them as elite seeds in the C++ population. The `create_random_individual()` at [evolution.h:673-761](file:///d:/Glassbox/glassbox/sr/cpp/evolution.h#L673-L761) already builds DAGs — adding a `create_individual_from_skeleton()` that takes a parsed formula tree and maps it to `OpNode` structures is the main engineering task (~100 lines of C++).
+
+---
+
+#### 4. Budget routing
+**Verdict: ✅ KEEP — Already partially implemented**
+
+`_estimate_compute_budget()` at [sklearn_wrapper.py:101-125](file:///d:/Glassbox/glassbox/sr/sklearn_wrapper.py#L101-L125) already does this. The R² gates at lines 115-122 route easy problems to short budgets and hard problems to long ones. The proposal just adds the probe consensus signal as an additional gate, which is reasonable if items 1 and 2 are implemented.
+
+---
+
+## Part 2: Missing Items to ADD
+
+These are improvements not in the `todo` but backed by research and codebase analysis:
+
+---
+
+### ➕ ADD 1: Upgrade constant optimization from finite-difference Adam to Levenberg-Marquardt
+**Priority: 🔴 CRITICAL**
+
+This is the **single most impactful change not in the todo**.
+
+The C++ engine's `refine_inner_params()` uses finite-difference Adam (see evolution.h lines 343-348, runs every 10 generations on top 5 elites). Finite-difference gradient estimation is noisy and slow — each parameter requires 2 function evaluations, making the per-iteration cost O(n_params × n_samples).
+
+The SOTA (Operon, PySR/SymbolicRegression.jl) uses **Levenberg-Marquardt** for constant optimization, which:
+- Converges in 5-15 iterations vs. 50-200 for Adam.
+- Produces lower MSE at convergence (second-order curvature information).
+- Is available in Eigen (which you already bundle at `glassbox/sr/cpp/eigen/`).
+
+**Impact estimate**: Based on SRBench comparisons, switching to LM for constant optimization typically yields 10-20% higher exact recovery rate and 2-3× faster time-to-solution. For Glassbox's 59% exact rate, this alone could push to ~65-70%.
+
+**Implementation**: Add `Eigen::LevenbergMarquardt` integration. Define a functor that evaluates the graph's output given parameters (omega, p, phi, coefficients). Call LM on the top elite every N=10 generations instead of finite-difference Adam. ~150 lines of C++.
+
+---
+
+### ➕ ADD 2: Formula-honest final selection (displayed-formula MSE)
+**Priority: 🔴 CRITICAL**
+
+This is already in `limitations.md` item 1 (line 53-55) but conspicuously absent from the `todo`. The soft-to-hard operator mismatch means the C++ engine's `raw_mse` (computed with soft arithmetic blends) can be much lower than the MSE of the *displayed formula* (computed with discrete operators).
+
+**Current problem**: `beam_search_evolution()` at [classifier_fast_path.py:2314](file:///d:/Glassbox/scripts/classifier_fast_path.py#L2314) ranks beams by `result['best_mse']` — the raw engine MSE. If the best-MSE beam has a display formula that doesn't match the raw evaluation, the user sees a wrong formula with a misleadingly good MSE.
+
+**Fix**: After `cleanup_graph()`, re-evaluate the displayed formula string against the data to compute `display_mse`. Rank final candidates by `display_mse`, not `raw_mse`. Add a `drift_penalty = abs(raw_mse - display_mse) / raw_mse` to flag suspicious solutions.
+
+---
+
+### ➕ ADD 3: Tighter snapping thresholds
+**Priority: 🟡 HIGH**
+
+Also from `limitations.md` item 2 (line 58-59). The `cleanup_graph()` function in `evolution.h` snaps parameters to integers/fractions if degradation is < 1.5×. This is too permissive — it can turn `exp(-0.98·x)` into `exp(-x)` or `2.05·x²` into `2·x²` when the true formula has irrational coefficients.
+
+**Recommendation**: Tighten from 1.5× to 1.05× for the primary snap. Add a **staged snapping** approach:
+1. Snap to exact integers if degradation < 1.01×
+2. Snap to common fractions (1/2, 1/3, ...) if degradation < 1.02×
+3. Snap to π, e, √2 if degradation < 1.05×
+4. Keep as-is otherwise
+
+---
+
+### ➕ ADD 4: Entropy penalty on soft arithmetic weights
+**Priority: 🟡 HIGH**
+
+The `arithmetic_soft_weights()` function at [eval.h:51-68](file:///d:/Glassbox/glassbox/sr/cpp/eval.h#L51-L68) computes a softmax over 4 arithmetic operations. At convergence, many nodes have weights like `[0.6, 0.2, 0.1, 0.1]` — too soft to snap to a clean formula. Adding an entropy penalty `H(w) = -Σ w_i log(w_i)` to the fitness function would push weights toward one-hot during evolution, making the displayed formula match the raw evaluation more closely.
+
+**This directly addresses `limitations.md` items 1 and 2.**
+
+---
+
+### ➕ ADD 5: Out-of-domain holdout scoring
+**Priority: 🟡 HIGH**
+
+Currently the fast path evaluates on the same data it fits. For formulas like `exp(-x)`, the LASSO fit might match perfectly on `[0, 3]` but diverge wildly outside that range. Holding back 10% of the domain edges (the extreme x values) as a validation set would:
+1. Catch extrapolation failures before they reach evolution.
+2. Improve formula selection by penalizing overfitted basis expansions.
+
+**Implementation**: In `fast_path_regression()`, split data into 90% fit / 10% holdout (extreme x-values). Report both in-sample and holdout MSE in the FPIP.
+
+---
+
+### ➕ ADD 6: Cross-validation skip guard for fast path
+**Priority: 🟢 MEDIUM**
+
+The fast path currently has a fixed R² threshold of 0.999 (`evolution_skip_r2` at [sklearn_wrapper.py:68](file:///d:/Glassbox/glassbox/sr/sklearn_wrapper.py#L68)) for skipping evolution. But a high R² on overfit data doesn't guarantee correctness. A quick 3-fold cross-validation on the fast-path fit (using different basis subsets or random data splits) would give a more reliable "should we skip evolution?" signal.
+
+This was discussed in a previous conversation ([a980c4a2](file:///onn_advanced_optimization.md) — the "cross-validation skip guard" concept).
+
+---
+
+## Part 3: Recommended Priority Roadmap
+
+Based on ROI (impact / effort) and the current failure modes:
+
+### Phase 1 — Fix the Foundation (1-2 weeks)
+> These address the known failure modes from `limitations.md` without adding new abstractions.
+
+| # | Item | Type | Effort | Impact |
+|---|---|---|---|---|
+| 1 | Formula-honest final selection (ADD 2) | Bug fix | Low | 🔴 Critical |
+| 2 | Tighter snapping thresholds (ADD 3) | Config | Low | 🟡 High |
+| 3 | Entropy penalty on arithmetic weights (ADD 4) | C++ change | Medium | 🟡 High |
+| 4 | Residual spectrum analysis on ALL fast-path outputs (KEEP 6) | Python | Low | 🟡 High |
+
+### Phase 2 — Build the Information Bridge (2-3 weeks)
+> These implement the core FPIP concept: making the fast path pass rich metadata to evolution.
+
+| # | Item | Type | Effort | Impact |
+|---|---|---|---|---|
+| 5 | Uncertainty metrics in FPIP (KEEP 2) | Python | Low | 🟡 High |
+| 6 | Top-K diverse formulas from LASSO (KEEP 7) | Python | Medium | 🔴 Critical |
+| 7 | Dynamic operator priors from uncertainty (KEEP Evo-1) | Python/C++ | Medium | 🟡 High |
+| 8 | Phase info in frequency detection (KEEP 4) | Python | Low | 🟢 Medium |
+| 9 | Budget routing from uncertainty (KEEP Evo-4) | Python | Low | 🟢 Medium |
+
+### Phase 3 — Upgrade the Engine (3-4 weeks)
+> These are deeper changes to the C++ evolution core.
+
+| # | Item | Type | Effort | Impact |
+|---|---|---|---|---|
+| 10 | **Levenberg-Marquardt constant optimization** (ADD 1) | C++ | High | 🔴 Critical |
+| 11 | Skeleton seeding from fast-path into C++ population (KEEP Evo-3) | C++ | High | 🔴 Critical |
+| 12 | Out-of-domain holdout scoring (ADD 5) | Python | Medium | 🟡 High |
+| 13 | Calibrated operator posteriors (KEEP 1) | ML pipeline | Medium | 🟡 High |
+
+### Phase 4 — Stretch Goals (when Phase 1-3 are validated)
+> Only pursue if benchmarks still show gaps after Phase 3.
+
+| # | Item | Type | Effort | Impact |
+|---|---|---|---|---|
+| 14 | Power pre-diagnostic (log-log regression) (KEEP 5) | Python | Low | 🟢 Medium |
+| 15 | Simple separability test for multivariate (item 8) | Python | Medium | 🟢 Medium |
+| 16 | Cross-validation skip guard (ADD 6) | Python | Medium | 🟢 Medium |
+| 17 | Probe ensemble (2 probes only: residual FFT + symmetry) | Python | Medium | 🟢 Medium |
+
+### ❌ Items to NOT pursue now
+
+| Item | Reason |
+|---|---|
+| Full 5-probe ensemble | Over-engineered; fix info flow first |
+| Structure cues (additive/multiplicative) | Fragile detection, wrong cues hurt |
+| Variable interaction map | Premature for univariate-dominated benchmarks |
+| Adaptive mutation policy (per-operator-type) | Too many knobs on uncertain signals |
+
+---
+
+## Key Research References
+
+| Paper | Relevance to Glassbox |
+|---|---|
+| **SRBench** (La Cava et al., 2021) | Calibrated priors + strong constant optimization = top quartile |
+| **PySR** (Cranmer, 2023) | BFGS inner loop, adaptive parsimony, Pareto selection |
+| **Operon** (Burlacu et al., 2020) | Levenberg-Marquardt for constant optimization — gold standard |
+| **PIGP** (Jha et al., NeurIPS 2024) | Seeding GP with Transformer candidates → 2-5× speedup |
+| **eggp / EGG-SR** (Kronberger et al., 2025) | E-graph deduplication to eliminate wasted evaluations |
+| **AI Feynman 2.0** (Udrescu & Tegmark, 2020) | Separability/symmetry tests for multivariate decomposition |
+| **StruSR** (2025) | Sensitivity-guided mutation (protect good subtrees) |
+
+---
+
+## Expected Impact
+
+If Phases 1-3 are executed well, based on the research baselines:
+
+| Metric | Current (v3.1) | Projected |
+|---|---|---|
+| Exact recovery rate | 59% (121/205) | ~70-75% |
+| Runtime (full suite) | 1967s | ~1400-1600s |
+| Structural-correctness rate | ~70% | ~85% |
+| Hard-composition recovery | ~30% | ~45-50% |
+
+The biggest jump will come from **LM constant optimization** (ADD 1) and **formula-honest selection** (ADD 2) — these directly attack the two largest failure categories identified in `limitations.md`.

@@ -2311,7 +2311,49 @@ def beam_search_evolution(
                 p_min=float(config.get('p_min', -2.0)),
                 p_max=float(config.get('p_max', 3.0)),
             )
-            return (result['best_mse'], result, config)
+            raw_mse = result['best_mse']
+            formula_str = result.get('formula', '0')
+            
+            try:
+                import sympy as sp
+                from sympy.parsing.sympy_parser import parse_expr, standard_transformations, convert_xor, implicit_multiplication_application
+                try:
+                    from simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+                except ImportError:
+                    from scripts.simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+                
+                try:
+                    sp_expr = simplify_onn_formula(formula_str)[1]
+                except Exception:
+                    transformations = standard_transformations + (convert_xor, implicit_multiplication_application)
+                    snapped = snap_formula_floats(formula_str, SnapConfig(int_tol=1e-5, zero_tol=1e-8))
+                    sp_expr = parse_expr(snapped, transformations=transformations, evaluate=False)
+                
+                free_syms = list(sp_expr.free_symbols)
+                if not free_syms:
+                    y_pred = np.full_like(y_np, float(sp_expr))
+                else:
+                    func = sp.lambdify(free_syms[0], sp_expr, modules=['numpy'])
+                    y_pred = func(x_np)
+                
+                if np.isscalar(y_pred):
+                    y_pred = np.full_like(y_np, y_pred)
+                    
+                display_mse = float(np.mean((y_pred - y_np)**2))
+                if not np.isfinite(display_mse):
+                    display_mse = float('inf')
+                    
+            except Exception:
+                display_mse = raw_mse
+                
+            drift_penalty = abs(raw_mse - display_mse) / max(raw_mse, 1e-12)
+            result['raw_mse'] = raw_mse
+            result['display_mse'] = display_mse
+            result['drift_penalty'] = drift_penalty
+            
+            # Use display_mse as the primary ranking metric instead of raw_mse
+            result['best_mse'] = display_mse
+            return (display_mse, result, config)
         except Exception:
             return (float('inf'), None, config)
     
@@ -2444,7 +2486,12 @@ def beam_search_evolution(
         model = None
     
     print(f"\n  Best formula: {formula}")
-    print(f"  Best MSE: {best_overall_mse:.2e}")
+    print(f"  Best MSE: {best_overall_mse:.2e} (displayed formula)")
+    if 'raw_mse' in best_overall_result:
+        raw = best_overall_result['raw_mse']
+        drift = best_overall_result.get('drift_penalty', 0.0)
+        print(f"  Raw MSE: {raw:.2e} (engine internal)")
+        print(f"  Drift Penalty: {drift:.2f}")
     print(f"  Best config: {best_overall_config['label']}")
     print(f"  Total beam search time: {elapsed:.2f}s")
     print("="*60)

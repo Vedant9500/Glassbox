@@ -240,29 +240,25 @@ def model_size(formula_str):
 
 
 def evaluate_formula(formula_str, X):
-    """Evaluate a discovered formula string safely on X."""
+    """Evaluate a discovered formula string strictly on X.
+
+    Strict mode means no silent domain repairs (for example log(abs(x)))
+    and no coercion of invalid values to zero.
+    """
     if not formula_str:
-        return np.zeros(X.shape[0], dtype=np.float64)
+        return None
 
     formula = str(formula_str).strip()
     formula = re.sub(r'\|([^|]+)\|', r'abs(\1)', formula)
     formula = formula.replace('^', '**').replace('np.', '')
 
-    def _safe_log(x):
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            return np.where(np.abs(x) > 1e-300, np.log(np.abs(x) + 1e-300), -300.0)
-
-    def _safe_sqrt(x):
-        return np.sqrt(np.maximum(x, 0.0))
-
     context = {
         "np": np,
-        "log": _safe_log,
+        "log": np.log,
         "sin": np.sin,
         "cos": np.cos,
-        "exp": lambda x: np.exp(np.clip(x, -500, 500)),
-        "sqrt": _safe_sqrt,
+        "exp": np.exp,
+        "sqrt": np.sqrt,
         "abs": np.abs,
         "Abs": np.abs,
         "pi": np.pi,
@@ -274,16 +270,19 @@ def evaluate_formula(formula_str, X):
         context["x"] = X[:, 0]
 
     try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
+        with np.errstate(all="raise"):
             y_pred = eval(formula, {"__builtins__": None}, context)
         if isinstance(y_pred, (int, float)):
             y_pred = np.full(X.shape[0], y_pred, dtype=np.float64)
         else:
             y_pred = np.asarray(y_pred, dtype=np.float64)
-        return np.where(np.isfinite(y_pred), y_pred, 0.0)
+        if y_pred.shape[0] != X.shape[0]:
+            return None
+        if not np.all(np.isfinite(y_pred)):
+            return None
+        return y_pred
     except Exception:
-        return np.zeros(X.shape[0], dtype=np.float64)
+        return None
 
 
 def simplify_formula_with_guard(formula, X_ref, y_ref, mse_slack=0.02):
@@ -314,6 +313,8 @@ def simplify_formula_with_guard(formula, X_ref, y_ref, mse_slack=0.02):
 
     y_orig = evaluate_formula(formula, X_ref)
     y_simpl = evaluate_formula(simplified, X_ref)
+    if y_orig is None or y_simpl is None:
+        return formula
     mse_orig = mse_score(y_ref, y_orig)
     mse_simpl = mse_score(y_ref, y_simpl)
 
@@ -647,8 +648,8 @@ def run_track1_blackbox(
 
                 # If bloat-skip enabled, make evolution skip more aggressively on good fast-path results
                 if skip_evolution_if_bloated:
-                    est_params["evolution_skip_r2"] = 0.95
-                    est_params["use_guided_evolution"] = False
+                    est_params["skip_evolution_if_bloated"] = True
+                    est_params["bloat_term_threshold"] = 20
 
                 if hard_timeout:
                     run_result = run_with_hard_timeout(
@@ -681,6 +682,18 @@ def run_track1_blackbox(
                         formula = simplify_formula_with_guard(formula, X_train, y_train)
                     y_pred = evaluate_formula(formula, X_test)
                     elapsed = time.time() - t0
+
+                if y_pred is None:
+                    seed_runs.append({
+                        "seed": seed,
+                        "r2": None,
+                        "mse": None,
+                        "time": elapsed,
+                        "formula": formula,
+                        "model_size": model_size(formula),
+                        "error": "formula_eval_failed",
+                    })
+                    continue
 
                 r2 = r2_score(y_test, y_pred)
                 mse = mse_score(y_test, y_pred)
@@ -802,8 +815,8 @@ def run_track2_ground_truth(
 
                 # If bloat-skip enabled, make evolution skip more aggressively on good fast-path results
                 if skip_evolution_if_bloated:
-                    est_params["evolution_skip_r2"] = 0.95
-                    est_params["use_guided_evolution"] = False
+                    est_params["skip_evolution_if_bloated"] = True
+                    est_params["bloat_term_threshold"] = 20
 
                 if hard_timeout:
                     run_result = run_with_hard_timeout(
@@ -828,7 +841,6 @@ def run_track2_ground_truth(
                     formula = run_result.get("formula", "")
                     if post_simplify and formula:
                         formula = simplify_formula_with_guard(formula, X_train, y_train)
-                    y_pred_test = evaluate_formula(formula, X_test)
                     y_pred_all = evaluate_formula(formula, X)
                 else:
                     est_copy = est.__class__(**est_params)
@@ -836,9 +848,24 @@ def run_track2_ground_truth(
                     formula = est_copy.get_formula()
                     if post_simplify and formula:
                         formula = simplify_formula_with_guard(formula, X_train, y_train)
-                    y_pred_test = evaluate_formula(formula, X_test)
                     y_pred_all = evaluate_formula(formula, X)
                     elapsed = time.time() - t0
+
+                if y_pred_all is None:
+                    seed_runs.append({
+                        "seed": seed,
+                        "r2": None,
+                        "mse": None,
+                        "time": elapsed,
+                        "problem": name,
+                        "true_formula": true_formula,
+                        "discovered_formula": formula,
+                        "model_size": model_size(formula),
+                        "error": "formula_eval_failed",
+                    })
+                    continue
+
+                y_pred_test = y_pred_all[n_train:]
 
                 r2 = r2_score(y_test, y_pred_test)
                 mse = mse_score(y_test, y_pred_test)

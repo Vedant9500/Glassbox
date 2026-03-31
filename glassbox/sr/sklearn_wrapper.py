@@ -71,6 +71,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         min_compute_budget=10,
         max_compute_budget=300,
         device=None,
+        skip_evolution_if_bloated=False,
+        bloat_term_threshold=20,
     ):
         self.population_size = population_size
         self.generations = generations
@@ -97,6 +99,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.min_compute_budget = min_compute_budget
         self.max_compute_budget = max_compute_budget
         self.device = device
+        self.skip_evolution_if_bloated = skip_evolution_if_bloated
+        self.bloat_term_threshold = bloat_term_threshold
 
     def _estimate_compute_budget(self, X, current_r2, term_count):
         """Adaptive compute budget: easy problems get short runs, hard problems get longer runs."""
@@ -234,13 +238,23 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         #   - We haven't exceeded the timeout
         current_r2 = _r2_from_mse(best_mse) if best_formula else -1.0
         term_count = (best_formula.count('+') + best_formula.count('-')) if best_formula else 0
-        need_evolution = (
-            best_formula is None or
-            best_mse is None or
-            not math.isfinite(best_mse) or
-            current_r2 < self.evolution_skip_r2 or
-            term_count > 8
-        )
+
+        # Optional benchmark policy: if fast-path is very bloated, keep it as-is
+        # and avoid launching evolution search for this sample.
+        if (
+            self.skip_evolution_if_bloated
+            and best_formula is not None
+            and term_count > int(self.bloat_term_threshold)
+        ):
+            need_evolution = False
+        else:
+            need_evolution = (
+                best_formula is None or
+                best_mse is None or
+                not math.isfinite(best_mse) or
+                current_r2 < self.evolution_skip_r2 or
+                term_count > 8
+            )
 
         effective_timeout = self._estimate_compute_budget(X, current_r2, term_count)
 

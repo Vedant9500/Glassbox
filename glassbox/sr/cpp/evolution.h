@@ -42,6 +42,12 @@ struct EvolutionConfig {
     bool use_early_stop = true;
     double early_stop_mse = 1e-6;
     int early_stop_max_nodes = 8;  // Max graph nodes for early-stop eligibility
+
+    // Inner-parameter optimizer (nonlinear constants like p/omega/phi)
+    bool use_lm_inner_optimizer = true;
+    bool lm_fallback_to_adam = true;
+    int lm_max_iterations = 15;
+    double lm_lambda_init = 1e-2;
     int timeout_seconds = 120;
 
     // Pruning and rounding
@@ -641,6 +647,8 @@ private:
         config_.restart_fraction = std::clamp(config_.restart_fraction, 0.0, 0.8);
         config_.topology_phase_mutation_boost = std::max(1.0, config_.topology_phase_mutation_boost);
         config_.post_restart_mutation_boost = std::max(1.0, config_.post_restart_mutation_boost);
+        config_.lm_max_iterations = std::max(1, config_.lm_max_iterations);
+        config_.lm_lambda_init = std::max(1e-8, config_.lm_lambda_init);
     }
     
     // Sample a UnaryOp using classifier priors (if available) or uniform
@@ -1298,7 +1306,7 @@ private:
     // Alternates between: (1) Adam steps on {p, omega, phi},
     // then (2) SVD refit of output weights. This ensures linear weights
     // stay in sync with the refined inner parameters.
-    void refine_inner_params(IndividualGraph& ind) {
+    void refine_inner_params_adam(IndividualGraph& ind) {
         if (ind.nodes.empty()) return;
         int n_samples = static_cast<int>(y_.size());
         
@@ -1405,6 +1413,172 @@ private:
         if (best_snapshot.raw_mse < ind.raw_mse) {
             ind = best_snapshot;
         }
+    }
+
+    // ── Levenberg-Marquardt-style optimizer for inner nonlinear params ───
+    // Optimizes unary {p, omega, phi} while analytically refitting output
+    // weights for each trial point (variable projection style).
+    bool refine_inner_params_lm(IndividualGraph& ind) {
+        if (ind.nodes.empty()) return false;
+        const int n_samples = static_cast<int>(y_.size());
+        if (n_samples <= 0) return false;
+
+        // Active unary nodes only (same gating as Adam path)
+        std::vector<int> active_unary;
+        for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
+            if (ind.nodes[i].type == NodeType::Unary &&
+                std::abs(ind.output_weights[i]) > 1e-4) {
+                active_unary.push_back(i);
+            }
+        }
+        if (active_unary.empty()) return false;
+
+        const int n_params = static_cast<int>(active_unary.size()) * 3;
+        if (n_params <= 0) return false;
+
+        auto pack_params = [&](const IndividualGraph& g) {
+            Eigen::VectorXd theta(n_params);
+            for (int ai = 0; ai < static_cast<int>(active_unary.size()); ++ai) {
+                const auto& node = g.nodes[active_unary[ai]];
+                theta(ai * 3 + 0) = node.p;
+                theta(ai * 3 + 1) = node.omega;
+                theta(ai * 3 + 2) = node.phi;
+            }
+            return theta;
+        };
+
+        auto unpack_params = [&](IndividualGraph& g, const Eigen::VectorXd& theta) {
+            for (int ai = 0; ai < static_cast<int>(active_unary.size()); ++ai) {
+                auto& node = g.nodes[active_unary[ai]];
+                node.p = std::clamp(theta(ai * 3 + 0), config_.p_min, config_.p_max);
+                node.omega = std::clamp(theta(ai * 3 + 1), config_.omega_min, config_.omega_max);
+                node.phi = theta(ai * 3 + 2);
+            }
+        };
+
+        auto evaluate_residual = [&](IndividualGraph& g, Eigen::VectorXd* residual_out = nullptr) {
+            std::vector<Eigen::ArrayXd> cache;
+            evaluate_graph(g, X_, n_samples, cache);
+            if (!solve_output_weights(g, cache)) {
+                return std::numeric_limits<double>::infinity();
+            }
+
+            Eigen::ArrayXd pred = Eigen::ArrayXd::Constant(n_samples, g.output_bias);
+            for (size_t i = 0; i < g.output_weights.size() && i < cache.size(); ++i) {
+                if (std::abs(g.output_weights[i]) > 1e-12) pred += g.output_weights[i] * cache[i];
+            }
+
+            Eigen::ArrayXd residual = pred - y_;
+            double mse = residual.square().mean();
+            if (!std::isfinite(mse)) return std::numeric_limits<double>::infinity();
+
+            if (residual_out != nullptr) {
+                *residual_out = residual.matrix();
+            }
+            return mse;
+        };
+
+        // Initialize state from current graph
+        Eigen::VectorXd theta = pack_params(ind);
+        double lambda = config_.lm_lambda_init;
+        IndividualGraph best_snapshot = ind;
+        Eigen::VectorXd residual;
+        double best_mse = evaluate_residual(best_snapshot, &residual);
+        if (!std::isfinite(best_mse)) return false;
+
+        bool improved_any = false;
+        const double fd_eps = 1e-4;
+
+        for (int iter = 0; iter < config_.lm_max_iterations; ++iter) {
+            // Evaluate at current theta
+            IndividualGraph base_graph = best_snapshot;
+            unpack_params(base_graph, theta);
+            Eigen::VectorXd r;
+            double base_mse = evaluate_residual(base_graph, &r);
+            if (!std::isfinite(base_mse)) {
+                lambda *= 10.0;
+                continue;
+            }
+
+            // Numerical Jacobian of residuals wrt nonlinear params
+            Eigen::MatrixXd J(n_samples, n_params);
+            J.setZero();
+            for (int pidx = 0; pidx < n_params; ++pidx) {
+                Eigen::VectorXd t_plus = theta;
+                Eigen::VectorXd t_minus = theta;
+                t_plus(pidx) += fd_eps;
+                t_minus(pidx) -= fd_eps;
+
+                IndividualGraph g_plus = base_graph;
+                unpack_params(g_plus, t_plus);
+                Eigen::VectorXd r_plus;
+                double mse_plus = evaluate_residual(g_plus, &r_plus);
+
+                IndividualGraph g_minus = base_graph;
+                unpack_params(g_minus, t_minus);
+                Eigen::VectorXd r_minus;
+                double mse_minus = evaluate_residual(g_minus, &r_minus);
+
+                if (!std::isfinite(mse_plus) || !std::isfinite(mse_minus)) {
+                    J.col(pidx).setZero();
+                    continue;
+                }
+
+                J.col(pidx) = (r_plus - r_minus) / (2.0 * fd_eps);
+            }
+
+            Eigen::MatrixXd H = J.transpose() * J;
+            Eigen::VectorXd g = J.transpose() * r;
+
+            // LM damping
+            H.diagonal().array() += lambda;
+
+            Eigen::VectorXd delta = H.ldlt().solve(-g);
+            if (!delta.allFinite()) {
+                lambda *= 10.0;
+                continue;
+            }
+
+            if (delta.norm() < 1e-8) break;
+
+            // Trial step
+            Eigen::VectorXd theta_trial = theta + delta;
+            IndividualGraph trial_graph = base_graph;
+            unpack_params(trial_graph, theta_trial);
+            double trial_mse = evaluate_residual(trial_graph, nullptr);
+
+            if (std::isfinite(trial_mse) && trial_mse < base_mse) {
+                // Accept
+                theta = theta_trial;
+                best_snapshot = trial_graph;
+                best_mse = trial_mse;
+                improved_any = true;
+                lambda = std::max(1e-8, lambda * 0.5);
+                if (best_mse < 1e-12) break;
+            } else {
+                // Reject
+                lambda = std::min(1e6, lambda * 2.0);
+            }
+        }
+
+        if (improved_any && std::isfinite(best_mse)) {
+            evaluate_fitness_with_penalty(best_snapshot, X_, y_, n_samples);
+            ind = std::move(best_snapshot);
+            return true;
+        }
+        return false;
+    }
+
+    // Entry point: prefer LM-style optimizer, fallback to Adam if requested.
+    void refine_inner_params(IndividualGraph& ind) {
+        if (config_.use_lm_inner_optimizer) {
+            const bool lm_ok = refine_inner_params_lm(ind);
+            if (!lm_ok && config_.lm_fallback_to_adam) {
+                refine_inner_params_adam(ind);
+            }
+            return;
+        }
+        refine_inner_params_adam(ind);
     }
     
     // ── Post-Evolution Graph Cleanup ─────────────────────────────────────
