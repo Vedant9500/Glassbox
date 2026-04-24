@@ -150,3 +150,32 @@ def test_run_formula_triggers_guided_on_suspicious_residual(monkeypatch):
 
     assert guided_called["value"] is True
     assert result["formula_discovered"]
+
+
+def test_run_formula_passes_candidate_formulas(monkeypatch):
+    candidates = [
+        {"formula": "x", "mse": 0.0, "score": 0.0, "n_nonzero": 1, "active_terms": ["x"], "alpha": 0.0},
+        {"formula": "2*x", "mse": 0.1, "score": 0.101, "n_nonzero": 1, "active_terms": ["x"], "alpha": 0.1},
+    ]
+
+    def _fake_fast_path(*args, **kwargs):
+        return {
+            "formula": "x",
+            "mse": 0.0,
+            "details": {"n_nonzero": 1, "n_nonzero_simplified": 1},
+            "candidate_formulas": candidates,
+        }
+
+    monkeypatch.setattr(bs, "run_fast_path", _fake_fast_path)
+
+    result = bs.run_formula(
+        formula_str="x",
+        x_range=(-2.0, 2.0),
+        classifier_path="unused.pt",
+        n_samples=64,
+        device="cpu",
+        with_evolution=False,
+        evolution_only=False,
+    )
+
+    assert result["candidate_formulas"] == candidates

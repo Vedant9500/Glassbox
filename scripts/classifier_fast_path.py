@@ -1048,11 +1048,20 @@ def fast_path_regression(
         if exact_match:
             formula, mse, coeffs = exact_match
             print(f"  Found EXACT symbolic match: {formula} (MSE={mse:.2e})")
+            active_idx = np.flatnonzero(np.abs(coeffs) >= sparsity_threshold)
             return formula, mse, {
                 'coefficients': coeffs,
                 'basis_names': names,
                 'n_nonzero': sum(1 for c in coeffs if abs(c) >= sparsity_threshold),
                 'exact_match': True,
+                'candidate_formulas': [{
+                    'formula': formula,
+                    'mse': float(mse),
+                    'score': float(mse),
+                    'n_nonzero': int(np.sum(np.abs(coeffs) >= sparsity_threshold)),
+                    'active_terms': [names[i] for i in active_idx],
+                    'alpha': 0.0,
+                }],
             }
     elif exact_match_enabled:
         print(f"  Skipping exact-match search (basis={basis.shape[1]} > {exact_match_max_basis})")
@@ -1061,12 +1070,55 @@ def fast_path_regression(
     basis_std = np.std(basis, axis=0, keepdims=True)
     basis_std[basis_std < 1e-10] = 1.0
     basis_norm = basis / basis_std
+
+    def _coeffs_to_formula(coeffs_arr: np.ndarray) -> str:
+        terms_local = []
+        for name, coef in zip(names, coeffs_arr):
+            if abs(coef) < sparsity_threshold:
+                continue
+
+            if name == "1":
+                terms_local.append(get_constant_symbol(coef, threshold=0.05))
+            elif abs(coef - 1.0) < 0.01:
+                terms_local.append(name)
+            elif abs(coef + 1.0) < 0.01:
+                terms_local.append(f"-{name}")
+            elif abs(coef - round(coef)) < 0.01:
+                terms_local.append(f"{int(round(coef))}*{name}")
+            else:
+                coef_sym = get_constant_symbol(coef, threshold=0.05)
+                terms_local.append(f"{coef_sym}*{name}")
+        return _join_formula_terms(terms_local)
+
+    def _candidate_signature(coeffs_arr: np.ndarray) -> Tuple[int, ...]:
+        return tuple(np.flatnonzero(np.abs(coeffs_arr) >= sparsity_threshold).tolist())
+
+    def _update_candidate_pool(
+        pool: Dict[Tuple[int, ...], Dict[str, Any]],
+        coeffs_arr: np.ndarray,
+        mse_val: float,
+        alpha_val: float,
+    ) -> None:
+        if not np.isfinite(mse_val):
+            return
+        n_terms_local = int(np.sum(np.abs(coeffs_arr) >= sparsity_threshold))
+        score_local = float(mse_val + COMPLEXITY_PENALTY * n_terms_local)
+        signature = _candidate_signature(coeffs_arr)
+        current = pool.get(signature)
+        if current is None or score_local < current['score']:
+            pool[signature] = {
+                'coeffs': coeffs_arr.copy(),
+                'mse': float(mse_val),
+                'n_terms': n_terms_local,
+                'score': score_local,
+                'alpha': alpha_val,
+            }
     
     # Try LASSO with adaptive alpha (coordinate descent)
     best_coeffs = None
     best_mse = float('inf')
-    best_n_terms = float('inf')
     best_score = float('inf')  # Complexity-penalized score
+    candidate_pool: Dict[Tuple[int, ...], Dict[str, Any]] = {}
     
     # Complexity penalty: prefer simpler solutions
     COMPLEXITY_PENALTY = 0.001  # λ in: score = MSE + λ * n_terms
@@ -1102,6 +1154,8 @@ def fast_path_regression(
                 best_coeffs = coeffs
                 best_mse = mse
                 best_score = score
+
+            _update_candidate_pool(candidate_pool, coeffs, mse, alpha)
         except Exception as e:
             print(f"  Error with alpha={alpha}: {e}")
             continue
@@ -1112,59 +1166,71 @@ def fast_path_regression(
             best_coeffs, _, _, _ = np.linalg.lstsq(basis, y, rcond=None)
             y_pred = basis @ best_coeffs
             best_mse = np.mean((y - y_pred) ** 2)
+            best_score = best_mse + COMPLEXITY_PENALTY * np.sum(np.abs(best_coeffs) >= sparsity_threshold)
+            _update_candidate_pool(candidate_pool, best_coeffs, best_mse, alpha_val=-1.0)
         except np.linalg.LinAlgError:
             return None, float('inf'), {}
-    
-    # IMPORTANT: Refit with OLS on selected terms only (LASSO shrinks coefficients)
-    # This recovers exact coefficients while keeping the sparse structure
-    selected_mask = np.abs(best_coeffs) > sparsity_threshold
-    if selected_mask.sum() > 0 and selected_mask.sum() < len(best_coeffs):
+
+    # IMPORTANT: Refit each candidate with OLS on selected terms only.
+    # This recovers exact coefficients while preserving sparse structure.
+    for signature, candidate in list(candidate_pool.items()):
+        coeffs_local = candidate['coeffs']
+        selected_mask = np.abs(coeffs_local) >= sparsity_threshold
+        if selected_mask.sum() == 0 or selected_mask.sum() == len(coeffs_local):
+            continue
         basis_selected = basis[:, selected_mask]
         try:
             refit_coeffs, _, _, _ = np.linalg.lstsq(basis_selected, y, rcond=None)
             y_pred = basis_selected @ refit_coeffs
-            refit_mse = np.mean((y - y_pred) ** 2)
-            
-            # Use refit if it's better
-            if refit_mse <= best_mse + 0.001:  # Allow small tolerance
-                best_coeffs = np.zeros_like(best_coeffs)
-                best_coeffs[selected_mask] = refit_coeffs
-                best_mse = refit_mse
+            refit_mse = float(np.mean((y - y_pred) ** 2))
+
+            if refit_mse <= candidate['mse'] + 0.001:
+                updated = np.zeros_like(coeffs_local)
+                updated[selected_mask] = refit_coeffs
+                n_terms_local = int(np.sum(np.abs(updated) >= sparsity_threshold))
+                candidate_pool[signature] = {
+                    'coeffs': updated,
+                    'mse': refit_mse,
+                    'n_terms': n_terms_local,
+                    'score': refit_mse + COMPLEXITY_PENALTY * n_terms_local,
+                    'alpha': candidate.get('alpha', -1.0),
+                }
         except (np.linalg.LinAlgError, ValueError):
-            pass  # Keep LASSO solution
-    
-    coeffs = best_coeffs
-    mse = best_mse
-    
-    # Build formula string (sparse)
-    terms = []
-    for i, (name, coef) in enumerate(zip(names, coeffs)):
-        if abs(coef) < sparsity_threshold:
-            continue
-        
-        # Format coefficient nicely
-        if name == "1":
-            terms.append(get_constant_symbol(coef, threshold=0.05))
-        elif abs(coef - 1.0) < 0.01:
-            terms.append(name)
-        elif abs(coef + 1.0) < 0.01:
-            terms.append(f"-{name}")
-        elif abs(coef - round(coef)) < 0.01:
-            terms.append(f"{int(round(coef))}*{name}")
-        else:
-            coef_sym = get_constant_symbol(coef, threshold=0.05)
-            terms.append(f"{coef_sym}*{name}")
-    
-    formula = _join_formula_terms(terms)
-    
-    n_nonzero = sum(1 for c in coeffs if abs(c) >= sparsity_threshold)
+            pass
+
+    if not candidate_pool:
+        _update_candidate_pool(candidate_pool, best_coeffs, best_mse, alpha_val=-1.0)
+
+    sorted_candidates = sorted(candidate_pool.values(), key=lambda c: (c['score'], c['mse']))
+    top_candidates = sorted_candidates[:5]
+    best_candidate = top_candidates[0]
+
+    coeffs = best_candidate['coeffs']
+    mse = float(best_candidate['mse'])
+    formula = _coeffs_to_formula(coeffs)
+
+    n_nonzero = int(np.sum(np.abs(coeffs) >= sparsity_threshold))
     exact_match_flag = mse < 1e-6 and n_nonzero <= 4
+
+    candidate_formulas = []
+    for cand in top_candidates:
+        cand_coeffs = cand['coeffs']
+        active_idx = np.flatnonzero(np.abs(cand_coeffs) >= sparsity_threshold)
+        candidate_formulas.append({
+            'formula': _coeffs_to_formula(cand_coeffs),
+            'mse': float(cand['mse']),
+            'score': float(cand['score']),
+            'n_nonzero': int(cand['n_terms']),
+            'active_terms': [names[i] for i in active_idx],
+            'alpha': float(cand.get('alpha', -1.0)),
+        })
 
     return formula, mse, {
         'coefficients': coeffs,
         'basis_names': names,
         'n_nonzero': n_nonzero,
         'exact_match': exact_match_flag,
+        'candidate_formulas': candidate_formulas,
     }
 
 
@@ -1916,10 +1982,26 @@ def run_fast_path(
             'mse': 0.0,
             'time': elapsed,
             'details': {'n_nonzero': 1, 'exact_match': True,
-                        'basis_names': ['1'], 'coefficients': np.array([const_val])},
+                        'basis_names': ['1'], 'coefficients': np.array([const_val]),
+                        'candidate_formulas': [{
+                            'formula': formula,
+                            'mse': 0.0,
+                            'score': 0.0,
+                            'n_nonzero': 1,
+                            'active_terms': ['1'],
+                            'alpha': 0.0,
+                        }]},
             'predictions': {'identity': 1.0},
             'uncertainty': _prediction_uncertainty_metrics({'identity': 1.0}),
             'residual_diagnostics': residual_diagnostics,
+            'candidate_formulas': [{
+                'formula': formula,
+                'mse': 0.0,
+                'score': 0.0,
+                'n_nonzero': 1,
+                'active_terms': ['1'],
+                'alpha': 0.0,
+            }],
             'operator_hints': {'operators': set(), 'frequencies': [],
                                'powers': [], 'has_rational': False,
                                'has_exp_decay': False, 'active_terms': ['1']},
@@ -2056,6 +2138,7 @@ def run_fast_path(
         'predictions': predictions,
         'uncertainty': uncertainty_metrics,
         'residual_diagnostics': residual_diagnostics,
+        'candidate_formulas': details.get('candidate_formulas', []),
         'simplification': simplification_info,
         'operator_hints': operator_hints,
     }

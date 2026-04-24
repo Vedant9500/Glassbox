@@ -600,6 +600,7 @@ def run_formula(
         "n_terms": 0,
         "uncertainty": None,
         "residual_diagnostics": None,
+        "candidate_formulas": None,
         "mse_divergence_abs": None,
         "mse_divergence_rel": None,
         "mse_divergence_flag": False,
@@ -632,6 +633,14 @@ def run_formula(
                 if y_pred is not None
                 else None
             )
+            result["candidate_formulas"] = [{
+                "formula": formula,
+                "mse": 0.0,
+                "score": 0.0,
+                "n_nonzero": result["n_terms"],
+                "active_terms": ["1"],
+                "alpha": 0.0,
+            }]
             result["score"] = score_result(0.0, formula)
             return result
 
@@ -675,6 +684,7 @@ def run_formula(
                 result["mse"] = _select_score_mse(result["mse_display"])
                 result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
                 result["uncertainty"] = fp_result.get("uncertainty")
+                result["candidate_formulas"] = fp_result.get("candidate_formulas")
                 if result["formula_discovered"] and result["mse_display"] is None and result["error"] is None:
                     result["error"] = "formula_eval_failed"
                 result["time"] = elapsed
@@ -756,6 +766,7 @@ def run_formula(
                         result["mse"] = guided_mse_for_compare
                         result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
                         result["uncertainty"] = fp_result.get("uncertainty") if fp_result else None
+                        result["candidate_formulas"] = fp_result.get("candidate_formulas") if fp_result else None
                         if result["formula_discovered"] and result["mse_display"] is None:
                             result["error"] = "formula_eval_failed"
                         else:
