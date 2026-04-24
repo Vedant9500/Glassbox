@@ -10,6 +10,7 @@ This can reduce solve time from ~300s to <10s for well-predicted formulas.
 import re
 import math
 import threading
+from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import permutations
 import numpy as np
@@ -41,6 +42,58 @@ def _with_derived_predictions(predictions: Dict[str, float]) -> Dict[str, float]
     derived.setdefault('exponential', exponential_prob)
     derived.setdefault('polynomial', polynomial_prob)
     return derived
+
+
+def _prediction_uncertainty_metrics(predictions: Dict[str, float]) -> Dict[str, float | bool | None]:
+    """Summarize classifier confidence with entropy and top-1/top-2 margin."""
+    metrics: Dict[str, float | bool | None] = {
+        'prediction_entropy': None,
+        'prediction_margin': None,
+        'prediction_top1': None,
+        'prediction_top2': None,
+        'prediction_uncertain': False,
+    }
+
+    if not predictions:
+        return metrics
+
+    probs = np.asarray([float(p) for p in predictions.values() if np.isfinite(p) and p > 0.0], dtype=np.float64)
+    if probs.size == 0:
+        return metrics
+
+    total = float(np.sum(probs))
+    if total <= 0.0:
+        return metrics
+
+    probs = probs / total
+    sorted_probs = np.sort(probs)[::-1]
+    top1 = float(sorted_probs[0])
+    top2 = float(sorted_probs[1]) if sorted_probs.size > 1 else 0.0
+    if sorted_probs.size > 1:
+        entropy = float(-np.sum(sorted_probs * np.log(sorted_probs + 1e-12)) / np.log(sorted_probs.size))
+    else:
+        entropy = 0.0
+
+    margin = top1 - top2
+    metrics['prediction_entropy'] = entropy
+    metrics['prediction_margin'] = margin
+    metrics['prediction_top1'] = top1
+    metrics['prediction_top2'] = top2
+    metrics['prediction_uncertain'] = entropy > 0.8 or margin < 0.1
+    return metrics
+
+
+def _empty_residual_diagnostics() -> Dict[str, Any]:
+    return {
+        'residual_mse': None,
+        'residual_skewness': None,
+        'residual_excess_kurtosis': None,
+        'residual_spectral_peak_ratio': None,
+        'residual_holdout_edge_mse': None,
+        'residual_holdout_core_mse': None,
+        'residual_holdout_ratio': None,
+        'residual_suspicious': False,
+    }
 
 
 def _resolve_device(device: Optional[str] = None) -> torch.device:
@@ -88,6 +141,138 @@ def _format_affine_formula(base_expr: str, scale: float, offset: float) -> str:
 def _candidate_match_tolerance(y: np.ndarray) -> float:
     scale = max(float(np.var(y)), float(np.mean(y ** 2)), 1.0)
     return max(1e-10, 1e-8 * scale)
+
+
+def _evaluate_formula_values(formula: str, x_np: np.ndarray) -> Optional[np.ndarray]:
+    """Evaluate a formula string on numpy inputs using SymPy/lambdify."""
+    if not formula:
+        return None
+
+    normalized = normalize_formula_ascii(formula)
+    if not normalized or normalized in {"N/A", "ERROR", "?"}:
+        return None
+
+    try:
+        free_symbol_names, const_value, func = _compile_formula_evaluator(normalized)
+
+        if const_value is not None:
+            return np.full(x_np.shape[0], const_value, dtype=np.float64)
+
+        if x_np.ndim == 1:
+            x_columns = [x_np.reshape(-1)]
+        elif x_np.ndim == 2:
+            x_columns = [x_np[:, i] for i in range(x_np.shape[1])]
+        else:
+            return None
+
+        if len(free_symbol_names) > len(x_columns):
+            return None
+
+        y_pred = func(*x_columns[:len(free_symbol_names)])
+        y_arr = np.asarray(y_pred, dtype=np.float64)
+        if y_arr.shape == ():
+            y_arr = np.full(x_np.shape[0], float(y_arr), dtype=np.float64)
+        return y_arr.reshape(-1)
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=256)
+def _compile_formula_evaluator(normalized_formula: str) -> Tuple[Tuple[str, ...], Optional[float], Optional[Any]]:
+    import sympy as sp
+    from sympy.parsing.sympy_parser import (
+        convert_xor,
+        implicit_multiplication_application,
+        parse_expr,
+        standard_transformations,
+    )
+
+    transformations = standard_transformations + (convert_xor, implicit_multiplication_application)
+    expr = parse_expr(normalized_formula, transformations=transformations, evaluate=False)
+    free_syms = sorted(expr.free_symbols, key=lambda sym: sym.name)
+
+    if not free_syms:
+        return tuple(), float(expr), None
+
+    func = sp.lambdify(free_syms, expr, modules=["numpy"])
+    return tuple(sym.name for sym in free_syms), None, func
+
+
+def _residual_diagnostics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    x_np: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """Summarize residual structure for fast-path quality checks."""
+    diagnostics = _empty_residual_diagnostics()
+
+    try:
+        y_true_arr = np.asarray(y_true, dtype=np.float64).reshape(-1)
+        y_pred_arr = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+    except Exception:
+        return diagnostics
+
+    if y_true_arr.shape != y_pred_arr.shape:
+        return diagnostics
+
+    mask = np.isfinite(y_true_arr) & np.isfinite(y_pred_arr)
+    if mask.sum() < 10:
+        return diagnostics
+
+    y_true_valid = y_true_arr[mask]
+    y_pred_valid = y_pred_arr[mask]
+    residual = y_true_valid - y_pred_valid
+    diagnostics['residual_mse'] = float(np.mean(residual ** 2))
+
+    centered = residual - residual.mean()
+    std = float(np.std(centered))
+    if std > 1e-12:
+        z = centered / std
+        diagnostics['residual_skewness'] = float(np.mean(z ** 3))
+        diagnostics['residual_excess_kurtosis'] = float(np.mean(z ** 4) - 3.0)
+
+    if residual.size >= 8:
+        fft_vals = np.fft.rfft(centered)
+        magnitudes = np.abs(fft_vals[1:])
+        if magnitudes.size > 0:
+            peak = float(np.max(magnitudes))
+            median = float(np.median(magnitudes)) if np.any(magnitudes) else 0.0
+            diagnostics['residual_spectral_peak_ratio'] = peak / max(median, 1e-12)
+
+    if x_np is not None:
+        try:
+            x_arr = np.asarray(x_np)
+            if x_arr.ndim == 1 or (x_arr.ndim == 2 and x_arr.shape[1] == 1):
+                x_flat = x_arr.reshape(-1)
+                if x_flat.shape[0] != y_true_arr.shape[0]:
+                    return diagnostics
+                x_flat = x_flat[mask]
+                order = np.argsort(x_flat)
+                n_total = order.size
+                holdout_n = max(1, int(round(n_total * 0.1)))
+                if n_total >= 20 and 2 * holdout_n < n_total:
+                    edge_idx = np.concatenate([order[:holdout_n], order[-holdout_n:]])
+                    core_idx = order[holdout_n:-holdout_n]
+                    edge_mse = float(np.mean((y_true_valid[edge_idx] - y_pred_valid[edge_idx]) ** 2))
+                    core_mse = float(np.mean((y_true_valid[core_idx] - y_pred_valid[core_idx]) ** 2))
+                    diagnostics['residual_holdout_edge_mse'] = edge_mse
+                    diagnostics['residual_holdout_core_mse'] = core_mse
+                    diagnostics['residual_holdout_ratio'] = edge_mse / max(core_mse, 1e-12)
+        except Exception:
+            pass
+
+    suspicious = False
+    if diagnostics['residual_spectral_peak_ratio'] is not None:
+        suspicious = suspicious or diagnostics['residual_spectral_peak_ratio'] > 8.0
+    if diagnostics['residual_holdout_ratio'] is not None:
+        suspicious = suspicious or diagnostics['residual_holdout_ratio'] > 2.0
+    if diagnostics['residual_skewness'] is not None:
+        suspicious = suspicious or abs(diagnostics['residual_skewness']) > 1.0
+    if diagnostics['residual_excess_kurtosis'] is not None:
+        suspicious = suspicious or diagnostics['residual_excess_kurtosis'] > 3.0
+
+    diagnostics['residual_suspicious'] = suspicious
+    return diagnostics
 
 
 def _maybe_match_easy_multivariate_formula(
@@ -1724,6 +1909,8 @@ def run_fast_path(
         print(f"  Formula: {formula}")
         print("  MSE: 0.000000")
         print("="*60)
+        y_pred = np.full_like(y_np, const_val, dtype=np.float64)
+        residual_diagnostics = _residual_diagnostics(y_np, y_pred, x_np)
         return {
             'formula': formula,
             'mse': 0.0,
@@ -1731,6 +1918,8 @@ def run_fast_path(
             'details': {'n_nonzero': 1, 'exact_match': True,
                         'basis_names': ['1'], 'coefficients': np.array([const_val])},
             'predictions': {'identity': 1.0},
+            'uncertainty': _prediction_uncertainty_metrics({'identity': 1.0}),
+            'residual_diagnostics': residual_diagnostics,
             'operator_hints': {'operators': set(), 'frequencies': [],
                                'powers': [], 'has_rational': False,
                                'has_exp_decay': False, 'active_terms': ['1']},
@@ -1743,12 +1932,18 @@ def run_fast_path(
         threshold=0.3,
         device=device,
     )
+    uncertainty_metrics = _prediction_uncertainty_metrics(predictions or {})
     
     if not predictions:
         print("  No operators predicted - falling back to evolution")
         return None
     
     print(f"  Predictions: {[(k, f'{v:.2f}') for k, v in sorted(predictions.items(), key=lambda x: -x[1])]}")
+    print(
+        "  Uncertainty: "
+        f"entropy={uncertainty_metrics['prediction_entropy']}, "
+        f"margin={uncertainty_metrics['prediction_margin']}"
+    )
     
     # Check if fast path is applicable (lowered threshold to 0.6 for broader coverage)
     if not should_use_fast_path(predictions, confidence_threshold=0.6):
@@ -1833,10 +2028,18 @@ def run_fast_path(
     # Keep a post-processed term estimate while preserving structural sparsity count.
     final_term_count = max(1, len([t for t in re.split(r'\s*[+-]\s*', formula) if t.strip()])) if formula else 0
     details['n_nonzero_simplified'] = final_term_count
+    y_pred = _evaluate_formula_values(formula, x_np)
+    residual_diagnostics = _residual_diagnostics(y_np, y_pred, x_np) if y_pred is not None else _empty_residual_diagnostics()
     
     print(f"\n  Formula: {formula}")
     print(f"  MSE: {mse:.6f}")
     print(f"  Non-zero terms: {details.get('n_nonzero', 0)}")
+    if residual_diagnostics['residual_suspicious']:
+        print(
+            "  Residual diagnostics: suspicious structure "
+            f"(fft_peak_ratio={residual_diagnostics['residual_spectral_peak_ratio']}, "
+            f"holdout_ratio={residual_diagnostics['residual_holdout_ratio']})"
+        )
     print(f"  Time: {elapsed:.2f}s")
     print("="*60)
     
@@ -1851,6 +2054,8 @@ def run_fast_path(
         'time': elapsed,
         'details': details,
         'predictions': predictions,
+        'uncertainty': uncertainty_metrics,
+        'residual_diagnostics': residual_diagnostics,
         'simplification': simplification_info,
         'operator_hints': operator_hints,
     }

@@ -44,6 +44,7 @@ _REPO_ROOT = _SCRIPT_DIR.parent
 sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_SCRIPT_DIR))
 
+import classifier_fast_path as cfp  # noqa: E402
 from classifier_fast_path import run_fast_path, run_guided_evolution  # noqa: E402
 from glassbox.sr.evolution import detect_dominant_frequency  # noqa: E402
 
@@ -517,6 +518,51 @@ def score_result(mse: float, formula: str) -> str:
     return "FAIL"
 
 
+def _guided_evolution_decision(
+    *,
+    evolution_only: bool,
+    with_evolution: bool,
+    fp_result: Optional[Dict[str, Any]],
+    mse: Optional[float],
+    n_terms: int,
+) -> Tuple[bool, str]:
+    """Decide whether guided evolution should run and return a short reason."""
+    if evolution_only:
+        return True, "evolution_only"
+
+    if not with_evolution:
+        return False, "disabled"
+
+    if fp_result is None:
+        return True, "fast_path_not_applicable"
+
+    if mse is None or not math.isfinite(mse):
+        return True, "invalid_mse"
+
+    if mse >= 1e-6:
+        return True, "mse_above_exact"
+
+    if n_terms > 5:
+        return True, "formula_too_complex"
+
+    uncertainty = fp_result.get("uncertainty")
+    if isinstance(uncertainty, dict):
+        if uncertainty.get("prediction_uncertain") is True:
+            return True, "prediction_uncertain"
+        entropy = uncertainty.get("prediction_entropy")
+        margin = uncertainty.get("prediction_margin")
+        if entropy is not None and math.isfinite(float(entropy)) and float(entropy) > 0.85:
+            return True, "high_entropy"
+        if margin is not None and math.isfinite(float(margin)) and float(margin) < 0.1:
+            return True, "low_margin"
+
+    residual = fp_result.get("residual_diagnostics")
+    if isinstance(residual, dict) and residual.get("residual_suspicious") is True:
+        return True, "suspicious_residual"
+
+    return False, "fast_path_confident"
+
+
 SCORE_SYMBOLS = {
     "EXACT":  "✅",
     "APPROX": "🟡",
@@ -552,6 +598,8 @@ def run_formula(
         "score": "FAIL",
         "error": None,
         "n_terms": 0,
+        "uncertainty": None,
+        "residual_diagnostics": None,
         "mse_divergence_abs": None,
         "mse_divergence_rel": None,
         "mse_divergence_flag": False,
@@ -577,6 +625,13 @@ def run_formula(
             result["mse"] = 0.0
             result["time"] = 0.0
             result["n_terms"] = _count_terms(formula)
+            result["uncertainty"] = cfp._prediction_uncertainty_metrics({'identity': 1.0})
+            y_pred = cfp._evaluate_formula_values(formula, x_np)
+            result["residual_diagnostics"] = (
+                cfp._residual_diagnostics(y_np, y_pred, x_np)
+                if y_pred is not None
+                else None
+            )
             result["score"] = score_result(0.0, formula)
             return result
 
@@ -619,6 +674,7 @@ def run_formula(
                 result["mse_display"] = _evaluate_formula_mse(result["formula_discovered"], x_np, y_np)
                 result["mse"] = _select_score_mse(result["mse_display"])
                 result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
+                result["uncertainty"] = fp_result.get("uncertainty")
                 if result["formula_discovered"] and result["mse_display"] is None and result["error"] is None:
                     result["error"] = "formula_eval_failed"
                 result["time"] = elapsed
@@ -637,14 +693,12 @@ def run_formula(
         # -----------------------------------------------------------------
         # Guided Evolution (latest path with beam search)
         # -----------------------------------------------------------------
-        should_run_guided = evolution_only or (
-            with_evolution and (
-                fp_result is None or
-                result["mse"] is None or
-                not math.isfinite(result["mse"]) or
-                result["mse"] >= 1e-6 or
-                result["n_terms"] > 5
-            )
+        should_run_guided, guided_reason = _guided_evolution_decision(
+            evolution_only=evolution_only,
+            with_evolution=with_evolution,
+            fp_result=fp_result,
+            mse=result["mse"],
+            n_terms=result["n_terms"],
         )
 
         if should_run_guided:
@@ -653,7 +707,10 @@ def run_formula(
             elif fp_result is None:
                 print("\n  [Latest Path] Fast-path not applicable. Running guided evolution (beam search)...")
             else:
-                print(f"\n  [Latest Path] Fast-path candidate (MSE={result['mse']:.2e}). Running guided evolution (beam search)...")
+                print(
+                    f"\n  [Latest Path] Fast-path candidate (MSE={result['mse']:.2e}, reason={guided_reason}). "
+                    "Running guided evolution (beam search)..."
+                )
 
             # Build hints from fast-path output when available; otherwise,
             # use conservative defaults and FFT frequencies.
@@ -698,6 +755,7 @@ def run_formula(
                         result["mse_display"] = guided_mse_display
                         result["mse"] = guided_mse_for_compare
                         result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
+                        result["uncertainty"] = fp_result.get("uncertainty") if fp_result else None
                         if result["formula_discovered"] and result["mse_display"] is None:
                             result["error"] = "formula_eval_failed"
                         else:
@@ -715,6 +773,12 @@ def run_formula(
                 result["mse_display"] = _evaluate_formula_mse(result["formula_discovered"], x_np, y_np)
             result["mse"] = _select_score_mse(result["mse_display"])
             result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
+            y_pred = cfp._evaluate_formula_values(result["formula_discovered"], x_np)
+            result["residual_diagnostics"] = (
+                cfp._residual_diagnostics(y_np, y_pred, x_np)
+                if y_pred is not None
+                else None
+            )
             if result["formula_discovered"] and result["mse_display"] is None and result["error"] is None:
                 result["error"] = "formula_eval_failed"
 
@@ -751,6 +815,7 @@ def run_formula_cpp_evolution(
         "score": "FAIL",
         "error": None,
         "n_terms": 0,
+        "residual_diagnostics": None,
         "mse_divergence_abs": None,
         "mse_divergence_rel": None,
         "mse_divergence_flag": False,
@@ -782,6 +847,16 @@ def run_formula_cpp_evolution(
             result["mse"] = 0.0
             result["time"] = elapsed
             result["n_terms"] = 1
+            result["residual_diagnostics"] = {
+                "residual_mse": 0.0,
+                "residual_skewness": 0.0,
+                "residual_excess_kurtosis": 0.0,
+                "residual_spectral_peak_ratio": 0.0,
+                "residual_holdout_edge_mse": 0.0,
+                "residual_holdout_core_mse": 0.0,
+                "residual_holdout_ratio": 0.0,
+                "residual_suspicious": False,
+            }
             result["score"] = score_result(0.0, formula)
             return result
         
@@ -814,6 +889,12 @@ def run_formula_cpp_evolution(
         result["mse_display"] = _evaluate_formula_mse(result["formula_discovered"], x_np, y_np)
         result["mse"] = _select_score_mse(result["mse_display"])
         result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
+        y_pred = cfp._evaluate_formula_values(result["formula_discovered"], x_np)
+        result["residual_diagnostics"] = (
+            cfp._residual_diagnostics(y_np, y_pred, x_np)
+            if y_pred is not None
+            else None
+        )
         if result["formula_discovered"] and result["mse_display"] is None and result["error"] is None:
             result["error"] = "formula_eval_failed"
         result["time"] = elapsed
