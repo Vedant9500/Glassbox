@@ -96,6 +96,7 @@
 
 - [ ] **Enhance gradient-informed mutation**
   - Upgrade current gradient-informed mutation with subtree-level sensitivity masks
+  - Partially implemented: sensitivity-aware rate and noise scaling now protects high-gradient logits while mutating low-sensitivity ones more aggressively
   - Protect high-sensitivity subtrees; mutate low-sensitivity regions more aggressively
 
 - [ ] **Structure-preserving crossover/mutation**

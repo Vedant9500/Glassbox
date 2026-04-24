@@ -20,6 +20,16 @@ class _DummyModel(nn.Module):
         return torch.tensor(float("nan"), device=self.output_proj.weight.device)
 
 
+class _SensitivityDummyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.high_logit = nn.Parameter(torch.zeros(4))
+        self.low_logit = nn.Parameter(torch.zeros(4))
+
+    def forward(self, x, hard=True):
+        return torch.zeros(x.shape[0], 1, device=x.device), None
+
+
 def _make_trainer(nested_bfgs: bool) -> evo.EvolutionaryONNTrainer:
     trainer = evo.EvolutionaryONNTrainer(
         model_factory=_DummyModel,
@@ -73,3 +83,33 @@ def test_nonfinite_penalty_terms_do_not_poison_fitness(monkeypatch):
     trainer.evaluate_fitness(x, y, generation=0, total_generations=1)
 
     assert math.isfinite(trainer.population[0].fitness)
+
+
+def test_gradient_informed_mutation_protects_sensitive_logits(monkeypatch):
+    individual = evo.Individual(_SensitivityDummyModel())
+
+    monkeypatch.setattr(
+        evo,
+        "compute_param_sensitivity",
+        lambda model, x, y: {"high_logit": 10.0, "low_logit": 0.1},
+    )
+    monkeypatch.setattr(evo.random, "random", lambda: 0.0)
+    monkeypatch.setattr(evo.random, "randint", lambda a, b: 0)
+    monkeypatch.setattr(evo.torch, "randn_like", lambda tensor: torch.ones_like(tensor))
+
+    x = torch.linspace(-1.0, 1.0, 8).unsqueeze(-1)
+    y = torch.zeros(8)
+
+    mutant = evo.mutate_operations_gradient_informed(
+        individual,
+        x,
+        y,
+        mutation_rate=1.0,
+        sensitivity_bias=1.0,
+    )
+
+    high_delta = torch.sum(torch.abs(mutant.model.high_logit - individual.model.high_logit)).item()
+    low_delta = torch.sum(torch.abs(mutant.model.low_logit - individual.model.low_logit)).item()
+
+    assert high_delta == 0.0
+    assert low_delta > 0.0

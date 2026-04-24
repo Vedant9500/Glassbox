@@ -1778,6 +1778,47 @@ private:
         {
             evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
             double snap_baseline_mse = ind.raw_mse;
+
+            enum class SnapTier {
+                Integer,
+                Fraction,
+                Special,
+            };
+
+            auto snap_accept_ratio = [](SnapTier tier) -> double {
+                switch (tier) {
+                    case SnapTier::Integer:
+                        return 1.01;
+                    case SnapTier::Fraction:
+                        return 1.02;
+                    case SnapTier::Special:
+                        return 1.05;
+                }
+                return 1.02;
+            };
+
+            auto snap_accepts = [&](double baseline_mse, double candidate_mse, SnapTier tier) -> bool {
+                return candidate_mse < baseline_mse * snap_accept_ratio(tier) + 1e-8;
+            };
+
+            auto is_near = [](double a, double b) -> bool {
+                return std::abs(a - b) < 1e-9;
+            };
+
+            auto classify_p_tier = [&](double candidate) -> SnapTier {
+                return std::abs(candidate - std::round(candidate)) < 1e-9 ? SnapTier::Integer : SnapTier::Fraction;
+            };
+
+            auto classify_omega_tier = [&](double candidate) -> SnapTier {
+                if (is_near(candidate, M_PI) || is_near(candidate, 2.0 * M_PI) || is_near(candidate, M_PI / 2.0)) {
+                    return SnapTier::Special;
+                }
+                return std::abs(candidate - std::round(candidate)) < 1e-9 ? SnapTier::Integer : SnapTier::Fraction;
+            };
+
+            auto classify_phi_tier = [&](double candidate) -> SnapTier {
+                return std::abs(candidate - std::round(candidate)) < 1e-9 ? SnapTier::Integer : SnapTier::Special;
+            };
             
             // 6a. Inner parameter snapping (p, omega, phi)
             const double snap_candidates_p[] = {-2, -1.5, -1, -0.5, 0, 0.25, 1.0/3.0, 0.5, 2.0/3.0, 0.75, 1, 1.5, 2, 2.5, 3, 4, 5};
@@ -1813,7 +1854,7 @@ private:
                         solve_output_weights(ind, snap_cache);
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                         
-                        if (ind.raw_mse < best_snap_mse * 1.02 + 1e-8) {
+                        if (snap_accepts(best_snap_mse, ind.raw_mse, classify_p_tier(candidate))) {
                             best_snap_p = candidate;
                             best_snap_mse = ind.raw_mse;
                         }
@@ -1848,7 +1889,7 @@ private:
                         solve_output_weights(ind, snap_cache);
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                         
-                        if (ind.raw_mse < best_snap_mse * 1.02 + 1e-8) {
+                        if (snap_accepts(best_snap_mse, ind.raw_mse, classify_omega_tier(candidate))) {
                             best_snap_omega = candidate;
                             best_snap_mse = ind.raw_mse;
                         }
@@ -1861,7 +1902,7 @@ private:
                         solve_output_weights(ind, snap_cache);
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                         
-                        if (ind.raw_mse < best_snap_mse * 1.02 + 1e-8) {
+                        if (snap_accepts(best_snap_mse, ind.raw_mse, SnapTier::Integer)) {
                             best_snap_omega = nearest_int;
                             best_snap_mse = ind.raw_mse;
                         }
@@ -1891,7 +1932,7 @@ private:
                         solve_output_weights(ind, snap_cache);
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                         
-                        if (ind.raw_mse < best_snap_mse * 1.02 + 1e-8) {
+                        if (snap_accepts(best_snap_mse, ind.raw_mse, classify_phi_tier(candidate))) {
                             best_snap_phi = candidate;
                             best_snap_mse = ind.raw_mse;
                         }
@@ -1935,7 +1976,7 @@ private:
                     solve_output_weights(ind, snap_cache);
                     evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                     
-                    if (ind.raw_mse < best_snap_mse * 1.02 + 1e-8) {
+                    if (snap_accepts(best_snap_mse, ind.raw_mse, classify_omega_tier(candidate))) {
                         best_snap_omega = candidate;
                         best_snap_mse = ind.raw_mse;
                     }
@@ -1950,7 +1991,7 @@ private:
                     solve_output_weights(ind, snap_cache);
                     evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                     
-                    if (ind.raw_mse < best_snap_mse * 1.02 + 1e-8) {
+                    if (snap_accepts(best_snap_mse, ind.raw_mse, SnapTier::Integer)) {
                         best_snap_omega = nearest_int_e;
                         best_snap_mse = ind.raw_mse;
                     }

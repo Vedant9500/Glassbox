@@ -802,6 +802,36 @@ def compute_param_sensitivity(
     return sensitivities
 
 
+def normalize_param_sensitivities(sensitivities: Dict[str, float]) -> Dict[str, float]:
+    """Normalize raw sensitivities to [0, 1] for mutation scheduling."""
+    if not sensitivities:
+        return {}
+
+    max_sens = max(sensitivities.values())
+    if max_sens <= 0:
+        return {name: 0.0 for name in sensitivities}
+
+    return {name: min(1.0, max(0.0, value / max_sens)) for name, value in sensitivities.items()}
+
+
+def _mutation_profile_from_sensitivity(
+    sensitivity: float,
+    mutation_rate: float,
+    sensitivity_bias: float,
+) -> Tuple[float, float, bool]:
+    """Map sensitivity to mutation rate, noise scale, and freeze flag."""
+    sensitivity = min(1.0, max(0.0, sensitivity))
+
+    # High-sensitivity parameters should be protected aggressively.
+    adjusted_rate = mutation_rate * (1.0 - sensitivity_bias * sensitivity)
+    adjusted_rate = max(0.05 * mutation_rate, min(1.0, adjusted_rate))
+
+    # Low-sensitivity parameters may absorb stronger perturbations.
+    noise_scale = 0.5 * (1.0 + (1.0 - sensitivity) * sensitivity_bias)
+    freeze = sensitivity >= 0.85
+    return adjusted_rate, noise_scale, freeze
+
+
 def mutate_operations_gradient_informed(
     individual: Individual, 
     x: torch.Tensor, 
@@ -832,12 +862,7 @@ def mutate_operations_gradient_informed(
         # Fallback to regular mutation if gradient computation fails
         return mutate_operations_lamarckian(individual, mutation_rate)
     
-    # Normalize sensitivities to [0, 1]
-    max_sens = max(sensitivities.values()) if sensitivities.values() else 1.0
-    if max_sens > 0:
-        norm_sens = {k: v / max_sens for k, v in sensitivities.items()}
-    else:
-        norm_sens = sensitivities
+    norm_sens = normalize_param_sensitivities(sensitivities)
     
     mutant = individual.clone()
     
@@ -845,11 +870,15 @@ def mutate_operations_gradient_informed(
         for name, param in mutant.model.named_parameters():
             if 'logit' in name or 'selector' in name:
                 # Compute adjusted mutation rate
-                # Low sensitivity = higher mutation rate (not important)
-                # High sensitivity = lower mutation rate (important)
                 sens = norm_sens.get(name, 0.5)
-                adjusted_rate = mutation_rate * (1.0 + sensitivity_bias * (1.0 - sens))
-                adjusted_rate = min(adjusted_rate, 1.0)
+                adjusted_rate, noise_scale, freeze = _mutation_profile_from_sensitivity(
+                    sens,
+                    mutation_rate,
+                    sensitivity_bias,
+                )
+
+                if freeze:
+                    continue
                 
                 if random.random() < adjusted_rate:
                     if random.random() < 0.5:
@@ -857,7 +886,7 @@ def mutate_operations_gradient_informed(
                         new_choice = random.randint(0, param.numel() - 1)
                         param.view(-1)[new_choice] = 3.0
                     else:
-                        param.add_(torch.randn_like(param) * 0.5)
+                        param.add_(torch.randn_like(param) * noise_scale)
     
     mutant.refresh_structure_hash()
     return mutant
