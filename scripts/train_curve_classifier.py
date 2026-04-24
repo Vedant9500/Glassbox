@@ -318,6 +318,117 @@ def calibrate_temperature(logits: torch.Tensor, labels: torch.Tensor, max_iter: 
     return float(torch.exp(log_t).detach().cpu().item())
 
 
+def calibrate_isotonic_per_class(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    temperature: float | None = None,
+    n_bins: int = 20,
+) -> list[dict]:
+    """
+    Fit per-class isotonic regression calibration maps on validation data.
+
+    For each class c:
+      1. Compute raw probabilities p = sigmoid(logits_c / T) if T is given,
+         else p = sigmoid(logits_c).
+      2. Fit an isotonic regression (monotonically increasing step function)
+         mapping raw p → calibrated P(y=1|p).
+      3. Return a list of dicts, one per class, each containing:
+         - 'boundaries': sorted array of bin edges (length n_bins+1)
+         - 'values': calibrated probability for each bin (length n_bins)
+
+    This is more expressive than global temperature scaling because each
+    operator class gets its own calibration curve, handling the common
+    multi-label problem where rare classes are systematically under-confident
+    and common classes are over-confident.
+
+    Returns:
+        List of calibration dicts, or empty list if sklearn is unavailable.
+    """
+    try:
+        from sklearn.isotonic import IsotonicRegression
+    except ImportError:
+        print("  Warning: sklearn not available, skipping isotonic calibration.")
+        return []
+
+    n_classes = labels.shape[1]
+    calibration_maps = []
+
+    for c in range(n_classes):
+        if temperature is not None:
+            raw_probs = torch.sigmoid(logits[:, c] / temperature).numpy()
+        else:
+            raw_probs = torch.sigmoid(logits[:, c]).numpy()
+        true_labels = labels[:, c].numpy()
+
+        # Skip calibration if class has too few positive samples
+        n_pos = int(true_labels.sum())
+        n_neg = len(true_labels) - n_pos
+        if n_pos < 10 or n_neg < 10:
+            # Not enough data: use near-identity mapping at bin centers.
+            # Using centers avoids edge artifacts from step-bin lookup.
+            bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+            bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+            calibration_maps.append({
+                'boundaries': bin_edges.tolist(),
+                'values': bin_centers.tolist(),
+            })
+            continue
+
+        # Fit isotonic regression
+        ir = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='clip')
+        ir.fit(raw_probs, true_labels)
+
+        # Discretize into bins for compact storage in checkpoint
+        bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
+        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
+        calibrated_values = ir.predict(bin_centers)
+
+        calibration_maps.append({
+            'boundaries': bin_edges.tolist(),
+            'values': calibrated_values.tolist(),
+        })
+
+    return calibration_maps
+
+
+def apply_isotonic_calibration(
+    raw_probs: np.ndarray,
+    calibration_maps: list[dict],
+) -> np.ndarray:
+    """
+    Apply per-class isotonic calibration to raw probability outputs.
+
+    Args:
+        raw_probs: Array of shape (n_classes,) or (batch, n_classes) with raw sigmoid outputs.
+        calibration_maps: List of dicts from calibrate_isotonic_per_class().
+
+    Returns:
+        Calibrated probabilities, same shape as input.
+    """
+    if not calibration_maps:
+        return raw_probs
+
+    single = raw_probs.ndim == 1
+    if single:
+        raw_probs = raw_probs.reshape(1, -1)
+
+    calibrated = raw_probs.copy()
+    n_classes = raw_probs.shape[1]
+
+    for c in range(min(n_classes, len(calibration_maps))):
+        cmap = calibration_maps[c]
+        boundaries = np.array(cmap['boundaries'])
+        values = np.array(cmap['values'])
+        # np.digitize returns index i such that boundaries[i-1] <= x < boundaries[i]
+        indices = np.digitize(raw_probs[:, c], boundaries, right=False) - 1
+        indices = np.clip(indices, 0, len(values) - 1)
+        calibrated[:, c] = values[indices]
+
+    if single:
+        return calibrated[0]
+    return calibrated
+
+
 def tune_thresholds(all_preds: torch.Tensor, all_labels: torch.Tensor, steps: int = 19) -> torch.Tensor:
     """Tune per-class thresholds to maximize F1 on validation data."""
     thresholds = torch.full((all_labels.shape[1],), 0.5, dtype=torch.float32)
@@ -498,11 +609,27 @@ def train_model(
         checkpoint['temperature'] = temperature
         print(f"\nCalibrated temperature saved to checkpoint: {temperature:.4f}")
 
+    # Isotonic per-class calibration (more expressive than temperature scaling)
+    isotonic_maps = calibrate_isotonic_per_class(
+        val_metrics['logits'],
+        val_metrics['labels'],
+        temperature=temperature,
+    )
+    if isotonic_maps:
+        checkpoint['isotonic_calibration'] = isotonic_maps
+        print(f"Per-class isotonic calibration maps saved ({len(isotonic_maps)} classes)")
+
     # Threshold tuning (optionally on calibrated probabilities)
     if tune_thresholds_flag:
         preds_for_tuning = val_metrics['preds']
         if temperature is not None:
             preds_for_tuning = torch.sigmoid(val_metrics['logits'] / temperature)
+        if isotonic_maps:
+            calibrated_np = apply_isotonic_calibration(
+                preds_for_tuning.detach().cpu().numpy(),
+                isotonic_maps,
+            )
+            preds_for_tuning = torch.from_numpy(calibrated_np).to(preds_for_tuning.dtype)
         thresholds = tune_thresholds(preds_for_tuning, val_metrics['labels'])
         checkpoint['thresholds'] = thresholds.numpy()
         print("\nTuned per-class thresholds saved to checkpoint")

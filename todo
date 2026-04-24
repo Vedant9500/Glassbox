@@ -192,7 +192,7 @@ These are improvements not in the `todo` but backed by research and codebase ana
 ---
 
 ### ➕ ADD 1: Upgrade constant optimization from finite-difference Adam to Levenberg-Marquardt
-**Priority: 🔴 CRITICAL**
+**Priority: 🔴 CRITICAL** ✅ DONE
 
 This is the **single most impactful change not in the todo**.
 
@@ -210,7 +210,7 @@ The SOTA (Operon, PySR/SymbolicRegression.jl) uses **Levenberg-Marquardt** for c
 ---
 
 ### ➕ ADD 2: Formula-honest final selection (displayed-formula MSE)
-**Priority: 🔴 CRITICAL**
+**Priority: 🔴 CRITICAL** ✅ DONE
 
 This is already in `limitations.md` item 1 (line 53-55) but conspicuously absent from the `todo`. The soft-to-hard operator mismatch means the C++ engine's `raw_mse` (computed with soft arithmetic blends) can be much lower than the MSE of the *displayed formula* (computed with discrete operators).
 

@@ -186,6 +186,7 @@ def _load_xgboost_classifier(model_path: Path, cache_key: str):
         'feature_scaler': payload.get('feature_scaler'),
         'type': 'xgboost',
         'operator_classes': operator_classes,
+        'isotonic_calibration': payload.get('isotonic_calibration'),
     }
     
     print(f"Loaded XGBoost curve classifier from {model_path}")
@@ -257,6 +258,7 @@ def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, ca
         'type': 'pytorch',
         'model_type': model_type,
         'operator_classes': operator_classes,
+        'isotonic_calibration': checkpoint.get('isotonic_calibration'),
     }
     print(f"Loaded PyTorch curve classifier from {model_path}")
     if 'val_acc' in checkpoint:
@@ -270,8 +272,8 @@ def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, ca
 # PREDICTION
 # =============================================================================
 
-def _predict_xgboost(model_dict: dict, features: np.ndarray) -> np.ndarray:
-    """Predict using XGBoost models."""
+def _predict_xgboost(model_dict: dict, features: np.ndarray, metadata: dict | None = None) -> np.ndarray:
+    """Predict using XGBoost models, with optional isotonic calibration."""
     models = model_dict['models']
     n_classes = len(models)
     probs = np.zeros(n_classes, dtype=np.float32)
@@ -284,11 +286,15 @@ def _predict_xgboost(model_dict: dict, features: np.ndarray) -> np.ndarray:
         else:
             probs[i] = m.predict_proba(features_2d)[0, 1]
     
+    # Apply per-class isotonic calibration if available
+    if metadata and metadata.get('isotonic_calibration'):
+        probs = _apply_isotonic_calibration(probs, metadata['isotonic_calibration'])
+    
     return probs
 
 
 def _predict_pytorch(model: nn.Module, features: np.ndarray, metadata: dict, device: torch.device) -> np.ndarray:
-    """Predict using PyTorch model."""
+    """Predict using PyTorch model, with optional isotonic calibration."""
     features_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
     
     with torch.no_grad():
@@ -298,7 +304,44 @@ def _predict_pytorch(model: nn.Module, features: np.ndarray, metadata: dict, dev
             logits = logits / float(temperature)
         probs = torch.sigmoid(logits).detach().cpu().numpy()
     
+    # Apply per-class isotonic calibration if available
+    isotonic_maps = metadata.get('isotonic_calibration')
+    if isotonic_maps:
+        probs = _apply_isotonic_calibration(probs, isotonic_maps)
+    
     return probs
+
+
+def _apply_isotonic_calibration(
+    raw_probs: np.ndarray,
+    calibration_maps: list,
+) -> np.ndarray:
+    """Apply per-class isotonic regression calibration to raw probabilities.
+    
+    Each calibration map is a dict with 'boundaries' (bin edges) and 'values'
+    (calibrated probability for each bin). Uses np.digitize for fast lookup.
+    """
+    if not calibration_maps:
+        return raw_probs
+    
+    single = raw_probs.ndim == 1
+    if single:
+        raw_probs = raw_probs.reshape(1, -1)
+    
+    calibrated = raw_probs.copy()
+    n_classes = raw_probs.shape[1]
+    
+    for c in range(min(n_classes, len(calibration_maps))):
+        cmap = calibration_maps[c]
+        boundaries = np.array(cmap['boundaries'])
+        values = np.array(cmap['values'])
+        indices = np.digitize(raw_probs[:, c], boundaries, right=False) - 1
+        indices = np.clip(indices, 0, len(values) - 1)
+        calibrated[:, c] = values[indices]
+    
+    if single:
+        return calibrated[0]
+    return calibrated
 
 
 def predict_operators(
@@ -366,7 +409,7 @@ def predict_operators(
     
     # Check if this is XGBoost or PyTorch model
     if metadata.get('type') == 'xgboost':
-        probs = _predict_xgboost(model, features)
+        probs = _predict_xgboost(model, features, metadata)
     else:
         probs = _predict_pytorch(model, features, metadata, resolved_device)
     
@@ -473,7 +516,7 @@ def _predict_operators_multi_input(
                 features = (features - scaler['mean']) / (scaler['std'] + 1e-8)
             
             if metadata.get('type') == 'xgboost':
-                probs = _predict_xgboost(model, features)
+                probs = _predict_xgboost(model, features, metadata)
             else:
                 probs = _predict_pytorch(model, features, metadata, device)
             
