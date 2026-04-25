@@ -179,3 +179,27 @@ def test_run_formula_passes_candidate_formulas(monkeypatch):
     )
 
     assert result["candidate_formulas"] == candidates
+
+
+def test_classifier_prior_trust_from_uncertainty_extremes():
+    high_trust = cfp._classifier_prior_trust_from_uncertainty(
+        {"prediction_entropy": 0.05, "prediction_margin": 0.45, "prediction_uncertain": False}
+    )
+    low_trust = cfp._classifier_prior_trust_from_uncertainty(
+        {"prediction_entropy": 0.99, "prediction_margin": 0.0, "prediction_uncertain": True}
+    )
+
+    assert 0.0 <= low_trust <= high_trust <= 1.0
+    assert high_trust > 0.8
+    assert low_trust < 0.2
+
+
+def test_blend_priors_with_uniform_respects_trust():
+    base = [0.7, 0.2, 0.08, 0.02]
+    almost_uniform = cfp._blend_priors_with_uniform(base, trust=0.0)
+    almost_base = cfp._blend_priors_with_uniform(base, trust=1.0)
+
+    assert abs(sum(almost_uniform) - 1.0) < 1e-12
+    assert abs(sum(almost_base) - 1.0) < 1e-12
+    assert max(abs(v - 0.25) for v in almost_uniform) < 1e-12
+    assert max(abs(v - e) for v, e in zip(almost_base, cfp._normalize_priors(base))) < 1e-12

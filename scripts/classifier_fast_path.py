@@ -96,6 +96,56 @@ def _empty_residual_diagnostics() -> Dict[str, Any]:
     }
 
 
+def _normalize_priors(priors: List[float]) -> List[float]:
+    cleaned = [max(0.0, float(p)) for p in priors]
+    total = sum(cleaned)
+    if total <= 0.0:
+        return [0.25, 0.25, 0.25, 0.25]
+    return [p / total for p in cleaned]
+
+
+def _classifier_prior_trust_from_uncertainty(uncertainty: Optional[Dict[str, Any]]) -> float:
+    """Map uncertainty diagnostics to trust in classifier-guided priors in [0, 1]."""
+    if not isinstance(uncertainty, dict):
+        return 1.0
+
+    entropy = uncertainty.get('prediction_entropy')
+    margin = uncertainty.get('prediction_margin')
+    uncertain_flag = bool(uncertainty.get('prediction_uncertain', False))
+
+    trust_entropy = 1.0
+    if entropy is not None:
+        try:
+            ent = float(entropy)
+            if np.isfinite(ent):
+                trust_entropy = float(np.clip(1.0 - ent, 0.0, 1.0))
+        except Exception:
+            trust_entropy = 1.0
+
+    trust_margin = 1.0
+    if margin is not None:
+        try:
+            mar = float(margin)
+            if np.isfinite(mar):
+                trust_margin = float(np.clip(mar / 0.35, 0.0, 1.0))
+        except Exception:
+            trust_margin = 1.0
+
+    trust = min(trust_entropy, trust_margin)
+    if uncertain_flag:
+        trust *= 0.5
+
+    return float(np.clip(trust, 0.0, 1.0))
+
+
+def _blend_priors_with_uniform(base_priors: List[float], trust: float) -> List[float]:
+    base = _normalize_priors(base_priors)
+    t = float(np.clip(trust, 0.0, 1.0))
+    uniform = [0.25, 0.25, 0.25, 0.25]
+    blended = [t * b + (1.0 - t) * u for b, u in zip(base, uniform)]
+    return _normalize_priors(blended)
+
+
 def _resolve_device(device: Optional[str] = None) -> torch.device:
     """Resolve device string to torch.device, with thread-safe CUDA fallback warning."""
     global _warned_no_cuda
@@ -2474,14 +2524,14 @@ def beam_search_evolution(
     
     # Build classifier-guided op_priors base
     # Op order: [Periodic, Power, Exp, Log]
-    classifier_priors = [
+    classifier_priors_raw = [
         0.6 if has_sin else 0.1,
         0.6 if has_power else 0.1,
         0.4 if has_exp else 0.05,
         0.2 if has_log else 0.05,
     ]
-    total = sum(classifier_priors)
-    classifier_priors = [p / total for p in classifier_priors]
+    prior_trust = _classifier_prior_trust_from_uncertainty(operator_hints.get('uncertainty'))
+    classifier_priors = _blend_priors_with_uniform(classifier_priors_raw, prior_trust)
     
     # Build diverse frequency sets
     fft_freqs = frequencies[:3] if frequencies else []
@@ -2690,6 +2740,7 @@ def beam_search_evolution(
     print(f"  Rounds: {n_rounds}")
     print(f"  Keep fraction: {keep_fraction}")
     print(f"  Base config: pop={base_pop_size}, gens={base_generations}")
+    print(f"  Classifier prior trust: {prior_trust:.2f}")
     print(f"  Power bounds: [{adaptive_p_min:.1f}, {adaptive_p_max:.1f}]")
     if polynomial_mode:
         print(

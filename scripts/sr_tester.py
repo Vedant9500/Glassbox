@@ -720,6 +720,7 @@ def run_single_mode(config: Config):
         operator_hints['has_rational'] = bool(operator_hints.get('has_rational', False))
         operator_hints['has_exp_decay'] = bool(operator_hints.get('has_exp_decay', False))
         operator_hints['active_terms'] = list(operator_hints.get('active_terms', []))
+        operator_hints['uncertainty'] = fast_path_result.get('uncertainty') if fast_path_result else None
 
         # Respect explicit operator constraints for guided evolution priors.
         ops = operator_hints['operators']

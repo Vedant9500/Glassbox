@@ -2,6 +2,31 @@
 
 > **Context**: This reviews the `todo` file proposing a "Fast Path Intelligence Packet" (FPIP) to bridge the classifier fast-path with guided evolution. Each item is evaluated against (1) the current Glassbox codebase, (2) the known failure modes in `limitations.md`, and (3) the 2024–2025 SR research landscape.
 
+## Progress Snapshot (2026-04-25)
+
+### Completed in this implementation cycle
+
+- [x] Uncertainty metrics in FPIP output (entropy, margin, uncertain flag) are implemented and passed through benchmark outputs.
+- [x] Residual diagnostics are implemented and recomputed on final selected formulas in benchmark outputs.
+- [x] Dynamic guided-evolution routing from uncertainty/residual risk is implemented.
+- [x] Top-K diverse candidate formulas are retained from fast-path regression and passed through benchmark outputs.
+- [x] Dynamic operator priors now blend classifier priors toward uniform based on uncertainty trust in beam search.
+- [x] Completed A/B benchmark artifact is stored in OpenLMLib (finding id: fnd-88097158a3a0).
+
+### Completed earlier in this roadmap
+
+- [x] Formula-honest final selection using displayed-formula MSE in beam search.
+- [x] Tighter staged snapping thresholds in C++ cleanup/simplification.
+- [x] Gradient-informed mutation sensitivity protection (Phase 2A partial implementation).
+
+### Remaining high-priority work
+
+- [ ] Calibrated operator posteriors (isotonic/temperature mapping persisted with classifier artifacts).
+- [ ] Phase information in FFT evidence and harmonic-consistency metadata.
+- [ ] Budget routing coupled to uncertainty (avoid expensive guided escalation on already-certain exact fast-path hits).
+- [ ] Targeted initialization from top-K fast-path candidates into evolution seeds.
+- [ ] Out-of-domain holdout scoring for fast-path fit quality.
+
 ---
 
 ## Summary Verdict

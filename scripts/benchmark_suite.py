@@ -732,6 +732,7 @@ def run_formula(
             operator_hints["has_rational"] = bool(operator_hints.get("has_rational", False))
             operator_hints["has_exp_decay"] = bool(operator_hints.get("has_exp_decay", False))
             operator_hints["active_terms"] = list(operator_hints.get("active_terms", []))
+            operator_hints["uncertainty"] = fp_result.get("uncertainty") if fp_result else None
 
             t1 = time.time()
             try:
