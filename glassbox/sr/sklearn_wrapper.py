@@ -102,8 +102,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.skip_evolution_if_bloated = skip_evolution_if_bloated
         self.bloat_term_threshold = bloat_term_threshold
 
-    def _estimate_compute_budget(self, X, current_r2, term_count):
-        """Adaptive compute budget: easy problems get short runs, hard problems get longer runs."""
+    def _estimate_compute_budget(self, X, current_r2, term_count, uncertainty=None):
+        """Adaptive compute budget: easy problems get short runs, hard problems get longer runs.
+
+        When *uncertainty* (from the fast-path FPIP) is supplied the budget
+        is further scaled:
+        - Low entropy + high margin → the classifier is confident, reduce budget.
+        - High entropy + low margin → uncertain, give evolution more time.
+        - Exact fast-path hit with low uncertainty → minimal budget.
+        """
         base_timeout = float(max(1, self.timeout))
         if not self.adaptive_compute_budget:
             return base_timeout
@@ -124,6 +131,30 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             score *= 0.9
         else:
             score *= 2.5
+
+        # ── Uncertainty-coupled budget routing ──
+        # If classifier uncertainty metrics are available, scale budget:
+        # certain classifier + strong R² → avoid expensive guided escalation.
+        if isinstance(uncertainty, dict):
+            entropy = uncertainty.get('prediction_entropy')
+            margin = uncertainty.get('prediction_margin')
+            uncertain_flag = bool(uncertainty.get('prediction_uncertain', False))
+
+            if not uncertain_flag and entropy is not None and margin is not None:
+                try:
+                    ent = float(entropy)
+                    mar = float(margin)
+                    if np.isfinite(ent) and np.isfinite(mar):
+                        # High confidence (low entropy, high margin) → shrink budget
+                        confidence = float(np.clip((1.0 - ent) * min(mar / 0.25, 1.0), 0.0, 1.0))
+                        # Map confidence ∈ [0,1] to multiplier ∈ [0.3, 1.0]
+                        uncertainty_scale = 1.0 - 0.7 * confidence
+                        score *= uncertainty_scale
+                except (TypeError, ValueError):
+                    pass
+            elif uncertain_flag:
+                # Uncertain → give more time
+                score *= 1.3
 
         budget = base_timeout * score
         return float(np.clip(budget, float(self.min_compute_budget), float(self.max_compute_budget)))
@@ -157,15 +188,23 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return formula
 
     def _detect_frequencies(self, X, y):
-        """Detect dominant frequencies via FFT."""
+        """Detect dominant frequencies via FFT, with optional phase info."""
         try:
             x_t = torch.tensor(X[:, 0], dtype=torch.float32).reshape(-1, 1)
             y_t = torch.tensor(y, dtype=torch.float32).reshape(-1, 1)
-            omegas = detect_dominant_frequency(x_t, y_t, n_frequencies=3)
+
+            # Get rich phase info for the fast-path pipeline
+            phase_info = detect_dominant_frequency(
+                x_t, y_t, n_frequencies=3, return_phase_info=True,
+            )
+            self._fft_phase_info = phase_info  # stash for later use
+
+            omegas = phase_info.get('omegas', [1.0])
             if omegas and omegas[0] == 1.0:
                 return []
             return omegas or []
         except Exception:
+            self._fft_phase_info = None
             return []
 
     def fit(self, X, y):
@@ -228,7 +267,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     best_formula = fp_result['formula']
                     best_mse = fp_result.get('mse', float('inf'))
                     operator_hints = fp_result.get('operator_hints', {})
+                    # Stash for uncertainty-coupled budget routing and candidate seeding
+                    self._fp_result = fp_result
             except Exception as e:
+                self._fp_result = None
                 print(f"  [Fast-path skipped: {e}]")
 
         # ── Stage 2: C++ Evolution ──
@@ -256,7 +298,12 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 term_count > 8
             )
 
-        effective_timeout = self._estimate_compute_budget(X, current_r2, term_count)
+        # Uncertainty-coupled budget routing: pass FPIP uncertainty metrics
+        _fp_uncertainty = None
+        _fp = getattr(self, '_fp_result', None)
+        if isinstance(_fp, dict):
+            _fp_uncertainty = _fp.get('uncertainty')
+        effective_timeout = self._estimate_compute_budget(X, current_r2, term_count, uncertainty=_fp_uncertainty)
 
         if need_evolution and _elapsed() < effective_timeout:
             if not CPP_AVAILABLE:

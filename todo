@@ -21,11 +21,11 @@
 
 ### Remaining high-priority work
 
-- [ ] Calibrated operator posteriors (isotonic/temperature mapping persisted with classifier artifacts).
-- [ ] Phase information in FFT evidence and harmonic-consistency metadata.
-- [ ] Budget routing coupled to uncertainty (avoid expensive guided escalation on already-certain exact fast-path hits).
-- [ ] Targeted initialization from top-K fast-path candidates into evolution seeds.
-- [ ] Out-of-domain holdout scoring for fast-path fit quality.
+- [x] Calibrated operator posteriors (isotonic/temperature mapping persisted with classifier artifacts). — Infrastructure already in place: `calibrate_classifier.py`, `_apply_isotonic_calibration()` wired in both PyTorch and XGBoost prediction paths.
+- [x] Phase information in FFT evidence and harmonic-consistency metadata. — `detect_dominant_frequency(return_phase_info=True)` now returns phases + harmonic series detection; used in sklearn_wrapper.
+- [x] Budget routing coupled to uncertainty (avoid expensive guided escalation on already-certain exact fast-path hits). — `_estimate_compute_budget()` now accepts uncertainty dict; scales budget ×0.3–1.0 based on entropy/margin.
+- [x] Targeted initialization from top-K fast-path candidates into evolution seeds. — `beam_search_evolution()` accepts `candidate_formulas` and injects them as elite seed configs in the first round.
+- [x] Out-of-domain holdout scoring for fast-path fit quality. — `fast_path_regression(holdout_fraction=0.10)` holds back domain edges before fitting, reports holdout_mse, and penalizes overfitted candidates.
 
 ---
 

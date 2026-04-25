@@ -1031,11 +1031,13 @@ def fast_path_regression(
     exact_match_enabled: bool = True,
     exact_match_max_basis: int = 150,
     max_power: int = 6,
+    holdout_fraction: float = 0.10,
 ) -> Tuple[str, float, Dict]:
     """
     Directly solve for coefficients using least squares regression.
     
     IMPROVED: First searches for exact symbolic matches before LASSO.
+    Supports out-of-domain holdout scoring for generalization assessment.
     
     Args:
         x: Input values (N,)
@@ -1043,15 +1045,49 @@ def fast_path_regression(
         predictions: Classifier predictions
         detected_omegas: FFT-detected frequencies
         sparsity_threshold: Coefficients below this are zeroed
+        holdout_fraction: Fraction of domain-edge points held out
+            for out-of-domain scoring (default 0.10, i.e. 5% each
+            from the lowest and highest x-values). Set to 0 to disable.
         
     Returns:
         formula: String representation
         mse: Mean squared error
-        details: Dict with coefficients and basis names
+        details: Dict with coefficients, basis names, and holdout_mse
     """
     if x.ndim > 2:
         raise ValueError(f"Expected x to be 1D or 2D, got shape {x.shape}")
     y = y.flatten()
+
+    # ── Out-of-domain holdout: hold back domain-edge points ──
+    holdout_mask = None
+    x_fit, y_fit = x, y  # default: fit on everything
+    x_holdout, y_holdout = None, None
+
+    if holdout_fraction > 0 and x.ndim <= 2:
+        n = len(y)
+        n_edge = max(1, int(n * holdout_fraction / 2))
+        if x.ndim == 2 and x.shape[1] > 1:
+            # Multi-input: hold out based on L2 norm from center
+            x_center = x.mean(axis=0)
+            dists = np.linalg.norm(x - x_center, axis=1)
+            order = np.argsort(dists)
+            holdout_indices = np.concatenate([order[-n_edge:]])
+        else:
+            x_flat = x.ravel() if x.ndim == 1 else x[:, 0]
+            order = np.argsort(x_flat)
+            holdout_indices = np.concatenate([order[:n_edge], order[-n_edge:]])
+
+        holdout_mask = np.zeros(n, dtype=bool)
+        holdout_mask[holdout_indices] = True
+        fit_mask = ~holdout_mask
+
+        if fit_mask.sum() >= 10:  # need enough points to fit
+            x_fit = x[fit_mask] if x.ndim == 1 else x[fit_mask]
+            y_fit = y[fit_mask]
+            x_holdout = x[holdout_indices] if x.ndim == 1 else x[holdout_indices]
+            y_holdout = y[holdout_indices]
+        else:
+            holdout_mask = None  # not enough data, skip
 
     if x.ndim == 2 and x.shape[1] > 1:
         easy_match = _maybe_match_easy_multivariate_formula(x, y)
@@ -1060,8 +1096,8 @@ def fast_path_regression(
             print(f"  Direct template match: {details['template_match']}")
             return formula, mse, details
     
-    # Build basis
-    basis, names = build_basis_from_predictions(
+    # Build basis from predictions (fit subset for holdout; full data for exact-match/evaluation)
+    basis_full, names = build_basis_from_predictions(
         x, predictions, 
         threshold=0.3,  # Lower threshold to include more options
         max_power=max_power,
@@ -1069,6 +1105,14 @@ def fast_path_regression(
         op_constraints=op_constraints,
         universal_basis=universal_basis,
     )
+
+    # If holdout is active, build a separate fit-only basis
+    if holdout_mask is not None:
+        basis = basis_full[~holdout_mask]
+        basis_holdout = basis_full[holdout_mask]
+    else:
+        basis = basis_full
+        basis_holdout = None
     
     print(f"  Fast-path basis: {len(names)} terms")
     print(f"  Terms: {names[:10]}{'...' if len(names) > 10 else ''}")
@@ -1090,7 +1134,7 @@ def fast_path_regression(
         exact_match = find_exact_symbolic_match(
             basis,
             names,
-            y,
+            y_fit,
             max_terms=exact_max_terms,
             tolerance=1e-5,
             num_threads=exact_match_threads,
@@ -1153,6 +1197,20 @@ def fast_path_regression(
             return
         n_terms_local = int(np.sum(np.abs(coeffs_arr) >= sparsity_threshold))
         score_local = float(mse_val + COMPLEXITY_PENALTY * n_terms_local)
+
+        # Out-of-domain holdout penalty: penalize solutions that overfit
+        if basis_holdout is not None and y_holdout is not None:
+            try:
+                y_pred_ho = basis_holdout @ coeffs_arr
+                ho_mse = float(np.mean((y_holdout - y_pred_ho) ** 2))
+                if np.isfinite(ho_mse):
+                    ood_ratio = ho_mse / max(mse_val, 1e-12)
+                    # Penalize if holdout MSE is much worse than in-sample
+                    if ood_ratio > 5.0:
+                        score_local += 0.01 * ho_mse
+            except Exception:
+                pass
+
         signature = _candidate_signature(coeffs_arr)
         current = pool.get(signature)
         if current is None or score_local < current['score']:
@@ -1163,6 +1221,17 @@ def fast_path_regression(
                 'score': score_local,
                 'alpha': alpha_val,
             }
+
+    def _holdout_mse_for_best(coeffs_arr: np.ndarray) -> Optional[float]:
+        """Compute holdout MSE for the best candidate's coefficients."""
+        if basis_holdout is None or y_holdout is None:
+            return None
+        try:
+            y_pred_ho = basis_holdout @ coeffs_arr
+            ho_mse = float(np.mean((y_holdout - y_pred_ho) ** 2))
+            return ho_mse if np.isfinite(ho_mse) else None
+        except Exception:
+            return None
     
     # Try LASSO with adaptive alpha (coordinate descent)
     best_coeffs = None
@@ -1176,7 +1245,7 @@ def fast_path_regression(
     # Try multiple alpha values to find best sparsity-accuracy tradeoff
     for alpha in [0.0, 0.001, 0.01, 0.05, 0.1, 0.2]:
         try:
-            coeffs = lasso_coordinate_descent(basis_norm, y, alpha=alpha, max_iter=1000)
+            coeffs = lasso_coordinate_descent(basis_norm, y_fit, alpha=alpha, max_iter=1000)
             
             # Check for NaN/Inf in coeffs
             if not np.all(np.isfinite(coeffs)):
@@ -1186,9 +1255,9 @@ def fast_path_regression(
             # Unnormalize coefficients
             coeffs = coeffs / basis_std.flatten()
             
-            # Compute MSE
+            # Compute MSE on fit data
             y_pred = basis @ coeffs
-            mse = np.mean((y - y_pred) ** 2)
+            mse = np.mean((y_fit - y_pred) ** 2)
             n_terms = np.sum(np.abs(coeffs) > sparsity_threshold)
             
             # Check if MSE is valid
@@ -1213,9 +1282,9 @@ def fast_path_regression(
     if best_coeffs is None:
         # Fallback to plain least squares
         try:
-            best_coeffs, _, _, _ = np.linalg.lstsq(basis, y, rcond=None)
+            best_coeffs, _, _, _ = np.linalg.lstsq(basis, y_fit, rcond=None)
             y_pred = basis @ best_coeffs
-            best_mse = np.mean((y - y_pred) ** 2)
+            best_mse = np.mean((y_fit - y_pred) ** 2)
             best_score = best_mse + COMPLEXITY_PENALTY * np.sum(np.abs(best_coeffs) >= sparsity_threshold)
             _update_candidate_pool(candidate_pool, best_coeffs, best_mse, alpha_val=-1.0)
         except np.linalg.LinAlgError:
@@ -1230,9 +1299,9 @@ def fast_path_regression(
             continue
         basis_selected = basis[:, selected_mask]
         try:
-            refit_coeffs, _, _, _ = np.linalg.lstsq(basis_selected, y, rcond=None)
+            refit_coeffs, _, _, _ = np.linalg.lstsq(basis_selected, y_fit, rcond=None)
             y_pred = basis_selected @ refit_coeffs
-            refit_mse = float(np.mean((y - y_pred) ** 2))
+            refit_mse = float(np.mean((y_fit - y_pred) ** 2))
 
             if refit_mse <= candidate['mse'] + 0.001:
                 updated = np.zeros_like(coeffs_local)
@@ -1256,7 +1325,11 @@ def fast_path_regression(
     best_candidate = top_candidates[0]
 
     coeffs = best_candidate['coeffs']
-    mse = float(best_candidate['mse'])
+    # Report MSE on *full* dataset (including holdout), not just fit subset
+    y_pred_full = basis_full @ coeffs
+    mse = float(np.mean((y - y_pred_full) ** 2))
+    if not np.isfinite(mse):
+        mse = float(best_candidate['mse'])
     formula = _coeffs_to_formula(coeffs)
 
     n_nonzero = int(np.sum(np.abs(coeffs) >= sparsity_threshold))
@@ -1281,6 +1354,7 @@ def fast_path_regression(
         'n_nonzero': n_nonzero,
         'exact_match': exact_match_flag,
         'candidate_formulas': candidate_formulas,
+        'holdout_mse': _holdout_mse_for_best(coeffs) if holdout_mask is not None else None,
     }
 
 
@@ -2165,6 +2239,9 @@ def run_fast_path(
     
     print(f"\n  Formula: {formula}")
     print(f"  MSE: {mse:.6f}")
+    holdout_mse = details.get('holdout_mse')
+    if holdout_mse is not None:
+        print(f"  Holdout MSE (domain edges): {holdout_mse:.6f}")
     print(f"  Non-zero terms: {details.get('n_nonzero', 0)}")
     if residual_diagnostics['residual_suspicious']:
         print(
@@ -2403,6 +2480,7 @@ def beam_search_evolution(
     base_pop_size: int = 50,
     base_generations: int = 500,
     device: str = 'cpu',
+    candidate_formulas: Optional[List[Dict]] = None,
 ) -> Dict:
     """
     Beam search over diverse C++ evolution configurations.
@@ -2421,6 +2499,9 @@ def beam_search_evolution(
         base_pop_size: Base population size for C++ runs
         base_generations: Base generation count for C++ runs
         device: Device string
+        candidate_formulas: Optional list of top-K fast-path candidates,
+            each a dict with at least 'formula', 'mse', 'active_terms'.
+            Used for targeted population initialization (elite seeding).
         
     Returns:
         Dict with 'formula', 'mse', 'model', 'time', or None if C++ unavailable
@@ -2559,6 +2640,38 @@ def beam_search_evolution(
                 'label': label_cfg,
             })
         
+        # ── Targeted initialization: inject top-K fast-path candidates as elite seeds ──
+        if candidate_formulas:
+            for ci, cand in enumerate(candidate_formulas[:3]):
+                active_terms = cand.get('active_terms', [])
+                cand_priors = list(classifier_priors)
+                has_trig = any('sin' in t or 'cos' in t for t in active_terms)
+                has_poly = any('x^' in t or 'x**' in t for t in active_terms)
+                has_exp_ = any('exp' in t for t in active_terms)
+                has_log_ = any('log' in t for t in active_terms)
+                if has_trig and len(cand_priors) > 0:
+                    cand_priors[0] = min(cand_priors[0] * 1.5, 0.6)
+                if has_poly and len(cand_priors) > 1:
+                    cand_priors[1] = min(cand_priors[1] * 1.5, 0.6)
+                if has_exp_ and len(cand_priors) > 2:
+                    cand_priors[2] = min(cand_priors[2] * 1.5, 0.6)
+                if has_log_ and len(cand_priors) > 3:
+                    cand_priors[3] = min(cand_priors[3] * 1.5, 0.6)
+                total_cp = sum(cand_priors) or 1.0
+                cand_priors = [p / total_cp for p in cand_priors]
+
+                cand_omegas = list(fft_freqs)
+                for t in active_terms:
+                    m = re.search(r'(?:sin|cos)\((\d+\.?\d*)\*', t)
+                    if m:
+                        try:
+                            cand_omegas.append(float(m.group(1)))
+                        except ValueError:
+                            pass
+
+                add_config(cand_priors, cand_omegas[:4], base_pop_size, base_generations,
+                           f'candidate-seed-{ci}')
+
         # 1. Classifier-guided (primary hypothesis)
         add_config(classifier_priors, fft_freqs, base_pop_size, base_generations, 'classifier-guided')
         
@@ -2853,6 +2966,7 @@ def run_guided_evolution(
     population_size: int = 20,
     device: str = 'cpu',
     visualizer = None,
+    candidate_formulas: Optional[List[Dict]] = None,
 ) -> Dict:
     """
     Run evolution guided by fast-path operator hints.
@@ -2884,6 +2998,7 @@ def run_guided_evolution(
         base_pop_size=30,
         base_generations=200,
         device=device,
+        candidate_formulas=candidate_formulas,
     )
     
     if beam_result is not None and beam_result['mse'] < float('inf'):

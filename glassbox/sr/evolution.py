@@ -107,7 +107,8 @@ def detect_dominant_frequency(
     x: torch.Tensor, 
     y: torch.Tensor,
     n_frequencies: int = 3,
-) -> List[float]:
+    return_phase_info: bool = False,
+) -> 'List[float] | Dict[str, Any]':
     """
     Use FFT to detect dominant frequencies in the target data.
     
@@ -118,10 +119,25 @@ def detect_dominant_frequency(
         x: Input tensor (N,) or (N, 1)
         y: Target tensor (N,) or (N, 1)
         n_frequencies: Number of top frequencies to return
+        return_phase_info: If True, return a dict with omegas, phases,
+            and harmonic-consistency metadata instead of a plain list.
         
     Returns:
-        List of detected omega values (angular frequencies)
+        List of detected omega values (angular frequencies), or if
+        return_phase_info is True a dict with keys:
+            omegas: List[float]
+            phases: List[float]  (radians, range [-π, π])
+            harmonic_fundamental: Optional[float]
+            is_harmonic_series: bool
     """
+    _fallback_omegas: List[float] = [1.0]
+    _fallback_info: Dict[str, Any] = {
+        'omegas': [1.0],
+        'phases': [0.0],
+        'harmonic_fundamental': None,
+        'is_harmonic_series': False,
+    }
+
     try:
         x_np = x.squeeze().cpu().numpy()
         y_np = y.squeeze().cpu().numpy()
@@ -137,7 +153,7 @@ def detect_dominant_frequency(
         x_range = x_max - x_min
         
         if x_range < 1e-6:
-            return [1.0]
+            return _fallback_info if return_phase_info else _fallback_omegas
 
         # Use refined sampling for better resolution (2x original points if possible)
         n_interp = max(n_samples, 1024)
@@ -154,20 +170,20 @@ def detect_dominant_frequency(
         dx = x_range / (n_interp - 1)
         freqs = np.fft.rfftfreq(n_interp, dx)
         
-        # Get magnitudes (skip DC component at index 0)
+        # Get magnitudes and phases (skip DC component at index 0)
         magnitudes = np.abs(fft_result[1:])
+        phase_angles = np.angle(fft_result[1:])  # Preserve phase spectrum
         freqs = freqs[1:]
         
         if len(magnitudes) == 0:
-            return [1.0]
+            return _fallback_info if return_phase_info else _fallback_omegas
         
         # Find top N frequency peaks
-        # Simple peak finding to avoid side-lobes?
-        # For now just max magnitude logic
         top_indices = np.argsort(magnitudes)[-n_frequencies:][::-1]
         
         # Convert frequencies to angular frequencies (omega = 2π*f)
-        detected_omegas = []
+        detected_omegas: List[float] = []
+        detected_phases: List[float] = []
         for idx in top_indices:
             if idx < len(freqs):
                 freq = freqs[idx]
@@ -175,16 +191,42 @@ def detect_dominant_frequency(
                 # Only accept reasonable omega values
                 if 0.1 < omega < 50.0:
                     detected_omegas.append(float(omega))
+                    detected_phases.append(float(phase_angles[idx]))
         
         # Ensure we return at least one value
         if not detected_omegas:
             detected_omegas = [1.0]
-            
-        return detected_omegas
+            detected_phases = [0.0]
+
+        if not return_phase_info:
+            return detected_omegas
+
+        # ── Harmonic consistency check ──
+        # Check if detected peaks are integer multiples of a fundamental.
+        # This flags likely square / triangle wave targets (sum-of-harmonics)
+        # vs. single-frequency targets.
+        harmonic_fundamental: Optional[float] = None
+        is_harmonic_series = False
+
+        if len(detected_omegas) >= 2:
+            candidate_fund = detected_omegas[0]  # strongest peak
+            if candidate_fund > 0.15:
+                ratios = [omega / candidate_fund for omega in detected_omegas[1:]]
+                int_ratios = [abs(r - round(r)) < 0.12 and round(r) >= 2 for r in ratios]
+                if sum(int_ratios) >= max(1, len(ratios) // 2):
+                    harmonic_fundamental = candidate_fund
+                    is_harmonic_series = True
+
+        return {
+            'omegas': detected_omegas,
+            'phases': detected_phases,
+            'harmonic_fundamental': harmonic_fundamental,
+            'is_harmonic_series': is_harmonic_series,
+        }
         
     except Exception as e:
         logger.debug(f"FFT frequency detection failed: {e}")
-        return [1.0]  # Safe fallback
+        return _fallback_info if return_phase_info else _fallback_omegas
 
 
 def seed_omega_from_fft(
