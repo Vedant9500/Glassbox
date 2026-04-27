@@ -9,7 +9,7 @@ Phase 1 MVP module:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 import numpy as np
 import torch
@@ -148,6 +148,148 @@ def decode_topk_skeletons(
     return out
 
 
+def _formula_operator_tags(formula: str) -> Set[str]:
+    tags: Set[str] = set()
+    f = formula.lower()
+    if "sin(" in f:
+        tags.add("sin")
+        tags.add("periodic")
+    if "cos(" in f:
+        tags.add("cos")
+        tags.add("periodic")
+    if "exp(" in f:
+        tags.add("exp")
+    if "log(" in f:
+        tags.add("log")
+    if "/" in f:
+        tags.add("rational")
+    if "x**" in f or "^" in f:
+        tags.add("power")
+    if "x" in f:
+        tags.add("identity")
+    return tags
+
+
+def _build_univariate_grammar_candidates(max_depth: int = 2) -> List[str]:
+    # Grammar-controlled expression set for Phase 1.
+    base = [
+        "x",
+        "x**2",
+        "x**3",
+        "sin(x)",
+        "cos(x)",
+        "exp(x)",
+        "exp(-x**2)",
+        "log(abs(x)+1e-6)",
+        "1/(x+1e-3)",
+    ]
+    if max_depth <= 1:
+        return base
+
+    composed = [
+        "sin(x**2)",
+        "cos(x**2)",
+        "x*sin(x)",
+        "x*cos(x)",
+        "x+sin(x)",
+        "x+cos(x)",
+        "x**2+sin(x)",
+        "x**2+cos(x)",
+        "sin(x)*cos(x)",
+        "exp(-x)*sin(x)",
+        "exp(-x**2)*sin(x)",
+        "log(abs(x)+1e-6)+sin(x)",
+    ]
+    return base + composed
+
+
+def _safe_formula_eval(formula: str, x: np.ndarray) -> Optional[np.ndarray]:
+    context = {
+        "np": np,
+        "x": x,
+        "sin": np.sin,
+        "cos": np.cos,
+        "exp": lambda z: np.exp(np.clip(z, -30.0, 30.0)),
+        "log": lambda z: np.log(np.abs(z) + 1e-6),
+        "abs": np.abs,
+    }
+    expr = formula.replace("^", "**")
+    try:
+        y = eval(expr, {"__builtins__": None}, context)
+    except Exception:
+        return None
+
+    if isinstance(y, (int, float)):
+        y = np.full_like(x, float(y), dtype=np.float64)
+    else:
+        y = np.asarray(y, dtype=np.float64)
+    if y.shape != x.shape:
+        return None
+    if not np.all(np.isfinite(y)):
+        return None
+    return y
+
+
+def _fit_affine_mse(y_true: np.ndarray, y_basis: np.ndarray) -> float:
+    # Solve y_true ~= a*y_basis + b by least squares.
+    A = np.stack([y_basis, np.ones_like(y_basis)], axis=1)
+    try:
+        coeffs, _, _, _ = np.linalg.lstsq(A, y_true, rcond=None)
+    except Exception:
+        return float("inf")
+    y_pred = A @ coeffs
+    mse = float(np.mean((y_true - y_pred) ** 2))
+    return mse if np.isfinite(mse) else float("inf")
+
+
+def grammar_decode_topk_skeletons(
+    operator_priors: Dict[str, float],
+    x: np.ndarray,
+    y: np.ndarray,
+    top_k: int = 5,
+    max_depth: int = 2,
+) -> List[Dict[str, Any]]:
+    """Decode top-k skeletons from a constrained grammar.
+
+    Candidate ranking combines:
+    - prior compatibility (operator tags vs predicted operator priors)
+    - optional data fit quality via affine fit MSE
+    """
+    candidates = _build_univariate_grammar_candidates(max_depth=max_depth)
+    y = y.reshape(-1)
+    x = x.reshape(-1)
+    y_var = float(np.var(y)) + 1e-12
+
+    scored: List[Dict[str, Any]] = []
+    for formula in candidates:
+        tags = _formula_operator_tags(formula)
+        if tags:
+            prior_score = float(np.mean([operator_priors.get(t, 1e-6) for t in tags]))
+        else:
+            prior_score = 1e-6
+
+        basis = _safe_formula_eval(formula, x)
+        mse = float("inf")
+        fit_score = 0.0
+        if basis is not None:
+            mse = _fit_affine_mse(y, basis)
+            fit_score = float(np.exp(-mse / y_var)) if np.isfinite(mse) else 0.0
+
+        # Weighted blend; keep score in [0,1] neighborhood.
+        score = 0.65 * prior_score + 0.35 * fit_score
+        scored.append(
+            {
+                "formula": formula,
+                "probability": float(max(1e-9, score)),
+                "score": float(1.0 - min(score, 1.0)),
+                "mse": None if not np.isfinite(mse) else float(mse),
+            }
+        )
+
+    scored.sort(key=lambda d: (-d["probability"], d["score"]))
+    return scored[: max(1, int(top_k))]
+
+
 def _operator_priors(operator_logits: Sequence[float], operator_vocab: Sequence[str]) -> Dict[str, float]:
     probs = _safe_softmax(np.asarray(operator_logits, dtype=np.float64))
     return {str(op): float(p) for op, p in zip(operator_vocab, probs)}
@@ -203,8 +345,20 @@ def propose_from_xy(
     operator_logits = pred["operator_logits"][0].detach().cpu().numpy()
     skeleton_logits = pred["skeleton_logits"][0].detach().cpu().numpy()
 
-    candidates = decode_topk_skeletons(skeleton_logits, model.skeleton_vocab, top_k=top_k)
     priors = _operator_priors(operator_logits, model.operator_vocab)
+    # Grammar-constrained decoding uses priors and quick data-fit checks.
+    candidates = grammar_decode_topk_skeletons(
+        priors,
+        x=x.astype(np.float64),
+        y=y.astype(np.float64),
+        top_k=top_k,
+        max_depth=2,
+    )
+
+    # Fallback to direct head decode if grammar decoding unexpectedly returns empty.
+    if not candidates:
+        candidates = decode_topk_skeletons(skeleton_logits, model.skeleton_vocab, top_k=top_k)
+
     uncertainty = _uncertainty_from_logits(skeleton_logits)
 
     return {
@@ -249,3 +403,42 @@ def proposer_output_to_fpip_v2(
     if not valid:
         payload["validation_errors"] = errors
     return payload
+
+
+def load_universal_proposer_checkpoint(
+    checkpoint_path: str,
+    device: Optional[str] = None,
+) -> UniversalProposer:
+    """Load UniversalProposer from checkpoint saved by train_universal_proposer.py."""
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    cfg_raw = ckpt.get("config", {})
+    config = UniversalProposerConfig(
+        hidden_dim=int(cfg_raw.get("hidden_dim", 128)),
+        point_mlp_layers=int(cfg_raw.get("point_mlp_layers", 2)),
+        operator_vocab=cfg_raw.get("operator_vocab"),
+        skeleton_vocab=cfg_raw.get("skeleton_vocab"),
+    )
+    model = UniversalProposer(config)
+    model.load_state_dict(ckpt["model_state_dict"])
+    if device is not None:
+        model = model.to(torch.device(device))
+    model.eval()
+    return model
+
+
+def propose_fpip_v2_from_xy(
+    model: UniversalProposer,
+    x: np.ndarray,
+    y: np.ndarray,
+    top_k: int = 5,
+    fit_diagnostics: Optional[Dict[str, Any]] = None,
+    interaction_hints: Optional[Dict[str, Any]] = None,
+    device: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Convenience wrapper: proposer inference + FPIP v2 adaptation."""
+    out = propose_from_xy(model, x=x, y=y, top_k=top_k, device=device)
+    return proposer_output_to_fpip_v2(
+        proposer_output=out,
+        fit_diagnostics=fit_diagnostics,
+        interaction_hints=interaction_hints,
+    )

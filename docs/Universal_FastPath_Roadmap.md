@@ -67,7 +67,10 @@ Deliverables:
 Progress update:
 - Completed: Phase 1 scaffold created (`glassbox/sr/universal_proposer.py`, `scripts/train_universal_proposer.py`) with unit tests.
 - Completed: proposer -> `FPIPv2` adapter implemented and validated in tests.
-- Next: replace fixed skeleton vocabulary decoder with richer grammar-constrained decoding and dataset-backed training.
+- Completed: fixed-vocabulary decode replaced with richer grammar-constrained top-K decoding.
+- Completed: dataset-backed proposer training path added (`--data` support in trainer).
+- Completed: dual-path feature flag + runtime routing logging added in sklearn wrapper.
+- Next: run proposer benchmark slice and calibrate proposer confidence routing thresholds.
 
 Deliverables:
 - New training script and model artifact format.
@@ -124,7 +127,7 @@ Suggested initial milestones on branch:
   - Mitigation: broaden grammar, curriculum, and OOD validation sets.
 
 ## Immediate Next Tasks
-1. Implement richer grammar-constrained skeleton decoding (top-K output).
-2. Add dataset-backed proposer training path (beyond synthetic scaffold).
-3. Add dual-path feature flag and logging for side-by-side proposer vs legacy runs.
-4. Run first proposer-only benchmark slice on feynman_easy + OOD subset.
+1. Run first proposer-only benchmark slice on feynman_easy + OOD subset.
+2. Add quick calibration pass for proposer confidence -> routing thresholds.
+3. Snapshot Phase 1 benchmark artifact and compare against legacy fast path.
+4. Decide default routing policy (`shadow` vs `active`) from benchmark outcomes.

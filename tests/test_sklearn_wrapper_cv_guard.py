@@ -55,3 +55,43 @@ def test_cv_skip_guard_fails_for_unstable_formula(monkeypatch):
     assert ok is False
     assert est.fast_path_cv_guard_["passed"] is False
     assert est.fast_path_cv_guard_["reason"] == "unstable_fold_performance"
+
+
+def test_universal_proposer_dual_path_skips_multivariate():
+    n = 64
+    x1 = np.linspace(-2.0, 2.0, n)
+    x2 = np.linspace(1.0, 3.0, n)
+    X = np.stack([x1, x2], axis=1)
+    y = x1 + x2
+
+    est = GlassboxRegressor(
+        use_universal_proposer=True,
+        universal_proposer_shadow_mode=True,
+        universal_proposer_log_routing=False,
+    )
+
+    payload, force = est._run_universal_proposer_dual_path(X, y, fast_path_result=None)
+
+    assert payload is None
+    assert force is False
+    assert est.universal_proposer_status_ == "skipped_multivariate"
+
+
+def test_universal_proposer_dual_path_handles_missing_checkpoint():
+    n = 64
+    x = np.linspace(-2.0, 2.0, n)
+    X = x.reshape(-1, 1)
+    y = np.sin(x)
+
+    est = GlassboxRegressor(
+        use_universal_proposer=True,
+        universal_proposer_path="models/does_not_exist.pt",
+        universal_proposer_shadow_mode=False,
+        universal_proposer_log_routing=False,
+    )
+
+    payload, force = est._run_universal_proposer_dual_path(X, y, fast_path_result={"mse": 0.1})
+
+    assert payload is None
+    assert force is False
+    assert str(est.universal_proposer_status_).startswith("error:")

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -21,6 +21,11 @@ from glassbox.sr.universal_proposer import (
     DEFAULT_OPERATOR_VOCAB,
     DEFAULT_SKELETON_VOCAB,
 )
+
+try:
+    from scripts.generate_curve_data import evaluate_formula
+except Exception:
+    from generate_curve_data import evaluate_formula
 
 
 class SyntheticCurveDataset(Dataset):
@@ -81,6 +86,83 @@ class SyntheticCurveDataset(Dataset):
         )
 
 
+class FormulaReplayDataset(Dataset):
+    """Dataset-backed proposer training from generated formula corpora (.npz).
+
+    Expects `.npz` with keys:
+    - labels: [N, C] multi-hot operator labels
+    - formulas: [N] formula strings
+    """
+
+    def __init__(
+        self,
+        data_path: Path,
+        n_points: int = 128,
+        x_min: float = -2.0,
+        x_max: float = 2.0,
+        max_samples: Optional[int] = None,
+    ):
+        blob = np.load(data_path, allow_pickle=True)
+        labels = np.asarray(blob["labels"], dtype=np.float32)
+        formulas = blob["formulas"].tolist()
+
+        if max_samples is not None:
+            limit = int(max_samples)
+            labels = labels[:limit]
+            formulas = formulas[:limit]
+
+        self.labels = labels
+        self.formulas = formulas
+        self.n_points = int(n_points)
+        self.x = np.linspace(float(x_min), float(x_max), self.n_points, dtype=np.float32)
+
+        self.operator_vocab = list(DEFAULT_OPERATOR_VOCAB)
+        self.skeleton_vocab = list(DEFAULT_SKELETON_VOCAB)
+
+    def __len__(self) -> int:
+        return len(self.formulas)
+
+    def _labels_to_operator_target(self, row: np.ndarray) -> np.ndarray:
+        # Map existing operator labels (from classifier dataset) into proposer vocab.
+        # Known index mapping from generate_curve_data.OPERATOR_CLASSES:
+        # identity=0,sin=1,cos=2,power=3,exp=4,log=5,addition=6,multiplication=7,rational=8,...
+        op = np.zeros(len(self.operator_vocab), dtype=np.float32)
+        if row.shape[0] >= 9:
+            op[self.operator_vocab.index("identity")] = row[0]
+            op[self.operator_vocab.index("sin")] = row[1]
+            op[self.operator_vocab.index("cos")] = row[2]
+            op[self.operator_vocab.index("power")] = row[3]
+            op[self.operator_vocab.index("exp")] = row[4]
+            op[self.operator_vocab.index("log")] = row[5]
+            op[self.operator_vocab.index("rational")] = row[8]
+            # Derived periodic tag from sin/cos.
+            op[self.operator_vocab.index("periodic")] = max(row[1], row[2])
+        return op
+
+    def __getitem__(self, idx: int):
+        formula = str(self.formulas[idx])
+        y, status = evaluate_formula(formula, self.x, safe_eval=True)
+        if y is None or status != "ok":
+            # Fallback to stable placeholder curve to keep batch shapes valid.
+            y = np.zeros_like(self.x, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32)
+        if y.shape != self.x.shape or np.any(~np.isfinite(y)):
+            y = np.zeros_like(self.x, dtype=np.float32)
+
+        points = np.stack([self.x, y], axis=1)
+        op_target = self._labels_to_operator_target(self.labels[idx])
+
+        # For dataset-backed mode we currently train skeleton head weakly;
+        # use -1 target so CE loss can be masked out.
+        skeleton_target = -1
+
+        return (
+            torch.from_numpy(points),
+            torch.from_numpy(op_target),
+            torch.tensor(skeleton_target, dtype=torch.long),
+        )
+
+
 def _train_epoch(model, loader, optimizer, device) -> Tuple[float, float]:
     model.train()
     total_loss = 0.0
@@ -94,7 +176,11 @@ def _train_epoch(model, loader, optimizer, device) -> Tuple[float, float]:
 
         out = model(points)
         op_loss = F.binary_cross_entropy_with_logits(out["operator_logits"], op_target)
-        sk_loss = F.cross_entropy(out["skeleton_logits"], skeleton_target)
+        valid_skeleton = skeleton_target >= 0
+        if bool(valid_skeleton.any()):
+            sk_loss = F.cross_entropy(out["skeleton_logits"][valid_skeleton], skeleton_target[valid_skeleton])
+        else:
+            sk_loss = torch.tensor(0.0, device=device)
         loss = op_loss + sk_loss
 
         optimizer.zero_grad()
@@ -103,7 +189,8 @@ def _train_epoch(model, loader, optimizer, device) -> Tuple[float, float]:
 
         total_loss += float(loss.item()) * points.shape[0]
         pred = torch.argmax(out["skeleton_logits"], dim=1)
-        correct += int((pred == skeleton_target).sum().item())
+        if bool(valid_skeleton.any()):
+            correct += int((pred[valid_skeleton] == skeleton_target[valid_skeleton]).sum().item())
         total += points.shape[0]
 
     return total_loss / max(total, 1), correct / max(total, 1)
@@ -119,6 +206,8 @@ def main():
     parser.add_argument("--hidden", type=int, default=128)
     parser.add_argument("--out", type=str, default="models/universal_proposer_mvp.pt")
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--data", type=str, default="", help="Optional dataset .npz path from generate_curve_data")
+    parser.add_argument("--max-samples", type=int, default=0, help="Optional cap when --data is used")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -126,7 +215,16 @@ def main():
     config = UniversalProposerConfig(hidden_dim=args.hidden)
     model = UniversalProposer(config).to(device)
 
-    ds = SyntheticCurveDataset(n_samples=args.n_samples, n_points=args.n_points)
+    if args.data:
+        ds = FormulaReplayDataset(
+            data_path=Path(args.data),
+            n_points=args.n_points,
+            max_samples=(args.max_samples if args.max_samples > 0 else None),
+        )
+        print(f"dataset=FormulaReplayDataset samples={len(ds)} path={args.data}")
+    else:
+        ds = SyntheticCurveDataset(n_samples=args.n_samples, n_points=args.n_points)
+        print(f"dataset=SyntheticCurveDataset samples={len(ds)}")
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True)
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)

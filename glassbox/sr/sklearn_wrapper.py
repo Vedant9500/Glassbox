@@ -75,6 +75,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         cv_skip_guard_min_fold_r2=0.98,
         cv_skip_guard_max_r2_std=0.03,
         cv_skip_guard_min_samples=45,
+        use_universal_proposer=False,
+        universal_proposer_path="models/universal_proposer_mvp.pt",
+        universal_proposer_shadow_mode=True,
+        universal_proposer_log_routing=True,
+        universal_proposer_top_k=5,
         device=None,
         skip_evolution_if_bloated=False,
         bloat_term_threshold=20,
@@ -108,9 +113,16 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.cv_skip_guard_min_fold_r2 = cv_skip_guard_min_fold_r2
         self.cv_skip_guard_max_r2_std = cv_skip_guard_max_r2_std
         self.cv_skip_guard_min_samples = cv_skip_guard_min_samples
+        self.use_universal_proposer = use_universal_proposer
+        self.universal_proposer_path = universal_proposer_path
+        self.universal_proposer_shadow_mode = universal_proposer_shadow_mode
+        self.universal_proposer_log_routing = universal_proposer_log_routing
+        self.universal_proposer_top_k = universal_proposer_top_k
         self.device = device
         self.skip_evolution_if_bloated = skip_evolution_if_bloated
         self.bloat_term_threshold = bloat_term_threshold
+
+        self._universal_proposer_model = None
 
     def _estimate_compute_budget(self, X, current_r2, term_count, uncertainty=None):
         """Adaptive compute budget: easy problems get short runs, hard problems get longer runs.
@@ -295,6 +307,78 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.fast_path_cv_guard_ = diagnostics
         return bool(passed)
 
+    def _run_universal_proposer_dual_path(self, X, y, fast_path_result):
+        """Optional side-by-side proposer run for routing diagnostics.
+
+        Returns:
+            Tuple[fpip_payload_or_none, force_evolution_bool]
+        """
+        if not self.use_universal_proposer:
+            return None, False
+
+        # Phase-1 proposer currently supports univariate x for stable decoding.
+        if int(X.shape[1]) != 1:
+            self.universal_proposer_status_ = "skipped_multivariate"
+            return None, False
+
+        try:
+            from .universal_proposer import (
+                load_universal_proposer_checkpoint,
+                propose_fpip_v2_from_xy,
+            )
+
+            if self._universal_proposer_model is None:
+                model_path = Path(self.universal_proposer_path)
+                if not model_path.is_absolute():
+                    model_path = _REPO_ROOT / model_path
+                self._universal_proposer_model = load_universal_proposer_checkpoint(
+                    str(model_path),
+                    device=self.device,
+                )
+
+            x1 = np.asarray(X[:, 0], dtype=np.float64)
+            y1 = np.asarray(y, dtype=np.float64).reshape(-1)
+
+            fit_diag = {}
+            if isinstance(fast_path_result, dict):
+                fit_diag["mse"] = fast_path_result.get("mse")
+                fit_diag["residual_suspicious"] = bool(
+                    (fast_path_result.get("residual_diagnostics") or {}).get("residual_suspicious", False)
+                )
+
+            payload = propose_fpip_v2_from_xy(
+                self._universal_proposer_model,
+                x=x1,
+                y=y1,
+                top_k=int(max(1, self.universal_proposer_top_k)),
+                fit_diagnostics=fit_diag,
+                interaction_hints={},
+                device=self.device,
+            )
+
+            self.universal_proposer_status_ = "ok"
+            self.universal_proposer_fpip_v2_ = payload
+
+            if self.universal_proposer_log_routing:
+                route = payload.get("routing_signal", {})
+                print(
+                    "  [Proposer] "
+                    f"guided={route.get('recommend_guided_evolution')} "
+                    f"reason={route.get('reason')}"
+                )
+
+            force_evolution = (
+                (not self.universal_proposer_shadow_mode)
+                and bool(payload.get("valid", False))
+                and bool((payload.get("routing_signal") or {}).get("recommend_guided_evolution", False))
+            )
+            return payload, force_evolution
+        except Exception as e:
+            self.universal_proposer_status_ = f"error:{e}"
+            if self.universal_proposer_log_routing:
+                print(f"  [Proposer skipped: {e}]")
+            return None, False
+
     def _simplify_formula(self, formula):
         """Apply multipass formula simplification."""
         if not formula or not self.use_simplification:
@@ -399,6 +483,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 self._fp_result = None
                 print(f"  [Fast-path skipped: {e}]")
 
+        self.universal_proposer_fpip_v2_ = None
+        _, proposer_forces_evolution = self._run_universal_proposer_dual_path(
+            X,
+            y,
+            getattr(self, '_fp_result', None),
+        )
+
         # ── Stage 2: C++ Evolution ──
         # Only run evolution if:
         #   - No formula found yet, OR
@@ -441,6 +532,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 not math.isfinite(best_mse) or
                 current_r2 < self.evolution_skip_r2 or
                 not fast_path_cv_ok or
+                proposer_forces_evolution or
                 term_count > 8
             )
 
