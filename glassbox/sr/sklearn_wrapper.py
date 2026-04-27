@@ -70,6 +70,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         adaptive_compute_budget=True,
         min_compute_budget=10,
         max_compute_budget=300,
+        cv_skip_guard_enabled=True,
+        cv_skip_guard_folds=3,
+        cv_skip_guard_min_fold_r2=0.98,
+        cv_skip_guard_max_r2_std=0.03,
+        cv_skip_guard_min_samples=45,
         device=None,
         skip_evolution_if_bloated=False,
         bloat_term_threshold=20,
@@ -98,6 +103,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.adaptive_compute_budget = adaptive_compute_budget
         self.min_compute_budget = min_compute_budget
         self.max_compute_budget = max_compute_budget
+        self.cv_skip_guard_enabled = cv_skip_guard_enabled
+        self.cv_skip_guard_folds = cv_skip_guard_folds
+        self.cv_skip_guard_min_fold_r2 = cv_skip_guard_min_fold_r2
+        self.cv_skip_guard_max_r2_std = cv_skip_guard_max_r2_std
+        self.cv_skip_guard_min_samples = cv_skip_guard_min_samples
         self.device = device
         self.skip_evolution_if_bloated = skip_evolution_if_bloated
         self.bloat_term_threshold = bloat_term_threshold
@@ -168,6 +178,122 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if repo_path.exists():
             return str(repo_path)
         return str(p)
+
+    def _safe_eval_formula_array(self, formula, X):
+        """Safely evaluate a symbolic formula over a feature matrix."""
+        def _safe_log(x):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                return np.where(
+                    np.abs(x) > 1e-300,
+                    np.log(np.abs(x) + 1e-300),
+                    -300.0,
+                )
+
+        def _safe_sqrt(x):
+            return np.sqrt(np.maximum(x, 0.0))
+
+        context = {
+            "np": np,
+            "log": _safe_log,
+            "sin": np.sin,
+            "cos": np.cos,
+            "exp": lambda x: np.exp(np.clip(x, -500, 500)),
+            "sqrt": _safe_sqrt,
+            "abs": np.abs,
+            "Abs": np.abs,
+            "pi": np.pi,
+            "E": np.e,
+        }
+        for i in range(X.shape[1]):
+            context[f"x{i}"] = X[:, i]
+        if X.shape[1] == 1:
+            context["x"] = X[:, 0]
+
+        expr = formula.strip()
+        expr = re.sub(r'\|([^|]+)\|', r'abs(\1)', expr)
+        expr = re.sub(r'\^', r'**', expr)
+        expr = expr.replace('np.', '')
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            y_pred = eval(expr, {"__builtins__": None}, context)
+
+        if isinstance(y_pred, (int, float)):
+            y_pred = np.full(X.shape[0], y_pred, dtype=np.float64)
+        else:
+            y_pred = np.asarray(y_pred, dtype=np.float64)
+        return np.where(np.isfinite(y_pred), y_pred, 0.0)
+
+    def _passes_cross_validation_skip_guard(self, formula, X, y):
+        """Return True when fast-path formula is stable enough to skip evolution."""
+        diagnostics = {
+            'enabled': bool(self.cv_skip_guard_enabled),
+            'fold_r2': [],
+            'min_fold_r2': None,
+            'std_fold_r2': None,
+            'passed': True,
+            'reason': 'disabled',
+        }
+
+        if not self.cv_skip_guard_enabled:
+            self.fast_path_cv_guard_ = diagnostics
+            return True
+
+        n_samples = int(X.shape[0])
+        n_folds = int(max(2, self.cv_skip_guard_folds))
+        if n_samples < int(max(n_folds * 2, self.cv_skip_guard_min_samples)):
+            diagnostics['reason'] = 'insufficient_samples'
+            self.fast_path_cv_guard_ = diagnostics
+            return True
+
+        try:
+            y_pred = self._safe_eval_formula_array(formula, X)
+        except Exception:
+            diagnostics['passed'] = False
+            diagnostics['reason'] = 'formula_eval_failed'
+            self.fast_path_cv_guard_ = diagnostics
+            return False
+
+        idx = np.arange(n_samples)
+        seed = 0 if self.random_state is None else int(self.random_state)
+        rng = np.random.RandomState(seed)
+        rng.shuffle(idx)
+        folds = [f for f in np.array_split(idx, n_folds) if len(f) > 0]
+
+        fold_r2 = []
+        for fold_idx in folds:
+            y_fold = y[fold_idx]
+            pred_fold = y_pred[fold_idx]
+            var_fold = float(np.var(y_fold))
+            if var_fold < 1e-15:
+                r2_fold = 1.0 if float(np.mean((pred_fold - y_fold) ** 2)) < 1e-15 else 0.0
+            else:
+                mse_fold = float(np.mean((pred_fold - y_fold) ** 2))
+                r2_fold = 1.0 - mse_fold / var_fold
+            if np.isfinite(r2_fold):
+                fold_r2.append(float(r2_fold))
+
+        diagnostics['fold_r2'] = fold_r2
+        if not fold_r2:
+            diagnostics['passed'] = False
+            diagnostics['reason'] = 'no_valid_folds'
+            self.fast_path_cv_guard_ = diagnostics
+            return False
+
+        min_fold_r2 = float(np.min(fold_r2))
+        std_fold_r2 = float(np.std(fold_r2))
+        diagnostics['min_fold_r2'] = min_fold_r2
+        diagnostics['std_fold_r2'] = std_fold_r2
+
+        passed = (
+            min_fold_r2 >= float(self.cv_skip_guard_min_fold_r2)
+            and std_fold_r2 <= float(self.cv_skip_guard_max_r2_std)
+        )
+        diagnostics['passed'] = bool(passed)
+        diagnostics['reason'] = 'ok' if passed else 'unstable_fold_performance'
+        self.fast_path_cv_guard_ = diagnostics
+        return bool(passed)
 
     def _simplify_formula(self, formula):
         """Apply multipass formula simplification."""
@@ -277,9 +403,28 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         # Only run evolution if:
         #   - No formula found yet, OR
         #   - R² is below the skip threshold (default 0.999)
+        #   - Cross-validation guard says fast-path fit is unstable
         #   - We haven't exceeded the timeout
         current_r2 = _r2_from_mse(best_mse) if best_formula else -1.0
         term_count = (best_formula.count('+') + best_formula.count('-')) if best_formula else 0
+        fast_path_cv_ok = True
+
+        if (
+            best_formula is not None
+            and best_mse is not None
+            and math.isfinite(best_mse)
+            and current_r2 >= self.evolution_skip_r2
+        ):
+            fast_path_cv_ok = self._passes_cross_validation_skip_guard(best_formula, X, y)
+        else:
+            self.fast_path_cv_guard_ = {
+                'enabled': bool(self.cv_skip_guard_enabled),
+                'fold_r2': [],
+                'min_fold_r2': None,
+                'std_fold_r2': None,
+                'passed': True,
+                'reason': 'not_applicable',
+            }
 
         # Optional benchmark policy: if fast-path is very bloated, keep it as-is
         # and avoid launching evolution search for this sample.
@@ -295,6 +440,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 best_mse is None or
                 not math.isfinite(best_mse) or
                 current_r2 < self.evolution_skip_r2 or
+                not fast_path_cv_ok or
                 term_count > 8
             )
 
@@ -318,7 +464,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
                 # Try guided evolution (beam search) only if R² is low
                 if (self.use_guided_evolution and operator_hints
-                        and current_r2 < self.evolution_skip_r2
+                    and (current_r2 < self.evolution_skip_r2 or not fast_path_cv_ok)
                     and _elapsed() < effective_timeout):
                     try:
                         from classifier_fast_path import run_guided_evolution
@@ -439,55 +585,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         check_is_fitted(self)
         X = check_array(X)
 
-        def _safe_log(x):
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                return np.where(
-                    np.abs(x) > 1e-300,
-                    np.log(np.abs(x) + 1e-300),
-                    -300.0,
-                )
-
-        def _safe_sqrt(x):
-            return np.sqrt(np.maximum(x, 0.0))
-
-        context = {
-            "np": np,
-            "log": _safe_log,
-            "sin": np.sin,
-            "cos": np.cos,
-            "exp": lambda x: np.exp(np.clip(x, -500, 500)),
-            "sqrt": _safe_sqrt,
-            "abs": np.abs,
-            "Abs": np.abs,  # sympy uses Abs
-            "pi": np.pi,
-            "E": np.e,
-        }
-        for i in range(self.n_features_in_):
-            context[f"x{i}"] = X[:, i]
-        # C++ engine uses bare 'x' for single-feature problems
-        if self.n_features_in_ == 1:
-            context["x"] = X[:, 0]
-
-        # Parse formula string into python-evaluable form
-        formula = self.formula_.strip()
-        # |x| -> abs(x)
-        formula = re.sub(r'\|([^|]+)\|', r'abs(\1)', formula)
-        # x^N -> x**N
-        formula = re.sub(r'\^', r'**', formula)
-        # Route math functions through our safe wrappers
-        formula = formula.replace('np.', '')
-
         try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                y_pred = eval(formula, {"__builtins__": None}, context)
-            if isinstance(y_pred, (int, float)):
-                y_pred = np.full(X.shape[0], y_pred)
-            else:
-                y_pred = np.asarray(y_pred, dtype=np.float64)
-            y_pred = np.where(np.isfinite(y_pred), y_pred, 0.0)
-            return y_pred
+            return self._safe_eval_formula_array(self.formula_, X)
         except Exception as e:
             print(f"Prediction error: {e}")
             return np.zeros(X.shape[0])

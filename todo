@@ -260,6 +260,7 @@ Also from `limitations.md` item 2 (line 58-59). The `cleanup_graph()` function i
 
 ### ➕ ADD 4: Entropy penalty on soft arithmetic weights
 **Priority: 🟡 HIGH**
+✅ DONE (implemented in C++ fitness scoring: `evaluate_fitness_with_penalty()` adds arithmetic entropy term for `BinaryOp::Arithmetic` nodes).
 
 The `arithmetic_soft_weights()` function at [eval.h:51-68](file:///d:/Glassbox/glassbox/sr/cpp/eval.h#L51-L68) computes a softmax over 4 arithmetic operations. At convergence, many nodes have weights like `[0.6, 0.2, 0.1, 0.1]` — too soft to snap to a clean formula. Adding an entropy penalty `H(w) = -Σ w_i log(w_i)` to the fitness function would push weights toward one-hot during evolution, making the displayed formula match the raw evaluation more closely.
 
@@ -280,6 +281,7 @@ Currently the fast path evaluates on the same data it fits. For formulas like `e
 
 ### ➕ ADD 6: Cross-validation skip guard for fast path
 **Priority: 🟢 MEDIUM**
+✅ DONE (implemented in `GlassboxRegressor` with fold-stability checks before skipping evolution).
 
 The fast path currently has a fixed R² threshold of 0.999 (`evolution_skip_r2` at [sklearn_wrapper.py:68](file:///d:/Glassbox/glassbox/sr/sklearn_wrapper.py#L68)) for skipping evolution. But a high R² on overfit data doesn't guarantee correctness. A quick 3-fold cross-validation on the fast-path fit (using different basis subsets or random data splits) would give a more reliable "should we skip evolution?" signal.
 
