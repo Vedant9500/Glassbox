@@ -541,6 +541,23 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         _fp = getattr(self, '_fp_result', None)
         if isinstance(_fp, dict):
             _fp_uncertainty = _fp.get('uncertainty')
+
+        # Override/blend with Universal Proposer's uncertainty if available
+        if self.universal_proposer_fpip_v2_ and self.universal_proposer_fpip_v2_.get("valid"):
+            proposer_unc = self.universal_proposer_fpip_v2_.get("sequence_uncertainty", {})
+            if "entropy" in proposer_unc and proposer_unc["entropy"] is not None:
+                if _fp_uncertainty is None:
+                    _fp_uncertainty = {}
+                # Take the max uncertainty between fast-path and proposer
+                _fp_uncertainty["prediction_entropy"] = max(
+                    _fp_uncertainty.get("prediction_entropy", 0.0), 
+                    proposer_unc["entropy"]
+                )
+                _fp_uncertainty["prediction_margin"] = min(
+                    _fp_uncertainty.get("prediction_margin", 1.0), 
+                    proposer_unc.get("margin", 1.0)
+                )
+
         effective_timeout = self._estimate_compute_budget(X, current_r2, term_count, uncertainty=_fp_uncertainty)
 
         if need_evolution and _elapsed() < effective_timeout:
@@ -572,11 +589,41 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         hints['has_exp_decay'] = bool(hints.get('has_exp_decay', False))
                         hints['active_terms'] = list(hints.get('active_terms', []))
 
+                        # Blend proposer priors into hints if available
+                        if self.universal_proposer_fpip_v2_ and self.universal_proposer_fpip_v2_.get("valid"):
+                            proposer_priors = self.universal_proposer_fpip_v2_.get("operator_priors", {})
+                            if proposer_priors:
+                                # Overwrite or augment fast-path hints with neural proposer priors
+                                if "operators" not in hints:
+                                    hints["operators"] = set()
+                                for op, prob in proposer_priors.items():
+                                    if prob > 0.15: # threshold for active inclusion
+                                        hints["operators"].add(op)
+                            
+                            # Prepare skeletons as candidate formulas
+                            proposer_skeletons = self.universal_proposer_fpip_v2_.get("candidate_skeletons", [])
+                            candidate_formulas = []
+                            for cand in proposer_skeletons:
+                                formula_str = cand.get("formula", "")
+                                if formula_str:
+                                    # Very basic heuristic to mimic 'active_terms' for the beam search
+                                    active_terms = [t.strip() for t in formula_str.replace("-", "+").split("+") if t.strip()]
+                                    candidate_formulas.append({
+                                        "formula": formula_str,
+                                        "mse": cand.get("mse", float("inf")),
+                                        "score": cand.get("score", 0.0),
+                                        "active_terms": active_terms,
+                                        "from_proposer": True
+                                    })
+                        else:
+                            candidate_formulas = None
+
                         guided_result = run_guided_evolution(
                             x_t, y_t, hints,
                             generations=min(40, self.generations // 10),
                             population_size=min(30, self.population_size),
                             device=self.device or "cpu",
+                            candidate_formulas=candidate_formulas,
                         )
 
                         if guided_result and guided_result.get('formula'):

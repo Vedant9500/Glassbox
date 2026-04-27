@@ -88,3 +88,14 @@ glassbox/sr/cpp/out/
 glassbox/sr/cpp/eigen*/
 glassbox/sr/cpp/Eigen/
 research_notes/
+
+# Models and Checkpoints
+models/
+*.pt
+*.pth
+*.ckpt
+*.h5
+
+# Temporary scripts
+**/_tmp_*.py
+scripts/_tmp_*.py

@@ -1989,9 +1989,13 @@ def fast_path_with_refinement(
 
     if should_try_power:
         print(f"  Attempting power refinement (MSE={best_mse:.4f}, Terms={n_terms})...")
-        power_result, power_mse = refine_powers(
-            x, y, detected_omegas=detected_omegas, device=device
-        )
+        try:
+            power_result, power_mse = refine_powers(
+                x, y, detected_omegas=detected_omegas, device=device
+            )
+        except Exception as err:
+            print(f"  [Power refinement skipped: {err}]")
+            power_result, power_mse = None, float('inf')
         
         if power_result is not None:
             # Acceptance logic:
