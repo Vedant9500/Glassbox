@@ -2067,7 +2067,10 @@ def run_fast_path(
         None if fast path not applicable
     """
     import time
-    from curve_classifier_integration import predict_operators
+    try:
+        from curve_classifier_integration import predict_operators
+    except ImportError:
+        from scripts.curve_classifier_integration import predict_operators
     
     start_time = time.time()
     

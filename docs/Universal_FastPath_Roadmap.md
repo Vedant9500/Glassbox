@@ -43,7 +43,13 @@ The current classifier + basis regression is very fast, but tied to basis covera
 
 ## Implementation Plan
 
-### Phase 0: Baseline and Interface Freeze (3-5 days)
+### Status
+- Phase 0: COMPLETE
+- Phase 1: IN PROGRESS
+- Phase 2: NOT STARTED
+- Phase 3: NOT STARTED
+
+### Phase 0: Baseline and Interface Freeze (3-5 days) [COMPLETE]
 - Freeze current baseline metrics (exact recovery, structural correctness, runtime, fail taxonomy).
 - Define `FPIPv2` schema and add validation tests.
 - Add feature flag to run old/new fast path side-by-side.
@@ -52,18 +58,23 @@ Deliverables:
 - Baseline report artifact.
 - `FPIPv2` typed schema and unit tests.
 
-### Phase 1: Universal Proposer MVP (1-2 weeks)
+### Phase 1: Universal Proposer MVP (1-2 weeks) [IN PROGRESS]
 - Build training pipeline for universal proposer.
 - Add grammar-constrained decoder for valid skeleton generation.
 - Emit top-K candidates + uncertainty + priors.
 - Keep latency target under ~400ms inference for proposer.
+
+Progress update:
+- Completed: Phase 1 scaffold created (`glassbox/sr/universal_proposer.py`, `scripts/train_universal_proposer.py`) with unit tests.
+- Completed: proposer -> `FPIPv2` adapter implemented and validated in tests.
+- Next: replace fixed skeleton vocabulary decoder with richer grammar-constrained decoding and dataset-backed training.
 
 Deliverables:
 - New training script and model artifact format.
 - Inference API that returns `FPIPv2` payload.
 - Benchmarks vs current classifier on OOD slices.
 
-### Phase 2: Evolution Integration (1-2 weeks)
+### Phase 2: Evolution Integration (1-2 weeks) [NOT STARTED]
 - Inject top-K skeletons into evolution seeds.
 - Wire proposer uncertainty into prior blending and budget routing.
 - Add fallback logic: if proposer fails, keep legacy path and existing evolution behavior.
@@ -72,7 +83,7 @@ Deliverables:
 - End-to-end pipeline with dual-path routing.
 - Regression tests for routing and seed injection.
 
-### Phase 3: Validation and A/B Rollout (1 week)
+### Phase 3: Validation and A/B Rollout (1 week) [NOT STARTED]
 - Compare three modes:
   - Legacy fast path only
   - Universal proposer only
@@ -113,7 +124,7 @@ Suggested initial milestones on branch:
   - Mitigation: broaden grammar, curriculum, and OOD validation sets.
 
 ## Immediate Next Tasks
-1. Define `FPIPv2` schema and tests.
-2. Scaffold proposer training/inference module.
-3. Add dual-path feature flag and logging for side-by-side runs.
-4. Run first A/B on feynman_easy + current benchmark suite.
+1. Implement richer grammar-constrained skeleton decoding (top-K output).
+2. Add dataset-backed proposer training path (beyond synthetic scaffold).
+3. Add dual-path feature flag and logging for side-by-side proposer vs legacy runs.
+4. Run first proposer-only benchmark slice on feynman_easy + OOD subset.
