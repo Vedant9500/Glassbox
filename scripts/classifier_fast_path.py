@@ -18,6 +18,7 @@ import torch
 from typing import Any, Dict, List, Tuple, Optional
 
 from glassbox.sr.meta_ops import get_constant_symbol, normalize_formula_ascii
+from glassbox.sr.fpip_v2 import build_fpip_v2_from_fast_path, validate_fpip_v2_payload
 
 # Thread-safe CUDA warning state
 _warned_no_cuda = False
@@ -2101,7 +2102,7 @@ def run_fast_path(
         print("="*60)
         y_pred = np.full_like(y_np, const_val, dtype=np.float64)
         residual_diagnostics = _residual_diagnostics(y_np, y_pred, x_np)
-        return {
+        result = {
             'formula': formula,
             'mse': 0.0,
             'time': elapsed,
@@ -2130,6 +2131,21 @@ def run_fast_path(
                                'powers': [], 'has_rational': False,
                                'has_exp_decay': False, 'active_terms': ['1']},
         }
+        fpip_v2 = build_fpip_v2_from_fast_path(
+            formula=result['formula'],
+            mse=result['mse'],
+            candidate_formulas=result.get('candidate_formulas', []),
+            predictions=result.get('predictions', {}),
+            uncertainty=result.get('uncertainty', {}),
+            residual_diagnostics=result.get('residual_diagnostics', {}),
+            operator_hints=result.get('operator_hints', {}),
+        )
+        fpip_ok, fpip_errors = validate_fpip_v2_payload(fpip_v2)
+        result['fpip_v2'] = fpip_v2
+        result['fpip_v2_valid'] = fpip_ok
+        if not fpip_ok:
+            result['fpip_v2_errors'] = fpip_errors
+        return result
     
     predictions = predict_operators(
         x_np,
@@ -2256,7 +2272,7 @@ def run_fast_path(
     operator_hints = extract_operator_hints(formula, details.get('basis_names', []), 
                                             details.get('coefficients', []))
     
-    return {
+    result = {
         'formula': formula,
         'formula_raw': raw_formula,
         'mse': mse,
@@ -2269,6 +2285,23 @@ def run_fast_path(
         'simplification': simplification_info,
         'operator_hints': operator_hints,
     }
+
+    fpip_v2 = build_fpip_v2_from_fast_path(
+        formula=result['formula'],
+        mse=result['mse'],
+        candidate_formulas=result.get('candidate_formulas', []),
+        predictions=result.get('predictions', {}),
+        uncertainty=result.get('uncertainty', {}),
+        residual_diagnostics=result.get('residual_diagnostics', {}),
+        operator_hints=result.get('operator_hints', {}),
+    )
+    fpip_ok, fpip_errors = validate_fpip_v2_payload(fpip_v2)
+    result['fpip_v2'] = fpip_v2
+    result['fpip_v2_valid'] = fpip_ok
+    if not fpip_ok:
+        result['fpip_v2_errors'] = fpip_errors
+
+    return result
 
 
 def extract_operator_hints(
