@@ -197,8 +197,8 @@ def train_epoch(model, dataloader, optimizer, criterion, device, max_grad_norm: 
     n_batches = 0
     
     for x_batch, y_batch in dataloader:
-        x_batch = x_batch.to(device)
-        y_batch = y_batch.to(device)
+        x_batch = x_batch.to(device, non_blocking=True)
+        y_batch = y_batch.to(device, non_blocking=True)
         
         optimizer.zero_grad()
         logits = model(x_batch)
@@ -235,8 +235,8 @@ def evaluate(
     
     with torch.no_grad():
         for x_batch, y_batch in dataloader:
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
+            x_batch = x_batch.to(device, non_blocking=True)
+            y_batch = y_batch.to(device, non_blocking=True)
             
             logits = model(x_batch)
             loss = criterion(logits, y_batch)
@@ -814,11 +814,19 @@ def main():
     val_dataset = IndexedFeatureDataset(features, labels, val_idx, scaler=scaler)
     
     # Use pin_memory for GPU and num_workers for parallel data loading
+    # optimized to use more available CPU cores and persistent workers
+    import os
     use_cuda = device.type == 'cuda'
+    num_cpus = os.cpu_count() or 4
+    n_workers = min(12, max(2, num_cpus - 2)) if use_cuda else 0
+    
     loader_kwargs = {
-        'num_workers': 4 if use_cuda else 0,
+        'num_workers': n_workers,
         'pin_memory': use_cuda,
     }
+    if n_workers > 0:
+        loader_kwargs['prefetch_factor'] = 4
+        loader_kwargs['persistent_workers'] = True
     
     train_loader = DataLoader(
         train_dataset, 

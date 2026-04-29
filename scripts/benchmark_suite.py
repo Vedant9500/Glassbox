@@ -564,10 +564,10 @@ def _guided_evolution_decision(
 
 
 SCORE_SYMBOLS = {
-    "EXACT":  "✅",
-    "APPROX": "🟡",
-    "LOOSE":  "🟠",
-    "FAIL":   "❌",
+    "EXACT":  "[PASS]",
+    "APPROX": "[APPROX]",
+    "LOOSE":  "[LOOSE]",
+    "FAIL":   "[FAIL]",
 }
 
 
@@ -1224,15 +1224,19 @@ Examples:
 
     for tier_num in sorted(tiers_to_run):
         tier_name, formulas = ALL_TIERS[tier_num]
-        print(f"\n{'─' * 90}")
+        print(f"\n{'-' * 90}")
         print(f"  TIER {tier_num}: {tier_name}  ({len(formulas)} formulas)")
-        print(f"{'─' * 90}")
+        print(f"{'-' * 90}")
 
         tier_results = []
         for formula_str, human_name, x_range in formulas:
             formula_idx += 1
             if not args.quiet:
-                print(f"  [{formula_idx}/{total_formulas}] {human_name:<30} ", end="", flush=True)
+                try:
+                    print(f"  [{formula_idx}/{total_formulas}] {human_name:<30} ", end="", flush=True)
+                except UnicodeEncodeError:
+                    human_name = human_name.encode('ascii', 'ignore').decode('ascii')
+                    print(f"  [{formula_idx}/{total_formulas}] {human_name:<30} ", end="", flush=True)
 
             if args.cpp_evolution_only:
                 result = run_formula_cpp_evolution(

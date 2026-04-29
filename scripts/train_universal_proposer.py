@@ -8,7 +8,13 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 from typing import List, Tuple, Optional
+
+# Add the repository root to sys.path so we can import glassbox
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import numpy as np
 import torch
@@ -170,9 +176,9 @@ def _train_epoch(model, loader, optimizer, device) -> Tuple[float, float]:
     correct = 0
 
     for points, op_target, skeleton_target in loader:
-        points = points.to(device)
-        op_target = op_target.to(device)
-        skeleton_target = skeleton_target.to(device)
+        points = points.to(device, non_blocking=True)
+        op_target = op_target.to(device, non_blocking=True)
+        skeleton_target = skeleton_target.to(device, non_blocking=True)
 
         out = model(points)
         op_loss = F.binary_cross_entropy_with_logits(out["operator_logits"], op_target)
@@ -225,7 +231,21 @@ def main():
     else:
         ds = SyntheticCurveDataset(n_samples=args.n_samples, n_points=args.n_points)
         print(f"dataset=SyntheticCurveDataset samples={len(ds)}")
-    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True)
+        
+    import os
+    use_cuda = device.type == 'cuda'
+    num_cpus = os.cpu_count() or 4
+    n_workers = min(12, max(2, num_cpus - 2)) if use_cuda else 0
+    
+    loader_kwargs = {
+        'num_workers': n_workers,
+        'pin_memory': use_cuda,
+    }
+    if n_workers > 0:
+        loader_kwargs['prefetch_factor'] = 4
+        loader_kwargs['persistent_workers'] = True
+
+    loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 

@@ -76,7 +76,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         cv_skip_guard_max_r2_std=0.03,
         cv_skip_guard_min_samples=45,
         use_universal_proposer="auto",
-        universal_proposer_path="models/universal_proposer_mvp.pt",
+        universal_proposer_path="models/universal_proposer_v1.pt",
         universal_proposer_shadow_mode="auto",
         universal_proposer_log_routing=True,
         universal_proposer_top_k=5,
