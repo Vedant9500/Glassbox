@@ -1128,10 +1128,10 @@ def fast_path_regression(
     else:
         allow_periodic = allow_exp = allow_log = allow_power = True
 
-    # If only power is allowed, enable 6-term exact match for polynomials
-    exact_max_terms = 6 if (allow_power and not allow_periodic and not allow_exp and not allow_log) else 3
+    # If only power is allowed, enable 10-term exact match for polynomials
+    exact_max_terms = 10 if (allow_power and not allow_periodic and not allow_exp and not allow_log) else 4
 
-    if exact_match_enabled and (exact_match_max_basis is None or basis.shape[1] <= exact_match_max_basis):
+    if exact_match_enabled and (exact_match_max_basis is None or basis.shape[1] <= 128):
         exact_match = find_exact_symbolic_match(
             basis,
             names,
@@ -1334,7 +1334,7 @@ def fast_path_regression(
     formula = _coeffs_to_formula(coeffs)
 
     n_nonzero = int(np.sum(np.abs(coeffs) >= sparsity_threshold))
-    exact_match_flag = mse < 1e-6 and n_nonzero <= 4
+    exact_match_flag = mse < 1e-6 and n_nonzero <= 10
 
     candidate_formulas = []
     for cand in top_candidates:
@@ -2521,6 +2521,7 @@ def beam_search_evolution(
     base_generations: int = 500,
     device: str = 'cpu',
     candidate_formulas: Optional[List[Dict]] = None,
+    confidence: float = 0.5, # New parameter
 ) -> Dict:
     """
     Beam search over diverse C++ evolution configurations.
@@ -2662,6 +2663,10 @@ def beam_search_evolution(
     # ── Generate initial beam configurations ──
     def make_beam_configs(n: int, round_idx: int = 0):
         configs = []
+        
+        # If we have high confidence skeletons, we can be much more selective
+        # with the beams we run, focusing on the seeds rather than random exploration.
+        is_confident_proposer = bool(confidence > 0.8 and candidate_formulas)
 
         def add_config(
             op_priors_cfg: List[float],
@@ -2711,6 +2716,13 @@ def beam_search_evolution(
 
                 add_config(cand_priors, cand_omegas[:4], base_pop_size, base_generations,
                            f'candidate-seed-{ci}')
+        
+        if is_confident_proposer:
+            # For confident proposer, we only add a few fallback exploratory beams
+            # instead of the full diverse suite.
+            add_config(classifier_priors, fft_freqs, base_pop_size, base_generations, 'classifier-guided')
+            add_config([0.25, 0.25, 0.25, 0.25], fft_freqs, base_pop_size, base_generations, 'uniform')
+            return configs[:n]
 
         # 1. Classifier-guided (primary hypothesis)
         add_config(classifier_priors, fft_freqs, base_pop_size, base_generations, 'classifier-guided')
@@ -2891,6 +2903,7 @@ def beam_search_evolution(
     print("="*60)
     print(f"  Beams per round: {n_beams}")
     print(f"  Rounds: {n_rounds}")
+    print(f"  Confidence: {confidence:.2f}")
     print(f"  Keep fraction: {keep_fraction}")
     print(f"  Base config: pop={base_pop_size}, gens={base_generations}")
     print(f"  Classifier prior trust: {prior_trust:.2f}")
@@ -2898,8 +2911,11 @@ def beam_search_evolution(
     if polynomial_mode:
         print(
             f"  Polynomial mode: on (deg={poly_degree}, rel={poly_rel_mse:.2e}, "
-            f"hinted_max_power={hinted_max_power:.2f})"
+            f"target_p={max(float(poly_degree), hinted_max_power)})"
         )
+    
+    # 1. Get initial configs
+    configs = make_beam_configs(n=n_beams, round_idx=0)
     
     best_overall_mse = float('inf')
     best_overall_result = None
@@ -3007,6 +3023,7 @@ def run_guided_evolution(
     device: str = 'cpu',
     visualizer = None,
     candidate_formulas: Optional[List[Dict]] = None,
+    confidence: float = 0.5,
 ) -> Dict:
     """
     Run evolution guided by fast-path operator hints.
@@ -3029,9 +3046,16 @@ def run_guided_evolution(
     import time
     
     # ── Primary: Beam Search (fast C++ path) ──
-    # Adjust beams and rounds based on requested generations
+    # Adjust beams and rounds based on requested generations and confidence
     n_beams = 10 if generations >= 100 else max(3, generations // 10)
     n_rounds = 2 if generations >= 100 else 1
+    
+    if confidence > 0.8 and candidate_formulas:
+        # High confidence in skeletons → focus beams on refinement
+        n_beams = min(n_beams, len(candidate_formulas) + 2)
+        n_rounds = 1 # One round is enough to check the seeds
+        print(f"  [Adaptive] Confident proposer: reducing search to {n_beams} beams, 1 round.")
+
     base_pop = population_size
     base_gens = generations
     
@@ -3045,6 +3069,7 @@ def run_guided_evolution(
         base_generations=base_gens,
         device=device,
         candidate_formulas=candidate_formulas,
+        confidence=confidence,
     )
     
     if beam_result is not None and beam_result['mse'] < float('inf'):

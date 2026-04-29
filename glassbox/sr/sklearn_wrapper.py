@@ -61,7 +61,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         use_guided_evolution=True,
         use_simplification=True,
         classifier_path="models/curve_classifier_v3.1.pt",
-        simplification_int_tol=0.01,
+        simplification_int_tol=0.05,
         simplification_zero_tol=1e-3,
         max_power=6,
         timeout=120,
@@ -174,14 +174,23 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     if np.isfinite(ent) and np.isfinite(mar):
                         # High confidence (low entropy, high margin) → shrink budget
                         confidence = float(np.clip((1.0 - ent) * min(mar / 0.25, 1.0), 0.0, 1.0))
-                        # Map confidence ∈ [0,1] to multiplier ∈ [0.3, 1.0]
-                        uncertainty_scale = 1.0 - 0.7 * confidence
+                        
+                        # Map confidence ∈ [0,1] to multiplier ∈ [0.1, 1.0] (more aggressive than 0.3)
+                        uncertainty_scale = 1.0 - 0.9 * confidence
                         score *= uncertainty_scale
                 except (TypeError, ValueError):
                     pass
             elif uncertain_flag:
-                # Uncertain → give more time
-                score *= 1.3
+                # Uncertain → give more time, but cap the escalation
+                score *= 1.2
+
+        # ── Proposer-specific budget scaling ──
+        # If we have skeletons, we expect faster convergence.
+        if getattr(self, 'universal_proposer_fpip_v2_', None):
+            payload = self.universal_proposer_fpip_v2_
+            if payload.get('valid') and payload.get('candidate_skeletons'):
+                # We have seeds! Reduce base budget because we aren't starting from scratch.
+                score *= 0.7
 
         budget = base_timeout * score
         return float(np.clip(budget, float(self.min_compute_budget), float(self.max_compute_budget)))
@@ -537,8 +546,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 not math.isfinite(best_mse) or
                 current_r2 < self.evolution_skip_r2 or
                 not fast_path_cv_ok or
-                proposer_forces_evolution or
-                term_count > 8
+                term_count > 10 # Higher threshold for Stage 1 bloat
             )
 
         # Uncertainty-coupled budget routing: pass FPIP uncertainty metrics
@@ -608,6 +616,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             # Prepare skeletons as candidate formulas
                             proposer_skeletons = self.universal_proposer_fpip_v2_.get("candidate_skeletons", [])
                             candidate_formulas = []
+                            
+                            # Always include the fast-path result for refinement
+                            if best_formula:
+                                candidate_formulas.append({
+                                    "formula": best_formula,
+                                    "mse": best_mse or float('inf'),
+                                    "from_fast_path": True
+                                })
+
                             for cand in proposer_skeletons:
                                 formula_str = cand.get("formula", "")
                                 if formula_str:
@@ -623,17 +640,37 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         else:
                             candidate_formulas = None
 
-                        guided_result = run_guided_evolution(
-                            x_t, y_t, hints,
-                            generations=min(40, self.generations // 10),
-                            population_size=min(30, self.population_size),
-                            device=self.device or "cpu",
-                            candidate_formulas=candidate_formulas,
-                        )
+                        # Check if any proposer skeleton is ALREADY a very good fit
+                        # to avoid launching evolution if we just need minor constant refinement.
+                        best_cand_mse = float('inf')
+                        for cand in candidate_formulas:
+                            if cand.get('mse', float('inf')) < best_cand_mse:
+                                best_cand_mse = cand['mse']
+                        
+                        # Short-circuit: if a proposer skeleton is already better than fast-path 
+                        # and very good, we can skip full evolution and just use it.
+                        if best_cand_mse < 1e-6 and best_cand_mse < (best_mse or float('inf')):
+                            print(f"  [Proposer] Rapid hit (MSE={best_cand_mse:.2e}), using skeleton directly.")
+                            best_formula = candidate_formulas[0]['formula']
+                            best_mse = best_cand_mse
+                            need_evolution = False 
+                        else:
+                            # Pass proposer uncertainty to guide beam count
+                            p_unc = self.universal_proposer_fpip_v2_.get("sequence_uncertainty", {})
+                            confidence = 1.0 - p_unc.get("entropy", 0.5)
 
-                        if guided_result and guided_result.get('formula'):
-                            evo_formula = guided_result['formula']
-                            evo_mse = guided_result.get('mse', float('inf'))
+                            guided_result = run_guided_evolution(
+                                x_t, y_t, hints,
+                                generations=min(40, self.generations // 10),
+                                population_size=min(30, self.population_size),
+                                device=self.device or "cpu",
+                                candidate_formulas=candidate_formulas,
+                                confidence=confidence, # New parameter
+                            )
+
+                            if guided_result and guided_result.get('formula'):
+                                evo_formula = guided_result['formula']
+                                evo_mse = guided_result.get('mse', float('inf'))
                     except Exception as e:
                         print(f"  [Guided evolution skipped: {e}]")
 

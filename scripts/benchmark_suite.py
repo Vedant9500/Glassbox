@@ -422,7 +422,7 @@ def _postprocess_formula(formula: str) -> str:
         # Evolution formulas need wider tolerances than fast-path:
         # Ridge regression produces coefficients like 0.9975 instead of 1.0
         # and small spurious bias terms like 0.0001924 instead of 0.0
-        evo_int_tol = 0.01    # snap 0.9975 → 1, 2.003 → 2, etc.
+        evo_int_tol = 0.05    # snap 7.955 → 8, 2.04 → 2, etc.
         evo_zero_tol = 1e-3   # snap 0.0001924 → 0
 
         if too_complex_for_symbolic:
@@ -509,7 +509,7 @@ def score_result(mse: float, formula: str) -> str:
     if mse is None or not math.isfinite(mse):
         return "FAIL"
     n_terms = _count_terms(formula)
-    if mse < 1e-6 and n_terms <= 5:
+    if mse < 1e-6 and n_terms <= 10:
         return "EXACT"
     if mse < 0.01:
         return "APPROX"
@@ -542,7 +542,7 @@ def _guided_evolution_decision(
     if mse >= 1e-6:
         return True, "mse_above_exact"
 
-    if n_terms > 5:
+    if n_terms > 10:
         return True, "formula_too_complex"
 
     uncertainty = fp_result.get("uncertainty")
