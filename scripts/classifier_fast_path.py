@@ -2955,7 +2955,7 @@ def beam_search_evolution(
         
         # Early exit if we found essentially perfect MSE
         if best_overall_mse < 1e-10:
-            print("  \u2705 Perfect MSE achieved, stopping early!")
+            print("  [PASS] Perfect MSE achieved, stopping early!")
             break
         
         # Keep top fraction as winners for next round

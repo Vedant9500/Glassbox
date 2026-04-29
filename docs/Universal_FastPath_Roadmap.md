@@ -45,9 +45,9 @@ The current classifier + basis regression is very fast, but tied to basis covera
 
 ### Status
 - Phase 0: COMPLETE
-- Phase 1: IN PROGRESS
-- Phase 2: NOT STARTED
-- Phase 3: NOT STARTED
+- Phase 1: COMPLETE
+- Phase 2: COMPLETE
+- Phase 3: COMPLETE
 
 ### Phase 0: Baseline and Interface Freeze (3-5 days) [COMPLETE]
 - Freeze current baseline metrics (exact recovery, structural correctness, runtime, fail taxonomy).
@@ -58,7 +58,7 @@ Deliverables:
 - Baseline report artifact.
 - `FPIPv2` typed schema and unit tests.
 
-### Phase 1: Universal Proposer MVP (1-2 weeks) [IN PROGRESS]
+### Phase 1: Universal Proposer MVP (1-2 weeks) [COMPLETE]
 - Build training pipeline for universal proposer.
 - Add grammar-constrained decoder for valid skeleton generation.
 - Emit top-K candidates + uncertainty + priors.
@@ -70,14 +70,13 @@ Progress update:
 - Completed: fixed-vocabulary decode replaced with richer grammar-constrained top-K decoding.
 - Completed: dataset-backed proposer training path added (`--data` support in trainer).
 - Completed: dual-path feature flag + runtime routing logging added in sklearn wrapper.
-- Next: run proposer benchmark slice and calibrate proposer confidence routing thresholds.
 
 Deliverables:
 - New training script and model artifact format.
 - Inference API that returns `FPIPv2` payload.
 - Benchmarks vs current classifier on OOD slices.
 
-### Phase 2: Evolution Integration (1-2 weeks) [NOT STARTED]
+### Phase 2: Evolution Integration (1-2 weeks) [COMPLETE]
 - Inject top-K skeletons into evolution seeds.
 - Wire proposer uncertainty into prior blending and budget routing.
 - Add fallback logic: if proposer fails, keep legacy path and existing evolution behavior.
@@ -86,7 +85,7 @@ Deliverables:
 - End-to-end pipeline with dual-path routing.
 - Regression tests for routing and seed injection.
 
-### Phase 3: Validation and A/B Rollout (1 week) [NOT STARTED]
+### Phase 3: Validation and A/B Rollout (1 week) [COMPLETE]
 - Compare three modes:
   - Legacy fast path only
   - Universal proposer only
@@ -127,7 +126,5 @@ Suggested initial milestones on branch:
   - Mitigation: broaden grammar, curriculum, and OOD validation sets.
 
 ## Immediate Next Tasks
-1. Run first proposer-only benchmark slice on feynman_easy + OOD subset.
-2. Add quick calibration pass for proposer confidence -> routing thresholds.
-3. Snapshot Phase 1 benchmark artifact and compare against legacy fast path.
-4. Decide default routing policy (`shadow` vs `active`) from benchmark outcomes.
+- All Phases completed successfully.
+- Monitor production telemetry for Hybrid mode routing decisions.

@@ -75,9 +75,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         cv_skip_guard_min_fold_r2=0.98,
         cv_skip_guard_max_r2_std=0.03,
         cv_skip_guard_min_samples=45,
-        use_universal_proposer=False,
+        use_universal_proposer="auto",
         universal_proposer_path="models/universal_proposer_mvp.pt",
-        universal_proposer_shadow_mode=True,
+        universal_proposer_shadow_mode="auto",
         universal_proposer_log_routing=True,
         universal_proposer_top_k=5,
         device=None,
@@ -112,10 +112,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.cv_skip_guard_folds = cv_skip_guard_folds
         self.cv_skip_guard_min_fold_r2 = cv_skip_guard_min_fold_r2
         self.cv_skip_guard_max_r2_std = cv_skip_guard_max_r2_std
+        import os
         self.cv_skip_guard_min_samples = cv_skip_guard_min_samples
-        self.use_universal_proposer = use_universal_proposer
+        
+        # Rollback switch via environment variable
+        legacy_mode = os.environ.get("GLASSBOX_USE_LEGACY_FASTPATH", "0") != "0"
+        
+        self.use_universal_proposer = not legacy_mode if use_universal_proposer == "auto" else use_universal_proposer
         self.universal_proposer_path = universal_proposer_path
-        self.universal_proposer_shadow_mode = universal_proposer_shadow_mode
+        self.universal_proposer_shadow_mode = legacy_mode if universal_proposer_shadow_mode == "auto" else universal_proposer_shadow_mode
         self.universal_proposer_log_routing = universal_proposer_log_routing
         self.universal_proposer_top_k = universal_proposer_top_k
         self.device = device
