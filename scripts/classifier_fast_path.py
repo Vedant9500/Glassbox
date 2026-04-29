@@ -3029,14 +3029,20 @@ def run_guided_evolution(
     import time
     
     # ── Primary: Beam Search (fast C++ path) ──
+    # Adjust beams and rounds based on requested generations
+    n_beams = 10 if generations >= 100 else max(3, generations // 10)
+    n_rounds = 2 if generations >= 100 else 1
+    base_pop = population_size
+    base_gens = generations
+    
     beam_result = beam_search_evolution(
         x, y,
         operator_hints,
-        n_beams=10,
-        n_rounds=2,
+        n_beams=n_beams,
+        n_rounds=n_rounds,
         keep_fraction=0.3,
-        base_pop_size=30,
-        base_generations=200,
+        base_pop_size=base_pop,
+        base_generations=base_gens,
         device=device,
         candidate_formulas=candidate_formulas,
     )

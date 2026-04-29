@@ -770,7 +770,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             for i, fn in enumerate(term_funcs):
                 args = [X[:, j] for j in range(self.n_features_in_)]
                 args.append(X[:, 0]) # for 'x' fallback
-                val = fn(*args)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    val = fn(*args)
                 if isinstance(val, (int, float)):
                     Z[:, i] = np.full(N, val)
                 else:

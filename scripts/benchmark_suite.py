@@ -571,6 +571,13 @@ SCORE_SYMBOLS = {
 }
 
 
+_PROPOSER_CACHE = {}
+def _get_proposer(path: str, device: str):
+    if path not in _PROPOSER_CACHE:
+        from glassbox.sr.universal_proposer import load_universal_proposer_checkpoint
+        _PROPOSER_CACHE[path] = load_universal_proposer_checkpoint(path, device=device)
+    return _PROPOSER_CACHE[path]
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -584,6 +591,8 @@ def run_formula(
     timeout: float = 60.0,
     with_evolution: bool = False,
     evolution_only: bool = False,
+    proposer_path: Optional[str] = None,
+    disable_proposer: bool = False,
 ) -> Dict[str, Any]:
     """Run fast-path and/or guided evolution on a single formula."""
     x_min, x_max = x_range
@@ -734,16 +743,48 @@ def run_formula(
             operator_hints["active_terms"] = list(operator_hints.get("active_terms", []))
             operator_hints["uncertainty"] = fp_result.get("uncertainty") if fp_result else None
 
+            candidate_formulas = None
+            if not disable_proposer and proposer_path:
+                try:
+                    from glassbox.sr.universal_proposer import propose_fpip_v2_from_xy
+                    model = _get_proposer(proposer_path, device)
+                    payload = propose_fpip_v2_from_xy(
+                        model, x=x_np, y=y_np, top_k=5, device=device
+                    )
+                    if payload and payload.get("valid"):
+                        proposer_priors = payload.get("operator_priors", {})
+                        if proposer_priors:
+                            for op, prob in proposer_priors.items():
+                                if prob > 0.15:
+                                    operator_hints["operators"].add(op)
+                        proposer_skeletons = payload.get("candidate_skeletons", [])
+                        candidate_formulas = []
+                        for cand in proposer_skeletons:
+                            f_str = cand.get("formula", "")
+                            if f_str:
+                                active = [t.strip() for t in f_str.replace("-", "+").split("+") if t.strip()]
+                                candidate_formulas.append({
+                                    "formula": f_str,
+                                    "mse": cand.get("mse", float("inf")),
+                                    "score": cand.get("score", 0.0),
+                                    "active_terms": active,
+                                    "from_proposer": True
+                                })
+                        if candidate_formulas:
+                            print(f"\n  [Universal Proposer] Active FPIPv2 metadata injected! Skeletons: {[c['formula'] for c in candidate_formulas]}")
+                except Exception as e:
+                    print(f"\n  [Universal Proposer] Warning: execution failed: {e}")
+
             t1 = time.time()
             try:
                 guided_result = run_guided_evolution(
                     x_2d,
                     y_2d,
                     operator_hints,
-                    generations=40,
-                    population_size=30,
-                    device=device or "cpu",
-                    visualizer=None,
+                    generations=500,
+                    population_size=100,
+                    device=device,
+                    candidate_formulas=candidate_formulas,
                 )
 
                 guided_elapsed = time.time() - t1
@@ -1107,6 +1148,14 @@ Examples:
         help="Path to the curve classifier model (default: models/curve_classifier_v3.1.pt)",
     )
     parser.add_argument(
+        "--proposer-model", type=str, default="models/universal_proposer_v1.pt",
+        help="Path to the universal neural proposer model (default: models/universal_proposer_v1.pt)",
+    )
+    parser.add_argument(
+        "--disable-proposer", action="store_true",
+        help="Disable the neural proposer and rely purely on legacy classifier hints",
+    )
+    parser.add_argument(
         "--with-evolution", action="store_true",
         help="Run latest guided evolution (beam-search path) when fast-path is not exact",
     )
@@ -1154,6 +1203,10 @@ Examples:
         "--generations", type=int, default=1000,
         help="Generations for C++ evolution (default: 1000, used with --cpp-evolution-only)",
     )
+    parser.add_argument(
+        "--runs", type=int, default=1,
+        help="Number of times to run each formula. Returns best result. (default: 1)",
+    )
     args = parser.parse_args()
 
     if args.cpp_evolution_only and args.evolution_only:
@@ -1197,11 +1250,11 @@ Examples:
     print("GLASSBOX SR BENCHMARK SUITE")
     print("=" * 90)
     if args.cpp_evolution_only:
-        mode_str = "C++ Evolution Only"
+        mode_str = "Pure C++ Evolution (No Classifier/Proposer)"
     elif args.evolution_only:
         mode_str = "Guided Evolution Only (latest path)"
     else:
-        mode_str = "Classifier Fast-Path"
+        mode_str = "Hybrid Fast-Path"
     print(f"  Mode:        {mode_str}")
     if args.cpp_evolution_only:
         print(f"  Pop size:    {args.pop_size}")
@@ -1210,6 +1263,8 @@ Examples:
         print("  Strategy:    guided beam-search evolution")
     else:
         print(f"  Classifier:  {args.classifier_model}")
+        proposer_txt = args.proposer_model if not args.disable_proposer else "DISABLED"
+        print(f"  Proposer:    {proposer_txt}")
         print("  Strategy:    optimized")
     print(f"  Device:      {device}")
     print(f"  Tiers:       {tiers_to_run}")
@@ -1238,27 +1293,45 @@ Examples:
                     human_name = human_name.encode('ascii', 'ignore').decode('ascii')
                     print(f"  [{formula_idx}/{total_formulas}] {human_name:<30} ", end="", flush=True)
 
-            if args.cpp_evolution_only:
-                result = run_formula_cpp_evolution(
-                    formula_str,
-                    x_range,
-                    n_samples=args.n_samples,
-                    pop_size=args.pop_size,
-                    generations=args.generations,
-                    device=device,
-                )
-            else:
-                result = run_formula(
-                    formula_str,
-                    x_range,
-                    classifier_path=args.classifier_model,
-                    n_samples=args.n_samples,
-                    device=device,
-                    timeout=args.timeout,
-                    with_evolution=args.with_evolution,
-                    evolution_only=args.evolution_only,
-                )
-
+            best_result = None
+            
+            for _ in range(args.runs):
+                if args.cpp_evolution_only:
+                    result = run_formula_cpp_evolution(
+                        formula_str,
+                        x_range,
+                        n_samples=args.n_samples,
+                        pop_size=args.pop_size,
+                        generations=args.generations,
+                        device=device,
+                    )
+                else:
+                    result = run_formula(
+                        formula_str,
+                        x_range,
+                        classifier_path=args.classifier_model,
+                        n_samples=args.n_samples,
+                        device=device,
+                        timeout=args.timeout,
+                        with_evolution=args.with_evolution,
+                        evolution_only=args.evolution_only,
+                        proposer_path=args.proposer_model,
+                        disable_proposer=args.disable_proposer,
+                    )
+                
+                # Keep the best result based on displayed MSE (or just any valid MSE if best_result is None)
+                if best_result is None:
+                    best_result = result
+                else:
+                    # Compare MSE
+                    best_mse = best_result.get("mse")
+                    curr_mse = result.get("mse")
+                    if best_mse is None or math.isnan(best_mse):
+                        best_result = result
+                    elif curr_mse is not None and not math.isnan(curr_mse) and curr_mse < best_mse:
+                        best_result = result
+                        
+            result = best_result
             result["human_name"] = human_name
             tier_results.append(result)
 
@@ -1286,7 +1359,7 @@ Examples:
         # Print tier subtotal
         s = _tier_summary(tier_results)
         pct = (s["EXACT"] / s["total"] * 100) if s["total"] > 0 else 0
-        print(f"  ── Tier {tier_num} subtotal: {s['EXACT']}/{s['total']} exact ({pct:.0f}%)")
+        print(f"  -- Tier {tier_num} subtotal: {s['EXACT']}/{s['total']} exact ({pct:.0f}%)")
 
     total_time = time.time() - t_start
 
