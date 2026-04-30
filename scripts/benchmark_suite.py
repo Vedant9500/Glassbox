@@ -744,6 +744,7 @@ def run_formula(
             operator_hints["uncertainty"] = fp_result.get("uncertainty") if fp_result else None
 
             candidate_formulas = None
+            proposer_confidence = 0.5
             if not disable_proposer and proposer_path:
                 try:
                     from glassbox.sr.universal_proposer import propose_fpip_v2_from_xy
@@ -752,6 +753,10 @@ def run_formula(
                         model, x=x_np, y=y_np, top_k=5, device=device
                     )
                     if payload and payload.get("valid"):
+                        seq_unc = payload.get("sequence_uncertainty", {})
+                        if seq_unc.get("confident") is True:
+                            proposer_confidence = 1.0
+                        
                         proposer_priors = payload.get("operator_priors", {})
                         if proposer_priors:
                             for op, prob in proposer_priors.items():
@@ -785,6 +790,7 @@ def run_formula(
                     population_size=100,
                     device=device,
                     candidate_formulas=candidate_formulas,
+                    confidence=proposer_confidence,
                 )
 
                 guided_elapsed = time.time() - t1

@@ -3050,15 +3050,25 @@ def run_guided_evolution(
     n_beams = 10 if generations >= 100 else max(3, generations // 10)
     n_rounds = 2 if generations >= 100 else 1
     
+    base_pop = population_size
+    base_gens = generations
+
     if confidence > 0.8 and candidate_formulas:
         # High confidence in skeletons → focus beams on refinement
         n_beams = min(n_beams, len(candidate_formulas) + 2)
         n_rounds = 1 # One round is enough to check the seeds
-        print(f"  [Adaptive] Confident proposer: reducing search to {n_beams} beams, 1 round.")
+        base_gens = min(base_gens, 150)
+        base_pop = min(base_pop, 50)
+        print(f"  [Adaptive] Confident proposer: reducing search to {n_beams} beams, 1 round, {base_pop} pop, {base_gens} gens.")
+    elif candidate_formulas:
+        # Proposer gave skeletons but isn't super confident
+        # We can still reduce search from full random exploration
+        n_beams = min(n_beams, 7)
+        n_rounds = 1
+        base_gens = min(base_gens, 250)
+        base_pop = min(base_pop, 60)
+        print(f"  [Adaptive] Proposer candidates available: reducing search to {n_beams} beams, 1 round, {base_pop} pop, {base_gens} gens.")
 
-    base_pop = population_size
-    base_gens = generations
-    
     beam_result = beam_search_evolution(
         x, y,
         operator_hints,
