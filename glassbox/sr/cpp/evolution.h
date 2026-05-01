@@ -103,6 +103,94 @@ struct EvolutionConfig {
     bool trace_include_formulas = false;
 };
 
+class DifferentialGramian {
+private:
+    Eigen::MatrixXd G_; // A^T A : size (F+1) x (F+1)
+    Eigen::VectorXd c_; // A^T y : size (F+1)
+    Eigen::ArrayXd y_;  // Target vector reference
+    int n_samples_;
+    int n_features_;
+
+public:
+    void initialize(const std::vector<Eigen::ArrayXd>& cache, const Eigen::ArrayXd& y) {
+        n_features_ = cache.size();
+        n_samples_ = y.size();
+        y_ = y;
+        
+        Eigen::MatrixXd A(n_samples_, n_features_ + 1);
+        for (int i = 0; i < n_features_; ++i) {
+            A.col(i) = cache[i].matrix();
+        }
+        A.col(n_features_).setOnes(); // Bias column
+        
+        G_ = A.transpose() * A;
+        c_ = A.transpose() * y.matrix();
+    }
+
+    void update_nodes(const std::vector<int>& changed_indices, 
+                      const std::vector<Eigen::ArrayXd>& old_cache, 
+                      const std::vector<Eigen::ArrayXd>& new_cache) {
+        if (changed_indices.empty()) return;
+        
+        int k = changed_indices.size();
+        
+        Eigen::MatrixXd delta_A(n_samples_, k);
+        Eigen::MatrixXd new_A_cols(n_samples_, k);
+        Eigen::MatrixXd old_A_cols(n_samples_, k);
+        
+        for (int i = 0; i < k; ++i) {
+            int idx = changed_indices[i];
+            new_A_cols.col(i) = new_cache[idx].matrix();
+            old_A_cols.col(i) = old_cache[idx].matrix();
+            delta_A.col(i) = new_A_cols.col(i) - old_A_cols.col(i);
+        }
+        
+        for (int j = 0; j < n_features_ + 1; ++j) {
+            bool is_changed = false;
+            for (int idx : changed_indices) {
+                if (j == idx) {
+                    is_changed = true;
+                    break;
+                }
+            }
+            if (is_changed) continue;
+            
+            Eigen::VectorXd col_j;
+            if (j == n_features_) {
+                col_j = Eigen::VectorXd::Ones(n_samples_);
+            } else {
+                col_j = old_cache[j].matrix(); 
+            }
+            
+            Eigen::VectorXd cross = delta_A.transpose() * col_j;
+            for (int i = 0; i < k; ++i) {
+                int idx = changed_indices[i];
+                G_(idx, j) += cross(i);
+                G_(j, idx) += cross(i);
+            }
+        }
+        
+        Eigen::MatrixXd block_delta = (new_A_cols.transpose() * new_A_cols) - (old_A_cols.transpose() * old_A_cols);
+        for (int i = 0; i < k; ++i) {
+            for (int j = 0; j < k; ++j) {
+                G_(changed_indices[i], changed_indices[j]) += block_delta(i, j);
+            }
+        }
+        
+        Eigen::VectorXd delta_c = delta_A.transpose() * y_.matrix();
+        for (int i = 0; i < k; ++i) {
+            c_(changed_indices[i]) += delta_c(i);
+        }
+    }
+
+    bool solve_ridge(double lambda, Eigen::VectorXd& w_out) const {
+        Eigen::MatrixXd G_ridge = G_;
+        G_ridge.diagonal().array() += lambda;
+        w_out = G_ridge.ldlt().solve(c_);
+        return w_out.allFinite();
+    }
+};
+
 class EvolutionEngine {
 public:
     EvolutionEngine(const EvolutionConfig& config, 
@@ -1423,7 +1511,6 @@ private:
         const int n_samples = static_cast<int>(y_.size());
         if (n_samples <= 0) return false;
 
-        // Active unary nodes only (same gating as Adam path)
         std::vector<int> active_unary;
         for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
             if (ind.nodes[i].type == NodeType::Unary &&
@@ -1478,7 +1565,6 @@ private:
             return mse;
         };
 
-        // Initialize state from current graph
         Eigen::VectorXd theta = pack_params(ind);
         double lambda = config_.lm_lambda_init;
         IndividualGraph best_snapshot = ind;
@@ -1490,34 +1576,73 @@ private:
         const double fd_eps = 1e-4;
 
         for (int iter = 0; iter < config_.lm_max_iterations; ++iter) {
-            // Evaluate at current theta
             IndividualGraph base_graph = best_snapshot;
             unpack_params(base_graph, theta);
+            
+            std::vector<Eigen::ArrayXd> base_cache;
+            evaluate_graph(base_graph, X_, n_samples, base_cache);
+            
+            DifferentialGramian dg;
+            dg.initialize(base_cache, y_);
+            
             Eigen::VectorXd r;
             double base_mse = evaluate_residual(base_graph, &r);
             if (!std::isfinite(base_mse)) {
                 lambda *= 10.0;
                 continue;
             }
+            
+            int n_features = base_cache.size();
 
-            // Numerical Jacobian of residuals wrt nonlinear params
             Eigen::MatrixXd J(n_samples, n_params);
             J.setZero();
+            
             for (int pidx = 0; pidx < n_params; ++pidx) {
-                Eigen::VectorXd t_plus = theta;
-                Eigen::VectorXd t_minus = theta;
-                t_plus(pidx) += fd_eps;
-                t_minus(pidx) -= fd_eps;
+                int node_idx = active_unary[pidx / 3];
 
+                Eigen::VectorXd t_plus = theta;
+                t_plus(pidx) += fd_eps;
                 IndividualGraph g_plus = base_graph;
                 unpack_params(g_plus, t_plus);
+                
+                std::vector<Eigen::ArrayXd> cache_plus;
+                std::vector<int> changed_plus;
+                evaluate_graph_partial(g_plus, node_idx, base_cache, cache_plus, changed_plus);
+                
+                dg.update_nodes(changed_plus, base_cache, cache_plus);
+                Eigen::VectorXd w_plus;
+                bool success_plus = dg.solve_ridge(1e-5, w_plus);
                 Eigen::VectorXd r_plus;
-                double mse_plus = evaluate_residual(g_plus, &r_plus);
+                double mse_plus = std::numeric_limits<double>::infinity();
+                if (success_plus) {
+                    Eigen::ArrayXd pred_plus = Eigen::ArrayXd::Constant(n_samples, w_plus(n_features));
+                    for (int i = 0; i < n_features; ++i) pred_plus += w_plus(i) * cache_plus[i];
+                    r_plus = (pred_plus - y_).matrix();
+                    mse_plus = r_plus.squaredNorm() / n_samples;
+                }
+                dg.update_nodes(changed_plus, cache_plus, base_cache); // revert
 
+                Eigen::VectorXd t_minus = theta;
+                t_minus(pidx) -= fd_eps;
                 IndividualGraph g_minus = base_graph;
                 unpack_params(g_minus, t_minus);
+                
+                std::vector<Eigen::ArrayXd> cache_minus;
+                std::vector<int> changed_minus;
+                evaluate_graph_partial(g_minus, node_idx, base_cache, cache_minus, changed_minus);
+                
+                dg.update_nodes(changed_minus, base_cache, cache_minus);
+                Eigen::VectorXd w_minus;
+                bool success_minus = dg.solve_ridge(1e-5, w_minus);
                 Eigen::VectorXd r_minus;
-                double mse_minus = evaluate_residual(g_minus, &r_minus);
+                double mse_minus = std::numeric_limits<double>::infinity();
+                if (success_minus) {
+                    Eigen::ArrayXd pred_minus = Eigen::ArrayXd::Constant(n_samples, w_minus(n_features));
+                    for (int i = 0; i < n_features; ++i) pred_minus += w_minus(i) * cache_minus[i];
+                    r_minus = (pred_minus - y_).matrix();
+                    mse_minus = r_minus.squaredNorm() / n_samples;
+                }
+                dg.update_nodes(changed_minus, cache_minus, base_cache); // revert
 
                 if (!std::isfinite(mse_plus) || !std::isfinite(mse_minus)) {
                     J.col(pidx).setZero();
@@ -1528,12 +1653,11 @@ private:
             }
 
             Eigen::MatrixXd H = J.transpose() * J;
-            Eigen::VectorXd g = J.transpose() * r;
+            Eigen::VectorXd g_grad = J.transpose() * r;
 
-            // LM damping
             H.diagonal().array() += lambda;
 
-            Eigen::VectorXd delta = H.ldlt().solve(-g);
+            Eigen::VectorXd delta = H.ldlt().solve(-g_grad);
             if (!delta.allFinite()) {
                 lambda *= 10.0;
                 continue;
@@ -1541,14 +1665,14 @@ private:
 
             if (delta.norm() < 1e-8) break;
 
-            // Trial step
             Eigen::VectorXd theta_trial = theta + delta;
             IndividualGraph trial_graph = base_graph;
             unpack_params(trial_graph, theta_trial);
+            
+            // Trial step evaluation uses full pruned path to ensure validity
             double trial_mse = evaluate_residual(trial_graph, nullptr);
 
             if (std::isfinite(trial_mse) && trial_mse < base_mse) {
-                // Accept
                 theta = theta_trial;
                 best_snapshot = trial_graph;
                 best_mse = trial_mse;
@@ -1556,7 +1680,6 @@ private:
                 lambda = std::max(1e-8, lambda * 0.5);
                 if (best_mse < 1e-12) break;
             } else {
-                // Reject
                 lambda = std::min(1e6, lambda * 2.0);
             }
         }

@@ -82,7 +82,7 @@ def test_run_formula_triggers_guided_on_uncertainty(monkeypatch):
     def _fake_fast_path(*args, **kwargs):
         return {
             "formula": "x",
-            "mse": 0.0,
+            "mse": 1e-8,
             "details": {"n_nonzero": 1, "n_nonzero_simplified": 1},
             "uncertainty": {
                 "prediction_entropy": 0.95,
@@ -99,6 +99,7 @@ def test_run_formula_triggers_guided_on_uncertainty(monkeypatch):
 
     monkeypatch.setattr(bs, "run_fast_path", _fake_fast_path)
     monkeypatch.setattr(bs, "run_guided_evolution", _fake_guided)
+    monkeypatch.setattr(bs, "_evaluate_formula_mse", lambda *a, **k: 1e-8)
 
     result = bs.run_formula(
         formula_str="x",
@@ -120,10 +121,10 @@ def test_run_formula_triggers_guided_on_suspicious_residual(monkeypatch):
     def _fake_fast_path(*args, **kwargs):
         return {
             "formula": "x",
-            "mse": 0.0,
+            "mse": 1e-8,
             "details": {"n_nonzero": 1, "n_nonzero_simplified": 1},
             "uncertainty": {
-                "prediction_entropy": 0.1,
+                "prediction_entropy": 0.5,
                 "prediction_margin": 0.8,
                 "prediction_uncertain": False,
             },
@@ -137,6 +138,7 @@ def test_run_formula_triggers_guided_on_suspicious_residual(monkeypatch):
 
     monkeypatch.setattr(bs, "run_fast_path", _fake_fast_path)
     monkeypatch.setattr(bs, "run_guided_evolution", _fake_guided)
+    monkeypatch.setattr(bs, "_evaluate_formula_mse", lambda *a, **k: 1e-8)
 
     result = bs.run_formula(
         formula_str="x",

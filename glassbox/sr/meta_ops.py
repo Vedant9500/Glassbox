@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict, Union
 import math
 import numpy as np
+import re
 
 
 def safe_numpy_power(x, p):

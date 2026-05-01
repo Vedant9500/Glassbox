@@ -280,8 +280,108 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
     return final_output;
 }
 
+inline void evaluate_graph_partial(const IndividualGraph& graph, 
+                                   int perturbed_node_idx,
+                                   const std::vector<Eigen::ArrayXd>& old_cache,
+                                   std::vector<Eigen::ArrayXd>& new_cache_out,
+                                   std::vector<int>& changed_indices_out) {
+    if (graph.nodes.empty()) return;
+    
+    new_cache_out = old_cache;
+    changed_indices_out.clear();
+    
+    std::vector<bool> changed(graph.nodes.size(), false);
+    changed[perturbed_node_idx] = true;
+    changed_indices_out.push_back(perturbed_node_idx);
+
+    for (size_t i = perturbed_node_idx; i < graph.nodes.size(); ++i) {
+        const auto& node = graph.nodes[i];
+        bool needs_eval = false;
+
+        if (i == static_cast<size_t>(perturbed_node_idx)) {
+            needs_eval = true;
+        } else if (node.type == NodeType::Unary && changed[node.left_child]) {
+            needs_eval = true;
+            changed[i] = true;
+            changed_indices_out.push_back(i);
+        } else if (node.type == NodeType::Binary && (changed[node.left_child] || changed[node.right_child])) {
+            needs_eval = true;
+            changed[i] = true;
+            changed_indices_out.push_back(i);
+        }
+
+        if (needs_eval) {
+            switch (node.type) {
+                case NodeType::Unary: {
+                    const auto& x = new_cache_out[node.left_child];
+                    switch (node.unary_op) {
+                        case UnaryOp::Periodic:
+                            new_cache_out[i] = node.amplitude * (node.omega * x + node.phi).sin();
+                            break;
+                        case UnaryOp::Power: {
+                            auto abs_x = x.abs() + 1e-10;
+                            auto sign_x = x.sign();
+                            auto abs_pow = abs_x.pow(node.p);
+                            double is_even = power_sign_blend(node.p);
+                            new_cache_out[i] = (1.0 - is_even) * (sign_x * abs_pow) + is_even * abs_pow;
+                            new_cache_out[i] = new_cache_out[i].max(-1e8).min(1e8);
+                            break;
+                        }
+                        case UnaryOp::IntPow: {
+                            int n = static_cast<int>(std::round(node.p));
+                            n = std::clamp(n, 2, 6);
+                            new_cache_out[i] = x.pow(n).max(-1e8).min(1e8);
+                            break;
+                        }
+                        case UnaryOp::Exp: {
+                            new_cache_out[i] = (node.omega * x + node.phi).exp().max(-1e6).min(1e6);
+                            break;
+                        }
+                        case UnaryOp::Log: {
+                            new_cache_out[i] = (x.abs() + 1e-6).log().max(-1e6).min(1e6);
+                            break;
+                        }
+                    }
+                    break;
+                }
+                case NodeType::Binary: {
+                    const auto& x = new_cache_out[node.left_child];
+                    const auto& y = new_cache_out[node.right_child];
+                    switch (node.binary_op) {
+                        case BinaryOp::Arithmetic: {
+                            auto w = arithmetic_soft_weights(node);
+                            auto res_add = x + y;
+                            auto res_sub = x - y;
+                            auto res_mul = x * y;
+                            auto res_div = x / (y.abs() + 1e-6) * y.sign();
+                            new_cache_out[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-1e6).min(1e6);
+                            break;
+                        }
+                        case BinaryOp::Division: {
+                            new_cache_out[i] = (x / (y.abs() + 1e-6) * y.sign()).max(-1e6).min(1e6);
+                            break;
+                        }
+                        case BinaryOp::Aggregation: {
+                            double local_tau = stabilized_tau(node.tau);
+                            auto max_val = x.max(y);
+                            auto exp_x = ((x - max_val) / local_tau).exp();
+                            auto exp_y = ((y - max_val) / local_tau).exp();
+                            auto sum_exp = exp_x + exp_y;
+                            new_cache_out[i] = (x * exp_x / sum_exp) + (y * exp_y / sum_exp);
+                            break;
+                        }
+                    }
+                    break;
+                }
+                default: break;
+            }
+        }
+    }
+}
+
 inline Eigen::ArrayXd evaluate_graph_simple(const IndividualGraph& graph, const std::vector<Eigen::ArrayXd>& X, int num_samples) {
     std::vector<Eigen::ArrayXd> cache;
+
     return evaluate_graph(graph, X, num_samples, cache);
 }
 

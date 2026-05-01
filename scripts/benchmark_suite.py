@@ -369,9 +369,10 @@ def _parse_formula(formula_str: str) -> Callable[[np.ndarray], np.ndarray]:
             
         return fn
     except Exception as e:
+        err_msg = str(e)
         # Fallback to a very basic eval if sympy fails (unlikely)
         def fallback_fn(x: np.ndarray) -> np.ndarray:
-            raise ValueError(f"SymPy parse failed for '{formula_str}': {e}")
+            raise ValueError(f"SymPy parse failed for '{formula_str}': {err_msg}")
         return fallback_fn
 
 
