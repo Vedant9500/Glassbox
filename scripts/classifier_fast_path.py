@@ -228,6 +228,26 @@ def _evaluate_formula_values(formula: str, x_np: np.ndarray) -> Optional[np.ndar
         return None
 
 
+def _safe_numpy_power(x, p):
+    """
+    Safe power function matching C++ power_sign_blend logic.
+    Supports fractional powers of negative numbers via signed power: sign(x) * |x|^p.
+    If p is an even integer, returns |x|^p (parity-preserving).
+    """
+    x = np.asarray(x)
+    p = np.asarray(p)
+    abs_x = np.abs(x) + 1e-15
+    res = np.power(abs_x, p)
+    
+    # Parity check for even integers
+    p_round = np.round(p)
+    is_even = (np.abs(p - p_round) < 1e-6) & (p_round.astype(np.int64) % 2 == 0)
+    
+    if np.isscalar(is_even):
+        return res if is_even else np.sign(x) * res
+    return np.where(is_even, res, np.sign(x) * res)
+
+
 @lru_cache(maxsize=256)
 def _compile_formula_evaluator(normalized_formula: str) -> Tuple[Tuple[str, ...], Optional[float], Optional[Any]]:
     import sympy as sp
@@ -245,7 +265,9 @@ def _compile_formula_evaluator(normalized_formula: str) -> Tuple[Tuple[str, ...]
     if not free_syms:
         return tuple(), float(expr), None
 
-    func = sp.lambdify(free_syms, expr, modules=["numpy"])
+    # Inject safe power into lambdify context
+    modules = [{"pow": _safe_numpy_power, "Pow": _safe_numpy_power}, "numpy"]
+    func = sp.lambdify(free_syms, expr, modules=modules)
     return tuple(sym.name for sym in free_syms), None, func
 
 

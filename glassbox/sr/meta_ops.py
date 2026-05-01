@@ -24,7 +24,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, List, Dict, Union
 import math
-import re
+import numpy as np
+
+
+def safe_numpy_power(x, p):
+    """
+    Safe power function matching C++ power_sign_blend logic.
+    Supports fractional powers of negative numbers via signed power: sign(x) * |x|^p.
+    If p is an even integer, returns |x|^p (parity-preserving).
+    """
+    x = np.asarray(x)
+    p = np.asarray(p)
+    abs_x = np.abs(x) + 1e-15
+    res = np.power(abs_x, p)
+    
+    # Parity check for even integers
+    p_round = np.round(p)
+    is_even = (np.abs(p - p_round) < 1e-6) & (p_round.astype(np.int64) % 2 == 0)
+    
+    if np.isscalar(is_even):
+        return res if is_even else np.sign(x) * res
+    return np.where(is_even, res, np.sign(x) * res)
 
 
 # ============================================================================

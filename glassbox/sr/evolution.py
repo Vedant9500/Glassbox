@@ -2593,8 +2593,8 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 pass
                 
             print("\nC++ BEST FORMULA (AST NODES):")
-            unary_ops = ["Periodic(sin/cos)", "Power", "Exp", "Log"]
-            binary_ops = ["Arithmetic(+-*/)", "Aggregation"]
+            unary_ops = ["Periodic", "Power", "IntPow", "Exp", "Log"]
+            binary_ops = ["Arithmetic", "Division", "Aggregation"]
             
             for idx, node in enumerate(result['nodes']):
                 op_type = node.get('type', 0)
@@ -2632,6 +2632,7 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             try:
                 from sympy import Symbol, sympify
                 from sympy.utilities.lambdify import lambdify
+                from glassbox.sr.meta_ops import safe_numpy_power
 
                 x_np = x.detach().cpu().numpy()
                 y_np = y.detach().cpu().numpy().reshape(-1)
@@ -2644,12 +2645,16 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                     local_symbols[f"x{i}"] = Symbol(f"x{i}")
 
                 expr = sympify(formula.replace("^", "**"), locals=local_symbols)
+                
+                # Inject safe power into lambdify context
+                modules = [{"pow": safe_numpy_power, "Pow": safe_numpy_power}, "numpy"]
+                
                 if n_features == 1:
-                    fn = lambdify(local_symbols["x"], expr, modules=["numpy"])
+                    fn = lambdify(local_symbols["x"], expr, modules=modules)
                     y_pred = fn(x_np[:, 0])
                 else:
                     args = [local_symbols[f"x{i}"] for i in range(n_features)]
-                    fn = lambdify(args, expr, modules=["numpy"])
+                    fn = lambdify(args, expr, modules=modules)
                     y_pred = fn(*[x_np[:, i] for i in range(n_features)])
 
                 y_pred = np.asarray(y_pred, dtype=np.float64).reshape(y_np.shape)

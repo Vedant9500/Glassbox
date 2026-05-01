@@ -304,40 +304,75 @@ ALL_TIERS = {
 # Formula evaluator (reused from sr_tester.py logic)
 # ---------------------------------------------------------------------------
 
+def _safe_numpy_power(x, p):
+    """Safe power matching C++ signed power logic."""
+    x = np.asarray(x)
+    p = np.asarray(p)
+    abs_x = np.abs(x) + 1e-15
+    res = np.power(abs_x, p)
+    p_round = np.round(p)
+    is_even = (np.abs(p - p_round) < 1e-6) & (p_round.astype(np.int64) % 2 == 0)
+    if np.isscalar(is_even):
+        return res if is_even else np.sign(x) * res
+    return np.where(is_even, res, np.sign(x) * res)
+
+
 def _parse_formula(formula_str: str) -> Callable[[np.ndarray], np.ndarray]:
-    """Parse formula string into a numpy function."""
-    formula = formula_str.strip().lower()
-    # Convert |...| notation (from C++ log display) to abs(...)
+    """Parse formula string into a numpy function with safe power handling."""
+    import sympy as sp
+    from sympy.parsing.sympy_parser import (
+        convert_xor,
+        implicit_multiplication_application,
+        parse_expr,
+        standard_transformations,
+    )
+    
+    # Normalize unicode and common variants
+    formula = _normalize_formula_text(formula_str).strip()
+    # Handle C++ |x| notation
     formula = re.sub(r'\|([^|]+)\|', r'abs(\1)', formula)
-    # x^N -> x**N
-    formula = re.sub(r'\^(\d+)', r'**\1', formula)
-    formula = re.sub(r'\^(\()', r'**\1', formula)
-    formula = re.sub(r'\^(\d+\.\d+)', r'**\1', formula)  # fractional powers
-    formula = formula.replace('np.', '')
-
-    # Replace math functions with numpy equivalents
-    formula = formula.replace('sin(', 'np.sin(')
-    formula = formula.replace('cos(', 'np.cos(')
-    formula = formula.replace('tan(', 'np.tan(')
-    formula = formula.replace('exp(', 'np.exp(')
-    formula = formula.replace('log(', 'np.log(')
-    # sqrt of numeric constants first
-    formula = re.sub(r'sqrt\(\s*([0-9\.]+)\s*\)', lambda m: str(math.sqrt(float(m.group(1)))), formula)
-    formula = formula.replace('sqrt(', 'np.sqrt(')
-    formula = formula.replace('abs(', 'np.abs(')
-    formula = formula.replace('pi', str(math.pi))
-    formula = re.sub(r'\be\b', str(math.e), formula)
-
-    def fn(x: np.ndarray) -> np.ndarray:
-        try:
-            result = eval(formula)
-            if isinstance(result, (int, float)):
-                return np.full_like(x, result, dtype=np.float64)
-            return np.asarray(result, dtype=np.float64)
-        except Exception as e:
-            raise ValueError(f"Error evaluating '{formula_str}': {e}")
-
-    return fn
+    
+    try:
+        transformations = standard_transformations + (convert_xor, implicit_multiplication_application)
+        expr = parse_expr(formula, transformations=transformations, evaluate=False)
+        free_syms = sorted(expr.free_symbols, key=lambda sym: sym.name)
+        
+        # Inject safe power into lambdify
+        modules = [{"pow": _safe_numpy_power, "Pow": _safe_numpy_power}, "numpy"]
+        func = sp.lambdify(free_syms, expr, modules=modules)
+        
+        def fn(x_in: np.ndarray) -> np.ndarray:
+            if x_in.ndim == 1:
+                cols = [x_in]
+            else:
+                cols = [x_in[:, i] for i in range(x_in.shape[1])]
+            
+            # Match columns to symbols
+            args = []
+            for sym in free_syms:
+                # Expect symbols like x, x0, x1...
+                if sym.name == 'x':
+                    args.append(cols[0])
+                elif sym.name.startswith('x') and sym.name[1:].isdigit():
+                    idx = int(sym.name[1:])
+                    args.append(cols[idx] if idx < len(cols) else np.zeros_like(cols[0]))
+                else:
+                    args.append(np.zeros_like(cols[0]))
+            
+            if not args and not free_syms:
+                # Constant expression
+                val = float(expr.evalf())
+                return np.full_like(x_in if x_in.ndim == 1 else x_in[:, 0], val)
+                
+            res = func(*args)
+            return np.asarray(res, dtype=np.float64).reshape(-1)
+            
+        return fn
+    except Exception as e:
+        # Fallback to a very basic eval if sympy fails (unlikely)
+        def fallback_fn(x: np.ndarray) -> np.ndarray:
+            raise ValueError(f"SymPy parse failed for '{formula_str}': {e}")
+        return fallback_fn
 
 
 def _generate_data(
@@ -538,6 +573,25 @@ def _guided_evolution_decision(
 
     if mse is None or not math.isfinite(mse):
         return True, "invalid_mse"
+
+    # Implementation: Early exit if fast-path found a perfect match.
+    # We define "perfect" as MSE < 1e-12 and complex enough to not be a constant,
+    # OR high-confidence classifier result with MSE < 1e-7.
+    is_effectively_zero = (mse < 1e-12)
+    is_high_confidence = False
+    
+    uncertainty = fp_result.get("uncertainty")
+    if isinstance(uncertainty, dict):
+        entropy = uncertainty.get("prediction_entropy")
+        # Lower entropy means more certain. Threshold 0.3 is very strict.
+        if entropy is not None and math.isfinite(float(entropy)) and float(entropy) < 0.3:
+            is_high_confidence = True
+
+    if is_effectively_zero:
+        return False, "fast_path_exact_zero"
+    
+    if is_high_confidence and mse < 1e-7 and n_terms <= 6:
+        return False, "fast_path_confident_exact"
 
     if mse >= 1e-6:
         return True, "mse_above_exact"

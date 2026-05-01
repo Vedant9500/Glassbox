@@ -32,11 +32,13 @@ class CppGraphModule(nn.Module):
     
     UNARY_PERIODIC = 0
     UNARY_POWER = 1
-    UNARY_EXP = 2
-    UNARY_LOG = 3
+    UNARY_INTPOW = 2
+    UNARY_EXP = 3
+    UNARY_LOG = 4
     
     BINARY_ARITHMETIC = 0
-    BINARY_AGGREGATION = 1
+    BINARY_DIVISION = 1
+    BINARY_AGGREGATION = 2
     
     def __init__(self, cpp_result: dict):
         super().__init__()
@@ -68,6 +70,7 @@ class CppGraphModule(nn.Module):
             elif ntype == self.TYPE_BINARY:
                 self.register_buffer(f"beta_{i}", torch.tensor(node["beta"], dtype=torch.float64))
                 self.register_buffer(f"gamma_{i}", torch.tensor(node["gamma"], dtype=torch.float64))
+                self.register_buffer(f"tau_{i}", torch.tensor(node["tau"], dtype=torch.float64))
     
     def forward(self, x: torch.Tensor, hard: bool = True, **kwargs) -> torch.Tensor:
         """
@@ -121,9 +124,21 @@ class CppGraphModule(nn.Module):
                 if unary_op == self.UNARY_PERIODIC:
                     out = amplitude * torch.sin(omega * child + phi)
                 elif unary_op == self.UNARY_POWER:
-                    out = torch.sign(child) * torch.abs(child + eps).pow(p)
+                    # sign(x) * |x|^p, with parity check similar to eval.h power_sign_blend
+                    abs_child = torch.abs(child) + eps
+                    sign_child = torch.sign(child)
+                    abs_pow = abs_child.pow(p)
+                    
+                    p_round = torch.round(p)
+                    is_even = (torch.abs(p - p_round) < 1e-6) & (p_round.long() % 2 == 0)
+                    is_even = is_even.double()
+                    
+                    out = (1.0 - is_even) * (sign_child * abs_pow) + is_even * abs_pow
+                elif unary_op == self.UNARY_INTPOW:
+                    n = torch.round(p).long().clamp(2, 6)
+                    out = child.pow(n)
                 elif unary_op == self.UNARY_EXP:
-                    out = torch.exp(torch.clamp(child, -20.0, 20.0))
+                    out = torch.exp(torch.clamp(omega * child + phi, -20.0, 20.0))
                 elif unary_op == self.UNARY_LOG:
                     out = torch.log(torch.abs(child) + eps)
                 else:
@@ -140,13 +155,28 @@ class CppGraphModule(nn.Module):
                 gamma = getattr(self, f"gamma_{i}")
                 
                 if binary_op == self.BINARY_ARITHMETIC:
-                    # Soft interpolation: beta < 1.5 → add, beta >= 1.5 → mul
+                    # Soft interpolation matching eval.h arithmetic_soft_weights
+                    # For simplicity in CppGraphModule (usually used post-evolution), 
+                    # we just pick the winner if beta is near 1.0 or 2.0.
                     if beta.item() < 1.5:
-                        out = left_val + gamma * right_val
+                        if gamma.item() > 0: out = left_val + right_val
+                        else: out = left_val - right_val
                     else:
-                        out = left_val * (right_val * gamma)
+                        if gamma.item() > 0: out = left_val * right_val
+                        else: out = left_val / (torch.abs(right_val) + eps) * torch.sign(right_val)
+                elif binary_op == self.BINARY_DIVISION:
+                    out = left_val / (torch.abs(right_val) + eps) * torch.sign(right_val)
                 elif binary_op == self.BINARY_AGGREGATION:
-                    out = (left_val + right_val) / 2.0
+                    # Softmax aggregation matching eval.h
+                    tau = getattr(self, f"tau_{i}")
+                    # Clamp tau to avoid div by zero
+                    local_tau = torch.where(torch.abs(tau) >= 1e-3, tau, torch.tensor(1e-3, dtype=torch.float64, device=tau.device))
+                    
+                    max_val = torch.maximum(left_val, right_val)
+                    exp_l = torch.exp((left_val - max_val) / local_tau)
+                    exp_r = torch.exp((right_val - max_val) / local_tau)
+                    sum_exp = exp_l + exp_r
+                    out = (left_val * exp_l + right_val * exp_r) / sum_exp
                 else:
                     out = left_val + right_val
             else:

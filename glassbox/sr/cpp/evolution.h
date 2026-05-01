@@ -37,7 +37,7 @@ struct EvolutionConfig {
     
     // Bounds
     double p_min = -2.0, p_max = 3.0;
-    double omega_min = 0.1, omega_max = 8.0;
+    double omega_min = -8.0, omega_max = 8.0;
     
     bool use_early_stop = true;
     double early_stop_mse = 1e-6;
