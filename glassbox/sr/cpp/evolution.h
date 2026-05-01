@@ -111,7 +111,15 @@ private:
     int n_samples_;
     int n_features_;
 
+    // Cholesky cache: avoid re-factoring when only c_ changes
+    mutable Eigen::LLT<Eigen::MatrixXd> llt_cache_;
+    mutable double cached_lambda_ = -1.0;
+    mutable bool llt_valid_ = false;
+
 public:
+    int n_features() const { return n_features_; }
+    int n_samples() const { return n_samples_; }
+
     void initialize(const std::vector<Eigen::ArrayXd>& cache, const Eigen::ArrayXd& y) {
         n_features_ = cache.size();
         n_samples_ = y.size();
@@ -125,69 +133,62 @@ public:
         
         G_ = A.transpose() * A;
         c_ = A.transpose() * y.matrix();
+        llt_valid_ = false;
     }
 
     void update_nodes(const std::vector<int>& changed_indices, 
                       const std::vector<Eigen::ArrayXd>& old_cache, 
                       const std::vector<Eigen::ArrayXd>& new_cache) {
         if (changed_indices.empty()) return;
+        llt_valid_ = false; // G_ changed — invalidate cached factorization
         
-        int k = changed_indices.size();
+        int N = static_cast<int>(G_.rows());
         
-        Eigen::MatrixXd delta_A(n_samples_, k);
-        Eigen::MatrixXd new_A_cols(n_samples_, k);
-        Eigen::MatrixXd old_A_cols(n_samples_, k);
-        
-        for (int i = 0; i < k; ++i) {
-            int idx = changed_indices[i];
-            new_A_cols.col(i) = new_cache[idx].matrix();
-            old_A_cols.col(i) = old_cache[idx].matrix();
-            delta_A.col(i) = new_A_cols.col(i) - old_A_cols.col(i);
-        }
-        
-        for (int j = 0; j < n_features_ + 1; ++j) {
-            bool is_changed = false;
-            for (int idx : changed_indices) {
-                if (j == idx) {
-                    is_changed = true;
-                    break;
+        for (int idx : changed_indices) {
+            const Eigen::VectorXd& new_col = new_cache[idx].matrix();
+            const Eigen::VectorXd& old_col = old_cache[idx].matrix();
+
+            // 1. Update RHS: c_i = A_i^T * y
+            double delta_ci = (new_col - old_col).dot(y_.matrix());
+            c_(idx) += delta_ci;
+
+            // 2. Update Gramian: G_ij = A_i^T * A_j
+            // We must update the entire row and column for idx to account for cross-terms
+            for (int j = 0; j < N; ++j) {
+                Eigen::VectorXd col_j;
+                if (j == n_features_) {
+                    col_j = Eigen::VectorXd::Ones(n_samples_);
+                } else {
+                    // Use the latest value from new_cache (partial eval ensures consistency)
+                    col_j = new_cache[j].matrix();
                 }
+                
+                double new_val = new_col.dot(col_j);
+                G_(idx, j) = new_val;
+                G_(j, idx) = new_val;
             }
-            if (is_changed) continue;
-            
-            Eigen::VectorXd col_j;
-            if (j == n_features_) {
-                col_j = Eigen::VectorXd::Ones(n_samples_);
-            } else {
-                col_j = old_cache[j].matrix(); 
-            }
-            
-            Eigen::VectorXd cross = delta_A.transpose() * col_j;
-            for (int i = 0; i < k; ++i) {
-                int idx = changed_indices[i];
-                G_(idx, j) += cross(i);
-                G_(j, idx) += cross(i);
-            }
-        }
-        
-        Eigen::MatrixXd block_delta = (new_A_cols.transpose() * new_A_cols) - (old_A_cols.transpose() * old_A_cols);
-        for (int i = 0; i < k; ++i) {
-            for (int j = 0; j < k; ++j) {
-                G_(changed_indices[i], changed_indices[j]) += block_delta(i, j);
-            }
-        }
-        
-        Eigen::VectorXd delta_c = delta_A.transpose() * y_.matrix();
-        for (int i = 0; i < k; ++i) {
-            c_(changed_indices[i]) += delta_c(i);
         }
     }
 
     bool solve_ridge(double lambda, Eigen::VectorXd& w_out) const {
+        // Always use LDLT for better stability in ill-conditioned SR problems.
+        // LLT can be unstable for semi-definite matrices.
         Eigen::MatrixXd G_ridge = G_;
         G_ridge.diagonal().array() += lambda;
         w_out = G_ridge.ldlt().solve(c_);
         return w_out.allFinite();
+    }
+
+    // Compute MSE directly from weights and a cache (avoids full graph re-eval)
+    double compute_mse(const Eigen::VectorXd& w, const std::vector<Eigen::ArrayXd>& cache) const {
+        Eigen::ArrayXd pred = Eigen::ArrayXd::Constant(n_samples_, w(n_features_)); // bias
+        for (int f = 0; f < n_features_; ++f) {
+            if (f < static_cast<int>(cache.size()) && cache[f].size() == n_samples_) {
+                pred += w(f) * cache[f];
+            }
+        }
+        double mse = (pred - y_).square().mean();
+        return std::isfinite(mse) ? mse : std::numeric_limits<double>::infinity();
     }
 };
 
@@ -1341,7 +1342,7 @@ private:
         
         try {
             // Ridge regression: w = (A^T A + λI)^{-1} A^T b
-            double lambda = 0.01;
+            double lambda = 1e-4;
             Eigen::MatrixXd AtA = A.transpose() * A;
             AtA.diagonal() += Eigen::VectorXd::Constant(num_features + 1, lambda);
             w = AtA.ldlt().solve(A.transpose() * b);
@@ -1611,7 +1612,7 @@ private:
                 
                 dg.update_nodes(changed_plus, base_cache, cache_plus);
                 Eigen::VectorXd w_plus;
-                bool success_plus = dg.solve_ridge(1e-5, w_plus);
+                bool success_plus = dg.solve_ridge(1e-4, w_plus); // Match solve_output_weights penalty
                 Eigen::VectorXd r_plus;
                 double mse_plus = std::numeric_limits<double>::infinity();
                 if (success_plus) {
@@ -1633,7 +1634,7 @@ private:
                 
                 dg.update_nodes(changed_minus, base_cache, cache_minus);
                 Eigen::VectorXd w_minus;
-                bool success_minus = dg.solve_ridge(1e-5, w_minus);
+                bool success_minus = dg.solve_ridge(1e-4, w_minus); // Match solve_output_weights penalty
                 Eigen::VectorXd r_minus;
                 double mse_minus = std::numeric_limits<double>::infinity();
                 if (success_minus) {
@@ -1964,27 +1965,26 @@ private:
                 {
                     double original_p = node.p;
                     double best_snap_p = original_p;
-                    double best_snap_mse = snap_baseline_mse;
+                    double best_snap_mse = std::numeric_limits<double>::infinity();
                     
                     for (int si = 0; si < n_snap_p; ++si) {
                         double candidate = snap_candidates_p[si];
-                        if (std::abs(original_p - candidate) > 0.3) continue; // Only snap if close
+                        if (std::abs(original_p - candidate) > 0.3) continue; 
                         
                         node.p = candidate;
-                        // Re-solve output weights with snapped parameter
                         std::vector<Eigen::ArrayXd> snap_cache;
                         evaluate_graph(ind, X_, n_samples, snap_cache);
                         solve_output_weights(ind, snap_cache);
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                         
-                        if (snap_accepts(best_snap_mse, ind.raw_mse, classify_p_tier(candidate))) {
+                        if (snap_accepts(snap_baseline_mse, ind.raw_mse, classify_p_tier(candidate)) &&
+                            ind.raw_mse < best_snap_mse) {
                             best_snap_p = candidate;
                             best_snap_mse = ind.raw_mse;
                         }
                     }
                     node.p = best_snap_p;
                     if (best_snap_p != original_p) {
-                        // Re-solve with accepted snap
                         std::vector<Eigen::ArrayXd> snap_cache;
                         evaluate_graph(ind, X_, n_samples, snap_cache);
                         solve_output_weights(ind, snap_cache);
@@ -1997,9 +1997,8 @@ private:
                 if (node.unary_op == UnaryOp::Periodic) {
                     double original_omega = node.omega;
                     double best_snap_omega = original_omega;
-                    double best_snap_mse = snap_baseline_mse;
+                    double best_snap_mse = std::numeric_limits<double>::infinity();
                     
-                    // Also try snapping to nearest integer
                     double nearest_int = std::round(original_omega);
                     
                     for (int si = 0; si < n_snap_omega; ++si) {
@@ -2012,12 +2011,13 @@ private:
                         solve_output_weights(ind, snap_cache);
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                         
-                        if (snap_accepts(best_snap_mse, ind.raw_mse, classify_omega_tier(candidate))) {
+                        if (snap_accepts(snap_baseline_mse, ind.raw_mse, classify_omega_tier(candidate)) &&
+                            ind.raw_mse < best_snap_mse) {
                             best_snap_omega = candidate;
                             best_snap_mse = ind.raw_mse;
                         }
                     }
-                    // Try nearest integer if not already in candidates
+                    // Try nearest integer
                     if (nearest_int >= 1.0 && nearest_int <= 10.0 && std::abs(original_omega - nearest_int) <= 0.3) {
                         node.omega = nearest_int;
                         std::vector<Eigen::ArrayXd> snap_cache;
@@ -2025,7 +2025,8 @@ private:
                         solve_output_weights(ind, snap_cache);
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                         
-                        if (snap_accepts(best_snap_mse, ind.raw_mse, SnapTier::Integer)) {
+                        if (snap_accepts(snap_baseline_mse, ind.raw_mse, SnapTier::Integer) &&
+                            ind.raw_mse < best_snap_mse) {
                             best_snap_omega = nearest_int;
                             best_snap_mse = ind.raw_mse;
                         }
@@ -2043,7 +2044,7 @@ private:
                     // Try snapping phi
                     double original_phi = node.phi;
                     double best_snap_phi = original_phi;
-                    best_snap_mse = snap_baseline_mse;
+                    best_snap_mse = std::numeric_limits<double>::infinity();
                     
                     for (int si = 0; si < n_snap_phi; ++si) {
                         double candidate = snap_candidates_phi[si];
@@ -2055,7 +2056,8 @@ private:
                         solve_output_weights(ind, snap_cache);
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                         
-                        if (snap_accepts(best_snap_mse, ind.raw_mse, classify_phi_tier(candidate))) {
+                        if (snap_accepts(snap_baseline_mse, ind.raw_mse, classify_phi_tier(candidate)) &&
+                            ind.raw_mse < best_snap_mse) {
                             best_snap_phi = candidate;
                             best_snap_mse = ind.raw_mse;
                         }
@@ -2087,7 +2089,7 @@ private:
                 
                 double original_omega = node.omega;
                 double best_snap_omega = original_omega;
-                double best_snap_mse = snap_baseline_mse;
+                double best_snap_mse = std::numeric_limits<double>::infinity();
                 
                 for (int si = 0; si < n_snap_exp_omega; ++si) {
                     double candidate = snap_exp_omega[si];
@@ -2099,7 +2101,8 @@ private:
                     solve_output_weights(ind, snap_cache);
                     evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                     
-                    if (snap_accepts(best_snap_mse, ind.raw_mse, classify_omega_tier(candidate))) {
+                    if (snap_accepts(snap_baseline_mse, ind.raw_mse, classify_omega_tier(candidate)) &&
+                        ind.raw_mse < best_snap_mse) {
                         best_snap_omega = candidate;
                         best_snap_mse = ind.raw_mse;
                     }
@@ -2114,7 +2117,8 @@ private:
                     solve_output_weights(ind, snap_cache);
                     evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                     
-                    if (snap_accepts(best_snap_mse, ind.raw_mse, SnapTier::Integer)) {
+                    if (snap_accepts(snap_baseline_mse, ind.raw_mse, SnapTier::Integer) &&
+                        ind.raw_mse < best_snap_mse) {
                         best_snap_omega = nearest_int_e;
                         best_snap_mse = ind.raw_mse;
                     }
@@ -2135,7 +2139,7 @@ private:
                 
                 double original_phi = node.phi;
                 double best_snap_phi = original_phi;
-                best_snap_mse = snap_baseline_mse;
+                best_snap_mse = std::numeric_limits<double>::infinity();
                 
                 for (int si = 0; si < n_snap_exp_phi; ++si) {
                     double candidate = snap_exp_phi[si];
@@ -2147,7 +2151,8 @@ private:
                     solve_output_weights(ind, snap_cache);
                     evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                     
-                    if (ind.raw_mse < best_snap_mse * 1.02 + 1e-8) {
+                    if (snap_accepts(snap_baseline_mse, ind.raw_mse, classify_phi_tier(candidate)) &&
+                        ind.raw_mse < best_snap_mse) {
                         best_snap_phi = candidate;
                         best_snap_mse = ind.raw_mse;
                     }
@@ -2212,7 +2217,29 @@ private:
             evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
             snap_baseline_mse = ind.raw_mse;
             
-            // 6b. Output weight snapping
+            // Build node output cache for 6b/6c — weight/bias snapping only
+            // changes output coefficients, not node params, so we can compute
+            // MSE from cached outputs instead of re-evaluating the full graph.
+            std::vector<Eigen::ArrayXd> snap_base_cache;
+            evaluate_graph(ind, X_, n_samples, snap_base_cache);
+            
+            // Helper: compute MSE from cached node outputs + current weights/bias.
+            // Used for 6b/6c where only output weights change, not node parameters.
+            auto mse_from_cache = [&](const IndividualGraph& graph,
+                                      const std::vector<Eigen::ArrayXd>& cache) -> double {
+                int ns = static_cast<int>(y_.size());
+                Eigen::ArrayXd pred = Eigen::ArrayXd::Constant(ns, graph.output_bias);
+                for (int f = 0; f < static_cast<int>(graph.output_weights.size()); ++f) {
+                    if (std::abs(graph.output_weights[f]) > 1e-15 &&
+                        f < static_cast<int>(cache.size()) && cache[f].size() == ns) {
+                        pred += graph.output_weights[f] * cache[f];
+                    }
+                }
+                double mse = (pred - y_).square().mean();
+                return std::isfinite(mse) ? mse : std::numeric_limits<double>::infinity();
+            };
+
+            // 6b. Output weight snapping — using cached node outputs (no graph re-eval)
             {
                 const double snap_weight_values[] = {
                     0.0, 0.25, 1.0/3.0, 0.5, 2.0/3.0, 0.75,
@@ -2233,30 +2260,29 @@ private:
                     
                     for (int si = 0; si < n_snap_w; ++si) {
                         double candidate = sign_w * snap_weight_values[si];
-                        // Also try the opposite sign for zero candidate
                         double rel_dist = (abs_w > 1e-8) ? std::abs(abs_w - snap_weight_values[si]) / abs_w : 1.0;
-                        if (rel_dist > 0.15 && std::abs(w - candidate) > 0.3) continue; // Within 15% or 0.3 absolute
+                        if (rel_dist > 0.15 && std::abs(w - candidate) > 0.3) continue;
                         
                         double original_w = ind.output_weights[i];
                         ind.output_weights[i] = candidate;
-                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                        double trial_mse = mse_from_cache(ind, snap_base_cache);
                         
-                        if (ind.raw_mse < best_snap_mse * 1.01 + 1e-8) {
+                        if (trial_mse < snap_baseline_mse * 1.05 + 1e-8 && trial_mse < best_snap_mse) {
                             best_snap_w = candidate;
-                            best_snap_mse = ind.raw_mse;
+                            best_snap_mse = trial_mse;
                         }
                         ind.output_weights[i] = original_w; // Restore
                     }
                     
                     if (best_snap_w != w) {
                         ind.output_weights[i] = best_snap_w;
-                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples); // Update fitness/raw_mse
                         snap_baseline_mse = ind.raw_mse;
                     }
                 }
             }
             
-            // 6c. Output bias snapping
+            // 6c. Output bias snapping — using cached node outputs (no graph re-eval)
             {
                 double bias = ind.output_bias;
                 if (std::abs(bias) > 1e-6) {
@@ -2275,25 +2301,28 @@ private:
                         if (std::abs(bias - candidate) > 0.5) continue;
                         
                         ind.output_bias = candidate;
-                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                        double trial_mse = mse_from_cache(ind, snap_base_cache);
                         
-                        if (ind.raw_mse < best_snap_mse * 1.01 + 1e-8) {
+                        if (trial_mse < snap_baseline_mse * 1.05 + 1e-8 && trial_mse < best_snap_mse) {
                             best_snap_b = candidate;
-                            best_snap_mse = ind.raw_mse;
+                            best_snap_mse = trial_mse;
                         }
                     }
                     // Also try nearest integer
                     double nearest_int = std::round(bias);
                     if (std::abs(bias - nearest_int) <= 0.3) {
                         ind.output_bias = nearest_int;
-                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
-                        if (ind.raw_mse < best_snap_mse * 1.01 + 1e-8) {
+                        double trial_mse = mse_from_cache(ind, snap_base_cache);
+                        if (trial_mse < snap_baseline_mse * 1.05 + 1e-8 && trial_mse < best_snap_mse) {
                             best_snap_b = nearest_int;
-                            best_snap_mse = ind.raw_mse;
+                            best_snap_mse = trial_mse;
                         }
                     }
                     
-                    ind.output_bias = best_snap_b;
+                    if (best_snap_b != bias) {
+                        ind.output_bias = best_snap_b;
+                        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                    }
                 }
             }
             
