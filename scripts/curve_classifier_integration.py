@@ -461,6 +461,8 @@ def predict_operators(
     features = extract_all_features(y)
     scaler = metadata.get('feature_scaler')
     if scaler is not None:
+        dim = len(scaler['mean'])
+        features = features[:dim]
         features = (features - scaler['mean']) / (scaler['std'] + 1e-8)
     
     # Check if this is XGBoost or PyTorch model
@@ -569,6 +571,8 @@ def _predict_operators_multi_input(
         try:
             features = extract_all_features(y_slice_valid)
             if scaler is not None:
+                dim = len(scaler['mean'])
+                features = features[:dim]
                 features = (features - scaler['mean']) / (scaler['std'] + 1e-8)
             
             if metadata.get('type') == 'xgboost':

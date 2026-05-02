@@ -1220,8 +1220,8 @@ Examples:
         help="Path to the curve classifier model (default: models/curve_classifier_v3.1.pt)",
     )
     parser.add_argument(
-        "--proposer-model", type=str, default="models/universal_proposer_v1.pt",
-        help="Path to the universal neural proposer model (default: models/universal_proposer_v1.pt)",
+        "--proposer-model", type=str, default="models/universal_proposer_robust.pt",
+        help="Path to the universal neural proposer model (default: models/universal_proposer_robust.pt)",
     )
     parser.add_argument(
         "--disable-proposer", action="store_true",

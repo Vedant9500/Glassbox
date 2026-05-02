@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .fpip_v2 import validate_fpip_v2_payload
 
@@ -44,8 +45,8 @@ DEFAULT_SKELETON_VOCAB: List[str] = [
 
 @dataclass
 class UniversalProposerConfig:
-    hidden_dim: int = 128
-    point_mlp_layers: int = 2
+    hidden_dim: int = 256
+    n_features: int = 370
     operator_vocab: Optional[List[str]] = None
     skeleton_vocab: Optional[List[str]] = None
 
@@ -57,56 +58,70 @@ class UniversalProposerConfig:
 
 
 class UniversalProposer(nn.Module):
-    """Simple Set-style proposer over (x, y) point clouds."""
+    """
+    Multiplicative Gated Proposer using Gated Linear Units (GLU).
+    Mathematically synchronized with CurveClassifierGLU to leverage high-level analytical features.
+    """
 
     def __init__(self, config: Optional[UniversalProposerConfig] = None):
         super().__init__()
         self.config = config or UniversalProposerConfig()
         operator_vocab = self.config.resolved_operator_vocab()
         skeleton_vocab = self.config.resolved_skeleton_vocab()
+        hidden = self.config.hidden_dim
+        n_features = self.config.n_features
 
-        point_layers: List[nn.Module] = []
-        in_dim = 2
-        for _ in range(max(1, int(self.config.point_mlp_layers))):
-            point_layers.append(nn.Linear(in_dim, self.config.hidden_dim))
-            point_layers.append(nn.ReLU())
-            in_dim = self.config.hidden_dim
-        self.point_encoder = nn.Sequential(*point_layers)
+        # GLU Trunk (Synchronized with Classifier architecture)
+        self.fc1 = nn.Linear(n_features, hidden * 2)
+        self.bn1 = nn.BatchNorm1d(hidden * 2)
+        
+        self.fc2 = nn.Linear(hidden, hidden * 2)
+        self.bn2 = nn.BatchNorm1d(hidden * 2)
 
-        # Aggregate with mean/max pooling and project once more.
-        self.trunk = nn.Sequential(
-            nn.Linear(self.config.hidden_dim * 2, self.config.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(self.config.hidden_dim, self.config.hidden_dim),
-            nn.ReLU(),
-        )
-
-        self.operator_head = nn.Linear(self.config.hidden_dim, len(operator_vocab))
-        self.skeleton_head = nn.Linear(self.config.hidden_dim, len(skeleton_vocab))
-        self.uncertainty_head = nn.Linear(self.config.hidden_dim, 2)  # entropy proxy, margin proxy
+        # Multi-head decoding
+        self.operator_head = nn.Linear(hidden, len(operator_vocab))
+        self.skeleton_head = nn.Linear(hidden, len(skeleton_vocab))
+        self.uncertainty_head = nn.Linear(hidden, 2)
 
         self.operator_vocab = operator_vocab
         self.skeleton_vocab = skeleton_vocab
+        self.dropout = nn.Dropout(0.2)
 
-    def forward(self, points_xy: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Forward pass.
+        self._init_weights()
+
+    def _init_weights(self):
+        """Hardware-sympathetic initialization for multiplicative gating."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.1)
+
+    def forward(self, features: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Forward pass using pre-computed high-level features.
 
         Args:
-            points_xy: Tensor[B, N, 2] with columns (x, y).
+            features: Tensor[B, 370] containing derivatives, invariants, FFT, and stats.
         """
-        if points_xy.ndim != 3 or points_xy.shape[-1] != 2:
-            raise ValueError(f"Expected points_xy shape [B,N,2], got {tuple(points_xy.shape)}")
-
-        feats = self.point_encoder(points_xy)
-        pooled_mean = feats.mean(dim=1)
-        pooled_max = feats.max(dim=1).values
-        pooled = torch.cat([pooled_mean, pooled_max], dim=1)
-        trunk = self.trunk(pooled)
+        if features.ndim == 1:
+            features = features.unsqueeze(0)
+            
+        # Layer 1 GLU projection
+        x = self.fc1(features)
+        x = self.bn1(x)
+        x = F.glu(x, dim=1)
+        x = self.dropout(x)
+        
+        # Layer 2 GLU composition
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = F.glu(x, dim=1)
+        x = self.dropout(x)
 
         return {
-            "operator_logits": self.operator_head(trunk),
-            "skeleton_logits": self.skeleton_head(trunk),
-            "uncertainty_raw": self.uncertainty_head(trunk),
+            "operator_logits": self.operator_head(x),
+            "skeleton_logits": self.skeleton_head(x),
+            "uncertainty_raw": self.uncertainty_head(x),
         }
 
 
@@ -291,8 +306,32 @@ def grammar_decode_topk_skeletons(
 
 
 def _operator_priors(operator_logits: Sequence[float], operator_vocab: Sequence[str]) -> Dict[str, float]:
-    probs = _safe_softmax(np.asarray(operator_logits, dtype=np.float64))
-    return {str(op): float(p) for op, p in zip(operator_vocab, probs)}
+    logits = np.asarray(operator_logits, dtype=np.float64)
+    # Use sigmoid for multi-label independent operator probabilities
+    probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -100, 100)))
+    
+    predictions = {str(op): float(p) for op, p in zip(operator_vocab, probs)}
+    
+    # Mathematical Entailment & Sparsification
+    implications = [
+        ("sin", "periodic"),
+        ("cos", "periodic"),
+        ("exp", "exponential"),
+        ("log", "exponential"),
+        ("rational", "power"),
+        ("identity", "polynomial")
+    ]
+    
+    for child, parent in implications:
+        if child in predictions and parent in predictions:
+            predictions[parent] = max(predictions[parent], predictions[child])
+            
+    # Entropy-based Sparsification: Silence weak guesses
+    for op in list(predictions.keys()):
+        if predictions[op] < 0.4:
+            del predictions[op]
+            
+    return predictions
 
 
 def _uncertainty_from_logits(logits: Sequence[float]) -> Dict[str, Any]:
@@ -320,6 +359,7 @@ def propose_from_xy(
     y: np.ndarray,
     top_k: int = 5,
     device: Optional[str] = None,
+    features: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Run proposer on a single curve and return decoded candidates + priors."""
     if x.ndim == 2 and x.shape[1] == 1:
@@ -331,16 +371,27 @@ def propose_from_xy(
     if x.shape[0] != y.shape[0]:
         raise ValueError("x and y must have same length")
 
-    points = np.stack([x.astype(np.float32), y.astype(np.float32)], axis=1)
-    points_t = torch.from_numpy(points).unsqueeze(0)
+    # If features are not provided, we must extract them (legacy behavior)
+    if features is None:
+        from scripts.generate_curve_data import extract_all_features
+        features = extract_all_features(y)
+    
+    # Apply SymLog + Scaling (Synchronization with GLU training)
+    features = np.sign(features) * np.log1p(np.abs(features))
+    if hasattr(model, 'feature_scaler') and model.feature_scaler is not None:
+        mean = model.feature_scaler['mean']
+        std = model.feature_scaler['std']
+        features = (features - mean) / (std + 1e-8)
+
+    features_t = torch.from_numpy(features.astype(np.float32)).unsqueeze(0)
 
     if device is not None:
         model = model.to(torch.device(device))
-        points_t = points_t.to(torch.device(device))
+        features_t = features_t.to(torch.device(device))
 
     model.eval()
     with torch.no_grad():
-        pred = model(points_t)
+        pred = model(features_t)
 
     operator_logits = pred["operator_logits"][0].detach().cpu().numpy()
     skeleton_logits = pred["skeleton_logits"][0].detach().cpu().numpy()
@@ -412,14 +463,20 @@ def load_universal_proposer_checkpoint(
     """Load UniversalProposer from checkpoint saved by train_universal_proposer.py."""
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     cfg_raw = ckpt.get("config", {})
+    
+    # Map new GLU config (n_features) and handle legacy point_mlp_layers
     config = UniversalProposerConfig(
-        hidden_dim=int(cfg_raw.get("hidden_dim", 128)),
-        point_mlp_layers=int(cfg_raw.get("point_mlp_layers", 2)),
+        hidden_dim=int(cfg_raw.get("hidden_dim", 256)),
+        n_features=int(cfg_raw.get("n_features", 370)),
         operator_vocab=cfg_raw.get("operator_vocab"),
         skeleton_vocab=cfg_raw.get("skeleton_vocab"),
     )
     model = UniversalProposer(config)
     model.load_state_dict(ckpt["model_state_dict"])
+    
+    # Attach scaler for automatic normalization during inference
+    model.feature_scaler = ckpt.get("feature_scaler")
+    
     if device is not None:
         model = model.to(torch.device(device))
     model.eval()

@@ -29,9 +29,42 @@ from glassbox.sr.universal_proposer import (
 )
 
 try:
-    from scripts.generate_curve_data import evaluate_formula
+    from scripts.generate_curve_data import extract_all_features, evaluate_formula
 except Exception:
-    from generate_curve_data import evaluate_formula
+    from generate_curve_data import extract_all_features, evaluate_formula
+
+
+def compute_feature_stats(
+    features: np.ndarray,
+    indices: np.ndarray,
+    chunk_size: int = 65536,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Compute feature mean/std on selected rows without full subset materialization."""
+    indices = np.asarray(indices, dtype=np.int64)
+    if len(indices) == 0:
+        raise ValueError("Cannot compute feature stats for empty indices")
+
+    n_features = int(features.shape[1])
+    total_count = 0
+    sum_x = np.zeros(n_features, dtype=np.float64)
+    sum_x2 = np.zeros(n_features, dtype=np.float64)
+
+    for start in range(0, len(indices), chunk_size):
+        batch_idx = indices[start:start + chunk_size]
+        batch = np.asarray(features[batch_idx], dtype=np.float64)
+        
+        # Apply SymLog compression to make distributions Gaussian-friendly
+        batch = np.sign(batch) * np.log1p(np.abs(batch))
+        
+        sum_x += batch.sum(axis=0)
+        sum_x2 += np.square(batch).sum(axis=0)
+        total_count += batch.shape[0]
+
+    mean = sum_x / max(total_count, 1)
+    var = (sum_x2 / max(total_count, 1)) - np.square(mean)
+    var = np.maximum(var, 0.0)
+    std = np.sqrt(var) + 1e-8
+    return mean.astype(np.float32), std.astype(np.float32)
 
 
 class SyntheticCurveDataset(Dataset):
@@ -77,181 +110,154 @@ class SyntheticCurveDataset(Dataset):
             y = x + np.sin(x)
             ops = ["identity", "sin", "periodic"]
 
-        # Small observation noise to avoid trivial overfitting.
+        # Extract real analytical features (Invariants, FFT, Derivatives)
         y = y + 0.01 * self.rng.randn(*y.shape).astype(np.float32)
-        points = np.stack([x, y.astype(np.float32)], axis=1)
+        features = extract_all_features(y)
+
+        # Apply SymLog (No scaler for synthetic MVP)
+        features = np.sign(features) * np.log1p(np.abs(features))
 
         op_target = np.zeros(len(self.operator_vocab), dtype=np.float32)
         for op in ops:
-            op_target[self.operator_vocab.index(op)] = 1.0
+            if op in self.operator_vocab:
+                op_target[self.operator_vocab.index(op)] = 1.0
 
         return (
-            torch.from_numpy(points),
+            torch.from_numpy(features.astype(np.float32)),
             torch.from_numpy(op_target),
             torch.tensor(kind, dtype=torch.long),
         )
 
 
 class FormulaReplayDataset(Dataset):
-    """Dataset-backed proposer training from generated formula corpora (.npz).
-
-    Expects `.npz` with keys:
-    - labels: [N, C] multi-hot operator labels
-    - formulas: [N] formula strings
-    """
+    """Dataset-backed proposer training from generated formula corpora (.npz)."""
 
     def __init__(
         self,
-        data_path: Path,
-        n_points: int = 128,
-        x_min: float = -2.0,
-        x_max: float = 2.0,
-        max_samples: Optional[int] = None,
+        features: np.ndarray,
+        labels: np.ndarray,
+        indices: np.ndarray,
+        scaler: Optional[dict] = None,
     ):
-        blob = np.load(data_path, allow_pickle=True)
-        labels = np.asarray(blob["labels"], dtype=np.float32)
-        formulas = blob["formulas"].tolist()
-
-        if max_samples is not None:
-            limit = int(max_samples)
-            labels = labels[:limit]
-            formulas = formulas[:limit]
-
+        self.features = features
         self.labels = labels
-        self.formulas = formulas
-        self.n_points = int(n_points)
-        self.x = np.linspace(float(x_min), float(x_max), self.n_points, dtype=np.float32)
-
+        self.indices = indices
+        self.scaler = scaler
         self.operator_vocab = list(DEFAULT_OPERATOR_VOCAB)
-        self.skeleton_vocab = list(DEFAULT_SKELETON_VOCAB)
 
     def __len__(self) -> int:
-        return len(self.formulas)
+        return len(self.indices)
 
     def _labels_to_operator_target(self, row: np.ndarray) -> np.ndarray:
-        # Map existing operator labels (from classifier dataset) into proposer vocab.
-        # Known index mapping from generate_curve_data.OPERATOR_CLASSES:
-        # identity=0,sin=1,cos=2,power=3,exp=4,log=5,addition=6,multiplication=7,rational=8,...
         op = np.zeros(len(self.operator_vocab), dtype=np.float32)
-        if row.shape[0] >= 9:
-            op[self.operator_vocab.index("identity")] = row[0]
-            op[self.operator_vocab.index("sin")] = row[1]
-            op[self.operator_vocab.index("cos")] = row[2]
-            op[self.operator_vocab.index("power")] = row[3]
-            op[self.operator_vocab.index("exp")] = row[4]
-            op[self.operator_vocab.index("log")] = row[5]
-            op[self.operator_vocab.index("rational")] = row[8]
-            # Derived periodic tag from sin/cos.
+        mapping = {
+            "identity": 0, "sin": 1, "cos": 2, "power": 3, "exp": 4, 
+            "log": 5, "rational": 8
+        }
+        for name, idx in mapping.items():
+            if idx < row.shape[0]:
+                op[self.operator_vocab.index(name)] = row[idx]
+        if "periodic" in self.operator_vocab:
             op[self.operator_vocab.index("periodic")] = max(row[1], row[2])
         return op
 
     def __getitem__(self, idx: int):
-        formula = str(self.formulas[idx])
-        y, status = evaluate_formula(formula, self.x, safe_eval=True)
-        if y is None or status != "ok":
-            # Fallback to stable placeholder curve to keep batch shapes valid.
-            y = np.zeros_like(self.x, dtype=np.float32)
-        y = np.asarray(y, dtype=np.float32)
-        if y.shape != self.x.shape or np.any(~np.isfinite(y)):
-            y = np.zeros_like(self.x, dtype=np.float32)
-
-        points = np.stack([self.x, y], axis=1)
-        op_target = self._labels_to_operator_target(self.labels[idx])
-
-        # For dataset-backed mode we currently train skeleton head weakly;
-        # use -1 target so CE loss can be masked out.
-        skeleton_target = -1
-
-        return (
-            torch.from_numpy(points),
-            torch.from_numpy(op_target),
-            torch.tensor(skeleton_target, dtype=torch.long),
-        )
+        sample_idx = self.indices[idx]
+        feat = self.features[sample_idx]
+        
+        # Apply SymLog + Scaling
+        feat = np.sign(feat) * np.log1p(np.abs(feat))
+        if self.scaler is not None:
+            feat = (feat - self.scaler['mean']) / (self.scaler['std'] + 1e-8)
+            
+        op_target = self._labels_to_operator_target(self.labels[sample_idx])
+        return torch.from_numpy(feat.astype(np.float32)), torch.from_numpy(op_target), torch.tensor(-1, dtype=torch.long)
 
 
-def _train_epoch(model, loader, optimizer, device) -> Tuple[float, float]:
+def _train_epoch(model, loader, optimizer, device) -> float:
     model.train()
     total_loss = 0.0
     total = 0
-    correct = 0
 
-    for points, op_target, skeleton_target in loader:
-        points = points.to(device, non_blocking=True)
+    for features, op_target, skeleton_target in loader:
+        features = features.to(device, non_blocking=True)
         op_target = op_target.to(device, non_blocking=True)
-        skeleton_target = skeleton_target.to(device, non_blocking=True)
 
-        out = model(points)
-        op_loss = F.binary_cross_entropy_with_logits(out["operator_logits"], op_target)
-        valid_skeleton = skeleton_target >= 0
-        if bool(valid_skeleton.any()):
-            sk_loss = F.cross_entropy(out["skeleton_logits"][valid_skeleton], skeleton_target[valid_skeleton])
-        else:
-            sk_loss = torch.tensor(0.0, device=device)
-        loss = op_loss + sk_loss
-
+        out = model(features)
+        loss = F.binary_cross_entropy_with_logits(out["operator_logits"], op_target)
+        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        total_loss += float(loss.item()) * points.shape[0]
-        pred = torch.argmax(out["skeleton_logits"], dim=1)
-        if bool(valid_skeleton.any()):
-            correct += int((pred[valid_skeleton] == skeleton_target[valid_skeleton]).sum().item())
-        total += points.shape[0]
+        total_loss += float(loss.item()) * features.shape[0]
+        total += features.shape[0]
 
-    return total_loss / max(total, 1), correct / max(total, 1)
+    return total_loss / max(total, 1)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train universal proposer (Phase 1 scaffold)")
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--n-samples", type=int, default=2000)
+    parser.add_argument("--n-samples", type=int, default=10000)
     parser.add_argument("--n-points", type=int, default=128)
-    parser.add_argument("--hidden", type=int, default=128)
-    parser.add_argument("--out", type=str, default="models/universal_proposer_mvp.pt")
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--hidden", type=int, default=512)
+    parser.add_argument("--out", type=str, default="models/universal_proposer_robust.pt")
+    parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--data", type=str, default="", help="Optional dataset .npz path from generate_curve_data")
     parser.add_argument("--max-samples", type=int, default=0, help="Optional cap when --data is used")
     args = parser.parse_args()
 
-    device = torch.device(args.device)
+    if args.device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(args.device)
 
     config = UniversalProposerConfig(hidden_dim=args.hidden)
     model = UniversalProposer(config).to(device)
 
     if args.data:
-        ds = FormulaReplayDataset(
-            data_path=Path(args.data),
-            n_points=args.n_points,
-            max_samples=(args.max_samples if args.max_samples > 0 else None),
-        )
+        blob = np.load(args.data, allow_pickle=True)
+        features = np.asarray(blob["features"], dtype=np.float32)
+        labels = np.asarray(blob["labels"], dtype=np.float32)
+        
+        if args.max_samples > 0:
+            features = features[:args.max_samples]
+            labels = labels[:args.max_samples]
+
+        indices = np.arange(len(features))
+        np.random.shuffle(indices)
+        
+        print("Computing feature statistics (SymLog + Standardize)...")
+        mean, std = compute_feature_stats(features, indices)
+        scaler = {'mean': mean, 'std': std}
+
+        ds = FormulaReplayDataset(features, labels, indices, scaler=scaler)
         print(f"dataset=FormulaReplayDataset samples={len(ds)} path={args.data}")
     else:
+        scaler = None
         ds = SyntheticCurveDataset(n_samples=args.n_samples, n_points=args.n_points)
         print(f"dataset=SyntheticCurveDataset samples={len(ds)}")
         
     import os
     use_cuda = device.type == 'cuda'
     num_cpus = os.cpu_count() or 4
-    n_workers = min(12, max(2, num_cpus - 2)) if use_cuda else 0
+    n_workers = min(8, max(2, num_cpus - 2)) if use_cuda else 0
     
-    loader_kwargs = {
-        'num_workers': n_workers,
-        'pin_memory': use_cuda,
-    }
+    loader_kwargs = {'num_workers': n_workers, 'pin_memory': use_cuda}
     if n_workers > 0:
-        loader_kwargs['prefetch_factor'] = 4
+        loader_kwargs['prefetch_factor'] = 2
         loader_kwargs['persistent_workers'] = True
 
     loader = DataLoader(ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
-
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
+    print(f"Training GLU Proposer on {device}...")
     for epoch in range(1, args.epochs + 1):
-        loss, acc = _train_epoch(model, loader, opt, device)
-        print(f"epoch={epoch:03d} loss={loss:.5f} skeleton_acc={acc:.4f}")
+        loss = _train_epoch(model, loader, opt, device)
+        print(f"epoch={epoch:03d} loss={loss:.5f}")
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -260,10 +266,11 @@ def main():
             "model_state_dict": model.state_dict(),
             "config": {
                 "hidden_dim": config.hidden_dim,
-                "point_mlp_layers": config.point_mlp_layers,
+                "n_features": config.n_features,
                 "operator_vocab": model.operator_vocab,
                 "skeleton_vocab": model.skeleton_vocab,
             },
+            "feature_scaler": scaler,
         },
         out_path,
     )
