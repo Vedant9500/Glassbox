@@ -29,6 +29,17 @@ import re
 import sys
 import time
 import traceback
+
+# Fix UnicodeEncodeError on Windows
+if sys.platform == 'win32':
+    import io
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
+    else:
+        # Fallback for older python versions
+        import codecs
+        sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
+
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple

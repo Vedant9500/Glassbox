@@ -709,8 +709,8 @@ def main():
                         help="Path to training data (.npz file) or base path / .features.dat + .labels.dat")
     parser.add_argument("--n-samples", type=int, default=None,
                         help="Number of samples (required for .dat if file size cannot be inferred)")
-    parser.add_argument("--feature-dim", type=int, default=366,
-                        help="Feature dimension for .dat files (default: 366)")
+    parser.add_argument("--feature-dim", type=int, default=370,
+                        help="Feature dimension for .dat files (default: 370)")
     parser.add_argument("--n-classes", type=int, default=9,
                         help="Number of classes for .dat files (default: 9)")
     parser.add_argument("--load-into-ram", action="store_true",

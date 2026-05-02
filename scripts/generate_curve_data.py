@@ -78,7 +78,7 @@ OPERATOR_CLASSES = {
 N_CLASSES = len(OPERATOR_CLASSES)
 
 # Feature dimensionality (see extract_all_features)
-FEATURE_DIM = 366
+FEATURE_DIM = 370
 
 # Feature schema (slices into feature vector)
 FEATURE_SCHEMA = {
@@ -88,6 +88,7 @@ FEATURE_SCHEMA = {
     "deriv": (192, 320),
     "stats": (320, 329),
     "curv": (329, 366),
+    "invariants": (366, 370),
 }
 
 
@@ -844,6 +845,51 @@ def extract_curvature_features(y: np.ndarray, n_points: int = 32) -> np.ndarray:
     return np.concatenate([curvature_resampled, curvature_stats])
 
 
+def extract_differential_invariants(y: np.ndarray, dx: float = 1.0) -> np.ndarray:
+    '''
+    Compute the 4 Differential Invariants for pure exponential, sinusoidal,
+    power law, and simple rational functions (Schwarzian derivative).
+    '''
+    n = len(y)
+    if n < 7:
+        return np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        
+    k1 = np.array([-3, -2, -1, 0, 1, 2, 3]) / (28.0 * dx)
+    k2 = np.array([5, 0, -3, -4, -3, 0, 5]) / (42.0 * dx**2)
+    k3 = np.array([-1, 1, 1, 0, -1, -1, 1]) / (6.0 * dx**3)
+    
+    inv_exps, inv_sins, inv_pows, inv_rats = [], [], [], []
+    
+    for i in range(3, n - 3):
+        window = y[i-3:i+4]
+        dy = np.sum(window * k1)
+        ddy = np.sum(window * k2)
+        dddy = np.sum(window * k3)
+        
+        if np.abs(dy) < 1e-3: # Guard against division by zero on flat regions
+            continue
+            
+        inv_exp = ddy / dy
+        inv_sin = dddy / dy
+        inv_pow = (dy * dddy) / (ddy**2) if np.abs(ddy) > 1e-3 else 0
+        inv_rat = inv_sin - 1.5 * (inv_exp**2)
+        
+        inv_exps.append(inv_exp)
+        inv_sins.append(inv_sin)
+        inv_pows.append(inv_pow)
+        inv_rats.append(np.abs(inv_rat))
+        
+    if len(inv_exps) < 2:
+        return np.array([0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        
+    return np.array([
+        np.var(inv_exps),
+        np.var(inv_sins),
+        np.var(inv_pows),
+        np.mean(inv_rats)
+    ], dtype=np.float64)
+
+
 def extract_all_features(y: np.ndarray) -> np.ndarray:
     """Combine all features into single vector."""
     raw = extract_raw_features(y, n_points=128)           # 128
@@ -852,11 +898,12 @@ def extract_all_features(y: np.ndarray) -> np.ndarray:
     deriv = extract_derivative_features(y, n_points=64)   # 128
     stats = extract_stat_features(y)                       # 9
     curv = extract_curvature_features(y, n_points=32)      # 37 (32 + 5)
+    invars = extract_differential_invariants(raw, dx=1.0/128.0) # 4
     
-    features = np.concatenate([raw, fft, fft_phase, deriv, stats, curv])
+    features = np.concatenate([raw, fft, fft_phase, deriv, stats, curv, invars])
     if features.shape[0] != FEATURE_DIM:
         raise ValueError(f"Feature vector size mismatch: {features.shape[0]} != {FEATURE_DIM}")
-    return features  # Total: 366
+    return features  # Total: 370
 
 
 # =============================================================================
