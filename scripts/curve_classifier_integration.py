@@ -14,6 +14,7 @@ Usage:
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import sys
@@ -105,6 +106,56 @@ class CurveClassifierCNN(nn.Module):
 
         combined = torch.cat([conv_out, other_out], dim=1)
         return self.classifier(combined)
+
+
+class CurveClassifierGLU(nn.Module):
+    """
+    First-Principles Mathematical Classifier using Gated Linear Units (GLU).
+    Mathematically models multiplicative function composition (e.g. x * sin(x)) natively.
+    Replaces both the redundant CNN and deep ReLU MLPs with a cache-contiguous 2-layer network.
+    """
+    def __init__(self, n_features: int = 370, n_classes: int = 9, hidden: int = 256):
+        super().__init__()
+        
+        # A GLU layer splits its output in half along dim=1. 
+        # To maintain a 'hidden' dimension size, we project to hidden * 2.
+        self.fc1 = nn.Linear(n_features, hidden * 2)
+        self.bn1 = nn.BatchNorm1d(hidden * 2)
+        
+        self.fc2 = nn.Linear(hidden, hidden * 2)
+        self.bn2 = nn.BatchNorm1d(hidden * 2)
+        
+        self.classifier = nn.Linear(hidden, n_classes)
+        self.dropout = nn.Dropout(0.2)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """Hardware-sympathetic initialization for multiplicative gating."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # Xavier initialization optimizes variance for the linear path
+                nn.init.xavier_normal_(m.weight)
+                if m.bias is not None:
+                    # Initialize biases slightly positive so the sigmoid gate starts "open"
+                    nn.init.constant_(m.bias, 0.1)
+                    
+    def forward(self, x):
+        # Layer 1: Invariants and FFT multi-hot gate the raw derivatives
+        # Mathematically computes: (xW_1 + b_1) ⊗ σ(xW_2 + b_2)
+        x = self.fc1(x)
+        x = self.bn1(x)
+        x = F.glu(x, dim=1)
+        x = self.dropout(x)
+        
+        # Layer 2: Higher-order multiplicative compositions (e.g. power * exp * trig)
+        x = self.fc2(x)
+        x = self.bn2(x)
+        x = F.glu(x, dim=1)
+        x = self.dropout(x)
+        
+        # Linear projection to class logits
+        return self.classifier(x)
 
 
 # =============================================================================
@@ -240,6 +291,11 @@ def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, ca
             n_features=n_features,
             curve_dim=curve_dim,
         )
+    elif model_type == 'glu':
+        input_weights = state_dict['fc1.weight']
+        n_features = int(model_config.get('n_features', input_weights.shape[1]))
+        hidden_size = int(model_config.get('hidden', input_weights.shape[0] // 2))
+        model = CurveClassifierGLU(n_features=n_features, n_classes=n_classes, hidden=hidden_size)
     else:
         input_weights = state_dict['net.0.weight']
         n_features = int(model_config.get('n_features', input_weights.shape[1]))
