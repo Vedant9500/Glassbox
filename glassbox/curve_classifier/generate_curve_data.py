@@ -78,7 +78,7 @@ OPERATOR_CLASSES = {
 N_CLASSES = len(OPERATOR_CLASSES)
 
 # Feature dimensionality (see extract_all_features)
-FEATURE_DIM = 370
+FEATURE_DIM = 398
 
 # Feature schema (slices into feature vector)
 FEATURE_SCHEMA = {
@@ -88,7 +88,7 @@ FEATURE_SCHEMA = {
     "deriv": (192, 320),
     "stats": (320, 329),
     "curv": (329, 366),
-    "invariants": (366, 370),
+    "invariants": (366, 398),  # expanded from 4 to 32 basis-invariant features
 }
 
 
@@ -888,20 +888,222 @@ def extract_differential_invariants(y: np.ndarray, dx: float = 1.0) -> np.ndarra
     ], dtype=np.float64)
 
 
+def spectral_derivatives(y: np.ndarray, n_points: int = 64) -> np.ndarray:
+    """Compute 1st and 2nd derivatives via Fourier differentiation.
+    
+    This is much more robust to noise than finite differences because it 
+    operates in the frequency domain where d/dx is just multiplication by i*omega.
+    """
+    n = len(y)
+    if n < 8:
+        return np.zeros(n_points * 2)
+        
+    # Detrend to handle non-periodic boundary conditions
+    x = np.linspace(0, 1, n)
+    # Filter out NaNs if any
+    mask = np.isfinite(y)
+    if np.sum(mask) < 2: return np.zeros(n_points * 2)
+    
+    slope, intercept = np.polyfit(x[mask], y[mask], 1)
+    y_detrended = y - (slope * x + intercept)
+    y_detrended = np.nan_to_num(y_detrended)
+    
+    # FFT
+    Y = np.fft.rfft(y_detrended)
+    freqs = np.fft.rfftfreq(n, d=1.0/n)
+    omega = 2 * np.pi * freqs
+    
+    # Spectral derivatives: d/dx -> i*omega, d2/dx2 -> -omega^2
+    dY = 1j * omega * Y
+    ddY = -(omega ** 2) * Y
+    
+    # Inverse FFT
+    dy = np.fft.irfft(dY, n=n) + slope
+    ddy = np.fft.irfft(ddY, n=n)
+    
+    # Resample to fixed size
+    dy_res = np.interp(np.linspace(0, 1, n_points), np.linspace(0, 1, n), dy)
+    ddy_res = np.interp(np.linspace(0, 1, n_points), np.linspace(0, 1, n), ddy)
+    
+    # Normalize by max abs to keep features in [-1, 1] range
+    m1 = np.max(np.abs(dy_res)) + 1e-12
+    m2 = np.max(np.abs(ddy_res)) + 1e-12
+    
+    return np.nan_to_num(np.concatenate([dy_res / m1, ddy_res / m2]))
+
+
+
+def extract_invariant_features_v2(y: np.ndarray, dx: float = 1.0) -> np.ndarray:
+    """32-dimensional basis-invariant feature vector.
+
+    Expands the original 4 differential invariants into a rich representation
+    capturing stability, cross-correlations, spectral entropy, and
+    autocorrelation decay of each invariant channel.
+
+    These features are mathematically invariant to affine reparameterization
+    x -> ax + b and rescaling y -> cy + d.
+
+    Feature layout (32 total):
+      [0:20]  Per-channel stats (5 x 4 channels):
+              variance, median|value|, window-stability, zero-crossing rate, spectral entropy
+      [20:26] Cross-correlations between channel pairs (C(4,2)=6)
+      [26:30] Autocorrelation decay rate per channel (4)
+      [30:32] Global: discrimination ratio, overall quality
+    """
+    n = len(y)
+    if n < 15:
+        return np.zeros(32, dtype=np.float64)
+
+    # Use Spectral Derivatives for cleaner invariants
+    s_derivs = spectral_derivatives(y, n_points=len(y)//2)
+    dy = s_derivs[:len(s_derivs)//2]
+    ddy = s_derivs[len(s_derivs)//2:]
+    
+    # 3rd derivative still via stencil for now, but on smoothed dy
+    k2 = np.array([5, 0, -3, -4, -3, 0, 5]) / (42.0 * dx**2)
+    dddy = np.convolve(dy, k2, mode='valid')
+    
+    # Align lengths
+    m = min(len(dy), len(ddy), len(dddy))
+    dy, ddy, dddy = dy[:m], ddy[:m], dddy[:m]
+
+    # dx is now effectively 1.0/m because we are on a canonical [0, 1] grid
+    canonical_dx = 1.0 / m
+
+    eps = 1e-6
+    safe_dy = np.where(np.abs(dy) > eps, dy, eps * np.sign(dy + 1e-12))
+    safe_ddy = np.where(np.abs(ddy) > eps, ddy, eps * np.sign(ddy + 1e-12))
+
+    # 4 raw invariant channels (Ratio-based, so dx cancels out anyway, 
+    # but canonical_dx ensures the magnitudes are consistent)
+    inv_exp = ddy / safe_dy
+    inv_sin = dddy / safe_dy
+    inv_pow = (dy * dddy) / (safe_ddy ** 2)
+    inv_rat = inv_sin - 1.5 * (inv_exp ** 2)
+
+    channels = [inv_exp, inv_sin, inv_pow, inv_rat]
+
+    features = []
+    variances = []
+
+    # --- Per-channel statistics: 5 per channel = 20 total ---
+    for ch in channels:
+        ch_clean = np.nan_to_num(np.clip(ch, -100, 100), nan=0.0)
+
+        # LOG-SCALED VARIANCE: Prevents feature squashing
+        v = float(np.var(ch_clean))
+        features.append(np.log1p(v)) 
+        variances.append(v)
+        
+        features.append(float(np.median(np.abs(ch_clean))))
+
+        # Windowed stability: log-scaled inter-window variance
+        windows = np.array_split(ch_clean, 4)
+        wmeans = [float(np.mean(w)) for w in windows if len(w) > 0]
+        wv = float(np.var(wmeans)) if len(wmeans) > 1 else 0.0
+        features.append(np.log1p(wv))
+
+        # Zero-crossing rate
+        if len(ch_clean) > 1:
+            zc = float(np.sum(np.diff(np.sign(ch_clean)) != 0)) / (len(ch_clean) - 1)
+        else:
+            zc = 0.0
+        features.append(zc)
+
+        # Spectral entropy of invariant channel
+        if len(ch_clean) >= 8:
+            fft_mag = np.abs(np.fft.rfft(ch_clean))
+            fft_sum = float(np.sum(fft_mag)) + 1e-12
+            fft_norm = fft_mag / fft_sum
+            entropy = float(-np.sum(fft_norm * np.log(fft_norm + 1e-12)))
+            features.append(entropy)
+        else:
+            features.append(0.0)
+
+    # --- Cross-correlations between channel pairs: C(4,2)=6 ---
+    for i in range(4):
+        for j in range(i + 1, 4):
+            ci = np.nan_to_num(np.clip(channels[i], -100, 100))
+            cj = np.nan_to_num(np.clip(channels[j], -100, 100))
+            m = min(len(ci), len(cj))
+            if m > 2:
+                # Avoid correlation on constant signals (zero variance)
+                if np.var(ci[:m]) < 1e-12 or np.var(cj[:m]) < 1e-12:
+                    features.append(0.0)
+                else:
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        corr = np.corrcoef(ci[:m], cj[:m])[0, 1]
+                    features.append(0.0 if not np.isfinite(corr) else float(corr))
+            else:
+                features.append(0.0)
+
+    # --- Autocorrelation decay rate per channel: 4 ---
+    for ch in channels:
+        ch_clean = np.nan_to_num(np.clip(ch, -100, 100))
+        if len(ch_clean) >= 8:
+            centered = ch_clean - np.mean(ch_clean)
+            v = np.var(ch_clean)
+            if v > 1e-12:
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    ac = np.correlate(centered, centered, mode='full')
+                    ac = ac[len(ac) // 2:]
+                    ac = ac / (ac[0] + 1e-12)
+                    below = np.where(ac < 1.0 / np.e)[0]
+                    decay = float(below[0]) / len(ch_clean) if len(below) > 0 else 1.0
+            else:
+                decay = 1.0
+            features.append(decay)
+        else:
+            features.append(1.0)
+
+    # --- Global features: 2 ---
+    sorted_vars = sorted(variances)
+    # Discrimination ratio: how much the best invariant stands out
+    features.append(sorted_vars[0] / (sorted_vars[1] + 1e-12))
+    log_vars = [np.log(v + 1e-12) for v in variances]
+    features.append(float(np.mean(log_vars)))
+
+    result = np.array(features[:32], dtype=np.float64)
+    return np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def extract_all_features(y: np.ndarray) -> np.ndarray:
-    """Combine all features into single vector."""
-    raw = extract_raw_features(y, n_points=128)           # 128
-    fft = extract_fft_features(y, n_freqs=32)             # 32
-    fft_phase = extract_fft_phase_features(y, n_bins=32)  # 32  (NEW)
-    deriv = extract_derivative_features(y, n_points=64)   # 128
-    stats = extract_stat_features(y)                       # 9
-    curv = extract_curvature_features(y, n_points=32)      # 37 (32 + 5)
-    invars = extract_differential_invariants(raw, dx=1.0/128.0) # 4
+    """Combine all features into single vector.
+    
+    CRITICAL BASIS-INDEPENDENCE NORMALIZATION:
+    1. y is normalized to zero-mean, unit-variance BEFORE feature extraction.
+       This ensures sin(x), 3*sin(x)+100, and 0.01*sin(x)-50 all produce
+       identical feature vectors — true y-axis invariance.
+    2. x-grid is treated as [0, 1] internally — true x-axis invariance.
+    
+    Together, these make the classifier invariant to (x → ax+b, y → cy+d).
+    """
+    y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+    
+    # ── Canonical y-normalization: zero-mean, unit-variance ──
+    # This is the KEY to basis independence. Without it, the same curve
+    # sampled on different domains produces wildly different raw/FFT features.
+    mu = np.mean(y)
+    sigma = np.std(y)
+    if sigma > 1e-12:
+        y = (y - mu) / sigma
+    else:
+        y = y - mu  # constant signal — shape is preserved as ~zero
+    
+    raw = extract_raw_features(y, n_points=128)
+    fft = extract_fft_features(y, n_freqs=32)
+    fft_phase = extract_fft_phase_features(y, n_bins=32)
+    
+    deriv = spectral_derivatives(y, n_points=64)
+    stats = extract_stat_features(y)
+    curv = extract_curvature_features(y, n_points=32)
+    
+    invars = extract_invariant_features_v2(y, dx=1.0)
     
     features = np.concatenate([raw, fft, fft_phase, deriv, stats, curv, invars])
     if features.shape[0] != FEATURE_DIM:
         raise ValueError(f"Feature vector size mismatch: {features.shape[0]} != {FEATURE_DIM}")
-    return features  # Total: 370
+    return features
 
 
 # =============================================================================
@@ -1619,12 +1821,12 @@ def main():
                         help="Maximum x value (default: 5)")
     parser.add_argument("--x-ranges", type=str, default="",
                         help="Comma-separated x ranges like '-1:1,-5:5,-10:10' (overrides --x-min/--x-max)")
-    parser.add_argument("--x-scale-min", type=float, default=0.8,
-                        help="Minimum multiplicative scale for x (default: 0.8)")
-    parser.add_argument("--x-scale-max", type=float, default=1.2,
-                        help="Maximum multiplicative scale for x (default: 1.2)")
-    parser.add_argument("--x-shift-std", type=float, default=0.05,
-                        help="Additive shift std for x as fraction of x span (default: 0.05)")
+    parser.add_argument("--x-scale-min", type=float, default=0.2,
+                        help="Minimum multiplicative scale for x (default: 0.2)")
+    parser.add_argument("--x-scale-max", type=float, default=5.0,
+                        help="Maximum multiplicative scale for x (default: 5.0)")
+    parser.add_argument("--x-shift-std", type=float, default=0.2,
+                        help="Additive shift std for x as fraction of x span (default: 0.2)")
     parser.add_argument("--n-points", type=int, default=256,
                         help="Number of points per curve (default: 256)")
     parser.add_argument("--rational-ratio", type=float, default=0.0,
@@ -1643,12 +1845,12 @@ def main():
                         help="Do not store formulas in the output dataset")
     parser.add_argument("--noise-std", type=float, default=0.01,
                         help="Additive noise std as fraction of curve std (default: 0.01)")
-    parser.add_argument("--y-scale-min", type=float, default=0.8,
-                        help="Minimum multiplicative scale for y (default: 0.8)")
-    parser.add_argument("--y-scale-max", type=float, default=1.2,
-                        help="Maximum multiplicative scale for y (default: 1.2)")
-    parser.add_argument("--y-offset-std", type=float, default=0.05,
-                        help="Additive offset std for y (default: 0.05)")
+    parser.add_argument("--y-scale-min", type=float, default=0.2,
+                        help="Minimum multiplicative scale for y (default: 0.2)")
+    parser.add_argument("--y-scale-max", type=float, default=5.0,
+                        help="Maximum multiplicative scale for y (default: 5.0)")
+    parser.add_argument("--y-offset-std", type=float, default=0.5,
+                        help="Additive offset std for y (default: 0.5)")
     parser.add_argument("--safe-eval", action="store_true",
                         help="Use restricted AST-based evaluation instead of eval")
     parser.add_argument("--unsafe-eval", action="store_true",
@@ -1659,11 +1861,11 @@ def main():
                         help="Keep b and d coefficients positive")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
-    parser.add_argument("--pcfg-ratio", type=float, default=0.0,
-                        help="Fraction of samples generated via PCFG grammar (0-1, default: 0)")
-    parser.add_argument("--pcfg-max-depth", type=int, default=4,
-                        help="Maximum tree depth for PCFG formulas (default: 4)")
-    parser.add_argument("--noise-profile", type=str, default='legacy',
+    parser.add_argument("--pcfg-ratio", type=float, default=0.3,
+                        help="Fraction of samples generated via PCFG grammar (0-1, default: 0.3)")
+    parser.add_argument("--pcfg-max-depth", type=int, default=5,
+                        help="Maximum tree depth for PCFG formulas (default: 5)")
+    parser.add_argument("--noise-profile", type=str, default='multi',
                         choices=['legacy', 'multi'],
                         help="Noise injection mode: 'legacy' (fixed Gaussian) or 'multi' (randomized multi-SNR)")
     

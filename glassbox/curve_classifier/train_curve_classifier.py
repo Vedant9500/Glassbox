@@ -26,7 +26,7 @@ from typing import Tuple, Optional, List
 class CurveClassifierMLP(nn.Module):
     """Simple MLP classifier for curve features."""
     
-    def __init__(self, n_features: int = 366, n_classes: int = 9, hidden: int = 256):
+    def __init__(self, n_features: int = 398, n_classes: int = 9, hidden: int = 512):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_features, hidden),
@@ -64,7 +64,7 @@ class CurveClassifierMLP(nn.Module):
 class CurveClassifierCNN(nn.Module):
     """1D CNN that operates on the raw curve portion of features."""
     
-    def __init__(self, n_classes: int = 9, n_features: int = 366, curve_dim: int = 128):
+    def __init__(self, n_classes: int = 9, n_features: int = 398, curve_dim: int = 128):
         super().__init__()
         
         # Dynamically determine curve dimension (use min of curve_dim and n_features)
@@ -136,7 +136,7 @@ class CurveClassifierGLU(nn.Module):
     Mathematically models multiplicative function composition (e.g. x * sin(x)) natively.
     Replaces both the redundant CNN and deep ReLU MLPs with a cache-contiguous 2-layer network.
     """
-    def __init__(self, n_features: int = 370, n_classes: int = 9, hidden: int = 256):
+    def __init__(self, n_features: int = 398, n_classes: int = 9, hidden: int = 512):
         super().__init__()
         
         # A GLU layer splits its output in half along dim=1. 
@@ -759,8 +759,8 @@ def main():
                         help="Path to training data (.npz file) or base path / .features.dat + .labels.dat")
     parser.add_argument("--n-samples", type=int, default=None,
                         help="Number of samples (required for .dat if file size cannot be inferred)")
-    parser.add_argument("--feature-dim", type=int, default=370,
-                        help="Feature dimension for .dat files (default: 370)")
+    parser.add_argument("--feature-dim", type=int, default=398,
+                        help="Feature dimension for .dat files (default: 398)")
     parser.add_argument("--n-classes", type=int, default=9,
                         help="Number of classes for .dat files (default: 9)")
     parser.add_argument("--load-into-ram", action="store_true",
@@ -774,7 +774,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="Learning rate")
     parser.add_argument("--hidden", type=int, default=512,
-                        help="Hidden layer size (MLP only, default: 512)")
+                        help="Hidden layer size (default: 512)")
     parser.add_argument("--val-split", type=float, default=0.1,
                         help="Validation split ratio")
     parser.add_argument("--output", type=str, default="models/curve_classifier.pt",
@@ -864,17 +864,24 @@ def main():
     val_dataset = IndexedFeatureDataset(features, labels, val_idx, scaler=scaler)
     
     # Use pin_memory for GPU and num_workers for parallel data loading
-    # optimized to use more available CPU cores and persistent workers
+    # On Windows, num_workers > 0 often causes deadlocks or hangs.
     import os
+    import platform
     use_cuda = device.type == 'cuda'
-    num_cpus = os.cpu_count() or 4
-    n_workers = min(12, max(2, num_cpus - 2)) if use_cuda else 0
+    
+    # Default to 0 workers on Windows for stability, or allow override
+    n_workers = 0 
+    if platform.system() != "Windows" and use_cuda:
+        num_cpus = os.cpu_count() or 4
+        n_workers = min(12, max(2, num_cpus - 2))
     
     loader_kwargs = {
         'num_workers': n_workers,
         'pin_memory': use_cuda,
     }
-    if n_workers > 0:
+    
+    # Only use advanced loader options on Linux/CUDA
+    if n_workers > 0 and platform.system() != "Windows":
         loader_kwargs['prefetch_factor'] = 4
         loader_kwargs['persistent_workers'] = True
     

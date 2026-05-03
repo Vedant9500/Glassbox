@@ -48,7 +48,7 @@ DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_v3.1.pt"
 class CurveClassifierMLP(nn.Module):
     """Simple MLP classifier for curve features."""
     
-    def __init__(self, n_features: int = 370, n_classes: int = 9, hidden: int = 256):
+    def __init__(self, n_features: int = 398, n_classes: int = 9, hidden: int = 512):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_features, hidden),
@@ -75,7 +75,7 @@ class CurveClassifierMLP(nn.Module):
 class CurveClassifierCNN(nn.Module):
     """1D CNN classifier matching training architecture."""
 
-    def __init__(self, n_classes: int = 9, n_features: int = 370, curve_dim: int = 128):
+    def __init__(self, n_classes: int = 9, n_features: int = 398, curve_dim: int = 128):
         super().__init__()
         self.curve_dim = min(curve_dim, n_features)
 
@@ -124,7 +124,7 @@ class CurveClassifierGLU(nn.Module):
     Mathematically models multiplicative function composition (e.g. x * sin(x)) natively.
     Replaces both the redundant CNN and deep ReLU MLPs with a cache-contiguous 2-layer network.
     """
-    def __init__(self, n_features: int = 370, n_classes: int = 9, hidden: int = 256):
+    def __init__(self, n_features: int = 398, n_classes: int = 9, hidden: int = 512):
         super().__init__()
         
         # A GLU layer splits its output in half along dim=1. 
