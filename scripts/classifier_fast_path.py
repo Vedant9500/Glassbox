@@ -2094,9 +2094,21 @@ def run_fast_path(
     """
     import time
     try:
-        from curve_classifier_integration import predict_operators
+        from glassbox.curve_classifier.curve_classifier_integration import predict_operators
     except ImportError:
-        from scripts.curve_classifier_integration import predict_operators
+        try:
+            from curve_classifier_integration import predict_operators
+        except ImportError:
+            try:
+                from scripts.curve_classifier_integration import predict_operators
+            except ImportError:
+                # Last resort: try to find it in the new package relative to root
+                try:
+                    import glassbox.curve_classifier.curve_classifier_integration as cci
+                    predict_operators = cci.predict_operators
+                except ImportError:
+                    print("Warning: predict_operators not found. Fast path will be limited.")
+                    def predict_operators(*args, **kwargs): return {}
     
     start_time = time.time()
     

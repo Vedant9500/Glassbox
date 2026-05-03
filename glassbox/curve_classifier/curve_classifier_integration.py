@@ -19,13 +19,23 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import sys
 
-# Add parent to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add repo root to path for imports
+_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 try:
-    from scripts.generate_curve_data import extract_all_features, OPERATOR_CLASSES
-except ImportError:
-    from generate_curve_data import extract_all_features, OPERATOR_CLASSES
+    from .generate_curve_data import extract_all_features, OPERATOR_CLASSES
+except (ImportError, ValueError):
+    try:
+        from glassbox.curve_classifier.generate_curve_data import extract_all_features, OPERATOR_CLASSES
+    except ImportError:
+        try:
+            import scripts.generate_curve_data as gcd
+            extract_all_features = gcd.extract_all_features
+            OPERATOR_CLASSES = gcd.OPERATOR_CLASSES
+        except ImportError:
+            from generate_curve_data import extract_all_features, OPERATOR_CLASSES
 
 
 DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_v3.1.pt"
