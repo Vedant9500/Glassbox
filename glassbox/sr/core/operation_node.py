@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Dict, List
 
-from .meta_ops import (
+from glassbox.sr.operations.meta_ops import (
     MetaPeriodic,
     MetaPower,
     MetaArithmetic,
@@ -23,7 +23,7 @@ from .meta_ops import (
     MetaExp,
     MetaLog,
 )
-from .hard_concrete import HardConcreteOperationSelector, hard_concrete_sample
+from glassbox.sr.hard_concrete import HardConcreteOperationSelector, hard_concrete_sample
 
 
 class AdaptiveArityRouter(nn.Module):

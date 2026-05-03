@@ -89,7 +89,7 @@ class PhasedSymbolicRegressor:
         Uses evolutionary training to find structure.
         Returns model with discovered operations.
         """
-        from glassbox.sr.evolution import train_onn_evolutionary
+        from glassbox.evolution import train_onn_evolutionary
         
         if verbose:
             print("\n" + "="*70)
@@ -715,7 +715,7 @@ class PhasedSymbolicRegressor:
 def test_phased_regression():
     """Test the phased symbolic regression approach."""
     
-    from glassbox.sr import OperationDAG, generate_polynomial_data
+    from glassbox.sr.core.operation_dag import OperationDAG, generate_polynomial_data
     
     print("\n" + "="*70)
     print("PHASED SYMBOLIC REGRESSION TEST")

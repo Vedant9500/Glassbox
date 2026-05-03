@@ -15,8 +15,8 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from classifier_fast_path import run_fast_path
-from glassbox.sr.evolution import detect_dominant_frequency, EvolutionaryONNTrainer
-from glassbox.sr.operation_dag import OperationDAG
+from glassbox.evolution import detect_dominant_frequency, EvolutionaryONNTrainer
+from glassbox.sr.core.operation_dag import OperationDAG
 
 
 # AI-Feynman demo mappings from the upstream README/Table 4:

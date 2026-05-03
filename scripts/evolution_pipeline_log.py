@@ -37,9 +37,9 @@ CPP_DIR = ROOT / "glassbox" / "sr" / "cpp"
 if str(CPP_DIR) not in sys.path:
     sys.path.insert(0, str(CPP_DIR))
 
-from glassbox.sr.operation_dag import OperationDAG
-import glassbox.sr.evolution as evo_mod
-from glassbox.sr.evolution import EvolutionaryONNTrainer
+from glassbox.sr.core.operation_dag import OperationDAG
+import glassbox.evolution as evo_mod
+from glassbox.evolution import EvolutionaryONNTrainer
 
 
 class JsonlLogger:

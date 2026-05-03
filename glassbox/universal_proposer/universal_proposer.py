@@ -16,7 +16,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .fpip_v2 import validate_fpip_v2_payload
+from glassbox.sr.fpip_v2 import validate_fpip_v2_payload
 
 
 DEFAULT_OPERATOR_VOCAB: List[str] = [

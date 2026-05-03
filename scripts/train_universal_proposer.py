@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
-from glassbox.sr.universal_proposer import (
+from glassbox.universal_proposer import (
     UniversalProposer,
     UniversalProposerConfig,
     DEFAULT_OPERATOR_VOCAB,

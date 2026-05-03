@@ -345,7 +345,7 @@ class OperationDAG(nn.Module):
         
         # Import constant snapping utilities
         try:
-            from .meta_ops import get_constant_symbol
+            from glassbox.sr.operations.meta_ops import get_constant_symbol
             use_constants = True
         except ImportError:
             use_constants = False

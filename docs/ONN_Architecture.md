@@ -590,8 +590,8 @@ def get_formula(self):
 
 ```python
 import torch
-from glassbox.sr import OperationDAG
-from glassbox.sr.evolution import train_onn_evolutionary
+from glassbox.sr.core.operation_dag import OperationDAG
+from glassbox.evolution import train_onn_evolutionary
 
 # Generate data
 x = torch.linspace(-3, 3, 300).reshape(-1, 1)

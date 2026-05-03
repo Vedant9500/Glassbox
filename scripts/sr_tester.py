@@ -122,8 +122,8 @@ except ImportError:
     HAS_RICH = False
 
 # Glassbox imports
-from glassbox.sr.operation_dag import OperationDAG
-from glassbox.sr.evolution import EvolutionaryONNTrainer, train_onn_evolutionary, finalize_model_coefficients
+from glassbox.sr.core.operation_dag import OperationDAG
+from glassbox.evolution import EvolutionaryONNTrainer, train_onn_evolutionary, finalize_model_coefficients
 from glassbox.sr.visualization import LiveTrainingVisualizer
 from glassbox.sr.pruning import PostTrainingPruner, prune_model
 # Note: generate_polynomial_data, BaselineMLP, get_device were removed from glassbox.sr
@@ -534,7 +534,7 @@ class SRTester:
             mse = torch.nn.functional.mse_loss(pred.squeeze(), y.squeeze()).item()
             
             # Build formula string
-            from glassbox.sr.meta_ops import get_constant_symbol
+            from glassbox.sr.operations.meta_ops import get_constant_symbol
             formula_parts = []
             for name, w in zip(feature_names, weights[:-1]):
                 w_val = w.item()
@@ -639,7 +639,7 @@ def run_single_mode(config: Config):
 
     try:
         from classifier_fast_path import run_fast_path, run_guided_evolution
-        from glassbox.sr.evolution import detect_dominant_frequency
+        from glassbox.evolution import detect_dominant_frequency
 
         # Get FFT frequencies for better basis and guided priors.
         detected_omegas = detect_dominant_frequency(x_tensor, y_tensor, n_frequencies=3)

@@ -57,7 +57,7 @@ sys.path.insert(0, str(_SCRIPT_DIR))
 
 import classifier_fast_path as cfp  # noqa: E402
 from classifier_fast_path import run_fast_path, run_guided_evolution  # noqa: E402
-from glassbox.sr.evolution import detect_dominant_frequency  # noqa: E402
+from glassbox.evolution import detect_dominant_frequency  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Benchmark Formula Bank  (~200 formulas across 8 tiers)
@@ -640,7 +640,7 @@ SCORE_SYMBOLS = {
 _PROPOSER_CACHE = {}
 def _get_proposer(path: str, device: str):
     if path not in _PROPOSER_CACHE:
-        from glassbox.sr.universal_proposer import load_universal_proposer_checkpoint
+        from glassbox.universal_proposer import load_universal_proposer_checkpoint
         _PROPOSER_CACHE[path] = load_universal_proposer_checkpoint(path, device=device)
     return _PROPOSER_CACHE[path]
 
@@ -813,7 +813,7 @@ def run_formula(
             proposer_confidence = 0.5
             if not disable_proposer and proposer_path:
                 try:
-                    from glassbox.sr.universal_proposer import propose_fpip_v2_from_xy
+                    from glassbox.universal_proposer import propose_fpip_v2_from_xy
                     model = _get_proposer(proposer_path, device)
                     payload = propose_fpip_v2_from_xy(
                         model, x=x_np, y=y_np, top_k=5, device=device

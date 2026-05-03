@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 
-import glassbox.sr.evolution as evo
+import glassbox.evolution as evo
 
 
 class _DummyModel(nn.Module):

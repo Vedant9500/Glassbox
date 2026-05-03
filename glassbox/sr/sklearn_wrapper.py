@@ -33,7 +33,7 @@ try:
 except ImportError:
     CPP_AVAILABLE = False
 
-from .evolution import detect_dominant_frequency
+from glassbox.evolution import detect_dominant_frequency
 
 
 class GlassboxRegressor(BaseEstimator, RegressorMixin):

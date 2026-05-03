@@ -1,7 +1,7 @@
 # Symbolic Regression Module
 
 # v2: Meta-Operations (continuous parametric)
-from .meta_ops import (
+from glassbox.sr.operations.meta_ops import (
     MetaPeriodic,
     MetaPower,
     MetaArithmetic,
@@ -22,7 +22,7 @@ from .meta_ops import (
 )
 
 # v2: Hard Concrete Distribution
-from .hard_concrete import (
+from glassbox.sr.hard_concrete import (
     hard_concrete_sample,
     HardConcreteGate,
     HardConcreteSelector,
@@ -32,62 +32,29 @@ from .hard_concrete import (
 )
 
 # v2: Operation Nodes and DAG
-from .operation_node import (
-    OperationNode,
-    OperationNodeSimple,
-    OperationLayer,
-)
-from .operation_dag import (
+from glassbox.sr.core.operation_dag import (
     OperationDAG,
     OperationDAGSimple,
     ONNLoss,
     train_onn,
 )
+
+from glassbox.sr.core.operation_node import (
+    OperationNode,
+    OperationNodeSimple,
+    OperationLayer,
+)
+
 # v2: Hybrid Optimization
-from .hybrid_optimizer import (
+from glassbox.sr.optimizers.hybrid_optimizer import (
     LBFGSConstantOptimizer,
     EvolutionaryOptimizer,
     HybridOptimizer,
     GradientGuidedEvolution,
 )
 
-# v2: Benchmarking
-
-
-# v2: Evolutionary Training (PROPER approach)
-from .evolution import (
-    EvolutionaryONNTrainer,
-    train_onn_evolutionary,
-    random_operation_init,
-    mutate_operations,
-    refine_constants,
-)
-
-# v2: Visualization
-from .visualization import (
-    ONNVisualizer,
-    LiveTrainingVisualizer,
-    create_network_diagram,
-    visualize_evolution,
-)
-
-# v2: Post-Training Pruning
-from .pruning import (
-    PostTrainingPruner,
-    prune_model,
-    analyze_model_sensitivity,
-)
-
-# v2: Risk-Seeking Policy Gradient
-from .risk_seeking_policy_gradient import (
-    GradientMonitor,
-    RiskSeekingEvolutionMixin,
-    compute_risk_seeking_fitness,
-    compute_selection_probabilities_rspg,
-)
-
-# v2: Multi-Start BFGS Optimizer
-from .bfgs_optimizer import (
+# v2: BFGS Optimizer
+from glassbox.sr.optimizers.bfgs_optimizer import (
     RegularizedBFGS,
     MultiStartBFGS,
     IterativeBFGSRefiner,
@@ -95,8 +62,54 @@ from .bfgs_optimizer import (
     build_formula_from_weights,
 )
 
-# v2: GPU Optimization
+# v2: Benchmarking
 
+# v2: Evolutionary Training (PROPER approach)
+# Note: Main evolution module moved to glassbox.evolution
+# Kept here for backward compatibility
+try:
+    from glassbox.evolution import (
+        EvolutionaryONNTrainer,
+        train_onn_evolutionary,
+        random_operation_init,
+        mutate_operations,
+        refine_constants,
+    )
+except ImportError:
+    # Fallback if glassbox.evolution is not available
+    pass
+
+# v2: Visualization
+from glassbox.sr.visualization import (
+    ONNVisualizer,
+    LiveTrainingVisualizer,
+    create_network_diagram,
+    visualize_evolution,
+)
+
+# v2: Post-Training Pruning
+from glassbox.sr.pruning import (
+    PostTrainingPruner,
+    prune_model,
+    analyze_model_sensitivity,
+)
+
+# v2: Risk-Seeking Policy Gradient
+from glassbox.sr.risk_seeking_policy_gradient import (
+    GradientMonitor,
+    RiskSeekingEvolutionMixin,
+    compute_risk_seeking_fitness,
+    compute_selection_probabilities_rspg,
+)
+
+# v2: FPIP v2
+from glassbox.sr.fpip_v2 import (
+    build_fpip_v2_from_fast_path,
+    validate_fpip_v2_payload,
+    FPIPv2,
+)
+
+# v2: GPU Optimization
 
 
 __all__ = [
@@ -143,10 +156,16 @@ __all__ = [
     'HybridOptimizer',
     'GradientGuidedEvolution',
     
+    # v2: BFGS Optimizer
+    'RegularizedBFGS',
+    'MultiStartBFGS',
+    'IterativeBFGSRefiner',
+    'fit_coefficients_bfgs',
+    'build_formula_from_weights',
+    
     # v2: Evolutionary Training
     'EvolutionaryONNTrainer',
     'train_onn_evolutionary',
-
     'random_operation_init',
     'mutate_operations',
     'refine_constants',
@@ -168,11 +187,8 @@ __all__ = [
     'compute_risk_seeking_fitness',
     'compute_selection_probabilities_rspg',
     
-    # v2: Multi-Start BFGS Optimizer
-    'RegularizedBFGS',
-    'MultiStartBFGS',
-    'IterativeBFGSRefiner',
-    'fit_coefficients_bfgs',
-    'build_formula_from_weights',
+    # v2: FPIP v2
+    'build_fpip_v2_from_fast_path',
+    'validate_fpip_v2_payload',
+    'FPIPv2Payload',
 ]
-

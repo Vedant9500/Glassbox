@@ -456,7 +456,7 @@ def build_formula_from_weights(
     """
     # Import constant snapping utilities
     try:
-        from .meta_ops import snap_to_constant, get_constant_symbol
+        from glassbox.sr.operations.meta_ops import snap_to_constant, get_constant_symbol
     except ImportError:
         snap_constants = False
     

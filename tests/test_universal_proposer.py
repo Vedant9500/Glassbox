@@ -1,7 +1,7 @@
 import numpy as np
 from pathlib import Path
 
-from glassbox.sr.universal_proposer import (
+from glassbox.universal_proposer import (
     UniversalProposer,
     UniversalProposerConfig,
     grammar_decode_topk_skeletons,

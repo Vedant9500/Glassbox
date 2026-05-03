@@ -135,7 +135,7 @@ Data (x, y)
 
 ```python
 import torch
-from glassbox.sr.evolution import train_onn_evolutionary
+from glassbox.evolution import train_onn_evolutionary
 
 # Generate data
 x = torch.linspace(-3, 3, 100).reshape(-1, 1)
@@ -261,30 +261,48 @@ Options:
 ```
 
 ## Project Structure
-
+ 
 ```
 glassbox/
 ├── glassbox/
-│   └── sr/
-│       ├── operation_dag.py      # Main ONN model
-│       ├── operation_node.py     # Individual operation nodes
-│       ├── meta_ops.py           # Parametric meta-operations
-│       ├── evolution.py          # Python evolutionary trainer gateway
-│       ├── cpp/                  # High-performance C++ backend
-│       │   ├── evolution.h       # C++ Evolution Engine (OpenMP + SVD)
-│       │   ├── ast.h             # C++ Expression DAG structures
-│       │   └── core.cpp          # Pybind11 bridge
-│       ├── hard_concrete.py      # Differentiable selection
-│       ├── pruning.py            # Post-training pruning
-│       └── visualization.py      # Training visualization
+│   ├── curve_classifier/           # Curve classification components
+│   │   ├── __init__.py
+│   │   ├── curve_classifier_integration.py  # Classifier loading & integration
+│   │   ├── generate_curve_data.py    # Training data generation
+│   │   └── train_curve_classifier.py # Classifier training
+│   ├── universal_proposer/         # Universal proposer components
+│   │   ├── __init__.py
+│   │   └── universal_proposer.py  # Fast-path skeleton generator
+│   ├── evolution/                  # Evolutionary training components
+│   │   ├── __init__.py
+│   │   └── evolution.py           # Python evolutionary trainer
+│   └── sr/                        # Core ONN components
+│       ├── __init__.py
+│       ├── core/
+│       │   ├── __init__.py
+│       │   ├── operation_dag.py     # Main ONN model (DAG)
+│       │   └── operation_node.py    # Individual operation nodes
+│       ├── operations/
+│       │   ├── __init__.py
+│       │   └── meta_ops.py          # Parametric meta-operations
+│       ├── optimizers/
+│       │   ├── __init__.py
+│       │   ├── bfgs_optimizer.py    # BFGS optimization
+│       │   └── hybrid_optimizer.py  # Hybrid optimization
+│       ├── cpp/                      # High-performance C++ backend
+│       │   ├── evolution.h           # C++ Evolution Engine (OpenMP + SVD)
+│       │   ├── ast.h                 # C++ Expression DAG structures
+│       │   └── core.cpp              # Pybind11 bridge
+│       ├── hard_concrete.py          # Differentiable selection
+│       ├── pruning.py                # Post-training pruning
+│       ├── visualization.py          # Training visualization
+│       └── (other supporting modules)
 ├── scripts/
 │   ├── sr_tester.py              # Main testing tool (TUI)
 │   ├── benchmark_suite.py        # Comprehensive 8-tier benchmark
 │   ├── classifier_fast_path.py   # Fast-path regression
 │   ├── benchmark_feynman_easy.py # AI-Feynman benchmark
-│   ├── curve_classifier_integration.py  # Classifier loading
-│   ├── generate_curve_data.py    # Training data generation
-│   └── train_curve_classifier.py # Classifier training
+│   └── (other scripts)
 ├── models/
 │   └── curve_classifier_v3.1.pt  # Pre-trained classifier
 ├── data/

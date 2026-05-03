@@ -78,7 +78,7 @@ TARGET_MSE_THRESHOLD = 0.01
 
 # Risk-Seeking Policy Gradient (RSPG)
 try:
-    from .risk_seeking_policy_gradient import (
+    from glassbox.sr.risk_seeking_policy_gradient import (
         RiskSeekingEvolutionMixin,
         GradientMonitor,
         compute_risk_seeking_fitness,
@@ -2632,7 +2632,7 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             try:
                 from sympy import Symbol, sympify
                 from sympy.utilities.lambdify import lambdify
-                from glassbox.sr.meta_ops import safe_numpy_power
+                from glassbox.sr.operations.meta_ops import safe_numpy_power
 
                 x_np = x.detach().cpu().numpy()
                 y_np = y.detach().cpu().numpy().reshape(-1)
@@ -3242,8 +3242,8 @@ def train_onn_evolutionary(
     Convenience function for evolutionary ONN training.
     
     Usage:
-        from glassbox.sr import OperationDAG
-        from glassbox.sr.evolution import train_onn_evolutionary
+        from glassbox.sr.core.operation_dag import OperationDAG
+        from glassbox.evolution import train_onn_evolutionary
         
         def make_model():
             return OperationDAG(n_inputs=1, n_hidden_layers=2, nodes_per_layer=4)

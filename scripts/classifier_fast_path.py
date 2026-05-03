@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from typing import Any, Dict, List, Tuple, Optional
 
-from glassbox.sr.meta_ops import get_constant_symbol, normalize_formula_ascii
+from glassbox.sr.operations.meta_ops import get_constant_symbol, normalize_formula_ascii
 from glassbox.sr.fpip_v2 import build_fpip_v2_from_fast_path, validate_fpip_v2_payload
 
 # Thread-safe CUDA warning state
@@ -1679,7 +1679,7 @@ def refine_powers(
     # detected_omegas is local variable, update it if we find more
     current_omegas = detected_omegas
     
-    from glassbox.sr.evolution import detect_dominant_frequency
+    from glassbox.evolution import detect_dominant_frequency
     
     with torch.no_grad():
         pred_stage1 = best_stage1_model(x_valid)
@@ -2456,7 +2456,7 @@ def create_guided_onn_factory(
     Returns:
         A factory function that creates operator-biased ONNs
     """
-    from glassbox.sr.operation_dag import OperationDAG
+    from glassbox.sr.core.operation_dag import OperationDAG
     
     # Determine if we need full ops or simplified
     needs_exp = 'exp' in operator_hints.get('operators', set())
@@ -3110,7 +3110,7 @@ def run_guided_evolution(
     # ── Fallback: Single PyTorch ONN evolution ──
     print("\n⚠️ Beam search unavailable, falling back to single PyTorch evolution...")
     
-    from glassbox.sr.evolution import EvolutionaryONNTrainer, finalize_model_coefficients
+    from glassbox.evolution import EvolutionaryONNTrainer, finalize_model_coefficients
     
     print("\n" + "="*60)
     print("GUIDED EVOLUTION: Operator-Constrained Search (PyTorch)")
