@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 
-DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_v3.1.pt"
+DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_wide.pt"
 
 # Configure module-level logger
 logger = logging.getLogger(__name__)
@@ -2497,31 +2497,33 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         print(f"Generations: {generations}")
         print("-"*60)
         
-        x = x.to(self.device)
-        y = y.to(self.device)
-        fit_x = fitness_x.to(self.device) if fitness_x is not None else x
-        fit_y = fitness_y.to(self.device) if fitness_y is not None else y
+        # 1. LAZY GPU OFFLOADING
+        # Ensure we stay on CPU for C++ phase if possible
+        x_cpu = x.cpu()
+        y_cpu = y.cpu()
+        fit_x_cpu = fitness_x.cpu() if fitness_x is not None else x_cpu
+        fit_y_cpu = fitness_y.cpu() if fitness_y is not None else y_cpu
         
         # Store original data for curve classifier (before normalization)
-        x_original = x.clone()
-        y_original = y.clone()
+        x_original = x_cpu.clone()
+        y_original = y_cpu.clone()
 
         # Optional normalization (improves stability on complex targets)
         if self.normalize_data:
-            x_mean = x.mean(dim=0, keepdim=True)
-            x_std = x.std(dim=0, keepdim=True).clamp(min=1e-6)
-            y_mean = y.mean()
-            y_std = y.std().clamp(min=1e-6)
+            x_mean = x_cpu.mean(dim=0, keepdim=True)
+            x_std = x_cpu.std(dim=0, keepdim=True).clamp(min=1e-6)
+            y_mean = y_cpu.mean()
+            y_std = y_cpu.std().clamp(min=1e-6)
             self.norm_stats = {
-                'x_mean': x_mean,
-                'x_std': x_std,
-                'y_mean': y_mean,
-                'y_std': y_std,
+                'x_mean': x_mean.to(self.device),
+                'x_std': x_std.to(self.device),
+                'y_mean': y_mean.to(self.device),
+                'y_std': y_std.to(self.device),
             }
 
-            x = (x - x_mean) / x_std
-            y = (y - y_mean) / y_std
-            fit_y = (fit_y - y_mean) / y_std
+            x_cpu = (x_cpu - x_mean) / x_std
+            y_cpu = (y_cpu - y_mean) / y_std
+            fit_y_cpu = (fit_y_cpu - y_mean) / y_std
             
         # ---------------------------------------------------------------------
         # NEW C++ BACKEND INTEGRATION
@@ -2543,22 +2545,28 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             
             # FFT warm-start is only well-defined for univariate inputs.
             detected_omegas = []
-            if x.dim() == 1 or (x.dim() > 1 and x.shape[1] == 1):
-                detected_omegas = detect_dominant_frequency(x, y, n_frequencies=3)
+            if x_cpu.dim() == 1 or (x_cpu.dim() > 1 and x_cpu.shape[1] == 1):
+                detected_omegas = detect_dominant_frequency(x_cpu, y_cpu, n_frequencies=3)
                 if detected_omegas and detected_omegas[0] != 1.0:
                     print(f"FFT detected frequencies (omega) for C++ seeding: {[f'{o:.2f}' for o in detected_omegas]}")
                 else:
                     detected_omegas = []
 
             # Prepare inputs for C++
-            X_list = [x[:, i].cpu().numpy() for i in range(x.shape[1])] if x.dim() > 1 else [x.cpu().numpy()]
-            y_arr = y.reshape(-1).cpu().numpy()
+            X_list = [x_cpu[:, i].numpy() for i in range(x_cpu.shape[1])] if x_cpu.dim() > 1 else [x_cpu.numpy()]
+            y_arr = y_cpu.reshape(-1).numpy()
             
             # Resolve C++ parameters: train() overrides take priority, then __init__ defaults
             effective_timeout = timeout_seconds if timeout_seconds is not None else self.timeout_seconds
             effective_seed = random_seed if random_seed is not None else self.random_seed
             
             start_time = time.time()
+            
+            # 2. DECOUPLE CPU CONTENTION
+            # Prevent PyTorch from spinning threads while OpenMP uses them
+            import torch
+            old_num_threads = torch.get_num_threads()
+            torch.set_num_threads(1)
             
             # Run C++ Loop (matching sklearn_wrapper parameter parity)
             result = _core.run_evolution(
@@ -2574,6 +2582,9 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 p_min=self.p_min,
                 p_max=self.p_max,
             )
+            
+            # Restore PyTorch threads
+            torch.set_num_threads(old_num_threads)
             
             end_time = time.time()
             print(f"✅ C++ Evolution completed in {end_time - start_time:.2f} seconds!")
@@ -2634,8 +2645,8 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 from sympy.utilities.lambdify import lambdify
                 from glassbox.sr.operations.meta_ops import safe_numpy_power
 
-                x_np = x.detach().cpu().numpy()
-                y_np = y.detach().cpu().numpy().reshape(-1)
+                x_np = x_cpu.detach().numpy()
+                y_np = y_cpu.detach().numpy().reshape(-1)
                 if x_np.ndim == 1:
                     x_np = x_np.reshape(-1, 1)
 
@@ -2686,10 +2697,21 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             print(f"⚠️ C++ backend not available ({e}), falling back to PyTorch...")
         except Exception as e:
             print(f"⚠️ C++ backend failed at runtime ({e}), falling back to PyTorch...")
+            
+            # If C++ failed but thread count was modified, ensure it's restored
+            import torch
+            if 'old_num_threads' in locals():
+                torch.set_num_threads(old_num_threads)
         # ---------------------------------------------------------------------
         
+        # Push to GPU now for the PyTorch loop
+        x = x_cpu.to(self.device)
+        y = y_cpu.to(self.device)
+        fit_x = fit_x_cpu.to(self.device)
+        fit_y = fit_y_cpu.to(self.device)
+        
         # Initialize population (with CNN seeding if curve classifier enabled)
-        self.initialize_population(x_original, y_original)
+        self.initialize_population(x_original.to(self.device), y_original.to(self.device))
         
         # FFT-based frequency detection only applies to univariate inputs.
         detected_omegas = []

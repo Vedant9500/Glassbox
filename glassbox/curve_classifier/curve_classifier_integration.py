@@ -5,7 +5,7 @@ Uses the trained curve classifier to predict operators and warm-start ONN evolut
 
 Usage:
     # Test on synthetic data
-    python scripts/curve_classifier_integration.py --model models/curve_classifier_v3.1.pt --formula "sin(x) + x**2"
+    python scripts/curve_classifier_integration.py --model models/curve_classifier_wide.pt --formula "sin(x) + x**2"
     
     # Integrate with ONN (in your training script)
     from scripts.curve_classifier_integration import predict_operators, bias_onn_from_predictions
@@ -31,14 +31,14 @@ except (ImportError, ValueError):
         from glassbox.curve_classifier.generate_curve_data import extract_all_features, OPERATOR_CLASSES
     except ImportError:
         try:
-            import scripts.generate_curve_data as gcd
+            import glassbox.curve_classifier.generate_curve_data as gcd
             extract_all_features = gcd.extract_all_features
             OPERATOR_CLASSES = gcd.OPERATOR_CLASSES
         except ImportError:
-            from generate_curve_data import extract_all_features, OPERATOR_CLASSES
+            from glassbox.curve_classifier.generate_curve_data import extract_all_features, OPERATOR_CLASSES
 
 
-DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_v3.1.pt"
+DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_wide.pt"
 
 
 # =============================================================================

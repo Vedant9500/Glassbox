@@ -7,13 +7,13 @@ the updated checkpoint with calibration metadata.
 
 Usage:
     # Calibrate using existing dataset
-    python scripts/calibrate_classifier.py --model models/curve_classifier_v3.1.pt --data data/curve_dataset_500k_v2.npz
+    python scripts/calibrate_classifier.py --model models/curve_classifier_wide.pt --data data/curve_dataset_500k_v2.npz
 
     # Calibrate with custom split ratio
-    python scripts/calibrate_classifier.py --model models/curve_classifier_v3.1.pt --data data/curve_dataset_500k_v2.npz --val-ratio 0.2
+    python scripts/calibrate_classifier.py --model models/curve_classifier_wide.pt --data data/curve_dataset_500k_v2.npz --val-ratio 0.2
 
     # Calibrate and save to new path
-    python scripts/calibrate_classifier.py --model models/curve_classifier_v3.1.pt --data data/curve_dataset_500k_v2.npz --output models/curve_classifier_v3.2_calibrated.pt
+    python scripts/calibrate_classifier.py --model models/curve_classifier_wide.pt --data data/curve_dataset_500k_v2.npz --output models/curve_classifier_v3.2_calibrated.pt
 """
 
 import numpy as np
@@ -35,7 +35,7 @@ from train_curve_classifier import (
     IndexedFeatureDataset,
     evaluate,
 )
-from generate_curve_data import OPERATOR_CLASSES
+from glassbox.curve_classifier.generate_curve_data import OPERATOR_CLASSES
 
 try:
     from curve_classifier_integration import (

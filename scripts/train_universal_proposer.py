@@ -29,9 +29,9 @@ from glassbox.universal_proposer import (
 )
 
 try:
-    from scripts.generate_curve_data import extract_all_features, evaluate_formula
+    from glassbox.curve_classifier.generate_curve_data import extract_all_features, evaluate_formula
 except Exception:
-    from generate_curve_data import extract_all_features, evaluate_formula
+    from glassbox.curve_classifier.generate_curve_data import extract_all_features, evaluate_formula
 
 
 def compute_feature_stats(

@@ -16,7 +16,7 @@ from pathlib import Path
 # Ensure scripts directory is on path
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
-from generate_curve_data import (
+from glassbox.curve_classifier.generate_curve_data import (
     PCFGFormulaGenerator,
     apply_noise_augmentation,
     evaluate_formula,

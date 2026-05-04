@@ -1,5 +1,5 @@
 import numpy as np
-from scripts.generate_curve_data import extract_raw_features, ALL_TEMPLATES, generate_dataset
+from glassbox.curve_classifier.generate_curve_data import extract_raw_features, ALL_TEMPLATES, generate_dataset
 import time
 
 def compute_differential_invariants(y, dx=1.0):

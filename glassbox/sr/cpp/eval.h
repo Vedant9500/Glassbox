@@ -73,66 +73,68 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
         return Eigen::ArrayXd::Zero(num_samples);
     }
     
-    // Cache for node values
-    std::vector<Eigen::ArrayXd> cache(graph.nodes.size());
+    // 1. THE REGISTER FILE PATTERN (Zero-Allocation)
+    // Pre-allocate a contiguous matrix instead of dynamic arrays for every node.
+    // Thread-local ensures we don't re-allocate across thousands of evaluations per thread.
+    thread_local Eigen::ArrayXXd arena;
+    if (arena.rows() != num_samples || arena.cols() < static_cast<int>(graph.nodes.size())) {
+        // Over-allocate columns to avoid resizing frequently
+        arena.resize(num_samples, std::max(static_cast<int>(graph.nodes.size()), 64));
+    }
     
     for (size_t i = 0; i < graph.nodes.size(); ++i) {
         const auto& node = graph.nodes[i];
         
         switch (node.type) {
             case NodeType::Input: {
-                if (node.feature_idx >= 0 && node.feature_idx < X.size()) {
-                    cache[i] = X[node.feature_idx];
+                if (node.feature_idx >= 0 && node.feature_idx < static_cast<int>(X.size())) {
+                    arena.col(i) = X[node.feature_idx];
                 } else {
-                    cache[i] = Eigen::ArrayXd::Zero(num_samples);
+                    arena.col(i).setZero();
                 }
                 break;
             }
             case NodeType::Constant: {
-                cache[i] = Eigen::ArrayXd::Constant(num_samples, node.value);
+                arena.col(i).setConstant(node.value);
                 break;
             }
             case NodeType::Unary: {
-                // Assume left_child is valid
-                const auto& x = cache[node.left_child];
+                const auto x = arena.col(node.left_child);
                 switch (node.unary_op) {
                     case UnaryOp::Periodic: {
-                        cache[i] = node.amplitude * (node.omega * x + node.phi).sin();
+                        arena.col(i) = node.amplitude * (node.omega * x + node.phi).sin();
                         break;
                     }
                     case UnaryOp::Power: {
-                        // sign(x) * |x|^p as defined in MetaPower
                         auto abs_x = x.abs() + 1e-10;
                         auto sign_x = x.sign();
                         auto abs_pow = abs_x.pow(node.p);
 
                         double is_even = power_sign_blend(node.p);
-                        cache[i] = (1.0 - is_even) * (sign_x * abs_pow) + is_even * abs_pow;
-                        // Clamp
-                        cache[i] = cache[i].max(-1e8).min(1e8);
+                        arena.col(i) = (1.0 - is_even) * (sign_x * abs_pow) + is_even * abs_pow;
+                        arena.col(i) = arena.col(i).max(-1e8).min(1e8);
                         break;
                     }
                     case UnaryOp::IntPow: {
                         int n = static_cast<int>(std::round(node.p));
                         n = std::clamp(n, 2, 6);
-                        cache[i] = x.pow(n).max(-1e8).min(1e8);
+                        arena.col(i) = x.pow(n).max(-1e8).min(1e8);
                         break;
                     }
                     case UnaryOp::Exp: {
-                        // exp(omega*x + phi) — omega enables sign (exp(-x)), phi enables shift
-                        cache[i] = (node.omega * x + node.phi).exp().max(-1e6).min(1e6);
+                        arena.col(i) = (node.omega * x + node.phi).exp().max(-1e6).min(1e6);
                         break;
                     }
                     case UnaryOp::Log: {
-                        cache[i] = (x.abs() + 1e-6).log().max(-1e6).min(1e6);
+                        arena.col(i) = (x.abs() + 1e-6).log().max(-1e6).min(1e6);
                         break;
                     }
                 }
                 break;
             }
             case NodeType::Binary: {
-                const auto& x = cache[node.left_child];
-                const auto& y = cache[node.right_child];
+                const auto x = arena.col(node.left_child);
+                const auto y = arena.col(node.right_child);
                 
                 switch (node.binary_op) {
                     case BinaryOp::Arithmetic: {
@@ -142,22 +144,20 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                         auto res_mul = x * y;
                         auto res_div = x / (y.abs() + 1e-6) * y.sign();
 
-                        cache[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-1e6).min(1e6);
+                        arena.col(i) = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-1e6).min(1e6);
                         break;
                     }
                     case BinaryOp::Division: {
-                        cache[i] = (x / (y.abs() + 1e-6) * y.sign()).max(-1e6).min(1e6);
+                        arena.col(i) = (x / (y.abs() + 1e-6) * y.sign()).max(-1e6).min(1e6);
                         break;
                     }
                     case BinaryOp::Aggregation: {
-                        // Simplification for MetaAggregation (just simple sum here to avoid complexity of tau-softmax)
-                        // In full implementation we might need full softmax over stacked (x,y)
                         double local_tau = stabilized_tau(node.tau);
                         auto max_val = x.max(y);
                         auto exp_x = ((x - max_val) / local_tau).exp();
                         auto exp_y = ((y - max_val) / local_tau).exp();
                         auto sum_exp = exp_x + exp_y;
-                        cache[i] = (x * exp_x / sum_exp) + (y * exp_y / sum_exp);
+                        arena.col(i) = (x * exp_x / sum_exp) + (y * exp_y / sum_exp);
                         break;
                     }
                 }
@@ -165,7 +165,16 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
             }
         }
     }
-    return cache.back(); // Dummy return for original evaluate_graph before closing
+    
+    // Output layer computation (weighted sum of nodes)
+    Eigen::ArrayXd final_output = Eigen::ArrayXd::Constant(num_samples, graph.output_bias);
+    for (size_t i = 0; i < graph.output_weights.size() && i < graph.nodes.size(); ++i) {
+        if (std::abs(graph.output_weights[i]) > 1e-6) {
+            final_output += graph.output_weights[i] * arena.col(i);
+        }
+    }
+    
+    return final_output;
 }
 
 // Output layer computation (weighted sum of nodes)

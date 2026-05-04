@@ -42,7 +42,7 @@ DATASETS: List[Dict[str, str]] = [
     },
 ]
 
-DEFAULT_CLASSIFIER_PATH = "models/curve_classifier_v3.1.pt"
+DEFAULT_CLASSIFIER_PATH = "models/curve_classifier_wide.pt"
 
 
 def resolve_repo_path(path_str: str) -> Path:

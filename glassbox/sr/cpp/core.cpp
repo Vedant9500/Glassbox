@@ -44,14 +44,15 @@ py::dict run_evolution_cpp(
     int stagnation_window = 40,
     double stagnation_min_improvement = 1e-5,
     double diversity_floor = 0.25,
-    double restart_fraction = 0.2,
-    double post_restart_mutation_boost = 1.25,
+    double restart_fraction = 0.25,
+    double post_restart_mutation_boost = 1.5,
     int random_seed = -1,
-    double acceptable_mse = 1e-3,
-    int acceptable_complexity = 20,
-    int early_stop_max_nodes = 8
+    double acceptable_mse = 1e-8,
+    int acceptable_complexity = 15,
+    int early_stop_max_nodes = 50,
+    int num_threads = -1
 ) {
-    // 1. Convert Python/Numpy to C++ Eigen
+    // 1. Convert Python/Numpy inputs to C++/Eigen
     std::vector<Eigen::ArrayXd> X;
     for (auto item : X_list) {
         auto arr = item.cast<py::array_t<double>>();
@@ -127,6 +128,11 @@ py::dict run_evolution_cpp(
 
     // Sync evaluator temperature so arithmetic blend sharpness is tunable from Python.
     sr::set_arithmetic_temperature(arithmetic_temperature);
+
+    int previous_omp_threads = omp_get_max_threads();
+    if (num_threads > 0) {
+        omp_set_num_threads(num_threads);
+    }
     
     std::cout << "[v6-nsga2] Starting C++ Evolution with " << omp_get_max_threads() << " OpenMP Threads!";
     if (use_nsga2) std::cout << " (NSGA-II mode)";
@@ -136,10 +142,18 @@ py::dict run_evolution_cpp(
     sr::EvolutionEngine engine(config, X, y, cpp_seed_omegas);
     
     // 3. Run evolution loop natively in C++
-    if (num_islands > 1) {
-        engine.run_islands();
-    } else {
-        engine.run();
+    {
+        py::gil_scoped_release release;
+        if (num_islands > 1) {
+            engine.run_islands();
+        } else {
+            engine.run();
+        }
+    }
+
+    // Restore thread count if modified
+    if (num_threads > 0) {
+        omp_set_num_threads(previous_omp_threads);
     }
     
     // 4. Return results as Python dict
@@ -211,10 +225,10 @@ PYBIND11_MODULE(_core, m) {
     m.def("run_evolution", &run_evolution_cpp, "Runs the evolutionary algorithm natively in C++",
           py::arg("X_list"), py::arg("y"), py::arg("pop_size")=50, py::arg("generations")=1000, 
           py::arg("early_stop_mse")=1e-6, py::arg("seed_omegas")=py::list(),
-          py::arg("timeout_seconds")=120, // NEW
+          py::arg("timeout_seconds")=120,
           py::arg("op_priors")=py::list(),
-                    py::arg("p_min")=-2.0,
-                    py::arg("p_max")=3.0,
+          py::arg("p_min")=-2.0,
+          py::arg("p_max")=3.0,
           py::arg("use_nsga2")=false,
           py::arg("num_islands")=1,
           py::arg("migration_interval")=25,
@@ -232,10 +246,11 @@ PYBIND11_MODULE(_core, m) {
           py::arg("stagnation_window")=40,
           py::arg("stagnation_min_improvement")=1e-5,
           py::arg("diversity_floor")=0.25,
-          py::arg("restart_fraction")=0.2,
-          py::arg("post_restart_mutation_boost")=1.25,
+          py::arg("restart_fraction")=0.25,
+          py::arg("post_restart_mutation_boost")=1.5,
           py::arg("random_seed")=-1,
-          py::arg("acceptable_mse")=1e-3,
-          py::arg("acceptable_complexity")=20,
-          py::arg("early_stop_max_nodes")=8);
+          py::arg("acceptable_mse")=1e-8,
+          py::arg("acceptable_complexity")=15,
+          py::arg("early_stop_max_nodes")=50,
+          py::arg("num_threads")=-1);
 }

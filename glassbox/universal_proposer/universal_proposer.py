@@ -373,9 +373,16 @@ def propose_from_xy(
 
     # If features are not provided, we must extract them (legacy behavior)
     if features is None:
-        from scripts.generate_curve_data import extract_all_features
+        from glassbox.curve_classifier.generate_curve_data import extract_all_features
         features = extract_all_features(y)
     
+    # Handle dimension mismatch (e.g. model trained with 370 features, codebase extracts 398)
+    expected_dim = model.config.n_features
+    if len(features) > expected_dim:
+        features = features[:expected_dim]
+    elif len(features) < expected_dim:
+        features = np.pad(features, (0, expected_dim - len(features)))
+
     # Apply SymLog + Scaling (Synchronization with GLU training)
     features = np.sign(features) * np.log1p(np.abs(features))
     if hasattr(model, 'feature_scaler') and model.feature_scaler is not None:

@@ -60,7 +60,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         use_fast_path=True,
         use_guided_evolution=True,
         use_simplification=True,
-        classifier_path="models/curve_classifier_v3.1.pt",
+        classifier_path="models/curve_classifier_wide.pt",
         simplification_int_tol=0.05,
         simplification_zero_tol=1e-3,
         max_power=6,

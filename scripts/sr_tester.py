@@ -666,7 +666,7 @@ def run_single_mode(config: Config):
         if getattr(config, 'use_curve_classifier', False) or getattr(config, 'fast_path_only', False):
             fast_path_result = run_fast_path(
                 x_tensor, y_tensor,
-                classifier_path=getattr(config, 'curve_classifier_model', None) or "models/curve_classifier_v3.1.pt",
+                classifier_path=getattr(config, 'curve_classifier_model', None) or "models/curve_classifier_wide.pt",
                 detected_omegas=detected_omegas,
                 op_constraints=op_constraints,
                 auto_expand=True,

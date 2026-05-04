@@ -29,7 +29,7 @@ _FREQ_SIN_PATTERN = re.compile(r'sin\(([0-9.]+)\*?x', re.IGNORECASE)
 _FREQ_COS_PATTERN = re.compile(r'cos\(([0-9.]+)\*?x', re.IGNORECASE)
 _POWER_PATTERN = re.compile(r'x\^([0-9.]+)', re.IGNORECASE)
 
-DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_v3.1.pt"
+DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_wide.pt"
 
 
 def _with_derived_predictions(predictions: Dict[str, float]) -> Dict[str, float]:

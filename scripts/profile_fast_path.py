@@ -20,7 +20,7 @@ TEST_PROBLEMS = [
     ("x^2*exp(-x)*cos(3*x)", (0, 8)),   # hard composite
 ]
 
-CLASSIFIER_PATH = "models/curve_classifier_v3.1.pt"
+CLASSIFIER_PATH = "models/curve_classifier_wide.pt"
 
 import torch
 
