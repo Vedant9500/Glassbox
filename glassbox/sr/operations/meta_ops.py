@@ -177,6 +177,11 @@ def get_constant_symbol(value: float, threshold: float = 0.05) -> str:
     """
     Get the symbolic representation of a value if it matches a known constant.
     
+    Priority order:
+      1. Integers (checked first to prevent e.g. 1 → π/3)
+      2. Simple fractions (1/2, 1/3, 2/3, 3/4, 1/4)
+      3. Transcendental constants (π, e, √2, etc.)
+    
     Args:
         value: The value to check
         threshold: Matching threshold
@@ -184,11 +189,30 @@ def get_constant_symbol(value: float, threshold: float = 0.05) -> str:
     Returns:
         Symbolic string (e.g., "π", "e", "√2") or formatted number
     """
+    # ── Priority 1: Integers ──
+    # Check integers FIRST with a tight tolerance to prevent
+    # values like 1.0 from being snapped to π/3 (1.047).
+    rounded = round(value)
+    if abs(value - rounded) < min(threshold, 0.03):
+        return str(int(rounded))
+    
+    # ── Priority 2: Simple fractions ──
+    simple_fractions = {
+        "1/2": 0.5, "1/3": 1/3, "2/3": 2/3,
+        "1/4": 0.25, "3/4": 0.75,
+        "-1/2": -0.5, "-1/3": -1/3, "-2/3": -2/3,
+        "-1/4": -0.25, "-3/4": -0.75,
+    }
+    for name, frac_val in simple_fractions.items():
+        if abs(value - frac_val) < min(threshold, 0.02):
+            return name
+    
+    # ── Priority 3: Transcendental constants ──
     _, name = snap_to_constant(value, threshold)
     if name is not None:
         return name
     
-    # Format as a clean number
+    # ── Fallback: formatted number ──
     if abs(value - round(value)) < 0.001:
         return str(int(round(value)))
     return f"{value:.4g}"

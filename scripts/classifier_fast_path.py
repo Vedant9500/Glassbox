@@ -296,6 +296,7 @@ def _residual_diagnostics(
     y_pred_valid = y_pred_arr[mask]
     residual = y_true_valid - y_pred_valid
     diagnostics['residual_mse'] = float(np.mean(residual ** 2))
+    diagnostics['y_variance'] = float(np.var(y_true_valid))
 
     centered = residual - residual.mean()
     std = float(np.std(centered))
@@ -1080,6 +1081,7 @@ def fast_path_regression(
     if x.ndim > 2:
         raise ValueError(f"Expected x to be 1D or 2D, got shape {x.shape}")
     y = y.flatten()
+    y_variance = float(np.var(y)) if y.size > 0 else 0.0
 
     # ── Out-of-domain holdout: hold back domain-edge points ──
     holdout_mask = None
@@ -1376,6 +1378,7 @@ def fast_path_regression(
         'basis_names': names,
         'n_nonzero': n_nonzero,
         'exact_match': exact_match_flag,
+        'y_variance': y_variance,
         'candidate_formulas': candidate_formulas,
         'holdout_mse': _holdout_mse_for_best(coeffs) if holdout_mask is not None else None,
     }
@@ -1977,8 +1980,10 @@ def fast_path_with_refinement(
     else:
         allow_periodic = allow_power = True
 
-    if (x.ndim == 1 or (x.ndim == 2 and x.shape[1] == 1)) and allow_periodic and allow_power and best_mse > 1e-4:
-        omega_pool = (detected_omegas or []) + [1.0, 2.0, 3.0, 5.0, 10.0]
+    if (x.ndim == 1 or (x.ndim == 2 and x.shape[1] == 1)) and allow_periodic and allow_power and best_mse > 5e-3:
+        # Only trigger refinement for genuinely poor fits (MSE > 5e-3).
+        # Previously 1e-4, which caused ~12s of wasted refinement on moderate fits.
+        omega_pool = (detected_omegas or []) + [1.0, 2.0, 3.0]
         # Deduplicate and keep reasonable range
         omega_inits = []
         for o in omega_pool:
@@ -1988,8 +1993,8 @@ def fast_path_with_refinement(
         refined = refine_periodic_rational(
             x, y,
             omega_inits=omega_inits,
-            c_inits=[0.5, 1.0, 2.0, 3.0],
-            steps=400,
+            c_inits=[0.5, 1.0],
+            steps=100,
             lr=0.1,
             device=device,
         )
@@ -2007,7 +2012,7 @@ def fast_path_with_refinement(
         predictions.get('power', 0.0) >= 0.4 or
         predictions.get('polynomial', 0.0) >= 0.4
     )
-    should_try_power = (x.ndim == 1 or (x.ndim == 2 and x.shape[1] == 1)) and allow_power and has_power_signal and (5e-5 <= best_mse <= 0.2 or n_terms > 6)
+    should_try_power = (x.ndim == 1 or (x.ndim == 2 and x.shape[1] == 1)) and allow_power and has_power_signal and (1e-3 <= best_mse <= 0.2 or n_terms > 8)
 
     if should_try_power:
         print(f"  Attempting power refinement (MSE={best_mse:.4f}, Terms={n_terms})...")

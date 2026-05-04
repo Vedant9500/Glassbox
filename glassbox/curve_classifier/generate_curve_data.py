@@ -933,7 +933,8 @@ def spectral_derivatives(y: np.ndarray, n_points: int = 64) -> np.ndarray:
 
 
 
-def extract_invariant_features_v2(y: np.ndarray, dx: float = 1.0) -> np.ndarray:
+def extract_invariant_features_v2(y: np.ndarray, dx: float = 1.0,
+                                   precomputed_derivs: np.ndarray = None) -> np.ndarray:
     """32-dimensional basis-invariant feature vector.
 
     Expands the original 4 differential invariants into a rich representation
@@ -949,15 +950,24 @@ def extract_invariant_features_v2(y: np.ndarray, dx: float = 1.0) -> np.ndarray:
       [20:26] Cross-correlations between channel pairs (C(4,2)=6)
       [26:30] Autocorrelation decay rate per channel (4)
       [30:32] Global: discrimination ratio, overall quality
+    
+    Args:
+        precomputed_derivs: If provided, skip the FFT and use these directly.
+                            Must be the output of spectral_derivatives().
     """
     n = len(y)
     if n < 15:
         return np.zeros(32, dtype=np.float64)
 
-    # Use Spectral Derivatives for cleaner invariants
-    s_derivs = spectral_derivatives(y, n_points=len(y)//2)
-    dy = s_derivs[:len(s_derivs)//2]
-    ddy = s_derivs[len(s_derivs)//2:]
+    # Reuse pre-computed spectral derivatives if available (avoids redundant FFT)
+    if precomputed_derivs is not None:
+        half = len(precomputed_derivs) // 2
+        dy = precomputed_derivs[:half]
+        ddy = precomputed_derivs[half:]
+    else:
+        s_derivs = spectral_derivatives(y, n_points=len(y)//2)
+        dy = s_derivs[:len(s_derivs)//2]
+        ddy = s_derivs[len(s_derivs)//2:]
     
     # 3rd derivative still via stencil for now, but on smoothed dy
     k2 = np.array([5, 0, -3, -4, -3, 0, 5]) / (42.0 * dx**2)
@@ -1094,10 +1104,12 @@ def extract_all_features(y: np.ndarray) -> np.ndarray:
     fft = extract_fft_features(y, n_freqs=32)
     fft_phase = extract_fft_phase_features(y, n_bins=32)
     
-    deriv = spectral_derivatives(y, n_points=64)
+    deriv = spectral_derivatives(y, n_points=64)          # 128-dim (64 dy + 64 ddy)
     stats = extract_stat_features(y)
     curv = extract_curvature_features(y, n_points=32)
     
+    # NOTE: invariant extractor uses its own spectral_derivatives(n_points=len(y)//2)
+    # which is a DIFFERENT resolution than the deriv slice above. Cannot share.
     invars = extract_invariant_features_v2(y, dx=1.0)
     
     features = np.concatenate([raw, fft, fft_phase, deriv, stats, curv, invars])

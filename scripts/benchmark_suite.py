@@ -573,7 +573,15 @@ def _guided_evolution_decision(
     mse: Optional[float],
     n_terms: int,
 ) -> Tuple[bool, str]:
-    """Decide whether guided evolution should run and return a short reason."""
+    """Decide whether guided evolution should run and return a short reason.
+    
+    ADAPTIVE ROUTING: Instead of hardcoded entropy/margin thresholds that
+    break when the classifier is retrained, we use relative fit quality
+    (MSE normalized by signal variance) as the primary decision signal.
+    
+    This makes the decision robust to classifier architecture changes,
+    retraining, or feature modifications.
+    """
     if evolution_only:
         return True, "evolution_only"
 
@@ -586,44 +594,51 @@ def _guided_evolution_decision(
     if mse is None or not math.isfinite(mse):
         return True, "invalid_mse"
 
-    # Implementation: Early exit if fast-path found a perfect match.
-    # We define "perfect" as MSE < 1e-12 and complex enough to not be a constant,
-    # OR high-confidence classifier result with MSE < 1e-7.
-    is_effectively_zero = (mse < 1e-12)
-    is_high_confidence = False
-    
-    uncertainty = fp_result.get("uncertainty")
-    if isinstance(uncertainty, dict):
-        entropy = uncertainty.get("prediction_entropy")
-        # Lower entropy means more certain. Threshold 0.3 is very strict.
-        if entropy is not None and math.isfinite(float(entropy)) and float(entropy) < 0.3:
-            is_high_confidence = True
-
-    if is_effectively_zero:
+    # ── Tier 1: Perfect fit — skip evolution unconditionally ──
+    if mse < 1e-12:
         return False, "fast_path_exact_zero"
-    
-    if is_high_confidence and mse < 1e-7 and n_terms <= 6:
-        return False, "fast_path_confident_exact"
 
+    # ── Tier 2: Relative fit quality (ADAPTIVE) ──
+    # Use MSE relative to signal variance. This is classifier-independent:
+    # if fast-path explains >99.9999% of variance, evolution can't help.
+    y_var = None
+    details = fp_result.get("details", {})
+    if isinstance(details, dict):
+        y_var = details.get("y_variance")
+    
+    # Fallback: estimate from residual diagnostics
+    if y_var is None:
+        residual = fp_result.get("residual_diagnostics", {})
+        if isinstance(residual, dict):
+            y_var = residual.get("y_variance")
+    
+    if y_var is not None and y_var > 1e-10:
+        relative_error = mse / y_var
+        # Fast-path explains >99.999% of variance → skip evolution
+        if relative_error < 1e-5 and n_terms <= 10:
+            return False, "fast_path_high_r2"
+    
+    # ── Tier 3: Absolute MSE quality gate ──
+    # Near-exact fit with reasonable complexity → skip
+    if mse < 1e-7 and n_terms <= 6:
+        return False, "fast_path_confident_exact"
+    
+    # Good fit (MSE < 1e-6) with reasonable complexity → skip
+    if mse < 1e-6 and n_terms <= 10:
+        return False, "fast_path_good_fit"
+
+    # ── Tier 4: MSE too high — evolution needed ──
+    # If the fit isn't very good, we need evolution
     if mse >= 1e-6:
         return True, "mse_above_exact"
 
     if n_terms > 10:
         return True, "formula_too_complex"
 
-    uncertainty = fp_result.get("uncertainty")
-    if isinstance(uncertainty, dict):
-        if uncertainty.get("prediction_uncertain") is True:
-            return True, "prediction_uncertain"
-        entropy = uncertainty.get("prediction_entropy")
-        margin = uncertainty.get("prediction_margin")
-        if entropy is not None and math.isfinite(float(entropy)) and float(entropy) > 0.85:
-            return True, "high_entropy"
-        if margin is not None and math.isfinite(float(margin)) and float(margin) < 0.1:
-            return True, "low_margin"
-
+    # ── Tier 5: Residual analysis (classifier-independent) ──
     residual = fp_result.get("residual_diagnostics")
     if isinstance(residual, dict) and residual.get("residual_suspicious") is True:
+        # If residuals show a clear periodic structure, evolution might find it
         return True, "suspicious_residual"
 
     return False, "fast_path_confident"
@@ -778,6 +793,10 @@ def run_formula(
         # -----------------------------------------------------------------
         # Guided Evolution (latest path with beam search)
         # -----------------------------------------------------------------
+        # Ensure we have y_variance for the adaptive decision
+        if fp_result and "details" in fp_result and "y_variance" not in fp_result["details"]:
+             fp_result["details"]["y_variance"] = float(np.var(y_np))
+
         should_run_guided, guided_reason = _guided_evolution_decision(
             evolution_only=evolution_only,
             with_evolution=with_evolution,
@@ -1216,8 +1235,8 @@ Examples:
         """,
     )
     parser.add_argument(
-        "--classifier-model", type=str, default="models/curve_classifier_v3.1.pt",
-        help="Path to the curve classifier model (default: models/curve_classifier_v3.1.pt)",
+        "--classifier-model", type=str, default="models/curve_classifier_wide.pt",
+        help="Path to the curve classifier model (default: models/curve_classifier_wide.pt)",
     )
     parser.add_argument(
         "--proposer-model", type=str, default="models/universal_proposer_robust.pt",
