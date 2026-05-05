@@ -811,8 +811,9 @@ def run_formula(
             elif fp_result is None:
                 print("\n  [Latest Path] Fast-path not applicable. Running guided evolution (beam search)...")
             else:
+                mse_str = f"{result['mse']:.2e}" if result['mse'] is not None else "N/A"
                 print(
-                    f"\n  [Latest Path] Fast-path candidate (MSE={result['mse']:.2e}, reason={guided_reason}). "
+                    f"\n  [Latest Path] Fast-path candidate (MSE={mse_str}, reason={guided_reason}). "
                     "Running guided evolution (beam search)..."
                 )
 
@@ -928,6 +929,7 @@ def run_formula(
 
     except Exception as e:
         result["error"] = str(e)
+        import traceback; traceback.print_exc()
         result["time"] = 0.0
 
     # Score
@@ -1049,6 +1051,7 @@ def run_formula_cpp_evolution(
         result["time"] = 0.0
     except Exception as e:
         result["error"] = str(e)
+        import traceback; traceback.print_exc()
         result["time"] = 0.0
     
     result["score"] = score_result(result["mse"], result["formula_discovered"])
