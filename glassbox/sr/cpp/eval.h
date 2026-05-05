@@ -367,7 +367,7 @@ inline void evaluate_graph_partial(const IndividualGraph& graph,
                             break;
                         }
                         case BinaryOp::Division: {
-                            new_cache_out[i] = (x / (y.abs() + 1e-6) * y.sign()).max(-1e6).min(1e6);
+                            new_cache_out[i] = (x / (1.0 + y.square()).sqrt()).max(-1e6).min(1e6);
                             break;
                         }
                         case BinaryOp::Aggregation: {
@@ -647,7 +647,7 @@ inline std::string format_node_to_string(const IndividualGraph& graph, int node_
                         if (max_w == w[0]) return "(" + l_str + " + " + r_str + ")";
                         if (max_w == w[3]) return "(" + l_str + " - " + r_str + ")";
                         if (max_w == w[1]) return "(" + l_str + " * " + r_str + ")";
-                        return "(" + l_str + " / " + r_str + ")";
+                        return "(" + l_str + " / sqrt(1.0 + (" + r_str + ")^2))";
                     }
 
                     std::string blend = "(";
@@ -670,8 +670,7 @@ inline std::string format_node_to_string(const IndividualGraph& graph, int node_
                     break;
                 }
                 case BinaryOp::Division:
-                    return "(" + l_str + " / " + r_str + ")";
-                case BinaryOp::Aggregation:
+                    return "(" + l_str + " / sqrt(1.0 + (" + r_str + ")^2))";                case BinaryOp::Aggregation:
                     return "(" + l_str + " + " + r_str + ")/2"; // Simplified aggregation display
             }
             break;

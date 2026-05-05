@@ -952,9 +952,13 @@ private:
             if (std::abs(graph.output_weights[i]) > 1e-4) active_nodes++;
         }
         double complexity_penalty = 5e-3 * active_nodes + 1e-4 * graph.nodes.size();
-        
-        graph.fitness = mse + complexity_penalty + config_.round_penalty_weight * penalty / std::max(1.0, (double)graph.nodes.size());
 
+        // Relax penalty if we have discovered an exact physical law
+        if (mse < 1e-6) {
+            complexity_penalty *= 1e-4;
+        }
+
+        graph.fitness = mse + complexity_penalty + config_.round_penalty_weight * penalty / std::max(1.0, (double)graph.nodes.size());
         // P7: Dimensional analysis penalty (only active when input_units provided)
         if (!config_.input_units.empty()) {
             graph.fitness += config_.dim_penalty_weight * dimensional_penalty(graph);
