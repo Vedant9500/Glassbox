@@ -1043,7 +1043,7 @@ private:
         
         double roll = runif(rng_);
         
-        if (roll < 0.5) {
+        if (roll < 0.4) {
             // ── Wrap Mutation ──
             // Pick a random non-input node and wrap it with a new unary op
             std::uniform_int_distribution<int> node_dist(1, n - 1);
@@ -1088,7 +1088,7 @@ private:
             child.nodes.push_back(wrap_node);
             child.output_weights.push_back(0.5); // Small initial weight
             
-        } else if (roll < 0.8) {
+        } else if (roll < 0.6) {
             // ── Multiply Mutation ──
             // Pick two existing nodes and create f(x) * g(x)
             std::uniform_int_distribution<int> node_dist(0, n - 1);
@@ -1107,8 +1107,34 @@ private:
             child.nodes.push_back(mul_node);
             child.output_weights.push_back(1.0);
             
-            // P3: Zero out children's additive contribution so Ridge is
-            // forced to use the product node instead of decomposing additively.
+            // P3: Zero out children's additive contribution
+            if (left < static_cast<int>(child.output_weights.size())) {
+                child.output_weights[left] = 0.0;
+            }
+            if (right < static_cast<int>(child.output_weights.size())) {
+                child.output_weights[right] = 0.0;
+            }
+            
+        } else if (roll < 0.8) {
+            // ── Divide / Rational Mutation ──
+            // Pick two existing nodes and create f(x) / g(x) (Analytic Quotient)
+            std::uniform_int_distribution<int> node_dist(0, n - 1);
+            int left = node_dist(rng_);
+            int right = node_dist(rng_);
+            while (right == left && n > 1) right = node_dist(rng_);
+            
+            OpNode div_node;
+            div_node.type = NodeType::Binary;
+            div_node.binary_op = BinaryOp::Division;
+            // Also seed beta/gamma towards division in case of arithmetic blend crossover
+            div_node.beta = 2.0;
+            div_node.gamma = -1.0; 
+            div_node.left_child = left;
+            div_node.right_child = right;
+            
+            child.nodes.push_back(div_node);
+            child.output_weights.push_back(1.0);
+            
             if (left < static_cast<int>(child.output_weights.size())) {
                 child.output_weights[left] = 0.0;
             }

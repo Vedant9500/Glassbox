@@ -142,7 +142,7 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                         auto res_add = x + y;
                         auto res_sub = x - y;
                         auto res_mul = x * y;
-                        auto res_div = x / (y.abs() + 1e-6) * y.sign();
+                        auto res_div = x / (1.0 + y.square()).sqrt();
 
                         arena.col(i) = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-1e6).min(1e6);
                         break;
@@ -252,7 +252,7 @@ inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::ve
                         auto res_add = x + y;
                         auto res_sub = x - y;
                         auto res_mul = x * y;
-                        auto res_div = x / (y.abs() + 1e-6) * y.sign();
+                        auto res_div = x / (1.0 + y.square()).sqrt();
 
                         cache_out[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-1e6).min(1e6);
                         break;
@@ -362,12 +362,12 @@ inline void evaluate_graph_partial(const IndividualGraph& graph,
                             auto res_add = x + y;
                             auto res_sub = x - y;
                             auto res_mul = x * y;
-                            auto res_div = x / (y.abs() + 1e-6) * y.sign();
+                            auto res_div = x / (1.0 + y.square()).sqrt();
                             new_cache_out[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-1e6).min(1e6);
                             break;
                         }
                         case BinaryOp::Division: {
-                            new_cache_out[i] = (x / (1.0 + y.square()).sqrt()).max(-1e6).min(1e6);
+                            new_cache_out[i] = (x / (y.square() + 1e-12).sqrt()).max(-1e6).min(1e6);
                             break;
                         }
                         case BinaryOp::Aggregation: {
@@ -478,7 +478,7 @@ inline Eigen::ArrayXd evaluate_graph_cached(const IndividualGraph& graph,
                         auto res_add = x + y;
                         auto res_sub = x - y;
                         auto res_mul = x * y;
-                        auto res_div = x / (y.abs() + 1e-6) * y.sign();
+                        auto res_div = x / (1.0 + y.square()).sqrt();
                         cache_out[i] = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-1e6).min(1e6);
                         break;
                     }
@@ -592,7 +592,7 @@ inline std::string format_node_to_string(const IndividualGraph& graph, int node_
                     if (std::abs(node.p - std::round(node.p)) < 1e-6) {
                         snprintf(buf, sizeof(buf), "(%s)^%d", child_str.c_str(), (int)std::round(node.p));
                     } else {
-                        snprintf(buf, sizeof(buf), "(%s)^%.4g", child_str.c_str(), node.p);
+                        snprintf(buf, sizeof(buf), "sign(%s)*(abs(%s))^%.4g", child_str.c_str(), child_str.c_str(), node.p);
                     }
                     return std::string(buf);
                 }
@@ -670,7 +670,8 @@ inline std::string format_node_to_string(const IndividualGraph& graph, int node_
                     break;
                 }
                 case BinaryOp::Division:
-                    return "(" + l_str + " / sqrt(1.0 + (" + r_str + ")^2))";                case BinaryOp::Aggregation:
+                    return "(" + l_str + " / " + r_str + ")";
+                case BinaryOp::Aggregation:
                     return "(" + l_str + " + " + r_str + ")/2"; // Simplified aggregation display
             }
             break;
@@ -733,3 +734,4 @@ inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs
 }
 
 } // namespace sr
+

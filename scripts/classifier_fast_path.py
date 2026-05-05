@@ -2315,9 +2315,9 @@ def run_fast_path(
     print("="*60)
     
     # Extract operator hints from the formula for guided evolution
-    operator_hints = extract_operator_hints(formula, details.get('basis_names', []), 
-                                            details.get('coefficients', []))
-    
+    operator_hints = extract_operator_hints(formula, details.get('basis_names', []),
+                                            details.get('coefficients', []),
+                                            predictions=predictions)    
     result = {
         'formula': formula,
         'formula_raw': raw_formula,
@@ -2355,6 +2355,7 @@ def extract_operator_hints(
     basis_names: List[str],
     coefficients: np.ndarray,
     threshold: float = 0.01,
+    predictions: Dict[str, float] = None,
 ) -> Dict[str, Any]:
     """
     Extract operator hints from a fast-path formula for guided evolution.
@@ -2445,6 +2446,20 @@ def extract_operator_hints(
             hints['operators'].add('power')
             hints['powers'].append(0.5)
     
+    # Inject raw classifier predictions to ensure evolution priors aren't blinded by poor basis regression
+    if predictions:
+        if predictions.get('sin', 0) > 0.3 or predictions.get('cos', 0) > 0.3 or predictions.get('periodic', 0) > 0.3:
+            hints['operators'].add('periodic')
+        if predictions.get('exp', 0) > 0.3 or predictions.get('exponential', 0) > 0.3:
+            hints['operators'].add('exp')
+        if predictions.get('log', 0) > 0.3:
+            hints['operators'].add('log')
+        if predictions.get('rational', 0) > 0.3:
+            hints['operators'].add('rational')
+            hints['operators'].add('power')
+        if predictions.get('power', 0) > 0.3 or predictions.get('polynomial', 0) > 0.3:
+            hints['operators'].add('power')
+
     # Deduplicate frequencies
     hints['frequencies'] = list(set(hints['frequencies']))
     hints['powers'] = list(set(hints['powers']))
