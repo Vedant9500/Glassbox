@@ -5,6 +5,7 @@
 #include "ast.h"
 #include "eval.h"
 #include "evolution.h"
+#include "refine.h"
 
 #include <omp.h>
 #include <iostream>
@@ -220,6 +221,75 @@ py::dict run_evolution_cpp(
     return result;
 }
 
+// Wrapper for refine_frequencies_cpp
+py::tuple refine_frequencies_wrapper(py::array_t<double> x_arr, py::array_t<double> y_arr, py::list initial_omegas, int steps = 100, double lr = 0.1) {
+    auto x_buf = x_arr.request();
+    Eigen::Map<Eigen::VectorXd> x(static_cast<double*>(x_buf.ptr), x_buf.size);
+    auto y_buf = y_arr.request();
+    Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
+
+    std::vector<double> omegas;
+    for (auto item : initial_omegas) omegas.push_back(item.cast<double>());
+
+    auto res = sr::refine_frequencies_cpp(x, y, omegas, steps, lr);
+    
+    py::list omegas_out;
+    for (double w : res.omegas) omegas_out.append(w);
+    
+    return py::make_tuple(omegas_out, res.mse);
+}
+
+// Wrapper for refine_powers_model_cpp
+py::tuple refine_powers_model_wrapper(py::array_t<double> x_arr, py::array_t<double> y_arr, py::list initial_powers, py::list initial_omegas, int steps = 200, double lr = 0.05) {
+    auto x_buf = x_arr.request();
+    Eigen::Map<Eigen::VectorXd> x(static_cast<double*>(x_buf.ptr), x_buf.size);
+    auto y_buf = y_arr.request();
+    Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
+
+    std::vector<double> powers, omegas;
+    for (auto item : initial_powers) powers.push_back(item.cast<double>());
+    for (auto item : initial_omegas) omegas.push_back(item.cast<double>());
+
+    auto res = sr::refine_powers_model_cpp(x, y, powers, omegas, steps, lr);
+    
+    py::dict out;
+    out["mse"] = res.mse;
+    out["constant"] = res.constant;
+    out["linear"] = res.linear;
+    
+    py::list p_out, c_out, w_out;
+    for (double p : res.powers) p_out.append(p);
+    for (double c : res.coeffs) c_out.append(c);
+    for (double pc : res.periodic_coeffs) w_out.append(pc);
+    
+    out["powers"] = p_out;
+    out["coeffs"] = c_out;
+    out["periodic_coeffs"] = w_out;
+    
+    return py::make_tuple(out, res.mse);
+}
+
+// Wrapper for refine_periodic_rational_cpp
+py::dict refine_periodic_rational_wrapper(py::array_t<double> x_arr, py::array_t<double> y_arr, double omega0, double c0, int steps = 200, double lr = 0.05) {
+    auto x_buf = x_arr.request();
+    Eigen::Map<Eigen::VectorXd> x(static_cast<double*>(x_buf.ptr), x_buf.size);
+    auto y_buf = y_arr.request();
+    Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
+
+    auto res = sr::refine_periodic_rational_cpp(x, y, omega0, c0, steps, lr);
+    
+    py::dict out;
+    out["omega"] = res.omega;
+    out["c"] = res.c;
+    out["a"] = res.a;
+    out["b"] = res.b;
+    out["d"] = res.d;
+    out["e"] = res.e;
+    out["mse"] = res.mse;
+    
+    return out;
+}
+
 PYBIND11_MODULE(_core, m) {
     m.doc() = "Fast C++ core for Glassbox Symbolic Regression";
     m.def("run_evolution", &run_evolution_cpp, "Runs the evolutionary algorithm natively in C++",
@@ -253,4 +323,8 @@ PYBIND11_MODULE(_core, m) {
           py::arg("acceptable_complexity")=15,
           py::arg("early_stop_max_nodes")=50,
           py::arg("num_threads")=-1);
+
+    m.def("refine_frequencies", &refine_frequencies_wrapper, "Refines frequencies via Eigen varpro");
+    m.def("refine_powers", &refine_powers_model_wrapper, "Refines powers via Eigen varpro");
+    m.def("refine_periodic_rational", &refine_periodic_rational_wrapper, "Refines periodic rational params via Eigen varpro");
 }

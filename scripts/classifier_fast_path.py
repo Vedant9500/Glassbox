@@ -1627,7 +1627,7 @@ def refine_powers(
     device: Optional[str] = None,
 ) -> Tuple[Optional[Dict], float]:
     """
-    Refine power exponent parameters using gradient descent.
+    Refine power exponent parameters using Eigen VarPro.
 
     Handles non-integer powers like x^2.3, x^0.7 where the basis
     only has integer powers (x^2, x^3). Can also include periodic terms.
@@ -1645,8 +1645,18 @@ def refine_powers(
     Returns:
         (result_dict, mse) where result_dict has 'formula', 'powers', 'coefficients'
     """
-    import torch
-    import torch.nn as nn
+    import sys
+    from pathlib import Path as _Path
+    try:
+        import _core
+    except ImportError:
+        try:
+            cpp_dir = _Path(__file__).parent.parent / 'glassbox' / 'sr' / 'cpp'
+            if str(cpp_dir) not in sys.path:
+                sys.path.insert(0, str(cpp_dir))
+            import _core
+        except ImportError:
+            raise ImportError("cannot import name 'core' from 'glassbox.sr.cpp'")
 
     # Ensure 1D inputs
     if x.ndim > 1:
@@ -1657,75 +1667,22 @@ def refine_powers(
     if initial_powers is None:
         initial_powers = [0.5, 1.5, 2.5, 3.5]
 
-    resolved_device = _resolve_device(device)
-    x_t = torch.tensor(x, dtype=torch.float64, device=resolved_device)
-    y_t = torch.tensor(y, dtype=torch.float64, device=resolved_device)
-
     # Filter out x <= 0 for safe power operations
-    valid_mask = x_t.abs() > 1e-8
+    valid_mask = np.abs(x) > 1e-8
     if valid_mask.sum() < 10:
         return None, float('inf')
-    x_valid = x_t[valid_mask]
-    y_valid = y_t[valid_mask]
-
-    class PowerModel(nn.Module):
-        def __init__(self, powers, omegas=None):
-            super().__init__()
-            n_pow = len(powers)
-            self.powers = nn.Parameter(torch.tensor(powers, dtype=torch.float64))
-            self.coeffs = nn.Parameter(torch.zeros(n_pow, dtype=torch.float64))
-            self.constant = nn.Parameter(torch.tensor(0.0, dtype=torch.float64))
-            self.linear = nn.Parameter(torch.tensor(0.0, dtype=torch.float64))
-            
-            self.omegas = omegas
-            if omegas:
-                self.periodic_coeffs = nn.Parameter(torch.zeros(2 * len(omegas), dtype=torch.float64))
-            else:
-                self.periodic_coeffs = None
-
-        def forward(self, x):
-            abs_x = torch.abs(x) + 1e-10
-            sign_x = torch.sign(x)
-            result = self.constant + self.linear * x
-            
-            # Power terms
-            for i, p in enumerate(self.powers):
-                # Even/odd symmetry based on p
-                is_even = 0.5 * (1.0 + torch.cos(p * math.pi))
-                abs_pow = torch.pow(abs_x, p)
-                term = (1.0 - is_even) * (sign_x * abs_pow) + is_even * abs_pow
-                result = result + self.coeffs[i] * term
-                
-            # Periodic terms
-            if self.periodic_coeffs is not None:
-                for i, omega in enumerate(self.omegas):
-                    result = result + self.periodic_coeffs[2*i] * torch.sin(omega * x)
-                    result = result + self.periodic_coeffs[2*i+1] * torch.cos(omega * x)
-                    
-            return result
+    x_valid = np.asarray(x[valid_mask], dtype=np.float64)
+    y_valid = np.asarray(y[valid_mask], dtype=np.float64)
 
     best_result = None
     best_mse = float('inf')
 
     # Stage 1: Fit powers (and initial omegas if provided)
-    # We try different power combinations
     stage1_models = []
     
     def _train_power_model(powers_subset):
-        model = PowerModel(powers_subset, detected_omegas).to(resolved_device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-        for step in range(n_steps):
-            optimizer.zero_grad()
-            pred = model(x_valid)
-            loss = ((pred - y_valid) ** 2).mean()
-            loss.backward()
-            optimizer.step()
-            with torch.no_grad():
-                model.powers.data.clamp_(-2.0, 5.0)
-        
-        mse = ((model(x_valid) - y_valid) ** 2).mean().item()
-        return mse, model, powers_subset
+        res, mse = _core.refine_powers(x_valid, y_valid, powers_subset, detected_omegas or [], n_steps, lr)
+        return mse, res, powers_subset
 
     import concurrent.futures
     import multiprocessing
@@ -1740,90 +1697,61 @@ def refine_powers(
     
     # Sort by MSE and pick best Stage 1 model
     stage1_models.sort(key=lambda x: x[0])
-    best_stage1_mse, best_stage1_model, best_powers = stage1_models[0]
+    best_stage1_mse, best_stage1_res, best_powers = stage1_models[0]
     
-    # Stage 2: Check residuals for hidden frequencies (if not already found)
-    # Only if we have a trend (MSE is low but maybe not perfect, or just to be safe)
-    # We assume the main trend handles the non-periodic part.
-    final_model = best_stage1_model
+    final_res = best_stage1_res
     final_mse = best_stage1_mse
-    
-    # detected_omegas is local variable, update it if we find more
-    current_omegas = detected_omegas
+    current_omegas = detected_omegas or []
     
     from glassbox.evolution import detect_dominant_frequency
     
-    with torch.no_grad():
-        pred_stage1 = best_stage1_model(x_valid)
-        residuals = y_valid - pred_stage1
+    # Check residuals for hidden frequencies
+    # We must construct pred_stage1 to get residuals
+    # model: c0 + c1*x + sum p_i + sum w_i
+    pred_stage1 = np.full_like(y_valid, final_res["constant"])
+    pred_stage1 += final_res["linear"] * x_valid
+    for i, p in enumerate(final_res["powers"]):
+        abs_x = np.abs(x_valid) + 1e-10
+        sign_x = np.sign(x_valid)
+        is_even = 0.5 * (1.0 + np.cos(p * np.pi))
+        abs_pow = np.power(abs_x, p)
+        term = (1.0 - is_even) * (sign_x * abs_pow) + is_even * abs_pow
+        pred_stage1 += final_res["coeffs"][i] * term
         
-        # Run FFT on residuals
-        # We need to reshape for detect_dominant_frequency
-        res_omegas = detect_dominant_frequency(x_valid, residuals, n_frequencies=2)
-        
-        # Filter new omegas - ignore if close to existing ones or 0
-        new_omegas = []
-        existing_omegas = current_omegas or []
-        for o in res_omegas:
-            if o < 0.1:
-                continue
-            if any(abs(o - eo) < 0.2 for eo in existing_omegas):
-                continue
-            new_omegas.append(o)
+    for i, w in enumerate(current_omegas):
+        if 2*i+1 < len(final_res["periodic_coeffs"]):
+            pred_stage1 += final_res["periodic_coeffs"][2*i] * np.sin(w * x_valid)
+            pred_stage1 += final_res["periodic_coeffs"][2*i+1] * np.cos(w * x_valid)
+            
+    residuals = y_valid - pred_stage1
+    res_omegas = detect_dominant_frequency(x_valid, residuals, n_frequencies=2)
+    
+    new_omegas = []
+    for o in res_omegas:
+        if o < 0.1:
+            continue
+        if any(abs(o - eo) < 0.2 for eo in current_omegas):
+            continue
+        new_omegas.append(o)
     
     if new_omegas:
-        # Refit with new omegas
-        # print(f"  [Refine] Found hidden frequencies in residuals: {new_omegas}")
-        combined_omegas = (current_omegas or []) + new_omegas
-        
-        # Create new model with best powers + combined omegas
-        # Initialize with learned powers/coeffs to speed up
-        new_model = PowerModel(best_powers, combined_omegas).to(resolved_device)
-        
-        # Copy learned params
-        with torch.no_grad():
-            new_model.powers.data.copy_(best_stage1_model.powers.data)
-            new_model.coeffs.data.copy_(best_stage1_model.coeffs.data)
-            new_model.constant.data.copy_(best_stage1_model.constant.data)
-            new_model.linear.data.copy_(best_stage1_model.linear.data)
-            if best_stage1_model.periodic_coeffs is not None:
-                # Copy existing periodic coeffs to the beginning
-                n_old = len(best_stage1_model.periodic_coeffs)
-                new_model.periodic_coeffs.data[:n_old].copy_(best_stage1_model.periodic_coeffs.data)
-        
-        optimizer = torch.optim.Adam(new_model.parameters(), lr=lr)
-        
-        for step in range(n_steps):
-            optimizer.zero_grad()
-            pred = new_model(x_valid)
-            loss = ((pred - y_valid) ** 2).mean()
-            loss.backward()
-            optimizer.step()
-            with torch.no_grad():
-                new_model.powers.data.clamp_(-2.0, 5.0)
-            
-        mse2 = ((new_model(x_valid) - y_valid) ** 2).mean().item()
-        
+        combined_omegas = current_omegas + new_omegas
+        res2, mse2 = _core.refine_powers(x_valid, y_valid, best_powers, combined_omegas, n_steps, lr)
         if mse2 < final_mse:
-            final_model = new_model
+            final_res = res2
             final_mse = mse2
-            # Update detected_omegas for reporting
             current_omegas = combined_omegas
 
     # Final extraction from winning model
     best_mse = final_mse
-    with torch.no_grad():
-        refined_powers = final_model.powers.detach().cpu().numpy().tolist()
-        refined_coeffs = final_model.coeffs.detach().cpu().numpy().tolist()
-        const_val = final_model.constant.item()
-        linear_val = final_model.linear.item()
-        per_coeffs = []
-        if final_model.periodic_coeffs is not None:
-            per_coeffs = final_model.periodic_coeffs.detach().cpu().numpy().tolist()
+    refined_powers = final_res["powers"]
+    refined_coeffs = final_res["coeffs"]
+    const_val = final_res["constant"]
+    linear_val = final_res["linear"]
+    per_coeffs = final_res["periodic_coeffs"]
 
     # Build formula
     terms = []
-    # Power terms
     # Power terms
     for p, c in zip(refined_powers, refined_coeffs):
         if abs(c) < 1e-3:
@@ -1831,7 +1759,6 @@ def refine_powers(
         
         p_snapped = _snap_power(p)
         
-        # Merge linear term if power is effectively 1
         if p_snapped == '1':
             c += linear_val
             linear_val = 0.0
