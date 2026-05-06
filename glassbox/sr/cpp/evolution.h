@@ -3,6 +3,7 @@
 #define _USE_MATH_DEFINES
 #include "ast.h"
 #include "eval.h"
+#include "execution.h"
 #include <vector>
 #include <random>
 #include <algorithm>
@@ -857,13 +858,14 @@ private:
     
     void evaluate_population() {
         int samples = static_cast<int>(y_.size());
-        gen_cache_.clear(); // Fresh cache per generation
-        // Note: not using cache in parallel eval to avoid thread-safety issues.
-        // Each thread evaluates independently; cache is used in serial paths.
-        #pragma omp parallel for schedule(dynamic)
-        for (int i = 0; i < static_cast<int>(population_.size()); ++i) {
-            evaluate_fitness_with_penalty(population_[i], X_, y_, samples);
-        }
+        ParallelExecutionEngine executor(X_, y_);
+        
+        executor.evaluate_population(population_, [&](IndividualGraph& ind, SubtreeCache& tc) {
+            evaluate_fitness_with_penalty(ind, X_, y_, samples, &tc);
+        });
+
+        // Pull the global merged cache out of executor
+        gen_cache_ = executor.get_gen_cache();
     }
 
     uint64_t graph_signature(const IndividualGraph& graph) const {
@@ -915,8 +917,14 @@ private:
     }
     
     // Evaluate fitness including complexity and soft rounding penalty
-    double evaluate_fitness_with_penalty(IndividualGraph& graph, const std::vector<Eigen::ArrayXd>& X, const Eigen::ArrayXd& y, int num_samples) {
-        Eigen::ArrayXd pred = evaluate_graph_simple(graph, X, num_samples);
+    double evaluate_fitness_with_penalty(IndividualGraph& graph, const std::vector<Eigen::ArrayXd>& X, const Eigen::ArrayXd& y, int num_samples, SubtreeCache* tc = nullptr) {
+        Eigen::ArrayXd pred;
+        if (tc != nullptr) {
+            std::vector<Eigen::ArrayXd> cache_out;
+            pred = evaluate_graph_cached(graph, X, num_samples, cache_out, *tc);
+        } else {
+            pred = evaluate_graph_simple(graph, X, num_samples);
+        }
         double mse = (pred - y).square().mean();
         graph.raw_mse = mse;
         

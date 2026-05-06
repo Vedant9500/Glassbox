@@ -2867,6 +2867,7 @@ def beam_search_evolution(
                 op_priors=config['op_priors'],
                 p_min=float(config.get('p_min', -2.0)),
                 p_max=float(config.get('p_max', 3.0)),
+                num_threads=config.get('num_threads', -1),
             )
             raw_mse = result['best_mse']
             formula_str = result.get('formula', '0')
@@ -2995,13 +2996,23 @@ def beam_search_evolution(
                 configs.append(mutate_config(configs[rng.randint(0, len(configs))], rng))
             configs = configs[:n_beams]
         
-        # Run all beams sequentially (C++ uses OpenMP internally, so 
-        # threading would cause oversubscription and hurt performance)
+        # Run all beams in parallel, but limit C++ OpenMP threads per beam 
+        # to avoid oversubscription. This smooths out Python SymPy overhead.
+        import multiprocessing
+        
         round_start = time.time()
         results = []
         
+        max_physical_threads = multiprocessing.cpu_count()
+        threads_per_beam = max(1, max_physical_threads // n_beams)
+        
         for cfg in configs:
-            results.append(run_single_beam(cfg))
+            cfg['num_threads'] = threads_per_beam
+            
+        with ThreadPoolExecutor(max_workers=n_beams) as executor:
+            futures = [executor.submit(run_single_beam, cfg) for cfg in configs]
+            for future in as_completed(futures):
+                results.append(future.result())
         
         # Sort by MSE
         results.sort(key=lambda r: r[0])
