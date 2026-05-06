@@ -6,6 +6,7 @@
 #include "eval.h"
 #include "evolution.h"
 #include "refine.h"
+#include "simplify.h"
 
 #include <omp.h>
 #include <iostream>
@@ -207,7 +208,8 @@ py::dict run_evolution_cpp(
     if (use_nsga2) {
         auto pareto = engine.get_pareto_front();
         py::list pareto_list;
-        for (const auto& ind : pareto) {
+        for (auto ind : pareto) {
+            sr::simplify_ast(ind);
             py::dict pdict;
             pdict["mse"] = ind.raw_mse;
             pdict["complexity"] = ind.complexity();
@@ -290,6 +292,54 @@ py::dict refine_periodic_rational_wrapper(py::array_t<double> x_arr, py::array_t
     return out;
 }
 
+// Wrapper for iterative_elastic_net
+py::tuple iterative_elastic_net_wrapper(py::array_t<double> X_arr, py::array_t<double> y_arr, 
+                                        double l1_weight, double l2_weight, 
+                                        int n_starts=3, int n_iterations=3, 
+                                        double prune_threshold=0.05, int max_iter=1000) {
+    auto X_buf = X_arr.request();
+    auto y_buf = y_arr.request();
+    
+    int n = X_buf.shape[0];
+    int p = X_buf.shape[1];
+    
+    Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> X(
+        static_cast<double*>(X_buf.ptr), n, p);
+    Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
+
+    auto res = sr::iterative_elastic_net(X, y, l1_weight, l2_weight, n_starts, n_iterations, prune_threshold, max_iter);
+    
+    py::list w_out;
+    for (int i = 0; i < res.weights.size(); ++i) {
+        w_out.append(res.weights(i));
+    }
+    
+    return py::make_tuple(w_out, res.mse);
+}
+
+// Wrapper for lasso_coordinate_descent
+py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::array_t<double> y_arr, 
+                                          double alpha, int max_iter=1000, double tol=1e-4) {
+    auto X_buf = X_arr.request();
+    auto y_buf = y_arr.request();
+    
+    int n = X_buf.shape[0];
+    int p = X_buf.shape[1];
+    
+    Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> X(
+        static_cast<double*>(X_buf.ptr), n, p);
+    Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
+
+    auto res = sr::elastic_net_cd_cpp(X, y, alpha, 0.0, max_iter, tol);
+    
+    py::list w_out;
+    for (int i = 0; i < res.weights.size(); ++i) {
+        w_out.append(res.weights(i));
+    }
+    
+    return w_out;
+}
+
 PYBIND11_MODULE(_core, m) {
     m.doc() = "Fast C++ core for Glassbox Symbolic Regression";
     m.def("run_evolution", &run_evolution_cpp, "Runs the evolutionary algorithm natively in C++",
@@ -327,4 +377,6 @@ PYBIND11_MODULE(_core, m) {
     m.def("refine_frequencies", &refine_frequencies_wrapper, "Refines frequencies via Eigen varpro");
     m.def("refine_powers", &refine_powers_model_wrapper, "Refines powers via Eigen varpro");
     m.def("refine_periodic_rational", &refine_periodic_rational_wrapper, "Refines periodic rational params via Eigen varpro");
+    m.def("iterative_elastic_net", &iterative_elastic_net_wrapper, "Iterative Elastic Net for regularized pruning");
+    m.def("lasso_coordinate_descent", &lasso_coordinate_descent_wrapper, "LASSO regression using coordinate descent");
 }

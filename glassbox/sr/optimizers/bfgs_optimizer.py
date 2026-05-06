@@ -382,7 +382,7 @@ def fit_coefficients_bfgs(
 ) -> Tuple[torch.Tensor, float, str]:
     """
     Fit coefficients using BFGS (high-level API).
-    
+
     Args:
         X: Feature matrix (n_samples, n_features)
         y: Target vector (n_samples,)
@@ -394,16 +394,56 @@ def fit_coefficients_bfgs(
         l2_weight: L2 regularization weight
         prune_threshold: Pruning threshold for iterative method
         verbose: Print progress
-    
+
     Returns:
         (weights, mse, formula_string)
     """
-    if method == 'simple':
+    if method == 'iterative':
+        # Try C++ native backend first
+        try:
+            import sys
+            from pathlib import Path as _Path
+            import numpy as np
+            try:
+                import _core
+            except ImportError:
+                try:
+                    cpp_dir = _Path(__file__).parent.parent / 'cpp'
+                    if str(cpp_dir) not in sys.path:
+                        sys.path.insert(0, str(cpp_dir))
+                    import _core
+                except ImportError:
+                    raise ImportError("C++ core not found")
+
+            weights_out, mse = _core.iterative_elastic_net(
+                X.detach().cpu().numpy().astype(np.float64),
+                y.detach().cpu().numpy().astype(np.float64),
+                l1_weight, l2_weight,
+                n_starts, n_iterations,
+                prune_threshold, 1000
+            )
+            weights = torch.tensor(weights_out, dtype=X.dtype, device=X.device)
+            active_indices = [i for i, w in enumerate(weights_out) if abs(w) > 0]
+            if verbose:
+                print(f"[C++] Iterative Elastic Net MSE: {mse:.6f}")
+        except Exception as e:
+            if verbose:
+                print(f"  [Fallback] C++ backend failed: {e}")
+            iterative = IterativeBFGSRefiner(
+                n_iterations=n_iterations,
+                prune_threshold=prune_threshold,
+                n_starts_per_iteration=n_starts,
+                l1_weight=l1_weight,
+                l2_weight=l2_weight,
+            )
+            weights, mse, active_indices = iterative.fit(X, y, feature_names=feature_names, verbose=verbose)
+
+    elif method == 'simple':
         # Simple BFGS from zero init
         bfgs = RegularizedBFGS(l1_weight=l1_weight, l2_weight=l2_weight)
         weights, mse = bfgs.fit(X, y)
         active_indices = list(range(X.shape[1]))
-    
+
     elif method == 'multistart':
         # Multi-start BFGS
         multistart = MultiStartBFGS(
@@ -413,26 +453,14 @@ def fit_coefficients_bfgs(
         )
         weights, mse, _ = multistart.fit(X, y, verbose=verbose)
         active_indices = list(range(X.shape[1]))
-    
-    elif method == 'iterative':
-        # Iterative pruning + refitting
-        iterative = IterativeBFGSRefiner(
-            n_iterations=n_iterations,
-            prune_threshold=prune_threshold,
-            n_starts_per_iteration=n_starts,
-            l1_weight=l1_weight,
-            l2_weight=l2_weight,
-        )
-        weights, mse, active_indices = iterative.fit(X, y, feature_names=feature_names, verbose=verbose)
-    
+
     else:
         raise ValueError(f"Unknown method: {method}")
-    
+
     # Build formula string
     formula = build_formula_from_weights(weights, feature_names, threshold=prune_threshold)
-    
-    return weights, mse, formula
 
+    return weights, mse, formula
 
 def build_formula_from_weights(
     weights: torch.Tensor,

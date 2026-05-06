@@ -440,60 +440,27 @@ def lasso_coordinate_descent(
     tol: float = 1e-4,
 ) -> np.ndarray:
     """
-    LASSO regression using coordinate descent.
-    
-    Solves: min_w ||y - X @ w||^2 + alpha * ||w||_1
-    
-    Optimized: Computes residual incrementally per-feature instead of
-    full matrix multiply, reducing complexity from O(n×m²) to O(n×m) per iteration.
-    
-    Args:
-        X: Feature matrix (n_samples, n_features)
-        y: Target vector (n_samples,)
-        alpha: L1 regularization strength
-        max_iter: Maximum iterations
-        tol: Convergence tolerance
-        
-    Returns:
-        w: Coefficient vector (n_features,)
+    LASSO regression using coordinate descent via C++ Eigen backend.
     """
-    n_samples, n_features = X.shape
-    w = np.zeros(n_features)
-    
-    # Precompute for efficiency
-    X_sq = (X ** 2).sum(axis=0)
-    X_sq[X_sq < 1e-10] = 1e-10  # Avoid division by zero
-    
-    # Precompute threshold
-    threshold = alpha * n_samples
-    
-    for iteration in range(max_iter):
-        w_old = w.copy()
-        
-        # Compute residual once per iteration (O(n×m))
-        residual = y - X @ w
-        
-        for j in range(n_features):
-            # Add back current feature contribution
-            residual_j = residual + X[:, j] * w[j]
+    import sys
+    from pathlib import Path as _Path
+    try:
+        import _core
+    except ImportError:
+        try:
+            cpp_dir = _Path(__file__).parent.parent / 'glassbox' / 'sr' / 'cpp'
+            if str(cpp_dir) not in sys.path:
+                sys.path.insert(0, str(cpp_dir))
+            import _core
+        except ImportError:
+            raise ImportError("cannot import name 'core' from 'glassbox.sr.cpp'")
             
-            # Correlation
-            rho = X[:, j] @ residual_j
-            
-            # Soft thresholding
-            if alpha == 0:
-                w[j] = rho / X_sq[j]
-            else:
-                w[j] = soft_threshold(rho, threshold) / X_sq[j]
-            
-            # Update residual incrementally (O(n) instead of O(n×m))
-            residual = residual_j - X[:, j] * w[j]
-        
-        # Check convergence
-        if np.max(np.abs(w - w_old)) < tol:
-            break
+    X_np = np.asarray(X, dtype=np.float64)
+    y_np = np.asarray(y, dtype=np.float64).flatten()
     
-    return w
+    # Run fast C++ coordinate descent
+    w_list = _core.lasso_coordinate_descent(X_np, y_np, alpha, max_iter, tol)
+    return np.array(w_list, dtype=np.float64)
 
 
 def soft_threshold(x: np.ndarray, threshold: float) -> np.ndarray:
@@ -1023,7 +990,8 @@ def find_exact_symbolic_match(
                     return formula, mse, full_coeffs
             
             return None
-        except Exception:
+        except Exception as e:
+            print(f"  [PyTorch fast search failed: {e}]")
             pass # Fall back to numpy implementation on any PyTorch error
     
     def chunk_ranges(n: int, chunks: int) -> List[Tuple[int, int]]:
@@ -1457,69 +1425,23 @@ def refine_frequencies(
     Refine frequency parameters using gradient descent.
     
     This handles cases like ω=3.2 where FFT might detect 3.13.
-    
-    Args:
-        x: Input values (N,)
-        y: Target values (N,)
-        initial_omegas: Starting frequencies from FFT
-        n_steps: Gradient descent steps
-        lr: Learning rate
-        
-    Returns:
-        refined_omegas: List of refined frequencies
-        final_mse: MSE after refinement
     """
-    import torch
-    import torch.nn as nn
+    import sys
+    from pathlib import Path as _Path
+    try:
+        import _core
+    except ImportError:
+        try:
+            cpp_dir = _Path(__file__).parent.parent / 'glassbox' / 'sr' / 'cpp'
+            if str(cpp_dir) not in sys.path:
+                sys.path.insert(0, str(cpp_dir))
+            import _core
+        except ImportError:
+            raise ImportError("cannot import name 'core' from 'glassbox.sr.cpp'")
     
-    resolved_device = _resolve_device(device)
-    x_t = torch.tensor(x, dtype=torch.float32, device=resolved_device)
-    y_t = torch.tensor(y, dtype=torch.float32, device=resolved_device)
-    
-    # Learnable parameters: constant, linear coef, and sin/cos for each omega
-    # Model: c0 + c1*x + sum_i [a_i*sin(omega_i*x) + b_i*cos(omega_i*x)]
-    
-    class FrequencyModel(nn.Module):
-        def __init__(self, omegas):
-            super().__init__()
-            n_freq = len(omegas)
-            self.omegas = nn.Parameter(torch.tensor(omegas, dtype=torch.float32))
-            self.sin_coeffs = nn.Parameter(torch.zeros(n_freq))
-            self.cos_coeffs = nn.Parameter(torch.zeros(n_freq))
-            self.constant = nn.Parameter(torch.tensor(0.0))
-            self.linear = nn.Parameter(torch.tensor(0.0))
-            self.quadratic = nn.Parameter(torch.tensor(0.0))
-        
-        def forward(self, x):
-            # Polynomial part
-            result = self.constant + self.linear * x + self.quadratic * x**2
-            
-            # Periodic parts
-            for i, omega in enumerate(self.omegas):
-                result = result + self.sin_coeffs[i] * torch.sin(omega * x)
-                result = result + self.cos_coeffs[i] * torch.cos(omega * x)
-            
-            return result
-    
-    model = FrequencyModel(initial_omegas).to(resolved_device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    
-    best_mse = float('inf')
-    best_omegas = initial_omegas.copy()
-    
-    for step in range(n_steps):
-        optimizer.zero_grad()
-        pred = model(x_t)
-        loss = ((pred - y_t) ** 2).mean()
-        loss.backward()
-        optimizer.step()
-        
-        mse = loss.item()
-        if mse < best_mse:
-            best_mse = mse
-            best_omegas = model.omegas.detach().cpu().numpy().tolist()
-    
-    return best_omegas, best_mse
+    x_np = np.asarray(x, dtype=np.float64).flatten()
+    y_np = np.asarray(y, dtype=np.float64).flatten()
+    return _core.refine_frequencies(x_np, y_np, initial_omegas, n_steps, lr)
 
 
 def refine_periodic_rational(
@@ -2248,20 +2170,20 @@ def run_fast_path(
             term_estimate = max(1, len([t for t in re.split(r'\s*[+-]\s*', formula) if t.strip()]))
             too_complex_for_symbolic = formula_len > 500 or term_estimate > 24
 
-            if too_complex_for_symbolic:
+            if too_complex_for_symbolic or not simplification_info.get('exact_match', False):
                 snapped_formula = snap_formula_floats(
                     formula,
                     SnapConfig(int_tol=simplification_int_tol, zero_tol=simplification_zero_tol),
                 )
                 simplified_formula = snapped_formula
                 if simplification_log:
-                    print(f"  [Post] Large formula detected (len={formula_len}, terms≈{term_estimate}); using fast snap-only mode.")
+                    print(f"  [Post] Formula simplified using fast snap-only mode to bypass SymPy bottleneck.")
             else:
                 snapped_formula, simplified_expr = simplify_onn_formula(
                     formula,
                     int_tol=simplification_int_tol,
                     zero_tol=simplification_zero_tol,
-                    use_nsimplify=(formula_len <= 300 and term_estimate <= 16),
+                    use_nsimplify=False,  # disabled nsimplify for speed
                 )
                 simplified_formula = str(simplified_expr)
 

@@ -5,8 +5,152 @@
 #include <cmath>
 #include <algorithm>
 #include <iostream>
+#include <random>
 
 namespace sr {
+
+struct ElasticNetResult {
+    Eigen::VectorXd weights;
+    double mse;
+};
+
+inline ElasticNetResult elastic_net_cd_cpp(const Eigen::MatrixXd& X, const Eigen::VectorXd& y,
+                                           double l1_weight, double l2_weight, 
+                                           int max_iter=1000, double tol=1e-7,
+                                           const Eigen::VectorXd& initial_w = Eigen::VectorXd()) {
+    int n = X.rows();
+    int p = X.cols();
+    
+    Eigen::VectorXd w = initial_w;
+    if (w.size() != p) w = Eigen::VectorXd::Zero(p);
+    if (n == 0 || p == 0) return {w, 0.0};
+    
+    // Precompute z_j = 1/n ||X_j||^2
+    Eigen::VectorXd z(p);
+    for (int j = 0; j < p; ++j) {
+        z(j) = X.col(j).squaredNorm() / n;
+    }
+    
+    Eigen::VectorXd res = y - X * w;
+    double l1_half = l1_weight / 2.0;
+    
+    for (int iter = 0; iter < max_iter; ++iter) {
+        double max_change = 0.0;
+        
+        for (int j = 0; j < p; ++j) {
+            if (z(j) < 1e-12) continue; // skip zero columns
+            
+            double old_w = w(j);
+            double rho = X.col(j).dot(res) / n + old_w * z(j);
+            
+            double new_w = 0.0;
+            if (rho > l1_half) {
+                new_w = (rho - l1_half) / (z(j) + l2_weight);
+            } else if (rho < -l1_half) {
+                new_w = (rho + l1_half) / (z(j) + l2_weight);
+            }
+            
+            if (new_w != old_w) {
+                res -= X.col(j) * (new_w - old_w);
+                w(j) = new_w;
+                max_change = std::max(max_change, std::abs(new_w - old_w));
+            }
+        }
+        
+        if (max_change < tol) break;
+    }
+    
+    double mse = res.squaredNorm() / n;
+    return {w, mse};
+}
+
+inline ElasticNetResult multi_start_elastic_net(const Eigen::MatrixXd& X, const Eigen::VectorXd& y,
+                                                double l1_weight, double l2_weight, 
+                                                int n_starts=5, double init_scale=0.1,
+                                                int max_iter=1000) {
+    int p = X.cols();
+    ElasticNetResult best_res;
+    best_res.mse = 1e15;
+    best_res.weights = Eigen::VectorXd::Zero(p);
+    
+    std::mt19937 gen(42);
+    std::normal_distribution<double> dist(0.0, init_scale);
+    
+    for (int i = 0; i < n_starts; ++i) {
+        Eigen::VectorXd init_w = Eigen::VectorXd::Zero(p);
+        if (i > 0) {
+            for(int j=0; j<p; ++j) init_w(j) = dist(gen);
+        }
+        
+        auto res = elastic_net_cd_cpp(X, y, l1_weight, l2_weight, max_iter, 1e-7, init_w);
+        if (res.mse < best_res.mse) {
+            best_res = res;
+        }
+    }
+    return best_res;
+}
+
+inline ElasticNetResult iterative_elastic_net(const Eigen::MatrixXd& X, const Eigen::VectorXd& y,
+                                              double l1_weight, double l2_weight, 
+                                              int n_starts=3, int n_iterations=3, 
+                                              double prune_threshold=0.05,
+                                              int max_iter=1000) {
+    int p = X.cols();
+    std::vector<bool> active_mask(p, true);
+    
+    ElasticNetResult best_res;
+    best_res.mse = 1e15;
+    best_res.weights = Eigen::VectorXd::Zero(p);
+    
+    for (int it = 0; it < n_iterations; ++it) {
+        int num_active = 0;
+        for (bool a : active_mask) if (a) num_active++;
+        if (num_active == 0) break;
+        
+        Eigen::MatrixXd X_active(X.rows(), num_active);
+        std::vector<int> active_indices;
+        int col_idx = 0;
+        for (int j = 0; j < p; ++j) {
+            if (active_mask[j]) {
+                X_active.col(col_idx++) = X.col(j);
+                active_indices.push_back(j);
+            }
+        }
+        
+        auto res = multi_start_elastic_net(X_active, y, l1_weight, l2_weight, n_starts, 0.1, max_iter);
+        
+        Eigen::VectorXd full_weights = Eigen::VectorXd::Zero(p);
+        for (int j = 0; j < num_active; ++j) {
+            full_weights(active_indices[j]) = res.weights(j);
+        }
+        
+        if (res.mse < best_res.mse) {
+            best_res.mse = res.mse;
+            best_res.weights = full_weights;
+        }
+        
+        double max_w = full_weights.cwiseAbs().maxCoeff();
+        if (max_w <= 0) break;
+        
+        double thresh = prune_threshold * max_w;
+        std::vector<bool> new_mask(p, false);
+        bool any_active = false;
+        bool changed = false;
+        
+        for (int j = 0; j < p; ++j) {
+            if (std::abs(full_weights(j)) > thresh) {
+                new_mask[j] = true;
+                any_active = true;
+            }
+            if (new_mask[j] != active_mask[j]) changed = true;
+        }
+        
+        if (!any_active || !changed) break;
+        active_mask = new_mask;
+    }
+    
+    return best_res;
+}
 
 // Evaluate linear coefficients given non-linear features
 // X is N x M, y is N x 1. Returns M x 1 coefficients.
