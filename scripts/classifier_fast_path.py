@@ -901,9 +901,37 @@ def find_exact_symbolic_match(
     Returns:
         (formula, mse, coefficients) if exact match found, else None
     """
+    import math
+    import threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     n_basis = basis.shape[1]
     y = y.flatten()
     
+    def build_formula(indices: List[int], coeffs: np.ndarray) -> Tuple[str, np.ndarray]:
+        from glassbox.sr.operations.meta_ops import get_constant_symbol
+        terms = []
+        full_coeffs = np.zeros(n_basis)
+        for idx, c in zip(indices, coeffs):
+            if abs(c) < 1e-6:
+                continue
+            name = names[idx]
+            if name == "1":
+                terms.append(get_constant_symbol(c, 0.05))
+            elif abs(c - 1.0) < 0.01:
+                terms.append(name)
+            elif abs(c + 1.0) < 0.01:
+                terms.append(f"-{name}")
+            elif abs(c - round(c)) < 0.01 and abs(c) < 100:
+                terms.append(f"{int(round(c))}*{name}")
+            else:
+                coef_sym = get_constant_symbol(c, 0.05)
+                terms.append(f"{coef_sym}*{name}")
+            full_coeffs[idx] = c
+
+        formula = _join_formula_terms(terms)
+        return formula, full_coeffs
+
     # Try single basis functions with coefficient fitting
     for i in range(n_basis):
         if names[i] == "1":  # Skip constant-only
@@ -942,34 +970,67 @@ def find_exact_symbolic_match(
                 except (np.linalg.LinAlgError, ValueError):
                     pass
     
+    # Optional PyTorch acceleration for pairs and triples
+    try:
+        import torch
+        has_torch = True
+    except ImportError:
+        has_torch = False
+
+    if has_torch and max_terms >= 2:
+        try:
+            basis_t = torch.from_numpy(basis).float()
+            y_t = torch.from_numpy(y).float().unsqueeze(1)
+            N = basis_t.shape[0]
+
+            def fast_torch_search(r: int):
+                idx = torch.combinations(torch.arange(n_basis), r=r)
+                n_combos = len(idx)
+                chunk_size = 50000
+
+                for start in range(0, n_combos, chunk_size):
+                    end = min(start + chunk_size, n_combos)
+                    chunk_idx = idx[start:end]
+                    
+                    X = basis_t[:, chunk_idx] # N x C x r
+                    X = X.permute(1, 0, 2) # C x N x r
+                    y_batch = y_t.expand(end - start, N, 1)
+                    
+                    sol = torch.linalg.lstsq(X, y_batch).solution # C x r x 1
+                    pred = torch.bmm(X, sol) # C x N x 1
+                    mse = torch.mean((y_batch - pred)**2, dim=1).squeeze(-1) # C
+                    
+                    best_mse, best_idx = torch.min(mse, dim=0)
+                    
+                    if best_mse < tolerance:
+                        idx_in_chunk = best_idx.item()
+                        real_idx = start + idx_in_chunk
+                        return idx[real_idx].tolist(), sol[idx_in_chunk].flatten().tolist(), best_mse.item()
+                return None
+
+            if max_terms >= 2:
+                res = fast_torch_search(2)
+                if res is not None:
+                    indices, coeffs, mse = res
+                    formula, full_coeffs = build_formula(indices, np.array(coeffs))
+                    return formula, mse, full_coeffs
+
+            if max_terms >= 3:
+                res = fast_torch_search(3)
+                if res is not None:
+                    indices, coeffs, mse = res
+                    formula, full_coeffs = build_formula(indices, np.array(coeffs))
+                    return formula, mse, full_coeffs
+            
+            return None
+        except Exception:
+            pass # Fall back to numpy implementation on any PyTorch error
+    
     def chunk_ranges(n: int, chunks: int) -> List[Tuple[int, int]]:
         if chunks <= 1 or n <= 1:
             return [(0, n)]
         size = max(1, math.ceil(n / chunks))
         return [(i, min(i + size, n)) for i in range(0, n, size)]
-
-    def build_formula(indices: List[int], coeffs: np.ndarray) -> Tuple[str, np.ndarray]:
-        terms = []
-        full_coeffs = np.zeros(n_basis)
-        for idx, c in zip(indices, coeffs):
-            if abs(c) < 1e-6:
-                continue
-            name = names[idx]
-            if name == "1":
-                terms.append(get_constant_symbol(c, 0.05))
-            elif abs(c - 1.0) < 0.01:
-                terms.append(name)
-            elif abs(c + 1.0) < 0.01:
-                terms.append(f"-{name}")
-            elif abs(c - round(c)) < 0.01 and abs(c) < 100:
-                terms.append(f"{int(round(c))}*{name}")
-            else:
-                coef_sym = get_constant_symbol(c, 0.05)
-                terms.append(f"{coef_sym}*{name}")
-            full_coeffs[idx] = c
-
-        formula = _join_formula_terms(terms)
-        return formula, full_coeffs
 
     def search_pairs_range(start_i: int, end_i: int, stop_event: threading.Event):
         for i in range(start_i, end_i):
@@ -1650,24 +1711,32 @@ def refine_powers(
     # We try different power combinations
     stage1_models = []
     
-    for n_powers in range(1, min(4, len(initial_powers) + 1)):
-        for start_idx in range(max(1, len(initial_powers) - n_powers + 1)):
-            powers_subset = initial_powers[start_idx:start_idx + n_powers]
+    def _train_power_model(powers_subset):
+        model = PowerModel(powers_subset, detected_omegas).to(resolved_device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
-            model = PowerModel(powers_subset, detected_omegas).to(resolved_device)
-            optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        for step in range(n_steps):
+            optimizer.zero_grad()
+            pred = model(x_valid)
+            loss = ((pred - y_valid) ** 2).mean()
+            loss.backward()
+            optimizer.step()
+            with torch.no_grad():
+                model.powers.data.clamp_(-2.0, 5.0)
+        
+        mse = ((model(x_valid) - y_valid) ** 2).mean().item()
+        return mse, model, powers_subset
 
-            for step in range(n_steps):
-                optimizer.zero_grad()
-                pred = model(x_valid)
-                loss = ((pred - y_valid) ** 2).mean()
-                loss.backward()
-                optimizer.step()
-                with torch.no_grad():
-                    model.powers.data.clamp_(-2.0, 5.0)
-            
-            mse = ((model(x_valid) - y_valid) ** 2).mean().item()
-            stage1_models.append((mse, model, powers_subset))
+    import concurrent.futures
+    import multiprocessing
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, multiprocessing.cpu_count())) as executor:
+        futures = []
+        for n_powers in range(1, min(4, len(initial_powers) + 1)):
+            for start_idx in range(max(1, len(initial_powers) - n_powers + 1)):
+                powers_subset = initial_powers[start_idx:start_idx + n_powers]
+                futures.append(executor.submit(_train_power_model, powers_subset))
+        for f in concurrent.futures.as_completed(futures):
+            stage1_models.append(f.result())
     
     # Sort by MSE and pick best Stage 1 model
     stage1_models.sort(key=lambda x: x[0])
@@ -2872,46 +2941,10 @@ def beam_search_evolution(
             raw_mse = result['best_mse']
             formula_str = result.get('formula', '0')
             
-            try:
-                import sympy as sp
-                from sympy.parsing.sympy_parser import parse_expr, standard_transformations, convert_xor, implicit_multiplication_application
-                try:
-                    from simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
-                except ImportError:
-                    from scripts.simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
-                
-                try:
-                    sp_expr = simplify_onn_formula(formula_str)[1]
-                except Exception:
-                    transformations = standard_transformations + (convert_xor, implicit_multiplication_application)
-                    snapped = snap_formula_floats(formula_str, SnapConfig(int_tol=1e-5, zero_tol=1e-8))
-                    sp_expr = parse_expr(snapped, transformations=transformations, evaluate=False)
-                
-                free_syms = list(sp_expr.free_symbols)
-                if not free_syms:
-                    y_pred = np.full_like(y_np, float(sp_expr))
-                else:
-                    func = sp.lambdify(free_syms[0], sp_expr, modules=['numpy'])
-                    y_pred = func(x_np)
-                
-                if np.isscalar(y_pred):
-                    y_pred = np.full_like(y_np, y_pred)
-                    
-                display_mse = float(np.mean((y_pred - y_np)**2))
-                if not np.isfinite(display_mse):
-                    display_mse = float('inf')
-                    
-            except Exception:
-                display_mse = raw_mse
-                
-            drift_penalty = abs(raw_mse - display_mse) / max(raw_mse, 1e-12)
+            # Defer expensive SymPy parsing until after the parallel phase
             result['raw_mse'] = raw_mse
-            result['display_mse'] = display_mse
-            result['drift_penalty'] = drift_penalty
-            
-            # Use display_mse as the primary ranking metric instead of raw_mse
-            result['best_mse'] = display_mse
-            return (display_mse, result, config)
+            result['best_mse'] = raw_mse
+            return (raw_mse, result, config)
         except Exception:
             return (float('inf'), None, config)
     
@@ -3013,6 +3046,49 @@ def beam_search_evolution(
             futures = [executor.submit(run_single_beam, cfg) for cfg in configs]
             for future in as_completed(futures):
                 results.append(future.result())
+
+        # Evaluate SymPy sequentially on main thread. 
+        # Since it's done for each beam sequentially, it causes the 4-5s pause.
+        # But we MUST use it for accurate best_mse ranking.
+        for i, (mse, res, cfg) in enumerate(results):
+            if res is not None:
+                try:
+                    import sympy as sp
+                    from sympy.parsing.sympy_parser import parse_expr, standard_transformations, convert_xor, implicit_multiplication_application
+                    try:
+                        from simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+                    except ImportError:
+                        from scripts.simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+                    
+                    formula_str = res.get('formula', '0')
+                    try:
+                        sp_expr = simplify_onn_formula(formula_str)[1]
+                    except Exception:
+                        transformations = standard_transformations + (convert_xor, implicit_multiplication_application)
+                        snapped = snap_formula_floats(formula_str, SnapConfig(int_tol=1e-5, zero_tol=1e-8))
+                        sp_expr = parse_expr(snapped, transformations=transformations, evaluate=False)
+                    
+                    free_syms = list(sp_expr.free_symbols)
+                    if not free_syms:
+                        y_pred = np.full_like(y_np, float(sp_expr))
+                    else:
+                        func = sp.lambdify(free_syms[0], sp_expr, modules=['numpy'])
+                        y_pred = func(x_np)
+                    
+                    if np.isscalar(y_pred):
+                        y_pred = np.full_like(y_np, y_pred)
+                        
+                    display_mse = float(np.mean((y_pred - y_np)**2))
+                    if not np.isfinite(display_mse):
+                        display_mse = float('inf')
+                except Exception:
+                    display_mse = res['raw_mse']
+                    
+                drift_penalty = abs(res['raw_mse'] - display_mse) / max(res['raw_mse'], 1e-12)
+                res['display_mse'] = display_mse
+                res['drift_penalty'] = drift_penalty
+                res['best_mse'] = display_mse
+                results[i] = (display_mse, res, cfg)
         
         # Sort by MSE
         results.sort(key=lambda r: r[0])
