@@ -1635,62 +1635,76 @@ private:
             
             int n_features = static_cast<int>(base_cache.size());
 
+            // Get base weights explicitly to use in analytical jacobian
+            Eigen::VectorXd base_w;
+            if (!dg.solve_ridge(1e-4, base_w)) {
+                lambda *= 10.0;
+                continue;
+            }
+
             Eigen::MatrixXd J(n_samples, n_params);
             J.setZero();
             
-            for (int pidx = 0; pidx < n_params; ++pidx) {
-                int node_idx = active_unary[pidx / 3];
+            // Build A matrix for the VARPRO projection step
+            Eigen::MatrixXd A(n_samples, n_features + 1);
+            for (int i = 0; i < n_features; ++i) A.col(i) = base_cache[i].matrix();
+            A.col(n_features).setOnes();
+            
+            // Precompute QR decomposition of A for the projection P_perp
+            // We want to compute v - A * (A^T A + lambda I)^{-1} A^T * v
+            Eigen::MatrixXd G_ridge = A.transpose() * A;
+            G_ridge.diagonal().array() += 1e-4;
+            Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr;
+            qr.compute(G_ridge);
+            
+            for (int ai = 0; ai < static_cast<int>(active_unary.size()); ++ai) {
+                int node_idx = active_unary[ai];
+                const auto& node = base_graph.nodes[node_idx];
+                const auto& child_out = base_cache[node.left_child];
+                double wi = base_w(node_idx);
 
-                Eigen::VectorXd t_plus = theta;
-                t_plus(pidx) += fd_eps;
-                IndividualGraph g_plus = base_graph;
-                unpack_params(g_plus, t_plus);
-                
-                std::vector<Eigen::ArrayXd> cache_plus;
-                std::vector<int> changed_plus;
-                evaluate_graph_partial(g_plus, node_idx, base_cache, cache_plus, changed_plus);
-                
-                dg.update_nodes(changed_plus, base_cache, cache_plus);
-                Eigen::VectorXd w_plus;
-                bool success_plus = dg.solve_ridge(1e-4, w_plus); // Match solve_output_weights penalty
-                Eigen::VectorXd r_plus;
-                double mse_plus = std::numeric_limits<double>::infinity();
-                if (success_plus) {
-                    Eigen::ArrayXd pred_plus = Eigen::ArrayXd::Constant(n_samples, w_plus(n_features));
-                    for (int i = 0; i < n_features; ++i) pred_plus += w_plus(i) * cache_plus[i];
-                    r_plus = (pred_plus - y_).matrix();
-                    mse_plus = r_plus.squaredNorm() / n_samples;
-                }
-                dg.update_nodes(changed_plus, cache_plus, base_cache); // revert
+                Eigen::ArrayXd df_dp, df_domega, df_dphi;
 
-                Eigen::VectorXd t_minus = theta;
-                t_minus(pidx) -= fd_eps;
-                IndividualGraph g_minus = base_graph;
-                unpack_params(g_minus, t_minus);
-                
-                std::vector<Eigen::ArrayXd> cache_minus;
-                std::vector<int> changed_minus;
-                evaluate_graph_partial(g_minus, node_idx, base_cache, cache_minus, changed_minus);
-                
-                dg.update_nodes(changed_minus, base_cache, cache_minus);
-                Eigen::VectorXd w_minus;
-                bool success_minus = dg.solve_ridge(1e-4, w_minus); // Match solve_output_weights penalty
-                Eigen::VectorXd r_minus;
-                double mse_minus = std::numeric_limits<double>::infinity();
-                if (success_minus) {
-                    Eigen::ArrayXd pred_minus = Eigen::ArrayXd::Constant(n_samples, w_minus(n_features));
-                    for (int i = 0; i < n_features; ++i) pred_minus += w_minus(i) * cache_minus[i];
-                    r_minus = (pred_minus - y_).matrix();
-                    mse_minus = r_minus.squaredNorm() / n_samples;
-                }
-                dg.update_nodes(changed_minus, cache_minus, base_cache); // revert
-
-                if (!std::isfinite(mse_plus) || !std::isfinite(mse_minus)) {
-                    J.col(pidx).setZero();
-                    continue;
+                switch (node.unary_op) {
+                    case UnaryOp::Periodic: {
+                        Eigen::ArrayXd arg = node.omega * child_out + node.phi;
+                        Eigen::ArrayXd cos_arg = arg.cos();
+                        df_domega = node.amplitude * child_out * cos_arg;
+                        df_dphi   = node.amplitude * cos_arg;
+                        df_dp     = Eigen::ArrayXd::Zero(n_samples);
+                        break;
+                    }
+                    case UnaryOp::Exp: {
+                        // base_cache[node_idx] is exactly exp(omega*x + phi) * amplitude
+                        Eigen::ArrayXd val = base_cache[node_idx]; 
+                        df_domega = child_out * val;
+                        df_dphi   = val;
+                        df_dp     = Eigen::ArrayXd::Zero(n_samples);
+                        break;
+                    }
+                    case UnaryOp::Power: {
+                        // derivative of |x|^p w.r.t p is |x|^p * ln(|x|)
+                        Eigen::ArrayXd abs_x = child_out.abs() + 1e-10;
+                        df_dp     = base_cache[node_idx] * abs_x.log();
+                        df_domega = Eigen::ArrayXd::Zero(n_samples);
+                        df_dphi   = Eigen::ArrayXd::Zero(n_samples);
+                        break;
+                    }
+                    default:
+                        df_dp = df_domega = df_dphi = Eigen::ArrayXd::Zero(n_samples);
                 }
 
-                J.col(pidx) = (r_plus - r_minus) / (2.0 * fd_eps);
+                Eigen::ArrayXd* derivs[3] = {&df_dp, &df_domega, &df_dphi};
+                for (int pi = 0; pi < 3; ++pi) {
+                    Eigen::VectorXd dAw = ((*derivs[pi]) * wi).matrix();
+                    
+                    // Varpro correction projection v = dAw - A * (A^T A + \lambda I)^{-1} A^T * dAw
+                    Eigen::VectorXd AtdAw = A.transpose() * dAw;
+                    Eigen::VectorXd correction = A * qr.solve(AtdAw);
+                    
+                    int pidx = ai * 3 + pi;
+                    J.col(pidx) = dAw - correction;
+                }
             }
 
             Eigen::MatrixXd H = J.transpose() * J;
