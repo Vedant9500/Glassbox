@@ -85,6 +85,10 @@ struct EvolutionConfig {
     int num_islands = 1;          // 1 = single population (default)
     int migration_interval = 25;  // Exchange elites every N generations
     int migration_size = 2;       // Number of elites migrated per exchange
+    
+    // Diverse Islands Support
+    std::vector<std::vector<double>> multi_op_priors;
+    std::vector<std::vector<double>> multi_seed_omegas;
 
     // P7: Dimensional Analysis
     std::vector<std::vector<double>> input_units;  // Per-feature unit exponents
@@ -519,7 +523,17 @@ public:
         island_cfg.num_islands = 1; // Each island is single-population
 
         for (int i = 0; i < config_.num_islands; ++i) {
-            islands.emplace_back(island_cfg, X_, y_, seed_omegas_);
+            EvolutionConfig current_island_cfg = island_cfg;
+            if (i < config_.multi_op_priors.size() && !config_.multi_op_priors[i].empty()) {
+                current_island_cfg.op_priors = config_.multi_op_priors[i];
+            }
+            
+            std::vector<double> current_seed_omegas = seed_omegas_;
+            if (i < config_.multi_seed_omegas.size() && !config_.multi_seed_omegas[i].empty()) {
+                current_seed_omegas = config_.multi_seed_omegas[i];
+            }
+            
+            islands.emplace_back(current_island_cfg, X_, y_, current_seed_omegas);
         }
 
         // Initialize all islands

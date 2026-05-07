@@ -2859,123 +2859,97 @@ def beam_search_evolution(
     best_overall_config = None
     rng = np.random.RandomState(123)
     
-    for round_idx in range(n_rounds):
-        if round_idx == 0:
-            configs = make_beam_configs(n_beams, round_idx)
-        else:
-            # Mutate winners into new beams
-            configs = []
-            n_keep = max(1, int(n_beams * keep_fraction))
-            n_mutants_per_winner = max(1, (n_beams - n_keep) // n_keep)
-            
-            for winner_cfg in winner_configs:  # noqa: F821 - set at end of loop
-                configs.append(winner_cfg)  # Keep original
-                for _ in range(n_mutants_per_winner):
-                    configs.append(mutate_config(winner_cfg, rng))
-            
-            # Fill remaining with random configs
-            while len(configs) < n_beams:
-                configs.append(mutate_config(configs[rng.randint(0, len(configs))], rng))
-            configs = configs[:n_beams]
-        
-        # Run all beams in parallel, but limit C++ OpenMP threads per beam 
-        # to avoid oversubscription. This smooths out Python SymPy overhead.
-        import multiprocessing
-        
-        round_start = time.time()
-        results = []
-        
-        max_physical_threads = multiprocessing.cpu_count()
-        threads_per_beam = max(1, max_physical_threads // n_beams)
-        
-        for cfg in configs:
-            cfg['num_threads'] = threads_per_beam
-            
-        with ThreadPoolExecutor(max_workers=n_beams) as executor:
-            futures = [executor.submit(run_single_beam, cfg) for cfg in configs]
-            for future in as_completed(futures):
-                results.append(future.result())
+    # 1. Get initial configs
+    configs = make_beam_configs(n=n_beams, round_idx=0)
 
-        # Evaluate SymPy sequentially on main thread. 
-        # Since it's done for each beam sequentially, it causes the 4-5s pause.
-        # But we MUST use it for accurate best_mse ranking.
-        for i, (mse, res, cfg) in enumerate(results):
-            if res is not None:
-                try:
-                    import sympy as sp
-                    from sympy.parsing.sympy_parser import parse_expr, standard_transformations, convert_xor, implicit_multiplication_application
-                    try:
-                        from simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
-                    except ImportError:
-                        from scripts.simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
-                    
-                    formula_str = res.get('formula', '0')
-                    try:
-                        sp_expr = simplify_onn_formula(formula_str)[1]
-                    except Exception:
-                        transformations = standard_transformations + (convert_xor, implicit_multiplication_application)
-                        snapped = snap_formula_floats(formula_str, SnapConfig(int_tol=1e-5, zero_tol=1e-8))
-                        sp_expr = parse_expr(snapped, transformations=transformations, evaluate=False)
-                    
-                    free_syms = list(sp_expr.free_symbols)
-                    if not free_syms:
-                        y_pred = np.full_like(y_np, float(sp_expr))
-                    else:
-                        func = sp.lambdify(free_syms[0], sp_expr, modules=['numpy'])
-                        y_pred = func(x_np)
-                    
-                    if np.isscalar(y_pred):
-                        y_pred = np.full_like(y_np, y_pred)
-                        
-                    display_mse = float(np.mean((y_pred - y_np)**2))
-                    if not np.isfinite(display_mse):
-                        display_mse = float('inf')
-                except Exception:
-                    display_mse = res['raw_mse']
-                    
-                drift_penalty = abs(res['raw_mse'] - display_mse) / max(res['raw_mse'], 1e-12)
-                res['display_mse'] = display_mse
-                res['drift_penalty'] = drift_penalty
-                res['best_mse'] = display_mse
-                results[i] = (display_mse, res, cfg)
-        
-        # Sort by MSE
-        results.sort(key=lambda r: r[0])
-        round_time = time.time() - round_start
-        
-        # Report
-        best_mse = results[0][0]
-        worst_kept = results[max(0, int(n_beams * keep_fraction) - 1)][0]
-        
-        print(f"\n  Round {round_idx + 1}/{n_rounds}: "
-              f"best={best_mse:.2e}, "
-              f"worst_kept={worst_kept:.2e}, "
-              f"time={round_time:.2f}s, "
-              f"winner='{results[0][2]['label']}'")
-        
-        # Track overall best
-        if results[0][0] < best_overall_mse:
-            best_overall_mse = results[0][0]
-            best_overall_result = results[0][1]
-            best_overall_config = results[0][2]
-        
-        # Early exit if we found essentially perfect MSE
-        if best_overall_mse < 1e-10:
-            print("  [PASS] Perfect MSE achieved, stopping early!")
-            break
-        
-        # Keep top fraction as winners for next round
-        n_keep = max(1, int(n_beams * keep_fraction))
-        winner_configs = [r[2] for r in results[:n_keep]]
-    
-    elapsed = time.time() - start_time
-    
+    # 2. Extract multi-priors and multi-seed-omegas
+    multi_op_priors = [cfg.get('op_priors', []) for cfg in configs]
+    multi_seed_omegas = [cfg.get('seed_omegas', []) for cfg in configs]
+
+    # 3. Launch the native C++ Island Model (one call to rule them all)
+    total_pop_size = base_pop_size * n_beams
+    total_generations = base_generations * max(1, n_rounds)
+
+    print(f"  Launching Native Diverse Island Model:")
+    print(f"  - Islands: {n_beams}")
+    print(f"  - Total Population: {total_pop_size}")
+    print(f"  - Generations: {total_generations}")
+
+    import multiprocessing
+    max_physical_threads = multiprocessing.cpu_count()
+
+    try:
+        result = _core.run_evolution(
+            X_list=X_list,
+            y=y_np,
+            pop_size=total_pop_size,
+            generations=total_generations,
+            early_stop_mse=1e-10,
+            num_islands=n_beams,
+            migration_interval=25,
+            migration_size=2,
+            p_min=adaptive_p_min,
+            p_max=adaptive_p_max,
+            multi_op_priors=multi_op_priors,
+            multi_seed_omegas=multi_seed_omegas,
+            num_threads=max_physical_threads, # Use all available cores via OpenMP
+        )
+    except Exception as e:
+        print(f"  \u274c Native Island Search failed: {e}")
+        return None
+
+    best_overall_mse = result.get('best_mse', float('inf'))
+    best_overall_result = result
+    best_overall_config = configs[0] # Default, as they were merged
+
+    elapsed = time.time() - start_time    
     if best_overall_result is None:
         print("  \u274c Beam search failed (no valid results)")
         return None
-    
+        
+    # [Optimized] Run SymPy ONLY ONCE on the absolute global winner
+    formula_str = best_overall_result.get('formula', '0')
+    display_mse = best_overall_mse
+    try:
+        import sympy as sp
+        from sympy.parsing.sympy_parser import parse_expr, standard_transformations, convert_xor, implicit_multiplication_application
+        try:
+            from simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+        except ImportError:
+            from scripts.simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+        
+        try:
+            sp_expr = simplify_onn_formula(formula_str)[1]
+        except Exception:
+            transformations = standard_transformations + (convert_xor, implicit_multiplication_application)
+            snapped = snap_formula_floats(formula_str, SnapConfig(int_tol=1e-5, zero_tol=1e-8))
+            sp_expr = parse_expr(snapped, transformations=transformations, evaluate=False)
+        
+        free_syms = list(sp_expr.free_symbols)
+        if not free_syms:
+            y_pred = np.full_like(y_np, float(sp_expr))
+        else:
+            func = sp.lambdify(free_syms[0], sp_expr, modules=['numpy'])
+            y_pred = func(x_np)
+        
+        if np.isscalar(y_pred):
+            y_pred = np.full_like(y_np, y_pred)
+            
+        display_mse = float(np.mean((y_pred - y_np)**2))
+        if not np.isfinite(display_mse):
+            display_mse = float('inf')
+            
+        formula_str = str(sp_expr)
+    except Exception:
+        display_mse = best_overall_mse
+
+    drift_penalty = abs(best_overall_mse - display_mse) / max(best_overall_mse, 1e-12)
+    best_overall_result['display_mse'] = display_mse
+    best_overall_result['drift_penalty'] = drift_penalty
+    best_overall_result['formula'] = formula_str
+
     # Build CppGraphModule from best result
-    formula = best_overall_result.get('formula', '0')
+    formula = formula_str
     
     try:
         from glassbox.sr.cpp.export_pytorch import CppGraphModule

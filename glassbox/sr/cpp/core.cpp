@@ -52,7 +52,10 @@ py::dict run_evolution_cpp(
     double acceptable_mse = 1e-8,
     int acceptable_complexity = 15,
     int early_stop_max_nodes = 50,
-    int num_threads = -1
+    int num_threads = -1,
+    // Diverse Islands Support
+    py::list multi_op_priors = py::list(),
+    py::list multi_seed_omegas = py::list()
 ) {
     // 1. Convert Python/Numpy inputs to C++/Eigen
     std::vector<Eigen::ArrayXd> X;
@@ -79,6 +82,26 @@ py::dict run_evolution_cpp(
         cpp_op_priors.push_back(item.cast<double>());
     }
 
+    // Parse multi_op_priors
+    std::vector<std::vector<double>> cpp_multi_op_priors;
+    for (auto item : multi_op_priors) {
+        std::vector<double> prior_vec;
+        for (auto val : item.cast<py::list>()) {
+            prior_vec.push_back(val.cast<double>());
+        }
+        cpp_multi_op_priors.push_back(prior_vec);
+    }
+
+    // Parse multi_seed_omegas
+    std::vector<std::vector<double>> cpp_multi_seed_omegas;
+    for (auto item : multi_seed_omegas) {
+        std::vector<double> seed_vec;
+        for (auto val : item.cast<py::list>()) {
+            seed_vec.push_back(val.cast<double>());
+        }
+        cpp_multi_seed_omegas.push_back(seed_vec);
+    }
+
     // Parse input_units (list of lists)
     std::vector<std::vector<double>> cpp_input_units;
     for (auto item : input_units) {
@@ -102,6 +125,8 @@ py::dict run_evolution_cpp(
     config.generations = generations;
     config.early_stop_mse = early_stop_mse;
     config.op_priors = cpp_op_priors;
+    config.multi_op_priors = cpp_multi_op_priors;
+    config.multi_seed_omegas = cpp_multi_seed_omegas;
     config.p_min = p_min;
     config.p_max = p_max;
     config.use_nsga2 = use_nsga2;
@@ -372,7 +397,9 @@ PYBIND11_MODULE(_core, m) {
           py::arg("acceptable_mse")=1e-8,
           py::arg("acceptable_complexity")=15,
           py::arg("early_stop_max_nodes")=50,
-          py::arg("num_threads")=-1);
+          py::arg("num_threads")=-1,
+          py::arg("multi_op_priors")=py::list(),
+          py::arg("multi_seed_omegas")=py::list());
 
     m.def("refine_frequencies", &refine_frequencies_wrapper, "Refines frequencies via Eigen varpro");
     m.def("refine_powers", &refine_powers_model_wrapper, "Refines powers via Eigen varpro");
