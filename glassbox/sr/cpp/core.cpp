@@ -441,7 +441,8 @@ PYBIND11_MODULE(_core, m) {
           py::arg("early_stop_max_nodes")=50,
           py::arg("num_threads")=-1,
           py::arg("multi_op_priors")=py::list(),
-          py::arg("multi_seed_omegas")=py::list());
+          py::arg("multi_seed_omegas")=py::list(),
+          py::arg("seed_graphs_py")=py::list());
 
     m.def("refine_frequencies", &refine_frequencies_wrapper, "Refines frequencies via Eigen varpro");
     m.def("refine_powers", &refine_powers_model_wrapper, "Refines powers via Eigen varpro");
