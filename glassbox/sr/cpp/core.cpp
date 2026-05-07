@@ -55,7 +55,8 @@ py::dict run_evolution_cpp(
     int num_threads = -1,
     // Diverse Islands Support
     py::list multi_op_priors = py::list(),
-    py::list multi_seed_omegas = py::list()
+    py::list multi_seed_omegas = py::list(),
+    py::list seed_graphs_py = py::list()
 ) {
     // 1. Convert Python/Numpy inputs to C++/Eigen
     std::vector<Eigen::ArrayXd> X;
@@ -100,6 +101,47 @@ py::dict run_evolution_cpp(
             seed_vec.push_back(val.cast<double>());
         }
         cpp_multi_seed_omegas.push_back(seed_vec);
+    }
+
+    // Parse seed_graphs
+    std::vector<sr::IndividualGraph> cpp_seed_graphs;
+    for (auto item : seed_graphs_py) {
+        auto gdict = item.cast<py::dict>();
+        sr::IndividualGraph g;
+        
+        if (gdict.contains("nodes")) {
+            auto nodes_list = gdict["nodes"].cast<py::list>();
+            for (auto n_item : nodes_list) {
+                auto ndict = n_item.cast<py::dict>();
+                sr::OpNode node;
+                node.type = static_cast<sr::NodeType>(ndict["type"].cast<int>());
+                if (ndict.contains("feature_idx")) node.feature_idx = ndict["feature_idx"].cast<int>();
+                if (ndict.contains("value")) node.value = ndict["value"].cast<double>();
+                if (ndict.contains("unary_op")) node.unary_op = static_cast<sr::UnaryOp>(ndict["unary_op"].cast<int>());
+                if (ndict.contains("binary_op")) node.binary_op = static_cast<sr::BinaryOp>(ndict["binary_op"].cast<int>());
+                if (ndict.contains("p")) node.p = ndict["p"].cast<double>();
+                if (ndict.contains("omega")) node.omega = ndict["omega"].cast<double>();
+                if (ndict.contains("phi")) node.phi = ndict["phi"].cast<double>();
+                if (ndict.contains("amplitude")) node.amplitude = ndict["amplitude"].cast<double>();
+                if (ndict.contains("beta")) node.beta = ndict["beta"].cast<double>();
+                if (ndict.contains("gamma")) node.gamma = ndict["gamma"].cast<double>();
+                if (ndict.contains("tau")) node.tau = ndict["tau"].cast<double>();
+                if (ndict.contains("left_child")) node.left_child = ndict["left_child"].cast<int>();
+                if (ndict.contains("right_child")) node.right_child = ndict["right_child"].cast<int>();
+                g.nodes.push_back(node);
+            }
+        }
+        
+        if (gdict.contains("output_weights")) {
+            auto weights_list = gdict["output_weights"].cast<py::list>();
+            for (auto w : weights_list) {
+                g.output_weights.push_back(w.cast<double>());
+            }
+        }
+        
+        if (gdict.contains("output_bias")) g.output_bias = gdict["output_bias"].cast<double>();
+        
+        cpp_seed_graphs.push_back(g);
     }
 
     // Parse input_units (list of lists)
@@ -166,7 +208,7 @@ py::dict run_evolution_cpp(
     if (num_islands > 1) std::cout << " (Island Model: " << num_islands << " islands)";
     std::cout << std::endl;
     
-    sr::EvolutionEngine engine(config, X, y, cpp_seed_omegas);
+    sr::EvolutionEngine engine(config, X, y, cpp_seed_omegas, cpp_seed_graphs);
     
     // 3. Run evolution loop natively in C++
     {

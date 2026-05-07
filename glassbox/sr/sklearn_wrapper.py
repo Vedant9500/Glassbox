@@ -683,6 +683,19 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         n_runs = max(1, int(self.multi_start_runs))
                         best_cpp_result = None
 
+                        # Combine operator priors from proposer to pass natively to C++
+                        cpp_op_priors = []
+                        if self.universal_proposer_fpip_v2_ and self.universal_proposer_fpip_v2_.get("valid"):
+                            pp = self.universal_proposer_fpip_v2_.get("operator_priors", {})
+                            if pp:
+                                # Order: periodic, power, exp, log
+                                cpp_op_priors = [
+                                    pp.get("periodic", 0.8),
+                                    pp.get("power", 0.08) + pp.get("int_pow", 0.0),
+                                    pp.get("exp", 0.02),
+                                    pp.get("log", 0.05)
+                                ]
+
                         for run_idx in range(n_runs):
                             remaining = max(0.0, effective_timeout - _elapsed())
                             if remaining <= 0.0:
@@ -703,6 +716,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 generations=self.generations,
                                 early_stop_mse=self.early_stop_mse,
                                 seed_omegas=detected_omegas,
+                                op_priors=cpp_op_priors,
                                 timeout_seconds=run_timeout,
                                 p_min=self.p_min,
                                 p_max=self.p_max,

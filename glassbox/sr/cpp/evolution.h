@@ -190,8 +190,9 @@ public:
     EvolutionEngine(const EvolutionConfig& config, 
                     const std::vector<Eigen::ArrayXd>& X, 
                     const Eigen::ArrayXd& y,
-                    const std::vector<double>& seed_omegas = {})
-                : config_(config), X_(X), y_(y), seed_omegas_(seed_omegas),
+                    const std::vector<double>& seed_omegas = {},
+                    const std::vector<IndividualGraph>& seed_graphs = {})
+                : config_(config), X_(X), y_(y), seed_omegas_(seed_omegas), seed_graphs_(seed_graphs),
                     rng_(config.random_seed >= 0
                             ? static_cast<unsigned int>(config.random_seed)
                             : std::random_device{}()) {
@@ -533,7 +534,8 @@ public:
                 current_seed_omegas = config_.multi_seed_omegas[i];
             }
             
-            islands.emplace_back(current_island_cfg, X_, y_, current_seed_omegas);
+            // Pass seed_graphs_ to all islands (they'll use max a fraction of pop so it's fine)
+            islands.emplace_back(current_island_cfg, X_, y_, current_seed_omegas, seed_graphs_);
         }
 
         // Initialize all islands
@@ -626,6 +628,7 @@ private:
     std::vector<Eigen::ArrayXd> X_;
     Eigen::ArrayXd y_;
     std::vector<double> seed_omegas_;
+    std::vector<IndividualGraph> seed_graphs_;
     
     std::vector<IndividualGraph> population_;
     IndividualGraph best_overall_;
@@ -865,8 +868,17 @@ private:
         population_.resize(config_.pop_size);
         int n_inputs = static_cast<int>(X_.size());
         
-        for (auto& ind : population_) {
-            ind = create_random_individual(n_inputs);
+        int seeded = 0;
+        // Seed first N individuals from proposer skeletons
+        int max_seed = std::min((int)seed_graphs_.size(), config_.pop_size / 4);
+        for (int i = 0; i < max_seed; ++i) {
+            population_[i] = seed_graphs_[i];
+            seeded++;
+        }
+        
+        // Fill rest with random individuals
+        for (int i = seeded; i < config_.pop_size; ++i) {
+            population_[i] = create_random_individual(n_inputs);
         }
     }
     
