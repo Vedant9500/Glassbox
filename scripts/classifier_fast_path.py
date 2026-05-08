@@ -634,21 +634,6 @@ def build_basis_from_predictions(
             names.append(f"{name}^2/(exp({name})-1)")
             basis_list.append((xi ** 3) / denom)
             names.append(f"{name}^3/(exp({name})-1)")
-            
-            # If the classifier strongly predicts 'e' or 'pi' as a base
-            if predictions.get('const_e', 0) >= threshold:
-                exps = np.exp(x_clamp * math.e)
-                basis_list.append(exps)
-                names.append(f"exp(e*{name})")
-                basis_list.append(np.exp(-x_clamp * math.e))
-                names.append(f"exp(-e*{name})")
-                
-            if predictions.get('const_pi', 0) >= threshold:
-                exps = np.exp(x_clamp * math.pi)
-                basis_list.append(exps)
-                names.append(f"exp(pi*{name})")
-                basis_list.append(np.exp(-x_clamp * math.pi))
-                names.append(f"exp(-pi*{name})")
     
     # Logarithmic operations (always include in universal mode for Nguyen-7 etc.)
     if allow_log and (universal_basis or predictions.get('log', 0) >= threshold):

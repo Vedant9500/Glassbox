@@ -98,4 +98,7 @@ models/
 
 # Temporary scripts
 **/_tmp_*.py
-scripts/_tmp_*.py
+scripts/_tmp_*.py
+
+
+grokking_experiments/

@@ -66,13 +66,6 @@ OPERATOR_CLASSES = {
 
     # Rational functions
     'rational': 8,       # 1/(x+c), x/(x²+c) type
-    
-    # Constants
-    'const_pi': 9,       # The constant pi (3.14159...)
-    'const_e': 10,       # The constant e (2.71828...)
-    'const_1': 11,       # The constant 1.0 or -1.0
-    'const_2': 12,       # The constant 2.0 or -2.0
-    'const_half': 13,    # The constant 0.5 or -0.5
 }
 
 N_CLASSES = len(OPERATOR_CLASSES)
@@ -507,6 +500,30 @@ class PCFGFormulaGenerator:
             ])
         else:
             return round(np.random.uniform(-5, 5), 4)
+
+class DepthAnnealedPCFG(PCFGFormulaGenerator):
+    """PCFG with scheduled depth annealing.
+    
+    Early in generation: shallow formulas (builds basic operator recognition)
+    Late in generation: deep compositions (builds compositional reasoning)
+    """
+    
+    def __init__(self, max_depth: int = 6):
+        super().__init__(max_depth=max_depth)
+        self.progress = 0.0  # 0.0 = start, 1.0 = end of generation
+    
+    def set_progress(self, progress: float):
+        """Set generation progress for weight annealing."""
+        self.progress = np.clip(progress, 0.0, 1.0)
+        # Anneal from shallow-heavy to deep-heavy
+        t = self.progress
+        self.weights = {
+            'unary': 0.20 + 0.25 * t,    # 0.20 → 0.45
+            'binary': 0.15 + 0.20 * t,   # 0.15 → 0.35
+            'term': 0.65 - 0.45 * t,     # 0.65 → 0.20
+        }
+        total = sum(self.weights.values())
+        self.weights = {k: v/total for k, v in self.weights.items()}
 
 
 # =============================================================================
@@ -1682,9 +1699,12 @@ def generate_chunk(
     }
 
     # Create PCFG generator if needed
-    pcfg_gen = PCFGFormulaGenerator(max_depth=pcfg_max_depth) if pcfg_ratio > 0 else None
+    pcfg_gen = DepthAnnealedPCFG(max_depth=pcfg_max_depth) if pcfg_ratio > 0 else None
 
     while len(features_local) < target and attempts < max_attempts:
+        if pcfg_gen is not None:
+            pcfg_gen.set_progress(len(features_local) / target)
+            
         attempts += 1
         
         # Decide: PCFG or template-based generation
@@ -1831,14 +1851,14 @@ def main():
                         help="Minimum x value (default: -5)")
     parser.add_argument("--x-max", type=float, default=5,
                         help="Maximum x value (default: 5)")
-    parser.add_argument("--x-ranges", type=str, default="",
+    parser.add_argument("--x-ranges", type=str, default="-0.5:0.5,-1:1,-2:2,-5:5,-10:10,-50:50,-100:100",
                         help="Comma-separated x ranges like '-1:1,-5:5,-10:10' (overrides --x-min/--x-max)")
-    parser.add_argument("--x-scale-min", type=float, default=0.2,
-                        help="Minimum multiplicative scale for x (default: 0.2)")
-    parser.add_argument("--x-scale-max", type=float, default=5.0,
-                        help="Maximum multiplicative scale for x (default: 5.0)")
-    parser.add_argument("--x-shift-std", type=float, default=0.2,
-                        help="Additive shift std for x as fraction of x span (default: 0.2)")
+    parser.add_argument("--x-scale-min", type=float, default=0.1,
+                        help="Minimum multiplicative scale for x (default: 0.1)")
+    parser.add_argument("--x-scale-max", type=float, default=10.0,
+                        help="Maximum multiplicative scale for x (default: 10.0)")
+    parser.add_argument("--x-shift-std", type=float, default=0.3,
+                        help="Additive shift std for x as fraction of x span (default: 0.3)")
     parser.add_argument("--n-points", type=int, default=256,
                         help="Number of points per curve (default: 256)")
     parser.add_argument("--rational-ratio", type=float, default=0.0,
@@ -1857,12 +1877,12 @@ def main():
                         help="Do not store formulas in the output dataset")
     parser.add_argument("--noise-std", type=float, default=0.01,
                         help="Additive noise std as fraction of curve std (default: 0.01)")
-    parser.add_argument("--y-scale-min", type=float, default=0.2,
-                        help="Minimum multiplicative scale for y (default: 0.2)")
-    parser.add_argument("--y-scale-max", type=float, default=5.0,
-                        help="Maximum multiplicative scale for y (default: 5.0)")
-    parser.add_argument("--y-offset-std", type=float, default=0.5,
-                        help="Additive offset std for y (default: 0.5)")
+    parser.add_argument("--y-scale-min", type=float, default=0.01,
+                        help="Minimum multiplicative scale for y (default: 0.01)")
+    parser.add_argument("--y-scale-max", type=float, default=100.0,
+                        help="Maximum multiplicative scale for y (default: 100.0)")
+    parser.add_argument("--y-offset-std", type=float, default=2.0,
+                        help="Additive offset std for y (default: 2.0)")
     parser.add_argument("--safe-eval", action="store_true",
                         help="Use restricted AST-based evaluation instead of eval")
     parser.add_argument("--unsafe-eval", action="store_true",
@@ -1873,9 +1893,9 @@ def main():
                         help="Keep b and d coefficients positive")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed (default: 42)")
-    parser.add_argument("--pcfg-ratio", type=float, default=0.3,
-                        help="Fraction of samples generated via PCFG grammar (0-1, default: 0.3)")
-    parser.add_argument("--pcfg-max-depth", type=int, default=5,
+    parser.add_argument("--pcfg-ratio", type=float, default=0.4,
+                        help="Fraction of samples generated via PCFG grammar (0-1, default: 0.4)")
+    parser.add_argument("--pcfg-max-depth", type=int, default=6,
                         help="Maximum tree depth for PCFG formulas (default: 5)")
     parser.add_argument("--noise-profile", type=str, default='multi',
                         choices=['legacy', 'multi'],

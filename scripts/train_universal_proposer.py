@@ -219,10 +219,29 @@ def main():
     model = UniversalProposer(config).to(device)
 
     if args.data:
-        blob = np.load(args.data, allow_pickle=True)
-        features = np.asarray(blob["features"], dtype=np.float32)
-        labels = np.asarray(blob["labels"], dtype=np.float32)
-        
+        if args.data.endswith(".npz"):
+            blob = np.load(args.data, allow_pickle=True)
+            features = np.asarray(blob["features"], dtype=np.float32)
+            labels = np.asarray(blob["labels"], dtype=np.float32)
+        else:
+            # Try loading streamed .dat files
+            base = Path(args.data)
+            features_path = base.with_suffix(".features.dat")
+            labels_path = base.with_suffix(".labels.dat")
+            if not features_path.exists() or not labels_path.exists():
+                raise FileNotFoundError(f"Could not find .npz or .dat files for {args.data}")
+            
+            # Infer sizes
+            # We assume features are n_samples x 398 (the new feature dim)
+            feature_dim = 398
+            n_classes = 9
+            file_size = features_path.stat().st_size
+            n_samples = file_size // (feature_dim * 4)
+            print(f"Inferred n_samples={n_samples} from {features_path.name}")
+            
+            features = np.memmap(features_path, dtype=np.float32, mode="r", shape=(n_samples, feature_dim))
+            labels = np.memmap(labels_path, dtype=np.float32, mode="r", shape=(n_samples, n_classes))
+            
         if args.max_samples > 0:
             features = features[:args.max_samples]
             labels = labels[:args.max_samples]

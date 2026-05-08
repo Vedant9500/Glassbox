@@ -46,7 +46,7 @@ DEFAULT_SKELETON_VOCAB: List[str] = [
 @dataclass
 class UniversalProposerConfig:
     hidden_dim: int = 256
-    n_features: int = 370
+    n_features: int = 398
     operator_vocab: Optional[List[str]] = None
     skeleton_vocab: Optional[List[str]] = None
 

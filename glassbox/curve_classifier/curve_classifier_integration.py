@@ -484,6 +484,62 @@ def predict_operators(
     return _build_result_dict(probs, threshold, metadata, cache_key)
 
 
+def detect_variable_interactions(
+    x: np.ndarray, 
+    y: np.ndarray,
+    interp,
+    n_grid: int = 15,
+    interaction_threshold: float = 0.1,
+) -> List[Tuple[int, int, float]]:
+    """Detect pairwise variable interactions using partial dependence.
+    
+    Returns list of (var_i, var_j, H_statistic) for interacting pairs.
+    """
+    n_vars = x.shape[1]
+    interactions = []
+    
+    var_y = np.var(y)
+    if var_y < 1e-12:
+        return interactions
+        
+    x_template = np.median(x, axis=0)
+    y_mean = float(np.mean(y))
+    
+    for i in range(n_vars):
+        for j in range(i + 1, n_vars):
+            xi_grid = np.linspace(x[:, i].min(), x[:, i].max(), n_grid)
+            xj_grid = np.linspace(x[:, j].min(), x[:, j].max(), n_grid)
+            
+            # Vectorized PD computation
+            XI, XJ = np.meshgrid(xi_grid, xj_grid, indexing='ij')
+            x_query_ij = np.tile(x_template, (n_grid * n_grid, 1))
+            x_query_ij[:, i] = XI.flatten()
+            x_query_ij[:, j] = XJ.flatten()
+            
+            pd_ij_flat = interp(x_query_ij)
+            pd_ij_flat = np.nan_to_num(pd_ij_flat, nan=y_mean)
+            pd_ij = pd_ij_flat.reshape(n_grid, n_grid)
+            
+            x_query_i = np.tile(x_template, (n_grid, 1))
+            x_query_i[:, i] = xi_grid
+            pd_i = interp(x_query_i)
+            pd_i = np.nan_to_num(pd_i, nan=y_mean)
+            
+            x_query_j = np.tile(x_template, (n_grid, 1))
+            x_query_j[:, j] = xj_grid
+            pd_j = interp(x_query_j)
+            pd_j = np.nan_to_num(pd_j, nan=y_mean)
+            
+            interaction_surface = pd_ij - pd_i[:, None] - pd_j[None, :] + y_mean
+            var_pd_ij = max(np.var(pd_ij), 1e-12)
+            H = np.var(interaction_surface) / var_pd_ij
+            
+            if H > interaction_threshold:
+                interactions.append((i, j, float(H)))
+                
+    return sorted(interactions, key=lambda t: -t[2])
+
+
 def _predict_operators_multi_input(
     x: np.ndarray,
     y: np.ndarray,
@@ -546,6 +602,13 @@ def _predict_operators_multi_input(
     scaler = metadata.get('feature_scaler')
     x_medians = np.median(x, axis=0)
     
+    interactions = []
+    if nearest_interp is not None:
+        try:
+            interactions = detect_variable_interactions(x, y, nearest_interp)
+        except Exception as e:
+            print(f"  Warning: Interaction detection failed: {e}")
+
     for var_idx in range(n_vars):
         # Create 1D slice: fix other variables at median, vary this one
         x_min_var = x[:, var_idx].min()
@@ -595,9 +658,65 @@ def _predict_operators_multi_input(
             # Skip this variable if feature extraction fails
             print(f"  Warning: Slice {var_idx} failed: {e}")
             continue
-    
-    # Aggregate: use max probability across all variables
-    # This captures operators that appear in ANY variable
+
+    # Handle interactions by processing diagonal slices and boosting multiplication
+    if interactions:
+        mult_idx = -1
+        if 'multiplication' in operator_classes:
+            mult_idx = operator_classes.index('multiplication')
+            
+        for i, j, H in interactions:
+            # 1. Boost multiplication probability directly based on interaction strength
+            if mult_idx >= 0:
+                boost = min(0.99, H * 2.0)
+                interaction_probs = np.zeros(len(operator_classes), dtype=np.float32)
+                interaction_probs[mult_idx] = boost
+                all_probs = np.vstack([all_probs, interaction_probs])
+                
+            # 2. Diagonal slice to catch features that only appear when both vary
+            x_min_i, x_max_i = x[:, i].min(), x[:, i].max()
+            x_min_j, x_max_j = x[:, j].min(), x[:, j].max()
+            
+            n_slice_points = min(256, len(y))
+            xi_slice = np.linspace(x_min_i, x_max_i, n_slice_points)
+            xj_slice = np.linspace(x_min_j, x_max_j, n_slice_points)
+            
+            x_query = np.tile(x_medians, (n_slice_points, 1))
+            x_query[:, i] = xi_slice
+            x_query[:, j] = xj_slice
+            
+            if linear_interp is not None:
+                y_slice = linear_interp(x_query)
+                if nearest_interp is not None:
+                    nan_mask = ~np.isfinite(y_slice)
+                    if np.any(nan_mask):
+                        y_slice[nan_mask] = nearest_interp(x_query[nan_mask])
+            else:
+                y_slice = nearest_interp(x_query)
+            
+            valid_mask = np.isfinite(y_slice)
+            if valid_mask.sum() < 10:
+                continue
+                
+            y_slice_valid = y_slice[valid_mask]
+            
+            try:
+                features = extract_all_features(y_slice_valid)
+                if scaler is not None:
+                    dim = len(scaler['mean'])
+                    features = features[:dim]
+                    features = (features - scaler['mean']) / (scaler['std'] + 1e-8)
+                
+                if metadata.get('type') == 'xgboost':
+                    probs = _predict_xgboost(model, features, metadata)
+                else:
+                    probs = _predict_pytorch(model, features, metadata, device)
+                
+                all_probs = np.vstack([all_probs, probs])
+            except Exception as e:
+                print(f"  Warning: Interaction diagonal slice {i}-{j} failed: {e}")
+
+    # Aggregate: use max probability across all variables and diagonal slices
     aggregated_probs = np.max(all_probs, axis=0)
     
     return _build_result_dict(aggregated_probs, threshold, metadata, cache_key)
