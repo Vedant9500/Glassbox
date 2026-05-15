@@ -2236,7 +2236,10 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                             ind.fitness = float('inf')
                             continue
 
-                        fitness = _add_if_finite(mse, complexity, self.complexity_penalty)
+                        # Scale-invariant parsimony: complexity penalty acts as a multiplier on MSE
+                        # so that it is agnostic to the magnitude of the target variable `y`.
+                        complexity_factor = self.complexity_penalty * complexity
+                        fitness = mse * (1.0 + complexity_factor) if math.isfinite(mse * complexity_factor) else float('inf')
                         
                         # Coefficient sparsity penalty (Hoyer-inspired)
                         # INCREASED: Stronger sparsity encourages fewer output terms

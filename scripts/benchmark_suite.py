@@ -344,10 +344,23 @@ def _parse_formula(formula_str: str) -> Callable[[np.ndarray], np.ndarray]:
     formula = re.sub(r'\|([^|]+)\|', r'abs(\1)', formula)
     
     try:
-        transformations = standard_transformations + (convert_xor, implicit_multiplication_application)
-        expr = parse_expr(formula, transformations=transformations, evaluate=False)
+        transformations = standard_transformations + (convert_xor, implicit_multiplication_application)        
+        local_dict = {
+            "Piecewise": sp.Piecewise,
+            "Eq": sp.Eq,
+            "Abs": sp.Abs,
+            "sign": sp.sign,
+            "sin": sp.sin,
+            "cos": sp.cos,
+            "tan": sp.tan,
+            "exp": sp.exp,
+            "log": sp.log,
+            "sqrt": sp.sqrt,
+            "pi": sp.pi,
+            "E": sp.E
+        }
+        expr = parse_expr(formula, local_dict=local_dict, transformations=transformations, evaluate=False)     
         free_syms = sorted(expr.free_symbols, key=lambda sym: sym.name)
-        
         # Inject safe power into lambdify
         modules = [{"pow": _safe_numpy_power, "Pow": _safe_numpy_power}, "numpy"]
         func = sp.lambdify(free_syms, expr, modules=modules)

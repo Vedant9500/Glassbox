@@ -24,29 +24,36 @@ from typing import Tuple, Optional, List
 # =============================================================================
 
 class CurveClassifierMLP(nn.Module):
-    """Simple MLP classifier for curve features."""
+    """Deep MLP classifier for curve features."""
     
     def __init__(self, n_features: int = 398, n_classes: int = 9, hidden: int = 512):
         super().__init__()
-        self.net = nn.Sequential(
+        layers = []
+        
+        layers.extend([
             nn.Linear(n_features, hidden),
             nn.BatchNorm1d(hidden),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            
-            nn.Linear(hidden, hidden),
-            nn.BatchNorm1d(hidden),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            
-            nn.Linear(hidden, hidden // 2),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            
-            nn.Linear(hidden // 2, n_classes),
-        )
+            nn.Dropout(0.2)
+        ])
         
-        # Apply weight initialization
+        for _ in range(6):
+            layers.extend([
+                nn.Linear(hidden, hidden),
+                nn.BatchNorm1d(hidden),
+                nn.ReLU(),
+                nn.Dropout(0.2)
+            ])
+            
+        layers.extend([
+            nn.Linear(hidden, hidden // 2),
+            nn.BatchNorm1d(hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden // 2, n_classes)
+        ])
+        
+        self.net = nn.Sequential(*layers)
         self._init_weights()
     
     def _init_weights(self):
@@ -60,17 +67,14 @@ class CurveClassifierMLP(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-
 class CurveClassifierCNN(nn.Module):
     """1D CNN that operates on the raw curve portion of features."""
     
     def __init__(self, n_classes: int = 9, n_features: int = 398, curve_dim: int = 128):
         super().__init__()
         
-        # Dynamically determine curve dimension (use min of curve_dim and n_features)
         self.curve_dim = min(curve_dim, n_features)
         
-        # CNN for raw curve (first curve_dim features)
         self.conv = nn.Sequential(
             nn.Conv1d(1, 32, kernel_size=7, padding=3),
             nn.ReLU(),
@@ -85,7 +89,6 @@ class CurveClassifierCNN(nn.Module):
             nn.AdaptiveAvgPool1d(4),
         )
         
-        # MLP for other features (FFT, derivatives, stats)
         other_dim = max(1, n_features - self.curve_dim)
         self.other_mlp = nn.Sequential(
             nn.Linear(other_dim, 128),
@@ -93,7 +96,6 @@ class CurveClassifierCNN(nn.Module):
             nn.Dropout(0.3),
         )
         
-        # Combined classifier
         self.classifier = nn.Sequential(
             nn.Linear(128 * 4 + 128, 256),
             nn.ReLU(),
@@ -101,7 +103,6 @@ class CurveClassifierCNN(nn.Module):
             nn.Linear(256, n_classes),
         )
         
-        # Apply weight initialization
         self._init_weights()
     
     def _init_weights(self):
@@ -113,39 +114,76 @@ class CurveClassifierCNN(nn.Module):
                     nn.init.zeros_(m.bias)
     
     def forward(self, x):
-        # Split features using dynamic curve dimension
         raw_curve = x[:, :self.curve_dim]
         other_features = x[:, self.curve_dim:]
         
-        # CNN path
-        raw_curve = raw_curve.unsqueeze(1)  # (batch, 1, curve_dim)
-        conv_out = self.conv(raw_curve)     # (batch, 128, 4)
-        conv_out = conv_out.flatten(1)      # (batch, 512)
+        raw_curve = raw_curve.unsqueeze(1)
+        conv_out = self.conv(raw_curve)
+        conv_out = conv_out.flatten(1)
         
-        # MLP path
-        other_out = self.other_mlp(other_features)  # (batch, 128)
+        other_out = self.other_mlp(other_features)
         
-        # Combine
         combined = torch.cat([conv_out, other_out], dim=1)
         return self.classifier(combined)
+
+
+class CrossFeatureAttention(nn.Module):
+    def __init__(self, n_features: int, n_tokens: int = 8, embed_dim: int = 128):
+        super().__init__()
+        self.n_tokens = n_tokens
+        self.embed_dim = embed_dim
+        
+        # Project raw features into a sequence of tokens
+        self.feature_to_tokens = nn.Linear(n_features, n_tokens * embed_dim)
+        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=4, batch_first=True)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Linear(embed_dim * 4, embed_dim)
+        )
+        
+    def forward(self, x):
+        # x: (batch, n_features)
+        tokens = self.feature_to_tokens(x).view(x.size(0), self.n_tokens, self.embed_dim)
+        
+        # Self-attention over the tokens
+        attn_out, _ = self.attention(tokens, tokens, tokens)
+        tokens = self.norm1(tokens + attn_out)
+        
+        # FFN
+        ffn_out = self.ffn(tokens)
+        tokens = self.norm2(tokens + ffn_out)
+        
+        return tokens.flatten(1)
 
 
 class CurveClassifierGLU(nn.Module):
     """
     First-Principles Mathematical Classifier using Gated Linear Units (GLU).
     Mathematically models multiplicative function composition (e.g. x * sin(x)) natively.
-    Replaces both the redundant CNN and deep ReLU MLPs with a cache-contiguous 2-layer network.
     """
     def __init__(self, n_features: int = 398, n_classes: int = 9, hidden: int = 512):
         super().__init__()
         
-        # A GLU layer splits its output in half along dim=1. 
-        # To maintain a 'hidden' dimension size, we project to hidden * 2.
-        self.fc1 = nn.Linear(n_features, hidden * 2)
+        n_tokens = 8
+        embed_dim = 128
+        self.attn = CrossFeatureAttention(n_features, n_tokens=n_tokens, embed_dim=embed_dim)
+        
+        attn_out_dim = n_tokens * embed_dim
+        
+        self.fc1 = nn.Linear(attn_out_dim, hidden * 2)
         self.bn1 = nn.BatchNorm1d(hidden * 2)
         
         self.fc2 = nn.Linear(hidden, hidden * 2)
         self.bn2 = nn.BatchNorm1d(hidden * 2)
+        
+        self.fc3 = nn.Linear(hidden, hidden * 2)
+        self.bn3 = nn.BatchNorm1d(hidden * 2)
+        
+        self.fc4 = nn.Linear(hidden, hidden * 2)
+        self.bn4 = nn.BatchNorm1d(hidden * 2)
         
         self.classifier = nn.Linear(hidden, n_classes)
         self.dropout = nn.Dropout(0.2)
@@ -156,51 +194,92 @@ class CurveClassifierGLU(nn.Module):
         """Hardware-sympathetic initialization for multiplicative gating."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                # Xavier initialization optimizes variance for the linear path
                 nn.init.xavier_normal_(m.weight)
                 if m.bias is not None:
-                    # Initialize biases slightly positive so the sigmoid gate starts "open"
                     nn.init.constant_(m.bias, 0.1)
                     
     def forward(self, x):
-        # Layer 1: Invariants and FFT multi-hot gate the raw derivatives
-        # Mathematically computes: (xW_1 + b_1) ⊗ σ(xW_2 + b_2)
+        x = self.attn(x)
+        
         x = self.fc1(x)
         x = self.bn1(x)
         x = F.glu(x, dim=1)
         x = self.dropout(x)
         
-        # Layer 2: Higher-order multiplicative compositions (e.g. power * exp * trig)
         x = self.fc2(x)
         x = self.bn2(x)
         x = F.glu(x, dim=1)
         x = self.dropout(x)
         
-        # Linear projection to class logits
+        x = self.fc3(x)
+        x = self.bn3(x)
+        x = F.glu(x, dim=1)
+        x = self.dropout(x)
+        
+        x = self.fc4(x)
+        x = self.bn4(x)
+        x = F.glu(x, dim=1)
+        x = self.dropout(x)
+        
         return self.classifier(x)
 
 
 class IndexedFeatureDataset(Dataset):
-    """Dataset view over feature/label arrays using explicit indices."""
+    """Dataset view over feature/label arrays using explicit indices.
+    Supports pre-loading entire dataset into RAM or VRAM for maximum throughput.
+    """
 
     def __init__(
         self,
-        features: np.ndarray,
-        labels: np.ndarray,
+        features: np.ndarray | torch.Tensor,
+        labels: np.ndarray | torch.Tensor,
         indices: np.ndarray,
         scaler: Optional[dict] = None,
+        device: Optional[torch.device] = None,
     ):
-        self.features = features
-        self.labels = labels
         self.indices = np.asarray(indices, dtype=np.int64)
         self.scaler = scaler
+
+        # Determine if data is already on target device
+        self.is_on_device = False
+
+        if device is not None and device.type == 'cuda':
+            print(f"Transferring dataset split to {device}...")
+            # We slice the required features/labels first to save memory before moving to GPU
+            x_sliced = np.asarray(features[self.indices], dtype=np.float32)
+
+            # Apply SymLog compression selectively to non-raw/fft features
+            x_sliced[:, 192:398] = np.sign(x_sliced[:, 192:398]) * np.log1p(np.abs(x_sliced[:, 192:398]))
+            if self.scaler is not None:
+                x_sliced = (x_sliced - self.scaler['mean']) / (self.scaler['std'] + 1e-8)
+            y_sliced = np.asarray(labels[self.indices], dtype=np.float32)
+
+            # Store directly as tensors on device. Reset indices mapping since we sliced.
+            self.features = torch.from_numpy(x_sliced).to(device)
+            self.labels = torch.from_numpy(y_sliced).to(device)
+            # Re-map indices to 0...N since we stored the sliced array
+            self.indices = np.arange(len(self.indices), dtype=np.int64)
+            self.is_on_device = True
+        else:
+            self.features = features
+            self.labels = labels
 
     def __len__(self) -> int:
         return len(self.indices)
 
     def __getitem__(self, idx: int):
         sample_idx = int(self.indices[idx])
+
+        if self.is_on_device:
+            # Zero-copy, already scaled and on GPU
+            return self.features[sample_idx], self.labels[sample_idx]
+
+        # CPU/Memmap path
         x = np.asarray(self.features[sample_idx], dtype=np.float32)
+
+        # Apply SymLog compression selectively to non-raw/fft features
+        x[192:398] = np.sign(x[192:398]) * np.log1p(np.abs(x[192:398]))
+
         if self.scaler is not None:
             x = (x - self.scaler['mean']) / (self.scaler['std'] + 1e-8)
         y = np.asarray(self.labels[sample_idx], dtype=np.float32)
@@ -225,6 +304,10 @@ def compute_feature_stats(
     for start in range(0, len(indices), chunk_size):
         batch_idx = indices[start:start + chunk_size]
         batch = np.asarray(features[batch_idx], dtype=np.float64)
+
+        # Apply SymLog compression selectively to non-raw/fft features
+        batch[:, 192:398] = np.sign(batch[:, 192:398]) * np.log1p(np.abs(batch[:, 192:398]))
+
         sum_x += batch.sum(axis=0)
         sum_x2 += np.square(batch).sum(axis=0)
         total_count += batch.shape[0]
@@ -234,36 +317,82 @@ def compute_feature_stats(
     var = np.maximum(var, 0.0)
     std = np.sqrt(var) + 1e-8
     return mean.astype(np.float32), std.astype(np.float32)
-
-
 # =============================================================================
 # TRAINING
 # =============================================================================
 
-def train_epoch(model, dataloader, optimizer, criterion, device, max_grad_norm: float = 1.0):
-    """Train for one epoch with gradient clipping."""
+def train_epoch(model, dataloader, optimizer, criterion, device, scaler, max_grad_norm: float = 1.0):
+    """Train for one epoch with gradient clipping and AMP scaling."""
     model.train()
-    total_loss = 0
+    
+    # Fast-path for VRAM-resident datasets (Bypasses Python DataLoader overhead)
+    ds = dataloader.dataset
+    if hasattr(ds, "is_on_device") and ds.is_on_device and device.type == 'cuda':
+        total_loss = torch.zeros(1, device=device)
+        n_samples = len(ds)
+        batch_size = dataloader.batch_size
+        
+        # Fast GPU-side shuffle
+        indices = torch.randperm(n_samples, device=device)
+        
+        for start_idx in range(0, n_samples, batch_size):
+            end_idx = min(start_idx + batch_size, n_samples)
+            batch_idx = indices[start_idx:end_idx]
+            
+            x_batch = ds.features[batch_idx]
+            y_batch = ds.labels[batch_idx]
+            
+            optimizer.zero_grad(set_to_none=True)
+            
+            # No AMP - Use FP32 for precision
+            logits = model(x_batch)
+            loss = criterion(logits, y_batch)
+                
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                optimizer.step()
+            
+            total_loss += loss.detach() * (end_idx - start_idx)
+            
+        return float((total_loss / max(n_samples, 1)).item())
+
+    # Standard path for RAM/Disk loaded datasets
+    total_loss = torch.zeros(1, device=device)
     n_batches = 0
     
     for x_batch, y_batch in dataloader:
         x_batch = x_batch.to(device, non_blocking=True)
         y_batch = y_batch.to(device, non_blocking=True)
         
-        optimizer.zero_grad()
-        logits = model(x_batch)
-        loss = criterion(logits, y_batch)
-        loss.backward()
+        optimizer.zero_grad(set_to_none=True)
         
-        # Gradient clipping for stability
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+        # No AMP - Use FP32
+        if True:
+            logits = model(x_batch)
+            loss = criterion(logits, y_batch)            
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+            optimizer.step()
         
-        optimizer.step()
-        
-        total_loss += loss.item()
+        # Accumulate without .item() to keep the CPU/GPU working in parallel
+        total_loss += loss.detach()
         n_batches += 1
     
-    return total_loss / n_batches
+    return float((total_loss / max(n_batches, 1)).item())
 
 
 def evaluate(
@@ -278,35 +407,70 @@ def evaluate(
 ):
     """Evaluate model on dataset."""
     model.eval()
-    total_loss = 0
     all_preds = []
     all_labels = []
     all_logits = []
     
-    with torch.no_grad():
-        for x_batch, y_batch in dataloader:
-            x_batch = x_batch.to(device, non_blocking=True)
-            y_batch = y_batch.to(device, non_blocking=True)
-            
-            logits = model(x_batch)
-            loss = criterion(logits, y_batch)
-            
-            total_loss += loss.item()
-            if temperature is None:
-                preds = torch.sigmoid(logits)
-            else:
-                preds = torch.sigmoid(logits / temperature)
+    ds = dataloader.dataset
+    if hasattr(ds, "is_on_device") and ds.is_on_device and device.type == 'cuda':
+        total_loss = 0.0
+        n_samples = len(ds)
+        batch_size = dataloader.batch_size
+        
+        with torch.no_grad():
+            for start_idx in range(0, n_samples, batch_size):
+                end_idx = min(start_idx + batch_size, n_samples)
+                
+                x_batch = ds.features[start_idx:end_idx]
+                y_batch = ds.labels[start_idx:end_idx]
+                
+                # No AMP - Use FP32
+                logits = model(x_batch)
+                loss = criterion(logits, y_batch)
+                    
+                total_loss += loss.item() * (end_idx - start_idx)
+                
+                if temperature is None:
+                    preds = torch.sigmoid(logits)
+                else:
+                    preds = torch.sigmoid(logits / temperature)
 
-            all_preds.append(preds.cpu())
-            all_labels.append(y_batch.cpu())
-            if return_logits:
-                all_logits.append(logits.cpu())
+                all_preds.append(preds.cpu())
+                all_labels.append(y_batch.cpu())
+                if return_logits:
+                    all_logits.append(logits.cpu())
+                    
+        avg_loss = total_loss / max(n_samples, 1)
+    else:
+        total_loss = 0.0
+        total_samples = 0
+        
+        with torch.no_grad():
+            for x_batch, y_batch in dataloader:
+                x_batch = x_batch.to(device, non_blocking=True)
+                y_batch = y_batch.to(device, non_blocking=True)
+                
+                # No AMP - Use FP32
+                if True:
+                    logits = model(x_batch)
+                    loss = criterion(logits, y_batch)                    
+                total_loss += loss.item() * x_batch.shape[0]
+                total_samples += x_batch.shape[0]
+                
+                if temperature is None:
+                    preds = torch.sigmoid(logits)
+                else:
+                    preds = torch.sigmoid(logits / temperature)
+
+                all_preds.append(preds.cpu())
+                all_labels.append(y_batch.cpu())
+                if return_logits:
+                    all_logits.append(logits.cpu())
+                    
+        avg_loss = total_loss / max(total_samples, 1)
     
     all_preds = torch.cat(all_preds)
     all_labels = torch.cat(all_labels)
-    
-    # Metrics
-    avg_loss = total_loss / len(dataloader)
     
     # Per-class accuracy (threshold = 0.5 or tuned thresholds)
     if thresholds is None:
@@ -574,7 +738,7 @@ def train_model(
     class_weights: Optional[torch.Tensor] = None,
 ):
     """Full training loop with early stopping."""
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=5
     )
@@ -585,6 +749,8 @@ def train_model(
         print(f"Using class weights: {class_weights.numpy()}")
     else:
         criterion = nn.BCEWithLogitsLoss()
+        
+    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
     
     best_val_loss = float('inf')
     best_val_f1 = -1.0
@@ -593,7 +759,17 @@ def train_model(
     
     for epoch in range(epochs):
         # Train
-        train_loss = train_epoch(model, train_loader, optimizer, criterion, device)
+        try:
+            train_loss = train_epoch(model, train_loader, optimizer, criterion, device, scaler)
+        except Exception as e:
+            # Handle lazy compilation failures (common on Windows)
+            if "inductor" in str(e).lower() and hasattr(model, "_orig_mod"):
+                print(f"\n[!] torch.compile failed during first forward pass: {e}")
+                print("[!] Falling back to eager mode for the rest of training.")
+                model = model._orig_mod
+                train_loss = train_epoch(model, train_loader, optimizer, criterion, device, scaler)
+            else:
+                raise e
         
         # Evaluate
         val_metrics = evaluate(model, val_loader, criterion, device)
@@ -763,8 +939,8 @@ def main():
                         help="Feature dimension for .dat files (default: 398)")
     parser.add_argument("--n-classes", type=int, default=9,
                         help="Number of classes for .dat files (default: 9)")
-    parser.add_argument("--load-into-ram", action="store_true",
-                        help="Load memmap data into RAM for faster training")
+    parser.add_argument("--load-into-ram", "--load-into-vram", dest="load_into_ram", action="store_true",
+                        help="Load dataset fully into RAM/VRAM for maximum throughput")
     parser.add_argument("--model", type=str, default="glu",
                         choices=["glu", "mlp", "cnn"], help="Model architecture")
     parser.add_argument("--epochs", type=int, default=50,
@@ -803,6 +979,8 @@ def main():
                         help="Calibrate probabilities with temperature scaling")
     parser.add_argument("--class-weights", action="store_true",
                         help="Use inverse frequency class weights for imbalanced labels")
+    parser.add_argument("--compile", action="store_true",
+                        help="Use torch.compile (PyTorch 2.0+) for kernel fusion")
     
     args = parser.parse_args()
 
@@ -822,6 +1000,10 @@ def main():
     else:
         device = torch.device(args.device)
     print(f"Using device: {device}")
+
+    # Enable TF32 for better performance on Ampere+ GPUs
+    if device.type == 'cuda':
+        torch.set_float32_matmul_precision('high')
     
     # Load data
     print(f"Loading data from {args.data}...")
@@ -860,8 +1042,14 @@ def main():
     print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}")
     
     # Data loaders with optimizations and lazy memmap-backed access
-    train_dataset = IndexedFeatureDataset(features, labels, train_idx, scaler=scaler)
-    val_dataset = IndexedFeatureDataset(features, labels, val_idx, scaler=scaler)
+    train_dataset = IndexedFeatureDataset(
+        features, labels, train_idx, scaler=scaler, 
+        device=device if args.load_into_ram else None
+    )
+    val_dataset = IndexedFeatureDataset(
+        features, labels, val_idx, scaler=scaler, 
+        device=device if args.load_into_ram else None
+    )
     
     # Use pin_memory for GPU and num_workers for parallel data loading
     # On Windows, num_workers > 0 often causes deadlocks or hangs.
@@ -931,6 +1119,13 @@ def main():
     model = model.to(device)
     print(f"\nModel: {args.model.upper()}")
     print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    if args.compile and hasattr(torch, "compile"):
+        print("Compiling model with torch.compile...")
+        try:
+            model = torch.compile(model)
+        except Exception as e:
+            print(f"Warning: torch.compile failed ({e}). Falling back to eager mode.")
     
     # Output directory
     output_path = Path(args.output)

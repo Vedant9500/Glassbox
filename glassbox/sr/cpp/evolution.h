@@ -384,7 +384,7 @@ public:
                     child = mutate_lamarckian(child, scheduled_mutation_rate * 0.3);
                 } else {
                     // --- Mutation-only ---
-                    int parent_idx = parent_dist(rng_);
+                    int parent_idx = tournament_select();
                     child = mutate_lamarckian(population_[parent_idx], scheduled_mutation_rate);
                 }
 
@@ -404,7 +404,7 @@ public:
 
             // Fill explorer population
             while (next_gen.size() < config_.pop_size) {
-                 int parent_idx = parent_dist(rng_); // Use elite parents, but mutate more aggressively
+                 int parent_idx = tournament_select(); // Use tournament selection for explorers too
                  double explorer_rate = std::min(1.0, scheduled_mutation_rate * config_.explorer_mutation_multiplier);
                  IndividualGraph explorer;
                  if (coin(rng_) < 0.2) {
@@ -643,6 +643,21 @@ private:
     double first_exact_time_sec_ = -1.0;
     int first_acceptable_generation_ = -1;
     double first_acceptable_time_sec_ = -1.0;
+
+    int tournament_select(int k = 5) {
+        if (population_.empty()) return 0;
+        std::uniform_int_distribution<int> dist(0, static_cast<int>(population_.size()) - 1);
+        int best_idx = dist(rng_);
+        double best_fitness = population_[best_idx].fitness;
+        for (int i = 1; i < k; ++i) {
+            int idx = dist(rng_);
+            if (population_[idx].fitness < best_fitness) {
+                best_idx = idx;
+                best_fitness = population_[idx].fitness;
+            }
+        }
+        return best_idx;
+    }
     double run_wall_time_sec_ = 0.0;
 
     void update_discovery_metrics(int generation, const std::chrono::steady_clock::time_point& start_time) {
@@ -965,6 +980,21 @@ private:
                     double frac_o = node.omega - std::floor(node.omega);
                     double dist_o = std::min(frac_o, 1.0 - frac_o);
                     penalty += dist_o * dist_o;
+
+                    // P8: Anti-Trigonometric Bloat Penalty
+                    // Prevent model from using sin(w*x) to approximate linear x by penalizing w -> 0.
+                    // Also explicitly penalize nested periodic functions (sin(sin(x))).
+                    if (node.unary_op == UnaryOp::Periodic) {
+                        if (std::abs(node.omega) < 0.1) {
+                            penalty += 5.0 * (0.1 - std::abs(node.omega));
+                        }
+                        if (node.left_child >= 0 && node.left_child < graph.nodes.size()) {
+                            const auto& child_node = graph.nodes[node.left_child];
+                            if (child_node.type == NodeType::Unary && child_node.unary_op == UnaryOp::Periodic) {
+                                penalty += 5.0; // High penalty for nested trig functions
+                            }
+                        }
+                    }
                 }
                 // P2: Arithmetic entropy penalty — push soft binary ops toward discrete
                 // selection. Lower entropy = more committed to one operation.
@@ -985,14 +1015,36 @@ private:
         for (size_t i = 0; i < graph.nodes.size() && i < graph.output_weights.size(); ++i) {
             if (std::abs(graph.output_weights[i]) > 1e-4) active_nodes++;
         }
-        double complexity_penalty = 5e-3 * active_nodes + 1e-4 * graph.nodes.size();
+        
+        // Scale-invariant parsimony: Complexity penalty is a multiplier on MSE.
+        // A graph must improve MSE by ~0.5% per active node to justify its existence.
+        double complexity_penalty_factor = 5e-3 * active_nodes + 1e-4 * graph.nodes.size();
 
         // Relax penalty if we have discovered an exact physical law
         if (mse < 1e-6) {
-            complexity_penalty *= 1e-4;
+            complexity_penalty_factor *= 1e-4;
         }
 
-        graph.fitness = mse + complexity_penalty + config_.round_penalty_weight * penalty / std::max(1.0, (double)graph.nodes.size());
+        // Apply multiplicative complexity penalty to guarantee scale invariance
+        graph.fitness = mse * (1.0 + complexity_penalty_factor) + config_.round_penalty_weight * penalty / std::max(1.0, (double)graph.nodes.size());
+
+        // P8: Hard Anti-Trigonometric Bloat Penalty
+        // Prevent model from using sin(w*x) to approximate linear x by penalizing w -> 0.
+        // Also explicitly penalize nested periodic functions (sin(sin(x))).
+        for (const auto& node : graph.nodes) {
+            if (node.type == NodeType::Unary && node.unary_op == UnaryOp::Periodic) {
+                if (std::abs(node.omega) < 0.1) {
+                    graph.fitness += 100.0; // Hard ban on taylor expansions
+                }
+                if (node.left_child >= 0 && node.left_child < graph.nodes.size()) {
+                    const auto& child_node = graph.nodes[node.left_child];
+                    if (child_node.type == NodeType::Unary && child_node.unary_op == UnaryOp::Periodic) {
+                        graph.fitness += 100.0; // Hard ban on nested trig functions
+                    }
+                }
+            }
+        }
+
         // P7: Dimensional analysis penalty (only active when input_units provided)
         if (!config_.input_units.empty()) {
             graph.fitness += config_.dim_penalty_weight * dimensional_penalty(graph);
@@ -2710,7 +2762,6 @@ private:
         }
 
         double current_structural_mutation_rate = config_.mutation_rate_structural;
-        std::uniform_int_distribution<int> parent_dist(0, std::max(0, config_.elite_size - 1));
         std::uniform_real_distribution<double> coin(0.0, 1.0);
 
         int num_explorers = static_cast<int>(config_.pop_size * config_.explorer_fraction);
@@ -2719,13 +2770,13 @@ private:
         while (static_cast<int>(next_gen.size()) < main_pop_target) {
             IndividualGraph child;
             if (config_.elite_size >= 2 && coin(rng_) < config_.crossover_rate) {
-                int p1 = parent_dist(rng_);
-                int p2 = parent_dist(rng_);
-                while (p2 == p1) p2 = parent_dist(rng_);
+                int p1 = tournament_select();
+                int p2 = tournament_select();
+                while (p2 == p1) p2 = tournament_select();
                 child = crossover_with_retry(population_[p1], population_[p2], 3);
                 child = mutate_lamarckian(child, current_structural_mutation_rate * 0.3);
             } else {
-                int parent_idx = parent_dist(rng_);
+                int parent_idx = tournament_select();
                 child = mutate_lamarckian(population_[parent_idx], current_structural_mutation_rate);
             }
             if (gen % 5 == 0) {
@@ -2737,7 +2788,7 @@ private:
         }
 
         while (static_cast<int>(next_gen.size()) < config_.pop_size) {
-            int parent_idx = parent_dist(rng_);
+            int parent_idx = tournament_select();
             double explorer_rate = std::min(1.0, current_structural_mutation_rate * config_.explorer_mutation_multiplier);
             IndividualGraph explorer = mutate_lamarckian(population_[parent_idx], explorer_rate);
             evaluate_fitness_with_penalty(explorer, X_, y_, static_cast<int>(y_.size()));

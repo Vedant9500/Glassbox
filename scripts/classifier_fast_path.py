@@ -259,7 +259,21 @@ def _compile_formula_evaluator(normalized_formula: str) -> Tuple[Tuple[str, ...]
     )
 
     transformations = standard_transformations + (convert_xor, implicit_multiplication_application)
-    expr = parse_expr(normalized_formula, transformations=transformations, evaluate=False)
+    local_dict = {
+        "Piecewise": sp.Piecewise,
+        "Eq": sp.Eq,
+        "Abs": sp.Abs,
+        "sign": sp.sign,
+        "sin": sp.sin,
+        "cos": sp.cos,
+        "tan": sp.tan,
+        "exp": sp.exp,
+        "log": sp.log,
+        "sqrt": sp.sqrt,
+        "pi": sp.pi,
+        "E": sp.E
+    }
+    expr = parse_expr(normalized_formula, local_dict=local_dict, transformations=transformations, evaluate=False)
     free_syms = sorted(expr.free_symbols, key=lambda sym: sym.name)
 
     if not free_syms:
