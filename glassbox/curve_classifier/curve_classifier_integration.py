@@ -118,22 +118,63 @@ class CurveClassifierCNN(nn.Module):
         return self.classifier(combined)
 
 
+class CrossFeatureAttention(nn.Module):
+    def __init__(self, n_features: int, n_tokens: int = 8, embed_dim: int = 128):
+        super().__init__()
+        self.n_tokens = n_tokens
+        self.embed_dim = embed_dim
+        
+        # Project raw features into a sequence of tokens
+        self.feature_to_tokens = nn.Linear(n_features, n_tokens * embed_dim)
+        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=4, batch_first=True)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Linear(embed_dim * 4, embed_dim)
+        )
+        
+    def forward(self, x):
+        # x: (batch, n_features)
+        tokens = self.feature_to_tokens(x).view(x.size(0), self.n_tokens, self.embed_dim)
+        
+        # Self-attention over the tokens
+        attn_out, _ = self.attention(tokens, tokens, tokens)
+        tokens = self.norm1(tokens + attn_out)
+        
+        # FFN
+        ffn_out = self.ffn(tokens)
+        tokens = self.norm2(tokens + ffn_out)
+        
+        return tokens.flatten(1)
+
+
 class CurveClassifierGLU(nn.Module):
     """
     First-Principles Mathematical Classifier using Gated Linear Units (GLU).
     Mathematically models multiplicative function composition (e.g. x * sin(x)) natively.
-    Replaces both the redundant CNN and deep ReLU MLPs with a cache-contiguous 2-layer network.
     """
     def __init__(self, n_features: int = 398, n_classes: int = 9, hidden: int = 512):
         super().__init__()
         
-        # A GLU layer splits its output in half along dim=1. 
-        # To maintain a 'hidden' dimension size, we project to hidden * 2.
-        self.fc1 = nn.Linear(n_features, hidden * 2)
+        n_tokens = 8
+        embed_dim = 128
+        self.attn = CrossFeatureAttention(n_features, n_tokens=n_tokens, embed_dim=embed_dim)
+        
+        attn_out_dim = n_tokens * embed_dim
+        
+        self.fc1 = nn.Linear(attn_out_dim, hidden * 2)
         self.bn1 = nn.BatchNorm1d(hidden * 2)
         
         self.fc2 = nn.Linear(hidden, hidden * 2)
         self.bn2 = nn.BatchNorm1d(hidden * 2)
+        
+        self.fc3 = nn.Linear(hidden, hidden * 2)
+        self.bn3 = nn.BatchNorm1d(hidden * 2)
+        
+        self.fc4 = nn.Linear(hidden, hidden * 2)
+        self.bn4 = nn.BatchNorm1d(hidden * 2)
         
         self.classifier = nn.Linear(hidden, n_classes)
         self.dropout = nn.Dropout(0.2)
@@ -144,27 +185,33 @@ class CurveClassifierGLU(nn.Module):
         """Hardware-sympathetic initialization for multiplicative gating."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                # Xavier initialization optimizes variance for the linear path
                 nn.init.xavier_normal_(m.weight)
                 if m.bias is not None:
-                    # Initialize biases slightly positive so the sigmoid gate starts "open"
                     nn.init.constant_(m.bias, 0.1)
                     
     def forward(self, x):
-        # Layer 1: Invariants and FFT multi-hot gate the raw derivatives
-        # Mathematically computes: (xW_1 + b_1) ⊗ σ(xW_2 + b_2)
+        x = self.attn(x)
+        
         x = self.fc1(x)
         x = self.bn1(x)
         x = F.glu(x, dim=1)
         x = self.dropout(x)
         
-        # Layer 2: Higher-order multiplicative compositions (e.g. power * exp * trig)
         x = self.fc2(x)
         x = self.bn2(x)
         x = F.glu(x, dim=1)
         x = self.dropout(x)
         
-        # Linear projection to class logits
+        x = self.fc3(x)
+        x = self.bn3(x)
+        x = F.glu(x, dim=1)
+        x = self.dropout(x)
+        
+        x = self.fc4(x)
+        x = self.bn4(x)
+        x = F.glu(x, dim=1)
+        x = self.dropout(x)
+        
         return self.classifier(x)
 
 
@@ -643,6 +690,10 @@ def _predict_operators_multi_input(
         # Extract features and predict
         try:
             features = extract_all_features(y_slice_valid)
+            
+            # Apply SymLog compression selectively to non-raw/fft features
+            features[192:398] = np.sign(features[192:398]) * np.log1p(np.abs(features[192:398]))
+            
             if scaler is not None:
                 dim = len(scaler['mean'])
                 features = features[:dim]
