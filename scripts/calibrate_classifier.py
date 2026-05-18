@@ -27,13 +27,14 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_REPO_ROOT / 'scripts'))
 
-from train_curve_classifier import (
+from glassbox.curve_classifier.train_curve_classifier import (
     calibrate_isotonic_per_class,
     tune_thresholds,
     CurveClassifierMLP,
     CurveClassifierCNN,
-    IndexedFeatureDataset,
     evaluate,
+    CurveClassifierGLU,
+    apply_isotonic_calibration,
 )
 from glassbox.curve_classifier.generate_curve_data import OPERATOR_CLASSES
 
@@ -77,6 +78,15 @@ def load_calibration_data(
     val_labels = labels[val_indices]
     
     return val_features, val_labels
+
+
+def apply_curve_feature_transform(features: np.ndarray) -> np.ndarray:
+    """Match training-time feature preprocessing before scaling."""
+    features = np.array(features, dtype=np.float32, copy=True)
+    end = min(features.shape[1], 398)
+    if end > 192:
+        features[:, 192:end] = np.sign(features[:, 192:end]) * np.log1p(np.abs(features[:, 192:end]))
+    return features
 
 
 def calibrate_existing_model(
@@ -134,6 +144,11 @@ def calibrate_existing_model(
             n_features=n_features,
             curve_dim=curve_dim,
         )
+    elif model_type == 'glu':
+        input_weights = state_dict['fc1.weight']
+        n_features = int(model_config.get('n_features', val_features.shape[1]))
+        hidden_size = int(model_config.get('hidden', input_weights.shape[0] // 2))
+        model = CurveClassifierGLU(n_features=n_features, n_classes=n_classes, hidden=hidden_size)
     else:
         input_weights = state_dict['net.0.weight']
         n_features = int(model_config.get('n_features', input_weights.shape[1]))
@@ -145,15 +160,16 @@ def calibrate_existing_model(
     model.eval()
     
     # Standardize features if scaler exists
+    val_features = apply_curve_feature_transform(val_features)
     scaler = checkpoint.get('feature_scaler')
     if scaler is not None:
         val_features = (val_features - scaler['mean']) / (scaler['std'] + 1e-8)
     
-    # Create DataLoader for evaluation
-    val_dataset = IndexedFeatureDataset(
-        val_features, val_labels,
-        indices=np.arange(len(val_features)),
-        scaler=None,  # Already standardized
+    # Create DataLoader for evaluation. Do not use IndexedFeatureDataset here:
+    # val_features have already been transformed and standardized above.
+    val_dataset = torch.utils.data.TensorDataset(
+        torch.from_numpy(np.asarray(val_features, dtype=np.float32)),
+        torch.from_numpy(np.asarray(val_labels, dtype=np.float32)),
     )
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=1024, shuffle=False, num_workers=0
@@ -213,7 +229,6 @@ def calibrate_existing_model(
     raw_probs = torch.sigmoid(all_logits / temperature if temperature else all_logits).numpy()
     
     # Apply calibration manually for evaluation
-    from train_curve_classifier import apply_isotonic_calibration
     calibrated_probs = apply_isotonic_calibration(raw_probs, isotonic_maps)
     
     # Compute calibrated metrics

@@ -39,6 +39,12 @@ except (ImportError, ValueError):
 
 
 DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_wide.pt"
+PYTORCH_CLASSIFIER_FALLBACKS = (
+    "models/curve_classifier_mlp_eql.pt",
+    "models/curve_classfier_v4.pt",
+    "models/curve_classifier_wider.pt",
+    "models/curve_classifier.pt",
+)
 
 
 # =============================================================================
@@ -46,30 +52,46 @@ DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_wide.pt"
 # =============================================================================
 
 class CurveClassifierMLP(nn.Module):
-    """Simple MLP classifier for curve features."""
+    """Deep MLP classifier for curve features."""
     
     def __init__(self, n_features: int = 398, n_classes: int = 9, hidden: int = 512):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_features, hidden),
+        
+        eql_out_dim = 256
+        self.eql = EQLLayer(in_features=n_features, out_features=eql_out_dim)
+        
+        layers = []
+        combined_dim = n_features + eql_out_dim
+        
+        layers.extend([
+            nn.Linear(combined_dim, hidden),
             nn.BatchNorm1d(hidden),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.2)
+        ])
+        
+        for _ in range(6):
+            layers.extend([
+                nn.Linear(hidden, hidden),
+                nn.BatchNorm1d(hidden),
+                nn.ReLU(),
+                nn.Dropout(0.2)
+            ])
             
-            nn.Linear(hidden, hidden),
-            nn.BatchNorm1d(hidden),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            
+        layers.extend([
             nn.Linear(hidden, hidden // 2),
+            nn.BatchNorm1d(hidden // 2),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            
-            nn.Linear(hidden // 2, n_classes),
-        )
+            nn.Dropout(0.1),
+            nn.Linear(hidden // 2, n_classes)
+        ])
+        
+        self.net = nn.Sequential(*layers)
     
     def forward(self, x):
-        return self.net(x)
+        eql_feats = self.eql(x)
+        combined = torch.cat([x, eql_feats], dim=1)
+        return self.net(combined)
 
 
 class CurveClassifierCNN(nn.Module):
@@ -118,28 +140,90 @@ class CurveClassifierCNN(nn.Module):
         return self.classifier(combined)
 
 
-class CrossFeatureAttention(nn.Module):
-    def __init__(self, n_features: int, n_tokens: int = 8, embed_dim: int = 128):
+class SemanticFeatureAttention(nn.Module):
+    """
+    Semantic Attention that treats each feature group as a distinct token.
+    Allows the model to attend across different modalities (FFT, derivatives, stats, etc.).
+    """
+    def __init__(self, embed_dim: int = 128):
         super().__init__()
-        self.n_tokens = n_tokens
         self.embed_dim = embed_dim
         
-        # Project raw features into a sequence of tokens
-        self.feature_to_tokens = nn.Linear(n_features, n_tokens * embed_dim)
+        # Project each semantic group independently
+        self.proj_raw = nn.Linear(128, embed_dim)
+        self.proj_fft = nn.Linear(32, embed_dim)
+        self.proj_fft_phase = nn.Linear(32, embed_dim)
+        self.proj_deriv = nn.Linear(128, embed_dim)
+        self.proj_stats = nn.Linear(9, embed_dim)
+        self.proj_curv = nn.Linear(37, embed_dim)
+        self.proj_invars = nn.Linear(32, embed_dim)
+        
+        # 7 feature tokens + 1 CLS token
+        self.n_tokens = 8 
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        
+        # Token type embeddings (tells attention which modality is which)
+        self.token_type_embed = nn.Parameter(torch.randn(1, self.n_tokens, embed_dim) * 0.02)
+        
         self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=4, batch_first=True)
         self.norm1 = nn.LayerNorm(embed_dim)
         self.norm2 = nn.LayerNorm(embed_dim)
         self.ffn = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 4),
             nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(embed_dim * 4, embed_dim)
         )
+        self.dropout = nn.Dropout(0.1)
         
+        self._init_weights()
+        
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        nn.init.normal_(self.cls_token, std=0.02)
+
     def forward(self, x):
-        # x: (batch, n_features)
-        tokens = self.feature_to_tokens(x).view(x.size(0), self.n_tokens, self.embed_dim)
+        b = x.size(0)
         
-        # Self-attention over the tokens
+        # Slice based on FEATURE_SCHEMA from generate_curve_data.py
+        # Fallbacks added in case feature dimension doesn't perfectly match
+        raw = x[:, 0:128]
+        fft = x[:, 128:160]
+        fft_phase = x[:, 160:192]
+        deriv = x[:, 192:320]
+        stats = x[:, 320:329]
+        curv = x[:, 329:366]
+        
+        # Handle cases where feature dimension might be slightly different
+        if x.shape[1] > 366:
+            invars = x[:, 366:398]
+        else:
+            invars = torch.zeros(b, 32, device=x.device, dtype=x.dtype)
+            
+        # Create tokens
+        t_raw = self.proj_raw(raw).unsqueeze(1)
+        t_fft = self.proj_fft(fft).unsqueeze(1)
+        t_fft_phase = self.proj_fft_phase(fft_phase).unsqueeze(1)
+        t_deriv = self.proj_deriv(deriv).unsqueeze(1)
+        t_stats = self.proj_stats(stats).unsqueeze(1)
+        t_curv = self.proj_curv(curv).unsqueeze(1)
+        t_invars = self.proj_invars(invars).unsqueeze(1)
+        
+        cls_tokens = self.cls_token.expand(b, -1, -1)
+        
+        # Sequence of 8 tokens
+        tokens = torch.cat([
+            cls_tokens, t_raw, t_fft, t_fft_phase, t_deriv, t_stats, t_curv, t_invars
+        ], dim=1)
+        
+        tokens = tokens + self.token_type_embed
+        tokens = self.dropout(tokens)
+        
+        # Attention
         attn_out, _ = self.attention(tokens, tokens, tokens)
         tokens = self.norm1(tokens + attn_out)
         
@@ -147,7 +231,63 @@ class CrossFeatureAttention(nn.Module):
         ffn_out = self.ffn(tokens)
         tokens = self.norm2(tokens + ffn_out)
         
+        # Flatten all tokens to maintain the 1024-dim output expected
         return tokens.flatten(1)
+
+
+class EQLLayer(nn.Module):
+    """
+    Equation Learner (EQL) Layer.
+    Applies explicit mathematical transformations to the input to act as a 
+    'cheat sheet' for the network to detect mathematical operators.
+    """
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        
+        # 6 explicit mathematical functions
+        self.n_funcs = 6
+        self.features_per_func = out_features // self.n_funcs
+        self.rem_features = out_features % self.n_funcs
+        
+        # Project input features to the space where functions will be applied
+        self.linear = nn.Linear(in_features, out_features)
+        
+        # Initialize weights to be small to prevent extreme values going into exp/log early on
+        nn.init.xavier_normal_(self.linear.weight, gain=0.1)
+        nn.init.zeros_(self.linear.bias)
+
+    def forward(self, x):
+        z = self.linear(x)
+        
+        out = []
+        start_idx = 0
+        
+        for i in range(self.n_funcs):
+            end_idx = start_idx + self.features_per_func + (self.rem_features if i == 0 else 0)
+            chunk = z[:, start_idx:end_idx]
+            
+            if i == 0:
+                # Identity
+                out.append(chunk)
+            elif i == 1:
+                # Sin
+                out.append(torch.sin(chunk))
+            elif i == 2:
+                # Cos
+                out.append(torch.cos(chunk))
+            elif i == 3:
+                # Exp (clamped to prevent inf/nan and massive BN shifts)
+                out.append(torch.exp(torch.clamp(chunk, min=-5.0, max=5.0)))
+            elif i == 4:
+                # Log (safe log)
+                out.append(torch.log(torch.abs(chunk) + 1e-6))
+            elif i == 5:
+                # Square
+                out.append(torch.square(chunk))
+                
+            start_idx = end_idx
+            
+        return torch.cat(out, dim=1)
 
 
 class CurveClassifierGLU(nn.Module):
@@ -158,13 +298,20 @@ class CurveClassifierGLU(nn.Module):
     def __init__(self, n_features: int = 398, n_classes: int = 9, hidden: int = 512):
         super().__init__()
         
+        # 1. Semantic Feature Attention
         n_tokens = 8
         embed_dim = 128
-        self.attn = CrossFeatureAttention(n_features, n_tokens=n_tokens, embed_dim=embed_dim)
-        
+        self.attn = SemanticFeatureAttention(embed_dim=embed_dim)
         attn_out_dim = n_tokens * embed_dim
         
-        self.fc1 = nn.Linear(attn_out_dim, hidden * 2)
+        # 2. EQL Layer
+        eql_out_dim = 256
+        self.eql = EQLLayer(in_features=n_features, out_features=eql_out_dim)
+        
+        # 3. Combine outputs
+        combined_dim = attn_out_dim + eql_out_dim
+        
+        self.fc1 = nn.Linear(combined_dim, hidden * 2)
         self.bn1 = nn.BatchNorm1d(hidden * 2)
         
         self.fc2 = nn.Linear(hidden, hidden * 2)
@@ -190,7 +337,14 @@ class CurveClassifierGLU(nn.Module):
                     nn.init.constant_(m.bias, 0.1)
                     
     def forward(self, x):
-        x = self.attn(x)
+        # Extract abstract semantic tokens
+        attn_features = self.attn(x)
+        
+        # Extract explicit mathematical transformations
+        eql_features = self.eql(x)
+        
+        # Combine
+        x = torch.cat([attn_features, eql_features], dim=1)
         
         x = self.fc1(x)
         x = self.bn1(x)
@@ -245,6 +399,24 @@ def _make_cache_key(model_path: str, resolved_device: torch.device) -> str:
     return f"{str(resolved_device)}:{str(Path(model_path).resolve())}"
 
 
+def _resolve_model_path(model_path: str) -> Path:
+    model_path_obj = Path(model_path)
+    if model_path_obj.exists():
+        return model_path_obj
+
+    if model_path == DEFAULT_CURVE_CLASSIFIER_PATH:
+        for candidate in PYTORCH_CLASSIFIER_FALLBACKS:
+            candidate_path = Path(candidate)
+            if candidate_path.exists():
+                print(
+                    f"Curve classifier model not found at {model_path}; "
+                    f"using {candidate_path} instead."
+                )
+                return candidate_path
+
+    raise FileNotFoundError(f"Classifier model not found at {model_path}")
+
+
 def load_classifier(
     model_path: str = DEFAULT_CURVE_CLASSIFIER_PATH,
     device: Optional[str] = None,
@@ -253,15 +425,11 @@ def load_classifier(
     global _cached_classifier_by_device
     
     resolved_device = _resolve_device(device)
+    model_path_obj = _resolve_model_path(model_path)
     # Create cache key using both device and absolute model path
-    cache_key = _make_cache_key(model_path, resolved_device)
+    cache_key = _make_cache_key(str(model_path_obj), resolved_device)
     if cache_key in _cached_classifier_by_device:
         return _cached_classifier_by_device[cache_key]
-    
-    model_path_obj = Path(model_path)
-    if not model_path_obj.exists():
-        # Clean failure if model not found
-        raise FileNotFoundError(f"Classifier model not found at {model_path}")
     
     # Check file extension to determine model type
     if model_path_obj.suffix in ('.pkl', '.joblib'):
@@ -483,8 +651,11 @@ def predict_operators(
     """
     # Check if model exists before trying to load
     if not Path(model_path).exists():
-        print(f"Warning: Curve classifier model not found at {model_path}. Skipping prediction.")
-        return {}
+        try:
+            model_path = str(_resolve_model_path(model_path))
+        except FileNotFoundError:
+            print(f"Warning: Curve classifier model not found at {model_path}. Skipping prediction.")
+            return {}
 
     # Load classifier
     try:
@@ -495,7 +666,7 @@ def predict_operators(
     
     # Get cache key for metadata lookup
     resolved_device = _resolve_device(device)
-    cache_key = _make_cache_key(model_path, resolved_device)
+    cache_key = _make_cache_key(str(_resolve_model_path(model_path)), resolved_device)
     metadata = _cached_metadata_by_device.get(cache_key, {})
     
     # Detect multi-input
@@ -516,6 +687,10 @@ def predict_operators(
     
     # Single-input: standard prediction
     features = extract_all_features(y)
+    # Match IndexedFeatureDataset/compute_feature_stats preprocessing from
+    # training. Without this, scaler statistics are applied to uncompressed
+    # derivative/curvature/invariant features at inference time.
+    features[192:398] = np.sign(features[192:398]) * np.log1p(np.abs(features[192:398]))
     scaler = metadata.get('feature_scaler')
     if scaler is not None:
         dim = len(scaler['mean'])

@@ -15,30 +15,60 @@ from sklearn.metrics import f1_score
 from glassbox.curve_classifier.generate_curve_data import (
     extract_all_features, generate_dataset, ALL_TEMPLATES, OPERATOR_CLASSES
 )
-from glassbox.curve_classifier.curve_classifier_integration import CurveClassifierGLU
+from glassbox.curve_classifier.curve_classifier_integration import CurveClassifierGLU, CurveClassifierMLP
+
+DEFAULT_MODEL_CANDIDATES = [
+    "models/curve_classifier_wide.pt",
+    "models/curve_classifier_mlp_eql.pt",
+    "models/curve_classfier_v4.pt",
+    "models/curve_classifier_wider.pt",
+    "models/curve_classifier.pt",
+]
 
 
 def load_model(path):
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
-    model = CurveClassifierGLU(
-        n_features=ckpt['model_config']['n_features'],
-        n_classes=ckpt['model_config']['n_classes'],
-        hidden=ckpt['model_config']['hidden']
+    config = ckpt['model_config']
+    model_type = ckpt.get('model_type', 'glu')
+    model_cls = CurveClassifierMLP if model_type == 'mlp' else CurveClassifierGLU
+    model = model_cls(
+        n_features=config['n_features'],
+        n_classes=config['n_classes'],
+        hidden=config['hidden']
     )
     model.load_state_dict(ckpt['model_state_dict'])
     model.eval()
-    return model, ckpt.get('feature_scaler')
+    return model, ckpt.get('feature_scaler'), ckpt.get('thresholds')
 
 
-def predict_batch(model, scaler, features):
+def apply_curve_feature_transform(features):
+    features = np.array(features, dtype=np.float32, copy=True)
+    end = min(features.shape[1], 398)
+    if end > 192:
+        features[:, 192:end] = np.sign(features[:, 192:end]) * np.log1p(np.abs(features[:, 192:end]))
+    return features
+
+
+def predict_batch(model, scaler, thresholds, features):
+    features = apply_curve_feature_transform(features)
     ft = torch.tensor(features, dtype=torch.float32)
     if scaler:
         ft = (ft - torch.tensor(scaler['mean'])) / (torch.tensor(scaler['std']) + 1e-8)
     with torch.no_grad():
-        return (torch.sigmoid(model(ft)).numpy() > 0.5).astype(int)
+        probs = torch.sigmoid(model(ft)).numpy()
+    if thresholds is None:
+        thresholds = np.full(probs.shape[1], 0.5, dtype=np.float32)
+    return (probs > np.asarray(thresholds, dtype=np.float32)).astype(int)
 
 
-def test_y_invariance(model, scaler):
+def resolve_model_path():
+    for path in DEFAULT_MODEL_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    return DEFAULT_MODEL_CANDIDATES[0]
+
+
+def test_y_invariance(model, scaler, thresholds):
     """Gold-standard basis-independence test: predictions under y -> a*y + b."""
     x = np.linspace(-5, 5, 256)
     curves = [
@@ -65,8 +95,8 @@ def test_y_invariance(model, scaler):
     for name, y in curves:
         f1 = extract_all_features(y).reshape(1, -1)
         f2 = extract_all_features(5 * y + 100).reshape(1, -1)
-        p1 = predict_batch(model, scaler, f1)[0]
-        p2 = predict_batch(model, scaler, f2)[0]
+        p1 = predict_batch(model, scaler, thresholds, f1)[0]
+        p2 = predict_batch(model, scaler, thresholds, f2)[0]
         
         ops1 = [op_names[i] for i in range(len(p1)) if p1[i]]
         ops2 = [op_names[i] for i in range(len(p2)) if p2[i]]
@@ -81,14 +111,14 @@ def test_y_invariance(model, scaler):
     return pct
 
 
-def test_accuracy(model, scaler, x_range, n_samples=2000):
+def test_accuracy(model, scaler, thresholds, x_range, n_samples=2000):
     """Per-class accuracy on a specific domain."""
     features, labels, _ = generate_dataset(
         n_samples=n_samples, x_range=x_range, n_points=256,
         templates=ALL_TEMPLATES, noise_std=0.01,
         balance_classes=True, seed=999
     )
-    preds = predict_batch(model, scaler, features)
+    preds = predict_batch(model, scaler, thresholds, features)
     op_names = list(OPERATOR_CLASSES.keys())
     
     print(f"\n{'='*60}")
@@ -112,20 +142,20 @@ def test_accuracy(model, scaler, x_range, n_samples=2000):
 
 
 def main():
-    path = "models/curve_classifier_wide.pt"
+    path = resolve_model_path()
     if not os.path.exists(path):
         print(f"Model not found: {path}"); return
     
-    model, scaler = load_model(path)
+    model, scaler, thresholds = load_model(path)
     
     print("="*60)
     print("COMPREHENSIVE CURVE CLASSIFIER EVALUATION")
     print(f"Model: {path}")
     print("="*60)
     
-    y_inv = test_y_invariance(model, scaler)
-    f1_std = test_accuracy(model, scaler, (-5, 5))
-    f1_ood = test_accuracy(model, scaler, (5, 15))
+    y_inv = test_y_invariance(model, scaler, thresholds)
+    f1_std = test_accuracy(model, scaler, thresholds, (-5, 5))
+    f1_ood = test_accuracy(model, scaler, thresholds, (5, 15))
     
     print("\n" + "="*60)
     print("SUMMARY")

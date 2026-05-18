@@ -28,10 +28,15 @@ class CurveClassifierMLP(nn.Module):
     
     def __init__(self, n_features: int = 398, n_classes: int = 9, hidden: int = 512):
         super().__init__()
+        
+        eql_out_dim = 256
+        self.eql = EQLLayer(in_features=n_features, out_features=eql_out_dim)
+        
         layers = []
+        combined_dim = n_features + eql_out_dim
         
         layers.extend([
-            nn.Linear(n_features, hidden),
+            nn.Linear(combined_dim, hidden),
             nn.BatchNorm1d(hidden),
             nn.ReLU(),
             nn.Dropout(0.2)
@@ -65,7 +70,9 @@ class CurveClassifierMLP(nn.Module):
                     nn.init.zeros_(m.bias)
     
     def forward(self, x):
-        return self.net(x)
+        eql_feats = self.eql(x)
+        combined = torch.cat([x, eql_feats], dim=1)
+        return self.net(combined)
 
 class CurveClassifierCNN(nn.Module):
     """1D CNN that operates on the raw curve portion of features."""
@@ -127,28 +134,90 @@ class CurveClassifierCNN(nn.Module):
         return self.classifier(combined)
 
 
-class CrossFeatureAttention(nn.Module):
-    def __init__(self, n_features: int, n_tokens: int = 8, embed_dim: int = 128):
+class SemanticFeatureAttention(nn.Module):
+    """
+    Semantic Attention that treats each feature group as a distinct token.
+    Allows the model to attend across different modalities (FFT, derivatives, stats, etc.).
+    """
+    def __init__(self, embed_dim: int = 128):
         super().__init__()
-        self.n_tokens = n_tokens
         self.embed_dim = embed_dim
         
-        # Project raw features into a sequence of tokens
-        self.feature_to_tokens = nn.Linear(n_features, n_tokens * embed_dim)
+        # Project each semantic group independently
+        self.proj_raw = nn.Linear(128, embed_dim)
+        self.proj_fft = nn.Linear(32, embed_dim)
+        self.proj_fft_phase = nn.Linear(32, embed_dim)
+        self.proj_deriv = nn.Linear(128, embed_dim)
+        self.proj_stats = nn.Linear(9, embed_dim)
+        self.proj_curv = nn.Linear(37, embed_dim)
+        self.proj_invars = nn.Linear(32, embed_dim)
+        
+        # 7 feature tokens + 1 CLS token
+        self.n_tokens = 8 
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        
+        # Token type embeddings (tells attention which modality is which)
+        self.token_type_embed = nn.Parameter(torch.randn(1, self.n_tokens, embed_dim) * 0.02)
+        
         self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=4, batch_first=True)
         self.norm1 = nn.LayerNorm(embed_dim)
         self.norm2 = nn.LayerNorm(embed_dim)
         self.ffn = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 4),
             nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(embed_dim * 4, embed_dim)
         )
+        self.dropout = nn.Dropout(0.1)
         
+        self._init_weights()
+        
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        nn.init.normal_(self.cls_token, std=0.02)
+
     def forward(self, x):
-        # x: (batch, n_features)
-        tokens = self.feature_to_tokens(x).view(x.size(0), self.n_tokens, self.embed_dim)
+        b = x.size(0)
         
-        # Self-attention over the tokens
+        # Slice based on FEATURE_SCHEMA from generate_curve_data.py
+        # Fallbacks added in case feature dimension doesn't perfectly match
+        raw = x[:, 0:128]
+        fft = x[:, 128:160]
+        fft_phase = x[:, 160:192]
+        deriv = x[:, 192:320]
+        stats = x[:, 320:329]
+        curv = x[:, 329:366]
+        
+        # Handle cases where feature dimension might be slightly different
+        if x.shape[1] > 366:
+            invars = x[:, 366:398]
+        else:
+            invars = torch.zeros(b, 32, device=x.device, dtype=x.dtype)
+            
+        # Create tokens
+        t_raw = self.proj_raw(raw).unsqueeze(1)
+        t_fft = self.proj_fft(fft).unsqueeze(1)
+        t_fft_phase = self.proj_fft_phase(fft_phase).unsqueeze(1)
+        t_deriv = self.proj_deriv(deriv).unsqueeze(1)
+        t_stats = self.proj_stats(stats).unsqueeze(1)
+        t_curv = self.proj_curv(curv).unsqueeze(1)
+        t_invars = self.proj_invars(invars).unsqueeze(1)
+        
+        cls_tokens = self.cls_token.expand(b, -1, -1)
+        
+        # Sequence of 8 tokens
+        tokens = torch.cat([
+            cls_tokens, t_raw, t_fft, t_fft_phase, t_deriv, t_stats, t_curv, t_invars
+        ], dim=1)
+        
+        tokens = tokens + self.token_type_embed
+        tokens = self.dropout(tokens)
+        
+        # Attention
         attn_out, _ = self.attention(tokens, tokens, tokens)
         tokens = self.norm1(tokens + attn_out)
         
@@ -156,7 +225,63 @@ class CrossFeatureAttention(nn.Module):
         ffn_out = self.ffn(tokens)
         tokens = self.norm2(tokens + ffn_out)
         
+        # Flatten all tokens to maintain the 1024-dim output expected
         return tokens.flatten(1)
+
+
+class EQLLayer(nn.Module):
+    """
+    Equation Learner (EQL) Layer.
+    Applies explicit mathematical transformations to the input to act as a 
+    'cheat sheet' for the network to detect mathematical operators.
+    """
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        
+        # 6 explicit mathematical functions
+        self.n_funcs = 6
+        self.features_per_func = out_features // self.n_funcs
+        self.rem_features = out_features % self.n_funcs
+        
+        # Project input features to the space where functions will be applied
+        self.linear = nn.Linear(in_features, out_features)
+        
+        # Initialize weights to be small to prevent extreme values going into exp/log early on
+        nn.init.xavier_normal_(self.linear.weight, gain=0.1)
+        nn.init.zeros_(self.linear.bias)
+
+    def forward(self, x):
+        z = self.linear(x)
+        
+        out = []
+        start_idx = 0
+        
+        for i in range(self.n_funcs):
+            end_idx = start_idx + self.features_per_func + (self.rem_features if i == 0 else 0)
+            chunk = z[:, start_idx:end_idx]
+            
+            if i == 0:
+                # Identity
+                out.append(chunk)
+            elif i == 1:
+                # Sin
+                out.append(torch.sin(chunk))
+            elif i == 2:
+                # Cos
+                out.append(torch.cos(chunk))
+            elif i == 3:
+                # Exp (clamped to prevent inf/nan)
+                out.append(torch.exp(torch.clamp(chunk, min=-10.0, max=10.0)))
+            elif i == 4:
+                # Log (safe log)
+                out.append(torch.log(torch.abs(chunk) + 1e-6))
+            elif i == 5:
+                # Square
+                out.append(torch.square(chunk))
+                
+            start_idx = end_idx
+            
+        return torch.cat(out, dim=1)
 
 
 class CurveClassifierGLU(nn.Module):
@@ -167,13 +292,20 @@ class CurveClassifierGLU(nn.Module):
     def __init__(self, n_features: int = 398, n_classes: int = 9, hidden: int = 512):
         super().__init__()
         
+        # 1. Semantic Feature Attention
         n_tokens = 8
         embed_dim = 128
-        self.attn = CrossFeatureAttention(n_features, n_tokens=n_tokens, embed_dim=embed_dim)
-        
+        self.attn = SemanticFeatureAttention(embed_dim=embed_dim)
         attn_out_dim = n_tokens * embed_dim
         
-        self.fc1 = nn.Linear(attn_out_dim, hidden * 2)
+        # 2. EQL Layer
+        eql_out_dim = 256
+        self.eql = EQLLayer(in_features=n_features, out_features=eql_out_dim)
+        
+        # 3. Combine outputs
+        combined_dim = attn_out_dim + eql_out_dim
+        
+        self.fc1 = nn.Linear(combined_dim, hidden * 2)
         self.bn1 = nn.BatchNorm1d(hidden * 2)
         
         self.fc2 = nn.Linear(hidden, hidden * 2)
@@ -199,7 +331,14 @@ class CurveClassifierGLU(nn.Module):
                     nn.init.constant_(m.bias, 0.1)
                     
     def forward(self, x):
-        x = self.attn(x)
+        # Extract abstract semantic tokens
+        attn_features = self.attn(x)
+        
+        # Extract explicit mathematical transformations
+        eql_features = self.eql(x)
+        
+        # Combine
+        x = torch.cat([attn_features, eql_features], dim=1)
         
         x = self.fc1(x)
         x = self.bn1(x)
@@ -275,7 +414,10 @@ class IndexedFeatureDataset(Dataset):
             return self.features[sample_idx], self.labels[sample_idx]
 
         # CPU/Memmap path
-        x = np.asarray(self.features[sample_idx], dtype=np.float32)
+        # np.asarray() can return a writable view into the backing ndarray/memmap.
+        # The feature transform below must be per-read only; mutating here would
+        # repeatedly log-compress columns 192:398 across epochs.
+        x = np.array(self.features[sample_idx], dtype=np.float32, copy=True)
 
         # Apply SymLog compression selectively to non-raw/fft features
         x[192:398] = np.sign(x[192:398]) * np.log1p(np.abs(x[192:398]))
@@ -344,17 +486,21 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scaler, max_gra
             
             optimizer.zero_grad(set_to_none=True)
             
-            # No AMP - Use FP32 for precision
-            logits = model(x_batch)
-            loss = criterion(logits, y_batch)
-                
+            # Use AMP if scaler is present
             if scaler is not None:
+                with torch.amp.autocast('cuda'):
+                    logits = model(x_batch)
+                    loss = criterion(logits, y_batch)
+                
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
                 scaler.step(optimizer)
                 scaler.update()
             else:
+                logits = model(x_batch)
+                loss = criterion(logits, y_batch)
+                
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
                 optimizer.step()
@@ -945,7 +1091,7 @@ def main():
                         choices=["glu", "mlp", "cnn"], help="Model architecture")
     parser.add_argument("--epochs", type=int, default=50,
                         help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=64,
+    parser.add_argument("--batch-size", type=int, default=8192,
                         help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3,
                         help="Learning rate")

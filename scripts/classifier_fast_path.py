@@ -219,7 +219,11 @@ def _evaluate_formula_values(formula: str, x_np: np.ndarray) -> Optional[np.ndar
         if len(free_symbol_names) > len(x_columns):
             return None
 
-        y_pred = func(*x_columns[:len(free_symbol_names)])
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            y_pred = func(*x_columns[:len(free_symbol_names)])
+            
         y_arr = np.asarray(y_pred, dtype=np.float64)
         if y_arr.shape == ():
             y_arr = np.full(x_np.shape[0], float(y_arr), dtype=np.float64)
@@ -3020,17 +3024,16 @@ def run_guided_evolution(
         # High confidence in skeletons → focus beams on refinement
         n_beams = min(n_beams, len(candidate_formulas) + 2)
         n_rounds = 1 # One round is enough to check the seeds
-        base_gens = min(base_gens, 150)
-        base_pop = min(base_pop, 50)
-        print(f"  [Adaptive] Confident proposer: reducing search to {n_beams} beams, 1 round, {base_pop} pop, {base_gens} gens.")
+        # REMOVED: base_gens = min(base_gens, 150)
+        # REMOVED: base_pop = min(base_pop, 50)
+        print(f"  [Adaptive] Confident proposer: focusing search on {n_beams} beams, 1 round, {base_pop} pop, {base_gens} gens.")
     elif candidate_formulas:
         # Proposer gave skeletons but isn't super confident
-        # We can still reduce search from full random exploration
         n_beams = min(n_beams, 7)
         n_rounds = 1
-        base_gens = min(base_gens, 250)
-        base_pop = min(base_pop, 60)
-        print(f"  [Adaptive] Proposer candidates available: reducing search to {n_beams} beams, 1 round, {base_pop} pop, {base_gens} gens.")
+        # REMOVED: base_gens = min(base_gens, 250)
+        # REMOVED: base_pop = min(base_pop, 60)
+        print(f"  [Adaptive] Proposer candidates available: focusing search on {n_beams} beams, 1 round, {base_pop} pop, {base_gens} gens.")
 
     beam_result = beam_search_evolution(
         x, y,

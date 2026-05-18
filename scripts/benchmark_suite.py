@@ -388,7 +388,10 @@ def _parse_formula(formula_str: str) -> Callable[[np.ndarray], np.ndarray]:
                 val = float(expr.evalf())
                 return np.full_like(x_in if x_in.ndim == 1 else x_in[:, 0], val)
                 
-            res = func(*args)
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                res = func(*args)
             return np.asarray(res, dtype=np.float64).reshape(-1)
             
         return fn
@@ -844,6 +847,9 @@ def run_formula(
 
             candidate_formulas = None
             proposer_confidence = 0.5
+            dynamic_gens = 500
+            dynamic_pop = 100
+            
             if not disable_proposer and proposer_path:
                 try:
                     from glassbox.universal_proposer import propose_fpip_v2_from_xy
@@ -853,8 +859,19 @@ def run_formula(
                     )
                     if payload and payload.get("valid"):
                         seq_unc = payload.get("sequence_uncertainty", {})
+                        
+                        # Calculate mathematical difficulty [0.0, 1.0]
+                        entropy = float(seq_unc.get("entropy") or 0.0)
+                        margin = float(seq_unc.get("margin") or 0.0)
+                        difficulty = np.clip((entropy / 1.5) + (1.0 - margin), 0.0, 1.0)
+                        proposer_confidence = float(np.clip(1.0 - difficulty, 0.0, 1.0))
+                        
+                        # Dynamically scale search budget based on difficulty
+                        dynamic_gens = int(500 + (difficulty * 2500))  # 500 to 3000
+                        dynamic_pop = int(100 + (difficulty * 200))    # 100 to 300
+                        
                         if seq_unc.get("confident") is True:
-                            proposer_confidence = 1.0
+                            proposer_confidence = max(proposer_confidence, 0.9)
                         
                         proposer_priors = payload.get("operator_priors", {})
                         if proposer_priors:
@@ -875,7 +892,8 @@ def run_formula(
                                     "from_proposer": True
                                 })
                         if candidate_formulas:
-                            print(f"\n  [Universal Proposer] Active FPIPv2 metadata injected! Skeletons: {[c['formula'] for c in candidate_formulas]}")
+                            print(f"\n  [Universal Proposer] Active FPIPv2 metadata injected!")
+                            print(f"  [Universal Proposer] Difficulty: {difficulty:.2f} -> Allocated Budget: {dynamic_gens} gens, {dynamic_pop} pop")
                 except Exception as e:
                     print(f"\n  [Universal Proposer] Warning: execution failed: {e}")
 
@@ -885,8 +903,8 @@ def run_formula(
                     x_2d,
                     y_2d,
                     operator_hints,
-                    generations=500,
-                    population_size=100,
+                    generations=dynamic_gens,
+                    population_size=dynamic_pop,
                     device=device,
                     candidate_formulas=candidate_formulas,
                     confidence=proposer_confidence,

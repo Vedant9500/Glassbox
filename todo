@@ -1,1 +1,4 @@
-find if the universal proposer can be improved such that it can suggest and set generations and population according to formula difficulty and if possible other parameters too.
+- Find if the universal proposer can be improved such that it can suggest and set generations and population according to formula difficulty and if possible other parameters too.
+- Add a Heterogeneous First Layer (EQL Layer): Before the GLU layers in the curve classifier, add a parallel linear layer with explicit mathematical activations (e.g., sin, cos, exp, log) so the network can "test" transformations on raw curve features.
+- PointNet / CNN Tokenization for Raw Curves: Introduce a 1D Conv layer over the raw signal to extract a sequence of "shape patches" prior to the attention mechanism, replacing the single-token representation for raw features.
+- Shift to Seq2Seq Architecture (Long Term): Transition from multi-label classification to an Auto-Regressive Decoder that directly predicts the abstract syntax tree (AST) of mathematical operators in Reverse Polish Notation.

@@ -1262,6 +1262,30 @@ def _ast_contains_x(node: ast.AST) -> bool:
     return False
 
 
+def _ast_is_np_constant(node: ast.AST, attr: str) -> bool:
+    """Return True for np.<attr> constants such as np.e."""
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == attr
+        and isinstance(node.value, ast.Name)
+        and node.value.id == 'np'
+    )
+
+
+def _ast_numeric_constant(node: ast.AST) -> float | None:
+    """Extract a numeric literal value, including unary signed constants."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return float(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.operand, ast.Constant):
+        value = node.operand.value
+        if isinstance(value, (int, float)):
+            if isinstance(node.op, ast.USub):
+                return -float(value)
+            if isinstance(node.op, ast.UAdd):
+                return float(value)
+    return None
+
+
 def derive_operators_from_formula(formula: str) -> Set[str]:
     """Derive operator labels directly from the expression AST."""
     ops: Set[str] = set()
@@ -1294,7 +1318,13 @@ def derive_operators_from_formula(formula: str) -> Set[str]:
             if isinstance(node.op, ast.Mult):
                 ops.add('multiplication')
             if isinstance(node.op, ast.Pow):
-                ops.add('power')
+                if _ast_is_np_constant(node.left, 'e') and _ast_contains_x(node.right):
+                    ops.add('exp')
+                else:
+                    ops.add('power')
+                    exponent = _ast_numeric_constant(node.right)
+                    if exponent is not None and exponent < 0 and _ast_contains_x(node.left):
+                        ops.add('rational')
             if isinstance(node.op, ast.Div):
                 # Mark rational if denominator depends on x
                 if _ast_contains_x(node.right):
@@ -1314,7 +1344,7 @@ def normalize_operators(operators: Set[str], formula: str) -> Set[str]:
 
 def operators_to_labels(operators: Set[str], formula: str | None = None) -> np.ndarray:
     """Convert operator set to multi-hot label vector (optionally normalized)."""
-    if formula is not None:
+    if formula is not None and not operators:
         derived = derive_operators_from_formula(formula)
         if derived:
             operators = derived
