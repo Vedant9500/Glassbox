@@ -328,6 +328,15 @@ def _safe_numpy_power(x, p):
     return np.where(is_even, res, np.sign(x) * res)
 
 
+def _safe_numpy_log(x, base=None):
+    """NumPy log that also supports SymPy's log(x, base) lambdify output."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = np.log(x)
+        if base is not None:
+            out = out / np.log(base)
+    return out
+
+
 def _parse_formula(formula_str: str) -> Callable[[np.ndarray], np.ndarray]:
     """Parse formula string into a numpy function with safe power handling."""
     import sympy as sp
@@ -362,7 +371,10 @@ def _parse_formula(formula_str: str) -> Callable[[np.ndarray], np.ndarray]:
         expr = parse_expr(formula, local_dict=local_dict, transformations=transformations, evaluate=False)     
         free_syms = sorted(expr.free_symbols, key=lambda sym: sym.name)
         # Inject safe power into lambdify
-        modules = [{"pow": _safe_numpy_power, "Pow": _safe_numpy_power}, "numpy"]
+        modules = [
+            {"pow": _safe_numpy_power, "Pow": _safe_numpy_power, "log": _safe_numpy_log},
+            "numpy",
+        ]
         func = sp.lambdify(free_syms, expr, modules=modules)
         
         def fn(x_in: np.ndarray) -> np.ndarray:
@@ -513,10 +525,20 @@ def _evaluate_formula_mse(formula: str, x: np.ndarray, y: np.ndarray) -> Optiona
     if not normalized or normalized in {"N/A", "ERROR", "?"}:
         return None
 
+    y_pred = None
     try:
         fn = _parse_formula(normalized)
         y_pred = fn(x)
     except Exception:
+        y_pred = None
+
+    if y_pred is None:
+        try:
+            y_pred = cfp._evaluate_formula_values(normalized, x)
+        except Exception:
+            y_pred = None
+
+    if y_pred is None:
         return None
 
     if y_pred.shape != y.shape:

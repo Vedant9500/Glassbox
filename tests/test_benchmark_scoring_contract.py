@@ -14,6 +14,14 @@ def test_formula_mse_eval_returns_none_on_parse_failure():
     assert bs._evaluate_formula_mse("sin(", x, y) is None
 
 
+def test_formula_mse_eval_handles_base_log_constants():
+    x = np.linspace(-2.0, 2.0, 64)
+    y = np.log(np.e) / np.log(10.0) * x
+
+    assert bs._evaluate_formula_mse("log(E, 10)*x", x, y) is not None
+    assert bs.cfp._evaluate_formula_values("log(E, 2)*x", x) is not None
+
+
 def test_run_formula_flags_formula_eval_failed(monkeypatch):
     def _fake_fast_path(*args, **kwargs):
         return {

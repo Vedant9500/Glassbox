@@ -252,6 +252,15 @@ def _safe_numpy_power(x, p):
     return np.where(is_even, res, np.sign(x) * res)
 
 
+def _safe_numpy_log(x, base=None):
+    """NumPy log that also supports SymPy's log(x, base) lambdify output."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        out = np.log(x)
+        if base is not None:
+            out = out / np.log(base)
+    return out
+
+
 @lru_cache(maxsize=256)
 def _compile_formula_evaluator(normalized_formula: str) -> Tuple[Tuple[str, ...], Optional[float], Optional[Any]]:
     import sympy as sp
@@ -283,8 +292,11 @@ def _compile_formula_evaluator(normalized_formula: str) -> Tuple[Tuple[str, ...]
     if not free_syms:
         return tuple(), float(expr), None
 
-    # Inject safe power into lambdify context
-    modules = [{"pow": _safe_numpy_power, "Pow": _safe_numpy_power}, "numpy"]
+    # Inject safe power/log into lambdify context.
+    modules = [
+        {"pow": _safe_numpy_power, "Pow": _safe_numpy_power, "log": _safe_numpy_log},
+        "numpy",
+    ]
     func = sp.lambdify(free_syms, expr, modules=modules)
     return tuple(sym.name for sym in free_syms), None, func
 
@@ -1972,6 +1984,7 @@ def should_use_fast_path(
     predictions: Dict[str, float],
     confidence_threshold: float = 0.6,  # Lowered from 0.8 to allow more fast-path usage
     min_operators: int = 1,
+    universal_basis: bool = True,
 ) -> bool:
     """
     Decide whether to use fast path based on classifier confidence.
@@ -1980,6 +1993,13 @@ def should_use_fast_path(
     1. At least one operator predicted with high confidence
     2. The predicted operators are well-covered by our basis
     """
+    # In universal-basis mode the classifier is a guide, not an applicability
+    # gate. Low confidence should not make simple valid formulas like -x^2
+    # skip fast-path entirely; the regression stage can still test the common
+    # polynomial/trig/exp/rational families and reject them by fit quality.
+    if universal_basis:
+        return True
+
     # Get high-confidence predictions
     high_conf = [name for name, prob in predictions.items() if prob >= confidence_threshold]
     
@@ -2121,11 +2141,14 @@ def run_fast_path(
         threshold=0.3,
         device=device,
     )
-    uncertainty_metrics = _prediction_uncertainty_metrics(predictions or {})
-    
+
     if not predictions:
-        print("  No operators predicted - falling back to evolution")
-        return None
+        # Do not make classifier failure an applicability failure. The fast path
+        # uses a universal basis by default, so conservative polynomial priors
+        # are enough to attempt regression and let MSE decide.
+        predictions = {'identity': 1.0, 'power': 1.0, 'polynomial': 1.0}
+
+    uncertainty_metrics = _prediction_uncertainty_metrics(predictions or {})
     
     print(f"  Predictions: {[(k, f'{v:.2f}') for k, v in sorted(predictions.items(), key=lambda x: -x[1])]}")
     print(
@@ -2135,7 +2158,7 @@ def run_fast_path(
     )
     
     # Check if fast path is applicable (lowered threshold to 0.6 for broader coverage)
-    if not should_use_fast_path(predictions, confidence_threshold=0.6):
+    if not should_use_fast_path(predictions, confidence_threshold=0.6, universal_basis=auto_expand):
         print("  Classifier confidence too low - falling back to evolution")
         return None
     
