@@ -9,7 +9,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Sequence
 
 # Add the repository root to sys.path so we can import glassbox
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -29,9 +29,72 @@ from glassbox.universal_proposer import (
 )
 
 try:
-    from glassbox.curve_classifier.generate_curve_data import extract_all_features, evaluate_formula
+    from glassbox.curve_classifier.generate_curve_data import (
+        extract_all_features,
+        evaluate_formula,
+        OPERATOR_CLASSES,
+        FEATURE_DIM,
+        FEATURE_SCHEMA,
+        N_CLASSES,
+    )
 except Exception:
-    from glassbox.curve_classifier.generate_curve_data import extract_all_features, evaluate_formula
+    from glassbox.curve_classifier.generate_curve_data import (
+        extract_all_features,
+        evaluate_formula,
+        OPERATOR_CLASSES,
+        FEATURE_DIM,
+        FEATURE_SCHEMA,
+        N_CLASSES,
+    )
+
+
+def apply_feature_transform(features: np.ndarray) -> np.ndarray:
+    """Apply the same selective SymLog transform used by classifier training."""
+    x = np.array(features, dtype=np.float32, copy=True)
+    if x.ndim == 1:
+        end = min(x.shape[0], FEATURE_DIM)
+        if end > 192:
+            x[192:end] = np.sign(x[192:end]) * np.log1p(np.abs(x[192:end]))
+    else:
+        end = min(x.shape[1], FEATURE_DIM)
+        if end > 192:
+            x[:, 192:end] = np.sign(x[:, 192:end]) * np.log1p(np.abs(x[:, 192:end]))
+    return x
+
+
+def _coerce_operator_classes(raw, n_classes: int) -> List[str]:
+    if raw is None:
+        return list(OPERATOR_CLASSES.keys())[:n_classes]
+    if isinstance(raw, np.ndarray):
+        raw = raw.tolist()
+    return [str(x) for x in raw]
+
+
+def _normalize_formula_key(formula: str) -> str:
+    return (
+        str(formula)
+        .replace("np.", "")
+        .replace(" ", "")
+        .replace("**", "^")
+    )
+
+
+def load_training_data(
+    data_path: str,
+    n_classes: int,
+) -> tuple[np.ndarray, np.ndarray, Optional[List[str]], Optional[List[str]], Optional[int], Optional[dict]]:
+    """Load proposer training data from the current curve dataset format."""
+    blob = np.load(data_path, allow_pickle=True)
+    features = np.asarray(blob["features"], dtype=np.float32)
+    labels = np.asarray(blob["labels"], dtype=np.float32)
+    formulas = blob["formulas"].tolist() if "formulas" in blob else None
+    operator_classes = _coerce_operator_classes(
+        blob["operator_classes"] if "operator_classes" in blob else None,
+        n_classes,
+    )
+    feature_dim = int(blob["feature_dim"]) if "feature_dim" in blob else int(features.shape[1])
+    feature_schema = blob["feature_schema"].item() if "feature_schema" in blob else None
+    return features, labels, formulas, operator_classes, feature_dim, feature_schema
 
 
 def compute_feature_stats(
@@ -53,8 +116,7 @@ def compute_feature_stats(
         batch_idx = indices[start:start + chunk_size]
         batch = np.asarray(features[batch_idx], dtype=np.float64)
 
-        # Apply SymLog selectively
-        batch[:, 192:398] = np.sign(batch[:, 192:398]) * np.log1p(np.abs(batch[:, 192:398]))
+        batch = apply_feature_transform(batch).astype(np.float64, copy=False)
 
         sum_x += batch.sum(axis=0)
         sum_x2 += np.square(batch).sum(axis=0)
@@ -114,8 +176,7 @@ class SyntheticCurveDataset(Dataset):
         y = y + 0.01 * self.rng.randn(*y.shape).astype(np.float32)
         features = extract_all_features(y)
 
-        # Apply SymLog
-        features = np.sign(features) * np.log1p(np.abs(features))
+        features = apply_feature_transform(features)
 
         op_target = np.zeros(len(self.operator_vocab), dtype=np.float32)
         for op in ops:
@@ -136,76 +197,119 @@ class FormulaReplayDataset(Dataset):
 
     def __init__(
         self,
-        features: np.ndarray,
-        labels: np.ndarray,
-        indices: np.ndarray,
+        features: np.ndarray | str | Path,
+        labels: Optional[np.ndarray] = None,
+        indices: Optional[np.ndarray] = None,
+        operator_classes: Optional[Sequence[str]] = None,
+        formulas: Optional[Sequence[str]] = None,
         scaler: Optional[dict] = None,
         device: Optional[torch.device] = None,
+        n_points: Optional[int] = None,
     ):
-        self.indices = indices
+        if labels is None and isinstance(features, (str, Path)):
+            (
+                features,
+                labels,
+                formulas,
+                operator_classes,
+                _feature_dim,
+                _feature_schema,
+            ) = load_training_data(str(features), n_classes=N_CLASSES)
+
+        if labels is None:
+            raise ValueError("labels must be provided when features is not a dataset path")
+
+        self.indices = (
+            np.asarray(indices, dtype=np.int64)
+            if indices is not None
+            else np.arange(len(features), dtype=np.int64)
+        )
         self.scaler = scaler
         self.operator_vocab = list(DEFAULT_OPERATOR_VOCAB)
-        
+        self.skeleton_vocab = list(DEFAULT_SKELETON_VOCAB)
+        self.operator_classes = _coerce_operator_classes(operator_classes, int(labels.shape[1]))
+        self.formulas = list(formulas) if formulas is not None else None
+        self.n_points = n_points
+
         self.is_on_device = False
         if device is not None and device.type == 'cuda':
             print(f"Transferring dataset to {device}...")
             # Slice first to save memory
-            x_sliced = np.asarray(features[self.indices], dtype=np.float32)
+            x_sliced = apply_feature_transform(features[self.indices])
             y_sliced = np.asarray(labels[self.indices], dtype=np.float32)
-            
-            # Apply SymLog selectively
-            x_sliced[:, 192:398] = np.sign(x_sliced[:, 192:398]) * np.log1p(np.abs(x_sliced[:, 192:398]))
-            
+
             if self.scaler is not None:
                 x_sliced = (x_sliced - self.scaler['mean']) / (self.scaler['std'] + 1e-8)
             
             # Convert labels to targets eagerly
             op_targets = np.zeros((len(y_sliced), len(self.operator_vocab)), dtype=np.float32)
+            skeleton_targets = np.full(len(y_sliced), -1, dtype=np.int64)
             for i, row in enumerate(y_sliced):
                 op_targets[i] = self._labels_to_operator_target(row)
+                if self.formulas is not None:
+                    skeleton_targets[i] = self._formula_to_skeleton_target(self.formulas[int(self.indices[i])])
                 
             self.features = torch.from_numpy(x_sliced).to(device)
             self.labels = torch.from_numpy(op_targets).to(device)
+            self.skeleton_targets = torch.from_numpy(skeleton_targets).to(device)
             self.indices = np.arange(len(self.indices), dtype=np.int64)
-            # Pre-allocate static output to avoid per-sample allocations
-            self._dummy_skeleton = torch.tensor(-1, dtype=torch.long, device=device)
             self.is_on_device = True
         else:
             self.features = features
             self.labels = labels
+            self.skeleton_targets = None
 
     def __len__(self) -> int:
         return len(self.indices)
 
     def _labels_to_operator_target(self, row: np.ndarray) -> np.ndarray:
         op = np.zeros(len(self.operator_vocab), dtype=np.float32)
-        mapping = {
-            "identity": 0, "sin": 1, "cos": 2, "power": 3, "exp": 4, 
-            "log": 5, "rational": 8
-        }
-        for name, idx in mapping.items():
-            if idx < row.shape[0]:
+        row = np.asarray(row, dtype=np.float32)
+        source_idx = {name: i for i, name in enumerate(self.operator_classes)}
+
+        for name in self.operator_vocab:
+            if name == "periodic":
+                continue
+            idx = source_idx.get(name)
+            if idx is not None and idx < row.shape[0]:
                 op[self.operator_vocab.index(name)] = row[idx]
+
         if "periodic" in self.operator_vocab:
-            op[self.operator_vocab.index("periodic")] = max(row[1], row[2])
+            sin_idx = source_idx.get("sin")
+            cos_idx = source_idx.get("cos")
+            sin_val = row[sin_idx] if sin_idx is not None and sin_idx < row.shape[0] else 0.0
+            cos_val = row[cos_idx] if cos_idx is not None and cos_idx < row.shape[0] else 0.0
+            op[self.operator_vocab.index("periodic")] = max(float(sin_val), float(cos_val))
         return op
 
+    def _formula_to_skeleton_target(self, formula: str) -> int:
+        key = _normalize_formula_key(formula)
+        vocab_keys = [_normalize_formula_key(item) for item in self.skeleton_vocab]
+        try:
+            return vocab_keys.index(key)
+        except ValueError:
+            return -1
+
     def __getitem__(self, idx: int):
-        sample_idx = self.indices[idx]
+        sample_idx = int(self.indices[idx])
         
         if self.is_on_device:
-            return self.features[sample_idx], self.labels[sample_idx], self._dummy_skeleton
+            return self.features[sample_idx], self.labels[sample_idx], self.skeleton_targets[sample_idx]
             
-        feat = self.features[sample_idx]
-        
-        # Apply SymLog selectively
-        feat[192:398] = np.sign(feat[192:398]) * np.log1p(np.abs(feat[192:398]))
+        feat = apply_feature_transform(self.features[sample_idx])
         
         if self.scaler is not None:
             feat = (feat - self.scaler['mean']) / (self.scaler['std'] + 1e-8)
             
         op_target = self._labels_to_operator_target(self.labels[sample_idx])
-        return torch.from_numpy(feat.astype(np.float32)), torch.from_numpy(op_target), torch.tensor(-1, dtype=torch.long)
+        skeleton_target = -1
+        if self.formulas is not None:
+            skeleton_target = self._formula_to_skeleton_target(self.formulas[sample_idx])
+        return (
+            torch.from_numpy(feat.astype(np.float32)),
+            torch.from_numpy(op_target),
+            torch.tensor(skeleton_target, dtype=torch.long),
+        )
 
 
 def _train_epoch(model, loader, optimizer, device, scaler=None) -> float:
@@ -233,6 +337,13 @@ def _train_epoch(model, loader, optimizer, device, scaler=None) -> float:
             with torch.autocast(device_type='cuda', dtype=torch.float16):
                 out = model(features)
                 loss = F.binary_cross_entropy_with_logits(out["operator_logits"], op_target)
+                skeleton_target = ds.skeleton_targets[batch_idx]
+                valid_skeleton = skeleton_target >= 0
+                if valid_skeleton.any():
+                    loss = loss + 0.2 * F.cross_entropy(
+                        out["skeleton_logits"][valid_skeleton],
+                        skeleton_target[valid_skeleton],
+                    )
                 
             if scaler is not None:
                 scaler.scale(loss).backward()
@@ -254,12 +365,19 @@ def _train_epoch(model, loader, optimizer, device, scaler=None) -> float:
     for features, op_target, skeleton_target in loader:
         features = features.to(device, non_blocking=True)
         op_target = op_target.to(device, non_blocking=True)
+        skeleton_target = skeleton_target.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True) 
         
         with torch.autocast(device_type=device.type, enabled=device.type=='cuda', dtype=torch.float16):
             out = model(features)
             loss = F.binary_cross_entropy_with_logits(out["operator_logits"], op_target)
+            valid_skeleton = skeleton_target >= 0
+            if valid_skeleton.any():
+                loss = loss + 0.2 * F.cross_entropy(
+                    out["skeleton_logits"][valid_skeleton],
+                    skeleton_target[valid_skeleton],
+                )
 
         if scaler is not None:
             scaler.scale(loss).backward()
@@ -297,6 +415,13 @@ def _evaluate(model, loader, device) -> dict:
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
                     out = model(features)
                     loss = F.binary_cross_entropy_with_logits(out["operator_logits"], op_target)
+                    skeleton_target = ds.skeleton_targets[start_idx:end_idx]
+                    valid_skeleton = skeleton_target >= 0
+                    if valid_skeleton.any():
+                        loss = loss + 0.2 * F.cross_entropy(
+                            out["skeleton_logits"][valid_skeleton],
+                            skeleton_target[valid_skeleton],
+                        )
                     
                 total_loss += loss.item() * (end_idx - start_idx)
                 all_preds.append(torch.sigmoid(out["operator_logits"]).cpu())
@@ -308,13 +433,20 @@ def _evaluate(model, loader, device) -> dict:
         total_samples = 0
         
         with torch.no_grad():
-            for features, op_target, _ in loader:
+            for features, op_target, skeleton_target in loader:
                 features = features.to(device, non_blocking=True)
                 op_target = op_target.to(device, non_blocking=True)
+                skeleton_target = skeleton_target.to(device, non_blocking=True)
                 
                 with torch.autocast(device_type=device.type, enabled=device.type=='cuda', dtype=torch.float16):
                     out = model(features)
                     loss = F.binary_cross_entropy_with_logits(out["operator_logits"], op_target)
+                    valid_skeleton = skeleton_target >= 0
+                    if valid_skeleton.any():
+                        loss = loss + 0.2 * F.cross_entropy(
+                            out["skeleton_logits"][valid_skeleton],
+                            skeleton_target[valid_skeleton],
+                        )
                     
                 total_loss += loss.item() * features.shape[0]
                 total_samples += features.shape[0]
@@ -382,9 +514,14 @@ def main():
 
     if args.data:
         if args.data.endswith(".npz"):
-            blob = np.load(args.data, allow_pickle=True)
-            features = np.asarray(blob["features"], dtype=np.float32)
-            labels = np.asarray(blob["labels"], dtype=np.float32)
+            (
+                features,
+                labels,
+                formulas,
+                operator_classes,
+                feature_dim,
+                feature_schema,
+            ) = load_training_data(args.data, n_classes=N_CLASSES)
         else:
             # Try loading streamed .dat files
             base = Path(args.data)
@@ -395,14 +532,17 @@ def main():
             
             # Infer sizes
             # We assume features are n_samples x 398 (the new feature dim)
-            feature_dim = 398
-            n_classes = 9
+            feature_dim = FEATURE_DIM
+            n_classes = N_CLASSES
             file_size = features_path.stat().st_size
             n_samples = file_size // (feature_dim * 4)
             print(f"Inferred n_samples={n_samples} from {features_path.name}")
             
             features = np.memmap(features_path, dtype=np.float32, mode="r", shape=(n_samples, feature_dim))
             labels = np.memmap(labels_path, dtype=np.float32, mode="r", shape=(n_samples, n_classes))
+            formulas = None
+            operator_classes = list(OPERATOR_CLASSES.keys())[:n_classes]
+            feature_schema = None
             
         if args.max_samples > 0:
             features = features[:args.max_samples]
@@ -423,14 +563,16 @@ def main():
         load_to_vram = args.load_into_ram
         
         train_ds = FormulaReplayDataset(
-            features, labels, train_idx, scaler=scaler,
+            features, labels, train_idx, operator_classes=operator_classes, formulas=formulas, scaler=scaler,
             device=device if load_to_vram else None
         )
         val_ds = FormulaReplayDataset(
-            features, labels, val_idx, scaler=scaler,
+            features, labels, val_idx, operator_classes=operator_classes, formulas=formulas, scaler=scaler,
             device=device if load_to_vram else None
         )
         print(f"train_samples={len(train_ds)} val_samples={len(val_ds)} path={args.data}")
+        if feature_schema is not None:
+            print(f"  Feature schema: {feature_schema}")
     else:
         scaler = None
         # Minimal synthetic dataset fallback
