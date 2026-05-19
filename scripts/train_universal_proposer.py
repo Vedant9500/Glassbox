@@ -557,24 +557,24 @@ def main():
         
         print("Computing feature statistics (SymLog + Standardize)...")
         mean, std = compute_feature_stats(features, train_idx)
-        scaler = {'mean': mean, 'std': std}
+        feature_scaler = {'mean': mean, 'std': std}
 
         # VRAM loading option
         load_to_vram = args.load_into_ram
         
         train_ds = FormulaReplayDataset(
-            features, labels, train_idx, operator_classes=operator_classes, formulas=formulas, scaler=scaler,
+            features, labels, train_idx, operator_classes=operator_classes, formulas=formulas, scaler=feature_scaler,
             device=device if load_to_vram else None
         )
         val_ds = FormulaReplayDataset(
-            features, labels, val_idx, operator_classes=operator_classes, formulas=formulas, scaler=scaler,
+            features, labels, val_idx, operator_classes=operator_classes, formulas=formulas, scaler=feature_scaler,
             device=device if load_to_vram else None
         )
         print(f"train_samples={len(train_ds)} val_samples={len(val_ds)} path={args.data}")
         if feature_schema is not None:
             print(f"  Feature schema: {feature_schema}")
     else:
-        scaler = None
+        feature_scaler = None
         # Minimal synthetic dataset fallback
         train_ds = SyntheticCurveDataset(n_samples=args.n_samples, n_points=args.n_points)
         val_ds = SyntheticCurveDataset(n_samples=int(args.n_samples * args.val_split), n_points=args.n_points)
@@ -601,7 +601,7 @@ def main():
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='max', factor=0.5, patience=5)
     
-    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+    amp_scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -612,7 +612,7 @@ def main():
     print(f"Training GLU Proposer on {device}...")
     for epoch in range(1, args.epochs + 1):
         try:
-            train_loss = _train_epoch(model, train_loader, opt, device, scaler)
+            train_loss = _train_epoch(model, train_loader, opt, device, amp_scaler)
         except Exception as e:
             if args.compile and "inductor" in str(e).lower():
                 print(f"\n[!] torch.compile failed during first forward pass: {e}")
@@ -620,7 +620,7 @@ def main():
                 if hasattr(model, "_orig_mod"):
                     model = model._orig_mod
                 args.compile = False 
-                train_loss = _train_epoch(model, train_loader, opt, device, scaler)
+                train_loss = _train_epoch(model, train_loader, opt, device, amp_scaler)
             else:
                 raise e
         
@@ -644,7 +644,7 @@ def main():
                         "operator_vocab": model.operator_vocab,
                         "skeleton_vocab": model.skeleton_vocab,
                     },
-                    "feature_scaler": scaler,
+                    "feature_scaler": feature_scaler,
                     "epoch": epoch,
                     "val_f1": best_f1,
                 },

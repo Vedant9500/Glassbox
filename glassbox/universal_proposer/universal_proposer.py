@@ -383,11 +383,19 @@ def propose_from_xy(
     elif len(features) < expected_dim:
         features = np.pad(features, (0, expected_dim - len(features)))
 
-    # Apply SymLog + Scaling (Synchronization with GLU training)
-    features = np.sign(features) * np.log1p(np.abs(features))
-    if hasattr(model, 'feature_scaler') and model.feature_scaler is not None:
-        mean = model.feature_scaler['mean']
-        std = model.feature_scaler['std']
+    # Apply the same selective SymLog + scaling used during proposer training.
+    features = np.array(features, dtype=np.float32, copy=True)
+    if features.ndim == 1 and features.shape[0] > 192:
+        end = min(features.shape[0], expected_dim)
+        features[192:end] = np.sign(features[192:end]) * np.log1p(np.abs(features[192:end]))
+    elif features.ndim > 1 and features.shape[1] > 192:
+        end = min(features.shape[1], expected_dim)
+        features[:, 192:end] = np.sign(features[:, 192:end]) * np.log1p(np.abs(features[:, 192:end]))
+
+    scaler = getattr(model, "feature_scaler", None)
+    if isinstance(scaler, dict) and "mean" in scaler and "std" in scaler:
+        mean = np.asarray(scaler["mean"], dtype=np.float32)
+        std = np.asarray(scaler["std"], dtype=np.float32)
         features = (features - mean) / (std + 1e-8)
 
     features_t = torch.from_numpy(features.astype(np.float32)).unsqueeze(0)
@@ -481,8 +489,16 @@ def load_universal_proposer_checkpoint(
     model = UniversalProposer(config)
     model.load_state_dict(ckpt["model_state_dict"])
     
-    # Attach scaler for automatic normalization during inference
-    model.feature_scaler = ckpt.get("feature_scaler")
+    # Attach scaler for automatic normalization during inference. Some older
+    # proposer checkpoints accidentally stored an AMP GradScaler here.
+    feature_scaler = ckpt.get("feature_scaler")
+    if not (
+        isinstance(feature_scaler, dict)
+        and "mean" in feature_scaler
+        and "std" in feature_scaler
+    ):
+        feature_scaler = None
+    model.feature_scaler = feature_scaler
     
     if device is not None:
         model = model.to(torch.device(device))
