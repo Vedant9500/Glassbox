@@ -744,6 +744,8 @@ def run_formula(
     evolution_only: bool = False,
     proposer_path: Optional[str] = None,
     disable_proposer: bool = False,
+    evolution_generations: int = 150,
+    evolution_population: int = 50,
 ) -> Dict[str, Any]:
     """Run fast-path and/or guided evolution on a single formula."""
     x_min, x_max = x_range
@@ -902,8 +904,8 @@ def run_formula(
 
             candidate_formulas = None
             proposer_confidence = 0.5
-            dynamic_gens = 500
-            dynamic_pop = 100
+            dynamic_gens = int(max(20, evolution_generations))
+            dynamic_pop = int(max(20, evolution_population))
             
             if not disable_proposer and proposer_path:
                 try:
@@ -921,9 +923,10 @@ def run_formula(
                         difficulty = np.clip((entropy / 1.5) + (1.0 - margin), 0.0, 1.0)
                         proposer_confidence = float(np.clip(1.0 - difficulty, 0.0, 1.0))
                         
-                        # Dynamically scale search budget based on difficulty
-                        dynamic_gens = int(500 + (difficulty * 2500))  # 500 to 3000
-                        dynamic_pop = int(100 + (difficulty * 200))    # 100 to 300
+                        # Keep benchmark-guided evolution bounded. The deeper
+                        # search is still available through CLI budget knobs.
+                        dynamic_gens = int(max(20, evolution_generations))
+                        dynamic_pop = int(max(20, evolution_population))
                         
                         if seq_unc.get("confident") is True:
                             proposer_confidence = max(proposer_confidence, 0.9)
@@ -954,7 +957,7 @@ def run_formula(
                                 })
                         if candidate_formulas:
                             print(f"\n  [Universal Proposer] Active FPIPv2 metadata injected!")
-                            print(f"  [Universal Proposer] Difficulty: {difficulty:.2f} -> Allocated Budget: {dynamic_gens} gens, {dynamic_pop} pop")
+                            print(f"  [Universal Proposer] Difficulty: {difficulty:.2f} -> Budget: {dynamic_gens} gens, {dynamic_pop} pop")
                 except Exception as e:
                     print(f"\n  [Universal Proposer] Warning: execution failed: {e}")
 
@@ -1397,6 +1400,14 @@ Examples:
         help="Generations for C++ evolution (default: 1000, used with --cpp-evolution-only)",
     )
     parser.add_argument(
+        "--guided-generations", type=int, default=150,
+        help="Generations for guided evolution in --with-evolution/--evolution-only mode (default: 150)",
+    )
+    parser.add_argument(
+        "--guided-pop-size", type=int, default=50,
+        help="Population per island for guided evolution in --with-evolution/--evolution-only mode (default: 50)",
+    )
+    parser.add_argument(
         "--runs", type=int, default=1,
         help="Number of times to run each formula. Returns best result. (default: 1)",
     )
@@ -1510,6 +1521,8 @@ Examples:
                         evolution_only=args.evolution_only,
                         proposer_path=args.proposer_model,
                         disable_proposer=args.disable_proposer,
+                        evolution_generations=args.guided_generations,
+                        evolution_population=args.guided_pop_size,
                     )
                 
                 # Keep the best result based on displayed MSE (or just any valid MSE if best_result is None)

@@ -196,11 +196,11 @@ private:
     }
 
     std::shared_ptr<ParseNode> parse_term() {
-        auto node = parse_factor();
+        auto node = parse_unary();
         while (peek().type == TokenType::Mul || peek().type == TokenType::Div) {
             Token op = peek();
             advance();
-            auto right = parse_factor();
+            auto right = parse_unary();
             auto parent = std::make_shared<ParseNode>();
             parent->type = (op.type == TokenType::Mul) ? ParseNodeType::Mul : ParseNodeType::Div;
             parent->left = node;
@@ -210,25 +210,11 @@ private:
         return node;
     }
 
-    std::shared_ptr<ParseNode> parse_factor() {
-        auto node = parse_primary();
-        if (peek().type == TokenType::Pow) {
-            advance();
-            auto right = parse_factor(); // right-associative
-            auto parent = std::make_shared<ParseNode>();
-            parent->type = ParseNodeType::Pow;
-            parent->left = node;
-            parent->right = right;
-            node = parent;
-        }
-        return node;
-    }
-
-    std::shared_ptr<ParseNode> parse_primary() {
+    std::shared_ptr<ParseNode> parse_unary() {
         Token t = peek();
         if (t.type == TokenType::Minus) {
             advance();
-            auto child = parse_primary();
+            auto child = parse_unary();
             if (child->type == ParseNodeType::Constant) {
                 child->value = -child->value;
                 return child;
@@ -244,8 +230,27 @@ private:
         }
         if (t.type == TokenType::Plus) {
             advance();
-            return parse_primary();
+            return parse_unary();
         }
+        return parse_power();
+    }
+
+    std::shared_ptr<ParseNode> parse_power() {
+        auto node = parse_primary();
+        if (peek().type == TokenType::Pow) {
+            advance();
+            auto right = parse_unary(); // right-associative
+            auto parent = std::make_shared<ParseNode>();
+            parent->type = ParseNodeType::Pow;
+            parent->left = node;
+            parent->right = right;
+            node = parent;
+        }
+        return node;
+    }
+
+    std::shared_ptr<ParseNode> parse_primary() {
+        Token t = peek();
         if (t.type == TokenType::Number) {
             advance();
             auto node = std::make_shared<ParseNode>();

@@ -64,6 +64,20 @@ def test_cpp_snapping():
     assert "x" in res
 
 @requires_cpp
+def test_cpp_unary_minus_precedence():
+    """Unary minus must bind looser than power: -x^2 means -(x^2)."""
+    x = np.linspace(-3.0, 3.0, 101)
+    expr = _core.simplify_formula("exp(-x^2)")
+    py_expr = expr.replace("^", "**")
+    y_pred = eval(
+        py_expr,
+        {"__builtins__": None},
+        {"x": x, "exp": np.exp, "abs": np.abs, "sign": np.sign},
+    )
+    y_true = np.exp(-(x ** 2))
+    assert np.mean((y_pred - y_true) ** 2) < 1e-12
+
+@requires_cpp
 def test_cpp_noise_reduction():
     """BIC noise reduction should prune unnecessary terms."""
     np.random.seed(42)
