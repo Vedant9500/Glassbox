@@ -7,6 +7,7 @@
 #include "evolution.h"
 #include "refine.h"
 #include "simplify.h"
+#include "simplify_advanced.h"
 
 #include <omp.h>
 #include <iostream>
@@ -61,13 +62,20 @@ py::dict run_evolution_cpp(
     // 1. Convert Python/Numpy inputs to C++/Eigen
     std::vector<Eigen::ArrayXd> X;
     for (auto item : X_list) {
-        auto arr = item.cast<py::array_t<double>>();
+        auto arr = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(item);
+        if (!arr) {
+            throw std::runtime_error("X_list entries must be convertible to contiguous float64 arrays");
+        }
         auto buf = arr.request();
         double* ptr = static_cast<double*>(buf.ptr);
         X.emplace_back(Eigen::Map<Eigen::ArrayXd>(ptr, buf.size));
     }
     
-    auto y_buf = y_array.request();
+    auto y_contig = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(y_array);
+    if (!y_contig) {
+        throw std::runtime_error("y must be convertible to a contiguous float64 array");
+    }
+    auto y_buf = y_contig.request();
     double* y_ptr = static_cast<double*>(y_buf.ptr);
     Eigen::Map<Eigen::ArrayXd> y(y_ptr, y_buf.size);
     
@@ -268,6 +276,10 @@ py::dict run_evolution_cpp(
     result["output_weights"] = weights_list;
     result["output_bias"] = best.output_bias;
     
+    // Simplify best graph before string export.
+    // Note: this is structural/constant-fold simplification (not SymPy-level algebra).
+    sr::simplify_ast(best);
+
     // Add the parsed formula string for Python compatibility
     result["formula"] = sr::get_formula_string(best, static_cast<int>(X.size()));
 
@@ -407,6 +419,53 @@ py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::array_t
     return w_out;
 }
 
+// Wrapper for simplify_formula_cpp
+std::string simplify_formula_wrapper(
+    std::string formula_str,
+    double int_tol = 1e-5,
+    double zero_tol = 1e-8,
+    int max_passes = 6,
+    bool use_nsimplify = true,
+    bool use_identities = true,
+    bool approximate_trig = false,
+    double dominant_trig_ratio = 0.9,
+    double small_term_ratio = 0.08,
+    int n_features = 1
+) {
+    return sr::simplify_formula_cpp(
+        formula_str, int_tol, zero_tol, max_passes, use_nsimplify, use_identities,
+        approximate_trig, dominant_trig_ratio, small_term_ratio, n_features
+    );
+}
+
+// Wrapper for reduce_formula_noise_cpp
+std::string reduce_formula_noise_wrapper(
+    std::string formula_str,
+    py::list X_list,
+    py::array_t<double> y_array
+) {
+    std::vector<Eigen::ArrayXd> X;
+    for (auto item : X_list) {
+        auto arr = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(item);
+        if (!arr) {
+            throw std::runtime_error("X_list entries must be convertible to contiguous float64 arrays");
+        }
+        auto buf = arr.request();
+        double* ptr = static_cast<double*>(buf.ptr);
+        X.emplace_back(Eigen::Map<Eigen::ArrayXd>(ptr, buf.size));
+    }
+    
+    auto y_contig = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(y_array);
+    if (!y_contig) {
+        throw std::runtime_error("y must be convertible to a contiguous float64 array");
+    }
+    auto y_buf = y_contig.request();
+    double* y_ptr = static_cast<double*>(y_buf.ptr);
+    Eigen::Map<Eigen::ArrayXd> y(y_ptr, y_buf.size);
+    
+    return sr::reduce_formula_noise_cpp(formula_str, X, y);
+}
+
 PYBIND11_MODULE(_core, m) {
     m.doc() = "Fast C++ core for Glassbox Symbolic Regression";
     m.def("run_evolution", &run_evolution_cpp, "Runs the evolutionary algorithm natively in C++",
@@ -449,4 +508,11 @@ PYBIND11_MODULE(_core, m) {
     m.def("refine_periodic_rational", &refine_periodic_rational_wrapper, "Refines periodic rational params via Eigen varpro");
     m.def("iterative_elastic_net", &iterative_elastic_net_wrapper, "Iterative Elastic Net for regularized pruning");
     m.def("lasso_coordinate_descent", &lasso_coordinate_descent_wrapper, "LASSO regression using coordinate descent");
+    m.def("simplify_formula", &simplify_formula_wrapper, "Simplifies a math formula string natively in C++",
+          py::arg("formula_str"), py::arg("int_tol")=1e-5, py::arg("zero_tol")=1e-8, py::arg("max_passes")=6,
+          py::arg("use_nsimplify")=true, py::arg("use_identities")=true, py::arg("approximate_trig")=false,
+          py::arg("dominant_trig_ratio")=0.9, py::arg("small_term_ratio")=0.08, py::arg("n_features")=1);
+    m.def("reduce_formula_noise", &reduce_formula_noise_wrapper, "Greedy backward elimination of terms to reduce noise",
+          py::arg("formula_str"), py::arg("X_list"), py::arg("y"));
 }
+

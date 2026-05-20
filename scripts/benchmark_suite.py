@@ -474,6 +474,31 @@ def _normalize_formula_text(formula: str) -> str:
     )
 
 
+def _simplify_formula_native(formula: str, int_tol: float, zero_tol: float) -> Optional[str]:
+    """Simplify with the native C++ Phase-1 simplifier, if available."""
+    try:
+        cpp_dir = _REPO_ROOT / "glassbox" / "sr" / "cpp"
+        if str(cpp_dir) not in sys.path:
+            sys.path.insert(0, str(cpp_dir))
+
+        import _core  # type: ignore
+
+        simplified = _core.simplify_formula(
+            formula,
+            int_tol=float(int_tol),
+            zero_tol=float(zero_tol),
+            max_passes=6,
+            use_nsimplify=True,
+            use_identities=True,
+            n_features=1,
+        )
+        if simplified and simplified not in {"N/A", "ERROR", "?"}:
+            return str(simplified)
+    except Exception:
+        return None
+    return None
+
+
 def _postprocess_formula(formula: str) -> str:
     """Apply the same simplify_formula pipeline used by fast-path outputs.
     
@@ -483,6 +508,13 @@ def _postprocess_formula(formula: str) -> str:
     normalized = _normalize_formula_text(formula)
     if not normalized or normalized in {"N/A", "ERROR", "?"}:
         return normalized
+
+    evo_int_tol = 0.05
+    evo_zero_tol = 1e-3
+
+    native = _simplify_formula_native(normalized, evo_int_tol, evo_zero_tol)
+    if native is not None:
+        return native
 
     try:
         try:
@@ -799,6 +831,7 @@ def run_formula(
                 exact_match_threads=1,
                 exact_match_enabled=True,
                 exact_match_max_basis=150,
+                simplify_formula_output=False,
             )
             elapsed = time.time() - t0
 
@@ -806,7 +839,7 @@ def run_formula(
                 result["error"] = "fast_path_not_applicable"
                 result["time"] = elapsed
             else:
-                result["formula_discovered"] = fp_result.get("formula", "")
+                result["formula_discovered"] = _postprocess_formula(fp_result.get("formula", ""))
                 result["mse_raw"] = fp_result.get("mse", float("inf"))
                 result["mse_display"] = _evaluate_formula_mse(result["formula_discovered"], x_np, y_np)
                 result["mse"] = _select_score_mse(result["mse_display"])
@@ -902,6 +935,12 @@ def run_formula(
                                     operator_hints["operators"].add(op)
                         proposer_skeletons = payload.get("candidate_skeletons", [])
                         candidate_formulas = []
+                        if fp_result and fp_result.get("formula"):
+                            candidate_formulas.append({
+                                "formula": fp_result["formula"],
+                                "mse": fp_result.get("mse", float("inf")),
+                                "from_fast_path": True,
+                            })
                         for cand in proposer_skeletons:
                             f_str = cand.get("formula", "")
                             if f_str:
@@ -918,6 +957,13 @@ def run_formula(
                             print(f"  [Universal Proposer] Difficulty: {difficulty:.2f} -> Allocated Budget: {dynamic_gens} gens, {dynamic_pop} pop")
                 except Exception as e:
                     print(f"\n  [Universal Proposer] Warning: execution failed: {e}")
+
+            if candidate_formulas is None and fp_result and fp_result.get("formula"):
+                candidate_formulas = [{
+                    "formula": fp_result["formula"],
+                    "mse": fp_result.get("mse", float("inf")),
+                    "from_fast_path": True,
+                }]
 
             t1 = time.time()
             try:
@@ -1291,7 +1337,7 @@ Examples:
         """,
     )
     parser.add_argument(
-        "--classifier-model", type=str, default="models/curve_classifier_wide.pt",
+        "--classifier-model", type=str, default="models/curve_classifier_glu_fixed.pt",
         help="Path to the curve classifier model (default: models/curve_classifier_wide.pt)",
     )
     parser.add_argument(

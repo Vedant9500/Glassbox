@@ -2203,7 +2203,7 @@ def run_fast_path(
                 )
                 simplified_formula = snapped_formula
                 if simplification_log:
-                    print(f"  [Post] Formula simplified using fast snap-only mode to bypass SymPy bottleneck.")
+                    print(f"  [Post] Formula simplified using fast snap-only mode (no symbolic algebra) to bypass SymPy bottleneck.")
             else:
                 snapped_formula, simplified_expr = simplify_onn_formula(
                     formula,
@@ -2215,7 +2215,10 @@ def run_fast_path(
 
             if simplification_log:
                 print(f"  [Post] Snapped: {snapped_formula}")
-                print(f"  [Post] Simplified: {simplified_formula}")
+                if too_complex_for_symbolic:
+                    print(f"  [Post] Simplified (snap-only): {simplified_formula}")
+                else:
+                    print(f"  [Post] Simplified: {simplified_formula}")
 
             formula = simplified_formula
             simplification_info = {
@@ -2506,6 +2509,27 @@ def bias_onn_toward_operators(model, operator_hints: Dict, bias_strength: float 
                             # Set omega to average detected frequency
                             avg_freq = sum(frequencies) / len(frequencies)
                             op.omega.data.fill_(avg_freq)
+
+
+def _build_cpp_seed_graphs(
+    candidate_formulas: Optional[List[Dict]],
+    max_seeds: int = 10,
+) -> List[Dict]:
+    """Convert fast-path / proposer formula strings into C++ seed graph dicts."""
+    if not candidate_formulas:
+        return []
+    try:
+        from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_candidates
+    except ImportError:
+        import sys
+        from pathlib import Path as _Path
+
+        _cpp_dir = _Path(__file__).resolve().parent.parent / "glassbox" / "sr" / "cpp"
+        if str(_cpp_dir) not in sys.path:
+            sys.path.insert(0, str(_cpp_dir))
+        from seed_graph_builder import build_seed_graphs_from_candidates  # type: ignore
+
+    return build_seed_graphs_from_candidates(candidate_formulas, max_seeds=max_seeds)
 
 
 def beam_search_evolution(
@@ -2904,6 +2928,21 @@ def beam_search_evolution(
     import multiprocessing
     max_physical_threads = multiprocessing.cpu_count()
 
+    # Seed first fraction of each island population from proposer / fast-path skeletons.
+    seed_graphs_py = _build_cpp_seed_graphs(
+        candidate_formulas,
+        max_seeds=min(12, max(3, len(candidate_formulas or []) + 1)),
+    )
+    if seed_graphs_py:
+        preview = []
+        for cand in (candidate_formulas or [])[:3]:
+            f = str(cand.get("formula", "") or "")
+            if f:
+                preview.append(f[:60] + ("..." if len(f) > 60 else ""))
+        print(f"  Evolution seeds: {len(seed_graphs_py)} graph(s) from candidates")
+        if preview:
+            print(f"    e.g. {preview[0]}")
+
     try:
         result = _core.run_evolution(
             X_list=X_list,
@@ -2918,7 +2957,8 @@ def beam_search_evolution(
             p_max=adaptive_p_max,
             multi_op_priors=multi_op_priors,
             multi_seed_omegas=multi_seed_omegas,
-            num_threads=max_physical_threads, # Use all available cores via OpenMP
+            num_threads=max_physical_threads,  # Use all available cores via OpenMP
+            seed_graphs_py=seed_graphs_py,
         )
     except Exception as e:
         print(f"  \u274c Native Island Search failed: {e}")

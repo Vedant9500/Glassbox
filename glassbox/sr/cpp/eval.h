@@ -306,9 +306,34 @@ inline double evaluate_fitness(IndividualGraph& graph, const std::vector<Eigen::
     return mse;
 }
 
-// Convert a node subtree to string
-inline std::string format_node_to_string(const IndividualGraph& graph, int node_idx, int n_inputs) {
+// Convert a node subtree to string. The extra guard state prevents malformed
+// graphs from recursing forever while formatting.
+inline std::string format_node_to_string(
+    const IndividualGraph& graph,
+    int node_idx,
+    int n_inputs,
+    std::vector<unsigned char>* visiting_ptr = nullptr,
+    int depth = 0
+) {
     if (node_idx < 0 || node_idx >= graph.nodes.size()) return "0";
+    if (depth > static_cast<int>(graph.nodes.size()) + 8) return "0";
+
+    std::vector<unsigned char> owned_visiting;
+    if (visiting_ptr == nullptr) {
+        owned_visiting.assign(graph.nodes.size(), 0);
+        visiting_ptr = &owned_visiting;
+    }
+    if (visiting_ptr->size() != graph.nodes.size()) {
+        visiting_ptr->assign(graph.nodes.size(), 0);
+    }
+    if ((*visiting_ptr)[node_idx]) return "0";
+    (*visiting_ptr)[node_idx] = 1;
+    struct VisitGuard {
+        std::vector<unsigned char>& visiting;
+        int idx;
+        ~VisitGuard() { visiting[idx] = 0; }
+    } guard{*visiting_ptr, node_idx};
+
     const auto& node = graph.nodes[node_idx];
     
     char buf[256];
@@ -324,7 +349,7 @@ inline std::string format_node_to_string(const IndividualGraph& graph, int node_
             snprintf(buf, sizeof(buf), "%.4g", node.value);
             return std::string(buf);
         case NodeType::Unary: {
-            std::string child_str = format_node_to_string(graph, node.left_child, n_inputs);
+            std::string child_str = format_node_to_string(graph, node.left_child, n_inputs, visiting_ptr, depth + 1);
             switch (node.unary_op) {
                 case UnaryOp::Periodic: {
                     // Build clean periodic string: [amp*]sin([omega*]child[ + phi])
@@ -417,8 +442,8 @@ inline std::string format_node_to_string(const IndividualGraph& graph, int node_
             break;
         }
         case NodeType::Binary: {
-            std::string l_str = format_node_to_string(graph, node.left_child, n_inputs);
-            std::string r_str = format_node_to_string(graph, node.right_child, n_inputs);
+            std::string l_str = format_node_to_string(graph, node.left_child, n_inputs, visiting_ptr, depth + 1);
+            std::string r_str = format_node_to_string(graph, node.right_child, n_inputs, visiting_ptr, depth + 1);
             
             switch (node.binary_op) {
                 case BinaryOp::Arithmetic: {
@@ -464,12 +489,21 @@ inline std::string format_node_to_string(const IndividualGraph& graph, int node_
 
 // Convert entire graph to formula string
 inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs) {
-    if (graph.nodes.empty()) return "0";
+    char buf[256];
+    if (graph.nodes.empty()) {
+        if (std::abs(graph.output_bias) <= 1e-4) return "0";
+        double abs_bias = std::abs(graph.output_bias);
+        if (std::abs(abs_bias - std::round(abs_bias)) < 1e-6) {
+            snprintf(buf, sizeof(buf), "%s%d", graph.output_bias < 0 ? "-" : "", (int)std::round(abs_bias));
+        } else {
+            snprintf(buf, sizeof(buf), "%s%.4g", graph.output_bias < 0 ? "-" : "", abs_bias);
+        }
+        return std::string(buf);
+    }
     
     std::string final_formula = "";
     bool first = true;
     
-    char buf[256];
     for (size_t i = 0; i < graph.output_weights.size() && i < graph.nodes.size(); ++i) {
         double w = graph.output_weights[i];
         if (std::abs(w) > 1e-4) {

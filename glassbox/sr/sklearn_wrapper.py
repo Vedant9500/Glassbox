@@ -398,18 +398,31 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if not formula or not self.use_simplification:
             return formula
         try:
-            from simplify_formula import simplify_onn_formula
-            _, simplified_expr = simplify_onn_formula(
+            from glassbox.sr.cpp import _core
+            simplified = _core.simplify_formula(
                 formula,
                 int_tol=self.simplification_int_tol,
                 zero_tol=self.simplification_zero_tol,
-                use_nsimplify=True,
                 max_passes=6,
+                use_nsimplify=True,
                 use_identities=True,
+                n_features=self.n_features_in_
             )
-            return str(simplified_expr)
+            return simplified
         except Exception:
-            return formula
+            try:
+                from simplify_formula import simplify_onn_formula
+                _, simplified_expr = simplify_onn_formula(
+                    formula,
+                    int_tol=self.simplification_int_tol,
+                    zero_tol=self.simplification_zero_tol,
+                    use_nsimplify=True,
+                    max_passes=6,
+                    use_identities=True,
+                )
+                return str(simplified_expr)
+            except Exception:
+                return formula
 
     def _detect_frequencies(self, X, y):
         """Detect dominant frequencies via FFT, with optional phase info."""
@@ -583,6 +596,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             else:
                 evo_formula = None
                 evo_mse = float('inf')
+                candidate_formulas = None
 
                 # Try guided evolution (beam search) only if R² is low
                 if (self.use_guided_evolution and operator_hints
@@ -602,48 +616,47 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         hints['has_exp_decay'] = bool(hints.get('has_exp_decay', False))
                         hints['active_terms'] = list(hints.get('active_terms', []))
 
+                        candidate_formulas = []
+                        if best_formula:
+                            candidate_formulas.append({
+                                "formula": best_formula,
+                                "mse": best_mse or float("inf"),
+                                "from_fast_path": True,
+                            })
+
                         # Blend proposer priors into hints if available
                         if self.universal_proposer_fpip_v2_ and self.universal_proposer_fpip_v2_.get("valid"):
                             proposer_priors = self.universal_proposer_fpip_v2_.get("operator_priors", {})
                             if proposer_priors:
-                                # Overwrite or augment fast-path hints with neural proposer priors
                                 if "operators" not in hints:
                                     hints["operators"] = set()
                                 for op, prob in proposer_priors.items():
-                                    if prob > 0.15: # threshold for active inclusion
+                                    if prob > 0.15:
                                         hints["operators"].add(op)
-                            
-                            # Prepare skeletons as candidate formulas
-                            proposer_skeletons = self.universal_proposer_fpip_v2_.get("candidate_skeletons", [])
-                            candidate_formulas = []
-                            
-                            # Always include the fast-path result for refinement
-                            if best_formula:
-                                candidate_formulas.append({
-                                    "formula": best_formula,
-                                    "mse": best_mse or float('inf'),
-                                    "from_fast_path": True
-                                })
 
-                            for cand in proposer_skeletons:
+                            for cand in self.universal_proposer_fpip_v2_.get("candidate_skeletons", []):
                                 formula_str = cand.get("formula", "")
                                 if formula_str:
-                                    # Very basic heuristic to mimic 'active_terms' for the beam search
-                                    active_terms = [t.strip() for t in formula_str.replace("-", "+").split("+") if t.strip()]
+                                    active_terms = [
+                                        t.strip()
+                                        for t in formula_str.replace("-", "+").split("+")
+                                        if t.strip()
+                                    ]
                                     candidate_formulas.append({
                                         "formula": formula_str,
                                         "mse": cand.get("mse", float("inf")),
                                         "score": cand.get("score", 0.0),
                                         "active_terms": active_terms,
-                                        "from_proposer": True
+                                        "from_proposer": True,
                                     })
-                        else:
+
+                        if not candidate_formulas:
                             candidate_formulas = None
 
                         # Check if any proposer skeleton is ALREADY a very good fit
                         # to avoid launching evolution if we just need minor constant refinement.
                         best_cand_mse = float('inf')
-                        for cand in candidate_formulas:
+                        for cand in (candidate_formulas or []):
                             if cand.get('mse', float('inf')) < best_cand_mse:
                                 best_cand_mse = cand['mse']
                         
@@ -696,6 +709,22 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                     pp.get("log", 0.05)
                                 ]
 
+                        seed_graphs_py = []
+                        try:
+                            from glassbox.sr.cpp.seed_graph_builder import (
+                                build_seed_graphs_from_candidates,
+                            )
+
+                            seed_graphs_py = build_seed_graphs_from_candidates(
+                                candidate_formulas if candidate_formulas else (
+                                    [{"formula": best_formula, "mse": best_mse}]
+                                    if best_formula else None
+                                ),
+                                max_seeds=10,
+                            )
+                        except Exception:
+                            seed_graphs_py = []
+
                         for run_idx in range(n_runs):
                             remaining = max(0.0, effective_timeout - _elapsed())
                             if remaining <= 0.0:
@@ -726,6 +755,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 migration_size=self.migration_size,
                                 arithmetic_temperature=self.arithmetic_temperature,
                                 random_seed=run_seed,
+                                seed_graphs_py=seed_graphs_py,
                             )
 
                             raw_mse = result.get('best_mse', float('inf'))
@@ -797,91 +827,96 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return formula_str
             
         try:
-            import sympy as sp
-            from sympy.parsing.sympy_parser import parse_expr
-            from sklearn.linear_model import LinearRegression
-            
-            expr = parse_expr(formula_str.replace('^', '**'))
-            terms = list(sp.Add.make_args(expr))
-            
-            if len(terms) <= 1 or len(terms) > 20:
-                return formula_str
-
-            term_funcs = []
-            x_syms = [sp.Symbol(f"x{i}") for i in range(self.n_features_in_)]
-            syms = x_syms + [sp.Symbol('x')]
-            
-            for t in terms:
-                fn = sp.lambdify(syms, t, modules=['numpy'])
-                term_funcs.append(fn)
+            from glassbox.sr.cpp import _core
+            X_list = [X[:, j] for j in range(self.n_features_in_)]
+            return _core.reduce_formula_noise(formula_str, X_list, y)
+        except Exception:
+            try:
+                import sympy as sp
+                from sympy.parsing.sympy_parser import parse_expr
+                from sklearn.linear_model import LinearRegression
                 
-            N = len(y)
-            Z = np.zeros((N, len(terms)))
-            
-            for i, fn in enumerate(term_funcs):
-                args = [X[:, j] for j in range(self.n_features_in_)]
-                args.append(X[:, 0]) # for 'x' fallback
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    val = fn(*args)
-                if isinstance(val, (int, float)):
-                    Z[:, i] = np.full(N, val)
-                else:
-                    Z[:, i] = val
+                expr = parse_expr(formula_str.replace('^', '**'))
+                terms = list(sp.Add.make_args(expr))
+                
+                if len(terms) <= 1 or len(terms) > 20:
+                    return formula_str
+
+                term_funcs = []
+                x_syms = [sp.Symbol(f"x{i}") for i in range(self.n_features_in_)]
+                syms = x_syms + [sp.Symbol('x')]
+                
+                for t in terms:
+                    fn = sp.lambdify(syms, t, modules=['numpy'])
+                    term_funcs.append(fn)
                     
-            def get_bic(mask):
-                if not np.any(mask):
-                    return float('inf'), None
-                Z_sub = Z[:, mask]
-                with warnings.catch_warnings():
-                    warnings.simplefilter('ignore')
-                    model = LinearRegression(fit_intercept=False).fit(Z_sub, y)
-                    preds = model.predict(Z_sub)
-                mse = np.mean((y - preds)**2)
-                if mse < 1e-15:
-                    mse = 1e-15
-                k = np.sum(mask)
-                return N * np.log(mse) + k * np.log(N), model.coef_
-
-            current_mask = np.ones(len(terms), dtype=bool)
-            best_bic, best_coef = get_bic(current_mask)
-            
-            while np.sum(current_mask) > 1:
-                best_drop_idx = -1
-                best_drop_bic = best_bic
-                best_drop_coef = best_coef
+                N = len(y)
+                Z = np.zeros((N, len(terms)))
                 
-                for i in range(len(terms)):
-                    if current_mask[i]:
-                        test_mask = current_mask.copy()
-                        test_mask[i] = False
-                        bic, coef = get_bic(test_mask)
+                for i, fn in enumerate(term_funcs):
+                    args = [X[:, j] for j in range(self.n_features_in_)]
+                    args.append(X[:, 0]) # for 'x' fallback
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        val = fn(*args)
+                    if isinstance(val, (int, float)):
+                        Z[:, i] = np.full(N, val)
+                    else:
+                        Z[:, i] = val
                         
-                        if bic < best_drop_bic:
-                            best_drop_bic = bic
-                            best_drop_idx = i
-                            best_drop_coef = coef
+                def get_bic(mask):
+                    if not np.any(mask):
+                        return float('inf'), None
+                    Z_sub = Z[:, mask]
+                    with warnings.catch_warnings():
+                        warnings.simplefilter('ignore')
+                        model = LinearRegression(fit_intercept=False).fit(Z_sub, y)
+                        preds = model.predict(Z_sub)
+                    mse = np.mean((y - preds)**2)
+                    if mse < 1e-15:
+                        mse = 1e-15
+                    k = np.sum(mask)
+                    return N * np.log(mse) + k * np.log(N), model.coef_
+
+                current_mask = np.ones(len(terms), dtype=bool)
+                best_bic, best_coef = get_bic(current_mask)
+                
+                while np.sum(current_mask) > 1:
+                    best_drop_idx = -1
+                    best_drop_bic = best_bic
+                    best_drop_coef = best_coef
+                    
+                    for i in range(len(terms)):
+                        if current_mask[i]:
+                            test_mask = current_mask.copy()
+                            test_mask[i] = False
+                            bic, coef = get_bic(test_mask)
                             
-                if best_drop_idx != -1:
-                    current_mask[best_drop_idx] = False
-                    best_bic = best_drop_bic
-                    best_coef = best_drop_coef
-                else:
-                    break
-                    
-            final_terms = []
-            coef_idx = 0
-            for i, t in enumerate(terms):
-                if current_mask[i]:
-                    c = best_coef[coef_idx]
-                    if abs(c) > 1e-8:
-                        final_terms.append(c * t)
-                    coef_idx += 1
-                    
-            if not final_terms:
-                return "0"
-            return str(sum(final_terms))
-            
-        except Exception as e:
-            print(f"  [Noise Reduction Skipped: {e}]")
-            return formula_str
+                            if bic < best_drop_bic:
+                                best_drop_bic = bic
+                                best_drop_idx = i
+                                best_drop_coef = coef
+                                
+                    if best_drop_idx != -1:
+                        current_mask[best_drop_idx] = False
+                        best_bic = best_drop_bic
+                        best_coef = best_drop_coef
+                    else:
+                        break
+                        
+                final_terms = []
+                coef_idx = 0
+                for i, t in enumerate(terms):
+                    if current_mask[i]:
+                        c = best_coef[coef_idx]
+                        if abs(c) > 1e-8:
+                            final_terms.append(c * t)
+                        coef_idx += 1
+                        
+                if not final_terms:
+                    return "0"
+                return str(sum(final_terms))
+                
+            except Exception as e:
+                print(f"  [Noise Reduction Fallback Skipped: {e}]")
+                return formula_str
