@@ -76,7 +76,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         cv_skip_guard_max_r2_std=0.03,
         cv_skip_guard_min_samples=45,
         use_universal_proposer="auto",
-        universal_proposer_path="models/universal_proposer_v1.pt",
+        universal_proposer_path="models/universal_proposer_robust.pt",
         universal_proposer_shadow_mode="auto",
         universal_proposer_log_routing=True,
         universal_proposer_top_k=5,
@@ -205,6 +205,18 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return str(repo_path)
         return str(p)
 
+    def _resolve_universal_proposer_path(self):
+        """Resolve proposer checkpoint path relative to repo root with fallback."""
+        candidates = [self.universal_proposer_path, "models/universal_proposer_robust.pt"]
+        for candidate in candidates:
+            p = Path(candidate)
+            if p.is_absolute() and p.exists():
+                return str(p)
+            repo_path = _REPO_ROOT / candidate
+            if repo_path.exists():
+                return str(repo_path)
+        return str(Path(self.universal_proposer_path))
+
     def _safe_eval_formula_array(self, formula, X):
         """Safely evaluate a symbolic formula over a feature matrix."""
         def _safe_log(x):
@@ -228,6 +240,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "sqrt": _safe_sqrt,
             "abs": np.abs,
             "Abs": np.abs,
+            "sign": np.sign,
             "pi": np.pi,
             "E": np.e,
         }
@@ -336,19 +349,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return None, False
 
         try:
-            from .universal_proposer import (
+            from glassbox.universal_proposer import (
                 load_universal_proposer_checkpoint,
                 propose_fpip_v2_from_xy,
             )
 
             if self._universal_proposer_model is None:
-                model_path = Path(self.universal_proposer_path)
-                if not model_path.is_absolute():
-                    model_path = _REPO_ROOT / model_path
-                self._universal_proposer_model = load_universal_proposer_checkpoint(
-                    str(model_path),
-                    device=self.device,
-                )
+                model_path = self._resolve_universal_proposer_path()
+                self._universal_proposer_model = load_universal_proposer_checkpoint(model_path, device=self.device)
 
             x1 = np.asarray(X[:, 0], dtype=np.float64)
             y1 = np.asarray(y, dtype=np.float64).reshape(-1)
@@ -370,11 +378,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 device=self.device,
             )
 
+            if not payload:
+                self.universal_proposer_status_ = "error:empty_payload"
+                if self.universal_proposer_log_routing:
+                    print("  [Proposer skipped: empty payload]")
+                return None, False
+
             self.universal_proposer_status_ = "ok"
             self.universal_proposer_fpip_v2_ = payload
 
             if self.universal_proposer_log_routing:
-                route = payload.get("routing_signal", {})
+                route = payload.get("routing_signal") or {}
                 print(
                     "  [Proposer] "
                     f"guided={route.get('recommend_guided_evolution')} "
@@ -491,7 +505,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 if fp_result and fp_result.get('formula'):
                     best_formula = fp_result['formula']
                     best_mse = fp_result.get('mse', float('inf'))
-                    operator_hints = fp_result.get('operator_hints', {})
+                    operator_hints = fp_result.get('operator_hints') or {}
                     # Stash for uncertainty-coupled budget routing and candidate seeding
                     self._fp_result = fp_result
             except Exception as e:
@@ -659,14 +673,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             # Pass proposer uncertainty to guide beam count
                             p_unc = self.universal_proposer_fpip_v2_.get("sequence_uncertainty", {})
                             confidence = 1.0 - p_unc.get("entropy", 0.5)
-
                             guided_result = run_guided_evolution(
                                 x_t, y_t, hints,
                                 generations=min(40, self.generations // 10),
                                 population_size=min(30, self.population_size),
                                 device=self.device or "cpu",
                                 candidate_formulas=candidate_formulas,
-                                confidence=confidence, # New parameter
+                                confidence=confidence,  # New parameter
                             )
 
                             if guided_result and guided_result.get('formula'):

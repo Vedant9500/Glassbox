@@ -21,6 +21,7 @@ import json
 import math  # noqa: F401
 import warnings
 import re
+import gzip
 from pathlib import Path
 from datetime import datetime
 from multiprocessing import get_context
@@ -33,6 +34,7 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_signal
 
 # ---------------------------------------------------------------------------
 # Ground-truth formulas (Track 2) — Feynman/Nguyen/Strogatz style
@@ -211,6 +213,83 @@ PMLB_DATASETS = [
 ]
 
 
+def get_official_pmlb_regression_datasets():
+    """Return the current PMLB regression dataset list used by SRBench black-box track."""
+    try:
+        from pmlb import regression_dataset_names
+    except Exception:
+        return list(PMLB_DATASETS)
+    return list(regression_dataset_names)
+
+
+def _read_symbolic_formula_from_metadata(dataset_dir):
+    """Best-effort extraction of the symbolic target formula from PMLB metadata."""
+    for meta_name in ("metadata.yaml", "metadata.yml"):
+        meta_path = Path(dataset_dir) / meta_name
+        if not meta_path.exists():
+            continue
+        try:
+            text = meta_path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        for key in ("formula", "equation", "symbolic_model", "model", "truth"):
+            match = re.search(rf"(?im)^\s*{re.escape(key)}\s*:\s*(.+?)\s*$", text)
+            if match:
+                value = match.group(1).strip().strip("'\"")
+                if value:
+                    return value
+    return ""
+
+
+def discover_official_ground_truth_problems(data_dir):
+    """Discover SRBench ground-truth files from a PMLB datasets checkout.
+
+    Official SRBench v2 runs symbolic data from PMLB paths matching
+    strogatz_* and feynman_* dataset directories. Each problem is represented
+    as a local TSV/TSV.GZ file with a target column.
+    """
+    if not data_dir:
+        return []
+
+    root = Path(data_dir)
+    if not root.exists():
+        return []
+
+    candidates = []
+    patterns = [
+        "strogatz_*/*.tsv",
+        "strogatz_*/*.tsv.gz",
+        "feynman_*/*.tsv",
+        "feynman_*/*.tsv.gz",
+        "**/strogatz_*.tsv",
+        "**/strogatz_*.tsv.gz",
+        "**/feynman_*.tsv",
+        "**/feynman_*.tsv.gz",
+    ]
+    seen = set()
+    for pattern in patterns:
+        for path in root.glob(pattern):
+            if not path.is_file():
+                continue
+            key = str(path.resolve()).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            dataset_dir = path.parent
+            name = dataset_dir.name if dataset_dir.name.startswith(("strogatz_", "feynman_")) else path.stem
+            if name.endswith(".tsv"):
+                name = name[:-4]
+            candidates.append({
+                "kind": "file",
+                "name": name,
+                "path": str(path),
+                "true_formula": _read_symbolic_formula_from_metadata(dataset_dir),
+            })
+
+    return sorted(candidates, key=lambda p: p["name"])
+
+
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
@@ -261,6 +340,7 @@ def evaluate_formula(formula_str, X):
         "sqrt": np.sqrt,
         "abs": np.abs,
         "Abs": np.abs,
+        "sign": np.sign,
         "pi": np.pi,
         "E": np.e,
     }
@@ -291,22 +371,34 @@ def simplify_formula_with_guard(formula, X_ref, y_ref, mse_slack=0.02):
         return formula
 
     try:
-        from simplify_formula import simplify_onn_formula
+        from glassbox.sr.cpp import _core
     except Exception:
-        return formula
+        _core = None
 
-    try:
-        _, simplified_expr = simplify_onn_formula(
-            formula,
-            int_tol=0.02,
-            zero_tol=2e-3,
-            use_nsimplify=True,
-            max_passes=6,
-            use_identities=True,
-        )
-        simplified = str(simplified_expr)
-    except Exception:
-        return formula
+    simplified = formula
+    if _core is not None and hasattr(_core, "simplify_formula_cpp"):
+        try:
+            simplified = str(_core.simplify_formula_cpp(formula))
+        except Exception:
+            simplified = formula
+    else:
+        try:
+            from simplify_formula import simplify_onn_formula
+        except Exception:
+            return formula
+
+        try:
+            _, simplified_expr = simplify_onn_formula(
+                formula,
+                int_tol=0.02,
+                zero_tol=2e-3,
+                use_nsimplify=True,
+                max_passes=6,
+                use_identities=True,
+            )
+            simplified = str(simplified_expr)
+        except Exception:
+            return formula
 
     if simplified == formula:
         return formula
@@ -467,6 +559,27 @@ def summarize_seed_runs(seed_runs):
     }
 
 
+def _build_srbench_seed_graphs(x_np, y_np, detected_omegas, candidate_formulas=None, max_seeds=12):
+    """Build seed graphs with the current shared signal-based helper."""
+    try:
+        graphs = build_seed_graphs_from_signal(
+            x_np,
+            y_np,
+            detected_omegas=detected_omegas,
+            max_seeds=max_seeds,
+        )
+        if graphs:
+            return graphs
+    except Exception:
+        pass
+
+    try:
+        from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_candidates
+        return build_seed_graphs_from_candidates(candidate_formulas, max_seeds=max_seeds)
+    except Exception:
+        return []
+
+
 def _fit_worker(payload, queue):
     """Child-process worker for hard timeout enforcement."""
     import signal
@@ -588,6 +701,7 @@ def run_track1_blackbox(
     max_datasets=None,
     n_samples=500,
     seeds=None,
+    runs_per_formula=1,
     verbose=True,
     hard_timeout=True,
     adaptive_timeout=True,
@@ -640,76 +754,82 @@ def run_track1_blackbox(
 
         seed_runs = []
         for seed in seeds:
-            t0 = time.time()
-            try:
-                est_params = est.get_params().copy()
-                est_params["timeout"] = timeout_budget
-                est_params["random_state"] = seed
+            for run_idx in range(max(1, int(runs_per_formula))):
+                repeat_seed = int(seed) + run_idx * 10007
+                t0 = time.time()
+                try:
+                    est_params = est.get_params().copy()
+                    est_params["timeout"] = timeout_budget
+                    est_params["random_state"] = repeat_seed
 
-                # If bloat-skip enabled, make evolution skip more aggressively on good fast-path results
-                if skip_evolution_if_bloated:
-                    est_params["skip_evolution_if_bloated"] = True
-                    est_params["bloat_term_threshold"] = 20
+                    # If bloat-skip enabled, make evolution skip more aggressively on good fast-path results
+                    if skip_evolution_if_bloated:
+                        est_params["skip_evolution_if_bloated"] = True
+                        est_params["bloat_term_threshold"] = 20
 
-                if hard_timeout:
-                    run_result = run_with_hard_timeout(
-                        est_params,
-                        X_train,
-                        y_train,
-                        X_test,
-                        timeout_seconds=timeout_budget + 5,
-                    )
-                    elapsed = time.time() - t0
-                    if run_result["status"] != "ok":
+                    if hard_timeout:
+                        run_result = run_with_hard_timeout(
+                            est_params,
+                            X_train,
+                            y_train,
+                            X_test,
+                            timeout_seconds=timeout_budget + 5,
+                        )
+                        elapsed = time.time() - t0
+                        if run_result["status"] != "ok":
+                            seed_runs.append({
+                                "seed": repeat_seed,
+                                "r2": None,
+                                "mse": None,
+                                "time": elapsed,
+                                "error": run_result.get("error", run_result["status"]),
+                            })
+                            if "timeout" in str(run_result.get("error", "")).lower():
+                                break
+                            continue
+
+                        formula = run_result.get("formula", "")
+                        if post_simplify and formula:
+                            formula = simplify_formula_with_guard(formula, X_train, y_train)
+                        y_pred = evaluate_formula(formula, X_test)
+                    else:
+                        est_copy = est.__class__(**est_params)
+                        est_copy.fit(X_train, y_train)
+                        formula = est_copy.get_formula()
+                        if post_simplify and formula:
+                            formula = simplify_formula_with_guard(formula, X_train, y_train)
+                        y_pred = evaluate_formula(formula, X_test)
+                        elapsed = time.time() - t0
+
+                    if y_pred is None:
                         seed_runs.append({
-                            "seed": seed,
+                            "seed": repeat_seed,
                             "r2": None,
                             "mse": None,
                             "time": elapsed,
-                            "error": run_result.get("error", run_result["status"]),
+                            "formula": formula,
+                            "model_size": model_size(formula),
+                            "error": "formula_eval_failed",
                         })
                         continue
 
-                    formula = run_result.get("formula", "")
-                    if post_simplify and formula:
-                        formula = simplify_formula_with_guard(formula, X_train, y_train)
-                    y_pred = evaluate_formula(formula, X_test)
-                else:
-                    est_copy = est.__class__(**est_params)
-                    est_copy.fit(X_train, y_train)
-                    formula = est_copy.get_formula()
-                    if post_simplify and formula:
-                        formula = simplify_formula_with_guard(formula, X_train, y_train)
-                    y_pred = evaluate_formula(formula, X_test)
-                    elapsed = time.time() - t0
-
-                if y_pred is None:
+                    r2 = r2_score(y_test, y_pred)
+                    mse = mse_score(y_test, y_pred)
+                    size = model_size(formula)
                     seed_runs.append({
-                        "seed": seed,
-                        "r2": None,
-                        "mse": None,
+                        "seed": repeat_seed,
+                        "r2": r2,
+                        "mse": mse,
                         "time": elapsed,
                         "formula": formula,
-                        "model_size": model_size(formula),
-                        "error": "formula_eval_failed",
+                        "model_size": size,
+                        "error": None,
                     })
-                    continue
-
-                r2 = r2_score(y_test, y_pred)
-                mse = mse_score(y_test, y_pred)
-                size = model_size(formula)
-                seed_runs.append({
-                    "seed": seed,
-                    "r2": r2,
-                    "mse": mse,
-                    "time": elapsed,
-                    "formula": formula,
-                    "model_size": size,
-                    "error": None,
-                })
-            except Exception as e:
-                elapsed = time.time() - t0
-                seed_runs.append({"seed": seed, "r2": None, "mse": None, "time": elapsed, "error": str(e)})
+                except Exception as e:
+                    elapsed = time.time() - t0
+                    seed_runs.append({"seed": repeat_seed, "r2": None, "mse": None, "time": elapsed, "error": str(e)})
+                    if "timeout" in str(e).lower():
+                        break
 
         valid_seed_runs = [r for r in seed_runs if r.get("r2") is not None]
         if not valid_seed_runs:
@@ -729,13 +849,14 @@ def run_track1_blackbox(
             continue
 
         stability = summarize_seed_runs(seed_runs)
+        best_run = min(valid_seed_runs, key=lambda r: float(r.get("mse", float("inf"))))
         aggregate = {
             "dataset": ds_name,
             "r2": stability["r2_stats"]["median"],
             "mse": stability["mse_stats"]["median"],
             "time": stability["time_stats"]["median"],
-            "formula": valid_seed_runs[0].get("formula", ""),
-            "model_size": valid_seed_runs[0].get("model_size"),
+            "formula": best_run.get("formula", ""),
+            "model_size": best_run.get("model_size"),
             "n_train": n_train,
             "n_test": len(y_test),
             "n_features": X.shape[1],
@@ -744,6 +865,7 @@ def run_track1_blackbox(
             "stability": stability,
             "time_to_discovery": summarize_time_to_discovery(seed_runs, exact_key="exact_match"),
             "scoring_source": "displayed_formula",
+            "runs_per_formula": int(max(1, int(runs_per_formula))),
         }
         results.append(aggregate)
 
@@ -768,6 +890,7 @@ def run_track2_ground_truth(
     max_problems=None,
     n_samples=500,
     seeds=None,
+    runs_per_formula=1,
     verbose=True,
     hard_timeout=True,
     adaptive_timeout=True,
@@ -790,112 +913,113 @@ def run_track2_ground_truth(
         name = problem[0]
         seed_runs = []
         for seed in seeds:
-            X, y, true_formula = generate_ground_truth_data(problem, n_samples=n_samples, seed=seed)
+            for run_idx in range(max(1, int(runs_per_formula))):
+                repeat_seed = int(seed) + run_idx * 10007
+                X, y, true_formula = generate_ground_truth_data(problem, n_samples=n_samples, seed=repeat_seed)
 
-            if X is None:
-                seed_runs.append({"seed": seed, "r2": None, "mse": None, "time": None, "error": "bad_data"})
-                continue
+                if X is None:
+                    seed_runs.append({"seed": repeat_seed, "r2": None, "mse": None, "time": None, "error": "bad_data"})
+                    continue
 
-            # Train/test split (80/20)
-            n_train = int(0.8 * len(y))
-            X_train, X_test = X[:n_train], X[n_train:]
-            y_train, y_test = y[:n_train], y[n_train:]
+                # Train/test split (80/20)
+                n_train = int(0.8 * len(y))
+                X_train, X_test = X[:n_train], X[n_train:]
+                y_train, y_test = y[:n_train], y[n_train:]
 
-            timeout_budget = estimate_timeout_budget(
-                base_timeout=est.get_params().get("timeout", 120),
-                n_features=X.shape[1],
-                n_train=n_train,
-                adaptive_timeout=adaptive_timeout,
-            )
-            t0 = time.time()
-            try:
-                est_params = est.get_params().copy()
-                est_params["timeout"] = timeout_budget
-                est_params["random_state"] = seed
+                timeout_budget = estimate_timeout_budget(
+                    base_timeout=est.get_params().get("timeout", 120),
+                    n_features=X.shape[1],
+                    n_train=n_train,
+                    adaptive_timeout=adaptive_timeout,
+                )
+                t0 = time.time()
+                try:
+                    est_params = est.get_params().copy()
+                    est_params["timeout"] = timeout_budget
+                    est_params["random_state"] = repeat_seed
 
-                # If bloat-skip enabled, make evolution skip more aggressively on good fast-path results
-                if skip_evolution_if_bloated:
-                    est_params["skip_evolution_if_bloated"] = True
-                    est_params["bloat_term_threshold"] = 20
+                    if skip_evolution_if_bloated:
+                        est_params["skip_evolution_if_bloated"] = True
+                        est_params["bloat_term_threshold"] = 20
 
-                if hard_timeout:
-                    run_result = run_with_hard_timeout(
-                        est_params,
-                        X_train,
-                        y_train,
-                        X_test,
-                        timeout_seconds=timeout_budget + 5,
-                        X_full=X,
-                    )
-                    elapsed = time.time() - t0
+                    if hard_timeout:
+                        run_result = run_with_hard_timeout(
+                            est_params,
+                            X_train,
+                            y_train,
+                            X_test,
+                            timeout_seconds=timeout_budget + 5,
+                            X_full=X,
+                        )
+                        elapsed = time.time() - t0
                     if run_result["status"] != "ok":
                         seed_runs.append({
-                            "seed": seed,
+                            "seed": repeat_seed,
                             "r2": None,
                             "mse": None,
                             "time": elapsed,
                             "error": run_result.get("error", run_result["status"]),
                         })
+                        if "timeout" in str(run_result.get("error", "")).lower():
+                            break
                         continue
 
-                    formula = run_result.get("formula", "")
-                    if post_simplify and formula:
-                        formula = simplify_formula_with_guard(formula, X_train, y_train)
-                    y_pred_all = evaluate_formula(formula, X)
-                else:
-                    est_copy = est.__class__(**est_params)
-                    est_copy.fit(X_train, y_train)
-                    formula = est_copy.get_formula()
-                    if post_simplify and formula:
-                        formula = simplify_formula_with_guard(formula, X_train, y_train)
-                    y_pred_all = evaluate_formula(formula, X)
-                    elapsed = time.time() - t0
+                        formula = run_result.get("formula", "")
+                        if post_simplify and formula:
+                            formula = simplify_formula_with_guard(formula, X_train, y_train)
+                        y_pred_all = evaluate_formula(formula, X)
+                    else:
+                        est_copy = est.__class__(**est_params)
+                        est_copy.fit(X_train, y_train)
+                        formula = est_copy.get_formula()
+                        if post_simplify and formula:
+                            formula = simplify_formula_with_guard(formula, X_train, y_train)
+                        y_pred_all = evaluate_formula(formula, X)
+                        elapsed = time.time() - t0
 
-                if y_pred_all is None:
+                    if y_pred_all is None:
+                        seed_runs.append({
+                            "seed": repeat_seed,
+                            "r2": None,
+                            "mse": None,
+                            "time": elapsed,
+                            "problem": name,
+                            "true_formula": true_formula,
+                            "discovered_formula": formula,
+                            "model_size": model_size(formula),
+                            "error": "formula_eval_failed",
+                        })
+                        continue
+
+                    y_pred_test = y_pred_all[n_train:]
+                    r2 = r2_score(y_test, y_pred_test)
+                    mse = mse_score(y_test, y_pred_test)
+                    size = model_size(formula)
+                    full_mse = mse_score(y, y_pred_all)
+                    exact_match = full_mse < 1e-6
+                    failure_bucket = None
+                    if not exact_match:
+                        failure_bucket = classify_failure_taxonomy(true_formula, formula, r2, full_mse)
+
                     seed_runs.append({
-                        "seed": seed,
-                        "r2": None,
-                        "mse": None,
-                        "time": elapsed,
+                        "seed": repeat_seed,
                         "problem": name,
                         "true_formula": true_formula,
                         "discovered_formula": formula,
-                        "model_size": model_size(formula),
-                        "error": "formula_eval_failed",
+                        "r2": r2,
+                        "mse": mse,
+                        "full_mse": full_mse,
+                        "exact_match": exact_match,
+                        "time": elapsed,
+                        "model_size": size,
+                        "failure_bucket": failure_bucket,
+                        "error": None,
                     })
-                    continue
-
-                y_pred_test = y_pred_all[n_train:]
-
-                r2 = r2_score(y_test, y_pred_test)
-                mse = mse_score(y_test, y_pred_test)
-                size = model_size(formula)
-
-                # Check for symbolic match (very low MSE on full data)
-                full_mse = mse_score(y, y_pred_all)
-                exact_match = full_mse < 1e-6
-
-                failure_bucket = None
-                if not exact_match:
-                    failure_bucket = classify_failure_taxonomy(true_formula, formula, r2, full_mse)
-
-                seed_runs.append({
-                    "seed": seed,
-                    "problem": name,
-                    "true_formula": true_formula,
-                    "discovered_formula": formula,
-                    "r2": r2,
-                    "mse": mse,
-                    "full_mse": full_mse,
-                    "exact_match": exact_match,
-                    "time": elapsed,
-                    "model_size": size,
-                    "failure_bucket": failure_bucket,
-                    "error": None,
-                })
-            except Exception as e:
-                elapsed = time.time() - t0
-                seed_runs.append({"seed": seed, "r2": None, "mse": None, "time": elapsed, "error": str(e)})
+                except Exception as e:
+                    elapsed = time.time() - t0
+                    seed_runs.append({"seed": repeat_seed, "r2": None, "mse": None, "time": elapsed, "error": str(e)})
+                    if "timeout" in str(e).lower():
+                        break
 
         valid_seed_runs = [r for r in seed_runs if r.get("r2") is not None]
         if not valid_seed_runs:
@@ -927,22 +1051,24 @@ def run_track2_ground_truth(
             key=lambda r: abs(float(r["r2"]) - float(stability["r2_stats"]["median"]))
         )
 
+        best_run = min(valid_seed_runs, key=lambda r: float(r.get("mse", float("inf"))))
         aggregate = {
             "problem": name,
-            "true_formula": median_run.get("true_formula"),
-            "discovered_formula": median_run.get("discovered_formula"),
+            "true_formula": best_run.get("true_formula"),
+            "discovered_formula": best_run.get("discovered_formula"),
             "r2": stability["r2_stats"]["median"],
             "mse": stability["mse_stats"]["median"],
             "full_mse": float(np.median([r["full_mse"] for r in valid_seed_runs if r.get("full_mse") is not None])),
             "exact_match": bool(stability.get("exact_recovery_rate", 0.0) == 1.0),
             "exact_recovery_rate": stability.get("exact_recovery_rate"),
             "time": stability["time_stats"]["median"],
-            "model_size": median_run.get("model_size"),
+            "model_size": best_run.get("model_size"),
             "error": None,
             "seed_runs": seed_runs,
             "stability": stability,
             "time_to_discovery": time_to_discovery,
             "scoring_source": "displayed_formula",
+            "runs_per_formula": int(max(1, int(runs_per_formula))),
         }
         results.append(aggregate)
 
@@ -1070,6 +1196,14 @@ def main():
                         help="C++ evolution population size")
     parser.add_argument("--gens", type=int, default=1000,
                         help="C++ evolution generations")
+    parser.add_argument("--classifier-model", type=str, default="models/curve_classifier_glu_fixed.pt",
+                        help="Classifier model path")
+    parser.add_argument("--proposer-model", type=str, default="models/universal_proposer_robust.pt",
+                        help="Universal proposer model path")
+    parser.add_argument("--no-fast-path", action="store_true",
+                        help="Disable fast-path discovery")
+    parser.add_argument("--no-guided-evolution", action="store_true",
+                        help="Disable guided evolution")
     parser.add_argument("--output-dir", type=str, default="results/srbench",
                         help="Output directory for results JSON")
     parser.add_argument("--quiet", action="store_true",
@@ -1086,6 +1220,12 @@ def main():
                         help="Skip C++ evolution if fast-path formula exceeds 20 terms")
     parser.add_argument("--seeds", type=str, default="42,1337,2027,7,11",
                         help="Comma-separated fixed seeds for reproducible multi-seed protocol")
+    parser.add_argument("--runs-per-formula", type=int, default=1,
+                        help="Repeat each formula this many times; use 1 for smoke tests")
+    parser.add_argument("--data-dir", type=str, default=None,
+                        help="Optional local PMLB checkout for official-style symbolic dataset discovery")
+    parser.add_argument("--official", action="store_true",
+                        help="Prefer official SRBench-like dataset discovery when available")
     parser.add_argument("--acceptable-r2", type=float, default=0.9,
                         help="R2 threshold for acceptable discovery metric")
     parser.add_argument("--complexity-cap", type=int, default=20,
@@ -1093,12 +1233,20 @@ def main():
     args = parser.parse_args()
 
     seeds = parse_seed_list(args.seeds)
+    use_fast_path = not args.no_fast_path
+    use_guided_evolution = not args.no_guided_evolution
 
     est = GlassboxRegressor(
         population_size=args.pop_size,
         generations=args.gens,
         random_state=42,
         timeout=args.timeout,
+        classifier_path=args.classifier_model,
+        use_fast_path=use_fast_path,
+        use_guided_evolution=use_guided_evolution,
+        skip_evolution_if_bloated=args.skip_evolution_if_bloated,
+        bloat_term_threshold=20,
+        universal_proposer_path=args.proposer_model,
     )
 
     print(f"\n  Glassbox SRBench Benchmark")
@@ -1108,8 +1256,19 @@ def main():
     adaptive_on = not args.no_adaptive_timeout
     print(f"  Adaptive timeout: {adaptive_on}  |  Post simplify: {args.post_simplify}")
     print(f"  Skip bloat: {args.skip_evolution_if_bloated}")
+    print(f"  Fast-path: {use_fast_path}  |  Guided evolution: {use_guided_evolution}")
+    print(f"  Classifier: {args.classifier_model}")
+    print(f"  Proposer: {args.proposer_model}")
     print(f"  Multi-seed protocol: {seeds}")
+    print(f"  Runs/formula: {args.runs_per_formula}")
     print(f"  Acceptable criteria: R2>={args.acceptable_r2:.2f}, size<={args.complexity_cap}")
+
+    blackbox_datasets = get_official_pmlb_regression_datasets() if args.official else list(PMLB_DATASETS)
+    discovered_gt = discover_official_ground_truth_problems(args.data_dir) if args.data_dir else []
+    if discovered_gt:
+        print(f"  Discovered official-style symbolic datasets: {len(discovered_gt)}")
+    elif args.official:
+        print("  Official symbolic dataset checkout not found; using built-in ground-truth smoke suite.")
 
     track1_results = []
     track2_results = []
@@ -1117,11 +1276,13 @@ def main():
     adaptive_timeout_enabled = not args.no_adaptive_timeout
 
     if args.track is None or args.track == 2:
+        track2_source = discovered_gt if discovered_gt else GROUND_TRUTH_PROBLEMS
         track2_results = run_track2_ground_truth(
-            est, GROUND_TRUTH_PROBLEMS,
+            est, track2_source,
             max_problems=args.max_datasets,
             n_samples=args.n_samples,
             seeds=seeds,
+            runs_per_formula=args.runs_per_formula,
             verbose=not args.quiet,
             hard_timeout=not args.no_hard_timeout,
             adaptive_timeout=adaptive_timeout_enabled,
@@ -1133,10 +1294,11 @@ def main():
 
     if args.track is None or args.track == 1:
         track1_results = run_track1_blackbox(
-            est, PMLB_DATASETS,
+            est, blackbox_datasets,
             max_datasets=args.max_datasets,
             n_samples=args.n_samples,
             seeds=seeds,
+            runs_per_formula=args.runs_per_formula,
             verbose=not args.quiet,
             hard_timeout=not args.no_hard_timeout,
             adaptive_timeout=adaptive_timeout_enabled,

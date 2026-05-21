@@ -2436,6 +2436,9 @@ def create_guided_onn_factory(
         A factory function that creates operator-biased ONNs
     """
     from glassbox.sr.core.operation_dag import OperationDAG
+
+    if operator_hints is None:
+        operator_hints = {}
     
     # Determine if we need full ops or simplified
     needs_exp = 'exp' in operator_hints.get('operators', set())
@@ -2472,6 +2475,9 @@ def bias_onn_toward_operators(model, operator_hints: Dict, bias_strength: float 
         operator_hints: Dict with 'operators' set
         bias_strength: How strongly to bias (higher = more deterministic)
     """
+    if operator_hints is None:
+        operator_hints = {}
+
     operators = operator_hints.get('operators', set())
     frequencies = operator_hints.get('frequencies', [])
     
@@ -2550,6 +2556,9 @@ def _build_signal_seed_graphs(
             sys.path.insert(0, str(_cpp_dir))
         from seed_graph_builder import build_seed_graphs_from_signal  # type: ignore
 
+    if operator_hints is None:
+        operator_hints = {}
+
     x_np = x.cpu().numpy().ravel()
     y_np = y.cpu().numpy().ravel()
     frequencies = operator_hints.get('frequencies', [])
@@ -2617,6 +2626,9 @@ def beam_search_evolution(
             import _core
         except ImportError:
             return None
+
+    if operator_hints is None:
+        operator_hints = {}
     
     start_time = time.time()
     
@@ -3112,6 +3124,9 @@ def run_guided_evolution(
         Dict with evolved formula, mse, and timing
     """
     import time
+
+    if operator_hints is None:
+        operator_hints = {}
     
     # ── Primary: Beam Search (fast C++ path) ──
     # Adjust beams and rounds based on requested generations and confidence

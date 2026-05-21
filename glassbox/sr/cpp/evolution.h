@@ -13,6 +13,7 @@
 #include <string>
 #include <sstream>
 #include <unordered_set>
+#include <utility>
 
 #include <omp.h>
 
@@ -1164,9 +1165,8 @@ private:
         
         if (roll < 0.4) {
             // ── Wrap Mutation ──
-            // Pick a random non-input node and wrap it with a new unary op
-            std::uniform_int_distribution<int> node_dist(1, n - 1);
-            int target = node_dist(rng_);
+            // Prefer active building blocks, falling back to random nodes.
+            int target = sample_active_node(child, 1, n - 1);
             
             // Create new unary node that takes 'target' as input
             OpNode wrap_node;
@@ -1209,11 +1209,16 @@ private:
             
         } else if (roll < 0.6) {
             // ── Multiply Mutation ──
-            // Pick two existing nodes and create f(x) * g(x)
-            std::uniform_int_distribution<int> node_dist(0, n - 1);
-            int left = node_dist(rng_);
-            int right = node_dist(rng_);
-            while (right == left && n > 1) right = node_dist(rng_);
+            // Recombine active modules into a product candidate.
+            int left = sample_active_node(child, 0, n - 1);
+            int right = sample_active_node(child, 0, n - 1);
+            int attempts = 0;
+            while (right == left && n > 1 && attempts++ < 8) {
+                right = sample_active_node(child, 0, n - 1);
+            }
+            if (right == left && n > 1) {
+                right = (left + 1) % n;
+            }
             
             OpNode mul_node;
             mul_node.type = NodeType::Binary;
@@ -1237,11 +1242,16 @@ private:
             
         } else if (roll < 0.8) {
             // ── Divide / Rational Mutation ──
-            // Pick two existing nodes and create f(x) / g(x) (Analytic Quotient)
-            std::uniform_int_distribution<int> node_dist(0, n - 1);
-            int left = node_dist(rng_);
-            int right = node_dist(rng_);
-            while (right == left && n > 1) right = node_dist(rng_);
+            // Prefer useful numerator/denominator modules (Analytic Quotient).
+            int left = sample_active_node(child, 0, n - 1);
+            int right = sample_active_node(child, 0, n - 1);
+            int attempts = 0;
+            while (right == left && n > 1 && attempts++ < 8) {
+                right = sample_active_node(child, 0, n - 1);
+            }
+            if (right == left && n > 1) {
+                right = (left + 1) % n;
+            }
             
             OpNode div_node;
             div_node.type = NodeType::Binary;
@@ -1278,12 +1288,10 @@ private:
                 return macro_mutate(parent); // Retry (will likely hit wrap/multiply)
             }
             
-            std::uniform_int_distribution<int> uni_dist(0, static_cast<int>(unary_indices.size()) - 1);
-            int f_idx = unary_indices[uni_dist(rng_)];
+            int f_idx = sample_active_from_candidates(child, unary_indices);
             
-            // Pick a different node to be the new input
-            std::uniform_int_distribution<int> node_dist(0, f_idx > 0 ? f_idx - 1 : 0);
-            int g_idx = node_dist(rng_);
+            // Pick an active lower-index module as the new input.
+            int g_idx = sample_active_node(child, 0, f_idx > 0 ? f_idx - 1 : 0);
             
             // Rewire: f's input becomes g (creating f(g(x)) composition)
             child.nodes[f_idx].left_child = g_idx;
@@ -1303,12 +1311,9 @@ private:
             return child; // Too small for meaningful crossover
         }
 
-        // Pick a non-terminal crossover point in each parent (skip node 0 to preserve an input root)
-        std::uniform_int_distribution<int> dist_a(1, static_cast<int>(parent_a.nodes.size()) - 1);
-        std::uniform_int_distribution<int> dist_b(1, static_cast<int>(parent_b.nodes.size()) - 1);
-
-        int xo_a = dist_a(rng_); // Point in parent A to replace
-        int xo_b = dist_b(rng_); // Point in parent B to donate
+        // Prefer active crossover points so recombination exchanges useful modules.
+        int xo_a = sample_active_node(parent_a, 1, static_cast<int>(parent_a.nodes.size()) - 1);
+        int xo_b = sample_active_node(parent_b, 1, static_cast<int>(parent_b.nodes.size()) - 1);
 
         // Collect the subtree rooted at xo_b in parent B
         // (all nodes whose index >= xo_b that are reachable from xo_b)
@@ -1453,6 +1458,97 @@ private:
 
         std::sort(result.begin(), result.end());
         return result;
+    }
+
+    std::vector<double> compute_activity_scores(const IndividualGraph& graph) {
+        int n = static_cast<int>(graph.nodes.size());
+        std::vector<double> scores(n, 1e-3);
+        int w_count = static_cast<int>(graph.output_weights.size());
+
+        for (int i = 0; i < n; ++i) {
+            if (i < w_count) {
+                scores[i] += std::abs(graph.output_weights[i]);
+            }
+        }
+
+        // Active output terms make their dependencies valuable modules too.
+        for (int root = 0; root < n && root < w_count; ++root) {
+            double root_weight = std::abs(graph.output_weights[root]);
+            if (root_weight < 1e-8) continue;
+
+            std::vector<bool> visited(n, false);
+            std::vector<std::pair<int, double>> stack;
+            stack.emplace_back(root, root_weight * 0.5);
+
+            while (!stack.empty()) {
+                int idx = stack.back().first;
+                double contribution = stack.back().second;
+                stack.pop_back();
+                if (idx < 0 || idx >= n || visited[idx] || contribution < 1e-6) continue;
+                visited[idx] = true;
+                scores[idx] += contribution;
+
+                const auto& node = graph.nodes[idx];
+                double child_contribution = contribution * 0.65;
+                if ((node.type == NodeType::Unary || node.type == NodeType::Binary) &&
+                    node.left_child >= 0 && node.left_child < idx) {
+                    stack.emplace_back(node.left_child, child_contribution);
+                }
+                if (node.type == NodeType::Binary &&
+                    node.right_child >= 0 && node.right_child < idx) {
+                    stack.emplace_back(node.right_child, child_contribution);
+                }
+            }
+        }
+
+        for (int i = 0; i < n; ++i) {
+            if (graph.nodes[i].type == NodeType::Constant) {
+                scores[i] *= 0.25;
+            }
+            if (!std::isfinite(scores[i]) || scores[i] <= 0.0) {
+                scores[i] = 1e-3;
+            }
+        }
+        return scores;
+    }
+
+    int sample_active_node(const IndividualGraph& graph, int min_idx, int max_idx) {
+        int n = static_cast<int>(graph.nodes.size());
+        if (n == 0) return 0;
+        min_idx = std::max(0, min_idx);
+        max_idx = std::min(n - 1, max_idx);
+        if (min_idx >= max_idx) return min_idx;
+
+        auto scores = compute_activity_scores(graph);
+        std::vector<double> weights;
+        weights.reserve(max_idx - min_idx + 1);
+        for (int i = min_idx; i <= max_idx; ++i) {
+            double weight = scores[i];
+            if (graph.nodes[i].type == NodeType::Input && min_idx > 0) {
+                weight *= 0.2;
+            }
+            weights.push_back(std::max(1e-6, weight));
+        }
+
+        std::discrete_distribution<int> dist(weights.begin(), weights.end());
+        return min_idx + dist(rng_);
+    }
+
+    int sample_active_from_candidates(const IndividualGraph& graph,
+                                      const std::vector<int>& candidates) {
+        if (candidates.empty()) return 0;
+        if (candidates.size() == 1) return candidates.front();
+
+        auto scores = compute_activity_scores(graph);
+        std::vector<double> weights;
+        weights.reserve(candidates.size());
+        for (int idx : candidates) {
+            double weight = (idx >= 0 && idx < static_cast<int>(scores.size())) ? scores[idx] : 1e-3;
+            weights.push_back(std::max(1e-6, weight));
+        }
+
+        std::discrete_distribution<int> dist(weights.begin(), weights.end());
+        return candidates[dist(rng_)];
     }
     
     // ── Ridge Regression solver for output weights ──────────────────────
