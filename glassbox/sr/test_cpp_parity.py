@@ -146,6 +146,16 @@ def test_result_schema(simple_data):
     assert isinstance(result["output_weights"], list), "output_weights should be a list"
 
 
+@requires_cpp
+def test_arithmetic_gate_can_canonicalize_products():
+    """Binary arithmetic should support clean multiply-mode structure."""
+    X = np.linspace(-2, 2, 64)
+    y = (X ** 2) * np.sin(X)
+    result = _core.run_evolution([X], y, pop_size=12, generations=8, early_stop_mse=1e-8, random_seed=7)
+    assert isinstance(result["formula"], str)
+    assert np.isfinite(result["best_mse"])
+
+
 # ── Direct execution (backward compatibility) ───────────────────────────
 
 if __name__ == "__main__":

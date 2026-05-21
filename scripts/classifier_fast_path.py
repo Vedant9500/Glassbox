@@ -2532,6 +2532,35 @@ def _build_cpp_seed_graphs(
     return build_seed_graphs_from_candidates(candidate_formulas, max_seeds=max_seeds)
 
 
+def _build_signal_seed_graphs(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    operator_hints: Dict,
+    max_seeds: int = 10,
+) -> List[Dict]:
+    """Build universal separability-aware seed graphs from the observed signal."""
+    try:
+        from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_signal
+    except ImportError:
+        import sys
+        from pathlib import Path as _Path
+
+        _cpp_dir = _Path(__file__).resolve().parent.parent / "glassbox" / "sr" / "cpp"
+        if str(_cpp_dir) not in sys.path:
+            sys.path.insert(0, str(_cpp_dir))
+        from seed_graph_builder import build_seed_graphs_from_signal  # type: ignore
+
+    x_np = x.cpu().numpy().ravel()
+    y_np = y.cpu().numpy().ravel()
+    frequencies = operator_hints.get('frequencies', [])
+    return build_seed_graphs_from_signal(
+        x_np,
+        y_np,
+        detected_omegas=frequencies,
+        max_seeds=max_seeds,
+    )
+
+
 def beam_search_evolution(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -2929,10 +2958,19 @@ def beam_search_evolution(
     max_physical_threads = multiprocessing.cpu_count()
 
     # Seed first fraction of each island population from proposer / fast-path skeletons.
+    candidate_seed_limit = min(12, max(3, len(candidate_formulas or []) + 1))
     seed_graphs_py = _build_cpp_seed_graphs(
         candidate_formulas,
-        max_seeds=min(12, max(3, len(candidate_formulas or []) + 1)),
+        max_seeds=candidate_seed_limit,
     )
+    signal_seed_graphs = _build_signal_seed_graphs(
+        x,
+        y,
+        operator_hints,
+        max_seeds=max(0, 12 - len(seed_graphs_py)),
+    )
+    if signal_seed_graphs:
+        seed_graphs_py = (seed_graphs_py or []) + signal_seed_graphs
     if seed_graphs_py:
         preview = []
         for cand in (candidate_formulas or [])[:3]:
@@ -3185,4 +3223,3 @@ def run_guided_evolution(
         'time': elapsed,
         'model': final_model,
     }
-

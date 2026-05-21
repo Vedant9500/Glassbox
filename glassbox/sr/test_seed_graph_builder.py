@@ -15,6 +15,8 @@ from seed_graph_builder import (  # noqa: E402
     UNARY_PERIODIC,
     build_seed_graphs_from_candidates,
     build_seed_graphs_from_formulas,
+    build_seed_graphs_from_signal,
+    discover_seed_formulas_from_signal,
     formula_to_seed_graph,
 )
 
@@ -114,3 +116,22 @@ def test_intpow_for_polynomial() -> None:
     pow_nodes = [n for n in graph["nodes"] if n.get("unary_op") == UNARY_INTPOW]
     assert pow_nodes
     assert pow_nodes[0]["p"] == 3.0
+
+
+def test_signal_seed_discovery_prefers_module_forms() -> None:
+    import numpy as np
+
+    x = np.linspace(-2, 2, 128)
+    y = (x**2) * np.sin(x)
+    formulas = discover_seed_formulas_from_signal(x, y, detected_omegas=[1.0], max_seeds=8)
+    assert formulas
+    assert any("x^2*sin" in f.replace(" ", "") or "x**2*sin" in f.replace(" ", "") for f in formulas)
+
+
+def test_signal_seed_graphs_build() -> None:
+    import numpy as np
+
+    x = np.linspace(-2, 2, 64)
+    y = (x**2) * np.sin(x)
+    graphs = build_seed_graphs_from_signal(x, y, detected_omegas=[1.0], max_seeds=5)
+    assert graphs

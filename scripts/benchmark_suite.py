@@ -58,6 +58,7 @@ sys.path.insert(0, str(_SCRIPT_DIR))
 import classifier_fast_path as cfp  # noqa: E402
 from classifier_fast_path import run_fast_path, run_guided_evolution  # noqa: E402
 from glassbox.evolution import detect_dominant_frequency  # noqa: E402
+from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_signal  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Benchmark Formula Bank  (~200 formulas across 8 tiers)
@@ -433,6 +434,21 @@ def _generate_data(
     x = x[mask]
     y = y[mask]
     return x, y
+
+
+def _build_universal_evolution_seed_graphs(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    detected_omegas: Optional[List[float]],
+    max_seeds: int = 12,
+) -> List[Dict[str, Any]]:
+    """Build data-driven generic seed graphs for the pure C++ search path."""
+    return build_seed_graphs_from_signal(
+        x_values,
+        y_values,
+        detected_omegas=detected_omegas,
+        max_seeds=max_seeds,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1120,6 +1136,13 @@ def run_formula_cpp_evolution(
                 detected_omegas = []
         except Exception:
             detected_omegas = []
+
+        seed_graphs_py = _build_universal_evolution_seed_graphs(
+            x_np,
+            y_np,
+            detected_omegas,
+            max_seeds=12,
+        )
         
         # Run pure C++ evolution
         t0 = time.time()
@@ -1130,6 +1153,7 @@ def run_formula_cpp_evolution(
             generations=generations,
             early_stop_mse=1e-10,
             seed_omegas=detected_omegas or [],
+            seed_graphs_py=seed_graphs_py,
         )
         elapsed = time.time() - t0
         

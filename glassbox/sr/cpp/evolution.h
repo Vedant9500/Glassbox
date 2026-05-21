@@ -787,6 +787,29 @@ private:
         if (r < 0.75) return BinaryOp::Division;
         return BinaryOp::Aggregation;
     }
+
+    void seed_arithmetic_gate(OpNode& node) {
+        std::uniform_int_distribution<int> mode_dist(0, 3);
+        switch (mode_dist(rng_)) {
+            case 0:
+                node.beta = 1.0;
+                node.gamma = 1.0;
+                break;
+            case 1:
+                node.beta = 2.0;
+                node.gamma = 1.0;
+                break;
+            case 2:
+                node.beta = 2.0;
+                node.gamma = -1.0;
+                break;
+            default:
+                node.beta = 1.0;
+                node.gamma = -1.0;
+                break;
+        }
+        node.tau = 1.0;
+    }
     
     IndividualGraph create_random_individual(int n_inputs) {
         IndividualGraph ind;
@@ -1089,6 +1112,9 @@ private:
                     } else {
                         node.type = NodeType::Binary;
                         node.binary_op = sample_binary_op();
+                        if (node.binary_op == BinaryOp::Arithmetic) {
+                            seed_arithmetic_gate(node);
+                        }
                         std::uniform_int_distribution<int> child_dist(0, i - 1);
                         node.left_child = child_dist(rng_);
                         node.right_child = child_dist(rng_);
@@ -1107,6 +1133,13 @@ private:
                     node.p = std::clamp(node.p, config_.p_min, config_.p_max);
                     if (node.type == NodeType::Unary && node.unary_op == UnaryOp::IntPow) {
                         node.p = static_cast<double>(std::clamp(static_cast<int>(std::round(node.p)), 2, 6));
+                    }
+                    if (node.type == NodeType::Binary && node.binary_op == BinaryOp::Arithmetic) {
+                        node.beta = std::clamp(node.beta + rnorm(rng_) * 0.15, 0.5, 2.5);
+                        node.gamma = std::clamp(node.gamma + rnorm(rng_) * 0.15, -1.5, 1.5);
+                    }
+                    if (node.type == NodeType::Binary && node.binary_op == BinaryOp::Aggregation) {
+                        node.tau = std::clamp(node.tau + rnorm(rng_) * 0.1, 0.1, 10.0);
                     }
                 }
             }
@@ -1185,6 +1218,7 @@ private:
             OpNode mul_node;
             mul_node.type = NodeType::Binary;
             mul_node.binary_op = BinaryOp::Arithmetic;
+            seed_arithmetic_gate(mul_node);
             mul_node.beta = 2.0;  // 2.0 = multiply mode
             mul_node.gamma = 1.0;
             mul_node.left_child = left;
@@ -2464,6 +2498,73 @@ private:
             // Re-evaluate after trig simplification
             evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
             snap_baseline_mse = ind.raw_mse;
+
+            // 6a.6 Arithmetic gate snapping
+            // If an arithmetic blend is already close to a discrete operator,
+            // snap it only when the fitted MSE stays effectively unchanged.
+            for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
+                if (ind.nodes[i].type != NodeType::Binary) continue;
+                if (ind.nodes[i].binary_op != BinaryOp::Arithmetic) continue;
+                if (i >= static_cast<int>(ind.output_weights.size())) continue;
+                if (std::abs(ind.output_weights[i]) < 1e-6) continue;
+
+                auto& node = ind.nodes[i];
+                const double original_beta = node.beta;
+                const double original_gamma = node.gamma;
+
+                struct ArithmeticSnapCandidate {
+                    double beta;
+                    double gamma;
+                    SnapTier tier;
+                };
+
+                const ArithmeticSnapCandidate candidates[] = {
+                    {1.0, 1.0, SnapTier::Integer},   // add
+                    {2.0, 1.0, SnapTier::Integer},   // mul
+                    {2.0, -1.0, SnapTier::Integer},  // div-like arithmetic gate
+                    {1.0, -1.0, SnapTier::Integer},  // sub
+                };
+
+                double best_beta = original_beta;
+                double best_gamma = original_gamma;
+                double best_snap_mse = std::numeric_limits<double>::infinity();
+
+                for (const auto& candidate : candidates) {
+                    double dist = std::sqrt(
+                        (original_beta - candidate.beta) * (original_beta - candidate.beta) +
+                        (original_gamma - candidate.gamma) * (original_gamma - candidate.gamma)
+                    );
+                    if (dist > 0.35) continue;
+
+                    node.beta = candidate.beta;
+                    node.gamma = candidate.gamma;
+
+                    std::vector<Eigen::ArrayXd> trial_cache;
+                    evaluate_graph(ind, X_, n_samples, trial_cache);
+                    solve_output_weights(ind, trial_cache);
+                    evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+
+                    if (snap_accepts(snap_baseline_mse, ind.raw_mse, candidate.tier) &&
+                        ind.raw_mse < best_snap_mse) {
+                        best_beta = candidate.beta;
+                        best_gamma = candidate.gamma;
+                        best_snap_mse = ind.raw_mse;
+                    }
+                }
+
+                node.beta = best_beta;
+                node.gamma = best_gamma;
+                if (best_beta != original_beta || best_gamma != original_gamma) {
+                    std::vector<Eigen::ArrayXd> updated_cache;
+                    evaluate_graph(ind, X_, n_samples, updated_cache);
+                    solve_output_weights(ind, updated_cache);
+                    evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                    snap_baseline_mse = ind.raw_mse;
+                } else {
+                    node.beta = original_beta;
+                    node.gamma = original_gamma;
+                }
+            }
             
             // Build node output cache for 6b/6c — weight/bias snapping only
             // changes output coefficients, not node params, so we can compute

@@ -10,6 +10,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import math
+import numpy as np
 
 try:
     import _core  # type: ignore
@@ -531,3 +532,211 @@ def build_seed_graphs_from_candidates(
         _add(cand.get("formula", ""))
 
     return build_seed_graphs_from_formulas(ordered, max_seeds=max_seeds)
+
+
+def _safe_array(values: Any) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).ravel()
+    if arr.size == 0:
+        return arr
+    return arr[np.isfinite(arr)]
+
+
+def _estimate_polynomial_signature(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    max_degree: int = 6,
+) -> Tuple[bool, int, float]:
+    """Detect whether the signal is well-approximated by a low-degree polynomial."""
+    if x_values.size < max_degree + 2 or y_values.size < max_degree + 2:
+        return False, 0, float("inf")
+
+    try:
+        x_span = float(np.max(x_values) - np.min(x_values))
+        x_scaled = (x_values - float(np.mean(x_values))) / max(0.5 * x_span, 1e-8)
+        y_var = max(float(np.var(y_values)), 1e-12)
+
+        best_degree = 1
+        best_mse = float("inf")
+        for degree in range(1, max_degree + 1):
+            coeffs = np.polyfit(x_scaled, y_values, degree)
+            pred = np.polyval(coeffs, x_scaled)
+            mse = float(np.mean((pred - y_values) ** 2))
+            if np.isfinite(mse) and mse < best_mse:
+                best_mse = mse
+                best_degree = degree
+
+        rel_mse = best_mse / y_var
+        return best_degree >= 2 and rel_mse < 1e-11, best_degree, rel_mse
+    except Exception:
+        return False, 0, float("inf")
+
+
+def _evaluate_formula_signal(formula: str, x_values: np.ndarray) -> Optional[np.ndarray]:
+    expr = _parse_formula_expr(formula)
+    if expr is None:
+        return None
+
+    free = list(expr.free_symbols)
+    if len(free) > 1:
+        return None
+
+    try:
+        if not free:
+            value = float(expr.evalf())
+            return np.full_like(x_values, value, dtype=float)
+
+        fn = sp.lambdify(free[0], expr, modules=["numpy"])
+        values = np.asarray(fn(x_values), dtype=float).ravel()
+        if values.shape != x_values.shape:
+            values = np.broadcast_to(values, x_values.shape).astype(float, copy=False)
+        return values
+    except Exception:
+        return None
+
+
+def _affine_fit_mse(pred: np.ndarray, target: np.ndarray) -> float:
+    mask = np.isfinite(pred) & np.isfinite(target)
+    if int(mask.sum()) < 8:
+        return float("inf")
+
+    x = pred[mask].astype(float, copy=False)
+    y = target[mask].astype(float, copy=False)
+    if np.allclose(x, x[0]):
+        fitted = np.full_like(y, float(np.mean(y)))
+        return float(np.mean((fitted - y) ** 2))
+
+    design = np.column_stack([x, np.ones_like(x)])
+    try:
+        coef, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
+        fitted = design @ coef
+        return float(np.mean((fitted - y) ** 2))
+    except Exception:
+        return float("inf")
+
+
+def discover_seed_formulas_from_signal(
+    x_values: Any,
+    y_values: Any,
+    detected_omegas: Optional[List[float]] = None,
+    max_seeds: int = 12,
+) -> List[str]:
+    """Discover universal module/product seed formulas from the observed signal."""
+    x = _safe_array(x_values)
+    y = _safe_array(y_values)
+    if x.size == 0 or y.size == 0:
+        return []
+
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    if x.size < 8 or y.size < 8:
+        return []
+
+    poly_like, degree, _ = _estimate_polynomial_signature(x, y)
+
+    def _dedupe(items: List[str]) -> List[str]:
+        ordered: List[str] = []
+        seen: set = set()
+        for item in items:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            key = re.sub(r"\s+", "", text.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(text)
+        return ordered
+
+    power_terms = ["x", "x^2", "x^3"]
+    decay_terms = ["exp(-x)", "exp(-x^2)"]
+    periodic_terms = ["sin(x)", "cos(x)"]
+
+    if poly_like:
+        for d in range(2, min(7, degree + 2)):
+            power_terms.append(f"x^{d}")
+            periodic_terms.append(f"sin(x^{d})")
+            periodic_terms.append(f"cos(x^{d})")
+            decay_terms.append(f"exp(-x^{d})")
+
+    if detected_omegas:
+        for omega in detected_omegas[:3]:
+            omega_text = f"{float(omega):.6g}"
+            periodic_terms.append(f"sin({omega_text}*x)")
+            periodic_terms.append(f"cos({omega_text}*x)")
+
+    power_terms = _dedupe(power_terms)
+    decay_terms = _dedupe(decay_terms)
+    periodic_terms = _dedupe(periodic_terms)
+
+    candidate_formulas: List[str] = []
+
+    def _add(formula: str) -> None:
+        text = str(formula or "").strip()
+        if not text:
+            return
+        candidate_formulas.append(text)
+
+    for formula in power_terms + decay_terms + periodic_terms:
+        _add(formula)
+
+    for power in power_terms:
+        for periodic in periodic_terms:
+            _add(f"{power}*{periodic}")
+        for decay in decay_terms:
+            _add(f"{power}*{decay}")
+        for periodic in periodic_terms:
+            for decay in decay_terms:
+                _add(f"{power}*{decay}*{periodic}")
+
+    for periodic in periodic_terms:
+        for decay in decay_terms:
+            _add(f"{decay}*{periodic}")
+
+    scored: List[Tuple[float, int, str]] = []
+    y_var = max(float(np.var(y)), 1e-12)
+    for formula in _dedupe(candidate_formulas):
+        pred = _evaluate_formula_signal(formula, x)
+        if pred is None:
+            continue
+        mse = _affine_fit_mse(pred, y)
+        if not np.isfinite(mse):
+            continue
+        rel_mse = mse / y_var
+        complexity = len(formula)
+        # Prefer formulas that match the observed structure, but keep the pool broad.
+        bonus = 0
+        if "*" in formula:
+            bonus -= 2
+        if "^" in formula or "**" in formula:
+            bonus -= 1
+        scored.append((rel_mse, complexity + bonus, formula))
+
+    scored.sort(key=lambda item: (item[0], item[1], item[2]))
+    ordered: List[str] = []
+    seen: set = set()
+    for _, _, formula in scored:
+        key = re.sub(r"\s+", "", formula.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(formula)
+        if len(ordered) >= max_seeds:
+            break
+    return ordered
+
+
+def build_seed_graphs_from_signal(
+    x_values: Any,
+    y_values: Any,
+    detected_omegas: Optional[List[float]] = None,
+    max_seeds: int = 12,
+) -> List[Dict[str, Any]]:
+    """Build universal separability-aware seed graphs from the observed signal."""
+    formulas = discover_seed_formulas_from_signal(
+        x_values,
+        y_values,
+        detected_omegas=detected_omegas,
+        max_seeds=max_seeds,
+    )
+    return build_seed_graphs_from_formulas(formulas, max_seeds=max_seeds)
