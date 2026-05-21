@@ -6,9 +6,18 @@ Used to inject fast-path / proposer skeletons into evolution initialization
 """
 from __future__ import annotations
 
-import math
 import re
 from typing import Any, Dict, List, Optional, Tuple
+
+import math
+
+try:
+    import _core  # type: ignore
+except Exception:  # pragma: no cover - fallback for direct execution
+    try:
+        import _core  # type: ignore
+    except Exception:  # pragma: no cover
+        _core = None
 
 import sympy as sp
 from sympy.parsing.sympy_parser import (
@@ -53,6 +62,20 @@ _LOCAL_DICT = {
     "pi": sp.pi,
     "E": sp.E,
 }
+
+
+def _cpp_seed_graph_from_formula(formula: str, x_name: str = "x") -> Optional[Dict[str, Any]]:
+    if _core is None or not hasattr(_core, "formula_to_seed_graph"):
+        return None
+    try:
+        graph = _core.formula_to_seed_graph(formula)
+        if graph is None:
+            return None
+        if x_name != "x":
+            return None
+        return graph
+    except Exception:
+        return None
 
 
 def _normalize_formula_text(formula: str) -> str:
@@ -422,6 +445,10 @@ class _GraphBuilder:
 
 def formula_to_seed_graph(formula: str, x_name: str = "x") -> Optional[Dict[str, Any]]:
     """Parse a formula string into a C++-compatible seed graph dict."""
+    cpp_graph = _cpp_seed_graph_from_formula(formula, x_name=x_name)
+    if cpp_graph is not None:
+        return cpp_graph
+
     expr = _parse_formula_expr(formula)
     if expr is None:
         return None

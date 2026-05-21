@@ -410,19 +410,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             )
             return simplified
         except Exception:
-            try:
-                from simplify_formula import simplify_onn_formula
-                _, simplified_expr = simplify_onn_formula(
-                    formula,
-                    int_tol=self.simplification_int_tol,
-                    zero_tol=self.simplification_zero_tol,
-                    use_nsimplify=True,
-                    max_passes=6,
-                    use_identities=True,
-                )
-                return str(simplified_expr)
-            except Exception:
-                return formula
+            return formula
 
     def _detect_frequencies(self, X, y):
         """Detect dominant frequencies via FFT, with optional phase info."""
@@ -831,92 +819,4 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             X_list = [X[:, j] for j in range(self.n_features_in_)]
             return _core.reduce_formula_noise(formula_str, X_list, y)
         except Exception:
-            try:
-                import sympy as sp
-                from sympy.parsing.sympy_parser import parse_expr
-                from sklearn.linear_model import LinearRegression
-                
-                expr = parse_expr(formula_str.replace('^', '**'))
-                terms = list(sp.Add.make_args(expr))
-                
-                if len(terms) <= 1 or len(terms) > 20:
-                    return formula_str
-
-                term_funcs = []
-                x_syms = [sp.Symbol(f"x{i}") for i in range(self.n_features_in_)]
-                syms = x_syms + [sp.Symbol('x')]
-                
-                for t in terms:
-                    fn = sp.lambdify(syms, t, modules=['numpy'])
-                    term_funcs.append(fn)
-                    
-                N = len(y)
-                Z = np.zeros((N, len(terms)))
-                
-                for i, fn in enumerate(term_funcs):
-                    args = [X[:, j] for j in range(self.n_features_in_)]
-                    args.append(X[:, 0]) # for 'x' fallback
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        val = fn(*args)
-                    if isinstance(val, (int, float)):
-                        Z[:, i] = np.full(N, val)
-                    else:
-                        Z[:, i] = val
-                        
-                def get_bic(mask):
-                    if not np.any(mask):
-                        return float('inf'), None
-                    Z_sub = Z[:, mask]
-                    with warnings.catch_warnings():
-                        warnings.simplefilter('ignore')
-                        model = LinearRegression(fit_intercept=False).fit(Z_sub, y)
-                        preds = model.predict(Z_sub)
-                    mse = np.mean((y - preds)**2)
-                    if mse < 1e-15:
-                        mse = 1e-15
-                    k = np.sum(mask)
-                    return N * np.log(mse) + k * np.log(N), model.coef_
-
-                current_mask = np.ones(len(terms), dtype=bool)
-                best_bic, best_coef = get_bic(current_mask)
-                
-                while np.sum(current_mask) > 1:
-                    best_drop_idx = -1
-                    best_drop_bic = best_bic
-                    best_drop_coef = best_coef
-                    
-                    for i in range(len(terms)):
-                        if current_mask[i]:
-                            test_mask = current_mask.copy()
-                            test_mask[i] = False
-                            bic, coef = get_bic(test_mask)
-                            
-                            if bic < best_drop_bic:
-                                best_drop_bic = bic
-                                best_drop_idx = i
-                                best_drop_coef = coef
-                                
-                    if best_drop_idx != -1:
-                        current_mask[best_drop_idx] = False
-                        best_bic = best_drop_bic
-                        best_coef = best_drop_coef
-                    else:
-                        break
-                        
-                final_terms = []
-                coef_idx = 0
-                for i, t in enumerate(terms):
-                    if current_mask[i]:
-                        c = best_coef[coef_idx]
-                        if abs(c) > 1e-8:
-                            final_terms.append(c * t)
-                        coef_idx += 1
-                        
-                if not final_terms:
-                    return "0"
-                return str(sum(final_terms))
-                
-            except Exception as e:
-                print(f"  [Noise Reduction Fallback Skipped: {e}]")
-                return formula_str
+            return formula_str

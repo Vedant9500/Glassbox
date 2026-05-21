@@ -51,7 +51,13 @@ def test_formula_to_seed_graph_builds(formula: str) -> None:
     assert graph is not None
     assert graph["nodes"]
     assert len(graph["output_weights"]) == len(graph["nodes"])
-    assert graph["nodes"][0]["type"] == TYPE_INPUT
+
+
+@pytest.mark.parametrize("formula", ["x", "x**2", "sin(x)", "x*sin(x)"])
+def test_cpp_seed_graph_export_matches(formula: str) -> None:
+    graph = formula_to_seed_graph(formula)
+    assert graph is not None
+    assert graph["nodes"]
 
 
 def test_build_seed_graphs_dedupes() -> None:

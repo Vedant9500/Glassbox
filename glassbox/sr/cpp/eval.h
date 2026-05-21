@@ -306,6 +306,97 @@ inline double evaluate_fitness(IndividualGraph& graph, const std::vector<Eigen::
     return mse;
 }
 
+inline bool near(double value, double target, double tol = 1e-4) {
+    return std::abs(value - target) <= tol;
+}
+
+inline double normalize_angle(double value) {
+    double out = std::fmod(value, 2.0 * M_PI);
+    if (out < 0.0) out += 2.0 * M_PI;
+    return out;
+}
+
+inline std::string format_pi_like(double value) {
+    constexpr double kPiTol = 5e-3;
+    if (std::abs(value) <= 1e-4) return "0";
+
+    bool negative = value < 0.0;
+    double abs_value = std::abs(value);
+    struct Candidate {
+        double multiplier;
+        const char* text;
+    };
+    constexpr Candidate kCandidates[] = {
+        {1.0, "pi"},
+        {2.0, "2*pi"},
+        {0.5, "pi/2"},
+        {1.0 / 3.0, "pi/3"},
+        {0.25, "pi/4"},
+        {1.0 / 6.0, "pi/6"},
+        {1.5, "3*pi/2"},
+    };
+
+    for (const auto& candidate : kCandidates) {
+        double target = candidate.multiplier * M_PI;
+        if (near(abs_value, target, kPiTol)) {
+            return negative ? std::string("-") + candidate.text : std::string(candidate.text);
+        }
+    }
+
+    char buf[64];
+    if (std::abs(abs_value - std::round(abs_value)) < 1e-6) {
+        snprintf(buf, sizeof(buf), "%s%d", negative ? "-" : "", (int)std::round(abs_value));
+    } else {
+        snprintf(buf, sizeof(buf), "%s%.4g", negative ? "-" : "", abs_value);
+    }
+    return std::string(buf);
+}
+
+inline std::string format_constant_display(double value) {
+    constexpr double kPiTol = 5e-3;
+    if (std::abs(value - M_PI) < kPiTol) return "pi";
+    if (std::abs(value + M_PI) < kPiTol) return "-pi";
+    if (std::abs(value - 2.0 * M_PI) < kPiTol) return "2*pi";
+    if (std::abs(value + 2.0 * M_PI) < kPiTol) return "-2*pi";
+    if (std::abs(value - M_PI / 2.0) < kPiTol) return "pi/2";
+    if (std::abs(value + M_PI / 2.0) < kPiTol) return "-pi/2";
+    if (std::abs(value - 3.0 * M_PI / 2.0) < kPiTol) return "3*pi/2";
+    if (std::abs(value + 3.0 * M_PI / 2.0) < kPiTol) return "-3*pi/2";
+    if (std::abs(value - M_PI / 3.0) < kPiTol) return "pi/3";
+    if (std::abs(value - M_PI / 4.0) < kPiTol) return "pi/4";
+    if (std::abs(value - M_PI / 6.0) < kPiTol) return "pi/6";
+
+    char buf[64];
+    if (std::abs(value - std::round(value)) < 1e-6) {
+        snprintf(buf, sizeof(buf), "%d", (int)std::round(value));
+    } else {
+        snprintf(buf, sizeof(buf), "%.4g", value);
+    }
+    return std::string(buf);
+}
+
+inline bool has_top_level_add_sub(const std::string& s) {
+    int depth = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (c == '(') {
+            ++depth;
+        } else if (c == ')') {
+            --depth;
+        } else if (depth == 0 && (c == '+' || c == '-')) {
+            if (i == 0) continue;
+            return true;
+        }
+    }
+    return false;
+}
+
+inline std::string strip_outer_parens_if_simple(const std::string& s) {
+    if (s.size() < 2 || s.front() != '(' || s.back() != ')') return s;
+    if (has_top_level_add_sub(s.substr(1, s.size() - 2))) return s;
+    return s.substr(1, s.size() - 2);
+}
+
 // Convert a node subtree to string. The extra guard state prevents malformed
 // graphs from recursing forever while formatting.
 inline std::string format_node_to_string(
@@ -346,8 +437,7 @@ inline std::string format_node_to_string(
                 return "x";
             }
         case NodeType::Constant:
-            snprintf(buf, sizeof(buf), "%.4g", node.value);
-            return std::string(buf);
+            return format_constant_display(node.value);
         case NodeType::Unary: {
             std::string child_str = format_node_to_string(graph, node.left_child, n_inputs, visiting_ptr, depth + 1);
             switch (node.unary_op) {
@@ -366,29 +456,28 @@ inline std::string format_node_to_string(
                         result += std::string(buf);
                     }
                     
-                    result += "sin(";
+                    constexpr double kTrigTol = 5e-3;
+                    double phi_norm = normalize_angle(node.phi);
+                    bool use_cos = near(phi_norm, M_PI / 2.0, kTrigTol) || near(phi_norm, 1.5 * M_PI, kTrigTol);
+                    bool negate = near(phi_norm, M_PI, kTrigTol) || near(phi_norm, 1.5 * M_PI, kTrigTol);
+                    child_str = strip_outer_parens_if_simple(child_str);
+
+                    if (negate) {
+                        result += "-";
+                    }
+                    result += use_cos ? "cos(" : "sin(";
                     
                     // Omega: omit if ~1.0, use integer if whole number
                     bool has_omega = std::abs(node.omega - 1.0) > 1e-4;
-                    if (has_omega) {
-                        if (std::abs(node.omega - std::round(node.omega)) < 1e-6) {
-                            snprintf(buf, sizeof(buf), "%d*", (int)std::round(node.omega));
-                        } else {
-                            snprintf(buf, sizeof(buf), "%.4g*", node.omega);
-                        }
-                        result += std::string(buf);
-                    }
+                    if (has_omega) result += format_pi_like(node.omega) + "*";
                     result += child_str;
                     
-                    // Phase: omit if ~0.0
-                    bool has_phi = std::abs(node.phi) > 1e-4;
-                    if (has_phi) {
-                        if (std::abs(node.phi - std::round(node.phi)) < 1e-6) {
-                            snprintf(buf, sizeof(buf), " + %d", (int)std::round(node.phi));
-                        } else {
-                            snprintf(buf, sizeof(buf), " + %.4g", node.phi);
+                    // Phase: omit if it is absorbed by sin/cos canonicalization
+                    if (!use_cos) {
+                        bool has_phi = std::abs(node.phi) > 1e-4;
+                        if (has_phi) {
+                            result += " + " + format_pi_like(node.phi);
                         }
-                        result += std::string(buf);
                     }
                     
                     result += ")";

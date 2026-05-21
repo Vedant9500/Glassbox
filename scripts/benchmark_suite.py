@@ -460,7 +460,7 @@ def _normalize_formula_text(formula: str) -> str:
     """Normalize common unicode/operator variants to a parser-friendly form."""
     if not formula:
         return formula
-    return (
+    formula = (
         formula
         .replace('²', '^2')
         .replace('³', '^3')
@@ -472,6 +472,7 @@ def _normalize_formula_text(formula: str) -> str:
         .replace('φ', 'phi')
         .replace('ω', 'omega')
     )
+    return re.sub(r"\s+", "", formula)
 
 
 def _simplify_formula_native(formula: str, int_tol: float, zero_tol: float) -> Optional[str]:
@@ -514,7 +515,7 @@ def _postprocess_formula(formula: str) -> str:
 
     native = _simplify_formula_native(normalized, evo_int_tol, evo_zero_tol)
     if native is not None:
-        return native
+        normalized = native
 
     try:
         try:

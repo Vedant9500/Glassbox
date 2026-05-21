@@ -438,6 +438,53 @@ std::string simplify_formula_wrapper(
     );
 }
 
+std::string simplify_formula_cpp_wrapper(std::string formula_str) {
+    return sr::simplify_formula_cpp(formula_str);
+}
+
+// Wrapper for formula_to_seed_graph_cpp
+py::dict formula_to_seed_graph_wrapper(std::string formula_str) {
+    sr::IndividualGraph graph = sr::formula_to_graph(formula_str);
+
+    py::dict result;
+    py::list nodes_list;
+    for (const auto& node : graph.nodes) {
+        py::dict ndict;
+        ndict["type"] = static_cast<int>(node.type);
+        ndict["feature_idx"] = node.feature_idx;
+        ndict["value"] = node.value;
+        ndict["unary_op"] = static_cast<int>(node.unary_op);
+        ndict["binary_op"] = static_cast<int>(node.binary_op);
+        ndict["p"] = node.p;
+        ndict["omega"] = node.omega;
+        ndict["phi"] = node.phi;
+        ndict["amplitude"] = node.amplitude;
+        ndict["beta"] = node.beta;
+        ndict["gamma"] = node.gamma;
+        ndict["tau"] = node.tau;
+        ndict["left_child"] = node.left_child;
+        ndict["right_child"] = node.right_child;
+        nodes_list.append(ndict);
+    }
+
+    py::list weights_list;
+    for (double w : graph.output_weights) {
+        weights_list.append(w);
+    }
+
+    result["nodes"] = nodes_list;
+    result["output_weights"] = weights_list;
+    result["output_bias"] = graph.output_bias;
+    return result;
+}
+
+// Wrapper for snap_formula_floats_cpp
+std::string snap_formula_floats_wrapper(std::string formula_str, int n_features = 1) {
+    sr::IndividualGraph graph = sr::formula_to_graph(formula_str);
+    sr::simplify_ast(graph);
+    return sr::get_formula_string(graph, n_features);
+}
+
 // Wrapper for reduce_formula_noise_cpp
 std::string reduce_formula_noise_wrapper(
     std::string formula_str,
@@ -512,7 +559,17 @@ PYBIND11_MODULE(_core, m) {
           py::arg("formula_str"), py::arg("int_tol")=1e-5, py::arg("zero_tol")=1e-8, py::arg("max_passes")=6,
           py::arg("use_nsimplify")=true, py::arg("use_identities")=true, py::arg("approximate_trig")=false,
           py::arg("dominant_trig_ratio")=0.9, py::arg("small_term_ratio")=0.08, py::arg("n_features")=1);
+    m.def("simplify_formula_cpp", &simplify_formula_cpp_wrapper, "Simplifies a math formula string natively in C++",
+          py::arg("formula_str"));
+    m.def("formula_to_seed_graph", &formula_to_seed_graph_wrapper, "Parse a formula into a seed graph dict",
+          py::arg("formula_str"));
+    m.def("formula_to_seed_graph_cpp", &formula_to_seed_graph_wrapper, "Alias for formula_to_seed_graph",
+          py::arg("formula_str"));
+    m.def("snap_formula_floats", &snap_formula_floats_wrapper, "Snaps display floats in a formula string",
+          py::arg("formula_str"), py::arg("n_features")=1);
+    m.def("snap_formula_floats_cpp", &snap_formula_floats_wrapper, "Alias for snap_formula_floats");
     m.def("reduce_formula_noise", &reduce_formula_noise_wrapper, "Greedy backward elimination of terms to reduce noise",
           py::arg("formula_str"), py::arg("X_list"), py::arg("y"));
+    m.def("reduce_formula_noise_cpp", &reduce_formula_noise_wrapper, "Alias for reduce_formula_noise");
 }
 

@@ -297,17 +297,16 @@ private:
                 node->value = M_E;
                 return node;
             }
-            
-            auto node = std::make_shared<ParseNode>();
-            node->type = ParseNodeType::Input;
-            if (t.text == "x") {
-                node->feature_idx = 0;
-            } else if (t.text.size() > 1 && t.text[0] == 'x' && std::isdigit(t.text[1])) {
-                node->feature_idx = std::stoi(t.text.substr(1));
-            } else {
-                node->feature_idx = 0;
+
+            if (t.text == "x" || (t.text.size() > 1 && t.text[0] == 'x' &&
+                                   std::all_of(t.text.begin() + 1, t.text.end(), ::isdigit))) {
+                auto node = std::make_shared<ParseNode>();
+                node->type = ParseNodeType::Input;
+                node->feature_idx = (t.text == "x") ? 0 : std::stoi(t.text.substr(1));
+                return node;
             }
-            return node;
+
+            throw std::runtime_error("Unsupported symbol: " + t.text);
         }
         throw std::runtime_error("Unexpected token: " + t.text);
     }
