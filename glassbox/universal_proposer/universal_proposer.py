@@ -353,6 +353,129 @@ def _uncertainty_from_logits(logits: Sequence[float]) -> Dict[str, Any]:
     }
 
 
+def _signal_complexity(x: np.ndarray, y: np.ndarray) -> Dict[str, float]:
+    """Cheap curve complexity diagnostics for search planning."""
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    out = {
+        "roughness": 0.0,
+        "turning_rate": 0.0,
+        "y_variance": float(np.var(y)) if y.size else 0.0,
+    }
+    if x.size < 5 or y.size < 5:
+        return out
+
+    try:
+        dy = np.gradient(y, x)
+        ddy = np.gradient(dy, x)
+        y_scale = float(np.std(y)) + 1e-12
+        x_span = float(np.max(x) - np.min(x)) + 1e-12
+        out["roughness"] = float(np.clip(np.mean(np.abs(ddy)) * x_span / y_scale, 0.0, 10.0))
+
+        signs = np.sign(dy)
+        signs[np.abs(dy) < 1e-10] = 0.0
+        nz = signs[signs != 0.0]
+        if nz.size > 1:
+            out["turning_rate"] = float(np.mean(nz[1:] != nz[:-1]))
+    except Exception:
+        pass
+    return out
+
+
+def build_search_plan(
+    *,
+    operator_priors: Dict[str, float],
+    candidates: Sequence[Dict[str, Any]],
+    uncertainty: Dict[str, Any],
+    x: np.ndarray,
+    y: np.ndarray,
+) -> Dict[str, Any]:
+    """Build an evolution search plan from proposer evidence.
+
+    This is intentionally heuristic for now. It gives the proposer a planner
+    role without requiring a new checkpoint format. Future training can replace
+    these rules with explicit budget/depth heads.
+    """
+    complexity = _signal_complexity(x, y)
+    y_var = max(float(complexity.get("y_variance", 0.0)), 1e-12)
+
+    finite_mses = [
+        float(c.get("mse"))
+        for c in candidates
+        if c.get("mse") is not None and np.isfinite(float(c.get("mse")))
+    ]
+    best_rel_mse = (min(finite_mses) / y_var) if finite_mses else float("inf")
+
+    entropy = uncertainty.get("entropy")
+    margin = uncertainty.get("margin")
+    entropy_f = 0.75 if entropy is None else float(np.clip(entropy, 0.0, 1.0))
+    margin_f = 0.0 if margin is None else float(np.clip(margin, 0.0, 1.0))
+    uncertain = 0.65 * entropy_f + 0.35 * (1.0 - margin_f)
+
+    roughness = float(complexity.get("roughness", 0.0))
+    turning_rate = float(complexity.get("turning_rate", 0.0))
+    has_periodic = max(operator_priors.get("periodic", 0.0), operator_priors.get("sin", 0.0), operator_priors.get("cos", 0.0))
+    has_power = operator_priors.get("power", 0.0)
+    has_exp = operator_priors.get("exp", 0.0)
+    has_log = operator_priors.get("log", 0.0)
+    has_rational = operator_priors.get("rational", 0.0)
+
+    difficulty = 0.0
+    difficulty += 0.35 * uncertain
+    difficulty += 0.20 * float(np.clip(np.log10(best_rel_mse + 1e-12) + 6.0, 0.0, 6.0) / 6.0)
+    difficulty += 0.15 * float(np.clip(roughness / 4.0, 0.0, 1.0))
+    difficulty += 0.10 * float(np.clip(turning_rate * 3.0, 0.0, 1.0))
+    difficulty += 0.10 * float(max(has_rational, has_exp, has_log))
+    difficulty += 0.10 * float(has_periodic > 0.4 and has_power > 0.25)
+    difficulty = float(np.clip(difficulty, 0.0, 1.0))
+
+    if best_rel_mse < 1e-8 and uncertainty.get("confident") is True:
+        strategy = "refine_seed"
+    elif difficulty < 0.35:
+        strategy = "focused"
+    elif difficulty < 0.70:
+        strategy = "balanced"
+    else:
+        strategy = "exploratory"
+
+    population_multiplier = float(0.7 + 1.4 * difficulty)
+    generation_multiplier = float(0.8 + 2.2 * difficulty)
+    n_beams = int(np.clip(round(3 + 8 * difficulty), 3, 12))
+    n_rounds = 1 if difficulty < 0.65 else 2
+
+    p_min = -2.0
+    p_max = 3.0
+    if has_power > 0.35 or has_rational > 0.25:
+        p_max = 5.0
+    if roughness > 3.0 and has_power > 0.25:
+        p_max = 6.0
+    if has_rational > 0.35:
+        p_min = -4.0
+
+    max_complexity = int(np.clip(round(10 + 28 * difficulty + 8 * max(has_rational, has_periodic)), 10, 50))
+    seed_budget = int(np.clip(len(candidates) + round(4 + 8 * difficulty), 4, 16))
+
+    return {
+        "strategy": strategy,
+        "difficulty": difficulty,
+        "population_multiplier": population_multiplier,
+        "generation_multiplier": generation_multiplier,
+        "n_beams": n_beams,
+        "n_rounds": n_rounds,
+        "p_min": p_min,
+        "p_max": p_max,
+        "early_stop_max_nodes": max_complexity,
+        "acceptable_complexity": min(max_complexity, 20),
+        "seed_budget": seed_budget,
+        "signals": {
+            "best_relative_mse": None if not np.isfinite(best_rel_mse) else float(best_rel_mse),
+            "uncertainty": float(uncertain),
+            "roughness": roughness,
+            "turning_rate": turning_rate,
+        },
+    }
+
+
 def propose_from_xy(
     model: UniversalProposer,
     x: np.ndarray,
@@ -426,11 +549,19 @@ def propose_from_xy(
         candidates = decode_topk_skeletons(skeleton_logits, model.skeleton_vocab, top_k=top_k)
 
     uncertainty = _uncertainty_from_logits(skeleton_logits)
+    search_plan = build_search_plan(
+        operator_priors=priors,
+        candidates=candidates,
+        uncertainty=uncertainty,
+        x=x.astype(np.float64),
+        y=y.astype(np.float64),
+    )
 
     return {
         "candidate_skeletons": candidates,
         "operator_priors": priors,
         "sequence_uncertainty": uncertainty,
+        "search_plan": search_plan,
     }
 
 
@@ -458,6 +589,7 @@ def proposer_output_to_fpip_v2(
         "operator_priors": dict(proposer_output.get("operator_priors", {})),
         "interaction_hints": dict(interaction_hints),
         "fit_diagnostics": dict(fit_diagnostics),
+        "search_plan": dict(proposer_output.get("search_plan", {})),
         "routing_signal": {
             "recommend_guided_evolution": bool(recommend_guided),
             "reason": "proposer_low_confidence" if recommend_guided else "proposer_confident",

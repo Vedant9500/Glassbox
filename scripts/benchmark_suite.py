@@ -933,6 +933,9 @@ def run_formula(
                     )
                     if payload and payload.get("valid"):
                         seq_unc = payload.get("sequence_uncertainty", {})
+                        search_plan = payload.get("search_plan", {})
+                        if not isinstance(search_plan, dict):
+                            search_plan = {}
                         
                         # Calculate mathematical difficulty [0.0, 1.0]
                         entropy = float(seq_unc.get("entropy") or 0.0)
@@ -940,10 +943,20 @@ def run_formula(
                         difficulty = np.clip((entropy / 1.5) + (1.0 - margin), 0.0, 1.0)
                         proposer_confidence = float(np.clip(1.0 - difficulty, 0.0, 1.0))
                         
-                        # Keep benchmark-guided evolution bounded. The deeper
-                        # search is still available through CLI budget knobs.
-                        dynamic_gens = int(max(20, evolution_generations))
-                        dynamic_pop = int(max(20, evolution_population))
+                        # Let the proposer act as a bounded search planner. The
+                        # CLI values remain the base budget and hard cap.
+                        gen_mult = float(search_plan.get("generation_multiplier", 1.0) or 1.0)
+                        pop_mult = float(search_plan.get("population_multiplier", 1.0) or 1.0)
+                        dynamic_gens = int(np.clip(
+                            round(evolution_generations * gen_mult),
+                            20,
+                            max(20, evolution_generations * 4),
+                        ))
+                        dynamic_pop = int(np.clip(
+                            round(evolution_population * pop_mult),
+                            20,
+                            max(20, evolution_population * 3),
+                        ))
                         
                         if seq_unc.get("confident") is True:
                             proposer_confidence = max(proposer_confidence, 0.9)
@@ -974,7 +987,13 @@ def run_formula(
                                 })
                         if candidate_formulas:
                             print(f"\n  [Universal Proposer] Active FPIPv2 metadata injected!")
-                            print(f"  [Universal Proposer] Difficulty: {difficulty:.2f} -> Budget: {dynamic_gens} gens, {dynamic_pop} pop")
+                            strategy = search_plan.get("strategy", "legacy")
+                            planned_difficulty = search_plan.get("difficulty", difficulty)
+                            print(
+                                f"  [Universal Proposer] Strategy: {strategy} "
+                                f"difficulty={float(planned_difficulty):.2f} -> "
+                                f"Budget: {dynamic_gens} gens, {dynamic_pop} pop"
+                            )
                 except Exception as e:
                     print(f"\n  [Universal Proposer] Warning: execution failed: {e}")
 

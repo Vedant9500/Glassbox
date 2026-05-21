@@ -17,6 +17,28 @@ import numpy as np
 import torch
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
+from glassbox.sr.blackbox_preprocessor import (
+    formula_from_search_to_original_space,
+    prepare_blackbox_search,
+    state_to_dict,
+)
+
+
+def _clamp_int(value, default, lo, hi):
+    try:
+        value = int(round(float(value)))
+    except Exception:
+        value = default
+    return int(max(lo, min(hi, value)))
+
+
+def _clamp_float(value, default, lo, hi):
+    try:
+        value = float(value)
+    except Exception:
+        value = default
+    return float(max(lo, min(hi, value)))
+
 
 # Path setup
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -80,6 +102,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         universal_proposer_shadow_mode="auto",
         universal_proposer_log_routing=True,
         universal_proposer_top_k=5,
+        blackbox_mode="auto",
+        blackbox_max_features=6,
+        blackbox_feature_selection=True,
+        blackbox_standardize=False,
+        blackbox_min_features_to_select=5,
         device=None,
         skip_evolution_if_bloated=False,
         bloat_term_threshold=20,
@@ -123,6 +150,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.universal_proposer_shadow_mode = legacy_mode if universal_proposer_shadow_mode == "auto" else universal_proposer_shadow_mode
         self.universal_proposer_log_routing = universal_proposer_log_routing
         self.universal_proposer_top_k = universal_proposer_top_k
+        self.blackbox_mode = blackbox_mode
+        self.blackbox_max_features = blackbox_max_features
+        self.blackbox_feature_selection = blackbox_feature_selection
+        self.blackbox_standardize = blackbox_standardize
+        self.blackbox_min_features_to_select = blackbox_min_features_to_select
         self.device = device
         self.skip_evolution_if_bloated = skip_evolution_if_bloated
         self.bloat_term_threshold = bloat_term_threshold
@@ -457,11 +489,45 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         X, y = check_X_y(X, y, accept_sparse=False)
         self.n_features_in_ = X.shape[1]
+        self.original_n_features_in_ = X.shape[1]
         fit_start = _time.time()
 
         if self.random_state is not None:
             np.random.seed(self.random_state)
             torch.manual_seed(self.random_state)
+
+        blackbox_enabled = (
+            bool(self.blackbox_feature_selection)
+            and (
+                self.blackbox_mode is True
+                or (
+                    self.blackbox_mode == "auto"
+                    and X.shape[1] >= int(max(2, self.blackbox_min_features_to_select))
+                )
+            )
+        )
+        X_original = X
+        y_original = y
+        X_search, y_search, blackbox_state = prepare_blackbox_search(
+            X,
+            y,
+            enabled=blackbox_enabled,
+            max_features=int(self.blackbox_max_features),
+            standardize=bool(self.blackbox_standardize),
+            min_features_to_select=int(self.blackbox_min_features_to_select),
+        )
+        self.blackbox_state_ = blackbox_state
+        self.blackbox_diagnostics_ = state_to_dict(blackbox_state)
+
+        if blackbox_state.enabled:
+            X = X_search
+            y = y_search
+            self.n_features_in_ = X.shape[1]
+            if self.universal_proposer_log_routing:
+                print(
+                    "  [Blackbox] selected features "
+                    f"{blackbox_state.selected_features} / {self.original_n_features_in_}"
+                )
 
         detected_omegas = self._detect_frequencies(X, y)
 
@@ -599,9 +665,18 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 evo_formula = None
                 evo_mse = float('inf')
                 candidate_formulas = None
+                proposer_payload = (
+                    self.universal_proposer_fpip_v2_
+                    if isinstance(self.universal_proposer_fpip_v2_, dict)
+                    else {}
+                )
+                proposer_plan = proposer_payload.get("search_plan", {})
+                if not isinstance(proposer_plan, dict):
+                    proposer_plan = {}
 
                 # Try guided evolution (beam search) only if R² is low
                 if (self.use_guided_evolution and operator_hints
+                    and self.n_features_in_ == 1
                     and (current_r2 < self.evolution_skip_r2 or not fast_path_cv_ok)
                     and _elapsed() < effective_timeout):
                     try:
@@ -627,8 +702,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             })
 
                         # Blend proposer priors into hints if available
-                        if self.universal_proposer_fpip_v2_ and self.universal_proposer_fpip_v2_.get("valid"):
-                            proposer_priors = self.universal_proposer_fpip_v2_.get("operator_priors", {})
+                        if proposer_payload.get("valid"):
+                            proposer_priors = proposer_payload.get("operator_priors", {})
                             if proposer_priors:
                                 if "operators" not in hints:
                                     hints["operators"] = set()
@@ -636,7 +711,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                     if prob > 0.15:
                                         hints["operators"].add(op)
 
-                            for cand in self.universal_proposer_fpip_v2_.get("candidate_skeletons", []):
+                            for cand in proposer_payload.get("candidate_skeletons", []):
                                 formula_str = cand.get("formula", "")
                                 if formula_str:
                                     active_terms = [
@@ -670,13 +745,29 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             best_mse = best_cand_mse
                             need_evolution = False 
                         else:
-                            # Pass proposer uncertainty to guide beam count
-                            p_unc = self.universal_proposer_fpip_v2_.get("sequence_uncertainty", {})
+                            # Pass proposer uncertainty to guide beam count when available.
+                            p_unc = proposer_payload.get("sequence_uncertainty", {})
+                            if not isinstance(p_unc, dict):
+                                p_unc = {}
                             confidence = 1.0 - p_unc.get("entropy", 0.5)
+                            guided_generations = _clamp_int(
+                                min(40, self.generations // 10)
+                                * _clamp_float(proposer_plan.get("generation_multiplier"), 1.0, 0.5, 4.0),
+                                default=min(40, self.generations // 10),
+                                lo=10,
+                                hi=max(10, int(self.generations)),
+                            )
+                            guided_population = _clamp_int(
+                                min(30, self.population_size)
+                                * _clamp_float(proposer_plan.get("population_multiplier"), 1.0, 0.5, 3.0),
+                                default=min(30, self.population_size),
+                                lo=10,
+                                hi=max(10, int(self.population_size)),
+                            )
                             guided_result = run_guided_evolution(
                                 x_t, y_t, hints,
-                                generations=min(40, self.generations // 10),
-                                population_size=min(30, self.population_size),
+                                generations=guided_generations,
+                                population_size=guided_population,
                                 device=self.device or "cpu",
                                 candidate_formulas=candidate_formulas,
                                 confidence=confidence,  # New parameter
@@ -699,8 +790,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
                         # Combine operator priors from proposer to pass natively to C++
                         cpp_op_priors = []
-                        if self.universal_proposer_fpip_v2_ and self.universal_proposer_fpip_v2_.get("valid"):
-                            pp = self.universal_proposer_fpip_v2_.get("operator_priors", {})
+                        if proposer_payload.get("valid"):
+                            pp = proposer_payload.get("operator_priors", {})
                             if pp:
                                 # Order: periodic, power, exp, log
                                 cpp_op_priors = [
@@ -742,20 +833,44 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             result = _core.run_evolution(
                                 X_list=X_list,
                                 y=y_arr,
-                                pop_size=self.population_size,
-                                generations=self.generations,
+                                pop_size=_clamp_int(
+                                    self.population_size
+                                    * _clamp_float(proposer_plan.get("population_multiplier"), 1.0, 0.5, 3.0),
+                                    default=self.population_size,
+                                    lo=10,
+                                    hi=max(10, int(self.population_size * 3)),
+                                ),
+                                generations=_clamp_int(
+                                    self.generations
+                                    * _clamp_float(proposer_plan.get("generation_multiplier"), 1.0, 0.5, 4.0),
+                                    default=self.generations,
+                                    lo=10,
+                                    hi=max(10, int(self.generations * 4)),
+                                ),
                                 early_stop_mse=self.early_stop_mse,
                                 seed_omegas=detected_omegas,
                                 op_priors=cpp_op_priors,
                                 timeout_seconds=run_timeout,
-                                p_min=self.p_min,
-                                p_max=self.p_max,
+                                p_min=_clamp_float(proposer_plan.get("p_min"), self.p_min, -8.0, 3.0),
+                                p_max=_clamp_float(proposer_plan.get("p_max"), self.p_max, 1.0, 10.0),
                                 use_nsga2=self.use_nsga2,
                                 num_islands=self.num_islands,
                                 migration_interval=self.migration_interval,
                                 migration_size=self.migration_size,
                                 arithmetic_temperature=self.arithmetic_temperature,
                                 random_seed=run_seed,
+                                acceptable_complexity=_clamp_int(
+                                    proposer_plan.get("acceptable_complexity"),
+                                    default=15,
+                                    lo=5,
+                                    hi=80,
+                                ),
+                                early_stop_max_nodes=_clamp_int(
+                                    proposer_plan.get("early_stop_max_nodes"),
+                                    default=50,
+                                    lo=10,
+                                    hi=120,
+                                ),
                                 seed_graphs_py=seed_graphs_py,
                             )
 
@@ -798,6 +913,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if best_formula:
             best_formula = self._reduce_formula_noise(best_formula, X, y)
             best_formula = self._simplify_formula(best_formula)
+            if getattr(self, "blackbox_state_", None) is not None and self.blackbox_state_.enabled:
+                best_formula = formula_from_search_to_original_space(
+                    best_formula,
+                    self.blackbox_state_,
+                )
 
         self.formula_ = best_formula or "0"
         self.best_mse_ = best_mse

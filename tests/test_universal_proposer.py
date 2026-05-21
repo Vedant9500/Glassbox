@@ -23,6 +23,9 @@ def test_universal_proposer_returns_topk_candidates():
     assert "operator_priors" in out
     assert len(out["operator_priors"]) > 0
     assert "sequence_uncertainty" in out
+    assert "search_plan" in out
+    assert out["search_plan"]["strategy"] in {"refine_seed", "focused", "balanced", "exploratory"}
+    assert out["search_plan"]["population_multiplier"] > 0
 
 
 def test_proposer_output_maps_to_valid_fpip_v2():
@@ -37,6 +40,8 @@ def test_proposer_output_maps_to_valid_fpip_v2():
     assert payload["valid"] is True
     assert len(payload["candidate_skeletons"]) == 3
     assert "routing_signal" in payload
+    assert "search_plan" in payload
+    assert "generation_multiplier" in payload["search_plan"]
 
 
 def test_grammar_decoder_prefers_periodic_candidates():

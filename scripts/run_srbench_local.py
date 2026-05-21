@@ -25,13 +25,15 @@ import gzip
 from pathlib import Path
 from datetime import datetime
 from multiprocessing import get_context
-
 import numpy as np
 
 # Project root
-_REPO_ROOT = Path(__file__).resolve().parent.parent
+_SCRIPT_DIR = Path(__file__).resolve().parent
+_REPO_ROOT = _SCRIPT_DIR.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
 from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_signal
@@ -318,6 +320,102 @@ def model_size(formula_str):
     return ops + funcs + 1
 
 
+def _normalize_formula_text(formula):
+    """Normalize common unicode/operator variants to a parser-friendly form."""
+    if not formula:
+        return formula
+    formula = (
+        str(formula)
+        .replace("²", "^2")
+        .replace("³", "^3")
+        .replace("·", "*")
+        .replace("⋅", "*")
+        .replace("×", "*")
+        .replace("π", "pi")
+        .replace("√", "sqrt")
+        .replace("φ", "phi")
+        .replace("ω", "omega")
+        .replace("np.", "")
+    )
+    return re.sub(r"\s+", "", formula)
+
+
+def _infer_formula_n_features(formula):
+    indices = [int(m.group(1)) for m in re.finditer(r"\bx(\d+)\b", str(formula or ""))]
+    return max(indices) + 1 if indices else 1
+
+
+def _simplify_formula_native(formula, int_tol=0.05, zero_tol=1e-3):
+    """Simplify with the native C++ simplifier when available."""
+    try:
+        cpp_dir = _REPO_ROOT / "glassbox" / "sr" / "cpp"
+        if str(cpp_dir) not in sys.path:
+            sys.path.insert(0, str(cpp_dir))
+
+        import _core  # type: ignore
+
+        if hasattr(_core, "simplify_formula"):
+            simplified = _core.simplify_formula(
+                formula,
+                int_tol=float(int_tol),
+                zero_tol=float(zero_tol),
+                max_passes=6,
+                use_nsimplify=True,
+                use_identities=True,
+                n_features=_infer_formula_n_features(formula),
+            )
+        elif hasattr(_core, "simplify_formula_cpp"):
+            simplified = _core.simplify_formula_cpp(formula)
+        else:
+            return None
+
+        if simplified and simplified not in {"N/A", "ERROR", "?"}:
+            return str(simplified)
+    except Exception:
+        return None
+    return None
+
+
+def postprocess_formula(formula):
+    """Apply the current benchmark-suite formula cleanup to displayed formulas."""
+    normalized = _normalize_formula_text(formula)
+    if not normalized or normalized in {"N/A", "ERROR", "?"}:
+        return normalized
+
+    evo_int_tol = 0.05
+    evo_zero_tol = 1e-3
+
+    native = _simplify_formula_native(normalized, evo_int_tol, evo_zero_tol)
+    if native is not None:
+        normalized = native
+
+    try:
+        try:
+            from simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+        except ImportError:
+            from scripts.simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+
+        formula_len = len(normalized)
+        term_estimate = max(1, len([t for t in re.split(r"\s*[+-]\s*", normalized) if t.strip()]))
+        too_complex_for_symbolic = formula_len > 500 or term_estimate > 24
+
+        if too_complex_for_symbolic:
+            return snap_formula_floats(
+                normalized,
+                SnapConfig(int_tol=evo_int_tol, zero_tol=evo_zero_tol),
+            )
+
+        _, simplified_expr = simplify_onn_formula(
+            normalized,
+            int_tol=evo_int_tol,
+            zero_tol=evo_zero_tol,
+            use_nsimplify=(formula_len <= 300 and term_estimate <= 16),
+        )
+        return str(simplified_expr)
+    except Exception:
+        return normalized
+
+
 def evaluate_formula(formula_str, X):
     """Evaluate a discovered formula string strictly on X.
 
@@ -327,9 +425,9 @@ def evaluate_formula(formula_str, X):
     if not formula_str:
         return None
 
-    formula = str(formula_str).strip()
+    formula = _normalize_formula_text(formula_str).strip()
     formula = re.sub(r'\|([^|]+)\|', r'abs(\1)', formula)
-    formula = formula.replace('^', '**').replace('np.', '')
+    formula = formula.replace('^', '**')
 
     context = {
         "np": np,
@@ -610,6 +708,13 @@ def _fit_worker(payload, queue):
         formula = est.get_formula()
         y_pred_test = est.predict(X_test)
         y_pred_full = est.predict(X_full) if X_full is not None else None
+        raw_mse = getattr(est, "mse_", None)
+        blackbox_diagnostics = getattr(est, "blackbox_diagnostics_", None)
+        evolution_wall_time = getattr(est, "evolution_wall_time_sec_", None)
+        time_to_first_exact = getattr(est, "time_to_first_exact_sec_", None)
+        time_to_first_acceptable = getattr(est, "time_to_first_acceptable_sec_", None)
+        generation_to_first_exact = getattr(est, "generation_to_first_exact_", None)
+        generation_to_first_acceptable = getattr(est, "generation_to_first_acceptable_", None)
 
         queue.put({
             "status": "ok",
@@ -617,6 +722,13 @@ def _fit_worker(payload, queue):
             "formula": formula,
             "y_pred_test": y_pred_test,
             "y_pred_full": y_pred_full,
+            "raw_mse": raw_mse,
+            "blackbox_diagnostics": blackbox_diagnostics,
+            "evolution_wall_time_sec": evolution_wall_time,
+            "time_to_first_exact": time_to_first_exact,
+            "time_to_first_acceptable": time_to_first_acceptable,
+            "generation_to_first_exact": generation_to_first_exact,
+            "generation_to_first_acceptable": generation_to_first_acceptable,
         })
     except TimeoutError as te:
         queue.put({"status": "timeout", "error": str(te)})
@@ -788,14 +900,14 @@ def run_track1_blackbox(
                                 break
                             continue
 
-                        formula = run_result.get("formula", "")
+                        formula = postprocess_formula(run_result.get("formula", ""))
                         if post_simplify and formula:
                             formula = simplify_formula_with_guard(formula, X_train, y_train)
                         y_pred = evaluate_formula(formula, X_test)
                     else:
                         est_copy = est.__class__(**est_params)
                         est_copy.fit(X_train, y_train)
-                        formula = est_copy.get_formula()
+                        formula = postprocess_formula(est_copy.get_formula())
                         if post_simplify and formula:
                             formula = simplify_formula_with_guard(formula, X_train, y_train)
                         y_pred = evaluate_formula(formula, X_test)
@@ -809,6 +921,7 @@ def run_track1_blackbox(
                             "time": elapsed,
                             "formula": formula,
                             "model_size": model_size(formula),
+                            "blackbox_diagnostics": run_result.get("blackbox_diagnostics") if hard_timeout else getattr(est_copy, "blackbox_diagnostics_", None),
                             "error": "formula_eval_failed",
                         })
                         continue
@@ -823,6 +936,7 @@ def run_track1_blackbox(
                         "time": elapsed,
                         "formula": formula,
                         "model_size": size,
+                        "blackbox_diagnostics": run_result.get("blackbox_diagnostics") if hard_timeout else getattr(est_copy, "blackbox_diagnostics_", None),
                         "error": None,
                     })
                 except Exception as e:
@@ -952,26 +1066,26 @@ def run_track2_ground_truth(
                             X_full=X,
                         )
                         elapsed = time.time() - t0
-                    if run_result["status"] != "ok":
-                        seed_runs.append({
-                            "seed": repeat_seed,
-                            "r2": None,
-                            "mse": None,
-                            "time": elapsed,
-                            "error": run_result.get("error", run_result["status"]),
-                        })
-                        if "timeout" in str(run_result.get("error", "")).lower():
-                            break
-                        continue
+                        if run_result["status"] != "ok":
+                            seed_runs.append({
+                                "seed": repeat_seed,
+                                "r2": None,
+                                "mse": None,
+                                "time": elapsed,
+                                "error": run_result.get("error", run_result["status"]),
+                            })
+                            if "timeout" in str(run_result.get("error", "")).lower():
+                                break
+                            continue
 
-                        formula = run_result.get("formula", "")
+                        formula = postprocess_formula(run_result.get("formula", ""))
                         if post_simplify and formula:
                             formula = simplify_formula_with_guard(formula, X_train, y_train)
                         y_pred_all = evaluate_formula(formula, X)
                     else:
                         est_copy = est.__class__(**est_params)
                         est_copy.fit(X_train, y_train)
-                        formula = est_copy.get_formula()
+                        formula = postprocess_formula(est_copy.get_formula())
                         if post_simplify and formula:
                             formula = simplify_formula_with_guard(formula, X_train, y_train)
                         y_pred_all = evaluate_formula(formula, X)
@@ -1230,6 +1344,12 @@ def main():
                         help="R2 threshold for acceptable discovery metric")
     parser.add_argument("--complexity-cap", type=int, default=20,
                         help="Complexity cap (model size) for acceptable discovery metric")
+    parser.add_argument("--blackbox-mode", choices=["auto", "on", "off"], default="auto",
+                        help="Feature-select multivariate blackbox problems before evolution")
+    parser.add_argument("--blackbox-max-features", type=int, default=6,
+                        help="Max selected features for blackbox feature selection")
+    parser.add_argument("--blackbox-standardize", action="store_true",
+                        help="Standardize X/y during blackbox symbolic search and map formula back")
     args = parser.parse_args()
 
     seeds = parse_seed_list(args.seeds)
@@ -1247,6 +1367,10 @@ def main():
         skip_evolution_if_bloated=args.skip_evolution_if_bloated,
         bloat_term_threshold=20,
         universal_proposer_path=args.proposer_model,
+        blackbox_mode=(True if args.blackbox_mode == "on" else False if args.blackbox_mode == "off" else "auto"),
+        blackbox_max_features=args.blackbox_max_features,
+        blackbox_feature_selection=(args.blackbox_mode != "off"),
+        blackbox_standardize=args.blackbox_standardize,
     )
 
     print(f"\n  Glassbox SRBench Benchmark")
@@ -1262,6 +1386,7 @@ def main():
     print(f"  Multi-seed protocol: {seeds}")
     print(f"  Runs/formula: {args.runs_per_formula}")
     print(f"  Acceptable criteria: R2>={args.acceptable_r2:.2f}, size<={args.complexity_cap}")
+    print(f"  Blackbox mode: {args.blackbox_mode}  |  max features: {args.blackbox_max_features}")
 
     blackbox_datasets = get_official_pmlb_regression_datasets() if args.official else list(PMLB_DATASETS)
     discovered_gt = discover_official_ground_truth_problems(args.data_dir) if args.data_dir else []

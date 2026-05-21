@@ -39,6 +39,7 @@ class FPIPv2:
     operator_priors: Dict[str, float] = field(default_factory=dict)
     interaction_hints: Dict[str, Any] = field(default_factory=dict)
     fit_diagnostics: Dict[str, Any] = field(default_factory=dict)
+    search_plan: Dict[str, Any] = field(default_factory=dict)
     routing_signal: RoutingSignal = field(
         default_factory=lambda: RoutingSignal(False, "default_fast_accept")
     )
@@ -133,6 +134,7 @@ def build_fpip_v2_from_fast_path(
             "residual_spectral_peak_ratio": _to_float_or_none(residual_diagnostics.get("residual_spectral_peak_ratio")),
             "residual_holdout_ratio": _to_float_or_none(residual_diagnostics.get("residual_holdout_ratio")),
         },
+        search_plan={},
         routing_signal=_routing_from_signals(uncertainty, residual_diagnostics),
     )
 
@@ -172,6 +174,10 @@ def validate_fpip_v2_payload(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:
             errors.append("routing_signal.recommend_guided_evolution is required")
         if "reason" not in routing:
             errors.append("routing_signal.reason is required")
+
+    search_plan = payload.get("search_plan", {})
+    if search_plan is not None and not isinstance(search_plan, dict):
+        errors.append("search_plan must be a dict when present")
 
     return len(errors) == 0, errors
 
