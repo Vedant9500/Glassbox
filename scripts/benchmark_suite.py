@@ -60,6 +60,84 @@ from classifier_fast_path import run_fast_path, run_guided_evolution  # noqa: E4
 from glassbox.evolution import detect_dominant_frequency  # noqa: E402
 from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_signal  # noqa: E402
 
+
+def _finite_float(value: Any, default: float) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
+def _finite_int(value: Any, default: int) -> int:
+    try:
+        out = int(round(float(value)))
+    except (TypeError, ValueError):
+        return default
+    return out if math.isfinite(out) else default
+
+
+def _planned_guided_budget(
+    search_plan: Dict[str, Any],
+    base_generations: int,
+    base_population: int,
+    *,
+    trust_plan: bool,
+) -> Tuple[int, int, Dict[str, Any]]:
+    """Translate proposer search_plan metadata into guided-evolution kwargs."""
+    gen_mult = _finite_float(search_plan.get("generation_multiplier"), 1.0)
+    pop_mult = _finite_float(search_plan.get("population_multiplier"), 1.0)
+    if gen_mult <= 0.0:
+        gen_mult = 1.0
+    if pop_mult <= 0.0:
+        pop_mult = 1.0
+    if not trust_plan:
+        gen_mult = max(0.05, gen_mult)
+        pop_mult = max(0.05, pop_mult)
+
+    if trust_plan:
+        generations = max(1, int(round(base_generations * gen_mult)))
+        population = max(1, int(round(base_population * pop_mult)))
+    else:
+        generations = int(np.clip(
+            round(base_generations * gen_mult),
+            20,
+            max(20, base_generations * 4),
+        ))
+        population = int(np.clip(
+            round(base_population * pop_mult),
+            20,
+            max(20, base_population * 3),
+        ))
+
+    guided_plan: Dict[str, Any] = {}
+    if trust_plan:
+        if "n_beams" in search_plan:
+            guided_plan["n_beams"] = max(1, _finite_int(search_plan.get("n_beams"), 1))
+        if "n_rounds" in search_plan:
+            guided_plan["n_rounds"] = max(1, _finite_int(search_plan.get("n_rounds"), 1))
+        if "p_min" in search_plan:
+            guided_plan["p_min"] = _finite_float(search_plan.get("p_min"), -2.0)
+        if "p_max" in search_plan:
+            guided_plan["p_max"] = _finite_float(search_plan.get("p_max"), 3.0)
+        if "seed_budget" in search_plan:
+            guided_plan["seed_budget"] = max(0, _finite_int(search_plan.get("seed_budget"), 0))
+        if "acceptable_complexity" in search_plan:
+            guided_plan["acceptable_complexity"] = max(
+                1, _finite_int(search_plan.get("acceptable_complexity"), 15)
+            )
+        if "early_stop_max_nodes" in search_plan:
+            guided_plan["early_stop_max_nodes"] = max(
+                1, _finite_int(search_plan.get("early_stop_max_nodes"), 50)
+            )
+        if "acceptable_mse" in search_plan:
+            guided_plan["acceptable_mse"] = max(
+                0.0, _finite_float(search_plan.get("acceptable_mse"), 1e-8)
+            )
+
+    return generations, population, guided_plan
+
+
 # ---------------------------------------------------------------------------
 # Benchmark Formula Bank  (~200 formulas across 8 tiers)
 # ---------------------------------------------------------------------------
@@ -763,6 +841,7 @@ def run_formula(
     disable_proposer: bool = False,
     evolution_generations: int = 150,
     evolution_population: int = 50,
+    trust_proposer_plan: bool = False,
 ) -> Dict[str, Any]:
     """Run fast-path and/or guided evolution on a single formula."""
     x_min, x_max = x_range
@@ -923,6 +1002,7 @@ def run_formula(
             proposer_confidence = 0.5
             dynamic_gens = int(max(20, evolution_generations))
             dynamic_pop = int(max(20, evolution_population))
+            guided_plan: Dict[str, Any] = {}
             
             if not disable_proposer and proposer_path:
                 try:
@@ -943,20 +1023,12 @@ def run_formula(
                         difficulty = np.clip((entropy / 1.5) + (1.0 - margin), 0.0, 1.0)
                         proposer_confidence = float(np.clip(1.0 - difficulty, 0.0, 1.0))
                         
-                        # Let the proposer act as a bounded search planner. The
-                        # CLI values remain the base budget and hard cap.
-                        gen_mult = float(search_plan.get("generation_multiplier", 1.0) or 1.0)
-                        pop_mult = float(search_plan.get("population_multiplier", 1.0) or 1.0)
-                        dynamic_gens = int(np.clip(
-                            round(evolution_generations * gen_mult),
-                            20,
-                            max(20, evolution_generations * 4),
-                        ))
-                        dynamic_pop = int(np.clip(
-                            round(evolution_population * pop_mult),
-                            20,
-                            max(20, evolution_population * 3),
-                        ))
+                        dynamic_gens, dynamic_pop, guided_plan = _planned_guided_budget(
+                            search_plan,
+                            evolution_generations,
+                            evolution_population,
+                            trust_plan=trust_proposer_plan,
+                        )
                         
                         if seq_unc.get("confident") is True:
                             proposer_confidence = max(proposer_confidence, 0.9)
@@ -989,11 +1061,14 @@ def run_formula(
                             print(f"\n  [Universal Proposer] Active FPIPv2 metadata injected!")
                             strategy = search_plan.get("strategy", "legacy")
                             planned_difficulty = search_plan.get("difficulty", difficulty)
+                            planner_mode = "trusted" if trust_proposer_plan else "bounded"
                             print(
-                                f"  [Universal Proposer] Strategy: {strategy} "
+                                f"  [Universal Proposer] Strategy: {strategy} ({planner_mode}) "
                                 f"difficulty={float(planned_difficulty):.2f} -> "
                                 f"Budget: {dynamic_gens} gens, {dynamic_pop} pop"
                             )
+                            if guided_plan:
+                                print(f"  [Universal Proposer] Search plan: {guided_plan}")
                 except Exception as e:
                     print(f"\n  [Universal Proposer] Warning: execution failed: {e}")
 
@@ -1015,6 +1090,7 @@ def run_formula(
                     device=device,
                     candidate_formulas=candidate_formulas,
                     confidence=proposer_confidence,
+                    search_plan=guided_plan,
                 )
 
                 guided_elapsed = time.time() - t1
@@ -1396,6 +1472,13 @@ Examples:
         help="Disable the neural proposer and rely purely on legacy classifier hints",
     )
     parser.add_argument(
+        "--trust-proposer-plan", action="store_true",
+        help=(
+            "Let the universal proposer control guided-evolution budget and search-plan "
+            "knobs instead of applying benchmark clamps"
+        ),
+    )
+    parser.add_argument(
         "--with-evolution", action="store_true",
         help="Run latest guided evolution (beam-search path) when fast-path is not exact",
     )
@@ -1513,6 +1596,8 @@ Examples:
         print(f"  Classifier:  {args.classifier_model}")
         proposer_txt = args.proposer_model if not args.disable_proposer else "DISABLED"
         print(f"  Proposer:    {proposer_txt}")
+        if not args.disable_proposer and args.trust_proposer_plan:
+            print("  Planner:     universal proposer search plan")
         print("  Strategy:    optimized")
     print(f"  Device:      {device}")
     print(f"  Tiers:       {tiers_to_run}")
@@ -1567,6 +1652,7 @@ Examples:
                         disable_proposer=args.disable_proposer,
                         evolution_generations=args.guided_generations,
                         evolution_population=args.guided_pop_size,
+                        trust_proposer_plan=args.trust_proposer_plan,
                     )
                 
                 # Keep the best result based on displayed MSE (or just any valid MSE if best_result is None)

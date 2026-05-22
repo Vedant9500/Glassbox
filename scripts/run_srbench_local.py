@@ -819,6 +819,7 @@ def run_track1_blackbox(
     adaptive_timeout=True,
     post_simplify=False,
     skip_evolution_if_bloated=True,
+    ablation_mode=False,
 ):
     """Track 1: Black-box regression on PMLB datasets."""
     try:
@@ -868,7 +869,6 @@ def run_track1_blackbox(
         for seed in seeds:
             for run_idx in range(max(1, int(runs_per_formula))):
                 repeat_seed = int(seed) + run_idx * 10007
-                t0 = time.time()
                 try:
                     est_params = est.get_params().copy()
                     est_params["timeout"] = timeout_budget
@@ -879,69 +879,83 @@ def run_track1_blackbox(
                         est_params["skip_evolution_if_bloated"] = True
                         est_params["bloat_term_threshold"] = 20
 
-                    if hard_timeout:
-                        run_result = run_with_hard_timeout(
-                            est_params,
-                            X_train,
-                            y_train,
-                            X_test,
-                            timeout_seconds=timeout_budget + 5,
-                        )
-                        elapsed = time.time() - t0
-                        if run_result["status"] != "ok":
-                            seed_runs.append({
+                    def _run_once(run_label, train_X, train_y, test_X, params):
+                        t0 = time.time()
+                        if hard_timeout:
+                            run_result = run_with_hard_timeout(
+                                params,
+                                train_X,
+                                train_y,
+                                test_X,
+                                timeout_seconds=timeout_budget + 5,
+                            )
+                            elapsed = time.time() - t0
+                            if run_result["status"] != "ok":
+                                return {
+                                    "seed": repeat_seed,
+                                    "r2": None,
+                                    "mse": None,
+                                    "time": elapsed,
+                                    "error": run_result.get("error", run_result["status"]),
+                                    "run_label": run_label,
+                                }
+
+                            formula = postprocess_formula(run_result.get("formula", ""))
+                            if post_simplify and formula:
+                                formula = simplify_formula_with_guard(formula, train_X, train_y)
+                            y_pred = evaluate_formula(formula, test_X)
+                            blackbox_diag = run_result.get("blackbox_diagnostics")
+                        else:
+                            est_copy = est.__class__(**est_params)
+                            est_copy.fit(train_X, train_y)
+                            formula = postprocess_formula(est_copy.get_formula())
+                            if post_simplify and formula:
+                                formula = simplify_formula_with_guard(formula, train_X, train_y)
+                            y_pred = evaluate_formula(formula, test_X)
+                            elapsed = time.time() - t0
+                            blackbox_diag = getattr(est_copy, "blackbox_diagnostics_", None)
+
+                        if y_pred is None:
+                            return {
                                 "seed": repeat_seed,
                                 "r2": None,
                                 "mse": None,
                                 "time": elapsed,
-                                "error": run_result.get("error", run_result["status"]),
-                            })
-                            if "timeout" in str(run_result.get("error", "")).lower():
-                                break
-                            continue
+                                "formula": formula,
+                                "model_size": model_size(formula),
+                                "blackbox_diagnostics": blackbox_diag,
+                                "error": "formula_eval_failed",
+                                "run_label": run_label,
+                            }
 
-                        formula = postprocess_formula(run_result.get("formula", ""))
-                        if post_simplify and formula:
-                            formula = simplify_formula_with_guard(formula, X_train, y_train)
-                        y_pred = evaluate_formula(formula, X_test)
-                    else:
-                        est_copy = est.__class__(**est_params)
-                        est_copy.fit(X_train, y_train)
-                        formula = postprocess_formula(est_copy.get_formula())
-                        if post_simplify and formula:
-                            formula = simplify_formula_with_guard(formula, X_train, y_train)
-                        y_pred = evaluate_formula(formula, X_test)
-                        elapsed = time.time() - t0
-
-                    if y_pred is None:
-                        seed_runs.append({
+                        r2 = r2_score(y_test, y_pred)
+                        mse = mse_score(y_test, y_pred)
+                        size = model_size(formula)
+                        return {
                             "seed": repeat_seed,
-                            "r2": None,
-                            "mse": None,
+                            "r2": r2,
+                            "mse": mse,
                             "time": elapsed,
                             "formula": formula,
-                            "model_size": model_size(formula),
-                            "blackbox_diagnostics": run_result.get("blackbox_diagnostics") if hard_timeout else getattr(est_copy, "blackbox_diagnostics_", None),
-                            "error": "formula_eval_failed",
-                        })
-                        continue
+                            "model_size": size,
+                            "blackbox_diagnostics": blackbox_diag,
+                            "error": None,
+                            "run_label": run_label,
+                            }
 
-                    r2 = r2_score(y_test, y_pred)
-                    mse = mse_score(y_test, y_pred)
-                    size = model_size(formula)
-                    seed_runs.append({
-                        "seed": repeat_seed,
-                        "r2": r2,
-                        "mse": mse,
-                        "time": elapsed,
-                        "formula": formula,
-                        "model_size": size,
-                        "blackbox_diagnostics": run_result.get("blackbox_diagnostics") if hard_timeout else getattr(est_copy, "blackbox_diagnostics_", None),
-                        "error": None,
-                    })
+                    selected_result = _run_once("selected_features", X_train, y_train, X_test, est_params)
+                    seed_runs.append(selected_result)
+
+                    if ablation_mode:
+                        all_features_params = est_params.copy()
+                        all_features_params["blackbox_feature_selection"] = False
+                        all_features_params["blackbox_mode"] = False
+                        seed_runs.append(
+                            _run_once("all_features", X_train, y_train, X_test, all_features_params)
+                        )
                 except Exception as e:
-                    elapsed = time.time() - t0
-                    seed_runs.append({"seed": repeat_seed, "r2": None, "mse": None, "time": elapsed, "error": str(e)})
+                    elapsed = 0.0
+                    seed_runs.append({"seed": repeat_seed, "r2": None, "mse": None, "time": elapsed, "error": str(e), "run_label": "selected_features"})
                     if "timeout" in str(e).lower():
                         break
 
@@ -980,6 +994,7 @@ def run_track1_blackbox(
             "time_to_discovery": summarize_time_to_discovery(seed_runs, exact_key="exact_match"),
             "scoring_source": "displayed_formula",
             "runs_per_formula": int(max(1, int(runs_per_formula))),
+            "ablation_mode": bool(ablation_mode),
         }
         results.append(aggregate)
 
@@ -1344,12 +1359,10 @@ def main():
                         help="R2 threshold for acceptable discovery metric")
     parser.add_argument("--complexity-cap", type=int, default=20,
                         help="Complexity cap (model size) for acceptable discovery metric")
-    parser.add_argument("--blackbox-mode", choices=["auto", "on", "off"], default="auto",
-                        help="Feature-select multivariate blackbox problems before evolution")
     parser.add_argument("--blackbox-max-features", type=int, default=6,
-                        help="Max selected features for blackbox feature selection")
-    parser.add_argument("--blackbox-standardize", action="store_true",
-                        help="Standardize X/y during blackbox symbolic search and map formula back")
+                        help="Max selected features used by the reduced search path")
+    parser.add_argument("--blackbox-ablation", action="store_true",
+                        help="Run an additional all-features baseline alongside reduced search")
     args = parser.parse_args()
 
     seeds = parse_seed_list(args.seeds)
@@ -1367,10 +1380,7 @@ def main():
         skip_evolution_if_bloated=args.skip_evolution_if_bloated,
         bloat_term_threshold=20,
         universal_proposer_path=args.proposer_model,
-        blackbox_mode=(True if args.blackbox_mode == "on" else False if args.blackbox_mode == "off" else "auto"),
         blackbox_max_features=args.blackbox_max_features,
-        blackbox_feature_selection=(args.blackbox_mode != "off"),
-        blackbox_standardize=args.blackbox_standardize,
     )
 
     print(f"\n  Glassbox SRBench Benchmark")
@@ -1386,7 +1396,7 @@ def main():
     print(f"  Multi-seed protocol: {seeds}")
     print(f"  Runs/formula: {args.runs_per_formula}")
     print(f"  Acceptable criteria: R2>={args.acceptable_r2:.2f}, size<={args.complexity_cap}")
-    print(f"  Blackbox mode: {args.blackbox_mode}  |  max features: {args.blackbox_max_features}")
+    print(f"  Reduced search max features: {args.blackbox_max_features}")
 
     blackbox_datasets = get_official_pmlb_regression_datasets() if args.official else list(PMLB_DATASETS)
     discovered_gt = discover_official_ground_truth_problems(args.data_dir) if args.data_dir else []
@@ -1429,6 +1439,7 @@ def main():
             adaptive_timeout=adaptive_timeout_enabled,
             post_simplify=args.post_simplify,
             skip_evolution_if_bloated=args.skip_evolution_if_bloated,
+            ablation_mode=args.blackbox_ablation,
         )
 
     print_summary(track1_results, track2_results, output_dir=args.output_dir)

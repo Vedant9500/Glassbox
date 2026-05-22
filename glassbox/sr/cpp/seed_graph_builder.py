@@ -79,6 +79,38 @@ def _cpp_seed_graph_from_formula(formula: str, x_name: str = "x") -> Optional[Di
         return None
 
 
+def _multi_feature_formula_to_seed_graph(formula: str) -> Optional[Dict[str, Any]]:
+    expr = _parse_formula_expr(formula)
+    if expr is None:
+        return None
+
+    free = sorted(expr.free_symbols, key=lambda s: str(s))
+    if not free:
+        builder = _GraphBuilder(sp.Symbol("x"))
+        val = float(expr.evalf())
+        idx = builder._append(_default_node(type=TYPE_CONSTANT, value=val))
+        return builder.to_graph_dict(idx)
+
+    if len(free) == 1:
+        return None
+
+    try:
+        for sym in free:
+            name = str(sym)
+            if not re.fullmatch(r"x\d+", name) and name != "x":
+                return None
+    except Exception:
+        return None
+
+    mapped_expr = sp.expand(mapped_expr)
+    lookup = {f"x{i}": i for i in range(len(free))}
+    builder = _GraphBuilder(sp.Symbol("x0"), feature_lookup=lookup)
+    root = builder.build(mapped_expr)
+    if root is None:
+        return None
+    return builder.to_graph_dict(root)
+
+
 def _normalize_formula_text(formula: str) -> str:
     text = str(formula).strip()
     text = text.replace("^", "**")
@@ -126,11 +158,13 @@ def _default_node(**overrides: Any) -> Dict[str, Any]:
 class _GraphBuilder:
     """Incremental AST → C++ graph (additive output layer)."""
 
-    def __init__(self, x_sym: sp.Symbol) -> None:
+    def __init__(self, x_sym: sp.Symbol, feature_lookup: Optional[Dict[str, int]] = None) -> None:
         self.x_sym = x_sym
+        self.feature_lookup = dict(feature_lookup or {})
         self.nodes: List[Dict[str, Any]] = []
         self.output_weights: List[float] = []
         self.output_bias = 0.0
+        self.input_nodes: Dict[int, int] = {}
 
     def _append(self, node: Dict[str, Any]) -> int:
         idx = len(self.nodes)
@@ -138,10 +172,13 @@ class _GraphBuilder:
         self.output_weights.append(0.0)
         return idx
 
-    def _input_node(self) -> int:
-        if not self.nodes:
-            return self._append(_default_node(type=TYPE_INPUT, feature_idx=0))
-        return 0
+    def _input_node(self, feature_idx: int = 0) -> int:
+        feature_idx = int(feature_idx)
+        if feature_idx in self.input_nodes:
+            return self.input_nodes[feature_idx]
+        idx = self._append(_default_node(type=TYPE_INPUT, feature_idx=feature_idx))
+        self.input_nodes[feature_idx] = idx
+        return idx
 
     def _set_root_weight(self, node_idx: int, weight: float) -> None:
         if 0 <= node_idx < len(self.output_weights):
@@ -219,11 +256,16 @@ class _GraphBuilder:
             return idx
 
         if expr == self.x_sym:
-            return self._input_node()
+            return self._input_node(0)
 
         if isinstance(expr, sp.Symbol):
+            name = str(expr)
+            if name in self.feature_lookup:
+                return self._input_node(self.feature_lookup[name])
             if str(expr) == str(self.x_sym):
-                return self._input_node()
+                return self._input_node(0)
+            if re.fullmatch(r"x\d+", name):
+                return self._input_node(int(name[1:]))
             return None
 
         if isinstance(expr, sp.Mul):
@@ -342,7 +384,7 @@ class _GraphBuilder:
                     omega=float(omega) if abs(omega) > 1e-15 else 1.0,
                     phi=float(phi),
                     amplitude=1.0,
-                    left_child=self._input_node(),
+                    left_child=self._input_node(0),
                 )
             )
 
@@ -359,7 +401,7 @@ class _GraphBuilder:
                     omega=float(omega) if abs(omega) > 1e-15 else 1.0,
                     phi=float(phi) + math.pi / 2.0,
                     amplitude=1.0,
-                    left_child=self._input_node(),
+                    left_child=self._input_node(0),
                 )
             )
 
@@ -374,7 +416,7 @@ class _GraphBuilder:
                         unary_op=UNARY_EXP,
                         omega=float(omega) if abs(omega) > 1e-15 else 1.0,
                         phi=float(phi),
-                        left_child=self._input_node(),
+                        left_child=self._input_node(0),
                     )
                 )
             inner = self.build(arg)
@@ -462,10 +504,10 @@ def formula_to_seed_graph(formula: str, x_name: str = "x") -> Optional[Dict[str,
         return builder.to_graph_dict(idx)
 
     if len(free) != 1:
-        return None
+        return _multi_feature_formula_to_seed_graph(formula)
     x_sym = next(iter(free))
     if x_sym.name != x_name:
-        return None
+        return _multi_feature_formula_to_seed_graph(formula)
 
     builder = _GraphBuilder(x_sym)
     root = builder.build(expr)

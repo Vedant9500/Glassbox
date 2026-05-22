@@ -107,7 +107,7 @@ def test_run_formula_triggers_guided_on_uncertainty(monkeypatch):
 
     monkeypatch.setattr(bs, "run_fast_path", _fake_fast_path)
     monkeypatch.setattr(bs, "run_guided_evolution", _fake_guided)
-    monkeypatch.setattr(bs, "_evaluate_formula_mse", lambda *a, **k: 1e-8)
+    monkeypatch.setattr(bs, "_evaluate_formula_mse", lambda *a, **k: 1e-3)
 
     result = bs.run_formula(
         formula_str="x",
@@ -146,7 +146,7 @@ def test_run_formula_triggers_guided_on_suspicious_residual(monkeypatch):
 
     monkeypatch.setattr(bs, "run_fast_path", _fake_fast_path)
     monkeypatch.setattr(bs, "run_guided_evolution", _fake_guided)
-    monkeypatch.setattr(bs, "_evaluate_formula_mse", lambda *a, **k: 1e-8)
+    monkeypatch.setattr(bs, "_evaluate_formula_mse", lambda *a, **k: 1e-3)
 
     result = bs.run_formula(
         formula_str="x",
@@ -159,6 +159,82 @@ def test_run_formula_triggers_guided_on_suspicious_residual(monkeypatch):
     )
 
     assert guided_called["value"] is True
+    assert result["formula_discovered"]
+
+
+def test_run_formula_can_trust_proposer_search_plan(monkeypatch):
+    captured = {}
+
+    payload = {
+        "valid": True,
+        "sequence_uncertainty": {"entropy": 0.1, "margin": 0.95, "confident": True},
+        "operator_priors": {"power": 0.7},
+        "candidate_skeletons": [{"formula": "x^2", "mse": 0.0, "score": 1.0}],
+        "search_plan": {
+            "strategy": "exploratory",
+            "difficulty": 0.9,
+            "generation_multiplier": 0.04,
+            "population_multiplier": 0.04,
+            "n_beams": 11,
+            "n_rounds": 2,
+            "p_min": -4.0,
+            "p_max": 6.0,
+            "seed_budget": 9,
+            "acceptable_complexity": 17,
+            "early_stop_max_nodes": 31,
+        },
+    }
+
+    def _fake_fast_path(*args, **kwargs):
+        return {
+            "formula": "x",
+            "mse": 1.0,
+            "details": {"n_nonzero": 1, "n_nonzero_simplified": 1},
+            "uncertainty": {
+                "prediction_entropy": 0.95,
+                "prediction_margin": 0.02,
+                "prediction_uncertain": True,
+            },
+            "residual_diagnostics": {"residual_suspicious": False},
+            "operator_hints": {},
+        }
+
+    def _fake_guided(*args, **kwargs):
+        captured.update(kwargs)
+        return {"formula": "x^2", "mse": 0.0}
+
+    monkeypatch.setattr(bs, "run_fast_path", _fake_fast_path)
+    monkeypatch.setattr(bs, "run_guided_evolution", _fake_guided)
+    monkeypatch.setattr(bs, "_get_proposer", lambda *args, **kwargs: object())
+    monkeypatch.setattr(bs, "_evaluate_formula_mse", lambda formula, *a, **k: 1.0 if formula == "x" else 0.0)
+
+    import glassbox.universal_proposer as up
+
+    monkeypatch.setattr(up, "propose_fpip_v2_from_xy", lambda *args, **kwargs: payload)
+
+    result = bs.run_formula(
+        formula_str="x^2",
+        x_range=(-2.0, 2.0),
+        classifier_path="unused.pt",
+        n_samples=64,
+        device="cpu",
+        with_evolution=True,
+        evolution_only=False,
+        proposer_path="unused.pt",
+        evolution_generations=150,
+        evolution_population=50,
+        trust_proposer_plan=True,
+    )
+
+    assert captured["generations"] == 6
+    assert captured["population_size"] == 2
+    assert captured["search_plan"]["n_beams"] == 11
+    assert captured["search_plan"]["n_rounds"] == 2
+    assert captured["search_plan"]["p_min"] == -4.0
+    assert captured["search_plan"]["p_max"] == 6.0
+    assert captured["search_plan"]["seed_budget"] == 9
+    assert captured["search_plan"]["acceptable_complexity"] == 17
+    assert captured["search_plan"]["early_stop_max_nodes"] == 31
     assert result["formula_discovered"]
 
 

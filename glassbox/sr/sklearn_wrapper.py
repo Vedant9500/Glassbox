@@ -19,6 +19,7 @@ from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 from glassbox.sr.blackbox_preprocessor import (
     formula_from_search_to_original_space,
+    discover_blackbox_interactions,
     prepare_blackbox_search,
     state_to_dict,
 )
@@ -105,8 +106,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         blackbox_mode="auto",
         blackbox_max_features=6,
         blackbox_feature_selection=True,
-        blackbox_standardize=False,
+        blackbox_standardize=True,
         blackbox_min_features_to_select=5,
+        enable_residual_stage=True,
         device=None,
         skip_evolution_if_bloated=False,
         bloat_term_threshold=20,
@@ -155,6 +157,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.blackbox_feature_selection = blackbox_feature_selection
         self.blackbox_standardize = blackbox_standardize
         self.blackbox_min_features_to_select = blackbox_min_features_to_select
+        self.enable_residual_stage = enable_residual_stage
         self.device = device
         self.skip_evolution_if_bloated = skip_evolution_if_bloated
         self.bloat_term_threshold = bloat_term_threshold
@@ -366,18 +369,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.fast_path_cv_guard_ = diagnostics
         return bool(passed)
 
-    def _run_universal_proposer_dual_path(self, X, y, fast_path_result):
+    def _run_universal_proposer_dual_path(self, X, y, fast_path_result, blackbox_state=None):
         """Optional side-by-side proposer run for routing diagnostics.
 
         Returns:
             Tuple[fpip_payload_or_none, force_evolution_bool]
         """
         if not self.use_universal_proposer:
-            return None, False
-
-        # Phase-1 proposer currently supports univariate x for stable decoding.
-        if int(X.shape[1]) != 1:
-            self.universal_proposer_status_ = "skipped_multivariate"
             return None, False
 
         try:
@@ -390,7 +388,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 model_path = self._resolve_universal_proposer_path()
                 self._universal_proposer_model = load_universal_proposer_checkpoint(model_path, device=self.device)
 
-            x1 = np.asarray(X[:, 0], dtype=np.float64)
+            X_arr = np.asarray(X, dtype=np.float64)
+            if X_arr.ndim == 1 or int(X_arr.shape[1]) == 1:
+                x1 = X_arr.reshape(-1)
+                proposer_status = "ok"
+            else:
+                x_centered = X_arr - np.mean(X_arr, axis=0, keepdims=True)
+                x1 = np.linalg.norm(x_centered, axis=1)
+                proposer_status = "ok_multivariate_proxy"
+
             y1 = np.asarray(y, dtype=np.float64).reshape(-1)
 
             fit_diag = {}
@@ -406,7 +412,12 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 y=y1,
                 top_k=int(max(1, self.universal_proposer_top_k)),
                 fit_diagnostics=fit_diag,
-                interaction_hints={},
+                interaction_hints={
+                    "multivariate_proxy": bool(int(np.asarray(X).ndim) > 1 and np.asarray(X).shape[1] > 1),
+                    "selected_feature_count": int(np.asarray(X).shape[1]) if np.asarray(X).ndim > 1 else 1,
+                    "selected_features": list(getattr(blackbox_state, "selected_features", [])) if blackbox_state is not None else [],
+                    "dropped_features": list(getattr(blackbox_state, "dropped_features", [])) if blackbox_state is not None else [],
+                },
                 device=self.device,
             )
 
@@ -416,7 +427,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     print("  [Proposer skipped: empty payload]")
                 return None, False
 
-            self.universal_proposer_status_ = "ok"
+            self.universal_proposer_status_ = proposer_status
             self.universal_proposer_fpip_v2_ = payload
 
             if self.universal_proposer_log_routing:
@@ -457,6 +468,96 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return simplified
         except Exception:
             return formula
+
+    def _stage_residual_symbolic_fit(self, X, y, base_formula, *, _allow_recursion=False):
+        """Fit a second symbolic stage on the residual when it improves holdout fit."""
+        if not self.enable_residual_stage or not _allow_recursion or not base_formula or not self.use_guided_evolution:
+            return None
+        if X.shape[1] < 1:
+            return None
+
+        try:
+            y_pred = self._safe_eval_formula_array(base_formula, X)
+        except Exception:
+            return None
+
+        residual = np.asarray(y, dtype=np.float64).reshape(-1) - np.asarray(y_pred, dtype=np.float64).reshape(-1)
+        if not np.all(np.isfinite(residual)) or float(np.var(residual)) < 1e-12:
+            return None
+
+        residual_state = discover_blackbox_interactions(X, residual)
+        self.residual_blackbox_diagnostics_ = residual_state
+        self._residual_stage_guard_ = {"enabled": True, "allowed": bool(_allow_recursion)}
+
+        holdout_n = max(1, int(round(X.shape[0] * 0.2)))
+        if X.shape[0] < 20 or holdout_n >= X.shape[0]:
+            return None
+        X_fit, X_holdout = X[:-holdout_n], X[-holdout_n:]
+        y_fit, y_holdout = residual[:-holdout_n], residual[-holdout_n:]
+
+        residual_est = self.__class__(
+            population_size=max(20, int(self.population_size // 2)),
+            generations=max(20, int(self.generations // 3)),
+            early_stop_mse=self.early_stop_mse,
+            random_state=self.random_state,
+            p_min=self.p_min,
+            p_max=self.p_max,
+            use_nsga2=self.use_nsga2,
+            num_islands=self.num_islands,
+            migration_interval=self.migration_interval,
+            migration_size=self.migration_size,
+            arithmetic_temperature=self.arithmetic_temperature,
+            use_fast_path=self.use_fast_path,
+            use_guided_evolution=self.use_guided_evolution,
+            use_simplification=self.use_simplification,
+            classifier_path=self.classifier_path,
+            simplification_int_tol=self.simplification_int_tol,
+            simplification_zero_tol=self.simplification_zero_tol,
+            max_power=self.max_power,
+            timeout=max(20, int(self.timeout // 2)),
+            evolution_skip_r2=self.evolution_skip_r2,
+            multi_start_runs=1,
+            adaptive_compute_budget=self.adaptive_compute_budget,
+            min_compute_budget=self.min_compute_budget,
+            max_compute_budget=self.max_compute_budget,
+            cv_skip_guard_enabled=self.cv_skip_guard_enabled,
+            cv_skip_guard_folds=self.cv_skip_guard_folds,
+            cv_skip_guard_min_fold_r2=self.cv_skip_guard_min_fold_r2,
+            cv_skip_guard_max_r2_std=self.cv_skip_guard_max_r2_std,
+            cv_skip_guard_min_samples=self.cv_skip_guard_min_samples,
+            use_universal_proposer=self.use_universal_proposer,
+            universal_proposer_path=self.universal_proposer_path,
+            universal_proposer_shadow_mode=self.universal_proposer_shadow_mode,
+            universal_proposer_log_routing=False,
+            universal_proposer_top_k=self.universal_proposer_top_k,
+            blackbox_feature_selection=False,
+            blackbox_mode=False,
+            blackbox_max_features=self.blackbox_max_features,
+            blackbox_standardize=self.blackbox_standardize,
+            blackbox_min_features_to_select=self.blackbox_min_features_to_select,
+            enable_residual_stage=False,
+            device=self.device,
+            skip_evolution_if_bloated=self.skip_evolution_if_bloated,
+            bloat_term_threshold=self.bloat_term_threshold,
+        )
+
+        try:
+            residual_est.fit(X_fit, y_fit)
+            residual_formula = residual_est.get_formula()
+            if residual_formula and residual_formula != "0":
+                try:
+                    base_pred = self._safe_eval_formula_array(base_formula, X_holdout)
+                    res_pred = residual_est._safe_eval_formula_array(residual_formula, X_holdout)
+                    combined = base_pred + res_pred
+                    base_mse = float(np.mean((base_pred - (y[-holdout_n:])) ** 2))
+                    combined_mse = float(np.mean((combined - (y[-holdout_n:])) ** 2))
+                    if np.isfinite(combined_mse) and combined_mse < base_mse:
+                        return residual_formula
+                except Exception:
+                    return None
+        except Exception:
+            return None
+        return None
 
     def _detect_frequencies(self, X, y):
         """Detect dominant frequencies via FFT, with optional phase info."""
@@ -502,7 +603,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 self.blackbox_mode is True
                 or (
                     self.blackbox_mode == "auto"
-                    and X.shape[1] >= int(max(2, self.blackbox_min_features_to_select))
+                    and X.shape[1] > 1
                 )
             )
         )
@@ -583,6 +684,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             X,
             y,
             getattr(self, '_fp_result', None),
+            getattr(self, "blackbox_state_", None),
         )
 
         # ── Stage 2: C++ Evolution ──
@@ -726,6 +828,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                         "active_terms": active_terms,
                                         "from_proposer": True,
                                     })
+
+                        blackbox_state = getattr(self, "blackbox_state_", None)
+                        if blackbox_state is not None and getattr(blackbox_state, "interaction_terms", None):
+                            for term in blackbox_state.interaction_terms[:5]:
+                                candidate_formulas.append({
+                                    "formula": term,
+                                    "mse": float("inf"),
+                                    "score": 0.5,
+                                    "active_terms": [term],
+                                    "from_blackbox_interaction": True,
+                                })
 
                         if not candidate_formulas:
                             candidate_formulas = None
@@ -918,6 +1031,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     best_formula,
                     self.blackbox_state_,
                 )
+
+            residual_formula = self._stage_residual_symbolic_fit(X, y, best_formula, _allow_recursion=True)
+            if residual_formula:
+                combined = f"({best_formula})+({residual_formula})"
+                try:
+                    combined_pred = self._safe_eval_formula_array(combined, X)
+                    base_pred = self._safe_eval_formula_array(best_formula, X)
+                    if np.mean((combined_pred - y) ** 2) < np.mean((base_pred - y) ** 2):
+                        best_formula = combined
+                except Exception:
+                    pass
 
         self.formula_ = best_formula or "0"
         self.best_mse_ = best_mse

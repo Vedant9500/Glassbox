@@ -57,7 +57,7 @@ def test_cv_skip_guard_fails_for_unstable_formula(monkeypatch):
     assert est.fast_path_cv_guard_["reason"] == "unstable_fold_performance"
 
 
-def test_universal_proposer_dual_path_skips_multivariate():
+def test_universal_proposer_dual_path_handles_multivariate_proxy(monkeypatch):
     n = 64
     x1 = np.linspace(-2.0, 2.0, n)
     x2 = np.linspace(1.0, 3.0, n)
@@ -72,9 +72,10 @@ def test_universal_proposer_dual_path_skips_multivariate():
 
     payload, force = est._run_universal_proposer_dual_path(X, y, fast_path_result=None)
 
-    assert payload is None
+    assert payload is not None
     assert force is False
-    assert est.universal_proposer_status_ == "skipped_multivariate"
+    assert est.universal_proposer_status_ == "ok_multivariate_proxy"
+    assert payload["interaction_hints"]["multivariate_proxy"] is True
 
 
 def test_universal_proposer_dual_path_handles_missing_checkpoint():
@@ -89,6 +90,7 @@ def test_universal_proposer_dual_path_handles_missing_checkpoint():
         universal_proposer_shadow_mode=False,
         universal_proposer_log_routing=False,
     )
+    est._resolve_universal_proposer_path = lambda: "models/does_not_exist.pt"
 
     payload, force = est._run_universal_proposer_dual_path(X, y, fast_path_result={"mse": 0.1})
 

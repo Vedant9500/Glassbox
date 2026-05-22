@@ -2582,6 +2582,7 @@ def beam_search_evolution(
     device: str = 'cpu',
     candidate_formulas: Optional[List[Dict]] = None,
     confidence: float = 0.5, # New parameter
+    search_plan: Optional[Dict[str, Any]] = None,
 ) -> Dict:
     """
     Beam search over diverse C++ evolution configurations.
@@ -2629,6 +2630,8 @@ def beam_search_evolution(
 
     if operator_hints is None:
         operator_hints = {}
+    if search_plan is None:
+        search_plan = {}
     
     start_time = time.time()
     
@@ -2706,6 +2709,19 @@ def beam_search_evolution(
             adaptive_p_max = min(8.0, max(4.0, float(math.ceil(target_power + 1.0))))
         elif hint_poly_only and hinted_max_power > 0.0:
             adaptive_p_max = min(8.0, max(4.0, float(math.ceil(hinted_max_power + 1.0))))
+
+    if "p_min" in search_plan:
+        try:
+            adaptive_p_min = float(search_plan["p_min"])
+        except (TypeError, ValueError):
+            pass
+    if "p_max" in search_plan:
+        try:
+            adaptive_p_max = float(search_plan["p_max"])
+        except (TypeError, ValueError):
+            pass
+    if adaptive_p_min >= adaptive_p_max:
+        adaptive_p_min, adaptive_p_max = min(adaptive_p_min, adaptive_p_max - 0.5), max(adaptive_p_max, adaptive_p_min + 0.5)
     
     # Build classifier-guided op_priors base
     # Op order: [Periodic, Power, Exp, Log]
@@ -2970,7 +2986,16 @@ def beam_search_evolution(
     max_physical_threads = multiprocessing.cpu_count()
 
     # Seed first fraction of each island population from proposer / fast-path skeletons.
-    candidate_seed_limit = min(12, max(3, len(candidate_formulas or []) + 1))
+    try:
+        planned_seed_budget = int(search_plan.get("seed_budget", 0) or 0)
+    except (TypeError, ValueError):
+        planned_seed_budget = 0
+    total_seed_budget = planned_seed_budget if planned_seed_budget > 0 else 12
+    candidate_seed_limit = (
+        planned_seed_budget
+        if planned_seed_budget > 0
+        else min(total_seed_budget, max(3, len(candidate_formulas or []) + 1))
+    )
     seed_graphs_py = _build_cpp_seed_graphs(
         candidate_formulas,
         max_seeds=candidate_seed_limit,
@@ -2979,7 +3004,7 @@ def beam_search_evolution(
         x,
         y,
         operator_hints,
-        max_seeds=max(0, 12 - len(seed_graphs_py)),
+        max_seeds=max(0, total_seed_budget - len(seed_graphs_py)),
     )
     if signal_seed_graphs:
         seed_graphs_py = (seed_graphs_py or []) + signal_seed_graphs
@@ -2994,6 +3019,9 @@ def beam_search_evolution(
             print(f"    e.g. {preview[0]}")
 
     try:
+        acceptable_complexity = int(search_plan.get("acceptable_complexity", 15) or 15)
+        early_stop_max_nodes = int(search_plan.get("early_stop_max_nodes", 50) or 50)
+        acceptable_mse = float(search_plan.get("acceptable_mse", 1e-8) or 1e-8)
         result = _core.run_evolution(
             X_list=X_list,
             y=y_np,
@@ -3005,6 +3033,9 @@ def beam_search_evolution(
             migration_size=2,
             p_min=adaptive_p_min,
             p_max=adaptive_p_max,
+            acceptable_mse=acceptable_mse,
+            acceptable_complexity=max(1, acceptable_complexity),
+            early_stop_max_nodes=max(1, early_stop_max_nodes),
             multi_op_priors=multi_op_priors,
             multi_seed_omegas=multi_seed_omegas,
             num_threads=max_physical_threads,  # Use all available cores via OpenMP
@@ -3104,6 +3135,7 @@ def run_guided_evolution(
     visualizer = None,
     candidate_formulas: Optional[List[Dict]] = None,
     confidence: float = 0.5,
+    search_plan: Optional[Dict[str, Any]] = None,
 ) -> Dict:
     """
     Run evolution guided by fast-path operator hints.
@@ -3127,29 +3159,45 @@ def run_guided_evolution(
 
     if operator_hints is None:
         operator_hints = {}
+    if search_plan is None:
+        search_plan = {}
     
     # ── Primary: Beam Search (fast C++ path) ──
     # Adjust beams and rounds based on requested generations and confidence
     n_beams = 10 if generations >= 100 else max(3, generations // 10)
     n_rounds = 2 if generations >= 100 else 1
+    if "n_beams" in search_plan:
+        try:
+            n_beams = max(1, int(search_plan["n_beams"]))
+        except (TypeError, ValueError):
+            pass
+    if "n_rounds" in search_plan:
+        try:
+            n_rounds = max(1, int(search_plan["n_rounds"]))
+        except (TypeError, ValueError):
+            pass
     
     base_pop = population_size
     base_gens = generations
 
     if confidence > 0.8 and candidate_formulas:
         # High confidence in skeletons → focus beams on refinement
-        n_beams = min(n_beams, len(candidate_formulas) + 2)
-        n_rounds = 1 # One round is enough to check the seeds
+        if "n_beams" not in search_plan:
+            n_beams = min(n_beams, len(candidate_formulas) + 2)
+        if "n_rounds" not in search_plan:
+            n_rounds = 1 # One round is enough to check the seeds
         # REMOVED: base_gens = min(base_gens, 150)
         # REMOVED: base_pop = min(base_pop, 50)
-        print(f"  [Adaptive] Confident proposer: focusing search on {n_beams} beams, 1 round, {base_pop} pop, {base_gens} gens.")
+        print(f"  [Adaptive] Confident proposer: focusing search on {n_beams} beams, {n_rounds} round(s), {base_pop} pop, {base_gens} gens.")
     elif candidate_formulas:
         # Proposer gave skeletons but isn't super confident
-        n_beams = min(n_beams, 7)
-        n_rounds = 1
+        if "n_beams" not in search_plan:
+            n_beams = min(n_beams, 7)
+        if "n_rounds" not in search_plan:
+            n_rounds = 1
         # REMOVED: base_gens = min(base_gens, 250)
         # REMOVED: base_pop = min(base_pop, 60)
-        print(f"  [Adaptive] Proposer candidates available: focusing search on {n_beams} beams, 1 round, {base_pop} pop, {base_gens} gens.")
+        print(f"  [Adaptive] Proposer candidates available: focusing search on {n_beams} beams, {n_rounds} round(s), {base_pop} pop, {base_gens} gens.")
 
     beam_result = beam_search_evolution(
         x, y,
@@ -3162,6 +3210,7 @@ def run_guided_evolution(
         device=device,
         candidate_formulas=candidate_formulas,
         confidence=confidence,
+        search_plan=search_plan,
     )
     
     if beam_result is not None and beam_result['mse'] < float('inf'):
