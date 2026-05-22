@@ -691,6 +691,14 @@ def discover_seed_formulas_from_signal(
         return ordered
 
     power_terms = ["x", "x^2", "x^3"]
+    rational_terms = [
+        "1/(x^2+1)",
+        "x/(x^2+1)",
+        "x^2/(x^2+1)",
+        "x/(x^4+1)",
+        "x^2/(x^4+1)",
+        "x^3/(x^4+1)",
+    ]
     decay_terms = ["exp(-x)", "exp(-x^2)"]
     periodic_terms = ["sin(x)", "cos(x)"]
 
@@ -708,6 +716,7 @@ def discover_seed_formulas_from_signal(
             periodic_terms.append(f"cos({omega_text}*x)")
 
     power_terms = _dedupe(power_terms)
+    rational_terms = _dedupe(rational_terms)
     decay_terms = _dedupe(decay_terms)
     periodic_terms = _dedupe(periodic_terms)
 
@@ -719,7 +728,7 @@ def discover_seed_formulas_from_signal(
             return
         candidate_formulas.append(text)
 
-    for formula in power_terms + decay_terms + periodic_terms:
+    for formula in power_terms + rational_terms + decay_terms + periodic_terms:
         _add(formula)
 
     for power in power_terms:

@@ -28,6 +28,7 @@ import os
 import re
 import sys
 import time
+import warnings
 import traceback
 
 # Fix UnicodeEncodeError on Windows
@@ -92,8 +93,10 @@ def _planned_guided_budget(
     if pop_mult <= 0.0:
         pop_mult = 1.0
     if not trust_plan:
-        gen_mult = max(0.05, gen_mult)
-        pop_mult = max(0.05, pop_mult)
+        # Bounded mode should let the proposer shape search, not silently turn
+        # every approximate fast-path case into a much larger benchmark run.
+        gen_mult = float(np.clip(gen_mult, 0.25, 1.25))
+        pop_mult = float(np.clip(pop_mult, 0.25, 1.15))
 
     if trust_plan:
         generations = max(1, int(round(base_generations * gen_mult)))
@@ -620,6 +623,7 @@ def _postprocess_formula(formula: str) -> str:
         formula_len = len(normalized)
         term_estimate = max(1, len([t for t in re.split(r'\s*[+-]\s*', normalized) if t.strip()]))
         too_complex_for_symbolic = formula_len > 500 or term_estimate > 24
+        sympy_unsafe = "Piecewise(" in normalized or "Eq(" in normalized
 
         # Evolution formulas need wider tolerances than fast-path:
         # Ridge regression produces coefficients like 0.9975 instead of 1.0
@@ -627,18 +631,21 @@ def _postprocess_formula(formula: str) -> str:
         evo_int_tol = 0.05    # snap 7.955 → 8, 2.04 → 2, etc.
         evo_zero_tol = 1e-3   # snap 0.0001924 → 0
 
-        if too_complex_for_symbolic:
+        if too_complex_for_symbolic or sympy_unsafe:
             return snap_formula_floats(
                 normalized,
                 SnapConfig(int_tol=evo_int_tol, zero_tol=evo_zero_tol),
             )
 
-        _, simplified_expr = simplify_onn_formula(
-            normalized,
-            int_tol=evo_int_tol,
-            zero_tol=evo_zero_tol,
-            use_nsimplify=(formula_len <= 300 and term_estimate <= 16),
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"sympy\..*")
+            warnings.filterwarnings("ignore", message=r".*Using non-Expr arguments in Mul.*")
+            _, simplified_expr = simplify_onn_formula(
+                normalized,
+                int_tol=evo_int_tol,
+                zero_tol=evo_zero_tol,
+                use_nsimplify=(formula_len <= 300 and term_estimate <= 16),
+            )
         return str(simplified_expr)
     except Exception:
         return normalized
@@ -654,14 +661,14 @@ def _evaluate_formula_mse(formula: str, x: np.ndarray, y: np.ndarray) -> Optiona
 
     y_pred = None
     try:
-        fn = _parse_formula(normalized)
-        y_pred = fn(x)
+        y_pred = cfp._evaluate_formula_values(normalized, x)
     except Exception:
         y_pred = None
 
     if y_pred is None:
         try:
-            y_pred = cfp._evaluate_formula_values(normalized, x)
+            fn = _parse_formula(normalized)
+            y_pred = fn(x)
         except Exception:
             y_pred = None
 
@@ -1030,9 +1037,6 @@ def run_formula(
                             trust_plan=trust_proposer_plan,
                         )
                         
-                        if seq_unc.get("confident") is True:
-                            proposer_confidence = max(proposer_confidence, 0.9)
-                        
                         proposer_priors = payload.get("operator_priors", {})
                         if proposer_priors:
                             for op, prob in proposer_priors.items():
@@ -1058,6 +1062,28 @@ def run_formula(
                                     "from_proposer": True
                                 })
                         if candidate_formulas:
+                            finite_candidate_mses = [
+                                float(c.get("mse"))
+                                for c in candidate_formulas
+                                if c.get("mse") is not None and math.isfinite(float(c.get("mse")))
+                            ]
+                            best_candidate_mse = min(finite_candidate_mses) if finite_candidate_mses else float("inf")
+                            baseline_for_conf = result["mse"] if result["mse"] is not None else float("inf")
+                            plan_signals = search_plan.get("signals", {}) if isinstance(search_plan, dict) else {}
+                            best_rel_mse = plan_signals.get("best_relative_mse")
+                            rel_confident = (
+                                best_rel_mse is not None
+                                and math.isfinite(float(best_rel_mse))
+                                and float(best_rel_mse) < 1e-4
+                            )
+                            if (
+                                seq_unc.get("confident") is True
+                                and (
+                                    best_candidate_mse <= baseline_for_conf * 1.05
+                                    or rel_confident
+                                )
+                            ):
+                                proposer_confidence = max(proposer_confidence, 0.9)
                             print(f"\n  [Universal Proposer] Active FPIPv2 metadata injected!")
                             strategy = search_plan.get("strategy", "legacy")
                             planned_difficulty = search_plan.get("difficulty", difficulty)

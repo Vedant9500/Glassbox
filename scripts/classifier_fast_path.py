@@ -194,6 +194,91 @@ def _candidate_match_tolerance(y: np.ndarray) -> float:
     return max(1e-10, 1e-8 * scale)
 
 
+def _format_regression_term(name: str, coef: float) -> Optional[str]:
+    """Format one linear-regression term using the project coefficient snapping rules."""
+    if abs(coef) < 1e-6:
+        return None
+    if name == "1":
+        return get_constant_symbol(coef, 0.05)
+    if abs(coef - 1.0) < 0.01:
+        return name
+    if abs(coef + 1.0) < 0.01:
+        return f"-{name}"
+    if abs(coef - round(coef)) < 0.01 and abs(coef) < 100:
+        return f"{int(round(coef))}*{name}"
+    coef_sym = get_constant_symbol(coef, 0.05)
+    return f"{coef_sym}*{name}"
+
+
+def _find_exact_polynomial_match(
+    x: np.ndarray,
+    y: np.ndarray,
+    basis_names: List[str],
+    *,
+    max_degree: int,
+    tolerance: Optional[float] = None,
+) -> Optional[Tuple[str, float, np.ndarray]]:
+    """Recover exact univariate polynomials before mixed bases can overfit them."""
+    if x.ndim == 2 and x.shape[1] == 1:
+        x_flat = x[:, 0]
+    elif x.ndim == 1:
+        x_flat = x
+    else:
+        return None
+
+    y_flat = y.reshape(-1)
+    if x_flat.size != y_flat.size or x_flat.size < 3:
+        return None
+
+    y_var = max(float(np.var(y_flat)), 1e-12)
+    exact_tol = tolerance if tolerance is not None else max(1e-10, y_var * 1e-12)
+    max_degree = max(1, min(int(max_degree), 10))
+
+    for degree in range(1, max_degree + 1):
+        cols = [np.ones_like(x_flat, dtype=np.float64)]
+        cols.extend((x_flat.astype(np.float64) ** p) for p in range(1, degree + 1))
+        design = np.column_stack(cols)
+        try:
+            coeffs, _, _, _ = np.linalg.lstsq(design, y_flat, rcond=None)
+        except (np.linalg.LinAlgError, ValueError):
+            continue
+
+        pred = design @ coeffs
+        mse = float(np.mean((pred - y_flat) ** 2))
+        if not np.isfinite(mse) or mse > exact_tol:
+            continue
+
+        terms: List[str] = []
+        full_coeffs = np.zeros(len(basis_names), dtype=np.float64)
+        for power, coef in enumerate(coeffs):
+            if abs(coef) < 1e-8:
+                continue
+            if power == 0:
+                name = "1"
+                basis_key = "1"
+            elif power == 1:
+                name = "x"
+                basis_key = "x"
+            else:
+                name = f"x**{power}"
+                basis_key = f"x^{power}"
+
+            term = _format_regression_term(name, float(coef))
+            if term and term != "0":
+                terms.append(term)
+            if basis_key in basis_names:
+                full_coeffs[basis_names.index(basis_key)] = float(coef)
+
+        if not terms:
+            continue
+        if terms and terms[0] == "0":
+            terms = terms[1:]
+        formula = _join_formula_terms(terms)
+        return formula, mse, full_coeffs
+
+    return None
+
+
 def _evaluate_formula_values(formula: str, x_np: np.ndarray) -> Optional[np.ndarray]:
     """Evaluate a formula string on numpy inputs using SymPy/lambdify."""
     if not formula:
@@ -292,9 +377,23 @@ def _compile_formula_evaluator(normalized_formula: str) -> Tuple[Tuple[str, ...]
     if not free_syms:
         return tuple(), float(expr), None
 
+    # SymPy lambdifies ``x**1.5`` as NumPy's native power operator, which
+    # produces NaN for negative x. The C++ engine and fast-path fractional
+    # basis use signed real powers instead: sign(x) * abs(x)**p.
+    signed_pow = sp.Function("_gb_signed_pow")
+    expr = expr.replace(
+        lambda node: isinstance(node, sp.Pow),
+        lambda node: signed_pow(node.base, node.exp),
+    )
+
     # Inject safe power/log into lambdify context.
     modules = [
-        {"pow": _safe_numpy_power, "Pow": _safe_numpy_power, "log": _safe_numpy_log},
+        {
+            "_gb_signed_pow": _safe_numpy_power,
+            "pow": _safe_numpy_power,
+            "Pow": _safe_numpy_power,
+            "log": _safe_numpy_log,
+        },
         "numpy",
     ]
     func = sp.lambdify(free_syms, expr, modules=modules)
@@ -813,6 +912,17 @@ def build_basis_from_predictions(
                 basis_list.append(1.0 / (np.abs(xi) + c))
                 names.append(f"1/(|{name}|+{c})")
 
+            for c in [0.5, 1.0, 2.0]:
+                denom_q4 = xi**4 + c
+                basis_list.append(1.0 / denom_q4)
+                names.append(f"1/({name}^4+{c})")
+                basis_list.append(xi / denom_q4)
+                names.append(f"{name}/({name}^4+{c})")
+                basis_list.append((xi**2) / denom_q4)
+                names.append(f"{name}^2/({name}^4+{c})")
+                basis_list.append((xi**3) / denom_q4)
+                names.append(f"{name}^3/({name}^4+{c})")
+
             if allow_periodic and (
                 predictions.get('rational', 0) >= threshold or
                 predictions.get('power', 0) >= threshold or
@@ -1186,8 +1296,9 @@ def fast_path_regression(
     print(f"  Fast-path basis: {len(names)} terms")
     print(f"  Terms: {names[:10]}{'...' if len(names) > 10 else ''}")
     
-    # STEP 1: Try to find exact symbolic match FIRST (before LASSO)
-    # This prevents LASSO from finding approximate solutions when exact ones exist
+    # STEP 1: Try to find exact symbolic matches FIRST (before LASSO).
+    # This prevents mixed bases from winning with approximate exp/rational/fractional
+    # terms when the target is an exact polynomial.
     if op_constraints:
         allow_periodic = op_constraints.get('periodic', True)
         allow_exp = op_constraints.get('exp', True)
@@ -1196,10 +1307,39 @@ def fast_path_regression(
     else:
         allow_periodic = allow_exp = allow_log = allow_power = True
 
+    if exact_match_enabled and allow_power:
+        exact_poly_match = _find_exact_polynomial_match(
+            x,
+            y,
+            names,
+            max_degree=max_power,
+            tolerance=max(1e-10, y_variance * 1e-12),
+        )
+        if exact_poly_match:
+            formula, mse, coeffs = exact_poly_match
+            print(f"  Found EXACT polynomial match: {formula} (MSE={mse:.2e})")
+            active_idx = np.flatnonzero(np.abs(coeffs) >= sparsity_threshold)
+            return formula, mse, {
+                'coefficients': coeffs,
+                'basis_names': names,
+                'n_nonzero': sum(1 for c in coeffs if abs(c) >= sparsity_threshold),
+                'exact_match': True,
+                'candidate_formulas': [{
+                    'formula': formula,
+                    'mse': float(mse),
+                    'score': float(mse),
+                    'n_nonzero': int(np.sum(np.abs(coeffs) >= sparsity_threshold)),
+                    'active_terms': [names[i] for i in active_idx],
+                    'alpha': 0.0,
+                }],
+                'y_variance': y_variance,
+                'holdout_mse': 0.0 if holdout_mask is not None else None,
+            }
+
     # If only power is allowed, enable 10-term exact match for polynomials
     exact_max_terms = 10 if (allow_power and not allow_periodic and not allow_exp and not allow_log) else 4
 
-    if exact_match_enabled and (exact_match_max_basis is None or basis.shape[1] <= 128):
+    if exact_match_enabled and (exact_match_max_basis is None or basis.shape[1] <= exact_match_max_basis):
         exact_match = find_exact_symbolic_match(
             basis,
             names,
@@ -3064,29 +3204,33 @@ def beam_search_evolution(
             from simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
         except ImportError:
             from scripts.simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
-        
-        try:
-            sp_expr = simplify_onn_formula(formula_str)[1]
-        except Exception:
-            transformations = standard_transformations + (convert_xor, implicit_multiplication_application)
-            snapped = snap_formula_floats(formula_str, SnapConfig(int_tol=1e-5, zero_tol=1e-8))
-            sp_expr = parse_expr(snapped, transformations=transformations, evaluate=False)
-        
-        free_syms = list(sp_expr.free_symbols)
-        if not free_syms:
-            y_pred = np.full_like(y_np, float(sp_expr))
+
+        sympy_unsafe = "Piecewise(" in formula_str or "Eq(" in formula_str
+        if sympy_unsafe:
+            formula_str = snap_formula_floats(
+                formula_str,
+                SnapConfig(int_tol=1e-5, zero_tol=1e-8),
+            )
         else:
-            func = sp.lambdify(free_syms[0], sp_expr, modules=['numpy'])
-            y_pred = func(x_np)
-        
-        if np.isscalar(y_pred):
-            y_pred = np.full_like(y_np, y_pred)
-            
-        display_mse = float(np.mean((y_pred - y_np)**2))
+            try:
+                import warnings
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"sympy\..*")
+                    warnings.filterwarnings("ignore", message=r".*Using non-Expr arguments in Mul.*")
+                    sp_expr = simplify_onn_formula(formula_str)[1]
+            except Exception:
+                transformations = standard_transformations + (convert_xor, implicit_multiplication_application)
+                snapped = snap_formula_floats(formula_str, SnapConfig(int_tol=1e-5, zero_tol=1e-8))
+                sp_expr = parse_expr(snapped, transformations=transformations, evaluate=False)
+            formula_str = str(sp_expr)
+
+        y_pred = _evaluate_formula_values(formula_str, x_np)
+        if y_pred is None:
+            display_mse = float('inf')
+        else:
+            display_mse = float(np.mean((y_pred - y_np)**2))
         if not np.isfinite(display_mse):
             display_mse = float('inf')
-            
-        formula_str = str(sp_expr)
     except Exception:
         display_mse = best_overall_mse
 
@@ -3105,19 +3249,19 @@ def beam_search_evolution(
         model = None
     
     print(f"\n  Best formula: {formula}")
-    print(f"  Best MSE: {best_overall_mse:.2e} (displayed formula)")
-    if 'raw_mse' in best_overall_result:
-        raw = best_overall_result['raw_mse']
-        drift = best_overall_result.get('drift_penalty', 0.0)
-        print(f"  Raw MSE: {raw:.2e} (engine internal)")
-        print(f"  Drift Penalty: {drift:.2f}")
+    print(f"  Display MSE: {display_mse:.2e}")
+    print(f"  Raw MSE: {best_overall_mse:.2e} (engine internal)")
+    drift = best_overall_result.get('drift_penalty', 0.0)
+    print(f"  Drift Penalty: {drift:.2f}")
     print(f"  Best config: {best_overall_config['label']}")
     print(f"  Total beam search time: {elapsed:.2f}s")
     print("="*60)
     
     return {
         'formula': formula,
-        'mse': best_overall_mse,
+        'mse': display_mse,
+        'raw_mse': best_overall_mse,
+        'display_mse': display_mse,
         'model': model,
         'time': elapsed,
         'config': best_overall_config,
