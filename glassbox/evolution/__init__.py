@@ -24,11 +24,16 @@ from .evolution import (
     refine_constants,
     quick_refine_internal,
     calculate_complexity,
+    coefficient_sparsity_loss,
+    progressive_round_loss,
+    compute_param_sensitivity,
     prune_small_coefficients,
     adaptive_coefficient_pruning,
     check_structure_quality,
     intensive_coefficient_refinement,
     ablate_and_select_terms,
+    random,
+    torch,
 )
 
 __all__ = [
@@ -51,9 +56,14 @@ __all__ = [
     'refine_constants',
     'quick_refine_internal',
     'calculate_complexity',
+    'coefficient_sparsity_loss',
+    'progressive_round_loss',
+    'compute_param_sensitivity',
     'prune_small_coefficients',
     'adaptive_coefficient_pruning',
     'check_structure_quality',
     'intensive_coefficient_refinement',
     'ablate_and_select_terms',
+    'random',
+    'torch',
 ]

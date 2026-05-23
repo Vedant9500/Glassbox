@@ -102,9 +102,12 @@ def _multi_feature_formula_to_seed_graph(formula: str) -> Optional[Dict[str, Any
     except Exception:
         return None
 
-    mapped_expr = sp.expand(mapped_expr)
-    lookup = {f"x{i}": i for i in range(len(free))}
-    builder = _GraphBuilder(sp.Symbol("x0"), feature_lookup=lookup)
+    mapped_expr = sp.expand(expr)
+    lookup = {
+        str(sym): (0 if str(sym) == "x" else int(str(sym)[1:]))
+        for sym in free
+    }
+    builder = _GraphBuilder(sp.Symbol("x"), feature_lookup=lookup)
     root = builder.build(mapped_expr)
     if root is None:
         return None
@@ -122,10 +125,14 @@ def _parse_formula_expr(formula: str) -> Optional[sp.Expr]:
     text = _normalize_formula_text(formula)
     if not text:
         return None
+    local_dict = dict(_LOCAL_DICT)
+    for name in set(re.findall(r"\bx\d*\b", text)):
+        if name == "x" or re.fullmatch(r"x\d+", name):
+            local_dict[name] = sp.Symbol(name)
     try:
         expr = parse_expr(
             text,
-            local_dict=dict(_LOCAL_DICT),
+            local_dict=local_dict,
             transformations=_TRANSFORMATIONS,
             evaluate=False,
         )
@@ -244,6 +251,61 @@ class _GraphBuilder:
                 omega += o
                 phi += p
             return omega, phi
+        return None
+
+    def _feature_index_for_symbol(self, expr: sp.Expr) -> Optional[int]:
+        if not isinstance(expr, sp.Symbol):
+            return None
+        name = str(expr)
+        if name in self.feature_lookup:
+            return int(self.feature_lookup[name])
+        if name == str(self.x_sym) or name == "x":
+            return 0
+        if re.fullmatch(r"x\d+", name):
+            return int(name[1:])
+        return None
+
+    def _linear_in_any_feature(self, expr: sp.Expr) -> Optional[Tuple[int, float, float]]:
+        """Return (feature_idx, omega, phi) for expr ~= omega*x_i + phi."""
+        feature_idx = self._feature_index_for_symbol(expr)
+        if feature_idx is not None:
+            return feature_idx, 1.0, 0.0
+        if expr.is_Number:
+            return -1, 0.0, float(expr)
+        if isinstance(expr, sp.Mul):
+            omega = 1.0
+            feature_idx = None
+            for factor in expr.args:
+                factor_feature_idx = self._feature_index_for_symbol(factor)
+                if factor_feature_idx is not None:
+                    if feature_idx is not None and feature_idx != factor_feature_idx:
+                        return None
+                    feature_idx = factor_feature_idx
+                elif factor.is_Number:
+                    omega *= float(factor)
+                else:
+                    return None
+            if feature_idx is not None:
+                return feature_idx, omega, 0.0
+            return None
+        if isinstance(expr, sp.Add):
+            feature_idx = None
+            omega = 0.0
+            phi = 0.0
+            for term in expr.args:
+                parsed = self._linear_in_any_feature(term)
+                if parsed is None:
+                    return None
+                term_feature_idx, o, p = parsed
+                if term_feature_idx >= 0:
+                    if feature_idx is not None and feature_idx != term_feature_idx:
+                        return None
+                    feature_idx = term_feature_idx
+                omega += o
+                phi += p
+            if feature_idx is None:
+                return -1, omega, phi
+            return feature_idx, omega, phi
         return None
 
     def build(self, expr: sp.Expr) -> Optional[int]:
@@ -373,10 +435,12 @@ class _GraphBuilder:
 
         if getattr(expr, "func", None) == sp.sin:
             (arg,) = expr.args
-            lin = self._linear_in_x(sp.expand(arg))
+            lin = self._linear_in_any_feature(sp.expand(arg))
             if lin is None:
                 return None
-            omega, phi = lin
+            feature_idx, omega, phi = lin
+            if feature_idx < 0:
+                return self._append(_default_node(type=TYPE_CONSTANT, value=math.sin(float(phi))))
             return self._append(
                 _default_node(
                     type=TYPE_UNARY,
@@ -384,16 +448,18 @@ class _GraphBuilder:
                     omega=float(omega) if abs(omega) > 1e-15 else 1.0,
                     phi=float(phi),
                     amplitude=1.0,
-                    left_child=self._input_node(0),
+                    left_child=self._input_node(feature_idx),
                 )
             )
 
         if getattr(expr, "func", None) == sp.cos:
             (arg,) = expr.args
-            lin = self._linear_in_x(sp.expand(arg))
+            lin = self._linear_in_any_feature(sp.expand(arg))
             if lin is None:
                 return None
-            omega, phi = lin
+            feature_idx, omega, phi = lin
+            if feature_idx < 0:
+                return self._append(_default_node(type=TYPE_CONSTANT, value=math.cos(float(phi))))
             return self._append(
                 _default_node(
                     type=TYPE_UNARY,
@@ -401,22 +467,24 @@ class _GraphBuilder:
                     omega=float(omega) if abs(omega) > 1e-15 else 1.0,
                     phi=float(phi) + math.pi / 2.0,
                     amplitude=1.0,
-                    left_child=self._input_node(0),
+                    left_child=self._input_node(feature_idx),
                 )
             )
 
         if getattr(expr, "func", None) == sp.exp:
             (arg,) = expr.args
-            lin = self._linear_in_x(sp.expand(arg))
+            lin = self._linear_in_any_feature(sp.expand(arg))
             if lin is not None:
-                omega, phi = lin
+                feature_idx, omega, phi = lin
+                if feature_idx < 0:
+                    return self._append(_default_node(type=TYPE_CONSTANT, value=math.exp(float(phi))))
                 return self._append(
                     _default_node(
                         type=TYPE_UNARY,
                         unary_op=UNARY_EXP,
                         omega=float(omega) if abs(omega) > 1e-15 else 1.0,
                         phi=float(phi),
-                        left_child=self._input_node(0),
+                        left_child=self._input_node(feature_idx),
                     )
                 )
             inner = self.build(arg)

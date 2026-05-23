@@ -23,6 +23,7 @@ from typing import Optional, Dict, List, Tuple, Callable, Any
 import copy
 import random
 import math
+import sys
 import time
 import logging
 from itertools import combinations
@@ -34,6 +35,17 @@ DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_wide.pt"
 
 # Configure module-level logger
 logger = logging.getLogger(__name__)
+
+
+def _public_api_func(name: str):
+    """Resolve helper functions through the package API when it is patched."""
+    package = sys.modules.get("glassbox.evolution")
+    local_value = globals()[name]
+    if package is not None:
+        public_value = getattr(package, name, local_value)
+        if callable(public_value) and public_value is not local_value:
+            return public_value
+    return local_value
 
 # ============================================================================
 # Constants (replacing magic numbers for maintainability)
@@ -898,7 +910,7 @@ def mutate_operations_gradient_informed(
         Mutated individual
     """
     # Compute sensitivities
-    sensitivities = compute_param_sensitivity(individual.model, x, y)
+    sensitivities = _public_api_func("compute_param_sensitivity")(individual.model, x, y)
     
     if not sensitivities:
         # Fallback to regular mutation if gradient computation fails
@@ -2198,7 +2210,7 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 if not getattr(ind, '_refined_this_gen', False):
                     # Need y with proper shape for quick_refine_internal
                     y_for_refine = y.unsqueeze(-1) if y.dim() == 1 else y
-                    refine_loss = quick_refine_internal(
+                    refine_loss = _public_api_func("quick_refine_internal")(
                         ind.model,
                         x,
                         y_for_refine,
@@ -2206,7 +2218,7 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                     )
                     # Deterministic fallback path when internal L-BFGS fails.
                     if not math.isfinite(refine_loss):
-                        refine_constants(
+                        _public_api_func("refine_constants")(
                             ind.model,
                             x,
                             y_for_refine,
@@ -2230,7 +2242,7 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                         ind.complexity = float('inf')
                     else:
                         # Add complexity penalty (BIC-inspired parsimony)
-                        complexity = calculate_complexity(ind.model)
+                        complexity = _public_api_func("calculate_complexity")(ind.model)
                         ind.complexity = complexity
                         if not math.isfinite(complexity):
                             ind.fitness = float('inf')
@@ -2243,7 +2255,7 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                         
                         # Coefficient sparsity penalty (Hoyer-inspired)
                         # INCREASED: Stronger sparsity encourages fewer output terms
-                        sparsity = coefficient_sparsity_loss(ind.model).item()
+                        sparsity = _public_api_func("coefficient_sparsity_loss")(ind.model).item()
                         fitness = _add_if_finite(fitness, sparsity, 0.05)
                         
                         # Entropy regularization with ANNEALED weight (Tier 1)
@@ -2259,7 +2271,7 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                         # Soft push toward integers for p, omega, etc.
                         if self.progressive_round_weight > 0:
                             try:
-                                round_loss = progressive_round_loss(ind.model).item()
+                                round_loss = _public_api_func("progressive_round_loss")(ind.model).item()
                                 fitness = _add_if_finite(fitness, round_loss, self.progressive_round_weight)
                             except Exception:
                                 pass

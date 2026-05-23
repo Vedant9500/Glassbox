@@ -19,6 +19,7 @@ from seed_graph_builder import (  # noqa: E402
     discover_seed_formulas_from_signal,
     formula_to_seed_graph,
 )
+import seed_graph_builder as sgb  # noqa: E402
 
 try:
     import _core
@@ -137,12 +138,46 @@ def test_signal_seed_graphs_build() -> None:
     assert graphs
 
 
-def test_multivariate_formula_to_seed_graph_builds():
-    graph = formula_to_seed_graph("x0*x1 + sin(x2)")
+def test_multivariate_formula_to_seed_graph_builds(monkeypatch):
+    monkeypatch.setattr(sgb, "_core", None)
+    graph = sgb.formula_to_seed_graph("x0*x1 + sin(x2)")
     assert graph is not None
     assert graph["nodes"]
+    periodic_nodes = [
+        n for n in graph["nodes"]
+        if n.get("type") == TYPE_UNARY and n.get("unary_op") == UNARY_PERIODIC
+    ]
+    assert periodic_nodes
+    sin_child = graph["nodes"][periodic_nodes[0]["left_child"]]
+    assert sin_child["type"] == TYPE_INPUT
+    assert sin_child["feature_idx"] == 2
 
 
 def test_multivariate_formula_handles_named_proxy():
     graph = formula_to_seed_graph("x0 + x1")
     assert graph is not None
+
+
+@requires_cpp
+def test_seeded_exact_evolution_records_generation_zero() -> None:
+    import numpy as np
+
+    x = np.linspace(-1, 1, 40)
+    y = x
+    graphs = build_seed_graphs_from_formulas(["x"], max_seeds=1)
+    assert graphs
+
+    result = _core.run_evolution(
+        X_list=[x],
+        y=y,
+        pop_size=8,
+        generations=20,
+        early_stop_mse=1e-10,
+        seed_graphs_py=graphs,
+        random_seed=7,
+        topology_refine_interval=1,
+    )
+
+    assert result["best_mse"] < 1e-10
+    assert result["generation_to_first_exact"] == 0
+    assert result["time_to_first_exact_sec"] >= 0.0

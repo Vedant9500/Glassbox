@@ -343,12 +343,12 @@ public:
                 should_restart = (window_improvement < config_.stagnation_min_improvement) && (diversity < config_.diversity_floor);
             }
 
+            update_discovery_metrics(gen, start_time);
+
             if (config_.use_early_stop && best_overall_.raw_mse < config_.early_stop_mse && best_overall_.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
                 trace_event("run.early_stop", gen);
                 break; // Exact algebraic match found that is simple
             }
-
-            update_discovery_metrics(gen, start_time);
             
             // Create next generation
             std::vector<IndividualGraph> next_gen;
@@ -598,9 +598,9 @@ public:
                     best_overall_ = best;
                 }
             }
-            if (config_.use_early_stop && should_stop) break;
-
             update_discovery_metrics(gen, start_time);
+
+            if (config_.use_early_stop && should_stop) break;
         }
 
         // Collect the best overall across all islands and run cleanup
@@ -2138,7 +2138,7 @@ private:
             // Accept if MSE is still acceptable (within 5% of baseline)
             if (candidate.raw_mse < baseline_mse * 1.05 + 1e-8) {
                 ind = candidate;
-                baseline_mse = std::max(baseline_mse, ind.raw_mse);
+                baseline_mse = ind.raw_mse;
             } else {
                 break; // Can't remove any more without hurting accuracy
             }
