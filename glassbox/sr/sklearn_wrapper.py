@@ -76,7 +76,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         p_min=-2.0,
         p_max=3.0,
         use_nsga2=False,
-        num_islands=1,
+        num_islands=8,
         migration_interval=25,
         migration_size=2,
         arithmetic_temperature=5.0,
@@ -230,6 +230,182 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         budget = base_timeout * score
         return float(np.clip(budget, float(self.min_compute_budget), float(self.max_compute_budget)))
+
+    def _derive_blackbox_search_plan(
+        self,
+        blackbox_state,
+        *,
+        fast_path_uncertainty=None,
+        proposer_uncertainty=None,
+        proposer_plan=None,
+    ):
+        """Heuristically scale breadth/depth for multivariate blackbox search."""
+        base_plan = {
+            "uncertainty_score": 0.0,
+            "selection_uncertainty": 0.0,
+            "interaction_pressure": 0.0,
+            "breadth_multiplier": 1.0,
+            "depth_multiplier": 1.0,
+            "generation_multiplier": 1.0,
+            "population_multiplier": 1.0,
+            "seed_budget": 8,
+            "acceptable_complexity": 15,
+            "early_stop_max_nodes": 50,
+            "timeout_multiplier": 1.0,
+            "focus": "balanced",
+        }
+        if blackbox_state is None or not getattr(blackbox_state, "enabled", False):
+            return base_plan
+
+        selected = list(getattr(blackbox_state, "selected_features", []) or [])
+        selected_count = max(1, len(selected))
+        original_count = int(getattr(self, "original_n_features_in_", selected_count) or selected_count)
+
+        feature_scores = getattr(blackbox_state, "feature_scores", {}) or {}
+        score_values = sorted(
+            [float(v) for v in feature_scores.values() if np.isfinite(v)],
+            reverse=True,
+        )
+        top_score = score_values[0] if score_values else 0.0
+        next_score = score_values[1] if len(score_values) > 1 else 0.0
+        score_gap = max(0.0, top_score - next_score)
+        score_gap_ratio = score_gap / max(abs(top_score), 1e-12) if top_score > 0 else 0.0
+
+        selection_uncertainty = 1.0 - float(np.clip(score_gap_ratio, 0.0, 1.0))
+        if getattr(blackbox_state, "feature_selection_uncertain", False):
+            selection_uncertainty = max(selection_uncertainty, 0.85)
+        if getattr(blackbox_state, "reason", "") == "retained_all_features_small_problem":
+            selection_uncertainty *= 0.5
+
+        interaction_scores = getattr(blackbox_state, "interaction_scores", {}) or {}
+        interaction_terms = list(getattr(blackbox_state, "interaction_terms", []) or [])
+        interaction_best = max(
+            [float(v) for v in interaction_scores.values() if np.isfinite(v)],
+            default=0.0,
+        )
+        interaction_density = len(interaction_terms) / max(1.0, float(selected_count - 1))
+        interaction_pressure = float(np.clip(0.55 * interaction_best + 0.15 * interaction_density, 0.0, 1.0))
+
+        feature_span_pressure = float(np.clip((selected_count - 1) / max(4.0, original_count - 1), 0.0, 1.0))
+
+        def _uncertainty_signal(payload):
+            if not isinstance(payload, dict):
+                return 0.0
+            entropy = payload.get("prediction_entropy")
+            margin = payload.get("prediction_margin")
+            uncertain_flag = bool(payload.get("prediction_uncertain", False))
+            signal = 0.0
+            if entropy is not None:
+                try:
+                    signal = max(signal, float(np.clip(float(entropy), 0.0, 1.0)))
+                except Exception:
+                    pass
+            if margin is not None:
+                try:
+                    margin = float(margin)
+                    signal = max(signal, float(np.clip(1.0 - min(max(margin, 0.0), 1.0), 0.0, 1.0)))
+                except Exception:
+                    pass
+            if uncertain_flag:
+                signal = max(signal, 0.75)
+            return float(np.clip(signal, 0.0, 1.0))
+
+        fast_uncertainty = _uncertainty_signal(fast_path_uncertainty)
+        proposer_unc = 0.0
+        if isinstance(proposer_uncertainty, dict):
+            proposer_unc = _uncertainty_signal(proposer_uncertainty)
+        elif proposer_uncertainty is not None:
+            proposer_unc = float(np.clip(float(proposer_uncertainty), 0.0, 1.0))
+
+        uncertainty_score = float(np.clip(
+            0.40 * selection_uncertainty
+            + 0.25 * interaction_pressure
+            + 0.20 * fast_uncertainty
+            + 0.15 * proposer_unc,
+            0.0,
+            1.0,
+        ))
+
+        breadth_multiplier = float(np.clip(
+            1.0 + 1.15 * selection_uncertainty + 0.35 * fast_uncertainty + 0.25 * (1.0 - interaction_pressure),
+            0.75,
+            3.5,
+        ))
+        depth_multiplier = float(np.clip(
+            1.0 + 0.95 * interaction_pressure + 0.35 * proposer_unc + 0.25 * feature_span_pressure,
+            0.75,
+            4.0,
+        ))
+        if uncertainty_score < 0.3:
+            breadth_multiplier *= 0.85
+            depth_multiplier *= 0.9
+        elif uncertainty_score > 0.7:
+            breadth_multiplier *= 1.15
+            depth_multiplier *= 1.10
+
+        generation_multiplier = float(np.clip(depth_multiplier, 0.75, 4.0))
+        population_multiplier = float(np.clip(breadth_multiplier, 0.75, 3.5))
+        seed_budget = int(np.clip(
+            round(8 + 10 * selection_uncertainty + 6 * interaction_pressure + 4 * fast_uncertainty + 2 * proposer_unc),
+            8,
+            24,
+        ))
+
+        acceptable_complexity = int(np.clip(
+            round(15 + 6 * uncertainty_score + 4 * interaction_pressure + 2 * feature_span_pressure),
+            10,
+            80,
+        ))
+        early_stop_max_nodes = int(np.clip(
+            round(50 + 18 * uncertainty_score + 8 * interaction_pressure + 6 * feature_span_pressure),
+            10,
+            120,
+        ))
+        timeout_multiplier = float(np.clip(
+            0.85 + 0.20 * breadth_multiplier + 0.30 * depth_multiplier,
+            0.8,
+            2.8,
+        ))
+
+        focus = "balanced"
+        if breadth_multiplier > depth_multiplier + 0.25:
+            focus = "breadth"
+        elif depth_multiplier > breadth_multiplier + 0.25:
+            focus = "depth"
+
+        plan = {
+            "uncertainty_score": uncertainty_score,
+            "selection_uncertainty": selection_uncertainty,
+            "interaction_pressure": interaction_pressure,
+            "breadth_multiplier": breadth_multiplier,
+            "depth_multiplier": depth_multiplier,
+            "generation_multiplier": generation_multiplier,
+            "population_multiplier": population_multiplier,
+            "seed_budget": seed_budget,
+            "acceptable_complexity": acceptable_complexity,
+            "early_stop_max_nodes": early_stop_max_nodes,
+            "timeout_multiplier": timeout_multiplier,
+            "focus": focus,
+        }
+
+        if proposer_plan:
+            plan["generation_multiplier"] *= float(_clamp_float(proposer_plan.get("generation_multiplier"), 1.0, 0.5, 4.0))
+            plan["population_multiplier"] *= float(_clamp_float(proposer_plan.get("population_multiplier"), 1.0, 0.5, 3.0))
+            plan["seed_budget"] = max(plan["seed_budget"], int(proposer_plan.get("seed_budget", plan["seed_budget"])))
+            plan["acceptable_complexity"] = max(
+                plan["acceptable_complexity"],
+                int(proposer_plan.get("acceptable_complexity", plan["acceptable_complexity"])),
+            )
+            plan["early_stop_max_nodes"] = max(
+                plan["early_stop_max_nodes"],
+                int(proposer_plan.get("early_stop_max_nodes", plan["early_stop_max_nodes"])),
+            )
+            plan["timeout_multiplier"] = float(np.clip(
+                plan["timeout_multiplier"] * float(_clamp_float(proposer_plan.get("timeout_multiplier"), 1.0, 0.5, 3.0)),
+                0.8,
+                3.0,
+            ))
+        return plan
 
     def _resolve_classifier_path(self):
         """Resolve classifier model path relative to repo root."""
@@ -620,6 +796,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         )
         self.blackbox_state_ = blackbox_state
         self.blackbox_diagnostics_ = state_to_dict(blackbox_state)
+        self.blackbox_search_plan_ = {}
 
         if blackbox_state.enabled:
             X = X_search
@@ -755,7 +932,30 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     proposer_unc.get("margin", 1.0)
                 )
 
-        effective_timeout = self._estimate_compute_budget(X, current_r2, term_count, uncertainty=_fp_uncertainty)
+        proposer_payload = (
+            self.universal_proposer_fpip_v2_
+            if isinstance(self.universal_proposer_fpip_v2_, dict)
+            else {}
+        )
+        proposer_plan = proposer_payload.get("search_plan", {})
+        if not isinstance(proposer_plan, dict):
+            proposer_plan = {}
+        blackbox_search_plan = self._derive_blackbox_search_plan(
+            getattr(self, "blackbox_state_", None),
+            fast_path_uncertainty=_fp_uncertainty,
+            proposer_uncertainty=proposer_payload.get("sequence_uncertainty", {}),
+            proposer_plan=proposer_plan,
+        )
+        self.blackbox_search_plan_ = blackbox_search_plan
+        if isinstance(self.blackbox_diagnostics_, dict):
+            self.blackbox_diagnostics_["search_plan"] = blackbox_search_plan
+
+        effective_timeout = self._estimate_compute_budget(
+            X,
+            current_r2,
+            term_count,
+            uncertainty=_fp_uncertainty,
+        ) * float(blackbox_search_plan.get("timeout_multiplier", 1.0))
 
         if need_evolution and _elapsed() < effective_timeout:
             if not CPP_AVAILABLE:
@@ -768,14 +968,6 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 evo_formula = None
                 evo_mse = float('inf')
                 candidate_formulas = None
-                proposer_payload = (
-                    self.universal_proposer_fpip_v2_
-                    if isinstance(self.universal_proposer_fpip_v2_, dict)
-                    else {}
-                )
-                proposer_plan = proposer_payload.get("search_plan", {})
-                if not isinstance(proposer_plan, dict):
-                    proposer_plan = {}
 
                 # Try guided evolution (beam search) only if R² is low
                 if (self.use_guided_evolution and operator_hints
@@ -872,14 +1064,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             confidence = 1.0 - p_unc.get("entropy", 0.5)
                             guided_generations = _clamp_int(
                                 min(40, self.generations // 10)
-                                * _clamp_float(proposer_plan.get("generation_multiplier"), 1.0, 0.5, 4.0),
+                                * float(blackbox_search_plan.get("generation_multiplier", 1.0)),
                                 default=min(40, self.generations // 10),
                                 lo=10,
                                 hi=max(10, int(self.generations)),
                             )
                             guided_population = _clamp_int(
                                 min(30, self.population_size)
-                                * _clamp_float(proposer_plan.get("population_multiplier"), 1.0, 0.5, 3.0),
+                                * float(blackbox_search_plan.get("population_multiplier", 1.0)),
                                 default=min(30, self.population_size),
                                 lo=10,
                                 hi=max(10, int(self.population_size)),
@@ -958,7 +1150,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                     [{"formula": best_formula, "mse": best_mse}]
                                     if best_formula else None
                                 ),
-                                max_seeds=10,
+                                max_seeds=max(
+                                    4,
+                                    min(
+                                        24,
+                                        int(blackbox_search_plan.get("seed_budget", 10)),
+                                    ),
+                                ),
                             )
                         except Exception:
                             seed_graphs_py = []
@@ -981,14 +1179,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 y=y_arr,
                                 pop_size=_clamp_int(
                                     self.population_size
-                                    * _clamp_float(proposer_plan.get("population_multiplier"), 1.0, 0.5, 3.0),
+                                    * float(blackbox_search_plan.get("population_multiplier", 1.0)),
                                     default=self.population_size,
                                     lo=10,
                                     hi=max(10, int(self.population_size * 3)),
                                 ),
                                 generations=_clamp_int(
                                     self.generations
-                                    * _clamp_float(proposer_plan.get("generation_multiplier"), 1.0, 0.5, 4.0),
+                                    * float(blackbox_search_plan.get("generation_multiplier", 1.0)),
                                     default=self.generations,
                                     lo=10,
                                     hi=max(10, int(self.generations * 4)),
@@ -1006,13 +1204,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 arithmetic_temperature=self.arithmetic_temperature,
                                 random_seed=run_seed,
                                 acceptable_complexity=_clamp_int(
-                                    proposer_plan.get("acceptable_complexity"),
+                                    blackbox_search_plan.get("acceptable_complexity"),
                                     default=15,
                                     lo=5,
                                     hi=80,
                                 ),
                                 early_stop_max_nodes=_clamp_int(
-                                    proposer_plan.get("early_stop_max_nodes"),
+                                    blackbox_search_plan.get("early_stop_max_nodes"),
                                     default=50,
                                     lo=10,
                                     hi=120,

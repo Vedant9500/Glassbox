@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+from glassbox.sr.blackbox_preprocessor import prepare_blackbox_search
 
 
 def test_cv_skip_guard_passes_for_stable_formula(monkeypatch):
@@ -102,6 +103,39 @@ def test_universal_proposer_dual_path_handles_missing_checkpoint():
     assert str(est.universal_proposer_status_).startswith("error:")
 
 
+def test_blackbox_search_plan_expands_uncertain_breadth_and_interaction_depth():
+    rng = np.random.RandomState(13)
+    X = rng.randn(160, 5)
+    y = X[:, 0] * np.sin(X[:, 1]) + 0.04 * rng.randn(160)
+
+    _, _, state = prepare_blackbox_search(
+        X,
+        y,
+        enabled=True,
+        max_features=4,
+        standardize=False,
+        min_features_to_select=2,
+    )
+    state.feature_selection_uncertain = True
+
+    est = GlassboxRegressor(population_size=20, generations=30)
+    est.original_n_features_in_ = X.shape[1]
+    plan = est._derive_blackbox_search_plan(
+        state,
+        fast_path_uncertainty={
+            "prediction_entropy": 0.9,
+            "prediction_margin": 0.05,
+            "prediction_uncertain": True,
+        },
+    )
+
+    assert plan["population_multiplier"] > 1.0
+    assert plan["generation_multiplier"] > 1.0
+    assert plan["seed_budget"] > 8
+    assert plan["acceptable_complexity"] > 15
+    assert plan["early_stop_max_nodes"] > 50
+
+
 def test_multivariate_blackbox_cpp_seeds_use_reduced_indices(monkeypatch):
     import glassbox.sr.sklearn_wrapper as sw
 
@@ -111,6 +145,10 @@ def test_multivariate_blackbox_cpp_seeds_use_reduced_indices(monkeypatch):
         @staticmethod
         def run_evolution(**kwargs):
             captured["seed_graphs"] = kwargs.get("seed_graphs_py", [])
+            captured["pop_size"] = kwargs.get("pop_size")
+            captured["generations"] = kwargs.get("generations")
+            captured["acceptable_complexity"] = kwargs.get("acceptable_complexity")
+            captured["early_stop_max_nodes"] = kwargs.get("early_stop_max_nodes")
             return {"best_mse": 0.0, "formula": "x0*x1", "nodes": [], "output_weights": []}
 
         @staticmethod
@@ -156,3 +194,9 @@ def test_multivariate_blackbox_cpp_seeds_use_reduced_indices(monkeypatch):
     ]
     assert feature_indices
     assert max(feature_indices) < est.n_features_in_
+    assert est.blackbox_search_plan_["seed_budget"] >= 8
+    assert est.blackbox_diagnostics_["search_plan"] == est.blackbox_search_plan_
+    assert captured["pop_size"] >= est.population_size
+    assert captured["generations"] >= est.generations
+    assert captured["acceptable_complexity"] == est.blackbox_search_plan_["acceptable_complexity"]
+    assert captured["early_stop_max_nodes"] == est.blackbox_search_plan_["early_stop_max_nodes"]

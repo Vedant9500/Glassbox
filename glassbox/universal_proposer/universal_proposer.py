@@ -366,10 +366,26 @@ def _signal_complexity(x: np.ndarray, y: np.ndarray) -> Dict[str, float]:
         return out
 
     try:
-        dy = np.gradient(y, x)
-        ddy = np.gradient(dy, x)
+        finite = np.isfinite(x) & np.isfinite(y)
+        x_valid = x[finite]
+        y_valid = y[finite]
+        if x_valid.size < 5:
+            return out
+
+        order = np.argsort(x_valid)
+        x_sorted = x_valid[order]
+        y_sorted = y_valid[order]
+        x_unique, unique_idx = np.unique(x_sorted, return_index=True)
+        if x_unique.size < 5:
+            return out
+        y_unique = y_sorted[unique_idx]
+
+        dy = np.gradient(y_unique, x_unique)
+        ddy = np.gradient(dy, x_unique)
+        if not (np.all(np.isfinite(dy)) and np.all(np.isfinite(ddy))):
+            return out
         y_scale = float(np.std(y)) + 1e-12
-        x_span = float(np.max(x) - np.min(x)) + 1e-12
+        x_span = float(np.max(x_unique) - np.min(x_unique)) + 1e-12
         out["roughness"] = float(np.clip(np.mean(np.abs(ddy)) * x_span / y_scale, 0.0, 10.0))
 
         signs = np.sign(dy)

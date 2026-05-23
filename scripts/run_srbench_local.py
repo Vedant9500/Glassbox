@@ -978,6 +978,8 @@ def run_track1_blackbox(
 
         stability = summarize_seed_runs(seed_runs)
         best_run = min(valid_seed_runs, key=lambda r: float(r.get("mse", float("inf"))))
+        best_blackbox_diag = best_run.get("blackbox_diagnostics") or {}
+        best_search_plan = best_blackbox_diag.get("search_plan") or {}
         aggregate = {
             "dataset": ds_name,
             "r2": stability["r2_stats"]["median"],
@@ -995,6 +997,7 @@ def run_track1_blackbox(
             "scoring_source": "displayed_formula",
             "runs_per_formula": int(max(1, int(runs_per_formula))),
             "ablation_mode": bool(ablation_mode),
+            "best_blackbox_search_plan": best_search_plan,
         }
         results.append(aggregate)
 
@@ -1325,6 +1328,16 @@ def main():
                         help="C++ evolution population size")
     parser.add_argument("--gens", type=int, default=1000,
                         help="C++ evolution generations")
+    parser.add_argument("--num-islands", type=int, default=8,
+                        help="Number of C++ evolution islands")
+    parser.add_argument("--migration-interval", type=int, default=25,
+                        help="Generations between island migrations")
+    parser.add_argument("--migration-size", type=int, default=2,
+                        help="Individuals migrated between islands")
+    parser.add_argument("--multi-start-runs", type=int, default=1,
+                        help="Internal C++ restarts per seed; keep at 1 when using multi-seed SRBench runs")
+    parser.add_argument("--enable-residual-stage", action="store_true",
+                        help="Enable expensive residual symbolic stage during SRBench runs")
     parser.add_argument("--classifier-model", type=str, default="models/curve_classifier_glu_fixed.pt",
                         help="Classifier model path")
     parser.add_argument("--proposer-model", type=str, default="models/universal_proposer_robust.pt",
@@ -1368,15 +1381,21 @@ def main():
     seeds = parse_seed_list(args.seeds)
     use_fast_path = not args.no_fast_path
     use_guided_evolution = not args.no_guided_evolution
+    effective_pop_size = int(args.pop_size) * max(1, int(args.num_islands))
 
     est = GlassboxRegressor(
-        population_size=args.pop_size,
+        population_size=effective_pop_size,
         generations=args.gens,
         random_state=42,
         timeout=args.timeout,
         classifier_path=args.classifier_model,
         use_fast_path=use_fast_path,
         use_guided_evolution=use_guided_evolution,
+        num_islands=args.num_islands,
+        migration_interval=args.migration_interval,
+        migration_size=args.migration_size,
+        multi_start_runs=args.multi_start_runs,
+        enable_residual_stage=args.enable_residual_stage,
         skip_evolution_if_bloated=args.skip_evolution_if_bloated,
         bloat_term_threshold=20,
         universal_proposer_path=args.proposer_model,
@@ -1384,7 +1403,14 @@ def main():
     )
 
     print(f"\n  Glassbox SRBench Benchmark")
-    print(f"  Population: {args.pop_size}  |  Generations: {args.gens}")
+    print(
+        f"  Population: {effective_pop_size} total "
+        f"({args.pop_size}/island)  |  Generations: {args.gens}"
+    )
+    print(
+        f"  Islands: {args.num_islands}  |  "
+        f"Migration: every {args.migration_interval} gens, size {args.migration_size}"
+    )
     print(f"  Samples: {args.n_samples}")
     print(f"  Timeout: {args.timeout}s  |  Hard timeout: {not args.no_hard_timeout}")
     adaptive_on = not args.no_adaptive_timeout
@@ -1394,7 +1420,11 @@ def main():
     print(f"  Classifier: {args.classifier_model}")
     print(f"  Proposer: {args.proposer_model}")
     print(f"  Multi-seed protocol: {seeds}")
-    print(f"  Runs/formula: {args.runs_per_formula}")
+    print(
+        f"  Runs/formula: {args.runs_per_formula}  |  "
+        f"Internal starts/seed: {args.multi_start_runs}  |  "
+        f"Residual stage: {args.enable_residual_stage}"
+    )
     print(f"  Acceptable criteria: R2>={args.acceptable_r2:.2f}, size<={args.complexity_cap}")
     print(f"  Reduced search max features: {args.blackbox_max_features}")
 

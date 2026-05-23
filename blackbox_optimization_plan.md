@@ -90,7 +90,7 @@ Estimator parameters to add:
 - [x] `blackbox_max_features=6`,
 - [x] `blackbox_feature_selection=True`,
 - [x] `blackbox_standardize=True`,
-- [ ] `blackbox_interaction_search=True`.
+- [x] `blackbox_interaction_search=True`.
 
 Auto-enable blackbox mode when:
 
@@ -172,7 +172,7 @@ Needed improvements:
 - [x] build seeds from multivariate formulas like `x0*x1`, `x0 + sin(x2)`,
 - [x] add feature-index-aware blackbox seed formulas,
 - [x] build pairwise interaction seeds from Phase 3,
-- [~] cap seed count; current implementation uses fixed caps rather than proposer-driven seed budget everywhere.
+- [x] cap seed count; current implementation now uses the blackbox search plan seed budget for C++ seed graph construction.
 
 This is one of the most important blackbox upgrades because good seeds reduce blind search.
 
@@ -185,8 +185,8 @@ Extend the universal proposer/search planner for multivariate data.
 For now, use heuristics:
 
 - [x] increase population/generations with selected feature count,
-- [ ] increase breadth when feature selection uncertainty is high,
-- [ ] increase depth/complexity only when pairwise interactions help validation,
+- [x] increase breadth when feature selection uncertainty is high,
+- [x] increase depth/complexity only when pairwise interactions help validation,
 - [ ] restrict operator families to those supported by feature-wise diagnostics.
 
 Future trained planner heads:
