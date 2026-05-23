@@ -40,6 +40,17 @@ Takeaway: blackbox optimization should begin with feature-space reduction, inter
 
 ## Target Architecture
 
+Status as of latest implementation:
+- [x] Preprocess data.
+- [x] Rank and select active features.
+- [x] Detect simple univariate structure per active feature via seed formulas.
+- [x] Detect pairwise interactions.
+- [x] Build candidate symbolic seeds and operator hints.
+- [x] Run C++ evolution on a reduced feature matrix.
+- [~] Validate on holdout/CV.
+- [~] Optionally add residual symbolic stages.
+- [x] Export the formula mapped back to original feature names/indices.
+
 Add a `blackbox_mode` path inside `GlassboxRegressor`.
 
 The pipeline should be:
@@ -56,6 +67,8 @@ The pipeline should be:
 
 ## Phase 1: Blackbox Preprocessor
 
+Status: mostly complete.
+
 Add a local module, likely:
 
 ```text
@@ -64,36 +77,38 @@ glassbox/sr/blackbox_preprocessor.py
 
 Responsibilities:
 
-- remove constant and near-constant features,
-- impute or reject non-finite rows cleanly,
-- standardize `X` and `y` for search,
-- keep inverse-transform metadata,
-- map selected reduced feature indices back to original feature indices,
-- store diagnostics in `est.blackbox_diagnostics_`.
+- [x] remove constant and near-constant features,
+- [~] impute or reject non-finite rows cleanly,
+- [x] standardize `X` and `y` for search,
+- [x] keep inverse-transform metadata,
+- [x] map selected reduced feature indices back to original feature indices,
+- [x] store diagnostics in `est.blackbox_diagnostics_`.
 
 Estimator parameters to add:
 
-- `blackbox_mode="auto"` or `True/False`,
-- `blackbox_max_features=6`,
-- `blackbox_feature_selection=True`,
-- `blackbox_standardize=True`,
-- `blackbox_interaction_search=True`.
+- [x] `blackbox_mode="auto"` or `True/False`,
+- [x] `blackbox_max_features=6`,
+- [x] `blackbox_feature_selection=True`,
+- [x] `blackbox_standardize=True`,
+- [ ] `blackbox_interaction_search=True`.
 
 Auto-enable blackbox mode when:
 
-- `n_features_in_ > 1`, or
-- target noise/holdout residual appears high, or
-- dataset is passed through SRBench Track 1.
+- [x] `n_features_in_ > 1`, or
+- [ ] target noise/holdout residual appears high, or
+- [x] dataset is passed through SRBench Track 1.
 
 ## Phase 2: Active Feature Ranking
 
+Status: partially complete.
+
 Implement a lightweight ensemble ranker:
 
-- absolute Pearson/Spearman correlation,
-- mutual information regression if sklearn is available,
-- Lasso/ElasticNet coefficients on standardized data,
-- ExtraTrees or RandomForest permutation/impurity importance,
-- single-feature fast-path score where cheap enough.
+- [x] absolute Pearson/Spearman correlation,
+- [ ] mutual information regression if sklearn is available,
+- [ ] Lasso/ElasticNet coefficients on standardized data,
+- [ ] ExtraTrees or RandomForest permutation/impurity importance,
+- [x] single-feature polynomial probe score where cheap enough.
 
 Output:
 
@@ -106,22 +121,24 @@ Output:
 }
 ```
 
-Use top `k` features for expensive evolution, default `k <= 6`.
+Use top `k` features for expensive evolution, default `k <= 6`. Status: complete.
 
-Important: keep a fallback where all features are retained if selection is uncertain and `n_features <= 4`.
+Important: keep a fallback where all features are retained if selection is uncertain and `n_features <= 4`. Status: complete, extended to small near-threshold candidate sets.
 
 ## Phase 3: Interaction Discovery
 
+Status: mostly complete for pairwise heuristics.
+
 After selecting top features, test cheap pairwise candidates:
 
-- `xi + xj`,
-- `xi * xj`,
-- `xi / (xj + eps)`,
-- `xi - xj`,
-- `xi^2 + xj^2`,
-- simple products with `sin`, `cos`, `exp`, `log` where operator priors suggest them.
+- [x] `xi + xj`,
+- [x] `xi * xj`,
+- [x] `xi / (xj + eps)`,
+- [x] `xi - xj`,
+- [x] `xi^2 + xj^2`,
+- [x] simple products with `sin`, `cos`, `exp`, `log`.
 
-Score each candidate using cross-validated or holdout MSE improvement over univariate fits.
+Score each candidate using cross-validated or holdout MSE improvement over univariate fits. Status: partial; current implementation uses deterministic in-sample affine MSE scoring.
 
 Output:
 
@@ -135,38 +152,42 @@ Output:
 
 These should feed:
 
-- `operator_hints`,
-- `candidate_formulas`,
-- seed graphs,
-- C++ evolution `X_list` feature subset.
+- [ ] `operator_hints`,
+- [x] `candidate_formulas`,
+- [x] seed graphs,
+- [x] C++ evolution `X_list` feature subset.
 
 ## Phase 4: Multivariate Seed Graphs
 
+Status: mostly complete for heuristic seeds.
+
 Current `seed_graph_builder.py` is mostly univariate:
 
-- input nodes default to `feature_idx=0`,
-- signal-discovered formulas use `x`,
-- formula-to-graph needs reliable handling of `x0`, `x1`, etc.
+- [x] input nodes no longer default incorrectly for parsed multivariate formulas,
+- [~] signal-discovered formulas are still univariate-first, with blackbox feature-aware seed generation added separately,
+- [x] formula-to-graph reliably handles `x0`, `x1`, etc.
 
 Needed improvements:
 
-- build seeds from multivariate formulas like `x0*x1`, `x0 + sin(x2)`,
-- add feature-index-aware signal seeds,
-- build pairwise interaction seeds from Phase 3,
-- cap seed count based on the proposer/search plan.
+- [x] build seeds from multivariate formulas like `x0*x1`, `x0 + sin(x2)`,
+- [x] add feature-index-aware blackbox seed formulas,
+- [x] build pairwise interaction seeds from Phase 3,
+- [~] cap seed count; current implementation uses fixed caps rather than proposer-driven seed budget everywhere.
 
 This is one of the most important blackbox upgrades because good seeds reduce blind search.
 
 ## Phase 5: Blackbox Search Plan
 
+Status: partial.
+
 Extend the universal proposer/search planner for multivariate data.
 
 For now, use heuristics:
 
-- increase population/generations with selected feature count,
-- increase breadth when feature selection uncertainty is high,
-- increase depth/complexity only when pairwise interactions help validation,
-- restrict operator families to those supported by feature-wise diagnostics.
+- [x] increase population/generations with selected feature count,
+- [ ] increase breadth when feature selection uncertainty is high,
+- [ ] increase depth/complexity only when pairwise interactions help validation,
+- [ ] restrict operator families to those supported by feature-wise diagnostics.
 
 Future trained planner heads:
 
@@ -181,6 +202,8 @@ Future trained planner heads:
 
 ## Phase 6: Residual Staged Symbolic Additive Model
 
+Status: partial.
+
 Instead of one monolithic expression, fit:
 
 ```text
@@ -189,27 +212,29 @@ f(x) = f1(selected_features) + f2(residual_features) + ...
 
 Workflow:
 
-1. Fit simplest symbolic expression.
-2. Evaluate validation residual.
-3. If residual has structure, fit another small symbolic term.
-4. Keep the term only if validation improves.
-5. Stop when residual improvement is small or complexity cap is reached.
+1. [x] Fit simplest symbolic expression.
+2. [x] Evaluate validation residual.
+3. [~] If residual has structure, fit another small symbolic term.
+4. [x] Keep the term only if validation improves.
+5. [~] Stop when residual improvement is small or complexity cap is reached.
 
 This is especially useful for blackbox approximation, where exact compact formulas may not exist.
 
 ## Phase 7: Validation and Metrics
 
+Status: partial.
+
 Blackbox should be optimized with different metrics from exact symbolic recovery:
 
-- validation/test R2,
-- median R2 across seeds,
-- worst-decile R2,
-- formula size,
-- selected feature count,
-- prediction stability,
-- domain failure rate,
-- time-to-acceptable model,
-- displayed-formula MSE/R2, not raw engine-only score.
+- [x] validation/test R2,
+- [x] median R2 across seeds,
+- [ ] worst-decile R2,
+- [x] formula size,
+- [x] selected feature count diagnostics,
+- [x] prediction stability summaries,
+- [ ] domain failure rate,
+- [x] time-to-acceptable model,
+- [x] displayed-formula MSE/R2, not raw engine-only score.
 
 For Track 1 SRBench, exact recovery should not be the headline metric.
 
@@ -252,14 +277,14 @@ Add multivariate candidate parsing and seed graph generation.
 
 ## Implementation Order
 
-1. Add blackbox preprocessor and feature ranker.
-2. Wire selected feature subset into `GlassboxRegressor`.
-3. Add formula remapping from reduced `x0..xk` back to original `xj`.
-4. Add interaction diagnostics and candidate formula seeds.
-5. Improve multivariate seed graph builder.
-6. Add blackbox mode flags to SRBench runner.
-7. Add residual staged additive fitting.
-8. Train multivariate proposer/planner after heuristic path proves useful.
+1. [x] Add blackbox preprocessor and feature ranker.
+2. [x] Wire selected feature subset into `GlassboxRegressor`.
+3. [x] Add formula remapping from reduced `x0..xk` back to original `xj`.
+4. [x] Add interaction diagnostics and candidate formula seeds.
+5. [x] Improve multivariate seed graph builder.
+6. [x] Add blackbox mode flags to SRBench runner.
+7. [~] Add residual staged additive fitting.
+8. [ ] Train multivariate proposer/planner after heuristic path proves useful.
 
 ## First Milestone
 
@@ -281,4 +306,3 @@ Success criteria:
 - smaller formulas,
 - stable or improved worst-decile R2,
 - no regression on Track 2 single-feature symbolic problems.
-

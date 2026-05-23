@@ -21,6 +21,7 @@ from glassbox.sr.blackbox_preprocessor import (
     formula_from_search_to_original_space,
     discover_blackbox_interactions,
     prepare_blackbox_search,
+    remap_original_formula_to_reduced,
     state_to_dict,
 )
 
@@ -832,11 +833,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         blackbox_state = getattr(self, "blackbox_state_", None)
                         if blackbox_state is not None and getattr(blackbox_state, "interaction_terms", None):
                             for term in blackbox_state.interaction_terms[:5]:
+                                seed_formula = term
+                                if getattr(blackbox_state, "enabled", False):
+                                    seed_formula = remap_original_formula_to_reduced(
+                                        term,
+                                        blackbox_state.selected_features,
+                                    )
                                 candidate_formulas.append({
-                                    "formula": term,
+                                    "formula": seed_formula,
                                     "mse": float("inf"),
                                     "score": 0.5,
-                                    "active_terms": [term],
+                                    "active_terms": [seed_formula],
                                     "from_blackbox_interaction": True,
                                 })
 
@@ -897,6 +904,32 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     try:
                         X_list = [X[:, i].astype(np.float64) for i in range(self.n_features_in_)]
                         y_arr = y.astype(np.float64).flatten()
+                        if candidate_formulas is None:
+                            candidate_formulas = []
+                            if best_formula:
+                                candidate_formulas.append({
+                                    "formula": best_formula,
+                                    "mse": best_mse or float("inf"),
+                                    "from_fast_path": True,
+                                })
+                            blackbox_state = getattr(self, "blackbox_state_", None)
+                            if blackbox_state is not None and getattr(blackbox_state, "candidate_seed_formulas", None):
+                                for formula in blackbox_state.candidate_seed_formulas[:16]:
+                                    seed_formula = formula
+                                    if getattr(blackbox_state, "enabled", False):
+                                        seed_formula = remap_original_formula_to_reduced(
+                                            formula,
+                                            blackbox_state.selected_features,
+                                        )
+                                    candidate_formulas.append({
+                                        "formula": seed_formula,
+                                        "mse": float("inf"),
+                                        "score": 0.25,
+                                        "active_terms": [seed_formula],
+                                        "from_blackbox_seed": True,
+                                    })
+                            if not candidate_formulas:
+                                candidate_formulas = None
 
                         n_runs = max(1, int(self.multi_start_runs))
                         best_cpp_result = None

@@ -30,6 +30,8 @@ class BlackboxState:
     interaction_pairs: List[Tuple[int, int]] = field(default_factory=list)
     interaction_terms: List[str] = field(default_factory=list)
     interaction_scores: Dict[str, float] = field(default_factory=dict)
+    feature_selection_uncertain: bool = False
+    candidate_seed_formulas: List[str] = field(default_factory=list)
 
 
 def _safe_std(values: np.ndarray) -> np.ndarray:
@@ -136,6 +138,14 @@ def discover_blackbox_interactions(
                 f"x{la}-x{lb}": xi - xj,
                 f"x{la}/(x{lb}+1e-6)": xi / (xj + 1e-6),
                 f"x{la}^2+x{lb}^2": xi * xi + xj * xj,
+                f"x{la}*sin(x{lb})": xi * np.sin(xj),
+                f"x{lb}*sin(x{la})": xj * np.sin(xi),
+                f"x{la}*cos(x{lb})": xi * np.cos(xj),
+                f"x{lb}*cos(x{la})": xj * np.cos(xi),
+                f"x{la}*exp(-abs(x{lb}))": xi * np.exp(-np.clip(np.abs(xj), 0.0, 60.0)),
+                f"x{lb}*exp(-abs(x{la}))": xj * np.exp(-np.clip(np.abs(xi), 0.0, 60.0)),
+                f"x{la}*log(abs(x{lb})+1e-6)": xi * np.log(np.abs(xj) + 1e-6),
+                f"x{lb}*log(abs(x{la})+1e-6)": xj * np.log(np.abs(xi) + 1e-6),
             }
 
             best_term = None
@@ -237,10 +247,24 @@ def prepare_blackbox_search(
         feature_scores = {usable[j]: score for j, score in scores.items()}
 
         k = int(max(1, min(max_features, len(usable))))
-        selected = sorted(usable, key=lambda idx: feature_scores.get(idx, 0.0), reverse=True)[:k]
+        ranked_usable = sorted(usable, key=lambda idx: feature_scores.get(idx, 0.0), reverse=True)
+        selected = ranked_usable[:k]
+        top_score = float(feature_scores.get(selected[0], 0.0)) if selected else 0.0
+        kth_score = float(feature_scores.get(selected[-1], 0.0)) if selected else 0.0
+        next_score = float(feature_scores.get(ranked_usable[k], 0.0)) if k < len(ranked_usable) else 0.0
+        score_gap = kth_score - next_score
+        uncertain = (
+            len(usable) <= max(4, k + 1)
+            and next_score > 0.0
+            and (top_score <= 0.15 or score_gap < max(0.03, 0.10 * max(top_score, 1e-12)))
+        )
+        if uncertain:
+            selected = list(usable)
+            reason = "retained_all_features_uncertain_selection"
+        else:
+            reason = "selected_top_features"
         selected = sorted(selected)
         dropped = [j for j in range(n_features) if j not in selected]
-        reason = "selected_top_features"
 
     interaction_state = discover_blackbox_interactions(
         X_scaled_all[:, selected],
@@ -262,8 +286,48 @@ def prepare_blackbox_search(
         interaction_pairs=list(interaction_state["interaction_pairs"]),
         interaction_terms=list(interaction_state["interaction_terms"]),
         interaction_scores=dict(interaction_state["interaction_scores"]),
+        feature_selection_uncertain=(reason == "retained_all_features_uncertain_selection"),
+        candidate_seed_formulas=build_blackbox_seed_formulas(selected, interaction_state["interaction_terms"]),
     )
     return X_scaled_all[:, selected], y_scaled, state
+
+
+def build_blackbox_seed_formulas(
+    selected_features: List[int],
+    interaction_terms: Optional[List[str]] = None,
+    max_seeds: int = 24,
+) -> List[str]:
+    """Build original-indexed multivariate seed formulas for blackbox search."""
+    formulas: List[str] = []
+
+    def add(formula: str) -> None:
+        text = str(formula or "").strip()
+        if text and text not in formulas:
+            formulas.append(text)
+
+    for idx in selected_features:
+        add(f"x{idx}")
+        add(f"x{idx}^2")
+        add(f"x{idx}^3")
+        add(f"sin(x{idx})")
+        add(f"cos(x{idx})")
+        add(f"exp(-abs(x{idx}))")
+        if len(formulas) >= max_seeds:
+            return formulas[:max_seeds]
+
+    for term in interaction_terms or []:
+        add(term)
+        if len(formulas) >= max_seeds:
+            return formulas[:max_seeds]
+
+    for a_i, a in enumerate(selected_features):
+        for b in selected_features[a_i + 1:]:
+            add(f"x{a}*x{b}")
+            add(f"x{a}+x{b}")
+            if len(formulas) >= max_seeds:
+                return formulas[:max_seeds]
+
+    return formulas[:max_seeds]
 
 
 def remap_reduced_formula_to_original(formula: str, selected_features: List[int]) -> str:
@@ -281,6 +345,22 @@ def remap_reduced_formula_to_original(formula: str, selected_features: List[int]
     if len(selected_features) == 1:
         mapped = re.sub(r"\bx\b", f"x{int(selected_features[0])}", mapped)
     return mapped
+
+
+def remap_original_formula_to_reduced(formula: str, selected_features: List[int]) -> str:
+    """Map original feature names xJ into reduced search-space names x0..xk."""
+    if not formula or not selected_features:
+        return formula
+
+    inverse = {int(original): local for local, original in enumerate(selected_features)}
+
+    def repl(match: re.Match[str]) -> str:
+        original_idx = int(match.group(1))
+        if original_idx in inverse:
+            return f"x{inverse[original_idx]}"
+        return match.group(0)
+
+    return re.sub(r"\bx(\d+)\b", repl, formula)
 
 
 def formula_from_search_to_original_space(formula: str, state: BlackboxState) -> str:
@@ -326,4 +406,6 @@ def state_to_dict(state: Optional[BlackboxState]) -> Dict[str, Any]:
         "interaction_pairs": list(state.interaction_pairs),
         "interaction_terms": list(state.interaction_terms),
         "interaction_scores": dict(state.interaction_scores),
+        "feature_selection_uncertain": bool(state.feature_selection_uncertain),
+        "candidate_seed_formulas": list(state.candidate_seed_formulas),
     }

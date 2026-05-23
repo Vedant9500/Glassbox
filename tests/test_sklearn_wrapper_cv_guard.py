@@ -1,3 +1,6 @@
+import sys
+from types import SimpleNamespace
+
 import numpy as np
 
 from glassbox.sr.sklearn_wrapper import GlassboxRegressor
@@ -97,3 +100,59 @@ def test_universal_proposer_dual_path_handles_missing_checkpoint():
     assert payload is None
     assert force is False
     assert str(est.universal_proposer_status_).startswith("error:")
+
+
+def test_multivariate_blackbox_cpp_seeds_use_reduced_indices(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    captured = {}
+
+    class _FakeCore:
+        @staticmethod
+        def run_evolution(**kwargs):
+            captured["seed_graphs"] = kwargs.get("seed_graphs_py", [])
+            return {"best_mse": 0.0, "formula": "x0*x1", "nodes": [], "output_weights": []}
+
+        @staticmethod
+        def reduce_formula_noise(formula, X_list, y):
+            return formula
+
+        @staticmethod
+        def simplify_formula(formula, **kwargs):
+            return formula
+
+    def _fake_fast_path(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
+    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+
+    rng = np.random.RandomState(8)
+    X = rng.randn(80, 5)
+    y = X[:, 1] * X[:, 4]
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=True,
+        use_universal_proposer=False,
+        blackbox_mode=True,
+        blackbox_max_features=2,
+        blackbox_standardize=False,
+        blackbox_min_features_to_select=2,
+        population_size=10,
+        generations=10,
+        multi_start_runs=1,
+        timeout=20,
+        random_state=8,
+    )
+    est.fit(X, y)
+
+    feature_indices = [
+        node.get("feature_idx")
+        for graph in captured.get("seed_graphs", [])
+        for node in graph.get("nodes", [])
+        if node.get("type") == 0
+    ]
+    assert feature_indices
+    assert max(feature_indices) < est.n_features_in_
