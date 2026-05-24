@@ -1338,9 +1338,9 @@ def main():
                         help="Internal C++ restarts per seed; keep at 1 when using multi-seed SRBench runs")
     parser.add_argument("--enable-residual-stage", action="store_true",
                         help="Enable expensive residual symbolic stage during SRBench runs")
-    parser.add_argument("--classifier-model", type=str, default="models/curve_classifier_glu_fixed.pt",
+    parser.add_argument("--classifier-model", type=str, default="models/curve_classifier_multi.pt",
                         help="Classifier model path")
-    parser.add_argument("--proposer-model", type=str, default="models/universal_proposer_robust.pt",
+    parser.add_argument("--proposer-model", type=str, default="models/universal_proposer_multi.pt",
                         help="Universal proposer model path")
     parser.add_argument("--no-fast-path", action="store_true",
                         help="Disable fast-path discovery")

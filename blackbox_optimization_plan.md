@@ -38,6 +38,33 @@ The broader SR literature points in the same direction:
 
 Takeaway: blackbox optimization should begin with feature-space reduction, interaction discovery, and staged decomposition before expensive symbolic evolution.
 
+## Research-Driven Update (2026-05-24)
+
+The latest code review plus literature review changes the priority order.
+
+What the current implementation gets right:
+
+- feature-space reduction before multivariate evolution,
+- blackbox-specific seed formulas and seed graphs,
+- reduced-space to original-space remapping,
+- blackbox diagnostics and ablation hooks.
+
+What the current implementation gets wrong:
+
+- it still treats hard Track 1 problems as mostly one monolithic global search,
+- it reacts to uncertainty by scaling population, generations, seeds, and timeout together,
+- interaction scoring is still mostly in-sample heuristic scoring,
+- there is no real candidate-formula refinement stage before expensive C++ evolution,
+- the residual/additive stage is too late and too weakly integrated,
+- the multivariate proposer path is still a proxy, not a true multivariate planner.
+
+Revised takeaway:
+
+- blackbox Track 1 should be optimized as predictive symbolic approximation,
+- validation should happen before expensive search expansion,
+- uncertainty should trigger candidate screening and decomposition, not mostly bigger brute-force search,
+- the highest-value next step is a validation-gated candidate refinement stage ahead of C++ evolution.
+
 ## Target Architecture
 
 Status as of latest implementation:
@@ -60,9 +87,9 @@ The pipeline should be:
 3. Detect simple univariate structure per active feature.
 4. Detect pairwise/triple interactions.
 5. Build candidate symbolic seeds and operator hints.
-6. Run C++ evolution on a reduced feature matrix.
-7. Validate on holdout/CV.
-8. Optionally add residual symbolic stages.
+6. Refine and validate candidate formulas on holdout/CV.
+7. Run C++ evolution only when candidates are still insufficient.
+8. Fit residual/additive symbolic stages under validation gating.
 9. Export the formula mapped back to original feature names/indices.
 
 ## Phase 1: Blackbox Preprocessor
@@ -100,7 +127,7 @@ Auto-enable blackbox mode when:
 
 ## Phase 2: Active Feature Ranking
 
-Status: partially complete.
+Status: partially complete, but still too weak for Track 1.
 
 Implement a lightweight ensemble ranker:
 
@@ -125,9 +152,15 @@ Use top `k` features for expensive evolution, default `k <= 6`. Status: complete
 
 Important: keep a fallback where all features are retained if selection is uncertain and `n_features <= 4`. Status: complete, extended to small near-threshold candidate sets.
 
+Research-driven next step:
+
+- [ ] make ranking validation-aware instead of purely in-sample,
+- [ ] add stronger rankers: MI, ElasticNet/Lasso, tree/permutation importance,
+- [ ] log ranker agreement/disagreement and use disagreement to control screening, not just search inflation.
+
 ## Phase 3: Interaction Discovery
 
-Status: mostly complete for pairwise heuristics.
+Status: mostly complete for pairwise heuristics, but not yet reliable enough to drive search budgets.
 
 After selecting top features, test cheap pairwise candidates:
 
@@ -138,7 +171,7 @@ After selecting top features, test cheap pairwise candidates:
 - [x] `xi^2 + xj^2`,
 - [x] simple products with `sin`, `cos`, `exp`, `log`.
 
-Score each candidate using cross-validated or holdout MSE improvement over univariate fits. Status: partial; current implementation uses deterministic in-sample affine MSE scoring.
+Score each candidate using cross-validated or holdout MSE improvement over univariate fits. Status: partial; current implementation has mostly used deterministic in-sample affine scoring and needs validation-aware scoring.
 
 Output:
 
@@ -156,6 +189,11 @@ These should feed:
 - [x] `candidate_formulas`,
 - [x] seed graphs,
 - [x] C++ evolution `X_list` feature subset.
+
+Highest-value next step:
+
+- [ ] score interactions against a holdout split and/or residual improvement, not just in-sample fit,
+- [ ] penalize redundant variants so all near-identical pair templates do not survive.
 
 ## Phase 4: Multivariate Seed Graphs
 
@@ -178,7 +216,7 @@ This is one of the most important blackbox upgrades because good seeds reduce bl
 
 ## Phase 5: Blackbox Search Plan
 
-Status: partial.
+Status: partial and currently too search-expansive.
 
 Extend the universal proposer/search planner for multivariate data.
 
@@ -188,6 +226,13 @@ For now, use heuristics:
 - [x] increase breadth when feature selection uncertainty is high,
 - [x] increase depth/complexity only when pairwise interactions help validation,
 - [ ] restrict operator families to those supported by feature-wise diagnostics.
+
+Research-driven correction:
+
+- [ ] uncertainty should first increase candidate screening/refinement budget,
+- [ ] uncertainty should not automatically multiply population, generations, and timeout together,
+- [ ] decomposition and validation should precede search inflation,
+- [ ] multivariate proposer influence should be reduced until a true multivariate planner exists.
 
 Future trained planner heads:
 
@@ -202,7 +247,7 @@ Future trained planner heads:
 
 ## Phase 6: Residual Staged Symbolic Additive Model
 
-Status: partial.
+Status: partial; current implementation is a useful fallback, not yet the intended blackbox strategy.
 
 Instead of one monolithic expression, fit:
 
@@ -219,6 +264,29 @@ Workflow:
 5. [~] Stop when residual improvement is small or complexity cap is reached.
 
 This is especially useful for blackbox approximation, where exact compact formulas may not exist.
+
+Research-driven correction:
+
+- [ ] move residual/additive fitting earlier in the blackbox decision path,
+- [ ] fit terms under explicit validation gating,
+- [ ] stop once marginal validation gain per added complexity is too small.
+
+## Phase 6.5: Candidate Refinement Before Evolution
+
+Status: highest-priority missing piece.
+
+Before launching expensive C++ evolution:
+
+1. [ ] collect fast-path, proposer, interaction, and blackbox seed candidates,
+2. [ ] refine affine scaling and constants where possible,
+3. [ ] evaluate on a deterministic holdout/CV split,
+4. [ ] rank by validation fit and complexity,
+5. [ ] skip or shrink global evolution if a candidate is already good enough.
+
+Rationale from SRBench:
+
+- strong blackbox methods combine search with parameter estimation and semantic guidance,
+- this is the fastest path to better Track 1 runtime without rewriting the core C++ engine.
 
 ## Phase 7: Validation and Metrics
 
@@ -237,6 +305,12 @@ Blackbox should be optimized with different metrics from exact symbolic recovery
 - [x] displayed-formula MSE/R2, not raw engine-only score.
 
 For Track 1 SRBench, exact recovery should not be the headline metric.
+
+Additional priorities:
+
+- [ ] distinguish candidate-screening wins from evolution wins,
+- [ ] report search inflation separately from true wall-clock savings,
+- [ ] align local Track 1 diagnosis more closely with official SRBench splits/protocol.
 
 ## Integration Points
 
@@ -283,8 +357,11 @@ Add multivariate candidate parsing and seed graph generation.
 4. [x] Add interaction diagnostics and candidate formula seeds.
 5. [x] Improve multivariate seed graph builder.
 6. [x] Add blackbox mode flags to SRBench runner.
-7. [~] Add residual staged additive fitting.
-8. [ ] Train multivariate proposer/planner after heuristic path proves useful.
+7. [~] Make interaction scoring validation-aware.
+8. [ ] Add candidate refinement and early acceptance before C++ evolution.
+9. [~] Turn residual staged additive fitting into a primary blackbox path.
+10. [ ] Strengthen feature ranking with MI / sparse linear / tree-based votes.
+11. [ ] Train or replace the multivariate proposer/planner after the heuristic path is stable.
 
 ## First Milestone
 
@@ -306,3 +383,11 @@ Success criteria:
 - smaller formulas,
 - stable or improved worst-decile R2,
 - no regression on Track 2 single-feature symbolic problems.
+
+## Immediate Patch Targets
+
+These are the current highest-value patches:
+
+1. Add a validation-gated candidate refinement layer before `_core.run_evolution`.
+2. Make pairwise interaction scoring holdout-aware.
+3. Rebalance the blackbox search plan so uncertainty spends more budget on screening and less on raw search inflation.

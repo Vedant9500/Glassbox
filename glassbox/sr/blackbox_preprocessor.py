@@ -73,6 +73,71 @@ def _univariate_poly_score(x: np.ndarray, y: np.ndarray) -> float:
         return 0.0
 
 
+def _affine_relative_score(
+    values: np.ndarray,
+    y: np.ndarray,
+    *,
+    validation_fraction: float = 0.25,
+    random_state: int = 0,
+) -> tuple[float, float]:
+    """Return holdout-aware and train relative R2 for a 1D candidate signal."""
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    mask = np.isfinite(values) & np.isfinite(y)
+    if int(mask.sum()) < 12:
+        return 0.0, 0.0
+
+    x = values[mask]
+    target = y[mask]
+    n = int(x.shape[0])
+    if n < 24:
+        try:
+            coef, _, _, _ = np.linalg.lstsq(
+                np.column_stack([x, np.ones_like(x)]),
+                target,
+                rcond=None,
+            )
+            pred = coef[0] * x + coef[1]
+            mse = float(np.mean((pred - target) ** 2))
+            y_var = max(float(np.var(target)), 1e-12)
+            rel = float(np.clip(1.0 - mse / y_var, 0.0, 1.0))
+            return rel, rel
+        except Exception:
+            return 0.0, 0.0
+
+    rng = np.random.RandomState(int(random_state))
+    indices = np.arange(n)
+    rng.shuffle(indices)
+    holdout_n = int(max(4, round(n * float(validation_fraction))))
+    holdout_n = min(holdout_n, n - 8)
+    if holdout_n <= 0:
+        holdout_n = max(1, n // 5)
+    train_idx = indices[:-holdout_n]
+    val_idx = indices[-holdout_n:]
+    if train_idx.size < 8 or val_idx.size < 4:
+        return 0.0, 0.0
+
+    x_train = x[train_idx]
+    y_train = target[train_idx]
+    x_val = x[val_idx]
+    y_val = target[val_idx]
+    try:
+        coef, _, _, _ = np.linalg.lstsq(
+            np.column_stack([x_train, np.ones_like(x_train)]),
+            y_train,
+            rcond=None,
+        )
+        train_pred = coef[0] * x_train + coef[1]
+        val_pred = coef[0] * x_val + coef[1]
+        train_var = max(float(np.var(y_train)), 1e-12)
+        val_var = max(float(np.var(y_val)), 1e-12)
+        train_rel = float(np.clip(1.0 - float(np.mean((train_pred - y_train) ** 2)) / train_var, 0.0, 1.0))
+        val_rel = float(np.clip(1.0 - float(np.mean((val_pred - y_val) ** 2)) / val_var, 0.0, 1.0))
+        return val_rel, train_rel
+    except Exception:
+        return 0.0, 0.0
+
+
 def rank_blackbox_features(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
     """Rank features using cheap, deterministic univariate signals."""
     X = np.asarray(X, dtype=np.float64)
@@ -100,6 +165,7 @@ def discover_blackbox_interactions(
     y: np.ndarray,
     selected_features: Optional[List[int]] = None,
     max_pairs: int = 6,
+    validation_fraction: float = 0.25,
 ) -> Dict[str, Any]:
     """Score a small set of pairwise interaction candidates."""
     X = np.asarray(X, dtype=np.float64)
@@ -112,7 +178,6 @@ def discover_blackbox_interactions(
     if len(cols) < 2:
         return {"interaction_pairs": [], "interaction_terms": [], "interaction_scores": {}}
 
-    y_var = max(float(np.var(y)), 1e-12)
     base_scores = rank_blackbox_features(X, y)
     candidate_rows: List[Tuple[float, Tuple[int, int], str]] = []
 
@@ -154,15 +219,17 @@ def discover_blackbox_interactions(
                 if not np.all(np.isfinite(values)):
                     continue
                 try:
-                    coef, _, _, _ = np.linalg.lstsq(
-                        np.column_stack([values, np.ones_like(values)]),
+                    val_rel, train_rel = _affine_relative_score(
+                        values,
                         yj,
-                        rcond=None,
+                        validation_fraction=validation_fraction,
+                        random_state=31 * (a + 1) + 17 * (b + 1),
                     )
-                    pred = coef[0] * values + coef[1]
-                    mse = float(np.mean((pred - yj) ** 2))
-                    rel = float(np.clip(1.0 - mse / y_var, 0.0, 1.0))
-                    score = rel + 0.15 * max(base_scores.get(a, 0.0), base_scores.get(b, 0.0))
+                    score = (
+                        0.75 * val_rel
+                        + 0.15 * train_rel
+                        + 0.10 * max(base_scores.get(a, 0.0), base_scores.get(b, 0.0))
+                    )
                     if score > best_score:
                         best_score = score
                         best_term = name

@@ -144,3 +144,21 @@ def test_blackbox_seed_formulas_include_features_and_interactions():
     assert "x3" in formulas
     assert "sin(x7)" in formulas
     assert "x3*sin(x7)" in formulas
+
+
+def test_interaction_scoring_prefers_holdout_stable_signal():
+    rng = np.random.RandomState(9)
+    X = rng.randn(220, 3)
+    y = X[:, 0] * X[:, 1] + 0.02 * rng.randn(220)
+
+    interactions = discover_blackbox_interactions(
+        X,
+        y,
+        selected_features=[0, 1, 2],
+        max_pairs=4,
+        validation_fraction=0.25,
+    )
+
+    assert interactions["interaction_terms"]
+    best_term = interactions["interaction_terms"][0]
+    assert "x0*x1" in best_term or "x1*x0" in best_term
