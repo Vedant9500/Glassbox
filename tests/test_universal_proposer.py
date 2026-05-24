@@ -4,6 +4,7 @@ from pathlib import Path
 from glassbox.universal_proposer import (
     UniversalProposer,
     UniversalProposerConfig,
+    grammar_decode_multivariate_skeletons,
     grammar_decode_topk_skeletons,
     propose_from_xy,
     proposer_output_to_fpip_v2,
@@ -64,6 +65,28 @@ def test_grammar_decoder_prefers_periodic_candidates():
     assert ("sin(" in joined) or ("cos(" in joined)
 
 
+def test_multivariate_grammar_decoder_returns_cross_terms():
+    x0 = np.linspace(-2.0, 2.0, 64, dtype=np.float64)
+    x1 = np.linspace(1.0, 3.0, 64, dtype=np.float64)
+    X = np.stack([x0, x1], axis=1)
+    y = x0 * x1
+    priors = {
+        "sin": 0.05,
+        "cos": 0.05,
+        "periodic": 0.05,
+        "identity": 0.2,
+        "power": 0.1,
+        "exp": 0.01,
+        "log": 0.01,
+        "rational": 0.1,
+    }
+
+    top = grammar_decode_multivariate_skeletons(priors, X, y, top_k=5, max_rank=2)
+    assert len(top) == 5
+    joined = " | ".join([c["formula"] for c in top])
+    assert "x0*x1" in joined or "x0+x1" in joined
+
+
 def test_formula_replay_dataset_loads_npz(tmp_path: Path):
     n = 16
     labels = np.zeros((n, 14), dtype=np.float32)
@@ -76,6 +99,21 @@ def test_formula_replay_dataset_loads_npz(tmp_path: Path):
     ds = FormulaReplayDataset(npz_path, n_points=64)
     points, op_target, skeleton_target = ds[0]
 
-    assert points.shape == (64, 2)
+    assert points.shape == (366,)
     assert op_target.shape[0] >= 8
-    assert int(skeleton_target.item()) == -1
+    assert int(skeleton_target.item()) >= 0
+
+
+def test_formula_replay_dataset_matches_multivariate_skeleton(tmp_path: Path):
+    n = 12
+    labels = np.zeros((n, 14), dtype=np.float32)
+    labels[:, 7] = 1.0  # multiplication
+    formulas = np.array(["x0*x1" for _ in range(n)], dtype=object)
+    features = np.zeros((n, 366), dtype=np.float32)
+    npz_path = tmp_path / "multi_dataset.npz"
+    np.savez_compressed(npz_path, features=features, labels=labels, formulas=formulas)
+
+    ds = FormulaReplayDataset(npz_path, n_points=64)
+    _, _, skeleton_target = ds[0]
+
+    assert int(skeleton_target.item()) >= 0

@@ -7,6 +7,7 @@ independent of a finalized dataset schema.
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 import sys
 from typing import List, Tuple, Optional, Sequence
@@ -26,6 +27,9 @@ from glassbox.universal_proposer import (
     UniversalProposerConfig,
     DEFAULT_OPERATOR_VOCAB,
     DEFAULT_SKELETON_VOCAB,
+    DEFAULT_UNIVARIATE_SKELETON_VOCAB,
+    DEFAULT_MULTIVARIATE_SKELETON_VOCAB,
+    normalize_formula_key,
 )
 
 try:
@@ -71,12 +75,17 @@ def _coerce_operator_classes(raw, n_classes: int) -> List[str]:
 
 
 def _normalize_formula_key(formula: str) -> str:
-    return (
-        str(formula)
-        .replace("np.", "")
-        .replace(" ", "")
-        .replace("**", "^")
-    )
+    return normalize_formula_key(formula)
+
+
+def _canonicalize_formula_for_vocab(formula: str, n_input_vars: int = 1) -> str:
+    key = _normalize_formula_key(formula)
+    if n_input_vars <= 1:
+        return key
+    vars_in_key = sorted(set(re.findall(r"\bx\d+\b", key)))
+    if len(vars_in_key) == 1:
+        key = re.sub(r"\bx\d+\b", "x", key)
+    return key
 
 
 def load_training_data(
@@ -135,7 +144,7 @@ class SyntheticCurveDataset(Dataset):
         self.n_points = int(n_points)
         self.rng = np.random.RandomState(seed)
         self.operator_vocab = list(DEFAULT_OPERATOR_VOCAB)
-        self.skeleton_vocab = list(DEFAULT_SKELETON_VOCAB)
+        self.skeleton_vocab = list(DEFAULT_UNIVARIATE_SKELETON_VOCAB)
 
     def __len__(self) -> int:
         return self.n_samples
@@ -230,6 +239,10 @@ class FormulaReplayDataset(Dataset):
         self.operator_classes = _coerce_operator_classes(operator_classes, int(labels.shape[1]))
         self.formulas = list(formulas) if formulas is not None else None
         self.n_points = n_points
+        self.n_input_vars = 1
+        if self.formulas:
+            self.n_input_vars = max(1, self._infer_formula_input_vars(self.formulas))
+        self.skeleton_vocab_keys = [self._canonical_vocab_key(item) for item in self.skeleton_vocab]
 
         self.is_on_device = False
         if device is not None and device.type == 'cuda':
@@ -262,6 +275,23 @@ class FormulaReplayDataset(Dataset):
     def __len__(self) -> int:
         return len(self.indices)
 
+    def _infer_formula_input_vars(self, formulas: Sequence[str]) -> int:
+        max_vars = 1
+        for formula in formulas:
+            vars_found = set(re.findall(r"\bx\d+\b", str(formula)))
+            if re.search(r"\bx\b", str(formula)):
+                vars_found.add("x")
+            max_vars = max(max_vars, len(vars_found))
+        return max_vars
+
+    def _canonical_vocab_key(self, formula: str) -> str:
+        key = _normalize_formula_key(formula)
+        if self.n_input_vars > 1:
+            vars_in_key = sorted(set(re.findall(r"\bx\d+\b", key)))
+            if len(vars_in_key) == 1:
+                key = re.sub(r"\bx\d+\b", "x", key)
+        return key
+
     def _labels_to_operator_target(self, row: np.ndarray) -> np.ndarray:
         op = np.zeros(len(self.operator_vocab), dtype=np.float32)
         row = np.asarray(row, dtype=np.float32)
@@ -283,10 +313,11 @@ class FormulaReplayDataset(Dataset):
         return op
 
     def _formula_to_skeleton_target(self, formula: str) -> int:
-        key = _normalize_formula_key(formula)
-        vocab_keys = [_normalize_formula_key(item) for item in self.skeleton_vocab]
+        key = self._canonical_vocab_key(formula)
+        if key not in self.skeleton_vocab_keys and self.n_input_vars > 1:
+            key = _normalize_formula_key(formula)
         try:
-            return vocab_keys.index(key)
+            return self.skeleton_vocab_keys.index(key)
         except ValueError:
             return -1
 
@@ -641,6 +672,8 @@ def main():
                     "config": {
                         "hidden_dim": config.hidden_dim,
                         "n_features": config.n_features,
+                        "supports_multivariate_formulas": config.supports_multivariate_formulas,
+                        "max_input_vars": config.max_input_vars,
                         "operator_vocab": model.operator_vocab,
                         "skeleton_vocab": model.skeleton_vocab,
                     },

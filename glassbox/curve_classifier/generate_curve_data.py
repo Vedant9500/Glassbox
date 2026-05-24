@@ -11,6 +11,7 @@ Usage:
 import numpy as np
 import argparse
 import random
+import re
 from typing import List, Tuple, Dict, Set
 from pathlib import Path
 import ast
@@ -302,6 +303,34 @@ PHYSICS_TEMPLATES = [
     # Power-law decay
     ("1 / (1 + x**2)", {'rational'}),
     ("1 / (1 + np.abs(x))", {'rational'}),
+]
+
+MULTIVARIATE_TEMPLATES = [
+    ("x0 + x1", {'identity', 'addition'}),
+    ("{a} * x0 + {b} * x1 + {c}", {'identity', 'addition', 'multiplication'}),
+    ("x0 * x1", {'identity', 'multiplication'}),
+    ("x0 * x1 + x0 + x1", {'identity', 'addition', 'multiplication'}),
+    ("x0 ** 2 + x1 ** 2", {'power', 'addition'}),
+    ("(x0 - x1) ** 2", {'power', 'addition'}),
+    ("np.sqrt((x0 - x1) ** 2 + 0.01)", {'power', 'addition'}),
+    ("np.sqrt(x0 ** 2 + x1 ** 2 + 0.01)", {'power', 'addition'}),
+    ("np.sin(x0) + x1", {'sin', 'addition', 'identity'}),
+    ("np.cos(x0) + x1 ** 2", {'cos', 'power', 'addition'}),
+    ("x0 * np.sin(x1)", {'identity', 'sin', 'multiplication'}),
+    ("x1 * np.sin(x0)", {'identity', 'sin', 'multiplication'}),
+    ("x0 * np.cos(x1)", {'identity', 'cos', 'multiplication'}),
+    ("np.sin(x0 + x1)", {'sin', 'addition'}),
+    ("np.cos(x0 * x1)", {'cos', 'multiplication'}),
+    ("np.exp(-np.abs(x0)) * x1", {'exp', 'identity', 'multiplication'}),
+    ("np.log(np.abs(x0 * x1) + 1)", {'log', 'multiplication'}),
+    ("x0 / (np.abs(x1) + 0.1)", {'identity', 'rational'}),
+    ("1 / (x0 ** 2 + x1 ** 2 + 0.1)", {'power', 'rational', 'addition'}),
+    ("x0 * x1 / (np.abs(x0) + np.abs(x1) + 0.1)", {'identity', 'rational', 'multiplication', 'addition'}),
+    ("x0 + x1 + x2", {'identity', 'addition'}),
+    ("x0 * x1 + x2", {'identity', 'addition', 'multiplication'}),
+    ("x0 * np.sin(x1) + x2 ** 2", {'identity', 'sin', 'power', 'addition', 'multiplication'}),
+    ("np.exp(-np.abs(x2)) * np.sin(x0 + x1)", {'exp', 'sin', 'addition', 'multiplication'}),
+    ("x0 / np.sqrt(1 + x1 ** 2 + x2 ** 2)", {'identity', 'power', 'rational', 'addition'}),
 ]
 
 ALL_TEMPLATES = (
@@ -1155,8 +1184,58 @@ def generate_random_formula() -> Tuple[str, Set[str]]:
     return formula, operators
 
 
-def _safe_eval_ast(node: ast.AST, x: np.ndarray) -> np.ndarray:
+def generate_random_multivariate_formula(n_inputs: int = 2) -> Tuple[str, Set[str]]:
+    """Pick a multivariate template and fill in coefficients."""
+    n_inputs = max(2, int(n_inputs))
+    if n_inputs <= 2:
+        candidates = [
+            tpl for tpl in MULTIVARIATE_TEMPLATES
+            if ("x2" not in tpl[0] and "x3" not in tpl[0])
+        ]
+    else:
+        candidates = list(MULTIVARIATE_TEMPLATES)
+    template, operators = random.choice(candidates)
+    formula = template.format(
+        a=np.random.uniform(-3, 3),
+        b=np.random.uniform(0.5, 3),
+        c=np.random.uniform(-2, 2),
+        d=np.random.uniform(0.5, 3),
+        p=np.random.choice([0.5, 2, 3, 4, -1, -0.5]),
+    )
+    return formula, operators
+
+
+def _sample_multivariate_x(
+    n_points: int,
+    n_inputs: int,
+    x_range: Tuple[float, float],
+    x_ranges: List[Tuple[float, float]] | None = None,
+    x_scale_min: float = 1.0,
+    x_scale_max: float = 1.0,
+    x_shift_std: float = 0.0,
+) -> np.ndarray:
+    n_inputs = max(2, int(n_inputs))
+    columns = []
+    for i in range(n_inputs):
+        if x_ranges:
+            xmin, xmax = random.choice(x_ranges)
+        else:
+            xmin, xmax = x_range
+        col = np.linspace(xmin, xmax, n_points)
+        if x_scale_min != 1.0 or x_scale_max != 1.0:
+            col = col * np.random.uniform(x_scale_min, x_scale_max)
+        if x_shift_std > 0.0:
+            span = float(np.max(col) - np.min(col))
+            col = col + np.random.normal(0.0, x_shift_std * span)
+        if i > 0:
+            col = np.roll(col, i * max(1, n_points // max(2, n_inputs)))
+        columns.append(col)
+    return np.stack(columns, axis=1)
+
+
+def _safe_eval_ast(node: ast.AST, x: np.ndarray, variables: Dict[str, np.ndarray] | None = None) -> np.ndarray:
     """Evaluate a restricted AST for numeric expressions involving x and np.*."""
+    variables = variables or {}
     allowed_funcs = {
         'sin': np.sin,
         'cos': np.cos,
@@ -1171,17 +1250,19 @@ def _safe_eval_ast(node: ast.AST, x: np.ndarray) -> np.ndarray:
     }
 
     if isinstance(node, ast.Expression):
-        return _safe_eval_ast(node.body, x)
+        return _safe_eval_ast(node.body, x, variables)
     if isinstance(node, ast.Constant):
         return np.array(node.value)
     if isinstance(node, ast.Name):
         if node.id == 'x':
             return x
+        if node.id in variables:
+            return variables[node.id]
         if node.id == 'np':
             return np
         raise ValueError("Unsafe name")
     if isinstance(node, ast.Attribute):
-        value = _safe_eval_ast(node.value, x)
+        value = _safe_eval_ast(node.value, x, variables)
         if value is np and node.attr in allowed_funcs:
             return allowed_funcs[node.attr]
         # Allow np.pi, np.e constants
@@ -1191,19 +1272,19 @@ def _safe_eval_ast(node: ast.AST, x: np.ndarray) -> np.ndarray:
             return np.e
         raise ValueError("Unsafe attribute")
     if isinstance(node, ast.Call):
-        func = _safe_eval_ast(node.func, x)
-        args = [_safe_eval_ast(a, x) for a in node.args]
+        func = _safe_eval_ast(node.func, x, variables)
+        args = [_safe_eval_ast(a, x, variables) for a in node.args]
         return func(*args)
     if isinstance(node, ast.UnaryOp):
-        operand = _safe_eval_ast(node.operand, x)
+        operand = _safe_eval_ast(node.operand, x, variables)
         if isinstance(node.op, ast.UAdd):
             return operand
         if isinstance(node.op, ast.USub):
             return -operand
         raise ValueError("Unsafe unary op")
     if isinstance(node, ast.BinOp):
-        left = _safe_eval_ast(node.left, x)
-        right = _safe_eval_ast(node.right, x)
+        left = _safe_eval_ast(node.left, x, variables)
+        right = _safe_eval_ast(node.right, x, variables)
         if isinstance(node.op, ast.Add):
             return left + right
         if isinstance(node.op, ast.Sub):
@@ -1230,14 +1311,19 @@ def evaluate_formula(formula: str, x: np.ndarray, safe_eval: bool = True) -> Tup
         with np.errstate(all='ignore'):
             if safe_eval:
                 tree = ast.parse(formula, mode='eval')
-                y = _safe_eval_ast(tree, x)
+                variables = _build_variable_context(x)
+                y = _safe_eval_ast(tree, x, variables)
             else:
-                y = eval(formula, {"x": x, "np": np})
+                context = {"x": x, "np": np}
+                context.update(_build_variable_context(x))
+                y = eval(formula, context)
             
             # Broadcast scalar results (e.g. from constant PCFG formulas)
             y = np.asarray(y, dtype=np.float64)
             if y.ndim == 0:
-                y = np.broadcast_to(y, x.shape).copy()
+                y = np.broadcast_to(y, _sample_count_from_x(x)).copy()
+            if y.ndim != 1:
+                return None, "eval_fail"
         
         # Check for invalid values
         if np.any(np.isnan(y)) or np.any(np.isinf(y)):
@@ -1252,9 +1338,21 @@ def evaluate_formula(formula: str, x: np.ndarray, safe_eval: bool = True) -> Tup
         return None, "eval_fail"
 
 
+def _build_variable_context(x: np.ndarray) -> Dict[str, np.ndarray]:
+    x_arr = np.asarray(x)
+    if x_arr.ndim != 2:
+        return {}
+    return {f"x{i}": x_arr[:, i] for i in range(x_arr.shape[1])}
+
+
+def _sample_count_from_x(x: np.ndarray) -> int:
+    x_arr = np.asarray(x)
+    return int(x_arr.shape[0])
+
+
 def _ast_contains_x(node: ast.AST) -> bool:
-    """Return True if AST node contains variable x."""
-    if isinstance(node, ast.Name) and node.id == 'x':
+    """Return True if AST node contains input variable x or x0/x1/..."""
+    if isinstance(node, ast.Name) and (node.id == 'x' or re.fullmatch(r"x\d+", node.id)):
         return True
     for child in ast.iter_child_nodes(node):
         if _ast_contains_x(child):
@@ -1295,7 +1393,7 @@ def derive_operators_from_formula(formula: str) -> Set[str]:
         return ops
 
     for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and node.id == 'x':
+        if isinstance(node, ast.Name) and (node.id == 'x' or re.fullmatch(r"x\d+", node.id)):
             ops.add('identity')
 
         if isinstance(node, ast.Call):
@@ -1380,6 +1478,8 @@ def generate_dataset(
     pcfg_ratio: float = 0.0,
     pcfg_max_depth: int = 4,
     noise_profile: str = 'legacy',
+    multivariate_ratio: float = 0.0,
+    n_inputs: int = 2,
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """
     Generate labeled curve dataset.
@@ -1461,6 +1561,8 @@ def generate_dataset(
             pcfg_ratio=pcfg_ratio,
             pcfg_max_depth=pcfg_max_depth,
             noise_profile=noise_profile,
+            multivariate_ratio=multivariate_ratio,
+            n_inputs=n_inputs,
         )
         
         # Run workers
@@ -1537,6 +1639,8 @@ def generate_dataset_streamed(
     pcfg_ratio: float = 0.0,
     pcfg_max_depth: int = 4,
     noise_profile: str = 'legacy',
+    multivariate_ratio: float = 0.0,
+    n_inputs: int = 2,
 ) -> Tuple[np.ndarray, np.ndarray, List[str]]:
     """Generate dataset while streaming features/labels to disk."""
     if templates is None:
@@ -1612,6 +1716,8 @@ def generate_dataset_streamed(
         pcfg_ratio=pcfg_ratio,
         pcfg_max_depth=pcfg_max_depth,
         noise_profile=noise_profile,
+        multivariate_ratio=multivariate_ratio,
+        n_inputs=n_inputs,
     )
 
     reject_stats = {
@@ -1692,6 +1798,8 @@ def generate_chunk(
     pcfg_ratio: float = 0.0,
     pcfg_max_depth: int = 4,
     noise_profile: str = 'legacy',
+    multivariate_ratio: float = 0.0,
+    n_inputs: int = 2,
 ) -> Tuple[List, List, List, Dict[str, int]]:
     """Generate a chunk of samples (worker function)."""
     n, seed = task
@@ -1739,6 +1847,12 @@ def generate_chunk(
         
         # Decide: PCFG or template-based generation
         use_pcfg = pcfg_gen is not None and random.random() < pcfg_ratio
+        use_multivariate = (
+            multivariate_ratio > 0.0
+            and random.random() < multivariate_ratio
+            and n_inputs >= 2
+            and not use_pcfg
+        )
         
         if use_pcfg:
             # PCFG-based generation
@@ -1746,6 +1860,8 @@ def generate_chunk(
             # Deriving operators from AST ensures labels match the final string exactly
             # (fixes issue where generator tracking missed implicit ops or drifted)
             operators = derive_operators_from_formula(formula)
+        elif use_multivariate:
+            formula, operators = generate_random_multivariate_formula(n_inputs=n_inputs)
         elif balance_classes and class_to_templates:
             if class_sampling_weights is not None:
                 classes, weights = class_sampling_weights
@@ -1764,7 +1880,7 @@ def generate_chunk(
             template, operators = random.choice(templates)
         
         # Fill in template coefficients (only for template-based formulas)
-        if not use_pcfg:
+        if not use_pcfg and not use_multivariate:
             b = np.random.uniform(0.3, 6.0)  # Wider frequency range
             d = np.random.uniform(0.3, 6.0)
             if signed_bd:
@@ -1787,18 +1903,29 @@ def generate_chunk(
             )
         
         # Sample x-range per curve if provided
-        if x_ranges:
-            xmin, xmax = random.choice(x_ranges)
-            x = np.linspace(xmin, xmax, n_points)
+        if use_multivariate:
+            x = _sample_multivariate_x(
+                n_points=n_points,
+                n_inputs=n_inputs,
+                x_range=x_range,
+                x_ranges=x_ranges,
+                x_scale_min=x_scale_min,
+                x_scale_max=x_scale_max,
+                x_shift_std=x_shift_std,
+            )
         else:
-            x = np.linspace(x_range[0], x_range[1], n_points)
+            if x_ranges:
+                xmin, xmax = random.choice(x_ranges)
+                x = np.linspace(xmin, xmax, n_points)
+            else:
+                x = np.linspace(x_range[0], x_range[1], n_points)
 
-        # Optional x scaling and shifting
-        if x_scale_min != 1.0 or x_scale_max != 1.0:
-            x = x * np.random.uniform(x_scale_min, x_scale_max)
-        if x_shift_std > 0.0:
-            span = (x.max() - x.min())
-            x = x + np.random.normal(0.0, x_shift_std * span)
+            # Optional x scaling and shifting
+            if x_scale_min != 1.0 or x_scale_max != 1.0:
+                x = x * np.random.uniform(x_scale_min, x_scale_max)
+            if x_shift_std > 0.0:
+                span = (x.max() - x.min())
+                x = x + np.random.normal(0.0, x_shift_std * span)
 
         # Evaluate
         y, status = evaluate_formula(formula, x, safe_eval=safe_eval)
@@ -1847,17 +1974,20 @@ def save_dataset(
     features: np.ndarray,
     labels: np.ndarray,
     formulas: List[str],
+    metadata: Dict[str, object] | None = None,
 ):
     """Save dataset to npz file."""
-    np.savez_compressed(
-        filepath,
-        features=features,
-        labels=labels,
-        formulas=np.array(formulas, dtype=object),
-        operator_classes=list(OPERATOR_CLASSES.keys()),
-        feature_dim=FEATURE_DIM,
-        feature_schema=FEATURE_SCHEMA,
-    )
+    payload = {
+        "features": features,
+        "labels": labels,
+        "formulas": np.array(formulas, dtype=object),
+        "operator_classes": list(OPERATOR_CLASSES.keys()),
+        "feature_dim": FEATURE_DIM,
+        "feature_schema": FEATURE_SCHEMA,
+    }
+    if metadata:
+        payload.update(metadata)
+    np.savez_compressed(filepath, **payload)
     print(f"Saved {len(features)} samples to {filepath}")
 
 
@@ -1927,6 +2057,10 @@ def main():
                         help="Fraction of samples generated via PCFG grammar (0-1, default: 0.4)")
     parser.add_argument("--pcfg-max-depth", type=int, default=6,
                         help="Maximum tree depth for PCFG formulas (default: 5)")
+    parser.add_argument("--multivariate-ratio", type=float, default=0.0,
+                        help="Fraction of samples generated from x0/x1/... multivariate templates (0-1, default: 0)")
+    parser.add_argument("--n-inputs", type=int, default=2,
+                        help="Number of input variables for multivariate templates (default: 2)")
     parser.add_argument("--noise-profile", type=str, default='multi',
                         choices=['legacy', 'multi'],
                         help="Noise injection mode: 'legacy' (fixed Gaussian) or 'multi' (randomized multi-SNR)")
@@ -1955,6 +2089,8 @@ def main():
         print(f"  rational_ratio: {args.rational_ratio:.2f}")
     if args.pcfg_ratio > 0:
         print(f"  pcfg_ratio: {args.pcfg_ratio:.2f} (max_depth={args.pcfg_max_depth})")
+    if args.multivariate_ratio > 0:
+        print(f"  multivariate_ratio: {args.multivariate_ratio:.2f} (n_inputs={args.n_inputs})")
     print(f"  noise_profile: {args.noise_profile}")
     print(f"  n_classes: {N_CLASSES}")
     print(f"  Operators: {list(OPERATOR_CLASSES.keys())}")
@@ -2004,6 +2140,8 @@ def main():
             pcfg_ratio=args.pcfg_ratio,
             pcfg_max_depth=args.pcfg_max_depth,
             noise_profile=args.noise_profile,
+            multivariate_ratio=args.multivariate_ratio,
+            n_inputs=args.n_inputs,
         )
         feats_g, labels_g, forms_g = generate_dataset(
             n_samples=n_general,
@@ -2027,6 +2165,8 @@ def main():
             pcfg_ratio=args.pcfg_ratio,
             pcfg_max_depth=args.pcfg_max_depth,
             noise_profile=args.noise_profile,
+            multivariate_ratio=args.multivariate_ratio,
+            n_inputs=args.n_inputs,
         )
         
         features = np.concatenate([feats_r, feats_g], axis=0)
@@ -2062,6 +2202,8 @@ def main():
                 pcfg_ratio=args.pcfg_ratio,
                 pcfg_max_depth=args.pcfg_max_depth,
                 noise_profile=args.noise_profile,
+                multivariate_ratio=args.multivariate_ratio,
+                n_inputs=args.n_inputs,
             )
         else:
             features, labels, formulas = generate_dataset(
@@ -2085,6 +2227,8 @@ def main():
                 pcfg_ratio=args.pcfg_ratio,
                 pcfg_max_depth=args.pcfg_max_depth,
                 noise_profile=args.noise_profile,
+                multivariate_ratio=args.multivariate_ratio,
+                n_inputs=args.n_inputs,
             )
     
     # Stats
@@ -2107,7 +2251,17 @@ def main():
         if save_formulas:
             print(f"  {output_path.with_suffix('.formulas.txt')}")
     else:
-        save_dataset(output_path, features, labels, formulas)
+        save_dataset(
+            output_path,
+            features,
+            labels,
+            formulas,
+            metadata={
+                "n_input_features": int(args.n_inputs if args.multivariate_ratio > 0 else 1),
+                "multivariate_ratio": float(args.multivariate_ratio),
+                "multivariate_templates": np.array([tpl for tpl, _ in MULTIVARIATE_TEMPLATES], dtype=object),
+            },
+        )
     
     # Show some examples (only if formulas were saved and not too many)
     if len(formulas) > 0 and len(formulas) <= 100000:

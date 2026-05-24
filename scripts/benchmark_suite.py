@@ -1486,12 +1486,12 @@ Examples:
         """,
     )
     parser.add_argument(
-        "--classifier-model", type=str, default="models/curve_classifier_glu_fixed.pt",
-        help="Path to the curve classifier model (default: models/curve_classifier_wide.pt)",
+        "--classifier-model", type=str, default="models/curve_classifier_multi.pt",
+        help="Path to the curve classifier model (default: models/curve_classifier_multi.pt)",
     )
     parser.add_argument(
-        "--proposer-model", type=str, default="models/universal_proposer_robust.pt",
-        help="Path to the universal neural proposer model (default: models/universal_proposer_robust.pt)",
+        "--proposer-model", type=str, default="models/universal_proposer_multi.pt",
+        help="Path to the universal neural proposer model (default: models/universal_proposer_multi.pt)",
     )
     parser.add_argument(
         "--disable-proposer", action="store_true",

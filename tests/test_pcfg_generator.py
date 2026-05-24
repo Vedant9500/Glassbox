@@ -21,6 +21,7 @@ from glassbox.curve_classifier.generate_curve_data import (
     apply_noise_augmentation,
     evaluate_formula,
     derive_operators_from_formula,
+    generate_dataset,
     extract_all_features,
     operators_to_labels,
     OPERATOR_CLASSES,
@@ -291,6 +292,44 @@ class TestIntegration:
         y, status = evaluate_formula("np.e ** x", x)
         assert status == "ok"
         np.testing.assert_allclose(y, np.e ** x, atol=1e-10)
+
+    def test_multivariate_safe_eval(self):
+        """Safe eval should handle x0/x1 style multivariate formulas."""
+        x0 = np.linspace(-2, 2, 64)
+        x1 = np.linspace(1, 3, 64)
+        X = np.stack([x0, x1], axis=1)
+        y, status = evaluate_formula("x0 * x1 + np.sin(x0)", X)
+        assert status == "ok"
+        np.testing.assert_allclose(y, x0 * x1 + np.sin(x0), atol=1e-10)
+
+    def test_derive_operators_multivariate_names(self):
+        """Operator derivation should treat x0/x1 as identity inputs."""
+        ops = derive_operators_from_formula("x0 * x1 + np.sin(x0)")
+        assert "identity" in ops
+        assert "multiplication" in ops
+        assert "addition" in ops
+        assert "sin" in ops
+
+    def test_generate_dataset_forced_multivariate(self):
+        """Dataset generation should be able to emit multivariate formulas."""
+        features, labels, formulas = generate_dataset(
+            n_samples=8,
+            n_points=64,
+            seed=123,
+            n_workers=1,
+            pcfg_ratio=0.0,
+            noise_profile="legacy",
+            noise_std=0.0,
+            y_scale_min=1.0,
+            y_scale_max=1.0,
+            y_offset_std=0.0,
+            multivariate_ratio=1.0,
+            n_inputs=3,
+            show_progress=False,
+        )
+        assert features.shape == (8, FEATURE_DIM)
+        assert labels.shape == (8, N_CLASSES)
+        assert any(("x0" in f and "x1" in f) for f in formulas)
 
     def test_pcfg_formula_with_noise_pipeline(self):
         """Full pipeline: PCFG generate → evaluate → noise → features → labels."""

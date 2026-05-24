@@ -9,6 +9,7 @@ Phase 1 MVP module:
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Dict, List, Optional, Sequence, Set
 
 import numpy as np
@@ -30,7 +31,7 @@ DEFAULT_OPERATOR_VOCAB: List[str] = [
     "periodic",
 ]
 
-DEFAULT_SKELETON_VOCAB: List[str] = [
+DEFAULT_UNIVARIATE_SKELETON_VOCAB: List[str] = [
     "x",
     "x^2",
     "sin(x)",
@@ -42,11 +43,60 @@ DEFAULT_SKELETON_VOCAB: List[str] = [
     "x+sin(x)",
 ]
 
+DEFAULT_MULTIVARIATE_SKELETON_VOCAB: List[str] = [
+    "x0",
+    "x1",
+    "x0^2",
+    "x1^2",
+    "x0*x1",
+    "x0+x1",
+    "x0-x1",
+    "x0/(x1+1e-3)",
+    "x1/(x0+1e-3)",
+    "x0*sin(x1)",
+    "x1*sin(x0)",
+    "x0*cos(x1)",
+    "x0+sin(x1)",
+    "x1+sin(x0)",
+    "sqrt((x0-x1)^2+1e-6)",
+    "sqrt(x0^2+x1^2)",
+    "x0^2+x1^2",
+    "x0*x1+x0+x1",
+]
+
+DEFAULT_SKELETON_VOCAB: List[str] = list(dict.fromkeys(
+    DEFAULT_UNIVARIATE_SKELETON_VOCAB + DEFAULT_MULTIVARIATE_SKELETON_VOCAB
+))
+
+
+def normalize_formula_key(formula: str) -> str:
+    text = str(formula)
+    text = text.replace("np.", "")
+    text = text.replace(" ", "")
+    text = text.replace("**", "^")
+    return text
+
+
+def _canonicalize_formula_key_for_vocab(formula: str) -> str:
+    """Normalize a formula for exact-vocab matching.
+
+    Single-variable formulas sometimes arrive as `x0` instead of `x`; when a
+    formula references only one symbolic input, collapse that lone variable to
+    `x` so univariate vocab entries still match.
+    """
+    key = normalize_formula_key(formula)
+    vars_in_key = sorted(set(re.findall(r"\bx\d+\b", key)))
+    if len(vars_in_key) == 1:
+        key = re.sub(r"\bx\d+\b", "x", key)
+    return key
+
 
 @dataclass
 class UniversalProposerConfig:
     hidden_dim: int = 256
     n_features: int = 398
+    supports_multivariate_formulas: bool = True
+    max_input_vars: int = 4
     operator_vocab: Optional[List[str]] = None
     skeleton_vocab: Optional[List[str]] = None
 
@@ -54,7 +104,11 @@ class UniversalProposerConfig:
         return list(self.operator_vocab) if self.operator_vocab else list(DEFAULT_OPERATOR_VOCAB)
 
     def resolved_skeleton_vocab(self) -> List[str]:
-        return list(self.skeleton_vocab) if self.skeleton_vocab else list(DEFAULT_SKELETON_VOCAB)
+        if self.skeleton_vocab:
+            return list(self.skeleton_vocab)
+        if self.supports_multivariate_formulas:
+            return list(DEFAULT_SKELETON_VOCAB)
+        return list(DEFAULT_UNIVARIATE_SKELETON_VOCAB)
 
 
 class UniversalProposer(nn.Module):
@@ -163,6 +217,45 @@ def decode_topk_skeletons(
     return out
 
 
+def _safe_formula_eval_multivariate(formula: str, x: np.ndarray) -> Optional[np.ndarray]:
+    x = np.asarray(x, dtype=np.float64)
+    if x.ndim == 1:
+        x = x.reshape(-1, 1)
+    if x.ndim != 2 or x.shape[1] == 0:
+        return None
+
+    context: Dict[str, Any] = {
+        "np": np,
+        "sin": np.sin,
+        "cos": np.cos,
+        "exp": lambda z: np.exp(np.clip(z, -30.0, 30.0)),
+        "log": lambda z: np.log(np.abs(z) + 1e-6),
+        "sqrt": lambda z: np.sqrt(np.abs(z) + 1e-6),
+        "abs": np.abs,
+    }
+    for i in range(x.shape[1]):
+        context[f"x{i}"] = x[:, i]
+    if x.shape[1] == 1:
+        context["x"] = x[:, 0]
+
+    expr = formula.replace("^", "**")
+    try:
+        y = eval(expr, {"__builtins__": None}, context)
+    except Exception:
+        return None
+
+    if isinstance(y, (int, float)):
+        y = np.full(x.shape[0], float(y), dtype=np.float64)
+    else:
+        y = np.asarray(y, dtype=np.float64)
+
+    if y.ndim != 1 or y.shape[0] != x.shape[0]:
+        return None
+    if not np.all(np.isfinite(y)):
+        return None
+    return y
+
+
 def _formula_operator_tags(formula: str) -> Set[str]:
     tags: Set[str] = set()
     f = formula.lower()
@@ -219,6 +312,8 @@ def _build_univariate_grammar_candidates(max_depth: int = 2) -> List[str]:
 
 
 def _safe_formula_eval(formula: str, x: np.ndarray) -> Optional[np.ndarray]:
+    if np.asarray(x).ndim > 1:
+        return _safe_formula_eval_multivariate(formula, x)
     context = {
         "np": np,
         "x": x,
@@ -305,6 +400,79 @@ def grammar_decode_topk_skeletons(
     return scored[: max(1, int(top_k))]
 
 
+def grammar_decode_multivariate_skeletons(
+    operator_priors: Dict[str, float],
+    x: np.ndarray,
+    y: np.ndarray,
+    top_k: int = 5,
+    max_rank: int = 2,
+) -> List[Dict[str, Any]]:
+    """Decode multivariate skeletons from a constrained algebraic grammar."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    if x.ndim != 2 or x.shape[1] < 2:
+        return grammar_decode_topk_skeletons(operator_priors, x.reshape(-1), y, top_k=top_k, max_depth=2)
+
+    y_var = float(np.var(y)) + 1e-12
+    scored: List[Dict[str, Any]] = []
+    feature_names = [f"x{i}" for i in range(x.shape[1])]
+    limit = min(x.shape[1], max(2, int(max_rank)))
+
+    for i in range(limit):
+        for j in range(i + 1, limit):
+            xi = x[:, i]
+            xj = x[:, j]
+            mask = np.isfinite(xi) & np.isfinite(xj) & np.isfinite(y)
+            if int(mask.sum()) < 8:
+                continue
+            xi = xi[mask]
+            xj = xj[mask]
+            yj = y[mask]
+            vi = feature_names[i]
+            vj = feature_names[j]
+            candidates = [
+                f"{vi}+{vj}",
+                f"{vi}-{vj}",
+                f"{vi}*{vj}",
+                f"{vi}/({vj}+1e-3)",
+                f"{vj}/({vi}+1e-3)",
+                f"{vi}^2+{vj}^2",
+                f"{vi}*sin({vj})",
+                f"{vj}*sin({vi})",
+                f"{vi}*cos({vj})",
+                f"{vj}*cos({vi})",
+                f"sqrt(({vi}-{vj})^2+1e-6)",
+                f"sqrt({vi}^2+{vj}^2)",
+                f"{vi}*{vj}+{vi}+{vj}",
+            ]
+            for formula in candidates:
+                basis = _safe_formula_eval_multivariate(formula, np.column_stack([xi, xj]))
+                mse = float("inf")
+                fit_score = 0.0
+                if basis is not None:
+                    mse = _fit_affine_mse(yj, basis)
+                    fit_score = float(np.exp(-mse / y_var)) if np.isfinite(mse) else 0.0
+                tags = _formula_operator_tags(formula)
+                if tags:
+                    prior_score = float(np.mean([operator_priors.get(t, 1e-6) for t in tags]))
+                else:
+                    prior_score = 1e-6
+                score = 0.6 * prior_score + 0.4 * fit_score
+                scored.append(
+                    {
+                        "formula": formula,
+                        "probability": float(max(1e-9, score)),
+                        "score": float(1.0 - min(score, 1.0)),
+                        "mse": None if not np.isfinite(mse) else float(mse),
+                    }
+                )
+
+    if not scored:
+        return grammar_decode_topk_skeletons(operator_priors, x[:, 0], y, top_k=top_k, max_depth=2)
+    scored.sort(key=lambda d: (-d["probability"], d["score"]))
+    return scored[: max(1, int(top_k))]
+
+
 def _operator_priors(operator_logits: Sequence[float], operator_vocab: Sequence[str]) -> Dict[str, float]:
     logits = np.asarray(operator_logits, dtype=np.float64)
     # Use sigmoid for multi-label independent operator probabilities
@@ -355,7 +523,8 @@ def _uncertainty_from_logits(logits: Sequence[float]) -> Dict[str, Any]:
 
 def _signal_complexity(x: np.ndarray, y: np.ndarray) -> Dict[str, float]:
     """Cheap curve complexity diagnostics for search planning."""
-    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    x_arr = np.asarray(x, dtype=np.float64)
+    x = x_arr[:, 0].reshape(-1) if x_arr.ndim == 2 else x_arr.reshape(-1)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
     out = {
         "roughness": 0.0,
@@ -492,6 +661,48 @@ def build_search_plan(
     }
 
 
+def build_multivariate_search_plan(
+    *,
+    operator_priors: Dict[str, float],
+    candidates: Sequence[Dict[str, Any]],
+    uncertainty: Dict[str, Any],
+    x: np.ndarray,
+    y: np.ndarray,
+    input_variables: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    plan = build_search_plan(
+        operator_priors=operator_priors,
+        candidates=candidates,
+        uncertainty=uncertainty,
+        x=x[:, 0] if np.asarray(x).ndim == 2 and np.asarray(x).shape[1] > 0 else x,
+        y=y,
+    )
+    x_arr = np.asarray(x, dtype=np.float64)
+    if x_arr.ndim != 2 or x_arr.shape[1] < 2:
+        plan["supports_multivariate_formulas"] = False
+        return plan
+
+    n_features = int(x_arr.shape[1])
+    input_variables = list(input_variables) if input_variables else [f"x{i}" for i in range(n_features)]
+    interaction_strength = 0.0
+    for term in candidates:
+        formula = str(term.get("formula", ""))
+        if "*" in formula or "/" in formula or "sqrt((" in formula:
+            interaction_strength = max(interaction_strength, float(term.get("probability", 0.0)))
+
+    plan["supports_multivariate_formulas"] = True
+    plan["input_variables"] = input_variables[: min(len(input_variables), n_features)]
+    plan["feature_count"] = n_features
+    plan["interaction_strength"] = float(interaction_strength)
+    plan["seed_budget"] = max(int(plan.get("seed_budget", 0)), min(24, 6 + 2 * n_features))
+    plan["generation_multiplier"] = float(plan.get("generation_multiplier", 1.0)) * (1.0 + 0.1 * max(0, n_features - 1))
+    plan["population_multiplier"] = float(plan.get("population_multiplier", 1.0)) * (1.0 + 0.08 * max(0, n_features - 1))
+    if interaction_strength > 0.2:
+        plan["early_stop_max_nodes"] = max(int(plan.get("early_stop_max_nodes", 20)), 24 + 4 * n_features)
+        plan["acceptable_complexity"] = max(int(plan.get("acceptable_complexity", 15)), 12 + 2 * n_features)
+    return plan
+
+
 def propose_from_xy(
     model: UniversalProposer,
     x: np.ndarray,
@@ -551,33 +762,56 @@ def propose_from_xy(
     skeleton_logits = pred["skeleton_logits"][0].detach().cpu().numpy()
 
     priors = _operator_priors(operator_logits, model.operator_vocab)
-    # Grammar-constrained decoding uses priors and quick data-fit checks.
-    candidates = grammar_decode_topk_skeletons(
-        priors,
-        x=x.astype(np.float64),
-        y=y.astype(np.float64),
-        top_k=top_k,
-        max_depth=2,
-    )
+    x_for_plan = x.astype(np.float64)
+    y_for_plan = y.astype(np.float64)
+
+    if x_for_plan.ndim == 1 or (x_for_plan.ndim == 2 and x_for_plan.shape[1] <= 1):
+        candidates = grammar_decode_topk_skeletons(
+            priors,
+            x=x_for_plan.reshape(-1),
+            y=y_for_plan,
+            top_k=top_k,
+            max_depth=2,
+        )
+    else:
+        candidates = grammar_decode_multivariate_skeletons(
+            priors,
+            x=x_for_plan,
+            y=y_for_plan,
+            top_k=top_k,
+            max_rank=min(model.config.max_input_vars, x_for_plan.shape[1]),
+        )
 
     # Fallback to direct head decode if grammar decoding unexpectedly returns empty.
     if not candidates:
         candidates = decode_topk_skeletons(skeleton_logits, model.skeleton_vocab, top_k=top_k)
 
     uncertainty = _uncertainty_from_logits(skeleton_logits)
-    search_plan = build_search_plan(
-        operator_priors=priors,
-        candidates=candidates,
-        uncertainty=uncertainty,
-        x=x.astype(np.float64),
-        y=y.astype(np.float64),
-    )
+    if x_for_plan.ndim == 1 or (x_for_plan.ndim == 2 and x_for_plan.shape[1] <= 1):
+        search_plan = build_search_plan(
+            operator_priors=priors,
+            candidates=candidates,
+            uncertainty=uncertainty,
+            x=x_for_plan.reshape(-1),
+            y=y_for_plan,
+        )
+    else:
+        search_plan = build_multivariate_search_plan(
+            operator_priors=priors,
+            candidates=candidates,
+            uncertainty=uncertainty,
+            x=x_for_plan,
+            y=y_for_plan,
+            input_variables=[f"x{i}" for i in range(x_for_plan.shape[1])],
+        )
 
     return {
         "candidate_skeletons": candidates,
         "operator_priors": priors,
         "sequence_uncertainty": uncertainty,
         "search_plan": search_plan,
+        "supports_multivariate_formulas": bool(x_for_plan.ndim == 2 and x_for_plan.shape[1] > 1),
+        "input_variables": [f"x{i}" for i in range(x_for_plan.shape[1])] if x_for_plan.ndim == 2 else ["x"],
     }
 
 
@@ -626,16 +860,26 @@ def load_universal_proposer_checkpoint(
     """Load UniversalProposer from checkpoint saved by train_universal_proposer.py."""
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     cfg_raw = ckpt.get("config", {})
+    state_dict = ckpt["model_state_dict"]
+    skeleton_vocab = cfg_raw.get("skeleton_vocab")
+    if skeleton_vocab is None:
+        head_weight = state_dict.get("skeleton_head.weight")
+        if head_weight is not None and int(head_weight.shape[0]) == len(DEFAULT_UNIVARIATE_SKELETON_VOCAB):
+            skeleton_vocab = list(DEFAULT_UNIVARIATE_SKELETON_VOCAB)
+        else:
+            skeleton_vocab = list(DEFAULT_SKELETON_VOCAB)
     
     # Map new GLU config (n_features) and handle legacy point_mlp_layers
     config = UniversalProposerConfig(
         hidden_dim=int(cfg_raw.get("hidden_dim", 256)),
         n_features=int(cfg_raw.get("n_features", 370)),
+        supports_multivariate_formulas=bool(cfg_raw.get("supports_multivariate_formulas", True)),
+        max_input_vars=int(cfg_raw.get("max_input_vars", 4)),
         operator_vocab=cfg_raw.get("operator_vocab"),
-        skeleton_vocab=cfg_raw.get("skeleton_vocab"),
+        skeleton_vocab=skeleton_vocab,
     )
     model = UniversalProposer(config)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(state_dict)
     
     # Attach scaler for automatic normalization during inference. Some older
     # proposer checkpoints accidentally stored an AMP GradScaler here.
