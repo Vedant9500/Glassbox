@@ -326,6 +326,43 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "complexity": complexity,
         }
 
+    def _formula_mse(self, formula, X, y):
+        """Evaluate a formula directly on data and return MSE, or inf on failure."""
+        text = str(formula or "").strip()
+        if not text:
+            return float("inf")
+        try:
+            pred = self._safe_eval_formula_array(text, X)
+        except Exception:
+            return float("inf")
+        pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+        target = np.asarray(y, dtype=np.float64).reshape(-1)
+        if pred.shape != target.shape:
+            return float("inf")
+        if not np.all(np.isfinite(pred)):
+            return float("inf")
+        mse = float(np.mean((pred - target) ** 2))
+        return mse if np.isfinite(mse) else float("inf")
+
+    def _select_final_formula(self, incumbent_formula, incumbent_mse, challenger_formula, challenger_mse, X, y):
+        """Choose between incumbent and challenger using direct formula evaluation."""
+        incumbent_text = str(incumbent_formula or "").strip()
+        challenger_text = str(challenger_formula or "").strip()
+        if not challenger_text:
+            return incumbent_formula, incumbent_mse, "incumbent"
+        if not incumbent_text:
+            return challenger_formula, challenger_mse, "challenger"
+
+        incumbent_eval = self._formula_mse(incumbent_text, X, y)
+        challenger_eval = self._formula_mse(challenger_text, X, y)
+
+        incumbent_score = incumbent_eval if np.isfinite(incumbent_eval) else float(incumbent_mse or float("inf"))
+        challenger_score = challenger_eval if np.isfinite(challenger_eval) else float(challenger_mse or float("inf"))
+
+        if challenger_score + 1e-12 < incumbent_score:
+            return challenger_formula, challenger_score, "challenger"
+        return incumbent_formula, incumbent_score, "incumbent"
+
     def _refine_candidate_formulas(self, candidate_formulas, X, y, *, max_candidates=12):
         """Refine symbolic candidates with affine scaling and holdout scoring."""
         if not candidate_formulas:
@@ -1672,10 +1709,34 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     except Exception as e:
                         print(f"  [C++ evolution error: {e}]")
 
-                # Take evolution result if better than fast-path
-                if evo_formula and (evo_mse < best_mse or best_formula is None):
-                    best_formula = evo_formula
-                    best_mse = evo_mse
+                # Take evolution result if it wins under direct formula evaluation.
+                if evo_formula:
+                    self.evolution_candidate_formula_ = evo_formula
+                    self.evolution_candidate_mse_ = evo_mse
+                    selected_formula, selected_mse, selection_source = self._select_final_formula(
+                        best_formula,
+                        best_mse,
+                        evo_formula,
+                        evo_mse,
+                        X,
+                        y,
+                    )
+                    if selection_source == "challenger":
+                        best_formula = selected_formula
+                        best_mse = selected_mse
+                    if isinstance(self.blackbox_diagnostics_, dict):
+                        self.blackbox_diagnostics_["evolution_selection"] = {
+                            "incumbent_formula": best_formula if selection_source != "challenger" else None,
+                            "challenger_formula": evo_formula,
+                            "challenger_mse": float(evo_mse) if np.isfinite(evo_mse) else None,
+                            "selected": selection_source,
+                        }
+                    print(
+                        "  [Evolution] "
+                        f"candidate_mse={float(evo_mse):.6g} "
+                        f"selected={selection_source} "
+                        f"formula={(evo_formula or '0')[:120]}"
+                    )
         elif need_evolution and _elapsed() >= effective_timeout:
             print(f"  [Timeout: skipping evolution after {_elapsed():.1f}s (budget={effective_timeout:.1f}s)]")
 

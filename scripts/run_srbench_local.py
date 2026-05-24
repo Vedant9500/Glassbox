@@ -906,7 +906,7 @@ def run_track1_blackbox(
                             y_pred = evaluate_formula(formula, test_X)
                             blackbox_diag = run_result.get("blackbox_diagnostics")
                         else:
-                            est_copy = est.__class__(**est_params)
+                            est_copy = est.__class__(**params)
                             est_copy.fit(train_X, train_y)
                             formula = postprocess_formula(est_copy.get_formula())
                             if post_simplify and formula:
@@ -945,14 +945,43 @@ def run_track1_blackbox(
 
                     selected_result = _run_once("selected_features", X_train, y_train, X_test, est_params)
                     seed_runs.append(selected_result)
+                    if verbose:
+                        if selected_result.get("error"):
+                            print(
+                                f"    seed={repeat_seed:<6d} "
+                                f"run={selected_result.get('run_label', 'selected_features'):<17s} "
+                                f"ERROR {selected_result.get('error')}"
+                            )
+                        else:
+                            print(
+                                f"    seed={repeat_seed:<6d} "
+                                f"run={selected_result.get('run_label', 'selected_features'):<17s} "
+                                f"R2={float(selected_result.get('r2', float('nan'))):7.4f} "
+                                f"MSE={float(selected_result.get('mse', float('nan'))):.3e} "
+                                f"time={float(selected_result.get('time', 0.0)):.1f}s"
+                            )
 
                     if ablation_mode:
                         all_features_params = est_params.copy()
                         all_features_params["blackbox_feature_selection"] = False
                         all_features_params["blackbox_mode"] = False
-                        seed_runs.append(
-                            _run_once("all_features", X_train, y_train, X_test, all_features_params)
-                        )
+                        all_features_result = _run_once("all_features", X_train, y_train, X_test, all_features_params)
+                        seed_runs.append(all_features_result)
+                        if verbose:
+                            if all_features_result.get("error"):
+                                print(
+                                    f"    seed={repeat_seed:<6d} "
+                                    f"run={all_features_result.get('run_label', 'all_features'):<17s} "
+                                    f"ERROR {all_features_result.get('error')}"
+                                )
+                            else:
+                                print(
+                                    f"    seed={repeat_seed:<6d} "
+                                    f"run={all_features_result.get('run_label', 'all_features'):<17s} "
+                                    f"R2={float(all_features_result.get('r2', float('nan'))):7.4f} "
+                                    f"MSE={float(all_features_result.get('mse', float('nan'))):.3e} "
+                                    f"time={float(all_features_result.get('time', 0.0)):.1f}s"
+                                )
                 except Exception as e:
                     elapsed = 0.0
                     seed_runs.append({"seed": repeat_seed, "r2": None, "mse": None, "time": elapsed, "error": str(e), "run_label": "selected_features"})

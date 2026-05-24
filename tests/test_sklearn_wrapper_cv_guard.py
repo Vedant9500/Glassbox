@@ -306,3 +306,52 @@ def test_blackbox_basis_model_skips_cpp_on_additive_signal(monkeypatch):
     assert called["cpp"] is False
     assert getattr(est, "blackbox_basis_model_", None) is not None
     assert est.best_mse_ < 0.5
+
+
+def test_evolution_result_is_selected_via_direct_formula_evaluation(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    class _FakeCore:
+        @staticmethod
+        def run_evolution(**kwargs):
+            return {"best_mse": 100.0, "formula": "x0+x1", "nodes": [], "output_weights": []}
+
+        @staticmethod
+        def reduce_formula_noise(formula, X_list, y):
+            return formula
+
+        @staticmethod
+        def simplify_formula(formula, **kwargs):
+            return formula
+
+    def _fake_fast_path(*args, **kwargs):
+        return {
+            "formula": "0",
+            "mse": 0.01,
+            "operator_hints": {},
+        }
+
+    monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
+    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+
+    rng = np.random.RandomState(31)
+    X = rng.randn(80, 2)
+    y = X[:, 0] + X[:, 1]
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=False,
+        use_universal_proposer=False,
+        blackbox_mode=False,
+        population_size=10,
+        generations=10,
+        multi_start_runs=1,
+        timeout=20,
+        random_state=31,
+        evolution_skip_r2=0.999999,
+    )
+    est.fit(X, y)
+
+    assert "x0" in est.get_formula() and "x1" in est.get_formula()
+    assert getattr(est, "evolution_candidate_formula_", None) == "x0+x1"
