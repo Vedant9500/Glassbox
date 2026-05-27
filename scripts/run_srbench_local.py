@@ -416,22 +416,47 @@ def postprocess_formula(formula):
         return normalized
 
 
-def evaluate_formula(formula_str, X):
+def evaluate_formula(formula_str, X, *, return_diagnostics=False):
     """Evaluate a discovered formula string strictly on X.
 
     Strict mode means no silent domain repairs (for example log(abs(x)))
     and no coercion of invalid values to zero.
     """
+    diagnostics = {
+        "ok": False,
+        "reason": None,
+        "exception_type": None,
+        "exception_message": None,
+        "formula": None,
+    }
+
+    def _finish(result, reason=None, exc=None):
+        diagnostics["ok"] = result is not None
+        diagnostics["reason"] = reason
+        diagnostics["formula"] = formula if "formula" in locals() else None
+        if exc is not None:
+            diagnostics["exception_type"] = type(exc).__name__
+            diagnostics["exception_message"] = str(exc)
+        return (result, diagnostics) if return_diagnostics else result
+
     if not formula_str:
-        return None
+        return _finish(None, reason="empty_formula")
 
     formula = _normalize_formula_text(formula_str).strip()
     formula = re.sub(r'\|([^|]+)\|', r'abs(\1)', formula)
     formula = formula.replace('^', '**')
 
+    def _safe_numpy_log(x, base=None):
+        """NumPy log that also supports SymPy-style log(x, base)."""
+        with np.errstate(divide="ignore", invalid="ignore"):
+            out = np.log(x)
+            if base is not None:
+                out = out / np.log(base)
+        return out
+
     context = {
         "np": np,
-        "log": np.log,
+        "log": _safe_numpy_log,
         "sin": np.sin,
         "cos": np.cos,
         "exp": np.exp,
@@ -454,13 +479,41 @@ def evaluate_formula(formula_str, X):
             y_pred = np.full(X.shape[0], y_pred, dtype=np.float64)
         else:
             y_pred = np.asarray(y_pred, dtype=np.float64)
-        if y_pred.shape[0] != X.shape[0]:
-            return None
+        if y_pred.ndim == 0:
+            y_pred = np.full(X.shape[0], float(y_pred), dtype=np.float64)
+        elif y_pred.shape[0] != X.shape[0]:
+            return _finish(None, reason="shape_mismatch")
         if not np.all(np.isfinite(y_pred)):
-            return None
-        return y_pred
-    except Exception:
-        return None
+            return _finish(None, reason="non_finite_output")
+        return _finish(y_pred, reason="ok")
+    except FloatingPointError as exc:
+        text = str(exc).lower()
+        if "divide by zero" in text:
+            reason = "divide_by_zero"
+        elif "overflow" in text:
+            reason = "overflow"
+        elif "invalid value" in text:
+            if "sqrt" in formula.lower():
+                reason = "invalid_sqrt"
+            elif "log" in formula.lower():
+                reason = "invalid_log"
+            else:
+                reason = "invalid_value"
+        else:
+            reason = "floating_point_error"
+        return _finish(None, reason=reason, exc=exc)
+    except ZeroDivisionError as exc:
+        return _finish(None, reason="divide_by_zero", exc=exc)
+    except ValueError as exc:
+        text = str(exc).lower()
+        if "math domain" in text or "invalid" in text:
+            if "sqrt" in formula.lower():
+                return _finish(None, reason="invalid_sqrt", exc=exc)
+            if "log" in formula.lower():
+                return _finish(None, reason="invalid_log", exc=exc)
+        return _finish(None, reason="value_error", exc=exc)
+    except Exception as exc:
+        return _finish(None, reason="eval_exception", exc=exc)
 
 
 def simplify_formula_with_guard(formula, X_ref, y_ref, mse_slack=0.02):
@@ -903,7 +956,7 @@ def run_track1_blackbox(
                             formula = postprocess_formula(run_result.get("formula", ""))
                             if post_simplify and formula:
                                 formula = simplify_formula_with_guard(formula, train_X, train_y)
-                            y_pred = evaluate_formula(formula, test_X)
+                            y_pred, eval_diag = evaluate_formula(formula, test_X, return_diagnostics=True)
                             blackbox_diag = run_result.get("blackbox_diagnostics")
                         else:
                             est_copy = est.__class__(**params)
@@ -911,11 +964,14 @@ def run_track1_blackbox(
                             formula = postprocess_formula(est_copy.get_formula())
                             if post_simplify and formula:
                                 formula = simplify_formula_with_guard(formula, train_X, train_y)
-                            y_pred = evaluate_formula(formula, test_X)
+                            y_pred, eval_diag = evaluate_formula(formula, test_X, return_diagnostics=True)
                             elapsed = time.time() - t0
                             blackbox_diag = getattr(est_copy, "blackbox_diagnostics_", None)
 
                         if y_pred is None:
+                            error_reason = "formula_eval_failed"
+                            if isinstance(eval_diag, dict) and eval_diag.get("reason"):
+                                error_reason = f"formula_eval_failed:{eval_diag['reason']}"
                             return {
                                 "seed": repeat_seed,
                                 "r2": None,
@@ -924,7 +980,8 @@ def run_track1_blackbox(
                                 "formula": formula,
                                 "model_size": model_size(formula),
                                 "blackbox_diagnostics": blackbox_diag,
-                                "error": "formula_eval_failed",
+                                "formula_eval_diagnostics": eval_diag,
+                                "error": error_reason,
                                 "run_label": run_label,
                             }
 
@@ -939,6 +996,7 @@ def run_track1_blackbox(
                             "formula": formula,
                             "model_size": size,
                             "blackbox_diagnostics": blackbox_diag,
+                            "formula_eval_diagnostics": eval_diag,
                             "error": None,
                             "run_label": run_label,
                             }
@@ -1128,17 +1186,20 @@ def run_track2_ground_truth(
                         formula = postprocess_formula(run_result.get("formula", ""))
                         if post_simplify and formula:
                             formula = simplify_formula_with_guard(formula, X_train, y_train)
-                        y_pred_all = evaluate_formula(formula, X)
+                        y_pred_all, eval_diag = evaluate_formula(formula, X, return_diagnostics=True)
                     else:
                         est_copy = est.__class__(**est_params)
                         est_copy.fit(X_train, y_train)
                         formula = postprocess_formula(est_copy.get_formula())
                         if post_simplify and formula:
                             formula = simplify_formula_with_guard(formula, X_train, y_train)
-                        y_pred_all = evaluate_formula(formula, X)
+                        y_pred_all, eval_diag = evaluate_formula(formula, X, return_diagnostics=True)
                         elapsed = time.time() - t0
 
                     if y_pred_all is None:
+                        error_reason = "formula_eval_failed"
+                        if isinstance(eval_diag, dict) and eval_diag.get("reason"):
+                            error_reason = f"formula_eval_failed:{eval_diag['reason']}"
                         seed_runs.append({
                             "seed": repeat_seed,
                             "r2": None,
@@ -1148,7 +1209,8 @@ def run_track2_ground_truth(
                             "true_formula": true_formula,
                             "discovered_formula": formula,
                             "model_size": model_size(formula),
-                            "error": "formula_eval_failed",
+                            "formula_eval_diagnostics": eval_diag,
+                            "error": error_reason,
                         })
                         continue
 
@@ -1174,6 +1236,7 @@ def run_track2_ground_truth(
                         "time": elapsed,
                         "model_size": size,
                         "failure_bucket": failure_bucket,
+                        "formula_eval_diagnostics": eval_diag,
                         "error": None,
                     })
                 except Exception as e:

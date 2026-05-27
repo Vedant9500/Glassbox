@@ -68,3 +68,23 @@ def test_run_track1_uses_per_run_params_without_hard_timeout(monkeypatch):
 
     # First constructor call is the fixture estimator above; second is the per-run estimator.
     assert captured["timeouts"][-1] == 19
+
+
+def test_evaluate_formula_supports_log_with_base():
+    X = np.random.RandomState(0).randn(10, 3)
+    y_pred, diag = rsl.evaluate_formula("log(E,10)", X, return_diagnostics=True)
+
+    assert y_pred is not None
+    assert diag["ok"] is True
+    assert diag["reason"] == "ok"
+
+
+def test_evaluate_formula_reports_divide_by_zero():
+    X = np.random.RandomState(1).randn(12, 3)
+    X[:3, 2] = 0.0
+
+    y_pred, diag = rsl.evaluate_formula("x1/x2", X, return_diagnostics=True)
+
+    assert y_pred is None
+    assert diag["ok"] is False
+    assert diag["reason"] == "divide_by_zero"
