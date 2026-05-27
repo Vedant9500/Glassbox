@@ -413,18 +413,218 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         )
         return ranked[: max(1, int(max_candidates))]
 
+    def _formula_family_signature(self, formula):
+        text = str(formula or "").strip().lower()
+        if not text:
+            return "empty"
+        if "sin(" in text:
+            return "sin"
+        if "cos(" in text:
+            return "cos"
+        if "exp(" in text:
+            return "exp"
+        if "log(" in text:
+            return "log"
+        if "/" in text:
+            return "rational"
+        if "*" in text:
+            return "multiplicative"
+        if "+" in text or "-" in text:
+            return "additive"
+        if "^" in text:
+            return "power"
+        return "univariate"
+
+    def _formula_feature_signature(self, formula):
+        text = str(formula or "")
+        return tuple(sorted({int(match.group(1)) for match in re.finditer(r"\bx(\d+)\b", text)}))
+
+    def _prune_blackbox_candidate_formulas(self, candidate_formulas, *, max_candidates=12):
+        """Keep diverse, high-quality blackbox candidates instead of many near-duplicates."""
+        if not candidate_formulas:
+            return []
+
+        ordered = sorted(
+            candidate_formulas,
+            key=lambda c: (
+                float(c.get("mse", float("inf"))),
+                -float(c.get("validation_r2", -float("inf"))),
+                float(c.get("complexity", float("inf"))),
+            ),
+        )
+        kept = []
+        seen_formulas = set()
+        seen_family_feature = set()
+        for cand in ordered:
+            formula = str(cand.get("formula", "")).strip()
+            if not formula:
+                continue
+            normalized = re.sub(r"\s+", "", formula.lower())
+            if normalized in seen_formulas:
+                continue
+            family = self._formula_family_signature(formula)
+            features = self._formula_feature_signature(formula)
+            key = (family, features)
+
+            if key in seen_family_feature:
+                if len(kept) >= max(2, int(max_candidates) // 2):
+                    continue
+            seen_formulas.add(normalized)
+            seen_family_feature.add(key)
+            kept.append(cand)
+            if len(kept) >= max(1, int(max_candidates)):
+                break
+        return kept
+
+    def _derive_blackbox_operator_hints(self, blackbox_state, candidate_formulas):
+        """Convert validated blackbox interactions/candidates into operator-family hints."""
+        hints = {
+            "operators": set(),
+            "powers": [],
+            "active_terms": [],
+            "has_rational": False,
+            "has_exp_decay": False,
+        }
+        if blackbox_state is None:
+            return hints
+
+        interaction_scores = getattr(blackbox_state, "interaction_scores", {}) or {}
+        for term in list(getattr(blackbox_state, "interaction_terms", []) or [])[:8]:
+            score = float(interaction_scores.get(term, 0.0))
+            if score < 0.12:
+                continue
+            hints["active_terms"].append(term)
+            lower = term.lower()
+            if "sin(" in lower or "cos(" in lower:
+                hints["operators"].add("periodic")
+            if "exp(" in lower:
+                hints["operators"].add("exp")
+                hints["has_exp_decay"] = True
+            if "log(" in lower:
+                hints["operators"].add("log")
+            if "/" in lower:
+                hints["operators"].add("rational")
+                hints["has_rational"] = True
+            if "^2" in lower or "^3" in lower:
+                hints["operators"].add("power")
+                for power_text in re.findall(r"\^(\d+)", lower):
+                    try:
+                        hints["powers"].append(int(power_text))
+                    except Exception:
+                        pass
+
+        for cand in candidate_formulas or []:
+            if float(cand.get("validation_r2", -1.0)) < 0.25:
+                continue
+            formula = str(cand.get("formula", "")).strip()
+            if not formula:
+                continue
+            hints["active_terms"].append(formula)
+            family = self._formula_family_signature(formula)
+            if family in ("sin", "cos"):
+                hints["operators"].add("periodic")
+            elif family == "exp":
+                hints["operators"].add("exp")
+                hints["has_exp_decay"] = True
+            elif family == "log":
+                hints["operators"].add("log")
+            elif family == "rational":
+                hints["operators"].add("rational")
+                hints["has_rational"] = True
+            elif family == "power":
+                hints["operators"].add("power")
+
+        hints["powers"] = sorted(set(int(p) for p in hints["powers"] if isinstance(p, (int, np.integer)) and 1 <= int(p) <= 8))
+        hints["active_terms"] = list(dict.fromkeys(hints["active_terms"]))[:12]
+        return hints
+
+    def _build_blackbox_candidate_formulas(
+        self,
+        best_formula,
+        best_mse,
+        proposer_payload,
+        blackbox_state,
+        X,
+        y,
+        *,
+        max_candidates,
+    ):
+        """Build, refine, and prune a shared candidate pool for basis fitting and evolution."""
+        raw_candidates = []
+        if best_formula:
+            raw_candidates.append({
+                "formula": best_formula,
+                "mse": best_mse if best_mse is not None else float("inf"),
+                "from_fast_path": True,
+            })
+
+        if isinstance(proposer_payload, dict):
+            for cand in proposer_payload.get("candidate_skeletons", [])[:10]:
+                formula = str(cand.get("formula", "")).strip()
+                if not formula:
+                    continue
+                raw_candidates.append({
+                    "formula": formula,
+                    "mse": cand.get("mse", float("inf")),
+                    "score": cand.get("score", 0.0),
+                    "active_terms": cand.get("active_terms", []),
+                    "from_proposer": True,
+                })
+
+        if blackbox_state is not None and getattr(blackbox_state, "enabled", False):
+            selected_features = list(getattr(blackbox_state, "selected_features", []) or [])
+            for term in list(getattr(blackbox_state, "interaction_terms", []) or [])[:8]:
+                seed_formula = remap_original_formula_to_reduced(term, selected_features)
+                raw_candidates.append({
+                    "formula": seed_formula,
+                    "mse": float("inf"),
+                    "score": float((getattr(blackbox_state, "interaction_scores", {}) or {}).get(term, 0.0)),
+                    "active_terms": [seed_formula],
+                    "from_blackbox_interaction": True,
+                })
+            for formula in list(getattr(blackbox_state, "candidate_seed_formulas", []) or [])[:16]:
+                seed_formula = remap_original_formula_to_reduced(formula, selected_features)
+                raw_candidates.append({
+                    "formula": seed_formula,
+                    "mse": float("inf"),
+                    "score": 0.2,
+                    "active_terms": [seed_formula],
+                    "from_blackbox_seed": True,
+                })
+
+        refined = self._refine_candidate_formulas(
+            raw_candidates,
+            X,
+            y,
+            max_candidates=max(
+                int(max_candidates),
+                8,
+            ),
+        )
+        return self._prune_blackbox_candidate_formulas(
+            refined,
+            max_candidates=max_candidates,
+        )
+
     def _build_blackbox_formula_pool(self, best_formula, proposer_payload, blackbox_state, n_features):
         """Assemble a compact pool of reduced-space formulas for cheap additive fitting."""
         formulas = []
         seen = set()
 
-        def _add(text):
+        def _add(text, family=None):
             formula = str(text or "").strip()
             if not formula or formula == "0":
                 return
             key = re.sub(r"\s+", "", formula.lower())
             if key in seen:
                 return
+            if family is not None:
+                existing = [
+                    f for f in formulas
+                    if self._formula_family_signature(f) == family
+                ]
+                if len(existing) >= 4:
+                    return
             seen.add(key)
             formulas.append(formula)
 
@@ -433,7 +633,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         if isinstance(proposer_payload, dict):
             for cand in proposer_payload.get("candidate_skeletons", [])[:8]:
-                _add(cand.get("formula", ""))
+                _add(cand.get("formula", ""), family=self._formula_family_signature(cand.get("formula", "")))
 
         for local_idx in range(int(max(1, n_features))):
             _add(f"x{local_idx}")
@@ -446,9 +646,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if blackbox_state is not None and getattr(blackbox_state, "enabled", False):
             selected = list(getattr(blackbox_state, "selected_features", []) or [])
             for term in list(getattr(blackbox_state, "interaction_terms", []) or [])[:8]:
-                _add(remap_original_formula_to_reduced(term, selected))
+                reduced = remap_original_formula_to_reduced(term, selected)
+                _add(reduced, family=self._formula_family_signature(reduced))
             for formula in list(getattr(blackbox_state, "candidate_seed_formulas", []) or [])[:16]:
-                _add(remap_original_formula_to_reduced(formula, selected))
+                reduced = remap_original_formula_to_reduced(formula, selected)
+                _add(reduced, family=self._formula_family_signature(reduced))
 
         for i in range(int(max(1, n_features))):
             for j in range(i + 1, int(max(1, n_features))):
@@ -598,17 +800,24 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         fast_path_uncertainty=None,
         proposer_uncertainty=None,
         proposer_plan=None,
+        candidate_screening=None,
     ):
         """Heuristically scale breadth/depth for multivariate blackbox search."""
         base_plan = {
             "uncertainty_score": 0.0,
             "selection_uncertainty": 0.0,
             "interaction_pressure": 0.0,
+            "candidate_strength": 0.0,
+            "candidate_diversity": 0.0,
             "breadth_multiplier": 1.0,
             "depth_multiplier": 1.0,
             "generation_multiplier": 1.0,
             "population_multiplier": 1.0,
             "seed_budget": 8,
+            "screening_budget": 8,
+            "basis_max_terms": 4,
+            "candidate_acceptance_r2": 0.985,
+            "candidate_shrink_r2": 0.95,
             "acceptable_complexity": 15,
             "early_stop_max_nodes": 50,
             "timeout_multiplier": 1.0,
@@ -648,6 +857,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         feature_span_pressure = float(np.clip((selected_count - 1) / max(4.0, original_count - 1), 0.0, 1.0))
 
+        screening = candidate_screening if isinstance(candidate_screening, dict) else {}
+        candidate_best_r2 = float(np.clip(float(screening.get("best_validation_r2", 0.0) or 0.0), 0.0, 1.0))
+        candidate_count = int(max(0, screening.get("candidate_count", 0) or 0))
+        candidate_family_count = int(max(0, screening.get("family_count", 0) or 0))
+        candidate_strength = candidate_best_r2
+        candidate_diversity = float(np.clip(candidate_family_count / max(1.0, min(6.0, float(candidate_count or 1))), 0.0, 1.0))
+
         def _uncertainty_signal(payload):
             if not isinstance(payload, dict):
                 return 0.0
@@ -678,21 +894,31 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             proposer_unc = float(np.clip(float(proposer_uncertainty), 0.0, 1.0))
 
         uncertainty_score = float(np.clip(
-            0.40 * selection_uncertainty
-            + 0.25 * interaction_pressure
-            + 0.20 * fast_uncertainty
-            + 0.15 * proposer_unc,
+            0.36 * selection_uncertainty
+            + 0.22 * interaction_pressure
+            + 0.18 * fast_uncertainty
+            + 0.12 * proposer_unc
+            + 0.12 * (1.0 - candidate_strength),
             0.0,
             1.0,
         ))
 
         breadth_multiplier = float(np.clip(
-            1.0 + 1.15 * selection_uncertainty + 0.35 * fast_uncertainty + 0.25 * (1.0 - interaction_pressure),
+            1.0
+            + 0.95 * selection_uncertainty
+            + 0.25 * fast_uncertainty
+            + 0.18 * (1.0 - interaction_pressure)
+            + 0.20 * (1.0 - candidate_strength),
             0.75,
             3.5,
         ))
         depth_multiplier = float(np.clip(
-            1.0 + 0.95 * interaction_pressure + 0.35 * proposer_unc + 0.25 * feature_span_pressure,
+            1.0
+            + 0.70 * interaction_pressure
+            + 0.25 * proposer_unc
+            + 0.20 * feature_span_pressure
+            + 0.20 * candidate_diversity
+            - 0.35 * candidate_strength,
             0.75,
             4.0,
         ))
@@ -711,28 +937,50 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         generation_multiplier = float(np.clip(depth_multiplier, 0.75, 4.0))
         population_multiplier = float(np.clip(breadth_multiplier, 0.75, 3.5))
         seed_budget = int(np.clip(
-            round(8 + 10 * selection_uncertainty + 6 * interaction_pressure + 4 * fast_uncertainty + 2 * proposer_unc),
+            round(8 + 8 * selection_uncertainty + 4 * interaction_pressure + 3 * fast_uncertainty + 2 * proposer_unc + 2 * candidate_diversity),
             8,
             24,
         ))
+        screening_budget = int(np.clip(
+            round(8 + 10 * selection_uncertainty + 8 * interaction_pressure + 6 * (1.0 - candidate_strength) + 3 * candidate_diversity),
+            6,
+            28,
+        ))
+        basis_max_terms = int(np.clip(
+            round(3 + 2 * interaction_pressure + 2 * candidate_diversity + 2 * (1.0 - candidate_strength)),
+            2,
+            8,
+        ))
+        candidate_acceptance_r2 = float(np.clip(
+            0.985 - 0.03 * interaction_pressure - 0.01 * candidate_diversity,
+            0.93,
+            0.985,
+        ))
+        candidate_shrink_r2 = float(np.clip(
+            candidate_acceptance_r2 - 0.04,
+            0.88,
+            0.96,
+        ))
 
         if getattr(blackbox_state, "enabled", False):
-            generation_multiplier = float(np.clip(generation_multiplier, 0.85, 2.25))
-            population_multiplier = float(np.clip(population_multiplier, 0.85, 2.0))
+            generation_multiplier = float(np.clip(generation_multiplier, 0.75, 2.0))
+            population_multiplier = float(np.clip(population_multiplier, 0.80, 1.85))
             seed_budget = int(np.clip(seed_budget, 6, 14))
+            screening_budget = int(np.clip(screening_budget, 8, 24))
+            basis_max_terms = int(np.clip(basis_max_terms, 3, 6))
 
         acceptable_complexity = int(np.clip(
-            round(15 + 6 * uncertainty_score + 4 * interaction_pressure + 2 * feature_span_pressure),
+            round(15 + 5 * uncertainty_score + 3 * interaction_pressure + 2 * feature_span_pressure + 2 * candidate_diversity),
             10,
             80,
         ))
         early_stop_max_nodes = int(np.clip(
-            round(50 + 18 * uncertainty_score + 8 * interaction_pressure + 6 * feature_span_pressure),
+            round(50 + 14 * uncertainty_score + 6 * interaction_pressure + 5 * feature_span_pressure - 6 * candidate_strength),
             10,
             120,
         ))
         timeout_multiplier = float(np.clip(
-            0.85 + 0.20 * breadth_multiplier + 0.30 * depth_multiplier,
+            0.82 + 0.16 * breadth_multiplier + 0.24 * depth_multiplier + 0.14 * (screening_budget / 12.0),
             0.8,
             2.8,
         ))
@@ -743,7 +991,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             timeout_multiplier = float(np.clip(timeout_multiplier, 0.85, 1.45))
 
         focus = "balanced"
-        if breadth_multiplier > depth_multiplier + 0.25:
+        if candidate_strength >= candidate_acceptance_r2:
+            focus = "screen_accept"
+        elif screening_budget >= seed_budget + 4:
+            focus = "screening"
+        elif breadth_multiplier > depth_multiplier + 0.25:
             focus = "breadth"
         elif depth_multiplier > breadth_multiplier + 0.25:
             focus = "depth"
@@ -752,11 +1004,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "uncertainty_score": uncertainty_score,
             "selection_uncertainty": selection_uncertainty,
             "interaction_pressure": interaction_pressure,
+            "candidate_strength": candidate_strength,
+            "candidate_diversity": candidate_diversity,
             "breadth_multiplier": breadth_multiplier,
             "depth_multiplier": depth_multiplier,
             "generation_multiplier": generation_multiplier,
             "population_multiplier": population_multiplier,
             "seed_budget": seed_budget,
+            "screening_budget": screening_budget,
+            "basis_max_terms": basis_max_terms,
+            "candidate_acceptance_r2": candidate_acceptance_r2,
+            "candidate_shrink_r2": candidate_shrink_r2,
             "acceptable_complexity": acceptable_complexity,
             "early_stop_max_nodes": early_stop_max_nodes,
             "timeout_multiplier": timeout_multiplier,
@@ -1316,6 +1574,32 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             if isinstance(self.universal_proposer_fpip_v2_, dict)
             else {}
         )
+        candidate_screening = None
+        blackbox_state = getattr(self, "blackbox_state_", None)
+        if blackbox_state is not None and blackbox_state.enabled:
+            preview_candidates = self._build_blackbox_candidate_formulas(
+                best_formula,
+                best_mse,
+                proposer_payload,
+                blackbox_state,
+                X,
+                y,
+                max_candidates=10,
+            )
+            if preview_candidates:
+                families = {
+                    self._formula_family_signature(c.get("formula", ""))
+                    for c in preview_candidates
+                    if str(c.get("formula", "")).strip()
+                }
+                candidate_screening = {
+                    "candidate_count": len(preview_candidates),
+                    "family_count": len(families),
+                    "best_validation_r2": max(
+                        float(c.get("validation_r2", -1.0))
+                        for c in preview_candidates
+                    ),
+                }
         proposer_plan = proposer_payload.get("search_plan", {})
         if not isinstance(proposer_plan, dict):
             proposer_plan = {}
@@ -1324,10 +1608,59 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             fast_path_uncertainty=_fp_uncertainty,
             proposer_uncertainty=proposer_payload.get("sequence_uncertainty", {}),
             proposer_plan=proposer_plan,
+            candidate_screening=candidate_screening,
         )
         self.blackbox_search_plan_ = blackbox_search_plan
         if isinstance(self.blackbox_diagnostics_, dict):
             self.blackbox_diagnostics_["search_plan"] = blackbox_search_plan
+
+        candidate_formulas = None
+        if blackbox_state is not None and blackbox_state.enabled:
+            candidate_formulas = self._build_blackbox_candidate_formulas(
+                best_formula,
+                best_mse,
+                proposer_payload,
+                blackbox_state,
+                X,
+                y,
+                max_candidates=max(
+                    8,
+                    int(blackbox_search_plan.get("seed_budget", 8)),
+                ),
+            )
+            interaction_hints = self._derive_blackbox_operator_hints(
+                blackbox_state,
+                candidate_formulas,
+            )
+            operator_hints = dict(operator_hints or {})
+            operator_hints["operators"] = set(operator_hints.get("operators", set()))
+            operator_hints["operators"].update(interaction_hints.get("operators", set()))
+            operator_hints["powers"] = sorted(set(
+                list(operator_hints.get("powers", [])) + list(interaction_hints.get("powers", []))
+            ))
+            operator_hints["active_terms"] = list(dict.fromkeys(
+                list(operator_hints.get("active_terms", [])) + list(interaction_hints.get("active_terms", []))
+            ))[:16]
+            operator_hints["has_rational"] = bool(
+                operator_hints.get("has_rational", False) or interaction_hints.get("has_rational", False)
+            )
+            operator_hints["has_exp_decay"] = bool(
+                operator_hints.get("has_exp_decay", False) or interaction_hints.get("has_exp_decay", False)
+            )
+            if isinstance(self.blackbox_diagnostics_, dict):
+                self.blackbox_diagnostics_["candidate_screening"] = {
+                    "candidate_count": len(candidate_formulas or []),
+                    "top_candidates": [
+                        {
+                            "formula": str(c.get("formula", ""))[:160],
+                            "validation_r2": c.get("validation_r2"),
+                            "validation_mse": c.get("validation_mse"),
+                            "complexity": c.get("complexity"),
+                        }
+                        for c in (candidate_formulas or [])[:6]
+                    ],
+                    "interaction_operator_hints": sorted(operator_hints.get("operators", set())),
+                }
 
         if getattr(self, "blackbox_state_", None) is not None and self.blackbox_state_.enabled:
             basis_pool = self._build_blackbox_formula_pool(
@@ -1336,11 +1669,16 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 self.blackbox_state_,
                 self.n_features_in_,
             )
+            for cand in candidate_formulas or []:
+                formula = str(cand.get("formula", "")).strip()
+                if formula and formula not in basis_pool:
+                    basis_pool.insert(0, formula)
+            basis_pool = list(dict.fromkeys(basis_pool))[:32]
             basis_result = self._fit_blackbox_basis_model(
                 X,
                 y,
                 basis_pool,
-                max_terms=4,
+                max_terms=int(blackbox_search_plan.get("basis_max_terms", 4)),
             )
             if basis_result is not None:
                 self.blackbox_basis_model_ = basis_result
@@ -1355,6 +1693,23 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 if basis_mse < best_mse or best_formula is None:
                     best_formula = basis_result.get("formula", best_formula)
                     best_mse = basis_mse
+                    updated_candidates = [{
+                        "formula": best_formula,
+                        "mse": best_mse,
+                        "validation_mse": basis_result.get("validation_mse", best_mse),
+                        "validation_r2": basis_result.get("validation_r2", -1.0),
+                        "complexity": basis_result.get("complexity", self._formula_complexity(best_formula)),
+                        "from_basis_model": True,
+                    }]
+                    if candidate_formulas:
+                        updated_candidates.extend(candidate_formulas)
+                    candidate_formulas = self._prune_blackbox_candidate_formulas(
+                        updated_candidates,
+                        max_candidates=max(
+                            8,
+                            int(blackbox_search_plan.get("seed_budget", 8)),
+                        ),
+                    )
             else:
                 self.blackbox_basis_model_ = None
         else:
@@ -1371,9 +1726,12 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if isinstance(basis_result, dict):
             basis_val_r2 = float(basis_result.get("validation_r2", -1.0))
             basis_terms = int(basis_result.get("n_terms", 99))
-            if basis_val_r2 >= 0.985 and basis_terms <= 4:
+            if (
+                basis_val_r2 >= float(blackbox_search_plan.get("candidate_acceptance_r2", 0.985))
+                and basis_terms <= int(blackbox_search_plan.get("basis_max_terms", 4))
+            ):
                 need_evolution = False
-            elif basis_val_r2 >= 0.95:
+            elif basis_val_r2 >= float(blackbox_search_plan.get("candidate_shrink_r2", 0.95)):
                 effective_timeout = min(effective_timeout, max(20.0, 0.4 * effective_timeout))
 
         if need_evolution and _elapsed() < effective_timeout:
@@ -1386,8 +1744,6 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             else:
                 evo_formula = None
                 evo_mse = float('inf')
-                candidate_formulas = None
-
                 # Try guided evolution (beam search) only if R² is low
                 if (self.use_guided_evolution and operator_hints
                     and self.n_features_in_ == 1
@@ -1407,14 +1763,6 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         hints['has_exp_decay'] = bool(hints.get('has_exp_decay', False))
                         hints['active_terms'] = list(hints.get('active_terms', []))
 
-                        candidate_formulas = []
-                        if best_formula:
-                            candidate_formulas.append({
-                                "formula": best_formula,
-                                "mse": best_mse or float("inf"),
-                                "from_fast_path": True,
-                            })
-
                         # Blend proposer priors into hints if available
                         if proposer_payload.get("valid"):
                             proposer_priors = proposer_payload.get("operator_priors", {})
@@ -1424,52 +1772,6 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 for op, prob in proposer_priors.items():
                                     if prob > 0.15:
                                         hints["operators"].add(op)
-
-                            for cand in proposer_payload.get("candidate_skeletons", []):
-                                formula_str = cand.get("formula", "")
-                                if formula_str:
-                                    active_terms = [
-                                        t.strip()
-                                        for t in formula_str.replace("-", "+").split("+")
-                                        if t.strip()
-                                    ]
-                                    candidate_formulas.append({
-                                        "formula": formula_str,
-                                        "mse": cand.get("mse", float("inf")),
-                                        "score": cand.get("score", 0.0),
-                                        "active_terms": active_terms,
-                                        "from_proposer": True,
-                                    })
-
-                        blackbox_state = getattr(self, "blackbox_state_", None)
-                        if blackbox_state is not None and getattr(blackbox_state, "interaction_terms", None):
-                            for term in blackbox_state.interaction_terms[:5]:
-                                seed_formula = term
-                                if getattr(blackbox_state, "enabled", False):
-                                    seed_formula = remap_original_formula_to_reduced(
-                                        term,
-                                        blackbox_state.selected_features,
-                                    )
-                                candidate_formulas.append({
-                                    "formula": seed_formula,
-                                    "mse": float("inf"),
-                                    "score": 0.5,
-                                    "active_terms": [seed_formula],
-                                    "from_blackbox_interaction": True,
-                                })
-
-                        if not candidate_formulas:
-                            candidate_formulas = None
-                        else:
-                            candidate_formulas = self._refine_candidate_formulas(
-                                candidate_formulas,
-                                X,
-                                y,
-                                max_candidates=max(
-                                    6,
-                                    int(blackbox_search_plan.get("seed_budget", 8)),
-                                ),
-                            ) or candidate_formulas
 
                         # Check if any proposer skeleton is ALREADY a very good fit
                         # to avoid launching evolution if we just need minor constant refinement.
@@ -1526,41 +1828,16 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         X_list = [X[:, i].astype(np.float64) for i in range(self.n_features_in_)]
                         y_arr = y.astype(np.float64).flatten()
                         if candidate_formulas is None:
-                            candidate_formulas = []
-                            if best_formula:
-                                candidate_formulas.append({
+                            candidate_formulas = (
+                                [{
                                     "formula": best_formula,
                                     "mse": best_mse or float("inf"),
+                                    "complexity": self._formula_complexity(best_formula),
+                                    "validation_r2": current_r2,
                                     "from_fast_path": True,
-                                })
-                            blackbox_state = getattr(self, "blackbox_state_", None)
-                            if blackbox_state is not None and getattr(blackbox_state, "candidate_seed_formulas", None):
-                                for formula in blackbox_state.candidate_seed_formulas[:16]:
-                                    seed_formula = formula
-                                    if getattr(blackbox_state, "enabled", False):
-                                        seed_formula = remap_original_formula_to_reduced(
-                                            formula,
-                                            blackbox_state.selected_features,
-                                        )
-                                    candidate_formulas.append({
-                                        "formula": seed_formula,
-                                        "mse": float("inf"),
-                                        "score": 0.25,
-                                        "active_terms": [seed_formula],
-                                        "from_blackbox_seed": True,
-                                    })
-                            if not candidate_formulas:
-                                candidate_formulas = None
-                            else:
-                                candidate_formulas = self._refine_candidate_formulas(
-                                    candidate_formulas,
-                                    X,
-                                    y,
-                                    max_candidates=max(
-                                        6,
-                                        int(blackbox_search_plan.get("seed_budget", 8)),
-                                    ),
-                                ) or candidate_formulas
+                                }]
+                                if best_formula else None
+                            )
 
                         best_refined_candidate = None
                         if candidate_formulas:
@@ -1579,7 +1856,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 np.isfinite(best_refined_mse)
                                 and (
                                     best_refined_mse <= self.early_stop_mse
-                                    or best_refined_candidate.get("validation_r2", -1.0) >= max(0.985, self.evolution_skip_r2)
+                                    or best_refined_candidate.get("validation_r2", -1.0) >= max(
+                                        float(blackbox_search_plan.get("candidate_acceptance_r2", 0.985)),
+                                        min(self.evolution_skip_r2, 0.999999),
+                                    )
                                 )
                             ):
                                 need_evolution = False

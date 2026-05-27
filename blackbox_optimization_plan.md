@@ -52,9 +52,9 @@ What the current implementation gets right:
 What the current implementation gets wrong:
 
 - it still treats hard Track 1 problems as mostly one monolithic global search,
-- it reacts to uncertainty by scaling population, generations, seeds, and timeout together,
-- interaction scoring is still mostly in-sample heuristic scoring,
-- there is no real candidate-formula refinement stage before expensive C++ evolution,
+- it still relies on heuristic search planning rather than a true multivariate planner,
+- interaction scoring is only partly validation-aware and still needs stronger redundancy control,
+- candidate-formula refinement exists but is still heuristic and not yet the dominant decision layer,
 - the residual/additive stage is too late and too weakly integrated,
 - the multivariate proposer path is still a proxy, not a true multivariate planner.
 
@@ -72,7 +72,7 @@ Status as of latest implementation:
 - [x] Rank and select active features.
 - [x] Detect simple univariate structure per active feature via seed formulas.
 - [x] Detect pairwise interactions.
-- [x] Build candidate symbolic seeds and operator hints.
+- [~] Build candidate symbolic seeds and operator hints.
 - [x] Run C++ evolution on a reduced feature matrix.
 - [~] Validate on holdout/CV.
 - [~] Optionally add residual symbolic stages.
@@ -132,9 +132,9 @@ Status: partially complete, but still too weak for Track 1.
 Implement a lightweight ensemble ranker:
 
 - [x] absolute Pearson/Spearman correlation,
-- [ ] mutual information regression if sklearn is available,
-- [ ] Lasso/ElasticNet coefficients on standardized data,
-- [ ] ExtraTrees or RandomForest permutation/impurity importance,
+- [x] mutual information regression if sklearn is available,
+- [x] Lasso/ElasticNet coefficients on standardized data,
+- [x] ExtraTrees or RandomForest permutation/impurity importance,
 - [x] single-feature polynomial probe score where cheap enough.
 
 Output:
@@ -154,9 +154,9 @@ Important: keep a fallback where all features are retained if selection is uncer
 
 Research-driven next step:
 
-- [ ] make ranking validation-aware instead of purely in-sample,
-- [ ] add stronger rankers: MI, ElasticNet/Lasso, tree/permutation importance,
-- [ ] log ranker agreement/disagreement and use disagreement to control screening, not just search inflation.
+- [~] make ranking validation-aware instead of purely in-sample,
+- [x] add stronger rankers: MI, ElasticNet/Lasso, tree/permutation importance,
+- [x] log ranker agreement/disagreement and use disagreement to control screening, not just search inflation.
 
 ## Phase 3: Interaction Discovery
 
@@ -172,6 +172,7 @@ After selecting top features, test cheap pairwise candidates:
 - [x] simple products with `sin`, `cos`, `exp`, `log`.
 
 Score each candidate using cross-validated or holdout MSE improvement over univariate fits. Status: partial; current implementation has mostly used deterministic in-sample affine scoring and needs validation-aware scoring.
+Score each candidate using cross-validated or holdout MSE improvement over univariate fits. Status: partial; current implementation now uses holdout-aware affine scoring, but it still needs stronger redundancy control and tighter validation integration.
 
 Output:
 
@@ -192,7 +193,7 @@ These should feed:
 
 Highest-value next step:
 
-- [ ] score interactions against a holdout split and/or residual improvement, not just in-sample fit,
+- [x] score interactions against a holdout split and/or residual improvement, not just in-sample fit,
 - [ ] penalize redundant variants so all near-identical pair templates do not survive.
 
 ## Phase 4: Multivariate Seed Graphs
@@ -229,9 +230,9 @@ For now, use heuristics:
 
 Research-driven correction:
 
-- [ ] uncertainty should first increase candidate screening/refinement budget,
-- [ ] uncertainty should not automatically multiply population, generations, and timeout together,
-- [ ] decomposition and validation should precede search inflation,
+- [~] uncertainty should first increase candidate screening/refinement budget,
+- [~] uncertainty should not automatically multiply population, generations, and timeout together,
+- [~] decomposition and validation should precede search inflation,
 - [ ] multivariate proposer influence should be reduced until a true multivariate planner exists.
 
 Future trained planner heads:
@@ -274,14 +275,15 @@ Research-driven correction:
 ## Phase 6.5: Candidate Refinement Before Evolution
 
 Status: highest-priority missing piece.
+Status: partially complete, but still not strong enough to be the main Track 1 gate.
 
 Before launching expensive C++ evolution:
 
-1. [ ] collect fast-path, proposer, interaction, and blackbox seed candidates,
-2. [ ] refine affine scaling and constants where possible,
-3. [ ] evaluate on a deterministic holdout/CV split,
-4. [ ] rank by validation fit and complexity,
-5. [ ] skip or shrink global evolution if a candidate is already good enough.
+1. [x] collect fast-path, proposer, interaction, and blackbox seed candidates,
+2. [x] refine affine scaling and constants where possible,
+3. [x] evaluate on a deterministic holdout/CV split,
+4. [x] rank by validation fit and complexity,
+5. [x] skip or shrink global evolution if a candidate is already good enough.
 
 Rationale from SRBench:
 
@@ -296,7 +298,7 @@ Blackbox should be optimized with different metrics from exact symbolic recovery
 
 - [x] validation/test R2,
 - [x] median R2 across seeds,
-- [ ] worst-decile R2,
+- [x] worst-decile R2,
 - [x] formula size,
 - [x] selected feature count diagnostics,
 - [x] prediction stability summaries,
@@ -358,9 +360,9 @@ Add multivariate candidate parsing and seed graph generation.
 5. [x] Improve multivariate seed graph builder.
 6. [x] Add blackbox mode flags to SRBench runner.
 7. [~] Make interaction scoring validation-aware.
-8. [ ] Add candidate refinement and early acceptance before C++ evolution.
+8. [x] Add candidate refinement and early acceptance before C++ evolution.
 9. [~] Turn residual staged additive fitting into a primary blackbox path.
-10. [ ] Strengthen feature ranking with MI / sparse linear / tree-based votes.
+10. [x] Strengthen feature ranking with MI / sparse linear / tree-based votes.
 11. [ ] Train or replace the multivariate proposer/planner after the heuristic path is stable.
 
 ## First Milestone
@@ -388,6 +390,6 @@ Success criteria:
 
 These are the current highest-value patches:
 
-1. Add a validation-gated candidate refinement layer before `_core.run_evolution`.
-2. Make pairwise interaction scoring holdout-aware.
-3. Rebalance the blackbox search plan so uncertainty spends more budget on screening and less on raw search inflation.
+1. Penalize redundant interaction variants and propagate the best interaction families into `operator_hints`.
+2. Move validation-gated additive/residual modeling earlier in the blackbox decision path.
+3. Rebalance the multivariate search planner so disagreement and uncertainty spend more budget on screening than on raw search inflation.

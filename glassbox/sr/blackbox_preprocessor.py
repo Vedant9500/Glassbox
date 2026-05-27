@@ -14,6 +14,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+try:
+    from sklearn.ensemble import ExtraTreesRegressor
+    from sklearn.feature_selection import mutual_info_regression
+    from sklearn.linear_model import ElasticNetCV, LassoCV
+except Exception:  # pragma: no cover - optional sklearn helpers
+    ExtraTreesRegressor = None
+    mutual_info_regression = None
+    ElasticNetCV = None
+    LassoCV = None
+
 
 @dataclass
 class BlackboxState:
@@ -21,6 +31,7 @@ class BlackboxState:
     selected_features: List[int]
     dropped_features: List[int]
     feature_scores: Dict[int, float]
+    ranker_votes: Dict[str, Dict[int, float]]
     x_mean: np.ndarray
     x_scale: np.ndarray
     y_mean: float
@@ -69,6 +80,56 @@ def _univariate_poly_score(x: np.ndarray, y: np.ndarray) -> float:
         if not np.isfinite(mse):
             return 0.0
         return float(np.clip(1.0 - mse / y_var, 0.0, 1.0))
+    except Exception:
+        return 0.0
+
+
+def _univariate_holdout_poly_score(
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    validation_fraction: float = 0.25,
+    random_state: int = 0,
+) -> float:
+    """Return holdout R2 from a small univariate polynomial probe."""
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    mask = np.isfinite(x) & np.isfinite(y)
+    if int(mask.sum()) < 12:
+        return 0.0
+
+    x = x[mask]
+    y = y[mask]
+    n = int(x.shape[0])
+    if n < 24:
+        return _univariate_poly_score(x, y)
+
+    rng = np.random.RandomState(int(random_state))
+    indices = np.arange(n)
+    rng.shuffle(indices)
+    holdout_n = int(max(4, round(n * float(validation_fraction))))
+    holdout_n = min(holdout_n, n - 8)
+    if holdout_n <= 0:
+        holdout_n = max(1, n // 5)
+    train_idx = indices[:-holdout_n]
+    val_idx = indices[-holdout_n:]
+    if train_idx.size < 8 or val_idx.size < 4:
+        return 0.0
+
+    x_train = x[train_idx]
+    y_train = y[train_idx]
+    x_val = x[val_idx]
+    y_val = y[val_idx]
+    try:
+        design_train = np.column_stack([x_train, x_train * x_train, x_train * x_train * x_train, np.ones_like(x_train)])
+        design_val = np.column_stack([x_val, x_val * x_val, x_val * x_val * x_val, np.ones_like(x_val)])
+        coef, _, _, _ = np.linalg.lstsq(design_train, y_train, rcond=None)
+        pred_val = design_val @ coef
+        val_var = max(float(np.var(y_val)), 1e-12)
+        mse = float(np.mean((pred_val - y_val) ** 2))
+        if not np.isfinite(mse):
+            return 0.0
+        return float(np.clip(1.0 - mse / val_var, 0.0, 1.0))
     except Exception:
         return 0.0
 
@@ -138,8 +199,27 @@ def _affine_relative_score(
         return 0.0, 0.0
 
 
-def rank_blackbox_features(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
-    """Rank features using cheap, deterministic univariate signals."""
+def _normalize_score_dict(scores: Dict[int, float]) -> Dict[int, float]:
+    if not scores:
+        return {}
+    finite = {
+        int(idx): max(0.0, float(value))
+        for idx, value in scores.items()
+        if np.isfinite(value)
+    }
+    if not finite:
+        return {int(idx): 0.0 for idx in scores}
+    max_value = max(finite.values(), default=0.0)
+    if max_value <= 1e-12:
+        return {int(idx): 0.0 for idx in scores}
+    return {
+        int(idx): float(np.clip(finite.get(int(idx), 0.0) / max_value, 0.0, 1.0))
+        for idx in scores
+    }
+
+
+def _cheap_feature_scores(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
+    """Rank features using deterministic univariate signals only."""
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
     scores: Dict[int, float] = {}
@@ -156,8 +236,211 @@ def rank_blackbox_features(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
         pearson = _corr_score(xj, yj)
         spearman = _corr_score(_rankdata(xj), y_rank[finite])
         poly = _univariate_poly_score(xj, yj)
-        scores[j] = float(0.35 * pearson + 0.25 * spearman + 0.40 * poly)
+        holdout_poly = _univariate_holdout_poly_score(
+            xj,
+            yj,
+            random_state=97 * (j + 1),
+        )
+        scores[j] = float(0.20 * pearson + 0.15 * spearman + 0.25 * poly + 0.40 * holdout_poly)
     return scores
+
+
+def _mutual_information_scores(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
+    if mutual_info_regression is None:
+        return {}
+    try:
+        scores = mutual_info_regression(
+            np.asarray(X, dtype=np.float64),
+            np.asarray(y, dtype=np.float64).reshape(-1),
+            random_state=0,
+        )
+        return _normalize_score_dict({j: float(scores[j]) for j in range(len(scores))})
+    except Exception:
+        return {}
+
+
+def _sparse_linear_scores(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
+    if LassoCV is None or ElasticNetCV is None:
+        return {}
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    if X.ndim != 2 or X.shape[1] == 0 or X.shape[0] < max(24, X.shape[1] + 4):
+        return {}
+
+    score_pool: List[np.ndarray] = []
+    try:
+        lasso = LassoCV(
+            cv=3,
+            random_state=0,
+            max_iter=5000,
+            alphas=32,
+        )
+        lasso.fit(X, y)
+        score_pool.append(np.abs(np.asarray(lasso.coef_, dtype=np.float64)))
+    except Exception:
+        pass
+    try:
+        enet = ElasticNetCV(
+            cv=3,
+            random_state=0,
+            max_iter=5000,
+            alphas=24,
+            l1_ratio=(0.2, 0.5, 0.8, 0.95, 1.0),
+        )
+        enet.fit(X, y)
+        score_pool.append(np.abs(np.asarray(enet.coef_, dtype=np.float64)))
+    except Exception:
+        pass
+    if not score_pool:
+        return {}
+
+    mean_scores = np.mean(np.vstack(score_pool), axis=0)
+    return _normalize_score_dict({j: float(mean_scores[j]) for j in range(mean_scores.shape[0])})
+
+
+def _tree_importance_scores(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
+    if ExtraTreesRegressor is None:
+        return {}
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    if X.ndim != 2 or X.shape[1] == 0 or X.shape[0] < 24:
+        return {}
+    try:
+        model = ExtraTreesRegressor(
+            n_estimators=64,
+            max_depth=min(8, max(3, int(np.sqrt(max(1, X.shape[0]))))),
+            min_samples_leaf=2,
+            random_state=0,
+            n_jobs=1,
+        )
+        model.fit(X, y)
+        importances = np.asarray(model.feature_importances_, dtype=np.float64)
+        return _normalize_score_dict({j: float(importances[j]) for j in range(importances.shape[0])})
+    except Exception:
+        return {}
+
+
+def _ranker_disagreement(
+    ranker_votes: Dict[str, Dict[int, float]],
+    feature_indices: List[int],
+) -> float:
+    """Estimate disagreement across rankers from per-feature rank spread."""
+    if not ranker_votes or not feature_indices:
+        return 0.0
+
+    rank_positions: Dict[int, List[int]] = {int(idx): [] for idx in feature_indices}
+    active_rankers = 0
+    for scores in ranker_votes.values():
+        ordered = sorted(
+            feature_indices,
+            key=lambda idx: float(scores.get(int(idx), 0.0)),
+            reverse=True,
+        )
+        if not ordered:
+            continue
+        active_rankers += 1
+        for pos, idx in enumerate(ordered):
+            rank_positions[int(idx)].append(pos)
+
+    if active_rankers < 2:
+        return 0.0
+
+    spreads = []
+    denom = max(1.0, float(len(feature_indices) - 1))
+    for idx in feature_indices:
+        positions = rank_positions.get(int(idx), [])
+        if len(positions) < 2:
+            continue
+        spreads.append(float(np.std(np.asarray(positions, dtype=np.float64)) / denom))
+    if not spreads:
+        return 0.0
+    return float(np.clip(np.mean(spreads) * 2.0, 0.0, 1.0))
+
+
+def compute_blackbox_feature_ranking(X: np.ndarray, y: np.ndarray) -> Dict[str, Any]:
+    """Rank features with deterministic and optional model-based votes."""
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    n_features = int(X.shape[1]) if X.ndim == 2 else 0
+    if n_features <= 0:
+        return {"feature_scores": {}, "ranker_votes": {}}
+
+    pearson_scores: Dict[int, float] = {}
+    spearman_scores: Dict[int, float] = {}
+    poly_scores: Dict[int, float] = {}
+    holdout_poly_scores: Dict[int, float] = {}
+
+    y_rank = _rankdata(y)
+    for j in range(n_features):
+        col = X[:, j]
+        finite = np.isfinite(col) & np.isfinite(y)
+        if int(finite.sum()) < 8:
+            pearson_scores[j] = 0.0
+            spearman_scores[j] = 0.0
+            poly_scores[j] = 0.0
+            holdout_poly_scores[j] = 0.0
+            continue
+        xj = col[finite]
+        yj = y[finite]
+        pearson_scores[j] = _corr_score(xj, yj)
+        spearman_scores[j] = _corr_score(_rankdata(xj), y_rank[finite])
+        poly_scores[j] = _univariate_poly_score(xj, yj)
+        holdout_poly_scores[j] = _univariate_holdout_poly_score(
+            xj,
+            yj,
+            random_state=97 * (j + 1),
+        )
+
+    ranker_votes: Dict[str, Dict[int, float]] = {
+        "pearson": _normalize_score_dict(pearson_scores),
+        "spearman": _normalize_score_dict(spearman_scores),
+        "poly": _normalize_score_dict(poly_scores),
+        "holdout_poly": _normalize_score_dict(holdout_poly_scores),
+    }
+
+    mi_scores = _mutual_information_scores(X, y)
+    if mi_scores:
+        ranker_votes["mutual_information"] = mi_scores
+
+    sparse_scores = _sparse_linear_scores(X, y)
+    if sparse_scores:
+        ranker_votes["sparse_linear"] = sparse_scores
+
+    tree_scores = _tree_importance_scores(X, y)
+    if tree_scores:
+        ranker_votes["tree"] = tree_scores
+
+    weights = {
+        "pearson": 0.14,
+        "spearman": 0.12,
+        "poly": 0.18,
+        "holdout_poly": 0.24,
+        "mutual_information": 0.12,
+        "sparse_linear": 0.10,
+        "tree": 0.10,
+    }
+    active_weights = {
+        name: weight
+        for name, weight in weights.items()
+        if name in ranker_votes
+    }
+    weight_total = sum(active_weights.values()) or 1.0
+    feature_scores: Dict[int, float] = {}
+    for j in range(n_features):
+        score = 0.0
+        for ranker_name, ranker_weight in active_weights.items():
+            score += ranker_weight * float(ranker_votes.get(ranker_name, {}).get(j, 0.0))
+        feature_scores[j] = float(score / weight_total)
+
+    return {
+        "feature_scores": feature_scores,
+        "ranker_votes": ranker_votes,
+    }
+
+
+def rank_blackbox_features(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
+    """Backwards-compatible feature score helper."""
+    return compute_blackbox_feature_ranking(X, y)["feature_scores"]
 
 
 def discover_blackbox_interactions(
@@ -178,7 +461,7 @@ def discover_blackbox_interactions(
     if len(cols) < 2:
         return {"interaction_pairs": [], "interaction_terms": [], "interaction_scores": {}}
 
-    base_scores = rank_blackbox_features(X, y)
+    base_scores = _cheap_feature_scores(X, y)
     candidate_rows: List[Tuple[float, Tuple[int, int], str]] = []
 
     for i in range(len(cols)):
@@ -276,6 +559,7 @@ def prepare_blackbox_search(
             selected_features=list(range(n_features)),
             dropped_features=[],
             feature_scores={},
+            ranker_votes={},
             x_mean=x_mean,
             x_scale=x_scale,
             y_mean=y_mean,
@@ -293,6 +577,7 @@ def prepare_blackbox_search(
             selected_features=list(range(n_features)),
             dropped_features=[],
             feature_scores={},
+            ranker_votes={},
             x_mean=x_mean,
             x_scale=x_scale,
             y_mean=y_mean,
@@ -307,11 +592,23 @@ def prepare_blackbox_search(
     if n_features < int(min_features_to_select):
         selected = sorted(usable)
         feature_scores = {idx: 0.0 for idx in usable}
+        ranker_votes = {}
         dropped = [j for j in range(n_features) if j not in selected]
         reason = "retained_all_features_small_problem"
     else:
-        scores = rank_blackbox_features(X_scaled_all[:, usable], y_scaled)
-        feature_scores = {usable[j]: score for j, score in scores.items()}
+        cheap_scores = _cheap_feature_scores(X_scaled_all[:, usable], y_scaled)
+        ranking = compute_blackbox_feature_ranking(X_scaled_all[:, usable], y_scaled)
+        feature_scores = {
+            usable[j]: score
+            for j, score in (ranking.get("feature_scores") or {}).items()
+        }
+        ranker_votes = {
+            ranker_name: {
+                usable[j]: float(score)
+                for j, score in ranker_scores.items()
+            }
+            for ranker_name, ranker_scores in (ranking.get("ranker_votes") or {}).items()
+        }
 
         k = int(max(1, min(max_features, len(usable))))
         ranked_usable = sorted(usable, key=lambda idx: feature_scores.get(idx, 0.0), reverse=True)
@@ -319,11 +616,23 @@ def prepare_blackbox_search(
         top_score = float(feature_scores.get(selected[0], 0.0)) if selected else 0.0
         kth_score = float(feature_scores.get(selected[-1], 0.0)) if selected else 0.0
         next_score = float(feature_scores.get(ranked_usable[k], 0.0)) if k < len(ranked_usable) else 0.0
+        top_cheap_score = max((float(v) for v in cheap_scores.values()), default=0.0)
         score_gap = kth_score - next_score
+        disagreement = _ranker_disagreement(ranker_votes, ranked_usable)
         uncertain = (
-            len(usable) <= max(4, k + 1)
-            and next_score > 0.0
-            and (top_score <= 0.15 or score_gap < max(0.03, 0.10 * max(top_score, 1e-12)))
+            len(usable) <= max(5, k + 2)
+            and (
+                top_cheap_score <= 0.12
+                or (
+                    next_score > 0.0
+                    and score_gap < max(0.04, 0.12 * max(top_score, 1e-12))
+                )
+                or (
+                    top_cheap_score <= 0.20
+                    and score_gap < max(0.08, 0.20 * max(top_score, 1e-12))
+                    and disagreement >= 0.35
+                )
+            )
         )
         if uncertain:
             selected = list(usable)
@@ -344,6 +653,7 @@ def prepare_blackbox_search(
         selected_features=selected,
         dropped_features=dropped,
         feature_scores=feature_scores,
+        ranker_votes=ranker_votes,
         x_mean=x_mean,
         x_scale=x_scale,
         y_mean=y_mean,
@@ -468,6 +778,10 @@ def state_to_dict(state: Optional[BlackboxState]) -> Dict[str, Any]:
         "selected_features": list(state.selected_features),
         "dropped_features": list(state.dropped_features),
         "feature_scores": dict(state.feature_scores),
+        "ranker_votes": {
+            str(name): dict(scores)
+            for name, scores in state.ranker_votes.items()
+        },
         "standardized": state.standardized,
         "reason": state.reason,
         "interaction_pairs": list(state.interaction_pairs),

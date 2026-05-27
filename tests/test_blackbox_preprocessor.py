@@ -2,6 +2,7 @@ import numpy as np
 
 from glassbox.sr.blackbox_preprocessor import (
     build_blackbox_seed_formulas,
+    compute_blackbox_feature_ranking,
     discover_blackbox_interactions,
     formula_from_search_to_original_space,
     prepare_blackbox_search,
@@ -28,6 +29,8 @@ def test_prepare_blackbox_search_selects_informative_features():
     assert X_search.shape[1] == 3
     assert 2 in state.selected_features
     assert 5 in state.selected_features
+    assert isinstance(state.ranker_votes, dict)
+    assert state.ranker_votes
     assert y_search.shape == y.shape
 
 
@@ -107,6 +110,26 @@ def test_blackbox_state_includes_interactions():
 
     assert isinstance(state.interaction_terms, list)
     assert isinstance(state.interaction_scores, dict)
+
+
+def test_compute_blackbox_feature_ranking_exposes_ranker_votes():
+    rng = np.random.RandomState(12)
+    X = rng.randn(160, 6)
+    y = 2.5 * X[:, 1] - 1.2 * X[:, 4] ** 2 + 0.03 * rng.randn(160)
+
+    ranking = compute_blackbox_feature_ranking(X, y)
+
+    assert "feature_scores" in ranking
+    assert "ranker_votes" in ranking
+    assert ranking["ranker_votes"]
+    assert "holdout_poly" in ranking["ranker_votes"]
+    top_features = sorted(
+        ranking["feature_scores"],
+        key=lambda idx: ranking["feature_scores"][idx],
+        reverse=True,
+    )[:3]
+    assert 1 in top_features
+    assert 4 in top_features
 
 
 def test_uncertain_feature_selection_retains_small_candidate_set():
