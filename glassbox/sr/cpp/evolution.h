@@ -78,6 +78,11 @@ struct EvolutionConfig {
     // Legacy 4-slot priors [Periodic, Power, Exp, Log] are supported.
     // Empty = uniform sampling. Non-empty = sample proportionally.
     std::vector<double> op_priors; // e.g. {0.8, 0.08, 0.02, 0.05, 0.05}
+    std::vector<int> allowed_unary_ops;
+    // Binary priors: [Arithmetic, Division, Aggregation].
+    // Empty = use the built-in defaults.
+    std::vector<double> binary_op_priors;
+    std::vector<int> allowed_binary_ops;
 
     // P5: NSGA-II multi-objective
     bool use_nsga2 = false;
@@ -89,6 +94,9 @@ struct EvolutionConfig {
     
     // Diverse Islands Support
     std::vector<std::vector<double>> multi_op_priors;
+    std::vector<std::vector<int>> multi_allowed_unary_ops;
+    std::vector<std::vector<double>> multi_binary_op_priors;
+    std::vector<std::vector<int>> multi_allowed_binary_ops;
     std::vector<std::vector<double>> multi_seed_omegas;
 
     // P7: Dimensional Analysis
@@ -219,19 +227,23 @@ public:
                 expanded[4] = config_.op_priors[3];               // Log
                 config_.op_priors = expanded;
             }
-
-            double sum = 0.0;
-            for (double p : config_.op_priors) sum += p;
-            if (sum > 0) {
-                for (double& p : config_.op_priors) p /= sum;
-            }
-            // Build CDF for weighted sampling
-            op_cdf_.resize(config_.op_priors.size());
-            op_cdf_[0] = config_.op_priors[0];
-            for (size_t i = 1; i < config_.op_priors.size(); ++i) {
-                op_cdf_[i] = op_cdf_[i-1] + config_.op_priors[i];
-            }
+            normalize_prior_vector(config_.op_priors);
+            op_cdf_ = build_cdf(config_.op_priors);
         }
+
+        if (!config_.binary_op_priors.empty()) {
+            normalize_prior_vector(config_.binary_op_priors);
+            binary_op_cdf_ = build_cdf(config_.binary_op_priors);
+        }
+
+        allowed_unary_ops_ = sanitize_allowed_ops<UnaryOp>(
+            config_.allowed_unary_ops,
+            static_cast<int>(UnaryOp::Log)
+        );
+        allowed_binary_ops_ = sanitize_allowed_ops<BinaryOp>(
+            config_.allowed_binary_ops,
+            static_cast<int>(BinaryOp::Aggregation)
+        );
     }
 
     // Main run loop
@@ -529,6 +541,15 @@ public:
             if (i < config_.multi_op_priors.size() && !config_.multi_op_priors[i].empty()) {
                 current_island_cfg.op_priors = config_.multi_op_priors[i];
             }
+            if (i < config_.multi_allowed_unary_ops.size() && !config_.multi_allowed_unary_ops[i].empty()) {
+                current_island_cfg.allowed_unary_ops = config_.multi_allowed_unary_ops[i];
+            }
+            if (i < config_.multi_binary_op_priors.size() && !config_.multi_binary_op_priors[i].empty()) {
+                current_island_cfg.binary_op_priors = config_.multi_binary_op_priors[i];
+            }
+            if (i < config_.multi_allowed_binary_ops.size() && !config_.multi_allowed_binary_ops[i].empty()) {
+                current_island_cfg.allowed_binary_ops = config_.multi_allowed_binary_ops[i];
+            }
             
             std::vector<double> current_seed_omegas = seed_omegas_;
             if (i < config_.multi_seed_omegas.size() && !config_.multi_seed_omegas[i].empty()) {
@@ -635,6 +656,9 @@ private:
     IndividualGraph best_overall_;
     SubtreeCache gen_cache_; // Per-generation subtree cache
     std::vector<double> op_cdf_; // CDF for prior-weighted op sampling
+    std::vector<double> binary_op_cdf_; // CDF for prior-weighted binary-op sampling
+    std::vector<int> allowed_unary_ops_;
+    std::vector<int> allowed_binary_ops_;
     
     std::mt19937 rng_;
     std::ofstream trace_stream_;
@@ -644,6 +668,58 @@ private:
     double first_exact_time_sec_ = -1.0;
     int first_acceptable_generation_ = -1;
     double first_acceptable_time_sec_ = -1.0;
+
+    static void normalize_prior_vector(std::vector<double>& priors) {
+        double sum = 0.0;
+        for (double& p : priors) {
+            if (!std::isfinite(p) || p < 0.0) {
+                p = 0.0;
+            }
+            sum += p;
+        }
+        if (sum > 0.0) {
+            for (double& p : priors) {
+                p /= sum;
+            }
+        }
+    }
+
+    static std::vector<double> build_cdf(const std::vector<double>& priors) {
+        std::vector<double> cdf(priors.size(), 0.0);
+        if (priors.empty()) {
+            return cdf;
+        }
+        cdf[0] = priors[0];
+        for (size_t i = 1; i < priors.size(); ++i) {
+            cdf[i] = cdf[i - 1] + priors[i];
+        }
+        cdf.back() = 1.0;
+        return cdf;
+    }
+
+    template <typename EnumT>
+    static std::vector<int> sanitize_allowed_ops(const std::vector<int>& raw, int max_value) {
+        std::vector<int> allowed;
+        allowed.reserve(raw.size());
+        for (int v : raw) {
+            if (v >= 0 && v <= max_value && std::find(allowed.begin(), allowed.end(), v) == allowed.end()) {
+                allowed.push_back(v);
+            }
+        }
+        return allowed;
+    }
+
+    bool unary_op_allowed(UnaryOp op) const {
+        if (allowed_unary_ops_.empty()) return true;
+        int value = static_cast<int>(op);
+        return std::find(allowed_unary_ops_.begin(), allowed_unary_ops_.end(), value) != allowed_unary_ops_.end();
+    }
+
+    bool binary_op_allowed(BinaryOp op) const {
+        if (allowed_binary_ops_.empty()) return true;
+        int value = static_cast<int>(op);
+        return std::find(allowed_binary_ops_.begin(), allowed_binary_ops_.end(), value) != allowed_binary_ops_.end();
+    }
 
     int tournament_select(int k = 5) {
         if (population_.empty()) return 0;
@@ -766,27 +842,113 @@ private:
     UnaryOp sample_unary_op() {
         std::uniform_real_distribution<double> u(0.0, 1.0);
         if (!op_cdf_.empty()) {
-            double r = u(rng_);
-            for (size_t i = 0; i < op_cdf_.size(); ++i) {
-                if (r <= op_cdf_[i]) return static_cast<UnaryOp>(i);
+            for (int attempt = 0; attempt < 16; ++attempt) {
+                double r = u(rng_);
+                for (size_t i = 0; i < op_cdf_.size(); ++i) {
+                    UnaryOp op = static_cast<UnaryOp>(i);
+                    if (r <= op_cdf_[i] && unary_op_allowed(op)) return op;
+                }
             }
-            return UnaryOp::Log; // Fallback to last
+            for (int op = 0; op <= static_cast<int>(UnaryOp::Log); ++op) {
+                if (unary_op_allowed(static_cast<UnaryOp>(op))) {
+                    return static_cast<UnaryOp>(op);
+                }
+            }
+            return UnaryOp::Log;
         }
         // Uniform: 0=Periodic, 1=Power, 2=IntPow, 3=Exp, 4=Log
-        double op_choice = u(rng_);
-        if (op_choice < 0.25) return UnaryOp::Periodic;
-        if (op_choice < 0.50) return UnaryOp::Power;
-        if (op_choice < 0.70) return UnaryOp::IntPow;
-        if (op_choice < 0.85) return UnaryOp::Exp;
+        const UnaryOp defaults[] = {
+            UnaryOp::Periodic, UnaryOp::Power, UnaryOp::IntPow, UnaryOp::Exp, UnaryOp::Log
+        };
+        for (int attempt = 0; attempt < 16; ++attempt) {
+            double op_choice = u(rng_);
+            UnaryOp op = UnaryOp::Log;
+            if (op_choice < 0.25) op = UnaryOp::Periodic;
+            else if (op_choice < 0.50) op = UnaryOp::Power;
+            else if (op_choice < 0.70) op = UnaryOp::IntPow;
+            else if (op_choice < 0.85) op = UnaryOp::Exp;
+            if (unary_op_allowed(op)) return op;
+        }
+        for (UnaryOp op : defaults) {
+            if (unary_op_allowed(op)) return op;
+        }
         return UnaryOp::Log;
     }
 
     BinaryOp sample_binary_op() {
         std::uniform_real_distribution<double> u(0.0, 1.0);
-        double r = u(rng_);
-        if (r < 0.45) return BinaryOp::Arithmetic;
-        if (r < 0.75) return BinaryOp::Division;
+        if (!binary_op_cdf_.empty()) {
+            for (int attempt = 0; attempt < 16; ++attempt) {
+                double r = u(rng_);
+                for (size_t i = 0; i < binary_op_cdf_.size(); ++i) {
+                    BinaryOp op = static_cast<BinaryOp>(i);
+                    if (r <= binary_op_cdf_[i] && binary_op_allowed(op)) return op;
+                }
+            }
+            for (int op = 0; op <= static_cast<int>(BinaryOp::Aggregation); ++op) {
+                if (binary_op_allowed(static_cast<BinaryOp>(op))) {
+                    return static_cast<BinaryOp>(op);
+                }
+            }
+            return BinaryOp::Aggregation;
+        }
+        const BinaryOp defaults[] = {
+            BinaryOp::Arithmetic, BinaryOp::Division, BinaryOp::Aggregation
+        };
+        for (int attempt = 0; attempt < 16; ++attempt) {
+            double r = u(rng_);
+            BinaryOp op = BinaryOp::Aggregation;
+            if (r < 0.45) op = BinaryOp::Arithmetic;
+            else if (r < 0.75) op = BinaryOp::Division;
+            if (binary_op_allowed(op)) return op;
+        }
+        for (BinaryOp op : defaults) {
+            if (binary_op_allowed(op)) return op;
+        }
         return BinaryOp::Aggregation;
+    }
+
+    bool unary_wrap_allowed(const IndividualGraph& graph, int child_idx, UnaryOp op) const {
+        if (child_idx < 0 || child_idx >= static_cast<int>(graph.nodes.size())) {
+            return true;
+        }
+        const auto& child = graph.nodes[child_idx];
+        if (child.type != NodeType::Unary) {
+            return true;
+        }
+        UnaryOp child_op = child.unary_op;
+        if (op == UnaryOp::Periodic && child_op == UnaryOp::Periodic) {
+            return false;
+        }
+        if (op == UnaryOp::Log && (child_op == UnaryOp::Periodic || child_op == UnaryOp::Exp || child_op == UnaryOp::Log)) {
+            return false;
+        }
+        if (op == UnaryOp::Exp && (child_op == UnaryOp::Exp || child_op == UnaryOp::Log)) {
+            return false;
+        }
+        if ((op == UnaryOp::Power || op == UnaryOp::IntPow) &&
+            (child_op == UnaryOp::Power || child_op == UnaryOp::IntPow || child_op == UnaryOp::Exp)) {
+            return false;
+        }
+        return true;
+    }
+
+    UnaryOp sample_unary_op_for_child(const IndividualGraph& graph, int child_idx) {
+        for (int attempt = 0; attempt < 24; ++attempt) {
+            UnaryOp op = sample_unary_op();
+            if (unary_wrap_allowed(graph, child_idx, op)) {
+                return op;
+            }
+        }
+        const UnaryOp fallbacks[] = {
+            UnaryOp::Periodic, UnaryOp::IntPow, UnaryOp::Power, UnaryOp::Exp, UnaryOp::Log
+        };
+        for (UnaryOp op : fallbacks) {
+            if (unary_op_allowed(op) && unary_wrap_allowed(graph, child_idx, op)) {
+                return op;
+            }
+        }
+        return sample_unary_op();
     }
 
     void seed_arithmetic_gate(OpNode& node) {
@@ -846,7 +1008,9 @@ private:
             } else {
                 if (runif(rng_) < 0.6 || i < n_inputs + 1) {
                     node.type = NodeType::Unary;
-                    node.unary_op = sample_unary_op();
+                    std::uniform_int_distribution<int> child_dist(0, i - 1);
+                    node.left_child = child_dist(rng_);
+                    node.unary_op = sample_unary_op_for_child(ind, node.left_child);
                     if (node.unary_op == UnaryOp::Power && runif(rng_) < 0.7) {
                         const double power_candidates[] = {-1.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0};
                         std::vector<double> valid_powers;
@@ -872,8 +1036,6 @@ private:
                         node.omega = exp_omega_seeds[eo_dist(rng_)];
                         node.phi = 0.0; // Exp shift is rarely needed at init
                     }
-                    std::uniform_int_distribution<int> child_dist(0, i - 1);
-                    node.left_child = child_dist(rng_);
                 } else {
                     node.type = NodeType::Binary;
                     node.binary_op = sample_binary_op();
@@ -1102,14 +1264,14 @@ private:
                 } else {
                     if (runif(rng_) < 0.6 || i < 2) {
                         node.type = NodeType::Unary;
-                        node.unary_op = sample_unary_op();
+                        std::uniform_int_distribution<int> child_dist(0, i - 1);
+                        node.left_child = child_dist(rng_);
+                        node.unary_op = sample_unary_op_for_child(child, node.left_child);
                         if (node.unary_op == UnaryOp::IntPow) {
                             const int intpow_candidates[] = {2, 3, 4, 5, 6};
                             std::uniform_int_distribution<int> ip_dist(0, 4);
                             node.p = static_cast<double>(intpow_candidates[ip_dist(rng_)]);
                         }
-                        std::uniform_int_distribution<int> child_dist(0, i - 1);
-                        node.left_child = child_dist(rng_);
                     } else {
                         node.type = NodeType::Binary;
                         node.binary_op = sample_binary_op();
@@ -1171,8 +1333,8 @@ private:
             // Create new unary node that takes 'target' as input
             OpNode wrap_node;
             wrap_node.type = NodeType::Unary;
-            wrap_node.unary_op = sample_unary_op();
             wrap_node.left_child = target;
+            wrap_node.unary_op = sample_unary_op_for_child(child, target);
             wrap_node.p = 1.0;
             wrap_node.omega = 1.0;
             wrap_node.phi = 0.0;
@@ -1255,10 +1417,17 @@ private:
             
             OpNode div_node;
             div_node.type = NodeType::Binary;
-            div_node.binary_op = BinaryOp::Division;
-            // Also seed beta/gamma towards division in case of arithmetic blend crossover
-            div_node.beta = 2.0;
-            div_node.gamma = -1.0; 
+            div_node.binary_op = sample_binary_op();
+            if (div_node.binary_op == BinaryOp::Arithmetic) {
+                seed_arithmetic_gate(div_node);
+                div_node.beta = 2.0;
+                div_node.gamma = 1.0;
+            } else if (div_node.binary_op == BinaryOp::Division) {
+                div_node.beta = 2.0;
+                div_node.gamma = -1.0;
+            } else {
+                div_node.tau = 1.0;
+            }
             div_node.left_child = left;
             div_node.right_child = right;
             

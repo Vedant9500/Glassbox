@@ -46,6 +46,14 @@ def _clamp_float(value, default, lo, hi):
     return float(max(lo, min(hi, value)))
 
 
+def _finite_float(value, default=0.0):
+    try:
+        out = float(value)
+    except Exception:
+        return float(default)
+    return out if np.isfinite(out) else float(default)
+
+
 # Path setup
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _SCRIPTS_DIR = _REPO_ROOT / 'scripts'
@@ -541,6 +549,20 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return challenger_formula, challenger_score, "challenger"
         return incumbent_formula, incumbent_score, "incumbent"
 
+    def _compare_blackbox_formulas(self, incumbent_formula, challenger_formula, X, y):
+        """Compare two formulas on validation, not just in-sample fit."""
+        candidates = []
+        if incumbent_formula:
+            candidates.append({"formula": incumbent_formula, "source": "incumbent"})
+        if challenger_formula:
+            candidates.append({"formula": challenger_formula, "source": "challenger"})
+        if len(candidates) < 2:
+            return None
+        choice = self._select_blackbox_pareto_formula(candidates, X, y)
+        if choice is None:
+            return None
+        return "challenger" if choice.get("source") == "challenger" else "incumbent"
+
     def _select_blackbox_pareto_formula(self, candidates, X, y):
         """Select a validation-stable Pareto winner for blackbox approximation."""
         if not candidates:
@@ -606,6 +628,206 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         selected["best_raw_validation_mse"] = best_raw["validation_mse"]
         selected["selected_by"] = "blackbox_validation_pareto"
         return selected
+
+    def _validate_blackbox_fast_path_candidate(self, formula, mse, X, y):
+        """Decide whether a fast-path formula is safe enough to be incumbent."""
+        split = self._domain_edge_validation_split(X, y, validation_fraction=0.25)
+        if split is None or not formula:
+            return {"accepted": True, "reason": "no_validation_split"}
+        scored = self._score_formula_candidate(
+            formula,
+            split["X_fit"],
+            split["y_fit"],
+            split["X_val"],
+            split["y_val"],
+        )
+        if scored is None:
+            return {"accepted": False, "reason": "validation_failed"}
+        val_mse = float(scored.get("validation_mse", scored.get("mse", float("inf"))))
+        fit_mse = float(scored.get("fit_mse", float("inf")))
+        val_var = max(float(np.var(split["y_val"])), 1e-12)
+        risk = float(scored.get("risk_score", self._formula_risk_score(formula, split["X_val"])))
+        complexity = self._formula_complexity(formula)
+        gap = float(max(0.0, val_mse - fit_mse) / val_var)
+        train_ratio = val_mse / max(float(mse), 1e-12) if mse is not None and np.isfinite(mse) else 1.0
+        accepted = (
+            np.isfinite(val_mse)
+            and val_mse <= 1.25 * val_var
+            and train_ratio <= 3.0
+            and gap <= 0.75
+            and risk <= 0.45
+            and complexity <= 36
+        )
+        reason = "accepted" if accepted else "unstable_validation"
+        return {
+            "accepted": bool(accepted),
+            "reason": reason,
+            "validation_mse": val_mse,
+            "validation_r2": 1.0 - val_mse / val_var,
+            "fit_mse": fit_mse,
+            "train_mse": float(mse) if mse is not None and np.isfinite(mse) else None,
+            "validation_to_train_mse": float(train_ratio) if np.isfinite(train_ratio) else None,
+            "risk_score": risk,
+            "generalization_gap": gap,
+            "complexity": complexity,
+            "candidate_formula": scored.get("formula"),
+        }
+
+    def _should_use_universal_fast_path(self, blackbox_state, fast_path_uncertainty):
+        """Disable kitchen-sink fast-path expansion when classifier evidence is weak."""
+        if blackbox_state is None or not getattr(blackbox_state, "enabled", False):
+            return True
+        selected = list(getattr(blackbox_state, "selected_features", []) or [])
+        if len(selected) <= 1:
+            return True
+        if not isinstance(fast_path_uncertainty, dict):
+            return True
+        entropy = _finite_float(fast_path_uncertainty.get("prediction_entropy"), 0.0)
+        margin = _finite_float(fast_path_uncertainty.get("prediction_margin"), 1.0)
+        uncertain = bool(fast_path_uncertainty.get("prediction_uncertain", False))
+        if uncertain and entropy >= 0.80 and margin <= 0.10:
+            return False
+        return True
+
+    def _constrain_blackbox_operator_hints(self, operator_hints, blackbox_state):
+        """Clamp risky operator families when multivariate fast-path evidence is weak."""
+        hints = dict(operator_hints or {})
+        ops = set(hints.get("operators", set()))
+        uncertainty = (getattr(self, "_fp_result", {}) or {}).get("uncertainty", {})
+        conservative = not self._should_use_universal_fast_path(blackbox_state, uncertainty)
+        if not (blackbox_state is not None and getattr(blackbox_state, "enabled", False) and conservative):
+            hints["operators"] = ops
+            return hints
+
+        interaction_terms = list(getattr(blackbox_state, "interaction_terms", []) or [])
+        interaction_text = " ".join(interaction_terms).lower()
+        keep_periodic = "sin(" in interaction_text or "cos(" in interaction_text
+        constrained = {"power", "exp", "log", "rational"}
+        ops.difference_update(constrained)
+        if keep_periodic:
+            ops.add("periodic")
+        hints["operators"] = ops
+        hints["powers"] = [p for p in list(hints.get("powers", [])) if isinstance(p, (int, np.integer)) and int(p) in (2, 3)]
+        hints["has_rational"] = False
+        hints["has_exp_decay"] = False
+        if isinstance(self.blackbox_diagnostics_, dict):
+            self.blackbox_diagnostics_["operator_hint_constraint"] = {
+                "conservative": True,
+                "kept_operators": sorted(ops),
+                "dropped_risky_families": sorted(constrained),
+            }
+        return hints
+
+    def _derive_blackbox_binary_priors(self, blackbox_state, operator_hints=None):
+        """Bias C++ binary search away from fragile rational structures in blackbox mode."""
+        if blackbox_state is None or not getattr(blackbox_state, "enabled", False):
+            return [], []
+
+        uncertainty = (getattr(self, "_fp_result", {}) or {}).get("uncertainty", {})
+        conservative = not self._should_use_universal_fast_path(blackbox_state, uncertainty)
+        hints = dict(operator_hints or {})
+        ops = set(hints.get("operators", set()))
+        interaction_terms = list(getattr(blackbox_state, "interaction_terms", []) or [])
+        interaction_text = " ".join(interaction_terms).lower()
+        has_periodic = "periodic" in ops or "sin(" in interaction_text or "cos(" in interaction_text
+        has_rational = bool(hints.get("has_rational", False)) and not conservative
+
+        base = [0.62, 0.12, 0.26]
+        if conservative:
+            base = [0.72, 0.06, 0.22]
+        elif has_rational:
+            base = [0.52, 0.24, 0.24]
+        elif has_periodic:
+            base = [0.58, 0.10, 0.32]
+
+        multi = []
+        if getattr(self, "num_islands", 1) > 1:
+            multi = [
+                [0.78, 0.04, 0.18],
+                [0.60, 0.06, 0.34],
+                [0.66, 0.12, 0.22],
+                [0.54, 0.18, 0.28] if has_rational else [0.70, 0.05, 0.25],
+            ]
+            while len(multi) < int(self.num_islands):
+                multi.append(list(multi[len(multi) % 4]))
+
+        diagnostics = getattr(self, "blackbox_diagnostics_", None)
+        if isinstance(diagnostics, dict):
+            diagnostics["binary_operator_priors"] = {
+                "global": list(base),
+                "multi_island": [list(v) for v in multi] if multi else [],
+                "conservative": bool(conservative),
+                "has_periodic_signal": bool(has_periodic),
+                "has_rational_signal": bool(has_rational),
+            }
+        return list(base), multi
+
+    def _derive_blackbox_unary_policy(self, blackbox_state, operator_hints=None):
+        """Build hard unary operator masks for low-trust multivariate blackbox runs."""
+        if blackbox_state is None or not getattr(blackbox_state, "enabled", False):
+            return [], [], [], []
+
+        uncertainty = (getattr(self, "_fp_result", {}) or {}).get("uncertainty", {})
+        conservative = not self._should_use_universal_fast_path(blackbox_state, uncertainty)
+        hints = dict(operator_hints or {})
+        ops = set(hints.get("operators", set()))
+        interaction_terms = list(getattr(blackbox_state, "interaction_terms", []) or [])
+        interaction_text = " ".join(interaction_terms).lower()
+        has_periodic = "periodic" in ops or "sin(" in interaction_text or "cos(" in interaction_text
+        has_rational = bool(hints.get("has_rational", False)) and not conservative
+        has_exp = ("exp" in ops or bool(hints.get("has_exp_decay", False))) and not conservative
+        has_log = "log" in ops and not conservative
+        permissive = [0, 1, 2, 3, 4]
+        safe_periodic = [0, 2] if has_periodic else [2]
+        exp_mild = sorted(set(([2, 3] if has_exp else [2]) + ([0] if has_periodic else [])))
+        log_mild = sorted(set(([2, 4] if (has_log or has_rational) else [2]) + ([0] if has_periodic else [])))
+
+        # Do not globally hard-mask every island. Keep one permissive search lane.
+        global_allowed = []
+        if conservative:
+            multi = [
+                [2],
+                safe_periodic,
+                exp_mild,
+                permissive,
+            ]
+        else:
+            multi = [
+                [2],
+                safe_periodic,
+                exp_mild,
+                permissive if (has_log or has_rational or has_exp or has_periodic) else [2, 1],
+            ]
+
+        multi = [sorted(set(int(v) for v in row)) for row in multi]
+        if getattr(self, "num_islands", 1) > 1:
+            while len(multi) < int(self.num_islands):
+                multi.append(list(multi[len(multi) % 4]))
+        else:
+            multi = []
+
+        # Likewise, avoid a global binary hard-mask; constrain by island.
+        binary_allowed = []
+        multi_binary = []
+        if getattr(self, "num_islands", 1) > 1:
+            multi_binary = [
+                [0],
+                [0, 2],
+                [0, 2],
+                [0, 1, 2],
+            ]
+            while len(multi_binary) < int(self.num_islands):
+                multi_binary.append(list(multi_binary[len(multi_binary) % 4]))
+
+        if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+            self.blackbox_diagnostics_["unary_operator_policy"] = {
+                "allowed_unary_ops": list(global_allowed),
+                "multi_allowed_unary_ops": [list(v) for v in multi] if multi else [],
+                "allowed_binary_ops": list(binary_allowed),
+                "multi_allowed_binary_ops": [list(v) for v in multi_binary] if multi_binary else [],
+                "conservative": bool(conservative),
+            }
+        return global_allowed, multi, binary_allowed, multi_binary
 
     def _refine_candidate_formulas(self, candidate_formulas, X, y, *, max_candidates=12):
         """Refine symbolic candidates with affine scaling and holdout scoring."""
@@ -674,12 +896,12 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         ranked.sort(
             key=lambda c: (
-                float(c.get("mse", float("inf"))) * (
+                _finite_float(c.get("mse"), float("inf")) * (
                     1.0
-                    + 0.25 * float(c.get("risk_score", 0.0))
-                    + 0.20 * float(c.get("generalization_gap", 0.0))
+                    + 0.25 * _finite_float(c.get("risk_score"), 0.0)
+                    + 0.20 * _finite_float(c.get("generalization_gap"), 0.0)
                 ),
-                float(c.get("complexity", float("inf"))),
+                _finite_float(c.get("complexity"), float("inf")),
                 str(c.get("formula", "")),
             )
         )
@@ -719,9 +941,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         ordered = sorted(
             candidate_formulas,
             key=lambda c: (
-                float(c.get("mse", float("inf"))),
-                -float(c.get("validation_r2", -float("inf"))),
-                float(c.get("complexity", float("inf"))),
+                _finite_float(c.get("mse"), float("inf")),
+                -_finite_float(c.get("validation_r2"), -float("inf")),
+                _finite_float(c.get("complexity"), float("inf")),
             ),
         )
         kept = []
@@ -786,7 +1008,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         pass
 
         for cand in candidate_formulas or []:
-            if float(cand.get("validation_r2", -1.0)) < 0.25:
+            if _finite_float(cand.get("validation_r2"), -1.0) < 0.25:
                 continue
             formula = str(cand.get("formula", "")).strip()
             if not formula:
@@ -1094,6 +1316,12 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "early_stop_max_nodes": 50,
             "timeout_multiplier": 1.0,
             "focus": "balanced",
+            "allowed_unary_ops": [],
+            "multi_allowed_unary_ops": [],
+            "binary_op_priors": [],
+            "multi_binary_op_priors": [],
+            "allowed_binary_ops": [],
+            "multi_allowed_binary_ops": [],
         }
         if blackbox_state is None or not getattr(blackbox_state, "enabled", False):
             return base_plan
@@ -1272,6 +1500,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         elif depth_multiplier > breadth_multiplier + 0.25:
             focus = "depth"
 
+        binary_op_priors, multi_binary_op_priors = self._derive_blackbox_binary_priors(
+            blackbox_state,
+            {},
+        )
+        allowed_unary_ops, multi_allowed_unary_ops, allowed_binary_ops, multi_allowed_binary_ops = (
+            self._derive_blackbox_unary_policy(blackbox_state, {})
+        )
         plan = {
             "uncertainty_score": uncertainty_score,
             "selection_uncertainty": selection_uncertainty,
@@ -1291,6 +1526,12 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "early_stop_max_nodes": early_stop_max_nodes,
             "timeout_multiplier": timeout_multiplier,
             "focus": focus,
+            "allowed_unary_ops": allowed_unary_ops,
+            "multi_allowed_unary_ops": multi_allowed_unary_ops,
+            "binary_op_priors": binary_op_priors,
+            "multi_binary_op_priors": multi_binary_op_priors,
+            "allowed_binary_ops": allowed_binary_ops,
+            "multi_allowed_binary_ops": multi_allowed_binary_ops,
         }
 
         if proposer_plan:
@@ -1783,6 +2024,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         best_formula = None
         best_mse = float('inf')
         operator_hints = {}
+        demoted_fast_path_candidate = None
         y_var = float(np.var(y))  # For R² calculation
 
         def _elapsed():
@@ -1818,11 +2060,49 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 )
 
                 if fp_result and fp_result.get('formula'):
+                    fp_uncertainty = fp_result.get("uncertainty") or {}
+                    if blackbox_state.enabled and not self._should_use_universal_fast_path(blackbox_state, fp_uncertainty):
+                        if isinstance(self.blackbox_diagnostics_, dict):
+                            self.blackbox_diagnostics_["fast_path_auto_expand"] = False
+                        fp_result = run_fast_path(
+                            x_t, y_t,
+                            classifier_path=classifier_path,
+                            detected_omegas=detected_omegas,
+                            op_constraints=None,
+                            auto_expand=False,
+                            device=self.device,
+                            exact_match_threads=1,
+                            exact_match_enabled=True,
+                            exact_match_max_basis=200,
+                            max_power=self.max_power,
+                            simplify_formula_output=False,
+                        )
+                    elif isinstance(self.blackbox_diagnostics_, dict) and blackbox_state.enabled:
+                        self.blackbox_diagnostics_["fast_path_auto_expand"] = True
                     best_formula = fp_result['formula']
                     best_mse = fp_result.get('mse', float('inf'))
                     operator_hints = fp_result.get('operator_hints') or {}
                     # Stash for uncertainty-coupled budget routing and candidate seeding
                     self._fp_result = fp_result
+                    if blackbox_state.enabled:
+                        gate = self._validate_blackbox_fast_path_candidate(best_formula, best_mse, X, y)
+                        if isinstance(self.blackbox_diagnostics_, dict):
+                            self.blackbox_diagnostics_["fast_path_validation_gate"] = gate
+                        if not gate.get("accepted", True):
+                            demoted_fast_path_candidate = {
+                                "formula": gate.get("candidate_formula") or best_formula,
+                                "mse": gate.get("validation_mse", best_mse),
+                                "validation_mse": gate.get("validation_mse"),
+                                "validation_r2": gate.get("validation_r2"),
+                                "complexity": gate.get("complexity", self._formula_complexity(best_formula)),
+                                "risk_score": gate.get("risk_score", 0.0),
+                                "generalization_gap": gate.get("generalization_gap", 0.0),
+                                "from_fast_path": True,
+                                "demoted_fast_path": True,
+                                "source": "demoted_fast_path",
+                            }
+                            best_formula = None
+                            best_mse = float("inf")
             except Exception as e:
                 self._fp_result = None
                 print(f"  [Fast-path skipped: {e}]")
@@ -1868,6 +2148,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             self.skip_evolution_if_bloated
             and best_formula is not None
             and term_count > int(self.bloat_term_threshold)
+            and not (blackbox_state is not None and blackbox_state.enabled)
         ):
             need_evolution = False
         else:
@@ -1919,6 +2200,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 y,
                 max_candidates=10,
             )
+            if demoted_fast_path_candidate is not None:
+                preview_candidates = self._prune_blackbox_candidate_formulas(
+                    [demoted_fast_path_candidate] + list(preview_candidates or []),
+                    max_candidates=10,
+                )
             if preview_candidates:
                 families = {
                     self._formula_family_signature(c.get("formula", ""))
@@ -1929,7 +2215,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     "candidate_count": len(preview_candidates),
                     "family_count": len(families),
                     "best_validation_r2": max(
-                        float(c.get("validation_r2", -1.0))
+                        _finite_float(c.get("validation_r2"), -1.0)
                         for c in preview_candidates
                     ),
                 }
@@ -1961,6 +2247,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     int(blackbox_search_plan.get("seed_budget", 8)),
                 ),
             )
+            if demoted_fast_path_candidate is not None:
+                candidate_formulas = self._prune_blackbox_candidate_formulas(
+                    [demoted_fast_path_candidate] + list(candidate_formulas or []),
+                    max_candidates=max(
+                        8,
+                        int(blackbox_search_plan.get("seed_budget", 8)),
+                    ),
+                )
             interaction_hints = self._derive_blackbox_operator_hints(
                 blackbox_state,
                 candidate_formulas,
@@ -1980,6 +2274,21 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             operator_hints["has_exp_decay"] = bool(
                 operator_hints.get("has_exp_decay", False) or interaction_hints.get("has_exp_decay", False)
             )
+            operator_hints = self._constrain_blackbox_operator_hints(operator_hints, blackbox_state)
+            binary_op_priors, multi_binary_op_priors = self._derive_blackbox_binary_priors(
+                blackbox_state,
+                operator_hints,
+            )
+            allowed_unary_ops, multi_allowed_unary_ops, allowed_binary_ops, multi_allowed_binary_ops = (
+                self._derive_blackbox_unary_policy(blackbox_state, operator_hints)
+            )
+            if blackbox_search_plan:
+                blackbox_search_plan["allowed_unary_ops"] = list(allowed_unary_ops)
+                blackbox_search_plan["multi_allowed_unary_ops"] = [list(v) for v in multi_allowed_unary_ops]
+                blackbox_search_plan["binary_op_priors"] = list(binary_op_priors)
+                blackbox_search_plan["multi_binary_op_priors"] = [list(v) for v in multi_binary_op_priors]
+                blackbox_search_plan["allowed_binary_ops"] = list(allowed_binary_ops)
+                blackbox_search_plan["multi_allowed_binary_ops"] = [list(v) for v in multi_allowed_binary_ops]
             if isinstance(self.blackbox_diagnostics_, dict):
                 self.blackbox_diagnostics_["candidate_screening"] = {
                     "candidate_count": len(candidate_formulas or []),
@@ -2192,11 +2501,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             best_refined_candidate = min(
                                 candidate_formulas,
                                 key=lambda c: (
-                                    float(c.get("mse", float("inf"))),
-                                    float(c.get("complexity", float("inf"))),
+                                    _finite_float(c.get("mse"), float("inf")),
+                                    _finite_float(c.get("complexity"), float("inf")),
                                 ),
                             )
-                            best_refined_mse = float(best_refined_candidate.get("mse", float("inf")))
+                            best_refined_mse = _finite_float(best_refined_candidate.get("mse"), float("inf"))
                             if best_refined_mse < best_mse:
                                 best_formula = best_refined_candidate.get("formula", best_formula)
                                 best_mse = best_refined_mse
@@ -2204,7 +2513,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 np.isfinite(best_refined_mse)
                                 and (
                                     best_refined_mse <= self.early_stop_mse
-                                    or best_refined_candidate.get("validation_r2", -1.0) >= max(
+                                    or _finite_float(best_refined_candidate.get("validation_r2"), -1.0) >= max(
                                         float(blackbox_search_plan.get("candidate_acceptance_r2", 0.985)),
                                         min(self.evolution_skip_r2, 0.999999),
                                     )
@@ -2293,6 +2602,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 early_stop_mse=self.early_stop_mse,
                                 seed_omegas=detected_omegas,
                                 op_priors=cpp_op_priors,
+                                allowed_unary_ops=list(blackbox_search_plan.get("allowed_unary_ops", [])),
+                                binary_op_priors=list(blackbox_search_plan.get("binary_op_priors", [])),
+                                allowed_binary_ops=list(blackbox_search_plan.get("allowed_binary_ops", [])),
                                 timeout_seconds=run_timeout,
                                 p_min=_clamp_float(proposer_plan.get("p_min"), self.p_min, -8.0, 3.0),
                                 p_max=_clamp_float(proposer_plan.get("p_max"), self.p_max, 1.0, 10.0),
@@ -2314,6 +2626,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                     lo=10,
                                     hi=120,
                                 ),
+                                multi_allowed_unary_ops=blackbox_search_plan.get("multi_allowed_unary_ops", []),
+                                multi_binary_op_priors=blackbox_search_plan.get("multi_binary_op_priors", []),
+                                multi_allowed_binary_ops=blackbox_search_plan.get("multi_allowed_binary_ops", []),
                                 seed_graphs_py=seed_graphs_py,
                             )
 
@@ -2349,14 +2664,21 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 if evo_formula:
                     self.evolution_candidate_formula_ = evo_formula
                     self.evolution_candidate_mse_ = evo_mse
-                    selected_formula, selected_mse, selection_source = self._select_final_formula(
-                        best_formula,
-                        best_mse,
-                        evo_formula,
-                        evo_mse,
-                        X,
-                        y,
-                    )
+                    if getattr(self, "blackbox_state_", None) is not None and self.blackbox_state_.enabled:
+                        selection_source = self._compare_blackbox_formulas(best_formula, evo_formula, X, y)
+                        if selection_source == "challenger":
+                            selected_formula, selected_mse = evo_formula, self._formula_mse(evo_formula, X, y)
+                        else:
+                            selected_formula, selected_mse = best_formula, self._formula_mse(best_formula, X, y)
+                    else:
+                        selected_formula, selected_mse, selection_source = self._select_final_formula(
+                            best_formula,
+                            best_mse,
+                            evo_formula,
+                            evo_mse,
+                            X,
+                            y,
+                        )
                     if selection_source == "challenger":
                         best_formula = selected_formula
                         best_mse = selected_mse

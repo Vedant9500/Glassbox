@@ -24,6 +24,9 @@ py::dict run_evolution_cpp(
     py::list seed_omegas = py::list(),
     int timeout_seconds = 120,
     py::list op_priors = py::list(),
+    py::list allowed_unary_ops = py::list(),
+    py::list binary_op_priors = py::list(),
+    py::list allowed_binary_ops = py::list(),
     // Power exponent bounds
     double p_min = -2.0,
     double p_max = 3.0,
@@ -56,6 +59,9 @@ py::dict run_evolution_cpp(
     int num_threads = -1,
     // Diverse Islands Support
     py::list multi_op_priors = py::list(),
+    py::list multi_allowed_unary_ops = py::list(),
+    py::list multi_binary_op_priors = py::list(),
+    py::list multi_allowed_binary_ops = py::list(),
     py::list multi_seed_omegas = py::list(),
     py::list seed_graphs_py = py::list()
 ) {
@@ -91,6 +97,21 @@ py::dict run_evolution_cpp(
         cpp_op_priors.push_back(item.cast<double>());
     }
 
+    std::vector<double> cpp_binary_op_priors;
+    for (auto item : binary_op_priors) {
+        cpp_binary_op_priors.push_back(item.cast<double>());
+    }
+
+    std::vector<int> cpp_allowed_unary_ops;
+    for (auto item : allowed_unary_ops) {
+        cpp_allowed_unary_ops.push_back(item.cast<int>());
+    }
+
+    std::vector<int> cpp_allowed_binary_ops;
+    for (auto item : allowed_binary_ops) {
+        cpp_allowed_binary_ops.push_back(item.cast<int>());
+    }
+
     // Parse multi_op_priors
     std::vector<std::vector<double>> cpp_multi_op_priors;
     for (auto item : multi_op_priors) {
@@ -99,6 +120,33 @@ py::dict run_evolution_cpp(
             prior_vec.push_back(val.cast<double>());
         }
         cpp_multi_op_priors.push_back(prior_vec);
+    }
+
+    std::vector<std::vector<double>> cpp_multi_binary_op_priors;
+    for (auto item : multi_binary_op_priors) {
+        std::vector<double> prior_vec;
+        for (auto val : item.cast<py::list>()) {
+            prior_vec.push_back(val.cast<double>());
+        }
+        cpp_multi_binary_op_priors.push_back(prior_vec);
+    }
+
+    std::vector<std::vector<int>> cpp_multi_allowed_unary_ops;
+    for (auto item : multi_allowed_unary_ops) {
+        std::vector<int> allowed_vec;
+        for (auto val : item.cast<py::list>()) {
+            allowed_vec.push_back(val.cast<int>());
+        }
+        cpp_multi_allowed_unary_ops.push_back(allowed_vec);
+    }
+
+    std::vector<std::vector<int>> cpp_multi_allowed_binary_ops;
+    for (auto item : multi_allowed_binary_ops) {
+        std::vector<int> allowed_vec;
+        for (auto val : item.cast<py::list>()) {
+            allowed_vec.push_back(val.cast<int>());
+        }
+        cpp_multi_allowed_binary_ops.push_back(allowed_vec);
     }
 
     // Parse multi_seed_omegas
@@ -175,7 +223,13 @@ py::dict run_evolution_cpp(
     config.generations = generations;
     config.early_stop_mse = early_stop_mse;
     config.op_priors = cpp_op_priors;
+    config.allowed_unary_ops = cpp_allowed_unary_ops;
+    config.binary_op_priors = cpp_binary_op_priors;
+    config.allowed_binary_ops = cpp_allowed_binary_ops;
     config.multi_op_priors = cpp_multi_op_priors;
+    config.multi_allowed_unary_ops = cpp_multi_allowed_unary_ops;
+    config.multi_binary_op_priors = cpp_multi_binary_op_priors;
+    config.multi_allowed_binary_ops = cpp_multi_allowed_binary_ops;
     config.multi_seed_omegas = cpp_multi_seed_omegas;
     config.p_min = p_min;
     config.p_max = p_max;
@@ -520,6 +574,9 @@ PYBIND11_MODULE(_core, m) {
           py::arg("early_stop_mse")=1e-6, py::arg("seed_omegas")=py::list(),
           py::arg("timeout_seconds")=120,
           py::arg("op_priors")=py::list(),
+          py::arg("allowed_unary_ops")=py::list(),
+          py::arg("binary_op_priors")=py::list(),
+          py::arg("allowed_binary_ops")=py::list(),
           py::arg("p_min")=-2.0,
           py::arg("p_max")=3.0,
           py::arg("use_nsga2")=false,
@@ -547,6 +604,9 @@ PYBIND11_MODULE(_core, m) {
           py::arg("early_stop_max_nodes")=50,
           py::arg("num_threads")=-1,
           py::arg("multi_op_priors")=py::list(),
+          py::arg("multi_allowed_unary_ops")=py::list(),
+          py::arg("multi_binary_op_priors")=py::list(),
+          py::arg("multi_allowed_binary_ops")=py::list(),
           py::arg("multi_seed_omegas")=py::list(),
           py::arg("seed_graphs_py")=py::list());
 

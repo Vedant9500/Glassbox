@@ -632,6 +632,14 @@ def build_basis_from_predictions(
         raise ValueError(f"Expected x to be 1D or 2D, got shape {x.shape}")
 
     n, n_vars = x.shape
+    prediction_uncertainty = _prediction_uncertainty_metrics(predictions)
+    low_trust_multivariate = (
+        n_vars > 1
+        and bool(prediction_uncertainty.get("prediction_uncertain", False))
+        and float(prediction_uncertainty.get("prediction_entropy") or 0.0) >= 0.80
+        and float(prediction_uncertainty.get("prediction_margin") or 1.0) <= 0.10
+    )
+    multivariate_blackbox = bool(n_vars > 1 and (universal_basis or low_trust_multivariate))
     
     basis_list = []
     names = []
@@ -668,13 +676,14 @@ def build_basis_from_predictions(
             for p in range(2, max_power + 1):
                 basis_list.append(xi ** p)
                 names.append(f"{var_name(i)}^{p}")
-            
-            # Fractional powers - critical for formulas like x^2.3, x^1.5
-            # Use absolute value to handle negative x values
-            xi_safe = np.abs(xi) + 1e-10  # Avoid 0^fractional
-            for p in [0.5, 1.5, 2.5, 0.33, 0.67, 1.33, 2.33]:
-                basis_list.append(np.sign(xi) * (xi_safe ** p))
-                names.append(f"{var_name(i)}^{p}")
+
+            # Fractional powers are useful in 1D exact recovery, but in
+            # multivariate blackbox mode they strongly encourage brittle fits.
+            if not multivariate_blackbox:
+                xi_safe = np.abs(xi) + 1e-10
+                for p in [0.5, 1.5, 2.5, 0.33, 0.67, 1.33, 2.33]:
+                    basis_list.append(np.sign(xi) * (xi_safe ** p))
+                    names.append(f"{var_name(i)}^{p}")
     
     # Periodic operations - build comprehensive omega list
     # Always include common frequencies: 1.0, 2.0, 0.5
@@ -692,11 +701,13 @@ def build_basis_from_predictions(
     
     # Periodic terms (always include in universal mode)
     include_periodic = allow_periodic and (
-        universal_basis or
+        (universal_basis and not multivariate_blackbox) or
         predictions.get('sin', 0) >= threshold or
         predictions.get('cos', 0) >= threshold or
         predictions.get('periodic', 0) >= threshold
     )
+    if multivariate_blackbox and detected_omegas:
+        include_periodic = include_periodic or predictions.get('periodic', 0) >= max(0.55, threshold)
 
     if include_periodic:
         for i in range(n_vars):
@@ -735,10 +746,15 @@ def build_basis_from_predictions(
     
     # Exponential operations (only if predicted OR universal)
     include_exp = allow_exp and (
-        universal_basis or
+        (universal_basis and not multivariate_blackbox) or
         predictions.get('exp', 0) >= threshold or 
         predictions.get('exponential', 0) >= threshold
     )
+    if multivariate_blackbox:
+        include_exp = include_exp and max(
+            predictions.get('exp', 0),
+            predictions.get('exponential', 0),
+        ) >= max(0.85, threshold + 0.25)
     if include_exp:
         for i in range(n_vars):
             xi = x[:, i]
@@ -752,20 +768,23 @@ def build_basis_from_predictions(
             basis_list.append(np.exp(-xi**2))
             names.append(f"exp(-{name}^2)")
 
-            denom = exp_x - 1.0
-            denom = np.where(np.abs(denom) < 1e-6, np.sign(denom + 1e-12) * 1e-6, denom)
-            
-            basis_list.append(1.0 / denom)
-            names.append(f"1/(exp({name})-1)")
-            basis_list.append(xi / denom)
-            names.append(f"{name}/(exp({name})-1)")
-            basis_list.append((xi ** 2) / denom)
-            names.append(f"{name}^2/(exp({name})-1)")
-            basis_list.append((xi ** 3) / denom)
-            names.append(f"{name}^3/(exp({name})-1)")
+            if not multivariate_blackbox:
+                denom = exp_x - 1.0
+                denom = np.where(np.abs(denom) < 1e-6, np.sign(denom + 1e-12) * 1e-6, denom)
+                basis_list.append(1.0 / denom)
+                names.append(f"1/(exp({name})-1)")
+                basis_list.append(xi / denom)
+                names.append(f"{name}/(exp({name})-1)")
+                basis_list.append((xi ** 2) / denom)
+                names.append(f"{name}^2/(exp({name})-1)")
+                basis_list.append((xi ** 3) / denom)
+                names.append(f"{name}^3/(exp({name})-1)")
     
     # Logarithmic operations (always include in universal mode for Nguyen-7 etc.)
-    if allow_log and (universal_basis or predictions.get('log', 0) >= threshold):
+    include_log = allow_log and ((universal_basis and not multivariate_blackbox) or predictions.get('log', 0) >= threshold)
+    if multivariate_blackbox:
+        include_log = include_log and predictions.get('log', 0) >= max(0.85, threshold + 0.25)
+    if include_log:
         for i in range(n_vars):
             xi = x[:, i]
             name = var_name(i)
@@ -776,7 +795,7 @@ def build_basis_from_predictions(
             names.append(f"log({name}^2+1)")
     
     # Composition terms (for sin(x²), etc. - covers Nguyen-10)
-    if universal_basis and allow_periodic:
+    if universal_basis and allow_periodic and not multivariate_blackbox:
         for i in range(n_vars):
             xi = x[:, i]
             name = var_name(i)
@@ -797,7 +816,7 @@ def build_basis_from_predictions(
             names.append(f"cos(1/{name})")
 
     # Power/rational families should be available even if periodic is disabled
-    if universal_basis and allow_power:
+    if universal_basis and allow_power and not multivariate_blackbox:
         for i in range(n_vars):
             xi = x[:, i]
             name = var_name(i)

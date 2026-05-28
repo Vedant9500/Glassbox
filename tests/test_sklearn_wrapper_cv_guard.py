@@ -390,6 +390,362 @@ def test_blackbox_basis_model_skips_cpp_on_additive_signal(monkeypatch):
     assert est.best_mse_ < 0.5
 
 
+def test_blackbox_demotes_unstable_fast_path_incumbent(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    called = {"cpp": False}
+
+    class _FakeCore:
+        @staticmethod
+        def run_evolution(**kwargs):
+            called["cpp"] = True
+            return {"best_mse": 1.0, "formula": "0", "nodes": [], "output_weights": []}
+
+        @staticmethod
+        def reduce_formula_noise(formula, X_list, y):
+            return formula
+
+        @staticmethod
+        def simplify_formula(formula, **kwargs):
+            return formula
+
+    def _fake_fast_path(*args, **kwargs):
+        return {
+            "formula": "2*x0 + 0.1*x1/(exp(x1)-1) + 0.05*x1**1.5",
+            "mse": 1e-4,
+            "operator_hints": {},
+        }
+
+    monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
+    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+
+    rng = np.random.RandomState(61)
+    X = rng.randn(160, 2)
+    X[:20, 1] = np.linspace(-1e-3, 1e-3, 20)
+    y = 2.0 * X[:, 0]
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=False,
+        use_universal_proposer=False,
+        blackbox_mode=True,
+        blackbox_standardize=False,
+        blackbox_min_features_to_select=2,
+        population_size=10,
+        generations=10,
+        multi_start_runs=1,
+        timeout=20,
+        random_state=61,
+    )
+    est.fit(X, y)
+
+    gate = est.blackbox_diagnostics_.get("fast_path_validation_gate", {})
+    assert gate.get("accepted") is False
+    assert "exp(x1)-1" not in est.get_formula()
+    assert called["cpp"] is False
+
+
+def test_blackbox_candidate_screening_handles_none_validation_values():
+    est = GlassboxRegressor(random_state=67)
+    candidates = [
+        {"formula": "x0", "mse": 0.1, "validation_r2": None, "complexity": None},
+        {"formula": "x1", "mse": None, "validation_r2": None, "complexity": 1},
+    ]
+
+    pruned = est._prune_blackbox_candidate_formulas(candidates, max_candidates=2)
+    hints = est._derive_blackbox_operator_hints(None, pruned)
+
+    assert len(pruned) == 2
+    assert isinstance(hints, dict)
+
+
+def test_blackbox_evolution_comparison_uses_validation_not_incumbent_train_mse():
+    rng = np.random.RandomState(71)
+    X = rng.randn(180, 2)
+    X[:20, 1] = np.linspace(-1e-3, 1e-3, 20)
+    y = 2.0 * X[:, 0]
+
+    est = GlassboxRegressor(random_state=71)
+    winner = est._compare_blackbox_formulas(
+        "2*x0 + 0.1*x1/(exp(x1)-1) + 0.05*x1**1.5",
+        "2*x0",
+        X,
+        y,
+    )
+
+    assert winner == "challenger"
+
+
+def test_blackbox_high_uncertainty_disables_universal_fast_path(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    calls = []
+
+    class _FakeCore:
+        @staticmethod
+        def run_evolution(**kwargs):
+            return {"best_mse": 10.0, "formula": "x0+x1", "nodes": [], "output_weights": []}
+
+        @staticmethod
+        def reduce_formula_noise(formula, X_list, y):
+            return formula
+
+        @staticmethod
+        def simplify_formula(formula, **kwargs):
+            return formula
+
+    def _fake_fast_path(*args, **kwargs):
+        calls.append(bool(kwargs.get("auto_expand", True)))
+        if kwargs.get("auto_expand", True):
+            return {
+                "formula": "x0 + x1 + x0^1.5",
+                "mse": 0.1,
+                "operator_hints": {},
+                "uncertainty": {
+                    "prediction_entropy": 0.95,
+                    "prediction_margin": 0.01,
+                    "prediction_uncertain": True,
+                },
+            }
+        return {
+            "formula": "x0 + x1",
+            "mse": 0.05,
+            "operator_hints": {},
+            "uncertainty": {
+                "prediction_entropy": 0.95,
+                "prediction_margin": 0.01,
+                "prediction_uncertain": True,
+            },
+        }
+
+    monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
+    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+
+    rng = np.random.RandomState(73)
+    X = rng.randn(120, 3)
+    y = X[:, 0] + X[:, 1]
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=False,
+        use_universal_proposer=False,
+        blackbox_mode=True,
+        blackbox_standardize=False,
+        blackbox_min_features_to_select=2,
+        population_size=10,
+        generations=10,
+        multi_start_runs=1,
+        timeout=20,
+        random_state=73,
+    )
+    est.fit(X, y)
+
+    assert calls[:2] == [True, False]
+    assert est.blackbox_diagnostics_.get("fast_path_auto_expand") is False
+
+
+def test_blackbox_low_trust_constraints_drop_risky_operator_hints():
+    from glassbox.sr.blackbox_preprocessor import BlackboxState
+
+    est = GlassboxRegressor(random_state=79)
+    est._fp_result = {
+        "uncertainty": {
+            "prediction_entropy": 0.95,
+            "prediction_margin": 0.01,
+            "prediction_uncertain": True,
+        }
+    }
+    est.blackbox_diagnostics_ = {}
+    state = BlackboxState(
+        enabled=True,
+        selected_features=[0, 1, 2],
+        dropped_features=[],
+        feature_scores={},
+        ranker_votes={},
+        x_mean=np.zeros(3),
+        x_scale=np.ones(3),
+        y_mean=0.0,
+        y_scale=1.0,
+        standardized=False,
+        reason="selected_top_features",
+        interaction_terms=["x0*x1"],
+    )
+    hints = est._constrain_blackbox_operator_hints(
+        {
+            "operators": {"periodic", "power", "exp", "log", "rational"},
+            "powers": [2, 3, 5],
+            "has_rational": True,
+            "has_exp_decay": True,
+        },
+        state,
+    )
+
+    assert hints["operators"] == {"periodic"}
+    assert hints["powers"] == [2, 3]
+    assert hints["has_rational"] is False
+    assert hints["has_exp_decay"] is False
+
+
+def test_blackbox_binary_priors_are_conservative_under_low_trust():
+    from glassbox.sr.blackbox_preprocessor import BlackboxState
+
+    est = GlassboxRegressor(num_islands=4, random_state=83)
+    est._fp_result = {
+        "uncertainty": {
+            "prediction_entropy": 0.95,
+            "prediction_margin": 0.01,
+            "prediction_uncertain": True,
+        }
+    }
+    est.blackbox_diagnostics_ = {}
+    state = BlackboxState(
+        enabled=True,
+        selected_features=[0, 1, 2],
+        dropped_features=[],
+        feature_scores={},
+        ranker_votes={},
+        x_mean=np.zeros(3),
+        x_scale=np.ones(3),
+        y_mean=0.0,
+        y_scale=1.0,
+        standardized=False,
+        reason="selected_top_features",
+        interaction_terms=["x0*x1"],
+    )
+
+    priors, multi = est._derive_blackbox_binary_priors(
+        state,
+        {"operators": {"periodic"}, "has_rational": False},
+    )
+
+    assert len(priors) == 3
+    assert priors[1] < priors[0]
+    assert priors[1] < priors[2]
+    assert len(multi) == 4
+    assert all(len(row) == 3 for row in multi)
+
+
+def test_blackbox_unary_policy_is_conservative_under_low_trust():
+    from glassbox.sr.blackbox_preprocessor import BlackboxState
+
+    est = GlassboxRegressor(num_islands=4, random_state=84)
+    est._fp_result = {
+        "uncertainty": {
+            "prediction_entropy": 0.95,
+            "prediction_margin": 0.01,
+            "prediction_uncertain": True,
+        }
+    }
+    est.blackbox_diagnostics_ = {}
+    state = BlackboxState(
+        enabled=True,
+        selected_features=[0, 1, 2],
+        dropped_features=[],
+        feature_scores={},
+        ranker_votes={},
+        x_mean=np.zeros(3),
+        x_scale=np.ones(3),
+        y_mean=0.0,
+        y_scale=1.0,
+        standardized=False,
+        reason="selected_top_features",
+        interaction_terms=["x0*x1"],
+    )
+
+    allowed_unary, multi_unary, allowed_binary, multi_binary = est._derive_blackbox_unary_policy(
+        state,
+        {"operators": {"periodic"}, "has_rational": False},
+    )
+
+    assert allowed_unary == []
+    assert allowed_binary == []
+    assert len(multi_unary) == 4
+    assert len(multi_binary) == 4
+    assert [0, 1, 2, 3, 4] in multi_unary
+    assert [0, 1, 2] in multi_binary
+
+
+def test_blackbox_cpp_receives_binary_priors(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    captured = {}
+
+    class _FakeCore:
+        @staticmethod
+        def run_evolution(**kwargs):
+            captured["allowed_unary_ops"] = kwargs.get("allowed_unary_ops")
+            captured["binary_op_priors"] = kwargs.get("binary_op_priors")
+            captured["allowed_binary_ops"] = kwargs.get("allowed_binary_ops")
+            captured["multi_allowed_unary_ops"] = kwargs.get("multi_allowed_unary_ops")
+            captured["multi_binary_op_priors"] = kwargs.get("multi_binary_op_priors")
+            captured["multi_allowed_binary_ops"] = kwargs.get("multi_allowed_binary_ops")
+            return {"best_mse": 10.0, "formula": "x0+x1", "nodes": [], "output_weights": []}
+
+        @staticmethod
+        def reduce_formula_noise(formula, X_list, y):
+            return formula
+
+        @staticmethod
+        def simplify_formula(formula, **kwargs):
+            return formula
+
+    def _fake_fast_path(*args, **kwargs):
+        return {
+            "formula": "x0 + x1",
+            "mse": 10.0,
+            "operator_hints": {
+                "operators": {"periodic", "rational"},
+                "has_rational": True,
+                "has_exp_decay": False,
+                "powers": [2],
+            },
+            "uncertainty": {
+                "prediction_entropy": 0.95,
+                "prediction_margin": 0.01,
+                "prediction_uncertain": True,
+            },
+        }
+
+    monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
+    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+    monkeypatch.setattr(sw.GlassboxRegressor, "_refine_candidate_formulas", lambda self, *args, **kwargs: [])
+    monkeypatch.setattr(sw.GlassboxRegressor, "_fit_blackbox_basis_model", lambda self, *args, **kwargs: None)
+
+    rng = np.random.RandomState(89)
+    X = rng.randn(140, 3)
+    y = X[:, 0] * np.sin(X[:, 1]) + 0.1 * X[:, 2]
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=False,
+        use_universal_proposer=False,
+        blackbox_mode=True,
+        blackbox_standardize=False,
+        blackbox_min_features_to_select=2,
+        population_size=10,
+        generations=10,
+        multi_start_runs=1,
+        timeout=20,
+        num_islands=4,
+        random_state=89,
+        evolution_skip_r2=0.999999,
+        early_stop_mse=1e-12,
+    )
+    est.fit(X, y)
+
+    assert captured["binary_op_priors"] is not None
+    assert captured["allowed_unary_ops"] == []
+    assert len(captured["binary_op_priors"]) == 3
+    assert captured["binary_op_priors"][1] < captured["binary_op_priors"][0]
+    assert captured["allowed_binary_ops"] == []
+    assert len(captured["multi_allowed_unary_ops"]) == est.num_islands
+    assert len(captured["multi_binary_op_priors"]) == est.num_islands
+    assert len(captured["multi_allowed_binary_ops"]) == est.num_islands
+
+
 def test_blackbox_candidate_screening_exports_interaction_operator_hints(monkeypatch):
     import glassbox.sr.sklearn_wrapper as sw
 

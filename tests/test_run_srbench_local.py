@@ -1,6 +1,7 @@
 import numpy as np
 
 from scripts import run_srbench_local as rsl
+from scripts import classifier_fast_path as cfp
 
 
 def test_run_track1_uses_per_run_params_without_hard_timeout(monkeypatch):
@@ -162,3 +163,42 @@ def test_apply_srbench_run_budget_caps_internal_adaptive_budget():
     assert capped["max_compute_budget"] == 7
     assert capped["min_compute_budget"] == 7
     assert params["max_compute_budget"] == 300
+
+
+def test_multivariate_universal_fast_path_basis_avoids_fragile_families():
+    X = np.random.RandomState(5).randn(40, 3)
+    basis, names = cfp.build_basis_from_predictions(
+        X,
+        predictions={"power": 0.9, "exp": 0.97, "log": 0.97, "periodic": 0.31},
+        threshold=0.3,
+        universal_basis=True,
+    )
+
+    assert basis.shape[0] == X.shape[0]
+    assert not any("1/(exp(" in name for name in names)
+    assert not any("^1.5" in name or "^0.67" in name or "^1.33" in name for name in names)
+    assert not any("sin(1/" in name for name in names)
+    assert not any("1/sqrt(1-" in name for name in names)
+
+
+def test_multivariate_low_trust_fast_path_basis_avoids_fragile_families_even_without_universal():
+    X = np.random.RandomState(6).randn(40, 3)
+    basis, names = cfp.build_basis_from_predictions(
+        X,
+        predictions={
+            "power": 0.79,
+            "exp": 0.97,
+            "exponential": 0.97,
+            "log": 0.90,
+            "periodic": 0.31,
+            "addition": 1.0,
+            "multiplication": 0.99,
+            "rational": 0.98,
+        },
+        threshold=0.3,
+        universal_basis=False,
+    )
+
+    assert basis.shape[0] == X.shape[0]
+    assert not any("1/(exp(" in name for name in names)
+    assert not any("^1.5" in name or "^0.67" in name or "^1.33" in name for name in names)
