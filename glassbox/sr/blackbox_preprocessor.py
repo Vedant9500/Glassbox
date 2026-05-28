@@ -462,7 +462,38 @@ def discover_blackbox_interactions(
         return {"interaction_pairs": [], "interaction_terms": [], "interaction_scores": {}}
 
     base_scores = _cheap_feature_scores(X, y)
-    candidate_rows: List[Tuple[float, Tuple[int, int], str]] = []
+    candidate_rows: List[Tuple[float, Tuple[int, int], str, np.ndarray]] = []
+
+    def _interaction_family(term: str) -> str:
+        lower = term.lower()
+        if "sin(" in lower or "cos(" in lower:
+            return "periodic"
+        if "exp(" in lower:
+            return "exp"
+        if "log(" in lower:
+            return "log"
+        if "/" in lower:
+            return "rational"
+        if "^" in lower:
+            return "power_sum"
+        if "*" in lower:
+            return "product"
+        if "+" in lower or "-" in lower:
+            return "linear_combo"
+        return "other"
+
+    def _normalized_signal(values: np.ndarray) -> Optional[np.ndarray]:
+        arr = np.asarray(values, dtype=np.float64).reshape(-1)
+        mask = np.isfinite(arr)
+        if int(mask.sum()) < 8:
+            return None
+        centered = arr[mask] - float(np.mean(arr[mask]))
+        scale = float(np.std(centered))
+        if not np.isfinite(scale) or scale < 1e-10:
+            return None
+        out = np.zeros_like(arr, dtype=np.float64)
+        out[mask] = centered / scale
+        return out
 
     for i in range(len(cols)):
         for j in range(i + 1, len(cols)):
@@ -498,6 +529,7 @@ def discover_blackbox_interactions(
 
             best_term = None
             best_score = -np.inf
+            best_signal = None
             for name, values in candidates.items():
                 if not np.all(np.isfinite(values)):
                     continue
@@ -516,18 +548,46 @@ def discover_blackbox_interactions(
                     if score > best_score:
                         best_score = score
                         best_term = name
+                        best_signal = _normalized_signal(values)
                 except Exception:
                     continue
 
-            if best_term is not None:
-                candidate_rows.append((best_score, (la, lb), best_term))
+            if best_term is not None and best_signal is not None:
+                candidate_rows.append((best_score, (la, lb), best_term, best_signal))
 
     candidate_rows.sort(key=lambda item: item[0], reverse=True)
-    top = candidate_rows[: max(0, int(max_pairs))]
+    top: List[Tuple[float, Tuple[int, int], str, np.ndarray]] = []
+    family_counts: Dict[str, int] = {}
+    for score, pair, term, signal in candidate_rows:
+        if len(top) >= max(0, int(max_pairs)):
+            break
+        family = _interaction_family(term)
+        # Keep the pool diverse: one dominant template is useful, many
+        # near-collinear variants waste seeds and inflate operator hints.
+        if family_counts.get(family, 0) >= 2 and len(top) >= max(2, int(max_pairs) // 2):
+            continue
+        redundant = False
+        for _, existing_pair, existing_term, existing_signal in top:
+            same_pair = tuple(pair) == tuple(existing_pair)
+            same_family = _interaction_family(existing_term) == family
+            if not (same_pair or same_family):
+                continue
+            try:
+                corr = float(np.corrcoef(signal, existing_signal)[0, 1])
+            except Exception:
+                corr = 0.0
+            if np.isfinite(corr) and abs(corr) >= 0.985:
+                redundant = True
+                break
+        if redundant:
+            continue
+        family_counts[family] = family_counts.get(family, 0) + 1
+        top.append((score, pair, term, signal))
+
     return {
-        "interaction_pairs": [pair for _, pair, _ in top],
-        "interaction_terms": [term for _, _, term in top],
-        "interaction_scores": {term: float(score) for score, _, term in top},
+        "interaction_pairs": [pair for _, pair, _, _ in top],
+        "interaction_terms": [term for _, _, term, _ in top],
+        "interaction_scores": {term: float(score) for score, _, term, _ in top},
     }
 
 

@@ -186,7 +186,7 @@ Output:
 
 These should feed:
 
-- [ ] `operator_hints`,
+- [x] `operator_hints`,
 - [x] `candidate_formulas`,
 - [x] seed graphs,
 - [x] C++ evolution `X_list` feature subset.
@@ -194,7 +194,7 @@ These should feed:
 Highest-value next step:
 
 - [x] score interactions against a holdout split and/or residual improvement, not just in-sample fit,
-- [ ] penalize redundant variants so all near-identical pair templates do not survive.
+- [x] penalize redundant variants so all near-identical pair templates do not survive.
 
 ## Phase 4: Multivariate Seed Graphs
 
@@ -233,7 +233,7 @@ Research-driven correction:
 - [~] uncertainty should first increase candidate screening/refinement budget,
 - [~] uncertainty should not automatically multiply population, generations, and timeout together,
 - [~] decomposition and validation should precede search inflation,
-- [ ] multivariate proposer influence should be reduced until a true multivariate planner exists.
+- [x] multivariate proposer influence should be reduced until a true multivariate planner exists.
 
 Future trained planner heads:
 
@@ -268,9 +268,9 @@ This is especially useful for blackbox approximation, where exact compact formul
 
 Research-driven correction:
 
-- [ ] move residual/additive fitting earlier in the blackbox decision path,
-- [ ] fit terms under explicit validation gating,
-- [ ] stop once marginal validation gain per added complexity is too small.
+- [x] move residual/additive fitting earlier in the blackbox decision path,
+- [x] fit terms under explicit validation gating,
+- [x] stop once marginal validation gain per added complexity is too small.
 
 ## Phase 6.5: Candidate Refinement Before Evolution
 
@@ -302,7 +302,7 @@ Blackbox should be optimized with different metrics from exact symbolic recovery
 - [x] formula size,
 - [x] selected feature count diagnostics,
 - [x] prediction stability summaries,
-- [ ] domain failure rate,
+- [x] domain failure rate,
 - [x] time-to-acceptable model,
 - [x] displayed-formula MSE/R2, not raw engine-only score.
 
@@ -310,8 +310,8 @@ For Track 1 SRBench, exact recovery should not be the headline metric.
 
 Additional priorities:
 
-- [ ] distinguish candidate-screening wins from evolution wins,
-- [ ] report search inflation separately from true wall-clock savings,
+- [x] distinguish candidate-screening wins from evolution wins,
+- [x] report search inflation separately from true wall-clock savings,
 - [ ] align local Track 1 diagnosis more closely with official SRBench splits/protocol.
 
 ## Integration Points
@@ -390,6 +390,6 @@ Success criteria:
 
 These are the current highest-value patches:
 
-1. Penalize redundant interaction variants and propagate the best interaction families into `operator_hints`.
-2. Move validation-gated additive/residual modeling earlier in the blackbox decision path.
-3. Rebalance the multivariate search planner so disagreement and uncertainty spend more budget on screening than on raw search inflation.
+1. [x] Penalize redundant interaction variants and propagate the best interaction families into `operator_hints`.
+2. [x] Move validation-gated additive/residual modeling earlier in the blackbox decision path.
+3. [x] Rebalance the multivariate search planner so disagreement and uncertainty spend more budget on screening than on raw search inflation.

@@ -22,6 +22,7 @@ import math  # noqa: F401
 import warnings
 import re
 import gzip
+import ast
 from pathlib import Path
 from datetime import datetime
 from multiprocessing import get_context
@@ -345,6 +346,54 @@ def _infer_formula_n_features(formula):
     return max(indices) + 1 if indices else 1
 
 
+def _protect_fractional_powers(formula):
+    """Rewrite simple non-integer powers to a real-valued protected form.
+
+    Blackbox evolution may emit terms such as ``x1**1.5``. NumPy evaluates
+    those as NaN for negative inputs, while the estimator's protected runtime
+    keeps formulas evaluable. For benchmark display/scoring, use a signed
+    magnitude power so the formula remains real-valued on PMLB splits.
+    """
+    text = str(formula or "")
+    if "**" not in text:
+        return text
+
+    class _FractionalPowerProtector(ast.NodeTransformer):
+        def visit_BinOp(self, node):  # noqa: N802 - ast API name
+            node = self.generic_visit(node)
+            if not isinstance(node.op, ast.Pow):
+                return node
+            exponent = None
+            if isinstance(node.right, ast.Constant) and isinstance(node.right.value, (int, float)):
+                exponent = float(node.right.value)
+            elif (
+                isinstance(node.right, ast.UnaryOp)
+                and isinstance(node.right.op, ast.USub)
+                and isinstance(node.right.operand, ast.Constant)
+                and isinstance(node.right.operand.value, (int, float))
+            ):
+                exponent = -float(node.right.operand.value)
+            if exponent is None:
+                return node
+            nearest_int = round(exponent)
+            if abs(exponent - nearest_int) <= 1e-10:
+                node.right = ast.Constant(value=int(nearest_int))
+                return node
+            return ast.Call(
+                func=ast.Name(id="_signed_power", ctx=ast.Load()),
+                args=[node.left, ast.Constant(value=exponent)],
+                keywords=[],
+            )
+
+    try:
+        tree = ast.parse(text, mode="eval")
+        tree = _FractionalPowerProtector().visit(tree)
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree)
+    except Exception:
+        return text
+
+
 def _simplify_formula_native(formula, int_tol=0.05, zero_tol=1e-3):
     """Simplify with the native C++ simplifier when available."""
     try:
@@ -400,10 +449,11 @@ def postprocess_formula(formula):
         too_complex_for_symbolic = formula_len > 500 or term_estimate > 24
 
         if too_complex_for_symbolic:
-            return snap_formula_floats(
+            snapped = snap_formula_floats(
                 normalized,
                 SnapConfig(int_tol=evo_int_tol, zero_tol=evo_zero_tol),
             )
+            return _protect_fractional_powers(snapped.replace("^", "**"))
 
         _, simplified_expr = simplify_onn_formula(
             normalized,
@@ -411,9 +461,9 @@ def postprocess_formula(formula):
             zero_tol=evo_zero_tol,
             use_nsimplify=(formula_len <= 300 and term_estimate <= 16),
         )
-        return str(simplified_expr)
+        return _protect_fractional_powers(str(simplified_expr).replace("^", "**"))
     except Exception:
-        return normalized
+        return _protect_fractional_powers(normalized.replace("^", "**"))
 
 
 def evaluate_formula(formula_str, X, *, return_diagnostics=False):
@@ -445,6 +495,7 @@ def evaluate_formula(formula_str, X, *, return_diagnostics=False):
     formula = _normalize_formula_text(formula_str).strip()
     formula = re.sub(r'\|([^|]+)\|', r'abs(\1)', formula)
     formula = formula.replace('^', '**')
+    formula = _protect_fractional_powers(formula)
 
     def _safe_numpy_log(x, base=None):
         """NumPy log that also supports SymPy-style log(x, base)."""
@@ -454,16 +505,28 @@ def evaluate_formula(formula_str, X, *, return_diagnostics=False):
                 out = out / np.log(base)
         return out
 
+    def _signed_power(base, power):
+        base_arr = np.asarray(base, dtype=np.float64)
+        power_val = float(power)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+            if power_val < 0:
+                return np.sign(base_arr) / ((np.abs(base_arr) + 1e-12) ** abs(power_val))
+            return np.sign(base_arr) * (np.abs(base_arr) ** power_val)
+
+    def _safe_exp(x):
+        return np.exp(np.clip(x, -500.0, 500.0))
+
     context = {
         "np": np,
         "log": _safe_numpy_log,
         "sin": np.sin,
         "cos": np.cos,
-        "exp": np.exp,
+        "exp": _safe_exp,
         "sqrt": np.sqrt,
         "abs": np.abs,
         "Abs": np.abs,
         "sign": np.sign,
+        "_signed_power": _signed_power,
         "pi": np.pi,
         "E": np.e,
     }
@@ -835,6 +898,35 @@ def run_with_hard_timeout(est_params, X_train, y_train, X_test, timeout_seconds,
         return {"status": "error", "error": f"spawn error: {outer_err}"}
 
 
+def _fallback_estimator_predictions(run_result, eval_diag, *, split="test"):
+    """Return protected estimator predictions when display-formula scoring fails."""
+    if not isinstance(run_result, dict) or not isinstance(eval_diag, dict):
+        return None, eval_diag
+    key = "y_pred_full" if split == "full" else "y_pred_test"
+    pred = run_result.get(key)
+    if pred is None:
+        return None, eval_diag
+    pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+    if pred.size == 0 or not np.all(np.isfinite(pred)):
+        return None, eval_diag
+    updated = dict(eval_diag)
+    updated["display_formula_failed"] = True
+    updated["display_formula_reason"] = eval_diag.get("reason")
+    updated["reason"] = "protected_estimator_prediction"
+    updated["ok"] = True
+    return pred, updated
+
+
+def _apply_srbench_run_budget(est_params, timeout_budget):
+    """Keep estimator-internal adaptive compute inside the SRBench run budget."""
+    params = dict(est_params)
+    budget = int(max(1, round(float(timeout_budget))))
+    params["timeout"] = budget
+    params["max_compute_budget"] = budget
+    params["min_compute_budget"] = min(int(params.get("min_compute_budget", 10) or 10), budget)
+    return params
+
+
 # ---------------------------------------------------------------------------
 # Runners
 # ---------------------------------------------------------------------------
@@ -923,8 +1015,7 @@ def run_track1_blackbox(
             for run_idx in range(max(1, int(runs_per_formula))):
                 repeat_seed = int(seed) + run_idx * 10007
                 try:
-                    est_params = est.get_params().copy()
-                    est_params["timeout"] = timeout_budget
+                    est_params = _apply_srbench_run_budget(est.get_params(), timeout_budget)
                     est_params["random_state"] = repeat_seed
 
                     # If bloat-skip enabled, make evolution skip more aggressively on good fast-path results
@@ -957,6 +1048,12 @@ def run_track1_blackbox(
                             if post_simplify and formula:
                                 formula = simplify_formula_with_guard(formula, train_X, train_y)
                             y_pred, eval_diag = evaluate_formula(formula, test_X, return_diagnostics=True)
+                            if y_pred is None:
+                                y_pred, eval_diag = _fallback_estimator_predictions(
+                                    run_result,
+                                    eval_diag,
+                                    split="test",
+                                )
                             blackbox_diag = run_result.get("blackbox_diagnostics")
                         else:
                             est_copy = est.__class__(**params)
@@ -1153,8 +1250,7 @@ def run_track2_ground_truth(
                 )
                 t0 = time.time()
                 try:
-                    est_params = est.get_params().copy()
-                    est_params["timeout"] = timeout_budget
+                    est_params = _apply_srbench_run_budget(est.get_params(), timeout_budget)
                     est_params["random_state"] = repeat_seed
 
                     if skip_evolution_if_bloated:
@@ -1187,6 +1283,12 @@ def run_track2_ground_truth(
                         if post_simplify and formula:
                             formula = simplify_formula_with_guard(formula, X_train, y_train)
                         y_pred_all, eval_diag = evaluate_formula(formula, X, return_diagnostics=True)
+                        if y_pred_all is None:
+                            y_pred_all, eval_diag = _fallback_estimator_predictions(
+                                run_result,
+                                eval_diag,
+                                split="full",
+                            )
                     else:
                         est_copy = est.__class__(**est_params)
                         est_copy.fit(X_train, y_train)

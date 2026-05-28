@@ -185,3 +185,24 @@ def test_interaction_scoring_prefers_holdout_stable_signal():
     assert interactions["interaction_terms"]
     best_term = interactions["interaction_terms"][0]
     assert "x0*x1" in best_term or "x1*x0" in best_term
+
+
+def test_interaction_discovery_prunes_redundant_variants():
+    rng = np.random.RandomState(19)
+    x0 = rng.uniform(0.8, 1.2, 180)
+    x1 = 2.0 * x0 + 1e-4 * rng.randn(180)
+    x2 = rng.randn(180)
+    X = np.column_stack([x0, x1, x2])
+    y = x0 * x1 + 0.01 * rng.randn(180)
+
+    interactions = discover_blackbox_interactions(
+        X,
+        y,
+        selected_features=[0, 1, 2],
+        max_pairs=6,
+    )
+
+    terms = interactions["interaction_terms"]
+    assert len(terms) == len(set(terms))
+    multiplicative_terms = [term for term in terms if "*" in term and "sin" not in term and "cos" not in term]
+    assert len(multiplicative_terms) <= 2

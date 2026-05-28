@@ -4,11 +4,12 @@ from scripts import run_srbench_local as rsl
 
 
 def test_run_track1_uses_per_run_params_without_hard_timeout(monkeypatch):
-    captured = {"timeouts": []}
+    captured = {"timeouts": [], "max_compute_budgets": []}
 
     class _FakeEstimator:
         def __init__(self, **kwargs):
             captured["timeouts"].append(kwargs.get("timeout"))
+            captured["max_compute_budgets"].append(kwargs.get("max_compute_budget"))
             self.kwargs = kwargs
 
         def get_params(self):
@@ -19,6 +20,8 @@ def test_run_track1_uses_per_run_params_without_hard_timeout(monkeypatch):
                 "bloat_term_threshold": 20,
                 "blackbox_feature_selection": True,
                 "blackbox_mode": True,
+                "min_compute_budget": 10,
+                "max_compute_budget": 300,
             }
 
         def fit(self, X, y):
@@ -68,6 +71,7 @@ def test_run_track1_uses_per_run_params_without_hard_timeout(monkeypatch):
 
     # First constructor call is the fixture estimator above; second is the per-run estimator.
     assert captured["timeouts"][-1] == 19
+    assert captured["max_compute_budgets"][-1] == 19
 
 
 def test_evaluate_formula_supports_log_with_base():
@@ -88,3 +92,73 @@ def test_evaluate_formula_reports_divide_by_zero():
     assert y_pred is None
     assert diag["ok"] is False
     assert diag["reason"] == "divide_by_zero"
+
+
+def test_evaluate_formula_protects_fractional_powers_on_negative_inputs():
+    X = np.random.RandomState(2).randn(20, 4)
+    X[:5, 1] = -np.abs(X[:5, 1]) - 0.1
+
+    y_pred, diag = rsl.evaluate_formula("x1**1.5 + 0.25*x2**0.67", X, return_diagnostics=True)
+
+    assert y_pred is not None
+    assert diag["ok"] is True
+    assert diag["reason"] == "ok"
+    assert np.all(np.isfinite(y_pred))
+
+
+def test_evaluate_formula_protects_fractional_powers_on_expression_bases():
+    X = np.random.RandomState(3).randn(20, 4)
+
+    y_pred, diag = rsl.evaluate_formula(
+        "((x1-2.0)/0.5)**1.5 + (x2+x3)**0.67",
+        X,
+        return_diagnostics=True,
+    )
+
+    assert y_pred is not None
+    assert diag["ok"] is True
+    assert np.all(np.isfinite(y_pred))
+
+
+def test_evaluate_formula_clips_exp_overflow():
+    X = np.random.RandomState(4).randn(10, 2)
+
+    y_pred, diag = rsl.evaluate_formula("exp(1000*x0)", X, return_diagnostics=True)
+
+    assert y_pred is not None
+    assert diag["ok"] is True
+    assert np.all(np.isfinite(y_pred))
+
+
+def test_postprocess_formula_protects_fractional_power_terms():
+    formula = rsl.postprocess_formula("0.25*x1**1.5 - 0.04272*x2**0.67")
+
+    assert "_signed_power" in formula or "Abs(" in formula or "abs(" in formula or "sign(" in formula
+
+
+def test_fallback_estimator_predictions_marks_display_formula_failure():
+    run_result = {"y_pred_test": np.array([1.0, 2.0, 3.0])}
+    eval_diag = {"ok": False, "reason": "invalid_log"}
+
+    y_pred, diag = rsl._fallback_estimator_predictions(run_result, eval_diag, split="test")
+
+    assert np.allclose(y_pred, [1.0, 2.0, 3.0])
+    assert diag["ok"] is True
+    assert diag["reason"] == "protected_estimator_prediction"
+    assert diag["display_formula_failed"] is True
+    assert diag["display_formula_reason"] == "invalid_log"
+
+
+def test_apply_srbench_run_budget_caps_internal_adaptive_budget():
+    params = {
+        "timeout": 60,
+        "min_compute_budget": 10,
+        "max_compute_budget": 300,
+    }
+
+    capped = rsl._apply_srbench_run_budget(params, 7)
+
+    assert capped["timeout"] == 7
+    assert capped["max_compute_budget"] == 7
+    assert capped["min_compute_budget"] == 7
+    assert params["max_compute_budget"] == 300

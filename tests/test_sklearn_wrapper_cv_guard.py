@@ -178,6 +178,49 @@ def test_blackbox_search_plan_prefers_screening_when_candidates_are_strong():
     assert plan["candidate_shrink_r2"] < plan["candidate_acceptance_r2"]
 
 
+def test_blackbox_search_plan_caps_proxy_proposer_inflation():
+    rng = np.random.RandomState(16)
+    X = rng.randn(180, 6)
+    y = X[:, 0] * np.sin(X[:, 1]) + 0.05 * rng.randn(180)
+
+    _, _, state = prepare_blackbox_search(
+        X,
+        y,
+        enabled=True,
+        max_features=5,
+        standardize=False,
+        min_features_to_select=2,
+    )
+    state.feature_selection_uncertain = True
+
+    est = GlassboxRegressor(population_size=20, generations=30)
+    est.original_n_features_in_ = X.shape[1]
+    plan = est._derive_blackbox_search_plan(
+        state,
+        fast_path_uncertainty={
+            "prediction_entropy": 0.95,
+            "prediction_margin": 0.02,
+            "prediction_uncertain": True,
+        },
+        proposer_plan={
+            "generation_multiplier": 4.0,
+            "population_multiplier": 3.0,
+            "seed_budget": 40,
+            "acceptable_complexity": 120,
+            "early_stop_max_nodes": 200,
+            "timeout_multiplier": 3.0,
+        },
+    )
+
+    assert plan["population_multiplier"] <= 1.85
+    assert plan["generation_multiplier"] <= 2.0
+    assert plan["seed_budget"] <= 14
+    assert plan["screening_budget"] >= plan["seed_budget"]
+    assert plan["acceptable_complexity"] <= 32
+    assert plan["early_stop_max_nodes"] <= 64
+    assert plan["timeout_multiplier"] <= 1.45
+
+
 def test_multivariate_blackbox_cpp_seeds_use_reduced_indices(monkeypatch):
     import glassbox.sr.sklearn_wrapper as sw
 
@@ -445,6 +488,12 @@ def test_blackbox_candidate_pool_can_skip_cpp_from_interaction_formula(monkeypat
 
     assert called["cpp"] is False
     assert "sin" in est.get_formula()
+    outcome = est.blackbox_diagnostics_.get("selection_outcome", {})
+    inflation = est.blackbox_diagnostics_.get("search_inflation", {})
+    assert outcome.get("candidate_screening_win") is True
+    assert outcome.get("evolution_ran") is False
+    assert inflation.get("screening_budget", 0) >= inflation.get("seed_budget", 0)
+    assert est.blackbox_diagnostics_.get("domain_failure_rate") == 0.0
 
 
 def test_evolution_result_is_selected_via_direct_formula_evaluation(monkeypatch):
@@ -494,3 +543,45 @@ def test_evolution_result_is_selected_via_direct_formula_evaluation(monkeypatch)
 
     assert "x0" in est.get_formula() and "x1" in est.get_formula()
     assert getattr(est, "evolution_candidate_formula_", None) == "x0+x1"
+
+
+def test_blackbox_pareto_selector_prefers_stable_simple_formula():
+    rng = np.random.RandomState(53)
+    X = rng.randn(160, 2)
+    y = 2.0 * X[:, 0] + 0.05 * rng.randn(160)
+
+    est = GlassboxRegressor(random_state=53)
+    choice = est._select_blackbox_pareto_formula(
+        [
+            {"formula": "2*x0", "source": "stable"},
+            {"formula": "2*x0 + 0.01*x1/(exp(x1)-1)", "source": "risky"},
+        ],
+        X,
+        y,
+    )
+
+    assert choice is not None
+    assert choice["source"] == "stable"
+    assert choice["risk_score"] < 0.2
+
+
+def test_constant_refinement_improves_candidate_validation_mse():
+    rng = np.random.RandomState(59)
+    X = rng.randn(180, 1)
+    y = 2.5 * X[:, 0] + 0.75
+
+    est = GlassboxRegressor(random_state=59)
+    split = est._domain_edge_validation_split(X, y)
+    base_pred = est._safe_eval_formula_array("1.2*x0+0.1", split["X_val"])
+    base_mse = float(np.mean((base_pred - split["y_val"]) ** 2))
+    refined = est._refine_formula_constants(
+        "1.2*x0+0.1",
+        split["X_fit"],
+        split["y_fit"],
+        split["X_val"],
+        split["y_val"],
+    )
+
+    assert refined is not None
+    assert refined["validation_mse"] < base_mse
+    assert refined["constant_refined"] is True
