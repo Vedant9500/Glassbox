@@ -199,7 +199,8 @@ def _format_regression_term(name: str, coef: float) -> Optional[str]:
     if abs(coef) < 1e-6:
         return None
     if name == "1":
-        return get_constant_symbol(coef, 0.05)
+        coef_sym = get_constant_symbol(coef, 0.05)
+        return None if coef_sym in {"0", "0.0"} else coef_sym
     if abs(coef - 1.0) < 0.01:
         return name
     if abs(coef + 1.0) < 0.01:
@@ -207,6 +208,8 @@ def _format_regression_term(name: str, coef: float) -> Optional[str]:
     if abs(coef - round(coef)) < 0.01 and abs(coef) < 100:
         return f"{int(round(coef))}*{name}"
     coef_sym = get_constant_symbol(coef, 0.05)
+    if coef_sym in {"0", "0.0"}:
+        return None
     return f"{coef_sym}*{name}"
 
 
@@ -640,6 +643,9 @@ def build_basis_from_predictions(
         and float(prediction_uncertainty.get("prediction_margin") or 1.0) <= 0.10
     )
     multivariate_blackbox = bool(n_vars > 1 and (universal_basis or low_trust_multivariate))
+    compact_multivariate = bool(n_vars > 1 and low_trust_multivariate)
+    if compact_multivariate:
+        max_power = min(int(max_power), 3)
     
     basis_list = []
     names = []
@@ -714,7 +720,8 @@ def build_basis_from_predictions(
             xi = x[:, i]
             name = var_name(i)
 
-            for omega in omegas[:6]:  # Increased to 6 to fit pi frequencies
+            omega_limit = 2 if compact_multivariate else 6
+            for omega in omegas[:omega_limit]:
                 basis_list.append(np.sin(omega * xi))
                 if omega == 1.0:
                     names.append(f"sin({name})")
@@ -729,7 +736,7 @@ def build_basis_from_predictions(
                 else:
                     names.append(f"sin({omega:.2f}*{name})")
 
-            for omega in omegas[:6]:
+            for omega in omegas[:omega_limit]:
                 basis_list.append(np.cos(omega * xi))
                 if omega == 1.0:
                     names.append(f"cos({name})")
@@ -847,7 +854,7 @@ def build_basis_from_predictions(
                 names.append(f"{var_name(i)}*{var_name(j)}")
     
     # Product-ratio terms for physics formulas (e.g., G*m1*m2/r²)
-    if universal_basis and allow_arithmetic and n_vars >= 2:
+    if universal_basis and allow_arithmetic and n_vars >= 2 and not compact_multivariate:
         epsilon = 1e-8  # Prevent division by zero
         
         # Triple products: a*b*c
@@ -918,7 +925,7 @@ def build_basis_from_predictions(
                 names.append(f"{var_name(i)}/√|{var_name(j)}|")
 
     # Rational and cross terms (per-variable)
-    if universal_basis and allow_power:
+    if universal_basis and allow_power and not compact_multivariate:
         for i in range(n_vars):
             xi = x[:, i]
             name = var_name(i)
@@ -1398,18 +1405,9 @@ def fast_path_regression(
         for name, coef in zip(names, coeffs_arr):
             if abs(coef) < sparsity_threshold:
                 continue
-
-            if name == "1":
-                terms_local.append(get_constant_symbol(coef, threshold=0.05))
-            elif abs(coef - 1.0) < 0.01:
-                terms_local.append(name)
-            elif abs(coef + 1.0) < 0.01:
-                terms_local.append(f"-{name}")
-            elif abs(coef - round(coef)) < 0.01:
-                terms_local.append(f"{int(round(coef))}*{name}")
-            else:
-                coef_sym = get_constant_symbol(coef, threshold=0.05)
-                terms_local.append(f"{coef_sym}*{name}")
+            term = _format_regression_term(name, float(coef))
+            if term:
+                terms_local.append(term)
         return _join_formula_terms(terms_local)
 
     def _candidate_signature(coeffs_arr: np.ndarray) -> Tuple[int, ...]:
@@ -1581,6 +1579,7 @@ def fast_path_regression(
         'basis_names': names,
         'n_nonzero': n_nonzero,
         'exact_match': exact_match_flag,
+        'compact_multivariate_basis': bool(x.ndim == 2 and x.shape[1] > 1 and len(names) <= 120),
         'y_variance': y_variance,
         'candidate_formulas': candidate_formulas,
         'holdout_mse': _holdout_mse_for_best(coeffs) if holdout_mask is not None else None,
@@ -2315,6 +2314,19 @@ def run_fast_path(
         f"entropy={uncertainty_metrics['prediction_entropy']}, "
         f"margin={uncertainty_metrics['prediction_margin']}"
     )
+
+    n_vars = int(x_np.shape[1]) if getattr(x_np, "ndim", 1) == 2 else 1
+    low_trust_multivariate = (
+        n_vars > 1
+        and bool(uncertainty_metrics.get("prediction_uncertain", False))
+        and float(uncertainty_metrics.get("prediction_entropy") or 0.0) >= 0.80
+        and float(uncertainty_metrics.get("prediction_margin") or 1.0) <= 0.10
+    )
+    if low_trust_multivariate and auto_expand:
+        auto_expand = False
+        exact_match_max_basis = min(int(exact_match_max_basis or 150), 120)
+        max_power = min(int(max_power), 3)
+        print("  Low-trust multivariate classifier signal; using compact fast-path basis")
     
     # Check if fast path is applicable (lowered threshold to 0.6 for broader coverage)
     if not should_use_fast_path(predictions, confidence_threshold=0.6, universal_basis=auto_expand):
@@ -3187,6 +3199,7 @@ def beam_search_evolution(
             pop_size=total_pop_size,
             generations=total_generations,
             early_stop_mse=1e-10,
+            use_nsga2=True,
             num_islands=n_beams,
             migration_interval=25,
             migration_size=2,

@@ -5,6 +5,7 @@
 #include <memory>
 #include <unordered_map>
 #include <functional>
+#include <cmath>
 #include <Eigen/Dense>
 
 namespace sr {
@@ -73,6 +74,53 @@ struct IndividualGraph {
     double crowding_distance = 0.0; // Crowding distance within the same rank
     int age = 0;                    // AFPO: generations survived (0 = newly created)
     int complexity() const { return static_cast<int>(nodes.size()); } // AST node count as 2nd objective
+    int active_complexity() const {
+        if (nodes.empty()) return 0;
+        std::vector<char> active(nodes.size(), 0);
+        for (int i = 0; i < static_cast<int>(nodes.size()) && i < static_cast<int>(output_weights.size()); ++i) {
+            if (std::abs(output_weights[i]) <= 1e-4) continue;
+            std::vector<int> stack = {i};
+            while (!stack.empty()) {
+                int idx = stack.back();
+                stack.pop_back();
+                if (idx < 0 || idx >= static_cast<int>(nodes.size()) || active[idx]) continue;
+                active[idx] = 1;
+                const auto& node = nodes[idx];
+                if ((node.type == NodeType::Unary || node.type == NodeType::Binary) && node.left_child >= 0) {
+                    stack.push_back(node.left_child);
+                }
+                if (node.type == NodeType::Binary && node.right_child >= 0) {
+                    stack.push_back(node.right_child);
+                }
+            }
+        }
+
+        int total = 0;
+        for (int i = 0; i < static_cast<int>(nodes.size()); ++i) {
+            if (!active[i]) continue;
+            const auto& node = nodes[i];
+            switch (node.type) {
+                case NodeType::Input:
+                    total += 1;
+                    break;
+                case NodeType::Constant:
+                    total += 1;
+                    break;
+                case NodeType::Unary:
+                    if (node.unary_op == UnaryOp::IntPow) total += 2;
+                    else if (node.unary_op == UnaryOp::Power) total += 3;
+                    else if (node.unary_op == UnaryOp::Periodic) total += 3;
+                    else total += 4;
+                    break;
+                case NodeType::Binary:
+                    if (node.binary_op == BinaryOp::Arithmetic) total += 2;
+                    else if (node.binary_op == BinaryOp::Aggregation) total += 3;
+                    else total += 5;
+                    break;
+            }
+        }
+        return std::max(1, total);
+    }
 };
 
 // ── Structural Hashing ──────────────────────────────────────────────────

@@ -345,7 +345,8 @@ py::dict run_evolution_cpp(
             sr::simplify_ast(ind);
             py::dict pdict;
             pdict["mse"] = ind.raw_mse;
-            pdict["complexity"] = ind.complexity();
+            pdict["complexity"] = ind.active_complexity();
+            pdict["raw_nodes"] = ind.complexity();
             pdict["formula"] = sr::get_formula_string(ind, static_cast<int>(X.size()));
             pdict["pareto_rank"] = ind.pareto_rank;
             pareto_list.append(pdict);

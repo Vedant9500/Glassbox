@@ -40,6 +40,7 @@ struct EvolutionConfig {
     // Bounds
     double p_min = -2.0, p_max = 3.0;
     double omega_min = -8.0, omega_max = 8.0;
+    int max_nodes = 24;  // Hard structural bloat cap for mutation/crossover
     
     bool use_early_stop = true;
     double early_stop_mse = 1e-6;
@@ -496,7 +497,7 @@ public:
         auto last = std::unique(front.begin(), front.end(),
                                 [](const IndividualGraph& a, const IndividualGraph& b) {
                                     return std::abs(a.raw_mse - b.raw_mse) < 1e-12 &&
-                                           a.complexity() == b.complexity();
+                                           a.active_complexity() == b.active_complexity();
                                 });
         front.erase(last, front.end());
 
@@ -509,9 +510,9 @@ public:
             for (size_t j = 0; j < front.size(); ++j) {
                 if (i == j) continue;
                 bool j_leq = (front[j].raw_mse <= front[i].raw_mse) &&
-                              (front[j].complexity() <= front[i].complexity());
+                              (front[j].active_complexity() <= front[i].active_complexity());
                 bool j_lt  = (front[j].raw_mse < front[i].raw_mse) ||
-                              (front[j].complexity() < front[i].complexity());
+                              (front[j].active_complexity() < front[i].active_complexity());
                 if (j_leq && j_lt) { dominated = true; break; }
             }
             if (!dominated) clean_front.push_back(front[i]);
@@ -826,6 +827,7 @@ private:
         config_.pop_size = std::max(1, config_.pop_size);
         config_.elite_size = std::max(1, std::min(config_.elite_size, config_.pop_size));
         config_.num_islands = std::max(1, config_.num_islands);
+        config_.max_nodes = std::max(4, config_.max_nodes);
         config_.migration_size = std::max(1, config_.migration_size);
         config_.topology_phase_generations = std::max(0, config_.topology_phase_generations);
         config_.topology_refine_interval = std::max(1, config_.topology_refine_interval);
@@ -1195,16 +1197,18 @@ private:
             }
         }
         
-        // Parsimony pressure: penalize graph size to prevent bloat
-        // Count active nodes (non-zero output weight) for stronger penalty
-        int active_nodes = 0;
-        for (size_t i = 0; i < graph.nodes.size() && i < graph.output_weights.size(); ++i) {
-            if (std::abs(graph.output_weights[i]) > 1e-4) active_nodes++;
-        }
+        // Parsimony pressure: penalize active weighted complexity, not just
+        // graph length. This keeps dead columns cheap to prune while making
+        // risky active operators pay their way.
+        int active_complexity = graph.active_complexity();
+        int inactive_nodes = std::max(0, static_cast<int>(graph.nodes.size()) - active_complexity);
         
-        // Scale-invariant parsimony: Complexity penalty is a multiplier on MSE.
-        // A graph must improve MSE by ~0.5% per active node to justify its existence.
-        double complexity_penalty_factor = 5e-3 * active_nodes + 1e-4 * graph.nodes.size();
+        // Scale-invariant parsimony: a graph must improve MSE by roughly 1.2%
+        // per active complexity unit to justify added structure.
+        double complexity_penalty_factor = 1.2e-2 * active_complexity + 5e-4 * inactive_nodes;
+        if (static_cast<int>(graph.nodes.size()) > config_.max_nodes) {
+            complexity_penalty_factor += 0.25 * (static_cast<int>(graph.nodes.size()) - config_.max_nodes);
+        }
 
         // Relax penalty if we have discovered an exact physical law
         if (mse < 1e-6) {
@@ -1322,6 +1326,9 @@ private:
         
         int n = static_cast<int>(child.nodes.size());
         if (n < 2) return mutate_lamarckian(child, 0.3); // Too small for macro
+        if (n >= config_.max_nodes) {
+            return mutate_lamarckian(child, 0.15);
+        }
         
         double roll = runif(rng_);
         
@@ -1466,6 +1473,9 @@ private:
             child.nodes[f_idx].left_child = g_idx;
         }
         
+        if (static_cast<int>(child.nodes.size()) > config_.max_nodes) {
+            return parent;
+        }
         return child;
     }
     
@@ -1551,7 +1561,7 @@ private:
         }
 
         // Safety: cap graph size to prevent bloat
-        if (new_nodes.size() > 30) {
+        if (new_nodes.size() > static_cast<size_t>(config_.max_nodes)) {
             return parent_a;
         }
 
@@ -2968,7 +2978,7 @@ private:
             for (int j = i + 1; j < n; ++j) {
                 // 3-objective dominance: minimize raw_mse, complexity, age
                 double mse_i = pop[i].raw_mse, mse_j = pop[j].raw_mse;
-                int comp_i = pop[i].complexity(), comp_j = pop[j].complexity();
+                int comp_i = pop[i].active_complexity(), comp_j = pop[j].active_complexity();
                 int age_i = pop[i].age, age_j = pop[j].age;
                 
                 bool i_leq_j = (mse_i <= mse_j) && (comp_i <= comp_j) && (age_i <= age_j);
@@ -3046,14 +3056,14 @@ private:
         // Objective 1: complexity
         std::sort(front.begin(), front.end(),
                   [](const IndividualGraph* a, const IndividualGraph* b) {
-                      return a->complexity() < b->complexity();
+                      return a->active_complexity() < b->active_complexity();
                   });
         front.front()->crowding_distance = 1e18;
         front.back()->crowding_distance = 1e18;
-        double comp_range = front.back()->complexity() - front.front()->complexity();
+        double comp_range = front.back()->active_complexity() - front.front()->active_complexity();
         if (comp_range > 1e-15) {
             for (int i = 1; i < n - 1; ++i) {
-                front[i]->crowding_distance += (double)(front[i+1]->complexity() - front[i-1]->complexity()) / comp_range;
+                front[i]->crowding_distance += (double)(front[i+1]->active_complexity() - front[i-1]->active_complexity()) / comp_range;
             }
         }
 
@@ -3109,6 +3119,64 @@ private:
     // ── P6: Single-generation evolution step (for island model) ───────────
     void evolve_one_generation(int gen) {
         evaluate_population();
+
+        if (config_.use_nsga2) {
+            bool in_topology_phase = config_.use_staged_schedule && (gen < config_.topology_phase_generations);
+            double current_structural_mutation_rate = config_.mutation_rate_structural;
+            if (in_topology_phase) {
+                current_structural_mutation_rate = std::min(1.0, current_structural_mutation_rate * config_.topology_phase_mutation_boost);
+            }
+
+            std::vector<IndividualGraph> combined;
+            combined.reserve(population_.size() + static_cast<size_t>(config_.pop_size));
+            for (auto& ind : population_) {
+                ind.age++;
+                combined.push_back(ind);
+            }
+
+            std::uniform_real_distribution<double> coin(0.0, 1.0);
+            std::uniform_int_distribution<int> any_parent(0, std::max(0, static_cast<int>(population_.size()) - 1));
+            for (int i = 0; i < config_.pop_size; ++i) {
+                IndividualGraph child;
+                double roll = coin(rng_);
+                if (roll < 0.15) {
+                    child = macro_mutate(population_[any_parent(rng_)]);
+                } else if (config_.elite_size >= 2 && roll < 0.15 + config_.crossover_rate) {
+                    int p1 = tournament_select();
+                    int p2 = tournament_select();
+                    while (p2 == p1) p2 = tournament_select();
+                    child = crossover_with_retry(population_[p1], population_[p2], 3);
+                    child = mutate_lamarckian(child, current_structural_mutation_rate * 0.3);
+                } else {
+                    int parent_idx = tournament_select();
+                    child = mutate_lamarckian(population_[parent_idx], current_structural_mutation_rate);
+                }
+
+                child.age = 0;
+                bool do_refine = in_topology_phase
+                    ? (gen % config_.topology_refine_interval == 0)
+                    : (gen % 5 == 0);
+                if (do_refine) {
+                    refine_constants(child);
+                } else {
+                    evaluate_fitness_with_penalty(child, X_, y_, static_cast<int>(y_.size()));
+                }
+                combined.push_back(std::move(child));
+            }
+
+            population_ = nsga2_select(combined, config_.pop_size);
+            for (const auto& ind : population_) {
+                if (ind.fitness < best_overall_.fitness) {
+                    best_overall_ = ind;
+                }
+            }
+            if (gen % 10 == 9) {
+                for (int i = 0; i < std::min(5, config_.elite_size) && i < static_cast<int>(population_.size()); ++i) {
+                    refine_inner_params(population_[i]);
+                }
+            }
+            return;
+        }
 
         std::sort(population_.begin(), population_.end(),
                   [](const IndividualGraph& a, const IndividualGraph& b) {

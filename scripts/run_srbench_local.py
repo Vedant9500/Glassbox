@@ -1188,7 +1188,7 @@ def run_track1_blackbox(
         median_r2 = aggregate["r2"]
         median_mse = aggregate["mse"]
         median_time = aggregate["time"]
-        symbol = "✅" if median_r2 > 0.9 else "🟡" if median_r2 > 0.5 else "❌"
+        symbol = "OK" if median_r2 > 0.9 else "MID" if median_r2 > 0.5 else "LOW"
         if verbose:
             print(
                 f"  [{idx+1:3d}/{len(ds_list)}] {ds_name:40s} "
@@ -1402,7 +1402,7 @@ def run_track2_ground_truth(
         median_mse = aggregate["mse"]
         median_time = aggregate["time"]
         exact_rate = aggregate.get("exact_recovery_rate", 0.0) or 0.0
-        symbol = "✅" if exact_rate >= 0.8 else "🟡" if median_r2 > 0.9 else "❌"
+        symbol = "OK" if exact_rate >= 0.8 else "MID" if median_r2 > 0.9 else "LOW"
         if verbose:
             print(
                 f"  [{idx+1:3d}/{len(prob_list)}] {name:40s} "
@@ -1423,7 +1423,7 @@ def run_track2_ground_truth(
 def print_summary(track1_results, track2_results, output_dir=None):
     """Print aggregate summary and optionally save to JSON."""
     print(f"\n{'='*70}")
-    print(f"  SRBENCH RESULTS SUMMARY — Glassbox")
+    print(f"  SRBENCH RESULTS SUMMARY - Glassbox")
     print(f"{'='*70}")
 
     # Track 1 summary
@@ -1432,8 +1432,8 @@ def print_summary(track1_results, track2_results, output_dir=None):
         r2_vals = [r["r2"] for r in valid]
         times = [r.get("time", 0) for r in valid]
         r2_worst_decile = compute_stability_stats(r2_vals).get("worst_decile") if r2_vals else None
-        print(f"\n  TRACK 1 — Black-Box Regression")
-        print(f"  {'─'*50}")
+        print(f"\n  TRACK 1 - Black-Box Regression")
+        print(f"  {'-'*50}")
         print(f"  Datasets tested:    {len(valid)}/{len(track1_results)}")
         if r2_vals:
             print(f"  Mean R²:            {np.mean(r2_vals):.4f}")
@@ -1462,8 +1462,8 @@ def print_summary(track1_results, track2_results, output_dir=None):
                 if not bucket:
                     continue
                 failure_counts[bucket] = failure_counts.get(bucket, 0) + 1
-        print(f"\n  TRACK 2 — Ground-Truth Symbolic Regression")
-        print(f"  {'─'*50}")
+        print(f"\n  TRACK 2 - Ground-Truth Symbolic Regression")
+        print(f"  {'-'*50}")
         print(f"  Problems tested:    {len(valid)}/{len(track2_results)}")
         if r2_vals:
             print(f"  Exact matches:      {len(exact)}/{len(valid)}")
@@ -1585,6 +1585,7 @@ def main():
         classifier_path=args.classifier_model,
         use_fast_path=use_fast_path,
         use_guided_evolution=use_guided_evolution,
+        use_nsga2=True,
         num_islands=args.num_islands,
         migration_interval=args.migration_interval,
         migration_size=args.migration_size,

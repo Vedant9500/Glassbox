@@ -742,6 +742,27 @@ def build_blackbox_seed_formulas(
         if text and text not in formulas:
             formulas.append(text)
 
+    # Multivariate Track 1 cases suffer when the seed budget is consumed by
+    # univariate basis terms before cross-feature structures are offered.
+    # Reserve the first slice for validated interactions and simple pairwise
+    # compositions, then fill the remainder with unary feature transforms.
+    for term in interaction_terms or []:
+        add(term)
+        if len(formulas) >= max_seeds:
+            return formulas[:max_seeds]
+
+    pair_budget = max(2, int(round(max_seeds * 0.40))) if len(selected_features) > 1 else 0
+    for a_i, a in enumerate(selected_features):
+        for b in selected_features[a_i + 1:]:
+            add(f"x{a}*x{b}")
+            add(f"x{a}+x{b}")
+            add(f"x{a}-x{b}")
+            add(f"(x{a}-x{b})^2")
+            if len(formulas) >= pair_budget:
+                break
+        if len(formulas) >= pair_budget:
+            break
+
     for idx in selected_features:
         add(f"x{idx}")
         add(f"x{idx}^2")
@@ -749,11 +770,6 @@ def build_blackbox_seed_formulas(
         add(f"sin(x{idx})")
         add(f"cos(x{idx})")
         add(f"exp(-abs(x{idx}))")
-        if len(formulas) >= max_seeds:
-            return formulas[:max_seeds]
-
-    for term in interaction_terms or []:
-        add(term)
         if len(formulas) >= max_seeds:
             return formulas[:max_seeds]
 
