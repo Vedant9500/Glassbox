@@ -57,6 +57,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_SCRIPT_DIR))
 
 import classifier_fast_path as cfp  # noqa: E402
+from scripts import benchmark_common as bc  # noqa: E402
 from classifier_fast_path import run_fast_path, run_guided_evolution  # noqa: E402
 from glassbox.evolution import detect_dominant_frequency  # noqa: E402
 from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_signal  # noqa: E402
@@ -689,6 +690,12 @@ def _evaluate_formula_mse(formula: str, x: np.ndarray, y: np.ndarray) -> Optiona
     if not math.isfinite(mse):
         return None
     return mse
+
+
+_normalize_formula_text = bc.normalize_formula_text
+_simplify_formula_native = bc.simplify_formula_native
+_postprocess_formula = bc.postprocess_formula
+_evaluate_formula_mse = bc.evaluate_formula_mse
 
 
 def _select_score_mse(mse_display: Optional[float]) -> Optional[float]:

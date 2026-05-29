@@ -2,6 +2,7 @@ import numpy as np
 
 from scripts import run_srbench_local as rsl
 from scripts import classifier_fast_path as cfp
+from scripts import benchmark_common as bc
 
 
 def test_run_track1_uses_per_run_params_without_hard_timeout(monkeypatch):
@@ -73,6 +74,11 @@ def test_run_track1_uses_per_run_params_without_hard_timeout(monkeypatch):
     # First constructor call is the fixture estimator above; second is the per-run estimator.
     assert captured["timeouts"][-1] == 19
     assert captured["max_compute_budgets"][-1] == 19
+
+
+def test_srbench_runner_uses_shared_benchmark_helpers():
+    assert rsl.postprocess_formula is bc.postprocess_formula
+    assert rsl.evaluate_formula is bc.evaluate_formula
 
 
 def test_evaluate_formula_supports_log_with_base():

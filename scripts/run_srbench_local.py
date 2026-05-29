@@ -38,6 +38,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_signal
+from scripts import benchmark_common as bc
 
 # ---------------------------------------------------------------------------
 # Ground-truth formulas (Track 2) — Feynman/Nguyen/Strogatz style
@@ -215,368 +216,23 @@ PMLB_DATASETS = [
     "712_chscase_geyser1",
 ]
 
-
-def get_official_pmlb_regression_datasets():
-    """Return the current PMLB regression dataset list used by SRBench black-box track."""
-    try:
-        from pmlb import regression_dataset_names
-    except Exception:
-        return list(PMLB_DATASETS)
-    return list(regression_dataset_names)
-
-
-def _read_symbolic_formula_from_metadata(dataset_dir):
-    """Best-effort extraction of the symbolic target formula from PMLB metadata."""
-    for meta_name in ("metadata.yaml", "metadata.yml"):
-        meta_path = Path(dataset_dir) / meta_name
-        if not meta_path.exists():
-            continue
-        try:
-            text = meta_path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            continue
-
-        for key in ("formula", "equation", "symbolic_model", "model", "truth"):
-            match = re.search(rf"(?im)^\s*{re.escape(key)}\s*:\s*(.+?)\s*$", text)
-            if match:
-                value = match.group(1).strip().strip("'\"")
-                if value:
-                    return value
-    return ""
-
-
-def discover_official_ground_truth_problems(data_dir):
-    """Discover SRBench ground-truth files from a PMLB datasets checkout.
-
-    Official SRBench v2 runs symbolic data from PMLB paths matching
-    strogatz_* and feynman_* dataset directories. Each problem is represented
-    as a local TSV/TSV.GZ file with a target column.
-    """
-    if not data_dir:
-        return []
-
-    root = Path(data_dir)
-    if not root.exists():
-        return []
-
-    candidates = []
-    patterns = [
-        "strogatz_*/*.tsv",
-        "strogatz_*/*.tsv.gz",
-        "feynman_*/*.tsv",
-        "feynman_*/*.tsv.gz",
-        "**/strogatz_*.tsv",
-        "**/strogatz_*.tsv.gz",
-        "**/feynman_*.tsv",
-        "**/feynman_*.tsv.gz",
-    ]
-    seen = set()
-    for pattern in patterns:
-        for path in root.glob(pattern):
-            if not path.is_file():
-                continue
-            key = str(path.resolve()).lower()
-            if key in seen:
-                continue
-            seen.add(key)
-            dataset_dir = path.parent
-            name = dataset_dir.name if dataset_dir.name.startswith(("strogatz_", "feynman_")) else path.stem
-            if name.endswith(".tsv"):
-                name = name[:-4]
-            candidates.append({
-                "kind": "file",
-                "name": name,
-                "path": str(path),
-                "true_formula": _read_symbolic_formula_from_metadata(dataset_dir),
-            })
-
-    return sorted(candidates, key=lambda p: p["name"])
-
-
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-
-def r2_score(y_true, y_pred):
-    """Compute R² score."""
-    ss_res = np.sum((y_true - y_pred) ** 2)
-    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-    if ss_tot < 1e-15:
-        return 1.0 if ss_res < 1e-15 else 0.0
-    return 1.0 - ss_res / ss_tot
-
-
-def mse_score(y_true, y_pred):
-    """Compute MSE."""
-    return float(np.mean((y_true - y_pred) ** 2))
-
-
-def model_size(formula_str):
-    """Rough complexity measure: count operators and terms."""
-    if not formula_str:
-        return 0
-    # Count distinct operators and operands
-    ops = sum(1 for c in formula_str if c in '+-*/^')
-    funcs = sum(formula_str.count(f) for f in ['sin', 'cos', 'exp', 'log', 'sqrt'])
-    return ops + funcs + 1
-
-
-def _normalize_formula_text(formula):
-    """Normalize common unicode/operator variants to a parser-friendly form."""
-    if not formula:
-        return formula
-    formula = (
-        str(formula)
-        .replace("²", "^2")
-        .replace("³", "^3")
-        .replace("·", "*")
-        .replace("⋅", "*")
-        .replace("×", "*")
-        .replace("π", "pi")
-        .replace("√", "sqrt")
-        .replace("φ", "phi")
-        .replace("ω", "omega")
-        .replace("np.", "")
-    )
-    return re.sub(r"\s+", "", formula)
-
-
-def _infer_formula_n_features(formula):
-    indices = [int(m.group(1)) for m in re.finditer(r"\bx(\d+)\b", str(formula or ""))]
-    return max(indices) + 1 if indices else 1
-
-
-def _protect_fractional_powers(formula):
-    """Rewrite simple non-integer powers to a real-valued protected form.
-
-    Blackbox evolution may emit terms such as ``x1**1.5``. NumPy evaluates
-    those as NaN for negative inputs, while the estimator's protected runtime
-    keeps formulas evaluable. For benchmark display/scoring, use a signed
-    magnitude power so the formula remains real-valued on PMLB splits.
-    """
-    text = str(formula or "")
-    if "**" not in text:
-        return text
-
-    class _FractionalPowerProtector(ast.NodeTransformer):
-        def visit_BinOp(self, node):  # noqa: N802 - ast API name
-            node = self.generic_visit(node)
-            if not isinstance(node.op, ast.Pow):
-                return node
-            exponent = None
-            if isinstance(node.right, ast.Constant) and isinstance(node.right.value, (int, float)):
-                exponent = float(node.right.value)
-            elif (
-                isinstance(node.right, ast.UnaryOp)
-                and isinstance(node.right.op, ast.USub)
-                and isinstance(node.right.operand, ast.Constant)
-                and isinstance(node.right.operand.value, (int, float))
-            ):
-                exponent = -float(node.right.operand.value)
-            if exponent is None:
-                return node
-            nearest_int = round(exponent)
-            if abs(exponent - nearest_int) <= 1e-10:
-                node.right = ast.Constant(value=int(nearest_int))
-                return node
-            return ast.Call(
-                func=ast.Name(id="_signed_power", ctx=ast.Load()),
-                args=[node.left, ast.Constant(value=exponent)],
-                keywords=[],
-            )
-
-    try:
-        tree = ast.parse(text, mode="eval")
-        tree = _FractionalPowerProtector().visit(tree)
-        ast.fix_missing_locations(tree)
-        return ast.unparse(tree)
-    except Exception:
-        return text
-
-
-def _simplify_formula_native(formula, int_tol=0.05, zero_tol=1e-3):
-    """Simplify with the native C++ simplifier when available."""
-    try:
-        cpp_dir = _REPO_ROOT / "glassbox" / "sr" / "cpp"
-        if str(cpp_dir) not in sys.path:
-            sys.path.insert(0, str(cpp_dir))
-
-        import _core  # type: ignore
-
-        if hasattr(_core, "simplify_formula"):
-            simplified = _core.simplify_formula(
-                formula,
-                int_tol=float(int_tol),
-                zero_tol=float(zero_tol),
-                max_passes=6,
-                use_nsimplify=True,
-                use_identities=True,
-                n_features=_infer_formula_n_features(formula),
-            )
-        elif hasattr(_core, "simplify_formula_cpp"):
-            simplified = _core.simplify_formula_cpp(formula)
-        else:
-            return None
-
-        if simplified and simplified not in {"N/A", "ERROR", "?"}:
-            return str(simplified)
-    except Exception:
-        return None
-    return None
-
-
-def postprocess_formula(formula):
-    """Apply the current benchmark-suite formula cleanup to displayed formulas."""
-    normalized = _normalize_formula_text(formula)
-    if not normalized or normalized in {"N/A", "ERROR", "?"}:
-        return normalized
-
-    evo_int_tol = 0.05
-    evo_zero_tol = 1e-3
-
-    native = _simplify_formula_native(normalized, evo_int_tol, evo_zero_tol)
-    if native is not None:
-        normalized = native
-
-    try:
-        try:
-            from simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
-        except ImportError:
-            from scripts.simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
-
-        formula_len = len(normalized)
-        term_estimate = max(1, len([t for t in re.split(r"\s*[+-]\s*", normalized) if t.strip()]))
-        too_complex_for_symbolic = formula_len > 500 or term_estimate > 24
-
-        if too_complex_for_symbolic:
-            snapped = snap_formula_floats(
-                normalized,
-                SnapConfig(int_tol=evo_int_tol, zero_tol=evo_zero_tol),
-            )
-            return _protect_fractional_powers(snapped.replace("^", "**"))
-
-        _, simplified_expr = simplify_onn_formula(
-            normalized,
-            int_tol=evo_int_tol,
-            zero_tol=evo_zero_tol,
-            use_nsimplify=(formula_len <= 300 and term_estimate <= 16),
-        )
-        return _protect_fractional_powers(str(simplified_expr).replace("^", "**"))
-    except Exception:
-        return _protect_fractional_powers(normalized.replace("^", "**"))
-
-
-def evaluate_formula(formula_str, X, *, return_diagnostics=False):
-    """Evaluate a discovered formula string strictly on X.
-
-    Strict mode means no silent domain repairs (for example log(abs(x)))
-    and no coercion of invalid values to zero.
-    """
-    diagnostics = {
-        "ok": False,
-        "reason": None,
-        "exception_type": None,
-        "exception_message": None,
-        "formula": None,
-    }
-
-    def _finish(result, reason=None, exc=None):
-        diagnostics["ok"] = result is not None
-        diagnostics["reason"] = reason
-        diagnostics["formula"] = formula if "formula" in locals() else None
-        if exc is not None:
-            diagnostics["exception_type"] = type(exc).__name__
-            diagnostics["exception_message"] = str(exc)
-        return (result, diagnostics) if return_diagnostics else result
-
-    if not formula_str:
-        return _finish(None, reason="empty_formula")
-
-    formula = _normalize_formula_text(formula_str).strip()
-    formula = re.sub(r'\|([^|]+)\|', r'abs(\1)', formula)
-    formula = formula.replace('^', '**')
-    formula = _protect_fractional_powers(formula)
-
-    def _safe_numpy_log(x, base=None):
-        """NumPy log that also supports SymPy-style log(x, base)."""
-        with np.errstate(divide="ignore", invalid="ignore"):
-            out = np.log(x)
-            if base is not None:
-                out = out / np.log(base)
-        return out
-
-    def _signed_power(base, power):
-        base_arr = np.asarray(base, dtype=np.float64)
-        power_val = float(power)
-        with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-            if power_val < 0:
-                return np.sign(base_arr) / ((np.abs(base_arr) + 1e-12) ** abs(power_val))
-            return np.sign(base_arr) * (np.abs(base_arr) ** power_val)
-
-    def _safe_exp(x):
-        return np.exp(np.clip(x, -500.0, 500.0))
-
-    context = {
-        "np": np,
-        "log": _safe_numpy_log,
-        "sin": np.sin,
-        "cos": np.cos,
-        "exp": _safe_exp,
-        "sqrt": np.sqrt,
-        "abs": np.abs,
-        "Abs": np.abs,
-        "sign": np.sign,
-        "_signed_power": _signed_power,
-        "pi": np.pi,
-        "E": np.e,
-    }
-    for i in range(X.shape[1]):
-        context[f"x{i}"] = X[:, i]
-    if X.shape[1] == 1:
-        context["x"] = X[:, 0]
-
-    try:
-        with np.errstate(all="raise"):
-            y_pred = eval(formula, {"__builtins__": None}, context)
-        if isinstance(y_pred, (int, float)):
-            y_pred = np.full(X.shape[0], y_pred, dtype=np.float64)
-        else:
-            y_pred = np.asarray(y_pred, dtype=np.float64)
-        if y_pred.ndim == 0:
-            y_pred = np.full(X.shape[0], float(y_pred), dtype=np.float64)
-        elif y_pred.shape[0] != X.shape[0]:
-            return _finish(None, reason="shape_mismatch")
-        if not np.all(np.isfinite(y_pred)):
-            return _finish(None, reason="non_finite_output")
-        return _finish(y_pred, reason="ok")
-    except FloatingPointError as exc:
-        text = str(exc).lower()
-        if "divide by zero" in text:
-            reason = "divide_by_zero"
-        elif "overflow" in text:
-            reason = "overflow"
-        elif "invalid value" in text:
-            if "sqrt" in formula.lower():
-                reason = "invalid_sqrt"
-            elif "log" in formula.lower():
-                reason = "invalid_log"
-            else:
-                reason = "invalid_value"
-        else:
-            reason = "floating_point_error"
-        return _finish(None, reason=reason, exc=exc)
-    except ZeroDivisionError as exc:
-        return _finish(None, reason="divide_by_zero", exc=exc)
-    except ValueError as exc:
-        text = str(exc).lower()
-        if "math domain" in text or "invalid" in text:
-            if "sqrt" in formula.lower():
-                return _finish(None, reason="invalid_sqrt", exc=exc)
-            if "log" in formula.lower():
-                return _finish(None, reason="invalid_log", exc=exc)
-        return _finish(None, reason="value_error", exc=exc)
-    except Exception as exc:
-        return _finish(None, reason="eval_exception", exc=exc)
+get_official_pmlb_regression_datasets = lambda: (
+    bc.get_official_pmlb_regression_datasets() or list(PMLB_DATASETS)
+)
+discover_official_ground_truth_problems = bc.discover_official_ground_truth_problems
+r2_score = bc.r2_score
+mse_score = bc.mse_score
+model_size = bc.model_size
+postprocess_formula = bc.postprocess_formula
+evaluate_formula = bc.evaluate_formula
+estimate_timeout_budget = bc.estimate_timeout_budget
+parse_seed_list = bc.parse_seed_list
+compute_stability_stats = bc.compute_stability_stats
+classify_failure_taxonomy = bc.classify_failure_taxonomy
+summarize_time_to_discovery = bc.summarize_time_to_discovery
+summarize_seed_runs = bc.summarize_seed_runs
+_fallback_estimator_predictions = bc.fallback_estimator_predictions
+_apply_srbench_run_budget = bc.apply_run_budget
 
 
 def simplify_formula_with_guard(formula, X_ref, y_ref, mse_slack=0.02):
@@ -630,120 +286,6 @@ def simplify_formula_with_guard(formula, X_ref, y_ref, mse_slack=0.02):
     return formula
 
 
-def estimate_timeout_budget(base_timeout, n_features, n_train, adaptive_timeout):
-    """Scale timeout by problem size when adaptive timeout is enabled."""
-    if not adaptive_timeout:
-        return int(base_timeout)
-    complexity = 1.0 + 0.15 * max(0, n_features - 1) + 0.08 * min(1.0, math.log10(max(50, n_train)) / 3.0)
-    budget = int(round(base_timeout * complexity))
-    return int(min(max(20, budget), base_timeout * 2))
-
-
-def parse_seed_list(seed_text):
-    """Parse a comma-separated seed list and return sorted unique integers."""
-    if seed_text is None:
-        return [42]
-    parts = [p.strip() for p in str(seed_text).split(",") if p.strip()]
-    if not parts:
-        return [42]
-    seeds = []
-    for p in parts:
-        seeds.append(int(p))
-    return sorted(set(seeds))
-
-
-def compute_stability_stats(values):
-    """Compute median/IQR/std and worst-decile summary for a metric list."""
-    if not values:
-        return {
-            "median": None,
-            "iqr": None,
-            "std": None,
-            "worst_decile": None,
-        }
-    arr = np.asarray(values, dtype=np.float64)
-    q25 = float(np.percentile(arr, 25))
-    q50 = float(np.percentile(arr, 50))
-    q75 = float(np.percentile(arr, 75))
-    if arr.size >= 10:
-        worst_count = max(1, int(np.ceil(arr.size * 0.1)))
-        worst = np.sort(arr)[:worst_count]
-        worst_decile = float(np.mean(worst))
-    else:
-        worst_decile = float(np.min(arr))
-    return {
-        "median": q50,
-        "iqr": float(q75 - q25),
-        "std": float(np.std(arr)),
-        "worst_decile": worst_decile,
-    }
-
-
-def classify_failure_taxonomy(true_formula, discovered_formula, r2, mse):
-    """Heuristic failure taxonomy for closed-loop mutation/operator analysis."""
-    true_f = (true_formula or "").lower()
-    disc_f = (discovered_formula or "").lower()
-
-    if not disc_f:
-        return "no_formula"
-
-    if "exp(-" in true_f and "exp(" in disc_f and "exp(-" not in disc_f:
-        return "exp_sign_error"
-
-    if "/" in true_f and "/" not in disc_f:
-        return "rational_denominator_missing"
-
-    true_pows = [int(m.group(1)) for m in re.finditer(r"\*\*\s*(\d+)", true_f)]
-    disc_pows = [int(m.group(1)) for m in re.finditer(r"\*\*\s*(\d+)", disc_f)]
-    if true_pows:
-        true_max = max(true_pows)
-        disc_max = max(disc_pows) if disc_pows else 1
-        if true_max >= 3 and disc_max < true_max:
-            return "missing_high_order_terms"
-
-    if ("sin(" in true_f or "cos(" in true_f) and not ("sin(" in disc_f or "cos(" in disc_f):
-        return "periodic_structure_missing"
-
-    if r2 is not None and r2 >= 0.8:
-        return "near_miss_structural"
-    if mse is not None and np.isfinite(mse) and mse > 1.0:
-        return "high_error_instability"
-    return "other_structural_failure"
-
-
-def summarize_time_to_discovery(seed_runs, acceptable_r2=0.9, complexity_cap=20, exact_key="exact_match"):
-    """Compute time to first exact and first acceptable formula across seeded runs."""
-    times_exact = []
-    times_acceptable = []
-    for run in seed_runs:
-        t = run.get("time")
-        if t is None or not np.isfinite(t):
-            continue
-        is_exact = bool(run.get(exact_key, False))
-        r2 = run.get("r2")
-        size = run.get("model_size")
-        is_acceptable = (
-            is_exact
-            or (
-                r2 is not None
-                and np.isfinite(r2)
-                and r2 >= acceptable_r2
-                and size is not None
-                and size <= complexity_cap
-            )
-        )
-        if is_exact:
-            times_exact.append(float(t))
-        if is_acceptable:
-            times_acceptable.append(float(t))
-
-    return {
-        "time_to_first_exact": (min(times_exact) if times_exact else None),
-        "time_to_first_acceptable": (min(times_acceptable) if times_acceptable else None),
-    }
-
-
-def summarize_seed_runs(seed_runs):
     """Aggregate per-seed runs into protocol-compliant stability summaries."""
     valid = [r for r in seed_runs if r.get("r2") is not None]
     if not valid:
@@ -898,33 +440,29 @@ def run_with_hard_timeout(est_params, X_train, y_train, X_test, timeout_seconds,
         return {"status": "error", "error": f"spawn error: {outer_err}"}
 
 
-def _fallback_estimator_predictions(run_result, eval_diag, *, split="test"):
-    """Return protected estimator predictions when display-formula scoring fails."""
-    if not isinstance(run_result, dict) or not isinstance(eval_diag, dict):
-        return None, eval_diag
-    key = "y_pred_full" if split == "full" else "y_pred_test"
-    pred = run_result.get(key)
-    if pred is None:
-        return None, eval_diag
-    pred = np.asarray(pred, dtype=np.float64).reshape(-1)
-    if pred.size == 0 or not np.all(np.isfinite(pred)):
-        return None, eval_diag
-    updated = dict(eval_diag)
-    updated["display_formula_failed"] = True
-    updated["display_formula_reason"] = eval_diag.get("reason")
-    updated["reason"] = "protected_estimator_prediction"
-    updated["ok"] = True
-    return pred, updated
+get_official_pmlb_regression_datasets = lambda: (
+    bc.get_official_pmlb_regression_datasets() or list(PMLB_DATASETS)
+)
+discover_official_ground_truth_problems = bc.discover_official_ground_truth_problems
+r2_score = bc.r2_score
+mse_score = bc.mse_score
+model_size = bc.model_size
+postprocess_formula = bc.postprocess_formula
+evaluate_formula = bc.evaluate_formula
+estimate_timeout_budget = bc.estimate_timeout_budget
+parse_seed_list = bc.parse_seed_list
+compute_stability_stats = bc.compute_stability_stats
+classify_failure_taxonomy = bc.classify_failure_taxonomy
+summarize_time_to_discovery = bc.summarize_time_to_discovery
+summarize_seed_runs = bc.summarize_seed_runs
+_fallback_estimator_predictions = bc.fallback_estimator_predictions
+_apply_srbench_run_budget = bc.apply_run_budget
 
 
-def _apply_srbench_run_budget(est_params, timeout_budget):
-    """Keep estimator-internal adaptive compute inside the SRBench run budget."""
-    params = dict(est_params)
-    budget = int(max(1, round(float(timeout_budget))))
-    params["timeout"] = budget
-    params["max_compute_budget"] = budget
-    params["min_compute_budget"] = min(int(params.get("min_compute_budget", 10) or 10), budget)
-    return params
+
+
+_fallback_estimator_predictions = bc.fallback_estimator_predictions
+_apply_srbench_run_budget = bc.apply_run_budget
 
 
 # ---------------------------------------------------------------------------
