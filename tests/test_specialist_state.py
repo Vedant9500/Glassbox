@@ -107,3 +107,40 @@ def test_build_seed_graphs_does_not_let_composed_seeds_dominate():
     ]
     seeds = build_seed_graphs_from_candidates(candidate_formulas, max_seeds=5)
     assert len(seeds) <= 5
+
+
+def test_build_hot_spot_segments_and_compute_specialist_state_phase5():
+    from glassbox.sr.specialist_state import build_hot_spot_segments
+    x = np.linspace(-3.0, 3.0, 100)
+    X = x.reshape(-1, 1)
+
+    # Let's create a residual with a sharp concentrated error spike at the center
+    best_residual = np.zeros_like(x)
+    best_residual[45:55] = 10.0
+
+    hs_segs = build_hot_spot_segments(X, best_residual, max_segments=6, min_segment_size=8)
+    assert len(hs_segs) >= 1
+    has_concentrated = any(8 <= seg.n_samples <= 10 for seg in hs_segs)
+    assert has_concentrated
+
+    # Test compute_specialist_state populates fields
+    y = best_residual
+    candidates = [
+        {"formula": "0*x0", "validation_r2": 0.0, "validation_mse": np.mean(y**2), "source": "candidate_screening"},
+        {"formula": "1+0*x0", "validation_r2": 0.0, "validation_mse": np.mean((y-1)**2), "source": "candidate_screening"}
+    ]
+    state = compute_specialist_state(
+        candidates,
+        X,
+        y,
+        evaluate_formula=_eval_formula,
+        complexity_fn=lambda formula: 1,
+        family_signature_fn=lambda formula: "constant",
+        max_candidates=2,
+        max_pairs=1
+    )
+    assert state is not None
+    assert len(state.hot_spot_segments) >= 1
+    for cand in state.candidates:
+        assert len(cand.hot_spot_segment_scores) == len(state.hot_spot_segments)
+

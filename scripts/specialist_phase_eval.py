@@ -442,6 +442,46 @@ def run_phase4(*, quick: bool = False) -> Dict[str, Any]:
         "cases": results,
     }
 
+def run_phase5(*, quick: bool = False) -> Dict[str, Any]:
+    cases = _phase0_cases()
+    if quick:
+        p5_cases = [c for c in cases if c["name"] == "composed_product_with_residual"]
+        cases = cases[:3] + p5_cases
+
+    results = []
+    phase5_hits = 0
+
+    for case in cases:
+        phase5 = _evaluate_run(
+            case,
+            enable_specialist_screening_diagnostics=True,
+            enable_specialist_composition_screening=True,
+            use_guided_evolution=True,
+        )
+
+        results.append({
+            "name": case["name"],
+            "kind": case["kind"],
+            "phase5": phase5,
+        })
+
+        spec_screening = phase5.get("specialist_screening")
+        if isinstance(spec_screening, dict):
+            hs_segs = spec_screening.get("hot_spot_segments", [])
+            if len(hs_segs) >= 1:
+                phase5_hits += 1
+
+    summary = {
+        "phase": 5,
+        "n_cases": len(results),
+        "phase5_hits": int(phase5_hits),
+        "pass": bool(phase5_hits >= 1),
+    }
+    return {
+        "summary": summary,
+        "cases": results,
+    }
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate specialist-layer phases against baseline behavior.")
@@ -458,8 +498,10 @@ def main() -> int:
         result = run_phase3(quick=bool(args.quick))
     elif args.phase == 4:
         result = run_phase4(quick=bool(args.quick))
+    elif args.phase == 5:
+        result = run_phase5(quick=bool(args.quick))
     else:
-        raise SystemExit(f"Only phase 0, 2, 3, and 4 are implemented in this harness right now, got phase={args.phase}")
+        raise SystemExit(f"Only phase 0, 2, 3, 4, and 5 are implemented in this harness right now, got phase={args.phase}")
     print(json.dumps(result["summary"], indent=2))
 
     if args.output:
@@ -473,3 +515,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

@@ -67,6 +67,7 @@ class SpecialistCandidate:
     best_segment: Dict[str, Any]
     worst_segment: Dict[str, Any]
     residual_vector: np.ndarray = field(repr=False)
+    hot_spot_segment_scores: List[SpecialistSegmentScore] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -79,6 +80,7 @@ class SpecialistCandidate:
             "best_segment": dict(self.best_segment),
             "worst_segment": dict(self.worst_segment),
             "segment_scores": [segment.to_dict() for segment in self.segment_scores],
+            "hot_spot_segment_scores": [segment.to_dict() for segment in self.hot_spot_segment_scores],
         }
 
 
@@ -119,6 +121,7 @@ class SpecialistState:
     segments: List[SpecialistSegment]
     candidates: List[SpecialistCandidate]
     top_pairs: List[SpecialistPairScore]
+    hot_spot_segments: List[SpecialistSegment] = field(default_factory=list)
 
     @property
     def candidate_count(self) -> int:
@@ -135,6 +138,7 @@ class SpecialistState:
             "segment_axis": self.segment_axis,
             "segment_count": self.segment_count,
             "segments": [segment.to_dict() for segment in self.segments],
+            "hot_spot_segments": [segment.to_dict() for segment in self.hot_spot_segments],
             "top_candidates": [candidate.to_dict() for candidate in self.candidates],
             "top_pairs": [pair.to_dict() for pair in self.top_pairs],
         }
@@ -221,6 +225,126 @@ def build_specialist_segment_slices(
     return axis_name, segments
 
 
+def build_hot_spot_segments(
+    X: Any,
+    best_residual: np.ndarray,
+    *,
+    max_segments: int = 6,
+    min_segment_size: int = 8,
+) -> List[SpecialistSegment]:
+    """Build hot-spot driven and curvature-aware segments for diagnostic screening."""
+    X_arr = np.asarray(X, dtype=np.float64)
+    n = int(X_arr.shape[0])
+    if n < max(8, int(min_segment_size)):
+        return []
+
+    if X_arr.ndim != 2 or X_arr.shape[1] == 0:
+        axis_values = np.arange(n, dtype=np.float64)
+    elif X_arr.shape[1] == 1:
+        axis_values = np.asarray(X_arr[:, 0], dtype=np.float64)
+    else:
+        centered = X_arr - np.nanmedian(X_arr, axis=0, keepdims=True)
+        axis_values = np.linalg.norm(np.where(np.isfinite(centered), centered, 0.0), axis=1)
+
+    axis_values = np.where(np.isfinite(axis_values), axis_values, 0.0)
+    order = np.argsort(axis_values, kind="mergesort")
+    sorted_x = axis_values[order]
+
+    sorted_res = best_residual[order]
+    sq_res = sorted_res**2
+    total_sq_res = np.sum(sq_res)
+
+    concentrated_seg = None
+    if total_sq_res >= 1e-12:
+        # Find shortest slice [i:j] with sum >= 0.7 * total_sq_res and length <= 0.3 * n
+        max_len = int(0.3 * n)
+        best_slice = None
+        if max_len >= min_segment_size:
+            cumsum = np.concatenate([[0.0], np.cumsum(sq_res)])
+            for L in range(min_segment_size, max_len + 1):
+                window_sums = cumsum[L:] - cumsum[:-L]
+                max_idx = np.argmax(window_sums)
+                if window_sums[max_idx] >= 0.7 * total_sq_res:
+                    best_slice = (max_idx, max_idx + L)
+                    break
+            if best_slice is not None:
+                i, j = best_slice
+                idx_arr = order[i:j]
+                concentrated_seg = SpecialistSegment(
+                    segment_index=-1,
+                    indices=idx_arr,
+                    n_samples=int(idx_arr.size),
+                    axis_min=float(np.min(sorted_x[i:j])),
+                    axis_max=float(np.max(sorted_x[i:j])),
+                )
+
+    # Curvature-aware binning (inflection points of smoothed residuals)
+    smoothed_res = sorted_res.copy()
+    window_size = 5
+    if n >= window_size:
+        window = np.ones(window_size) / window_size
+        smoothed_res = np.convolve(sorted_res, window, mode="same")
+        half = window_size // 2
+        smoothed_res[:half] = sorted_res[:half]
+        smoothed_res[-half:] = sorted_res[-half:]
+
+    dx = np.diff(sorted_x)
+    dx = np.where(dx == 0.0, 1e-5, dx)
+    d1 = np.diff(smoothed_res) / dx
+
+    mid_x = (sorted_x[1:] + sorted_x[:-1]) / 2.0
+    dmid_x = np.diff(mid_x)
+    dmid_x = np.where(dmid_x == 0.0, 1e-5, dmid_x)
+    d2 = np.diff(d1) / dmid_x
+
+    inflection_candidates = []
+    for k in range(1, len(d2)):
+        if d2[k] * d2[k-1] < 0:
+            idx_in_sorted = k + 1
+            score = abs(d2[k] - d2[k-1])
+            inflection_candidates.append((idx_in_sorted, score))
+
+    inflection_candidates.sort(key=lambda x: -x[1])
+    top_candidates = [item[0] for item in inflection_candidates[:15]]
+    top_candidates.sort()
+
+    splits = [0]
+    for p in top_candidates:
+        if p - splits[-1] >= min_segment_size and n - p >= min_segment_size:
+            splits.append(p)
+            if len(splits) - 1 >= max_segments - 1:
+                break
+    splits.append(n)
+
+    curvature_segments = []
+    for idx in range(len(splits) - 1):
+        i, j = splits[idx], splits[idx+1]
+        idx_arr = order[i:j]
+        curvature_segments.append(
+            SpecialistSegment(
+                segment_index=idx,
+                indices=idx_arr,
+                n_samples=int(idx_arr.size),
+                axis_min=float(np.min(sorted_x[i:j])),
+                axis_max=float(np.max(sorted_x[i:j])),
+            )
+        )
+
+    all_hs_segments = []
+    seg_idx = 0
+    if concentrated_seg is not None:
+        concentrated_seg.segment_index = seg_idx
+        all_hs_segments.append(concentrated_seg)
+        seg_idx += 1
+
+    for seg in curvature_segments:
+        seg.segment_index = seg_idx
+        all_hs_segments.append(seg)
+        seg_idx += 1
+
+    return all_hs_segments[:max_segments]
+
+
 def infer_specialist_source(candidate: Dict[str, Any]) -> str:
     """Normalize the source tag for a candidate formula."""
     if not isinstance(candidate, dict):
@@ -266,7 +390,8 @@ def compute_specialist_state(
     if y_arr.shape[0] != int(X_arr.shape[0]):
         return None
 
-    candidates: List[SpecialistCandidate] = []
+    # First, evaluate and create temporary candidate info
+    temp_candidates = []
     for candidate in list(candidate_formulas)[: max(1, int(max_candidates))]:
         formula = str((candidate or {}).get("formula", "")).strip()
         if not formula:
@@ -301,6 +426,58 @@ def compute_specialist_state(
 
         best_segment = max(segment_scores, key=lambda item: (item.r2, -item.mse))
         worst_segment = min(segment_scores, key=lambda item: (item.r2, item.mse))
+
+        temp_candidates.append({
+            "formula": formula,
+            "candidate": candidate,
+            "pred": pred,
+            "residual": residual,
+            "segment_scores": segment_scores,
+            "best_segment": best_segment,
+            "worst_segment": worst_segment,
+        })
+
+    if not temp_candidates:
+        return None
+
+    # Identify the best candidate's residual vector
+    best_residual = temp_candidates[0]["residual"]
+
+    # Build hot-spot segments using the best candidate's residual
+    hot_spot_segments = build_hot_spot_segments(
+        X_arr,
+        best_residual,
+        max_segments=6,
+        min_segment_size=8,
+    )
+
+    # Now build SpecialistCandidate objects
+    candidates: List[SpecialistCandidate] = []
+    for tc in temp_candidates:
+        pred = tc["pred"]
+        formula = tc["formula"]
+        candidate = tc["candidate"]
+
+        # Compute scores on hot_spot_segments
+        hs_segment_scores: List[SpecialistSegmentScore] = []
+        for hs_seg in hot_spot_segments:
+            idx = hs_seg.indices
+            y_seg = y_arr[idx]
+            pred_seg = pred[idx]
+            mse = float(np.mean((pred_seg - y_seg) ** 2))
+            y_var = float(np.var(y_seg))
+            r2 = 1.0 if y_var < 1e-15 and mse < 1e-15 else (0.0 if y_var < 1e-15 else 1.0 - mse / y_var)
+            hs_segment_scores.append(
+                SpecialistSegmentScore(
+                    segment_index=int(hs_seg.segment_index),
+                    n_samples=int(hs_seg.n_samples),
+                    mse=mse,
+                    r2=float(r2),
+                    axis_min=float(hs_seg.axis_min),
+                    axis_max=float(hs_seg.axis_max),
+                )
+            )
+
         candidates.append(
             SpecialistCandidate(
                 formula=formula,
@@ -309,30 +486,27 @@ def compute_specialist_state(
                 validation_mse=_clean_float((candidate or {}).get("validation_mse")),
                 complexity=int((candidate or {}).get("complexity") or complexity_fn(formula)),
                 family_signature=str(family_signature_fn(formula)),
-                segment_scores=segment_scores,
+                segment_scores=tc["segment_scores"],
                 best_segment={
-                    "segment_index": int(best_segment.segment_index),
-                    "r2": float(best_segment.r2),
+                    "segment_index": int(tc["best_segment"].segment_index),
+                    "r2": float(tc["best_segment"].r2),
                 },
                 worst_segment={
-                    "segment_index": int(worst_segment.segment_index),
-                    "r2": float(worst_segment.r2),
+                    "segment_index": int(tc["worst_segment"].segment_index),
+                    "r2": float(tc["worst_segment"].r2),
                 },
-                residual_vector=residual,
+                residual_vector=tc["residual"],
+                hot_spot_segment_scores=hs_segment_scores,
             )
         )
-
-    if not candidates:
-        return None
 
     pair_scores: List[SpecialistPairScore] = []
     for left_idx in range(len(candidates)):
         for right_idx in range(left_idx + 1, len(candidates)):
             left = candidates[left_idx]
             right = candidates[right_idx]
-            if len(left.segment_scores) != len(right.segment_scores):
-                continue
 
+            # Standard segment complementarity
             left_wins = 0
             right_wins = 0
             segment_switches = 0
@@ -354,6 +528,11 @@ def compute_specialist_state(
                 denom = max(seg_l.mse, seg_r.mse, 1e-12)
                 segment_margin_sum += abs(seg_l.mse - seg_r.mse) / denom
 
+            split_score = min(left_wins, right_wins) / max(1.0, float(len(left.segment_scores)))
+            switch_score = segment_switches / max(1.0, float(len(left.segment_scores) - 1))
+            margin_score = segment_margin_sum / max(1.0, float(len(left.segment_scores)))
+
+            # Residual correlation
             residual_corr = 0.0
             left_res = np.asarray(left.residual_vector, dtype=np.float64)
             right_res = np.asarray(right.residual_vector, dtype=np.float64)
@@ -365,12 +544,9 @@ def compute_specialist_state(
                             residual_corr = 0.0
                 except Exception:
                     residual_corr = 0.0
-
-            split_score = min(left_wins, right_wins) / max(1.0, float(len(left.segment_scores)))
-            switch_score = segment_switches / max(1.0, float(len(left.segment_scores) - 1))
-            margin_score = segment_margin_sum / max(1.0, float(len(left.segment_scores)))
             residual_disagreement = 1.0 - abs(float(np.clip(residual_corr, -1.0, 1.0)))
-            complementarity = float(np.clip(
+
+            comp_std = float(np.clip(
                 0.45 * split_score
                 + 0.20 * switch_score
                 + 0.20 * min(1.0, margin_score)
@@ -378,6 +554,64 @@ def compute_specialist_state(
                 0.0,
                 1.0,
             ))
+
+            # Hot-spot segment complementarity
+            comp_hs = 0.0
+            hs_left_wins = 0
+            hs_right_wins = 0
+            hs_segment_switches = 0
+            hs_prev_winner = None
+            hs_segment_margin_sum = 0.0
+
+            if len(hot_spot_segments) >= 2:
+                for seg_l, seg_r in zip(left.hot_spot_segment_scores, right.hot_spot_segment_scores):
+                    if seg_l.mse + 1e-12 < seg_r.mse:
+                        winner = 0
+                        hs_left_wins += 1
+                    elif seg_r.mse + 1e-12 < seg_l.mse:
+                        winner = 1
+                        hs_right_wins += 1
+                    else:
+                        winner = -1
+                    if hs_prev_winner is not None and winner != -1 and hs_prev_winner != -1 and winner != hs_prev_winner:
+                        hs_segment_switches += 1
+                    if winner != -1:
+                        hs_prev_winner = winner
+                    denom = max(seg_l.mse, seg_r.mse, 1e-12)
+                    hs_segment_margin_sum += abs(seg_l.mse - seg_r.mse) / denom
+
+                hs_split_score = min(hs_left_wins, hs_right_wins) / max(1.0, float(len(hot_spot_segments)))
+                hs_switch_score = hs_segment_switches / max(1.0, float(len(hot_spot_segments) - 1))
+                hs_margin_score = hs_segment_margin_sum / max(1.0, float(len(hot_spot_segments)))
+
+                comp_hs = float(np.clip(
+                    0.45 * hs_split_score
+                    + 0.20 * hs_switch_score
+                    + 0.20 * min(1.0, hs_margin_score)
+                    + 0.15 * residual_disagreement,
+                    0.0,
+                    1.0,
+                ))
+
+            # Excel-on-hot-spot bonus
+            hs_excel_bonus = 0.0
+            best_candidate = candidates[0]
+            total_best_mse = float(np.mean(best_candidate.residual_vector ** 2))
+            if total_best_mse >= 1e-12 and len(hot_spot_segments) > 0:
+                for seg_idx, (seg_l, seg_r) in enumerate(zip(left.hot_spot_segment_scores, right.hot_spot_segment_scores)):
+                    seg_best = best_candidate.hot_spot_segment_scores[seg_idx]
+                    if seg_best.mse > 1.2 * total_best_mse:
+                        if min(seg_l.mse, seg_r.mse) < 0.7 * seg_best.mse:
+                            hs_excel_bonus += 0.10
+                hs_excel_bonus = min(0.20, hs_excel_bonus)
+
+            # Combined score
+            if len(hot_spot_segments) >= 2:
+                complementarity = 0.5 * comp_std + 0.5 * comp_hs + hs_excel_bonus
+            else:
+                complementarity = comp_std + hs_excel_bonus
+            complementarity = float(np.clip(complementarity, 0.0, 1.0))
+
             pair_scores.append(
                 SpecialistPairScore(
                     formula_a=left.formula,
@@ -410,6 +644,7 @@ def compute_specialist_state(
         segments=segments,
         candidates=candidates,
         top_pairs=pair_scores[: max(0, int(max_pairs))],
+        hot_spot_segments=hot_spot_segments,
     )
 
 
