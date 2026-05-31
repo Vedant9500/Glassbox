@@ -98,6 +98,18 @@ def _phase0_cases() -> List[Dict[str, Any]]:
         "expect_specialist_signal": False,
     })
 
+    # Case for Phase 3: composition + evolution constant addition
+    x_p3 = grid(-2.5, 2.5, 170)
+    X_p3 = np.column_stack([x_p3, np.sin(x_p3), np.cos(x_p3)])
+    y_p3 = x_p3 * np.sin(x_p3) + 0.5
+    cases.append({
+        "name": "composed_product_plus_constant",
+        "X": X_p3,
+        "y": y_p3,
+        "kind": "compositional_seeded_evolution",
+        "expect_specialist_signal": True,
+    })
+
     return cases
 
 
@@ -179,6 +191,7 @@ def _evaluate_run(
         "composition_proposal_count": int(composition.get("proposal_count", 0) or 0),
         "composition_accepted_count": int(composition.get("accepted_count", 0) or 0),
         "specialist_screening": specialist if enable_specialist_screening_diagnostics else None,
+        "specialist_track": getattr(est, "specialist_track_", None),
     }
 
 
@@ -335,6 +348,45 @@ def run_phase2(*, quick: bool = False) -> Dict[str, Any]:
     }
 
 
+def run_phase3(*, quick: bool = False) -> Dict[str, Any]:
+    cases = _phase0_cases()
+    if quick:
+        p3_cases = [c for c in cases if c["name"] == "composed_product_plus_constant"]
+        cases = cases[:3] + p3_cases
+
+    results = []
+    phase3_hits = 0
+
+    for case in cases:
+        phase3 = _evaluate_run(
+            case,
+            enable_specialist_screening_diagnostics=True,
+            enable_specialist_composition_screening=True,
+        )
+
+        results.append({
+            "name": case["name"],
+            "kind": case["kind"],
+            "phase3": phase3,
+        })
+
+        if case["name"] == "composed_product_plus_constant":
+            track = phase3.get("specialist_track")
+            if track in ("composed seed + evolution", "screening only"):
+                phase3_hits += 1
+
+    summary = {
+        "phase": 3,
+        "n_cases": len(results),
+        "phase3_hits": int(phase3_hits),
+        "pass": bool(phase3_hits >= 1),
+    }
+    return {
+        "summary": summary,
+        "cases": results,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate specialist-layer phases against baseline behavior.")
     parser.add_argument("--phase", type=int, default=0, help="Specialist phase to evaluate")
@@ -346,8 +398,10 @@ def main() -> int:
         result = run_phase0(quick=bool(args.quick))
     elif args.phase == 2:
         result = run_phase2(quick=bool(args.quick))
+    elif args.phase == 3:
+        result = run_phase3(quick=bool(args.quick))
     else:
-        raise SystemExit(f"Only phase 0 and phase 2 are implemented in this harness right now, got phase={args.phase}")
+        raise SystemExit(f"Only phase 0, 2, and 3 are implemented in this harness right now, got phase={args.phase}")
     print(json.dumps(result["summary"], indent=2))
 
     if args.output:

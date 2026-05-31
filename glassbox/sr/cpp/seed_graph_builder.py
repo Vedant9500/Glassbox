@@ -620,6 +620,37 @@ def build_seed_graphs_from_candidates(
     if not candidate_formulas:
         return []
 
+    # Separate composed candidates and standard candidates
+    composed_cands = []
+    standard_cands = []
+    for c in candidate_formulas:
+        if c.get("from_specialist_composition") or c.get("source") == "specialist_composition":
+            composed_cands.append(c)
+        else:
+            standard_cands.append(c)
+
+    # Sort both groups by MSE (lower is better)
+    composed_cands.sort(key=lambda c: float(c.get("mse", float("inf")) or float("inf")))
+    standard_cands.sort(key=lambda c: float(c.get("mse", float("inf")) or float("inf")))
+
+    # Limit composed seeds so they don't dominate (max 35% of max_seeds, min 1 if any exists)
+    max_composed = 0
+    if composed_cands:
+        max_composed = max(1, int(round(max_seeds * 0.35)))
+
+    selected_composed = composed_cands[:max_composed]
+    remaining_budget = max(0, max_seeds - len(selected_composed))
+    selected_standard = standard_cands[:remaining_budget]
+
+    # If there is remaining budget, fill with leftover composed candidates
+    if len(selected_composed) + len(selected_standard) < max_seeds:
+        extra_budget = max_seeds - (len(selected_composed) + len(selected_standard))
+        selected_composed.extend(composed_cands[max_composed:max_composed + extra_budget])
+
+    # Re-combine and sort by MSE
+    combined = selected_composed + selected_standard
+    combined.sort(key=lambda c: float(c.get("mse", float("inf")) or float("inf")))
+
     ordered: List[str] = []
     seen: set = set()
 
@@ -633,12 +664,7 @@ def build_seed_graphs_from_candidates(
         seen.add(key)
         ordered.append(text)
 
-    # Prefer lower-MSE candidates first
-    ranked = sorted(
-        candidate_formulas,
-        key=lambda c: float(c.get("mse", float("inf")) or float("inf")),
-    )
-    for cand in ranked:
+    for cand in combined:
         _add(cand.get("formula", ""))
 
     return build_seed_graphs_from_formulas(ordered, max_seeds=max_seeds)

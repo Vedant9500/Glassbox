@@ -5,6 +5,7 @@ from glassbox.sr.specialist_state import (
     compute_specialist_state,
     propose_specialist_compositions,
 )
+from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_candidates
 
 
 def _eval_formula(formula, X):
@@ -94,3 +95,15 @@ def test_propose_specialist_compositions_emits_add_and_mul_forms():
     operators = {proposal.operator for proposal in proposals}
     assert "add" in operators
     assert "mul" in operators
+
+
+def test_build_seed_graphs_does_not_let_composed_seeds_dominate():
+    candidate_formulas = [
+        {"formula": f"x0 * {i}", "mse": 0.01 * i, "source": "specialist_composition", "from_specialist_composition": True}
+        for i in range(1, 6)
+    ] + [
+        {"formula": f"x0 + {i}", "mse": 0.5 + 0.1 * i, "source": "candidate_screening"}
+        for i in range(1, 6)
+    ]
+    seeds = build_seed_graphs_from_candidates(candidate_formulas, max_seeds=5)
+    assert len(seeds) <= 5

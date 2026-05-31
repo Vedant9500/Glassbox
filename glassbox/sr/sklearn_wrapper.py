@@ -66,7 +66,7 @@ for p in [str(_REPO_ROOT), str(_SCRIPTS_DIR), str(_CPP_DIR)]:
         sys.path.insert(0, p)
 
 try:
-    import _core
+    import _core  # type: ignore
     CPP_AVAILABLE = True
 except ImportError:
     CPP_AVAILABLE = False
@@ -183,6 +183,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         self._universal_proposer_model = None
         self.specialist_state_ = None
+        self.specialist_track_ = "incumbent path"
+        self.has_composed_seeds_ = False
 
     def _estimate_compute_budget(self, X, current_r2, term_count, uncertainty=None):
         """Adaptive compute budget: easy problems get short runs, hard problems get longer runs.
@@ -2458,6 +2460,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         import time as _time
 
         X, y = check_X_y(X, y, accept_sparse=False)
+        self.has_composed_seeds_ = False
+        self.specialist_track_ = "incumbent path"
         self.n_features_in_ = X.shape[1]
         self.original_n_features_in_ = X.shape[1]
         fit_start = _time.time()
@@ -2573,7 +2577,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         # ── Stage 1: Classifier Fast Path ──
         if self.use_fast_path and _elapsed() < self.timeout:
             try:
-                from classifier_fast_path import run_fast_path
+                from classifier_fast_path import run_fast_path  # type: ignore
 
                 x_t = torch.tensor(X, dtype=torch.float32)
                 y_t = torch.tensor(y, dtype=torch.float32).reshape(-1, 1)
@@ -2866,6 +2870,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 ),
                             )
                         if specialist_candidates:
+                            self.has_composed_seeds_ = True
                             candidate_formulas = self._prune_blackbox_candidate_formulas(
                                 list(specialist_candidates) + list(candidate_formulas or []),
                                 max_candidates=max(
@@ -3094,7 +3099,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     and (current_r2 < self.evolution_skip_r2 or not fast_path_cv_ok)
                     and _elapsed() < effective_timeout):
                     try:
-                        from classifier_fast_path import run_guided_evolution
+                        from classifier_fast_path import run_guided_evolution  # type: ignore
 
                         x_t = torch.tensor(X, dtype=torch.float32)
                         y_t = torch.tensor(y, dtype=torch.float32).reshape(-1, 1)
@@ -3527,7 +3532,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         best_formula,
                         X_original,
                     )
-                    self.blackbox_diagnostics_["selection_outcome"] = {
+                    selection_outcome = {
                         "candidate_screening_win": bool(blackbox_candidate_accepted and not blackbox_evolution_ran),
                         "evolution_ran": bool(blackbox_evolution_ran),
                         "evolution_win": bool(blackbox_evolution_improved),
@@ -3537,6 +3542,26 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             else ("evolution" if blackbox_evolution_improved else "incumbent_or_basis")
                         ),
                     }
+                    
+                    specialist_track = "incumbent path"
+                    final_pareto = self.blackbox_diagnostics_.get("final_pareto_selection")
+                    if isinstance(final_pareto, dict):
+                        winner_source = final_pareto.get("source")
+                        if winner_source == "evolution":
+                            if self.has_composed_seeds_:
+                                specialist_track = "composed seed + evolution"
+                            else:
+                                specialist_track = "incumbent path"
+                        elif winner_source in ("specialist_composition", "candidate_screening", "proposer", "basis_model", "engineered_basis"):
+                            specialist_track = "screening only"
+                        elif winner_source == "incumbent":
+                            specialist_track = "incumbent path"
+                    elif selection_outcome["candidate_screening_win"]:
+                        specialist_track = "screening only"
+                    
+                    selection_outcome["specialist_track"] = specialist_track
+                    self.blackbox_diagnostics_["selection_outcome"] = selection_outcome
+                    self.specialist_track_ = specialist_track
 
             residual_formula = self._stage_residual_symbolic_fit(X, y, best_formula, _allow_recursion=True)
             if residual_formula:
