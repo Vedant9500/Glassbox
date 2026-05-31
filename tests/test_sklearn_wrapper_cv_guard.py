@@ -794,6 +794,116 @@ def test_blackbox_candidate_screening_exports_interaction_operator_hints(monkeyp
     screening = est.blackbox_diagnostics_.get("candidate_screening", {})
     assert screening.get("candidate_count", 0) > 0
     assert "periodic" in screening.get("interaction_operator_hints", [])
+    specialist = screening.get("specialist_screening", {})
+    assert specialist.get("enabled") is True
+    assert specialist.get("candidate_count", 0) > 0
+    assert specialist.get("segment_count", 0) >= 2
+    assert specialist.get("segment_axis") in {"x0", "radius", "index"}
+    assert specialist.get("top_candidates")
+
+
+def test_blackbox_candidate_screening_exports_specialist_pair_diagnostics(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    called = {"cpp": False}
+
+    class _FakeCore:
+        @staticmethod
+        def run_evolution(**kwargs):
+            called["cpp"] = True
+            return {"best_mse": 10.0, "formula": "0", "nodes": [], "output_weights": []}
+
+        @staticmethod
+        def reduce_formula_noise(formula, X_list, y):
+            return formula
+
+        @staticmethod
+        def simplify_formula(formula, **kwargs):
+            return formula
+
+    def _fake_fast_path(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
+    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+
+    rng = np.random.RandomState(53)
+    x = np.linspace(-3.0, 3.0, 160)
+    X = np.column_stack([x, np.sin(x), np.cos(x)])
+    y = np.where(x < 0.0, x * x, np.sin(2.0 * x))
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=False,
+        use_universal_proposer=False,
+        blackbox_mode=True,
+        blackbox_standardize=False,
+        blackbox_min_features_to_select=2,
+        population_size=10,
+        generations=10,
+        multi_start_runs=1,
+        timeout=20,
+        random_state=53,
+    )
+    est.fit(X, y)
+
+    screening = est.blackbox_diagnostics_.get("candidate_screening", {})
+    specialist = screening.get("specialist_screening", {})
+    assert specialist.get("enabled") is True
+    assert specialist.get("top_pairs")
+    pair = specialist["top_pairs"][0]
+    assert 0.0 <= pair.get("complementarity_score", -1.0) <= 1.0
+    assert "formula_a" in pair and "formula_b" in pair
+    assert "residual_correlation" in pair
+
+
+def test_blackbox_candidate_screening_can_disable_specialist_diagnostics(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    class _FakeCore:
+        @staticmethod
+        def run_evolution(**kwargs):
+            return {"best_mse": 10.0, "formula": "0", "nodes": [], "output_weights": []}
+
+        @staticmethod
+        def reduce_formula_noise(formula, X_list, y):
+            return formula
+
+        @staticmethod
+        def simplify_formula(formula, **kwargs):
+            return formula
+
+    def _fake_fast_path(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
+    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+
+    rng = np.random.RandomState(59)
+    X = rng.randn(150, 3)
+    y = X[:, 0] * np.sin(X[:, 1])
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=False,
+        use_universal_proposer=False,
+        blackbox_mode=True,
+        blackbox_standardize=False,
+        blackbox_min_features_to_select=2,
+        enable_specialist_screening_diagnostics=False,
+        population_size=10,
+        generations=10,
+        multi_start_runs=1,
+        timeout=20,
+        random_state=59,
+    )
+    est.fit(X, y)
+
+    screening = est.blackbox_diagnostics_.get("candidate_screening", {})
+    assert screening.get("candidate_count", 0) > 0
+    assert "specialist_screening" not in screening
 
 
 def test_blackbox_candidate_pool_can_skip_cpp_from_interaction_formula(monkeypatch):

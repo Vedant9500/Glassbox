@@ -121,6 +121,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         blackbox_feature_selection=True,
         blackbox_standardize=True,
         blackbox_min_features_to_select=5,
+        enable_specialist_screening_diagnostics=True,
         enable_residual_stage=True,
         device=None,
         skip_evolution_if_bloated=False,
@@ -170,6 +171,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.blackbox_feature_selection = blackbox_feature_selection
         self.blackbox_standardize = blackbox_standardize
         self.blackbox_min_features_to_select = blackbox_min_features_to_select
+        self.enable_specialist_screening_diagnostics = enable_specialist_screening_diagnostics
         self.enable_residual_stage = enable_residual_stage
         self.device = device
         self.skip_evolution_if_bloated = skip_evolution_if_bloated
@@ -675,6 +677,241 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "complexity": complexity,
             "risk_score": risk_score,
             "generalization_gap": generalization_gap,
+        }
+
+    def _build_specialist_segment_slices(self, X, *, max_segments=4, min_segment_size=8):
+        """Build coarse contiguous diagnostic segments over the current search space."""
+        X = np.asarray(X, dtype=np.float64)
+        n = int(X.shape[0])
+        if n < max(8, int(min_segment_size)):
+            return []
+
+        if X.ndim != 2 or X.shape[1] == 0:
+            axis_values = np.arange(n, dtype=np.float64)
+            axis_name = "index"
+        elif X.shape[1] == 1:
+            axis_values = np.asarray(X[:, 0], dtype=np.float64)
+            axis_name = "x0"
+        else:
+            centered = X - np.nanmedian(X, axis=0, keepdims=True)
+            axis_values = np.linalg.norm(np.where(np.isfinite(centered), centered, 0.0), axis=1)
+            axis_name = "radius"
+
+        axis_values = np.where(np.isfinite(axis_values), axis_values, 0.0)
+        order = np.argsort(axis_values, kind="mergesort")
+        n_segments = int(min(max_segments, max(2, n // max(int(min_segment_size), 1))))
+        if n_segments < 2:
+            return []
+
+        raw_slices = [chunk for chunk in np.array_split(order, n_segments) if int(len(chunk)) >= int(min_segment_size)]
+        if len(raw_slices) < 2:
+            return []
+
+        segments = []
+        for idx, chunk in enumerate(raw_slices):
+            chunk = np.asarray(chunk, dtype=int)
+            if chunk.size == 0:
+                continue
+            chunk_axis = axis_values[chunk]
+            segments.append({
+                "segment_index": int(idx),
+                "indices": chunk,
+                "n_samples": int(chunk.size),
+                "axis_min": float(np.min(chunk_axis)),
+                "axis_max": float(np.max(chunk_axis)),
+            })
+        if len(segments) < 2:
+            return []
+        return {
+            "axis": axis_name,
+            "segments": segments,
+        }
+
+    def _compute_specialist_screening_diagnostics(self, candidate_formulas, X, y, *, max_candidates=6, max_pairs=5):
+        """Summarize coarse segment behavior and pair complementarity for top candidates."""
+        if not candidate_formulas:
+            return None
+
+        segment_payload = self._build_specialist_segment_slices(X, max_segments=4, min_segment_size=8)
+        if not segment_payload:
+            return None
+
+        y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+        if y_arr.shape[0] != int(np.asarray(X).shape[0]):
+            return None
+
+        segments = segment_payload["segments"]
+        candidates = []
+        for candidate in list(candidate_formulas)[: max(1, int(max_candidates))]:
+            formula = str((candidate or {}).get("formula", "")).strip()
+            if not formula:
+                continue
+            try:
+                pred = self._safe_eval_formula_array(formula, X)
+            except Exception:
+                continue
+            pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+            if pred.shape != y_arr.shape or not np.all(np.isfinite(pred)):
+                continue
+
+            residual = pred - y_arr
+            segment_scores = []
+            for segment in segments:
+                idx = segment["indices"]
+                y_seg = y_arr[idx]
+                pred_seg = pred[idx]
+                mse = float(np.mean((pred_seg - y_seg) ** 2))
+                y_var = float(np.var(y_seg))
+                r2 = 1.0 if y_var < 1e-15 and mse < 1e-15 else (0.0 if y_var < 1e-15 else 1.0 - mse / y_var)
+                segment_scores.append({
+                    "segment_index": int(segment["segment_index"]),
+                    "n_samples": int(segment["n_samples"]),
+                    "mse": mse,
+                    "r2": float(r2),
+                    "axis_min": float(segment["axis_min"]),
+                    "axis_max": float(segment["axis_max"]),
+                })
+
+            best_segment = max(segment_scores, key=lambda item: (item["r2"], -item["mse"]))
+            worst_segment = min(segment_scores, key=lambda item: (item["r2"], item["mse"]))
+            candidates.append({
+                "formula": formula,
+                "source": str((candidate or {}).get("source") or (
+                    "basis_model" if candidate.get("from_basis_model") else
+                    "fast_path" if candidate.get("from_fast_path") else
+                    "proposer" if candidate.get("from_proposer") else
+                    "blackbox_interaction" if candidate.get("from_blackbox_interaction") else
+                    "blackbox_seed" if candidate.get("from_blackbox_seed") else
+                    "candidate"
+                )),
+                "validation_r2": _finite_float(candidate.get("validation_r2"), None),
+                "validation_mse": _finite_float(candidate.get("validation_mse"), None),
+                "complexity": int(candidate.get("complexity") or self._formula_complexity(formula)),
+                "family_signature": self._formula_family_signature(formula),
+                "segment_scores": segment_scores,
+                "best_segment": {
+                    "segment_index": int(best_segment["segment_index"]),
+                    "r2": float(best_segment["r2"]),
+                },
+                "worst_segment": {
+                    "segment_index": int(worst_segment["segment_index"]),
+                    "r2": float(worst_segment["r2"]),
+                },
+                "residual": residual,
+            })
+
+        if not candidates:
+            return None
+
+        candidate_payload = []
+        for item in candidates:
+            candidate_payload.append({
+                "formula": str(item["formula"])[:160],
+                "source": item["source"],
+                "validation_r2": item["validation_r2"],
+                "validation_mse": item["validation_mse"],
+                "complexity": item["complexity"],
+                "family_signature": item["family_signature"],
+                "best_segment": dict(item["best_segment"]),
+                "worst_segment": dict(item["worst_segment"]),
+                "segment_scores": [dict(seg) for seg in item["segment_scores"]],
+            })
+
+        pair_scores = []
+        for left_idx in range(len(candidates)):
+            for right_idx in range(left_idx + 1, len(candidates)):
+                left = candidates[left_idx]
+                right = candidates[right_idx]
+                left_seg = left["segment_scores"]
+                right_seg = right["segment_scores"]
+                if len(left_seg) != len(right_seg):
+                    continue
+
+                left_wins = 0
+                right_wins = 0
+                segment_switches = 0
+                prev_winner = None
+                segment_margin_sum = 0.0
+                for seg_l, seg_r in zip(left_seg, right_seg):
+                    if seg_l["mse"] + 1e-12 < seg_r["mse"]:
+                        winner = 0
+                        left_wins += 1
+                    elif seg_r["mse"] + 1e-12 < seg_l["mse"]:
+                        winner = 1
+                        right_wins += 1
+                    else:
+                        winner = -1
+                    if prev_winner is not None and winner != -1 and prev_winner != -1 and winner != prev_winner:
+                        segment_switches += 1
+                    if winner != -1:
+                        prev_winner = winner
+                    denom = max(seg_l["mse"], seg_r["mse"], 1e-12)
+                    segment_margin_sum += abs(seg_l["mse"] - seg_r["mse"]) / denom
+
+                residual_corr = 0.0
+                left_res = np.asarray(left["residual"], dtype=np.float64)
+                right_res = np.asarray(right["residual"], dtype=np.float64)
+                if left_res.size >= 8 and right_res.size == left_res.size:
+                    try:
+                        if np.std(left_res) > 1e-12 and np.std(right_res) > 1e-12:
+                            residual_corr = float(np.corrcoef(left_res, right_res)[0, 1])
+                            if not np.isfinite(residual_corr):
+                                residual_corr = 0.0
+                    except Exception:
+                        residual_corr = 0.0
+
+                split_score = min(left_wins, right_wins) / max(1.0, float(len(left_seg)))
+                switch_score = segment_switches / max(1.0, float(len(left_seg) - 1))
+                margin_score = segment_margin_sum / max(1.0, float(len(left_seg)))
+                residual_disagreement = 1.0 - abs(float(np.clip(residual_corr, -1.0, 1.0)))
+                complementarity = float(np.clip(
+                    0.45 * split_score
+                    + 0.20 * switch_score
+                    + 0.20 * min(1.0, margin_score)
+                    + 0.15 * residual_disagreement,
+                    0.0,
+                    1.0,
+                ))
+                pair_scores.append({
+                    "formula_a": str(left["formula"])[:160],
+                    "formula_b": str(right["formula"])[:160],
+                    "source_a": left["source"],
+                    "source_b": right["source"],
+                    "family_a": left["family_signature"],
+                    "family_b": right["family_signature"],
+                    "left_segment_wins": int(left_wins),
+                    "right_segment_wins": int(right_wins),
+                    "segment_switches": int(segment_switches),
+                    "residual_correlation": float(residual_corr),
+                    "complementarity_score": complementarity,
+                })
+
+        pair_scores.sort(
+            key=lambda item: (
+                -float(item["complementarity_score"]),
+                -int(item["segment_switches"]),
+                float(abs(item["residual_correlation"])),
+                item["formula_a"],
+                item["formula_b"],
+            )
+        )
+
+        return {
+            "enabled": True,
+            "candidate_count": len(candidate_payload),
+            "segment_axis": segment_payload["axis"],
+            "segment_count": len(segments),
+            "segments": [
+                {
+                    "segment_index": int(segment["segment_index"]),
+                    "n_samples": int(segment["n_samples"]),
+                    "axis_min": float(segment["axis_min"]),
+                    "axis_max": float(segment["axis_max"]),
+                }
+                for segment in segments
+            ],
+            "top_candidates": candidate_payload,
+            "top_pairs": pair_scores[: max(0, int(max_pairs))],
         }
 
     def _formula_mse(self, formula, X, y):
@@ -2759,6 +2996,16 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     ],
                     "interaction_operator_hints": sorted(operator_hints.get("operators", set())),
                 }
+                if self.enable_specialist_screening_diagnostics:
+                    specialist_screening = self._compute_specialist_screening_diagnostics(
+                        candidate_formulas,
+                        X,
+                        y,
+                        max_candidates=6,
+                        max_pairs=5,
+                    )
+                    if specialist_screening is not None:
+                        self.blackbox_diagnostics_["candidate_screening"]["specialist_screening"] = specialist_screening
 
         if getattr(self, "blackbox_state_", None) is not None and self.blackbox_state_.enabled:
             basis_pool = self._build_blackbox_formula_pool(
