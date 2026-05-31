@@ -158,6 +158,18 @@ def _phase0_cases() -> List[Dict[str, Any]]:
         "expect_specialist_signal": True,
     })
 
+    # Phase 7: slowly converging approximation / multi-stage boosting
+    x_p7 = grid(-2.5, 2.5, 120)
+    X_p7 = np.column_stack([x_p7, np.sin(x_p7), np.cos(2.0 * x_p7), np.exp(-x_p7**2)])
+    y_p7 = np.sin(x_p7) + np.cos(2.0 * x_p7) + np.exp(-x_p7**2)
+    cases.append({
+        "name": "phase7_boosting_three_terms",
+        "X": X_p7,
+        "y": y_p7,
+        "kind": "multi_stage_boosting",
+        "expect_specialist_signal": True,
+    })
+
     return cases
 
 
@@ -554,6 +566,40 @@ def run_phase6(*, quick: bool = False) -> Dict[str, Any]:
         "summary": summary,
         "cases": results,
     }
+def run_phase7(*, quick: bool = False) -> Dict[str, Any]:
+    cases = _phase0_cases()
+    p7_cases = [c for c in cases if c["name"] == "phase7_boosting_three_terms"]
+
+    results = []
+    phase7_hits = 0
+
+    for case in p7_cases:
+        phase7 = _evaluate_run(
+            case,
+            enable_specialist_screening_diagnostics=True,
+            enable_specialist_composition_screening=True,
+            use_guided_evolution=True,
+        )
+
+        results.append({
+            "name": case["name"],
+            "kind": case["kind"],
+            "phase7": phase7,
+        })
+
+        if phase7.get("r2", 0.0) >= 0.99:
+            phase7_hits += 1
+
+    summary = {
+        "phase": 7,
+        "n_cases": len(results),
+        "phase7_hits": int(phase7_hits),
+        "pass": bool(phase7_hits >= 1),
+    }
+    return {
+        "summary": summary,
+        "cases": results,
+    }
 
 
 def main() -> int:
@@ -575,8 +621,10 @@ def main() -> int:
         result = run_phase5(quick=bool(args.quick))
     elif args.phase == 6:
         result = run_phase6(quick=bool(args.quick))
+    elif args.phase == 7:
+        result = run_phase7(quick=bool(args.quick))
     else:
-        raise SystemExit(f"Only phase 0, 2, 3, 4, 5, and 6 are implemented in this harness right now, got phase={args.phase}")
+        raise SystemExit(f"Only phase 0, 2, 3, 4, 5, 6, and 7 are implemented in this harness right now, got phase={args.phase}")
     print(json.dumps(result["summary"], indent=2))
 
     if args.output:
@@ -590,5 +638,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 

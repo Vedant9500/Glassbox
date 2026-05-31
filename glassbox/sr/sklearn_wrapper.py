@@ -2433,6 +2433,123 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return None
         return None
 
+    def _run_residual_boosting(self, X, y, base_formula):
+        """Run a multi-stage symbolic boosting loop on top of base_formula."""
+        if not self.enable_residual_stage or not base_formula or not self.use_guided_evolution:
+            return base_formula
+
+        def local_r2(y_true, y_pred):
+            y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+            y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+            var = float(np.var(y_true))
+            if var < 1e-15:
+                return 1.0 if np.mean((y_true - y_pred)**2) < 1e-15 else 0.0
+            return float(1.0 - np.mean((y_true - y_pred)**2) / var)
+
+        max_boosting_stages = getattr(self, "max_boosting_stages", 3)
+
+        try:
+            pred = self._safe_eval_formula_array(base_formula, X)
+            base_r2 = local_r2(y, pred)
+            if base_r2 > 0.9999:
+                return base_formula
+        except Exception:
+            return base_formula
+
+        current_formula = base_formula
+        self.boosting_stages_ = []
+
+        holdout_n = max(1, int(round(X.shape[0] * 0.2)))
+        if X.shape[0] < 20 or holdout_n >= X.shape[0]:
+            return base_formula
+
+        X_fit, X_holdout = X[:-holdout_n], X[-holdout_n:]
+        y_fit, y_holdout = y[:-holdout_n], y[-holdout_n:]
+
+        learning_rates = [0.5, 0.8, 1.0]
+
+        for stage in range(max_boosting_stages):
+            try:
+                pred_all = self._safe_eval_formula_array(current_formula, X)
+                pred_holdout = self._safe_eval_formula_array(current_formula, X_holdout)
+            except Exception:
+                break
+
+            current_holdout_mse = float(np.mean((pred_holdout - y_holdout)**2))
+            current_holdout_r2 = local_r2(y_holdout, pred_holdout)
+
+            if current_holdout_r2 > 0.999:
+                break
+
+            orig_timeout = self.timeout
+            stage_timeout = max(5, orig_timeout // (2 ** (stage + 1)))
+            self.timeout = stage_timeout
+
+            try:
+                h_k = self._stage_residual_symbolic_fit(X, y, current_formula, _allow_recursion=True)
+            finally:
+                self.timeout = orig_timeout
+
+            if not h_k or h_k == "0":
+                break
+
+            best_eta = None
+            best_holdout_mse = current_holdout_mse
+            best_combined_formula = None
+
+            try:
+                h_pred_holdout = self._safe_eval_formula_array(h_k, X_holdout)
+            except Exception:
+                break
+
+            for eta in learning_rates:
+                combined_formula = f"({current_formula}) + (({eta:.6g}) * ({h_k}))"
+                try:
+                    combined_pred = pred_holdout + eta * h_pred_holdout
+                    mse = float(np.mean((combined_pred - y_holdout)**2))
+                    if mse < best_holdout_mse:
+                        best_holdout_mse = mse
+                        best_eta = eta
+                        best_combined_formula = combined_formula
+                except Exception:
+                    continue
+
+            if best_eta is None:
+                break
+
+            try:
+                best_pred_holdout = pred_holdout + best_eta * h_pred_holdout
+                best_holdout_r2 = local_r2(y_holdout, best_pred_holdout)
+            except Exception:
+                break
+
+            r2_improvement = best_holdout_r2 - current_holdout_r2
+            if r2_improvement < 0.005:
+                break
+
+            refined_list = self._refine_candidate_formulas(
+                [{"formula": best_combined_formula, "source": f"residual_boosting_stage_{stage}"}],
+                X,
+                y,
+                max_candidates=1,
+            )
+            if refined_list:
+                current_formula = refined_list[0]["formula"]
+            else:
+                current_formula = best_combined_formula
+
+            self.boosting_stages_.append({
+                "stage": stage,
+                "h_k": h_k,
+                "eta": best_eta,
+                "combined_formula": current_formula
+            })
+
+            if best_holdout_r2 > 0.999:
+                break
+
+        return current_formula
+
     def _detect_frequencies(self, X, y):
         """Detect dominant frequencies via FFT, with optional phase info."""
         try:
@@ -3592,16 +3709,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     self.blackbox_diagnostics_["selection_outcome"] = selection_outcome
                     self.specialist_track_ = specialist_track
 
-            residual_formula = self._stage_residual_symbolic_fit(X, y, best_formula, _allow_recursion=True)
-            if residual_formula:
-                combined = f"({best_formula})+({residual_formula})"
-                try:
-                    combined_pred = self._safe_eval_formula_array(combined, X)
-                    base_pred = self._safe_eval_formula_array(best_formula, X)
-                    if np.mean((combined_pred - y) ** 2) < np.mean((base_pred - y) ** 2):
-                        best_formula = combined
-                except Exception:
-                    pass
+            best_formula = self._run_residual_boosting(X, y, best_formula)
 
         self.formula_ = best_formula or "0"
         self.best_mse_ = best_mse

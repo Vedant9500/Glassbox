@@ -108,3 +108,20 @@ def test_phase6_harness_returns_summary_and_cases():
     assert summary["pass"] is True
 
 
+def test_phase7_harness_returns_summary_and_cases():
+    result = spe.run_phase7(quick=True)
+
+    assert isinstance(result, dict)
+    assert "summary" in result
+    assert "cases" in result
+
+    summary = result["summary"]
+    cases = result["cases"]
+
+    assert summary["phase"] == 7
+    assert summary["n_cases"] == len(cases)
+    assert len(cases) >= 1
+    assert summary["pass"] is True
+
+
+
