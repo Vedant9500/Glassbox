@@ -122,6 +122,42 @@ def _phase0_cases() -> List[Dict[str, Any]]:
         "expect_specialist_signal": True,
     })
 
+    # Phase 6: nested transcendental
+    x_p6_1 = grid(-2.0, 2.0, 100)
+    X_p6_1 = np.column_stack([x_p6_1, np.sin(x_p6_1), np.cos(x_p6_1)])
+    y_p6_1 = np.sin(np.cos(x_p6_1))
+    cases.append({
+        "name": "phase6_nested_sin_cos",
+        "X": X_p6_1,
+        "y": y_p6_1,
+        "kind": "nested_transcendental",
+        "expect_specialist_signal": True,
+    })
+
+    # Phase 6: sigmoid gate
+    x_p6_2 = grid(-3.0, 3.0, 100)
+    X_p6_2 = np.column_stack([x_p6_2, np.exp(-x_p6_2)])
+    y_p6_2 = 1.0 / (1.0 + np.exp(-x_p6_2))
+    cases.append({
+        "name": "phase6_sigmoid_gate",
+        "X": X_p6_2,
+        "y": y_p6_2,
+        "kind": "sigmoid_gate",
+        "expect_specialist_signal": True,
+    })
+
+    # Phase 6: damped oscillation
+    x_p6_3 = grid(-2.0, 2.0, 150)
+    X_p6_3 = np.column_stack([x_p6_3, np.sin(3.0 * x_p6_3), np.exp(-x_p6_3**2)])
+    y_p6_3 = np.exp(-x_p6_3**2) * np.sin(3.0 * x_p6_3)
+    cases.append({
+        "name": "phase6_damped_oscillation",
+        "X": X_p6_3,
+        "y": y_p6_3,
+        "kind": "damped_product",
+        "expect_specialist_signal": True,
+    })
+
     return cases
 
 
@@ -481,6 +517,43 @@ def run_phase5(*, quick: bool = False) -> Dict[str, Any]:
         "summary": summary,
         "cases": results,
     }
+def run_phase6(*, quick: bool = False) -> Dict[str, Any]:
+    cases = _phase0_cases()
+    p6_names = {"phase6_nested_sin_cos", "phase6_sigmoid_gate", "phase6_damped_oscillation"}
+    p6_cases = [c for c in cases if c["name"] in p6_names]
+    if quick:
+        p6_cases = p6_cases[:2]
+
+    results = []
+    phase6_hits = 0
+
+    for case in p6_cases:
+        phase6 = _evaluate_run(
+            case,
+            enable_specialist_screening_diagnostics=True,
+            enable_specialist_composition_screening=True,
+            use_guided_evolution=True,
+        )
+
+        results.append({
+            "name": case["name"],
+            "kind": case["kind"],
+            "phase6": phase6,
+        })
+
+        if phase6.get("r2", 0.0) >= 0.99:
+            phase6_hits += 1
+
+    summary = {
+        "phase": 6,
+        "n_cases": len(results),
+        "phase6_hits": int(phase6_hits),
+        "pass": bool(phase6_hits >= 1 if quick else phase6_hits >= 2),
+    }
+    return {
+        "summary": summary,
+        "cases": results,
+    }
 
 
 def main() -> int:
@@ -500,8 +573,10 @@ def main() -> int:
         result = run_phase4(quick=bool(args.quick))
     elif args.phase == 5:
         result = run_phase5(quick=bool(args.quick))
+    elif args.phase == 6:
+        result = run_phase6(quick=bool(args.quick))
     else:
-        raise SystemExit(f"Only phase 0, 2, 3, 4, and 5 are implemented in this harness right now, got phase={args.phase}")
+        raise SystemExit(f"Only phase 0, 2, 3, 4, 5, and 6 are implemented in this harness right now, got phase={args.phase}")
     print(json.dumps(result["summary"], indent=2))
 
     if args.output:
@@ -515,4 +590,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 

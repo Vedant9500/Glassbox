@@ -648,9 +648,18 @@ def compute_specialist_state(
     )
 
 
+def nest_formulas(f: str, g: str) -> str:
+    """Replace variable (e.g. x0, x1, x) in f with (g)."""
+    import re
+    return re.sub(r"\bx\d*\b", f"({g})", f)
+
+
 def propose_specialist_compositions(
     state: Optional[SpecialistState],
+    X: Any = None,
+    y: Any = None,
     *,
+    evaluate_formula: Optional[Callable[[str, Any], Any]] = None,
     max_pairs: int = 3,
     min_complementarity: float = 0.30,
 ) -> List[SpecialistCompositionProposal]:
@@ -658,17 +667,199 @@ def propose_specialist_compositions(
     if state is None or not state.enabled:
         return []
 
+    import re
     proposals: List[SpecialistCompositionProposal] = []
     seen = set()
+
+    # Simple local eval helper if evaluate_formula is not provided
+    def _local_eval(expr_str: str, X_val: np.ndarray) -> np.ndarray:
+        context = {
+            "np": np,
+            "sin": np.sin,
+            "cos": np.cos,
+            "exp": np.exp,
+            "log": np.log,
+            "sqrt": np.sqrt,
+            "abs": np.abs,
+        }
+        X_val = np.asarray(X_val, dtype=np.float64)
+        for idx in range(X_val.shape[1]):
+            context[f"x{idx}"] = X_val[:, idx]
+        if X_val.shape[1] == 1:
+            context["x"] = X_val[:, 0]
+        cleaned_expr = str(expr_str).replace("^", "**")
+        return np.asarray(eval(cleaned_expr, {"__builtins__": None}, context), dtype=np.float64)
+
+    eval_fn = evaluate_formula if evaluate_formula is not None else _local_eval
+
+    # We map formula strings to candidates for quick retrieval of residual_vector
+    cand_map = {c.formula: c for c in state.candidates}
+
     for pair in list(state.top_pairs)[: max(0, int(max_pairs))]:
         if float(pair.complementarity_score) < float(min_complementarity):
             continue
+
+        left = cand_map.get(pair.formula_a)
+        right = cand_map.get(pair.formula_b)
+        if left is None or right is None:
+            continue
+
+        # Get evaluated predictions if y is provided
+        pred_f, pred_g = None, None
+        if y is not None:
+            y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+            pred_f = left.residual_vector + y_arr
+            pred_g = right.residual_vector + y_arr
 
         forms = [
             ("add", f"(({pair.formula_a})+({pair.formula_b}))"),
             ("mul", f"(({pair.formula_a})*({pair.formula_b}))"),
         ]
+
+        # 1. Division: f / g
+        if y is not None and pred_g is not None:
+            min_g = np.min(np.abs(pred_g))
+            if min_g > 0.01:
+                forms.append(("div", f"(({pair.formula_a})/({pair.formula_b}))"))
+        else:
+            forms.append(("div", f"(({pair.formula_a})/({pair.formula_b}))"))
+
+        # 2. Nested: f(g)
+        is_unary_a = pair.family_a in {"sin", "cos", "exp", "log"}
+        if is_unary_a:
+            if y is not None and pred_g is not None:
+                std_g = np.std(pred_g)
+                range_g = np.max(pred_g) - np.min(pred_g)
+                if std_g > 1e-5 and range_g < 20.0:
+                    if pair.family_a == "exp" and np.max(pred_g) < 5.0:
+                        forms.append(("nested", nest_formulas(pair.formula_a, pair.formula_b)))
+                    elif pair.family_a == "log" and np.min(pred_g) > 0.01:
+                        forms.append(("nested", nest_formulas(pair.formula_a, pair.formula_b)))
+                    elif pair.family_a in {"sin", "cos"}:
+                        forms.append(("nested", nest_formulas(pair.formula_a, pair.formula_b)))
+            else:
+                forms.append(("nested", nest_formulas(pair.formula_a, pair.formula_b)))
+
+        # 3. Affine blend: a*f + (1-a)*g
+        if y is not None and pred_f is not None and pred_g is not None:
+            diff = pred_f - pred_g
+            denom = np.sum(diff**2)
+            alpha = np.sum(diff * (y_arr - pred_g)) / denom if denom > 1e-9 else 0.5
+            alpha = float(np.clip(alpha, 0.05, 0.95))
+            forms.append(("affine", f"(({alpha:.6g})*({pair.formula_a})) + (((1.0 - {alpha:.6g}))*({pair.formula_b}))"))
+        else:
+            forms.append(("affine", f"((0.5)*({pair.formula_a})) + (((1.0 - 0.5))*({pair.formula_b}))"))
+
+        # 4. Damped product: f * exp(-beta * g^2)
+        if y is not None and pred_f is not None and pred_g is not None:
+            betas = np.logspace(-3, 2, 15)
+            best_beta = 0.1
+            best_mse = float('inf')
+            for b in betas:
+                pred_hs = pred_f * np.exp(-b * (pred_g**2))
+                mse = np.mean((pred_hs - y_arr)**2)
+                if mse < best_mse:
+                    best_mse = mse
+                    best_beta = b
+            final_damp = np.exp(-best_beta * (pred_g**2))
+            if np.mean(final_damp < 1e-3) <= 0.5:
+                forms.append(("damped_product", f"(({pair.formula_a}) * exp((-{best_beta:.6g}) * (({pair.formula_b})**2)))"))
+        else:
+            forms.append(("damped_product", f"(({pair.formula_a}) * exp((-1.0) * (({pair.formula_b})**2)))"))
+
+        # 5. Sigmoid gate: f * sig + g * (1 - sig)
+        if y is not None and X is not None and pred_f is not None and pred_g is not None:
+            X_arr = np.asarray(X, dtype=np.float64)
+            if X_arr.ndim != 2 or X_arr.shape[1] == 0:
+                t = np.arange(len(y_arr), dtype=np.float64)
+            elif X_arr.shape[1] == 1:
+                t = np.asarray(X_arr[:, 0], dtype=np.float64)
+            else:
+                centered = X_arr - np.nanmedian(X_arr, axis=0, keepdims=True)
+                t = np.linalg.norm(np.where(np.isfinite(centered), centered, 0.0), axis=1)
+
+            if X_arr.shape[1] == 1:
+                gate_var = "x0"
+            else:
+                best_corr = -1.0
+                best_feat = 0
+                for i in range(X_arr.shape[1]):
+                    corr = abs(float(np.corrcoef(X_arr[:, i], t)[0, 1]))
+                    if np.isfinite(corr) and corr > best_corr:
+                        best_corr = corr
+                        best_feat = i
+                gate_var = f"x{best_feat}"
+
+            c_candidates = np.percentile(t, [20, 30, 40, 50, 60, 70, 80])
+            k_candidates = [-10.0, -5.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 5.0, 10.0]
+
+            best_k, best_c = 1.0, np.median(t)
+            best_mse = float('inf')
+            for c_val in c_candidates:
+                for k_val in k_candidates:
+                    arg = -k_val * (t - c_val)
+                    arg = np.clip(arg, -50.0, 50.0)
+                    sig = 1.0 / (1.0 + np.exp(arg))
+                    pred_hs = pred_f * sig + pred_g * (1.0 - sig)
+                    mse = np.mean((pred_hs - y_arr)**2)
+                    if mse < best_mse:
+                        best_mse = mse
+                        best_k = k_val
+                        best_c = c_val
+
+            forms.append(("sigmoid_gate", f"(({pair.formula_a}) * (1.0 / (1.0 + exp((-{best_k:.6g}) * ({gate_var} - ({best_c:.6g})))))) + (({pair.formula_b}) * (1.0 - (1.0 / (1.0 + exp((-{best_k:.6g}) * ({gate_var} - ({best_c:.6g})))))))"))
+        else:
+            forms.append(("sigmoid_gate", f"(({pair.formula_a}) * (1.0 / (1.0 + exp((-1.0) * (x0 - (0.0)))))) + (({pair.formula_b}) * (1.0 - (1.0 / (1.0 + exp((-1.0) * (x0 - (0.0)))))))"))
+
+        # Grade templates by training MSE and complexity
+        candidate_templates = []
         for operator, formula in forms:
+            if y is not None and X is not None:
+                try:
+                    pred_comp = eval_fn(formula, X_arr)
+                    pred_comp = np.asarray(pred_comp, dtype=np.float64).reshape(-1)
+                    if pred_comp.shape == y_arr.shape and np.all(np.isfinite(pred_comp)):
+                        mse_val = np.mean((pred_comp - y_arr)**2)
+                    else:
+                        mse_val = float('inf')
+                except Exception:
+                    mse_val = float('inf')
+            else:
+                mse_val = 0.0
+
+            # Reject too complex templates
+            comp_f = len(pair.formula_a)
+            comp_g = len(pair.formula_b)
+            if left is not None and right is not None:
+                comp_f = left.complexity
+                comp_g = right.complexity
+
+            op_extra = 1
+            if operator == "div":
+                op_extra = 3
+            elif operator == "nested":
+                op_extra = 2
+            elif operator == "affine":
+                op_extra = 5
+            elif operator == "damped_product":
+                op_extra = 6
+            elif operator == "sigmoid_gate":
+                op_extra = 12
+
+            total_comp = comp_f + comp_g + op_extra
+            simpler_comp = min(comp_f, comp_g)
+            if total_comp > max(15, 2.0 * simpler_comp):
+                continue
+
+            candidate_templates.append((operator, formula, mse_val, total_comp))
+
+        # Filter out invalid
+        candidate_templates = [ct for ct in candidate_templates if ct[2] != float('inf')]
+        # Sort: lowest MSE first, then lowest complexity
+        candidate_templates.sort(key=lambda ct: (ct[2], ct[3]))
+
+        # Select top 3 templates
+        for operator, formula, _, _ in candidate_templates[:3]:
             key = "".join(str(formula).lower().split())
             if key in seen:
                 continue
@@ -686,4 +877,6 @@ def propose_specialist_compositions(
                     complementarity_score=float(pair.complementarity_score),
                 )
             )
-    return proposals
+
+    return proposals[:12]
+

@@ -712,6 +712,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         proposals = propose_specialist_compositions(
             state,
+            X,
+            y,
+            evaluate_formula=self._safe_eval_formula_array,
             max_pairs=3,
             min_complementarity=0.30,
         )

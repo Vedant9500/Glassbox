@@ -144,3 +144,41 @@ def test_build_hot_spot_segments_and_compute_specialist_state_phase5():
     for cand in state.candidates:
         assert len(cand.hot_spot_segment_scores) == len(state.hot_spot_segments)
 
+
+def test_propose_specialist_compositions_expanded_templates_phase6():
+    x = np.linspace(-1.0, 1.0, 50)
+    X = x.reshape(-1, 1)
+
+    y = np.sin(x + 1.0)
+
+    candidates = [
+        {"formula": "sin(x0)", "validation_r2": 0.8, "validation_mse": 0.01, "source": "candidate_screening"},
+        {"formula": "x0+1.0", "validation_r2": 0.8, "validation_mse": 0.01, "source": "candidate_screening"}
+    ]
+
+    state = compute_specialist_state(
+        candidates,
+        X,
+        y,
+        evaluate_formula=_eval_formula,
+        complexity_fn=lambda formula: 1,
+        family_signature_fn=lambda formula: "sin" if "sin" in str(formula) else "poly",
+        max_candidates=2,
+        max_pairs=1
+    )
+
+    assert state is not None
+
+    proposals = propose_specialist_compositions(
+        state,
+        X,
+        y,
+        evaluate_formula=_eval_formula,
+        max_pairs=1,
+        min_complementarity=0.0
+    )
+
+    operators = {proposal.operator for proposal in proposals}
+    assert "nested" in operators or "affine" in operators or "add" in operators
+
+
