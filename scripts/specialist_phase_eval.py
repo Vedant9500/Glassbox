@@ -110,6 +110,18 @@ def _phase0_cases() -> List[Dict[str, Any]]:
         "expect_specialist_signal": True,
     })
 
+    # Case for Phase 4: composition + residual fitting
+    x_p4 = grid(-2.5, 2.5, 170)
+    X_p4 = np.column_stack([x_p4, np.sin(x_p4), np.cos(x_p4), np.exp(-x_p4)])
+    y_p4 = x_p4 * np.sin(x_p4) + np.exp(-x_p4)
+    cases.append({
+        "name": "composed_product_with_residual",
+        "X": X_p4,
+        "y": y_p4,
+        "kind": "compositional_residual",
+        "expect_specialist_signal": True,
+    })
+
     return cases
 
 
@@ -117,16 +129,18 @@ def _make_estimator(
     *,
     enable_specialist_screening_diagnostics: bool,
     enable_specialist_composition_screening: bool = True,
+    use_guided_evolution: bool = False,
 ) -> GlassboxRegressor:
     return GlassboxRegressor(
         use_fast_path=False,
-        use_guided_evolution=False,
+        use_guided_evolution=use_guided_evolution,
         use_universal_proposer=False,
         blackbox_mode=True,
         blackbox_standardize=False,
         blackbox_min_features_to_select=2,
         enable_specialist_screening_diagnostics=enable_specialist_screening_diagnostics,
         enable_specialist_composition_screening=enable_specialist_composition_screening,
+        enable_residual_stage=True,
         population_size=12,
         generations=12,
         multi_start_runs=1,
@@ -153,6 +167,7 @@ def _evaluate_run(
     *,
     enable_specialist_screening_diagnostics: bool,
     enable_specialist_composition_screening: bool = True,
+    use_guided_evolution: bool = False,
 ) -> Dict[str, Any]:
     X = np.asarray(case["X"], dtype=np.float64)
     y = np.asarray(case["y"], dtype=np.float64).reshape(-1)
@@ -160,6 +175,7 @@ def _evaluate_run(
     est = _make_estimator(
         enable_specialist_screening_diagnostics=enable_specialist_screening_diagnostics,
         enable_specialist_composition_screening=enable_specialist_composition_screening,
+        use_guided_evolution=use_guided_evolution,
     )
     t0 = time.time()
     est.fit(X, y)
@@ -387,6 +403,46 @@ def run_phase3(*, quick: bool = False) -> Dict[str, Any]:
     }
 
 
+def run_phase4(*, quick: bool = False) -> Dict[str, Any]:
+    cases = _phase0_cases()
+    if quick:
+        p4_cases = [c for c in cases if c["name"] == "composed_product_with_residual"]
+        cases = cases[:3] + p4_cases
+
+    results = []
+    phase4_hits = 0
+
+    for case in cases:
+        phase4 = _evaluate_run(
+            case,
+            enable_specialist_screening_diagnostics=True,
+            enable_specialist_composition_screening=True,
+            use_guided_evolution=True,
+        )
+
+        results.append({
+            "name": case["name"],
+            "kind": case["kind"],
+            "phase4": phase4,
+        })
+
+        if case["name"] == "composed_product_with_residual":
+            formula = phase4.get("formula")
+            if formula and ("sin" in formula or "x1" in formula) and ("exp" in formula or "x3" in formula):
+                phase4_hits += 1
+
+    summary = {
+        "phase": 4,
+        "n_cases": len(results),
+        "phase4_hits": int(phase4_hits),
+        "pass": bool(phase4_hits >= 1),
+    }
+    return {
+        "summary": summary,
+        "cases": results,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate specialist-layer phases against baseline behavior.")
     parser.add_argument("--phase", type=int, default=0, help="Specialist phase to evaluate")
@@ -400,8 +456,10 @@ def main() -> int:
         result = run_phase2(quick=bool(args.quick))
     elif args.phase == 3:
         result = run_phase3(quick=bool(args.quick))
+    elif args.phase == 4:
+        result = run_phase4(quick=bool(args.quick))
     else:
-        raise SystemExit(f"Only phase 0, 2, and 3 are implemented in this harness right now, got phase={args.phase}")
+        raise SystemExit(f"Only phase 0, 2, 3, and 4 are implemented in this harness right now, got phase={args.phase}")
     print(json.dumps(result["summary"], indent=2))
 
     if args.output:

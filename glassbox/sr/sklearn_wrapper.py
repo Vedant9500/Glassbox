@@ -2869,10 +2869,36 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                     int(blackbox_search_plan.get("screening_budget", 8)),
                                 ),
                             )
-                        if specialist_candidates:
+                        
+                        # Phase 4: Guided Residual Evolution From Merged Formulas
+                        residual_merged_candidates = []
+                        if self.enable_residual_stage and specialist_candidates:
+                            for cand in list(specialist_candidates)[:2]:  # Cap at top 2 compositions to keep compute budget small
+                                formula = cand.get("formula")
+                                if not formula:
+                                    continue
+                                val_r2 = _finite_float(cand.get("validation_r2"), -1.0)
+                                if val_r2 >= 0.75:
+                                    res_form = self._stage_residual_symbolic_fit(X, y, formula, _allow_recursion=True)
+                                    if res_form and res_form != "0":
+                                        combined_formula = f"({formula})+({res_form})"
+                                        refined_list = self._refine_candidate_formulas(
+                                            [{
+                                                "formula": combined_formula,
+                                                "source": "specialist_residual_composition",
+                                                "from_specialist_composition": True,
+                                            }],
+                                            X,
+                                            y,
+                                            max_candidates=1,
+                                        )
+                                        if refined_list:
+                                            residual_merged_candidates.extend(refined_list)
+
+                        if specialist_candidates or residual_merged_candidates:
                             self.has_composed_seeds_ = True
                             candidate_formulas = self._prune_blackbox_candidate_formulas(
-                                list(specialist_candidates) + list(candidate_formulas or []),
+                                list(residual_merged_candidates) + list(specialist_candidates) + list(candidate_formulas or []),
                                 max_candidates=max(
                                     8,
                                     int(blackbox_search_plan.get("seed_budget", 8)),
@@ -3552,7 +3578,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 specialist_track = "composed seed + evolution"
                             else:
                                 specialist_track = "incumbent path"
-                        elif winner_source in ("specialist_composition", "candidate_screening", "proposer", "basis_model", "engineered_basis"):
+                        elif winner_source in ("specialist_composition", "specialist_residual_composition", "candidate_screening", "proposer", "basis_model", "engineered_basis"):
                             specialist_track = "screening only"
                         elif winner_source == "incumbent":
                             specialist_track = "incumbent path"

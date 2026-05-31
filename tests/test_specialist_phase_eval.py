@@ -58,3 +58,19 @@ def test_winning_track_tracking_on_simple_regressor():
 
     reg.fit(X, y)
     assert reg.specialist_track_ in ("incumbent path", "screening only")
+
+
+def test_phase4_harness_returns_summary_and_cases():
+    result = spe.run_phase4(quick=True)
+
+    assert isinstance(result, dict)
+    assert "summary" in result
+    assert "cases" in result
+
+    summary = result["summary"]
+    cases = result["cases"]
+
+    assert summary["phase"] == 4
+    assert summary["n_cases"] == len(cases)
+    assert len(cases) >= 1
+    assert summary["pass"] is True
