@@ -101,7 +101,11 @@ def _phase0_cases() -> List[Dict[str, Any]]:
     return cases
 
 
-def _make_estimator(*, enable_specialist_screening_diagnostics: bool) -> GlassboxRegressor:
+def _make_estimator(
+    *,
+    enable_specialist_screening_diagnostics: bool,
+    enable_specialist_composition_screening: bool = True,
+) -> GlassboxRegressor:
     return GlassboxRegressor(
         use_fast_path=False,
         use_guided_evolution=False,
@@ -110,6 +114,7 @@ def _make_estimator(*, enable_specialist_screening_diagnostics: bool) -> Glassbo
         blackbox_standardize=False,
         blackbox_min_features_to_select=2,
         enable_specialist_screening_diagnostics=enable_specialist_screening_diagnostics,
+        enable_specialist_composition_screening=enable_specialist_composition_screening,
         population_size=12,
         generations=12,
         multi_start_runs=1,
@@ -131,12 +136,18 @@ def _r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(1.0 - _mse(y_true, y_pred) / var)
 
 
-def _evaluate_run(case: Dict[str, Any], *, enable_specialist_screening_diagnostics: bool) -> Dict[str, Any]:
+def _evaluate_run(
+    case: Dict[str, Any],
+    *,
+    enable_specialist_screening_diagnostics: bool,
+    enable_specialist_composition_screening: bool = True,
+) -> Dict[str, Any]:
     X = np.asarray(case["X"], dtype=np.float64)
     y = np.asarray(case["y"], dtype=np.float64).reshape(-1)
 
     est = _make_estimator(
         enable_specialist_screening_diagnostics=enable_specialist_screening_diagnostics,
+        enable_specialist_composition_screening=enable_specialist_composition_screening,
     )
     t0 = time.time()
     est.fit(X, y)
@@ -149,6 +160,7 @@ def _evaluate_run(case: Dict[str, Any], *, enable_specialist_screening_diagnosti
 
     screening = (getattr(est, "blackbox_diagnostics_", {}) or {}).get("candidate_screening", {})
     specialist = screening.get("specialist_screening")
+    composition = (getattr(est, "blackbox_diagnostics_", {}) or {}).get("specialist_composition_screening", {})
     top_pairs = specialist.get("top_pairs", []) if isinstance(specialist, dict) else []
     max_pair_score = max((float(p.get("complementarity_score", 0.0)) for p in top_pairs), default=0.0)
 
@@ -164,6 +176,8 @@ def _evaluate_run(case: Dict[str, Any], *, enable_specialist_screening_diagnosti
         "specialist_pair_count": len(top_pairs),
         "max_complementarity_score": float(max_pair_score),
         "specialist_signal_detected": bool(max_pair_score >= 0.35),
+        "composition_proposal_count": int(composition.get("proposal_count", 0) or 0),
+        "composition_accepted_count": int(composition.get("accepted_count", 0) or 0),
         "specialist_screening": specialist if enable_specialist_screening_diagnostics else None,
     }
 
@@ -260,6 +274,62 @@ def run_phase0(*, quick: bool = False) -> Dict[str, Any]:
     )
 
     return {
+            "summary": summary,
+            "cases": results,
+        }
+
+
+def run_phase2(*, quick: bool = False) -> Dict[str, Any]:
+    cases = _phase0_cases()
+    if quick:
+        cases = cases[:3]
+
+    results = []
+    composition_hits = 0
+    regressions_vs_phase0 = 0
+
+    for case in cases:
+        baseline = _evaluate_run(
+            case,
+            enable_specialist_screening_diagnostics=False,
+            enable_specialist_composition_screening=False,
+        )
+        phase0 = _evaluate_run(
+            case,
+            enable_specialist_screening_diagnostics=True,
+            enable_specialist_composition_screening=False,
+        )
+        phase2 = _evaluate_run(
+            case,
+            enable_specialist_screening_diagnostics=True,
+            enable_specialist_composition_screening=True,
+        )
+
+        if (
+            phase2.get("mse") is not None
+            and phase0.get("mse") is not None
+            and float(phase2["mse"]) > float(phase0["mse"]) + 1e-9
+        ):
+            regressions_vs_phase0 += 1
+        if int(phase2.get("composition_accepted_count", 0) or 0) > 0:
+            composition_hits += 1
+
+        results.append({
+            "name": case["name"],
+            "kind": case["kind"],
+            "baseline": baseline,
+            "phase0": phase0,
+            "phase2": phase2,
+        })
+
+    summary = {
+        "phase": 2,
+        "n_cases": len(results),
+        "composition_hits": int(composition_hits),
+        "regressions_vs_phase0": int(regressions_vs_phase0),
+        "pass": bool(composition_hits >= 1 and regressions_vs_phase0 == 0),
+    }
+    return {
         "summary": summary,
         "cases": results,
     }
@@ -272,10 +342,12 @@ def main() -> int:
     parser.add_argument("--output", type=str, default="", help="Optional JSON output path")
     args = parser.parse_args()
 
-    if args.phase != 0:
-        raise SystemExit(f"Only phase 0 is implemented in this harness right now, got phase={args.phase}")
-
-    result = run_phase0(quick=bool(args.quick))
+    if args.phase == 0:
+        result = run_phase0(quick=bool(args.quick))
+    elif args.phase == 2:
+        result = run_phase2(quick=bool(args.quick))
+    else:
+        raise SystemExit(f"Only phase 0 and phase 2 are implemented in this harness right now, got phase={args.phase}")
     print(json.dumps(result["summary"], indent=2))
 
     if args.output:

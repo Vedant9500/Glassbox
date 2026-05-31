@@ -856,6 +856,8 @@ def test_blackbox_candidate_screening_exports_specialist_pair_diagnostics(monkey
     assert 0.0 <= pair.get("complementarity_score", -1.0) <= 1.0
     assert "formula_a" in pair and "formula_b" in pair
     assert "residual_correlation" in pair
+    composition = est.blackbox_diagnostics_.get("specialist_composition_screening", {})
+    assert composition.get("proposal_count", 0) >= 0
 
 
 def test_blackbox_candidate_screening_can_disable_specialist_diagnostics(monkeypatch):
@@ -904,6 +906,53 @@ def test_blackbox_candidate_screening_can_disable_specialist_diagnostics(monkeyp
     screening = est.blackbox_diagnostics_.get("candidate_screening", {})
     assert screening.get("candidate_count", 0) > 0
     assert "specialist_screening" not in screening
+
+
+def test_blackbox_candidate_screening_can_accept_specialist_compositions(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    class _FakeCore:
+        @staticmethod
+        def run_evolution(**kwargs):
+            return {"best_mse": 10.0, "formula": "0", "nodes": [], "output_weights": []}
+
+        @staticmethod
+        def reduce_formula_noise(formula, X_list, y):
+            return formula
+
+        @staticmethod
+        def simplify_formula(formula, **kwargs):
+            return formula
+
+    def _fake_fast_path(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
+    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+
+    x = np.linspace(-3.0, 3.0, 180)
+    X = np.column_stack([x, np.sin(2.0 * x), np.cos(2.0 * x)])
+    y = np.where(x < 0.0, x * x, np.sin(2.0 * x))
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=False,
+        use_universal_proposer=False,
+        blackbox_mode=True,
+        blackbox_standardize=False,
+        blackbox_min_features_to_select=2,
+        population_size=10,
+        generations=10,
+        multi_start_runs=1,
+        timeout=20,
+        random_state=61,
+    )
+    est.fit(X, y)
+
+    composition = est.blackbox_diagnostics_.get("specialist_composition_screening", {})
+    assert composition.get("proposal_count", 0) >= 1
+    assert composition.get("accepted_count", 0) >= 1
 
 
 def test_blackbox_candidate_pool_can_skip_cpp_from_interaction_formula(monkeypatch):
