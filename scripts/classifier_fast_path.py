@@ -372,7 +372,8 @@ def _compile_formula_evaluator(normalized_formula: str) -> Tuple[Tuple[str, ...]
         "log": sp.log,
         "sqrt": sp.sqrt,
         "pi": sp.pi,
-        "E": sp.E
+        "E": sp.E,
+        "e": sp.E,
     }
     expr = parse_expr(normalized_formula, local_dict=local_dict, transformations=transformations, evaluate=False)
     free_syms = sorted(expr.free_symbols, key=lambda sym: sym.name)

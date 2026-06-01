@@ -5,14 +5,248 @@
 #include "ast.h"
 #include "eval.h"
 #include "evolution.h"
+#include "formula_parser.h"
 #include "refine.h"
 #include "simplify.h"
 #include "simplify_advanced.h"
 
 #include <omp.h>
 #include <iostream>
+#include <limits>
 
 namespace py = pybind11;
+
+Eigen::ArrayXd evaluate_parse_node_exact(
+    const std::shared_ptr<sr::ParseNode>& node,
+    const std::vector<Eigen::ArrayXd>& X,
+    int num_samples
+) {
+    if (!node) return Eigen::ArrayXd::Zero(num_samples);
+    switch (node->type) {
+        case sr::ParseNodeType::Input:
+            if (node->feature_idx >= 0 && node->feature_idx < static_cast<int>(X.size())) {
+                return X[node->feature_idx];
+            }
+            throw std::runtime_error("feature_index_out_of_range");
+        case sr::ParseNodeType::Constant:
+            return Eigen::ArrayXd::Constant(num_samples, node->value);
+        case sr::ParseNodeType::Add:
+            return evaluate_parse_node_exact(node->left, X, num_samples) + evaluate_parse_node_exact(node->right, X, num_samples);
+        case sr::ParseNodeType::Sub:
+            return evaluate_parse_node_exact(node->left, X, num_samples) - evaluate_parse_node_exact(node->right, X, num_samples);
+        case sr::ParseNodeType::Mul:
+            return evaluate_parse_node_exact(node->left, X, num_samples) * evaluate_parse_node_exact(node->right, X, num_samples);
+        case sr::ParseNodeType::Div: {
+            Eigen::ArrayXd left = evaluate_parse_node_exact(node->left, X, num_samples);
+            Eigen::ArrayXd right = evaluate_parse_node_exact(node->right, X, num_samples);
+            return left / right;
+        }
+        case sr::ParseNodeType::Pow: {
+            Eigen::ArrayXd base = evaluate_parse_node_exact(node->left, X, num_samples);
+            Eigen::ArrayXd exp_arr = evaluate_parse_node_exact(node->right, X, num_samples);
+            Eigen::ArrayXd out(num_samples);
+            bool constant_exp = exp_arr.size() == num_samples && (exp_arr - exp_arr(0)).abs().maxCoeff() < 1e-12;
+            if (constant_exp) {
+                double p = exp_arr(0);
+                double p_round = std::round(p);
+                if (std::abs(p - p_round) < 1e-10) {
+                    out = base.pow(static_cast<int>(p_round));
+                } else {
+                    if ((base < 0.0).any()) {
+                        throw std::runtime_error("power_domain_error");
+                    }
+                    out = base.pow(p);
+                }
+            } else {
+                for (int i = 0; i < num_samples; ++i) {
+                    out(i) = std::pow(base(i), exp_arr(i));
+                }
+            }
+            return out;
+        }
+        case sr::ParseNodeType::Sin:
+            return evaluate_parse_node_exact(node->left, X, num_samples).sin();
+        case sr::ParseNodeType::Cos:
+            return evaluate_parse_node_exact(node->left, X, num_samples).cos();
+        case sr::ParseNodeType::Exp:
+            return evaluate_parse_node_exact(node->left, X, num_samples).min(500.0).max(-500.0).exp();
+        case sr::ParseNodeType::Log:
+            return (evaluate_parse_node_exact(node->left, X, num_samples).abs() + 1e-300).log();
+        case sr::ParseNodeType::Abs:
+            return evaluate_parse_node_exact(node->left, X, num_samples).abs();
+        case sr::ParseNodeType::Sqrt:
+            return evaluate_parse_node_exact(node->left, X, num_samples).max(0.0).sqrt();
+    }
+    return Eigen::ArrayXd::Zero(num_samples);
+}
+
+std::shared_ptr<sr::ParseNode> parse_formula_exact(const std::string& formula) {
+    std::string norm = sr::normalize_formula_string(formula);
+    auto tokens = sr::tokenize(norm);
+    sr::Parser parser(tokens);
+    return parser.parse();
+}
+
+py::list score_formula_candidates_cpp(
+    py::list formulas_py,
+    py::array_t<double> X_fit_array,
+    py::array_t<double> y_fit_array,
+    py::array_t<double> X_val_array,
+    py::array_t<double> y_val_array,
+    int num_threads = -1
+) {
+    auto X_fit_contig = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(X_fit_array);
+    auto y_fit_contig = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(y_fit_array);
+    auto X_val_contig = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(X_val_array);
+    auto y_val_contig = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(y_val_array);
+    if (!X_fit_contig || !y_fit_contig || !X_val_contig || !y_val_contig) {
+        throw std::runtime_error("score_formula_candidates expects contiguous float64 arrays");
+    }
+
+    auto X_fit_buf = X_fit_contig.request();
+    auto y_fit_buf = y_fit_contig.request();
+    auto X_val_buf = X_val_contig.request();
+    auto y_val_buf = y_val_contig.request();
+    if (X_fit_buf.ndim != 2 || X_val_buf.ndim != 2) {
+        throw std::runtime_error("X_fit and X_val must be 2D arrays");
+    }
+    int n_fit = static_cast<int>(X_fit_buf.shape[0]);
+    int n_val = static_cast<int>(X_val_buf.shape[0]);
+    int p_fit = static_cast<int>(X_fit_buf.shape[1]);
+    int p_val = static_cast<int>(X_val_buf.shape[1]);
+    if (p_fit != p_val || y_fit_buf.size != n_fit || y_val_buf.size != n_val) {
+        throw std::runtime_error("Input shapes are inconsistent");
+    }
+
+    const double* X_fit_ptr = static_cast<double*>(X_fit_buf.ptr);
+    const double* X_val_ptr = static_cast<double*>(X_val_buf.ptr);
+    Eigen::Map<Eigen::ArrayXd> y_fit(static_cast<double*>(y_fit_buf.ptr), n_fit);
+    Eigen::Map<Eigen::ArrayXd> y_val(static_cast<double*>(y_val_buf.ptr), n_val);
+
+    std::vector<Eigen::ArrayXd> X_fit_cols;
+    std::vector<Eigen::ArrayXd> X_val_cols;
+    X_fit_cols.reserve(p_fit);
+    X_val_cols.reserve(p_fit);
+    for (int j = 0; j < p_fit; ++j) {
+        Eigen::ArrayXd col_fit(n_fit);
+        Eigen::ArrayXd col_val(n_val);
+        for (int i = 0; i < n_fit; ++i) col_fit(i) = X_fit_ptr[i * p_fit + j];
+        for (int i = 0; i < n_val; ++i) col_val(i) = X_val_ptr[i * p_fit + j];
+        X_fit_cols.push_back(std::move(col_fit));
+        X_val_cols.push_back(std::move(col_val));
+    }
+
+    struct CandidateScore {
+        bool ok = false;
+        std::string formula;
+        std::string error;
+        double fit_mse = std::numeric_limits<double>::infinity();
+        double val_mse = std::numeric_limits<double>::infinity();
+        double r2 = -std::numeric_limits<double>::infinity();
+        double scale = 0.0;
+        double bias = 0.0;
+    };
+
+    std::vector<std::string> formulas;
+    formulas.reserve(py::len(formulas_py));
+    for (auto item : formulas_py) {
+        formulas.push_back(item.cast<std::string>());
+    }
+    std::vector<CandidateScore> scores(formulas.size());
+
+    int previous_omp_threads = omp_get_max_threads();
+    if (num_threads > 0) omp_set_num_threads(num_threads);
+
+    {
+        py::gil_scoped_release release;
+        #pragma omp parallel for schedule(dynamic)
+        for (int idx = 0; idx < static_cast<int>(formulas.size()); ++idx) {
+            CandidateScore score;
+            score.formula = formulas[idx];
+            try {
+                auto parsed = parse_formula_exact(score.formula);
+                Eigen::ArrayXd pred_fit = evaluate_parse_node_exact(parsed, X_fit_cols, n_fit);
+                Eigen::ArrayXd pred_val = evaluate_parse_node_exact(parsed, X_val_cols, n_val);
+                if (pred_fit.size() != n_fit || pred_val.size() != n_val) {
+                    score.error = "shape_mismatch";
+                    scores[idx] = score;
+                    continue;
+                }
+                bool finite = true;
+                for (int i = 0; i < n_fit; ++i) {
+                    if (!std::isfinite(pred_fit(i)) || !std::isfinite(y_fit(i))) {
+                        finite = false;
+                        break;
+                    }
+                }
+                if (finite) {
+                    for (int i = 0; i < n_val; ++i) {
+                        if (!std::isfinite(pred_val(i)) || !std::isfinite(y_val(i))) {
+                            finite = false;
+                            break;
+                        }
+                    }
+                }
+                if (!finite || n_fit < 2 || n_val < 1) {
+                    score.error = "nonfinite";
+                    scores[idx] = score;
+                    continue;
+                }
+
+                double mean_x = pred_fit.mean();
+                double mean_y = y_fit.mean();
+                double var_x = (pred_fit - mean_x).square().sum();
+                double cov_xy = ((pred_fit - mean_x) * (y_fit - mean_y)).sum();
+                if (var_x > 1e-15) {
+                    score.scale = cov_xy / var_x;
+                    score.bias = mean_y - score.scale * mean_x;
+                } else {
+                    score.scale = 0.0;
+                    score.bias = mean_y;
+                }
+
+                Eigen::ArrayXd fit_err = score.scale * pred_fit + score.bias - y_fit;
+                Eigen::ArrayXd val_err = score.scale * pred_val + score.bias - y_val;
+                score.fit_mse = fit_err.square().mean();
+                score.val_mse = val_err.square().mean();
+
+                double mean_y_val = y_val.mean();
+                double var_y_val = (y_val - mean_y_val).square().mean();
+                if (var_y_val < 1e-15) {
+                    score.r2 = score.val_mse < 1e-15 ? 1.0 : 0.0;
+                } else {
+                    score.r2 = 1.0 - score.val_mse / var_y_val;
+                }
+                score.ok = std::isfinite(score.fit_mse) && std::isfinite(score.val_mse) && std::isfinite(score.r2);
+                if (!score.ok) score.error = "invalid_score";
+            } catch (const std::exception& e) {
+                score.error = e.what();
+            } catch (...) {
+                score.error = "unknown_error";
+            }
+            scores[idx] = score;
+        }
+    }
+
+    if (num_threads > 0) omp_set_num_threads(previous_omp_threads);
+
+    py::list out;
+    for (const auto& score : scores) {
+        py::dict item;
+        item["formula"] = score.formula;
+        item["ok"] = score.ok;
+        item["fit_mse"] = score.fit_mse;
+        item["mse"] = score.val_mse;
+        item["validation_mse"] = score.val_mse;
+        item["r2"] = score.r2;
+        item["validation_r2"] = score.r2;
+        item["scale"] = score.scale;
+        item["bias"] = score.bias;
+        item["error"] = score.error;
+        out.append(item);
+    }
+    return out;
+}
 
 // Pybind wrapper for the evolution engine
 py::dict run_evolution_cpp(
@@ -570,6 +804,10 @@ std::string reduce_formula_noise_wrapper(
 
 PYBIND11_MODULE(_core, m) {
     m.doc() = "Fast C++ core for Glassbox Symbolic Regression";
+    m.def("score_formula_candidates", &score_formula_candidates_cpp,
+          "Parse and score formulas with affine scaling using OpenMP",
+          py::arg("formulas"), py::arg("X_fit"), py::arg("y_fit"),
+          py::arg("X_val"), py::arg("y_val"), py::arg("num_threads")=-1);
     m.def("run_evolution", &run_evolution_cpp, "Runs the evolutionary algorithm natively in C++",
           py::arg("X_list"), py::arg("y"), py::arg("pop_size")=50, py::arg("generations")=1000, 
           py::arg("early_stop_mse")=1e-6, py::arg("seed_omegas")=py::list(),

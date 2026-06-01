@@ -60,6 +60,106 @@ def test_winning_track_tracking_on_simple_regressor():
     assert reg.specialist_track_ in ("incumbent path", "screening only")
 
 
+def test_specialist_metadata_splits_composition_semantics():
+    from scripts import benchmark_common as bc
+
+    reg = GlassboxRegressor()
+    reg.composition_candidates_accepted_ = True
+    reg.composition_candidate_count_ = 3
+    reg.composition_seeded_evolution_ = True
+    reg.composition_won_final_selection_ = False
+    reg.composition_improved_mse_ = False
+    reg.formula_eval_count_ = 7
+    reg.formula_eval_cache_hits_ = 3
+    reg._formula_eval_cache_ = {"cached": object()}
+
+    meta = bc.specialist_metadata_from_estimator(reg)
+
+    assert meta["composition_candidates_accepted"] is True
+    assert meta["composition_candidate_count"] == 3
+    assert meta["composition_seeded_evolution"] is True
+    assert meta["composition_won_final_selection"] is False
+    assert meta["composition_improved_mse"] is False
+    assert meta["formula_eval_count"] == 7
+    assert meta["formula_eval_cache_hits"] == 3
+    assert meta["formula_eval_cache_size"] == 1
+
+
+def test_safe_eval_formula_array_caches_repeated_matrix_eval():
+    reg = GlassboxRegressor()
+    X = np.linspace(-2.0, 2.0, 32).reshape(-1, 1)
+
+    first = reg._safe_eval_formula_array("sin(x)", X)
+    second = reg._safe_eval_formula_array("sin(x)", X)
+
+    assert np.allclose(first, second)
+    assert reg.formula_eval_count_ == 2
+    assert reg.formula_eval_cache_hits_ == 1
+
+
+def test_targeted_specialist_probes_prioritize_envelope_carrier_products():
+    reg = GlassboxRegressor()
+    x = np.linspace(-2.0, 2.0, 160)
+    X = x.reshape(-1, 1)
+    y = np.exp(-(x ** 2)) * np.sin(3.0 * x)
+
+    probes = reg._targeted_specialist_probe_formulas(X, y, max_formulas=12)
+
+    formulas = [probe["formula"] for probe in probes]
+    assert "exp(-x0^2)*sin(3*x0)" in formulas
+
+
+def test_univariate_specialist_candidate_pool_includes_targeted_probes():
+    class ProbeRegressor(GlassboxRegressor):
+        def _refine_candidate_formulas(self, candidate_formulas, X, y, *, max_candidates=12):
+            return list(candidate_formulas)[:max_candidates]
+
+    reg = ProbeRegressor()
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = np.exp(-x) * np.sin(2.0 * x)
+
+    candidates = reg._build_univariate_specialist_candidate_formulas(
+        None,
+        None,
+        None,
+        X,
+        y,
+        max_candidates=80,
+    )
+
+    assert any(candidate.get("from_targeted_specialist_probe") for candidate in candidates)
+    assert any(candidate.get("source") == "envelope_carrier_probe" for candidate in candidates)
+
+
+def test_cpp_batch_candidate_scoring_matches_affine_fit_when_available():
+    try:
+        import _core  # type: ignore
+    except Exception:
+        return
+    if not hasattr(_core, "score_formula_candidates"):
+        return
+
+    x = np.linspace(-2.0, 2.0, 80)
+    X = np.ascontiguousarray(x.reshape(-1, 1), dtype=np.float64)
+    y = np.ascontiguousarray(2.0 * np.sin(3.0 * x) + 0.5, dtype=np.float64)
+    split = 60
+
+    scores = _core.score_formula_candidates(
+        ["sin(3*x0)", "x0^2"],
+        X[:split],
+        y[:split],
+        X[split:],
+        y[split:],
+        2,
+    )
+
+    assert scores[0]["ok"] is True
+    assert scores[0]["validation_r2"] > 0.999
+    assert abs(scores[0]["scale"] - 2.0) < 1e-9
+    assert abs(scores[0]["bias"] - 0.5) < 1e-9
+
+
 def test_phase4_harness_returns_summary_and_cases():
     result = spe.run_phase4(quick=True)
 

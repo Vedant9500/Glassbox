@@ -789,6 +789,10 @@ def compute_specialist_state(
                 hot_spot_segment_scores=hs_segment_scores,
             )
         )
+    best_candidate_for_hot_spots = next(
+        (candidate for candidate in candidates if candidate.formula == best_formula_for_hot_spots),
+        candidates[0],
+    )
 
     pair_scores: List[SpecialistPairScore] = []
     for left_idx in range(len(candidates)):
@@ -885,11 +889,10 @@ def compute_specialist_state(
 
             # Excel-on-hot-spot bonus
             hs_excel_bonus = 0.0
-            best_candidate = candidates[0]
-            total_best_mse = float(np.mean(best_candidate.residual_vector ** 2))
+            total_best_mse = float(np.mean(best_candidate_for_hot_spots.residual_vector ** 2))
             if total_best_mse >= 1e-12 and len(hot_spot_segments) > 0:
                 for seg_idx, (seg_l, seg_r) in enumerate(zip(left.hot_spot_segment_scores, right.hot_spot_segment_scores)):
-                    seg_best = best_candidate.hot_spot_segment_scores[seg_idx]
+                    seg_best = best_candidate_for_hot_spots.hot_spot_segment_scores[seg_idx]
                     if seg_best.mse > 1.2 * total_best_mse:
                         if min(seg_l.mse, seg_r.mse) < 0.7 * seg_best.mse:
                             hs_excel_bonus += 0.10

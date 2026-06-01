@@ -28,6 +28,12 @@ def test_formula_mse_eval_handles_base_log_constants():
     assert bs.cfp._evaluate_formula_values("log(E, 2)*x", x) is not None
 
 
+def test_benchmark_target_parser_treats_lowercase_e_as_euler_constant():
+    x, y = bs._generate_data("e*x", -2.0, 2.0, 64)
+
+    assert np.allclose(y, np.e * x)
+
+
 def test_run_formula_flags_formula_eval_failed(monkeypatch):
     def _fake_fast_path(*args, **kwargs):
         return {
@@ -51,6 +57,8 @@ def test_run_formula_flags_formula_eval_failed(monkeypatch):
     assert result["formula_discovered"]
     assert result["mse_display"] is None
     assert result["error"] == "formula_eval_failed"
+    assert result["formula_before_display_error"]
+    assert result["display_eval_diagnostics"]["ok"] is False
     assert result["score"] == "FAIL"
 
 
@@ -271,6 +279,139 @@ def test_run_formula_passes_candidate_formulas(monkeypatch):
     )
 
     assert result["candidate_formulas"] == candidates
+    assert result["fast_path_candidate_formulas"] == candidates
+    assert result["winning_stage"] == "fast_path"
+
+
+def test_run_formula_preserves_guided_raw_mse_and_seed_candidates(monkeypatch):
+    sent_candidates = [
+        {"formula": "x", "mse": 1.0, "from_fast_path": True},
+    ]
+
+    def _fake_fast_path(*args, **kwargs):
+        return {
+            "formula": "x",
+            "mse": 1.0,
+            "details": {"n_nonzero": 1, "n_nonzero_simplified": 1},
+            "candidate_formulas": sent_candidates,
+            "operator_hints": {},
+        }
+
+    def _fake_guided(*args, **kwargs):
+        return {"formula": "x^2", "mse": 0.0, "raw_mse": 0.123}
+
+    monkeypatch.setattr(bs, "run_fast_path", _fake_fast_path)
+    monkeypatch.setattr(bs, "run_guided_evolution", _fake_guided)
+    monkeypatch.setattr(bs, "_evaluate_formula_mse", lambda formula, *a, **k: 1.0 if formula == "x" else 0.0)
+
+    result = bs.run_formula(
+        formula_str="x^2",
+        x_range=(-2.0, 2.0),
+        classifier_path="unused.pt",
+        n_samples=64,
+        device="cpu",
+        with_evolution=True,
+        evolution_only=False,
+    )
+
+    assert result["winning_stage"] == "guided_evolution"
+    assert result["mse_raw"] == 0.123
+    assert result["engine_raw_mse"] == 0.123
+    assert result["evolution_seed_candidates"]
+    assert result["candidate_formulas"] == result["evolution_seed_candidates"]
+
+
+def test_specialist_regressor_benchmark_defaults_keep_expensive_phases_off(monkeypatch):
+    captured = {}
+
+    class FakeRegressor:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.best_mse_ = 0.0
+            self.specialist_track_ = "incumbent path"
+            self.has_composed_seeds_ = False
+            self.phase_timings_ = {"total_fit": 0.0}
+            self.boosting_stages_ = []
+            self.boosting_attempted_ = False
+            self.boosting_improved_ = False
+            self.boosting_diagnostics_ = {}
+            self.blackbox_diagnostics_ = {}
+            self.inception_rounds_ = []
+            self.inception_diagnostics_ = {}
+            self.specialist_vault_ = None
+
+        def fit(self, X, y):
+            return self
+
+        def get_formula(self):
+            return "x"
+
+    import glassbox.sr.sklearn_wrapper as sw
+
+    monkeypatch.setattr(sw, "GlassboxRegressor", FakeRegressor)
+
+    result = bs.run_formula_specialist_regressor(
+        formula_str="x",
+        x_range=(-2.0, 2.0),
+        classifier_path="unused.pt",
+        proposer_path=None,
+        n_samples=64,
+        device="cpu",
+    )
+
+    assert captured["enable_specialist_screening_diagnostics"] is True
+    assert captured["enable_specialist_composition_screening"] is True
+    assert captured["enable_specialist_vault_memory"] is True
+    assert captured["enable_residual_stage"] is False
+    assert captured["enable_inception_reuse"] is False
+    assert result["specialist_phase_config"]["residual"] is False
+    assert result["specialist_phase_config"]["inception"] is False
+
+
+def test_specialist_regressor_benchmark_can_enable_full_phases(monkeypatch):
+    captured = {}
+
+    class FakeRegressor:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.best_mse_ = 0.0
+            self.specialist_track_ = "incumbent path"
+            self.has_composed_seeds_ = False
+            self.phase_timings_ = {"total_fit": 0.0}
+            self.boosting_stages_ = []
+            self.boosting_attempted_ = False
+            self.boosting_improved_ = False
+            self.boosting_diagnostics_ = {}
+            self.blackbox_diagnostics_ = {}
+            self.inception_rounds_ = []
+            self.inception_diagnostics_ = {}
+            self.specialist_vault_ = None
+
+        def fit(self, X, y):
+            return self
+
+        def get_formula(self):
+            return "x"
+
+    import glassbox.sr.sklearn_wrapper as sw
+
+    monkeypatch.setattr(sw, "GlassboxRegressor", FakeRegressor)
+
+    result = bs.run_formula_specialist_regressor(
+        formula_str="x",
+        x_range=(-2.0, 2.0),
+        classifier_path="unused.pt",
+        proposer_path=None,
+        n_samples=64,
+        device="cpu",
+        specialist_residual=True,
+        specialist_inception=True,
+    )
+
+    assert captured["enable_residual_stage"] is True
+    assert captured["enable_inception_reuse"] is True
+    assert result["specialist_phase_config"]["residual"] is True
+    assert result["specialist_phase_config"]["inception"] is True
 
 
 def test_classifier_prior_trust_from_uncertainty_extremes():

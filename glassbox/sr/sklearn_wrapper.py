@@ -201,12 +201,34 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.specialist_vault_ = SpecialistVault(max_entries=self.specialist_vault_size)
         self.specialist_track_ = "incumbent path"
         self.has_composed_seeds_ = False
+        self.composition_candidates_accepted_ = False
+        self.composition_candidate_count_ = 0
+        self.composition_seeded_evolution_ = False
+        self.composition_won_final_selection_ = False
+        self.composition_improved_mse_ = False
+        self.phase_timings_ = {}
+        self.formula_eval_count_ = 0
+        self.formula_eval_cache_hits_ = 0
+        self._formula_eval_cache_ = {}
         self.boosting_stages_ = []
         self.boosting_attempted_ = False
         self.boosting_improved_ = False
         self.boosting_diagnostics_ = {}
         self.inception_rounds_ = []
         self.inception_diagnostics_ = {}
+
+    def _add_phase_time(self, phase: str, elapsed: float) -> None:
+        try:
+            value = float(elapsed)
+        except Exception:
+            return
+        if value < 0.0 or not np.isfinite(value):
+            return
+        timings = getattr(self, "phase_timings_", None)
+        if not isinstance(timings, dict):
+            timings = {}
+            self.phase_timings_ = timings
+        timings[phase] = float(timings.get(phase, 0.0) or 0.0) + value
 
     def _estimate_compute_budget(self, X, current_r2, term_count, uncertainty=None):
         """Adaptive compute budget: easy problems get short runs, hard problems get longer runs.
@@ -710,16 +732,21 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
     def _compute_specialist_screening_diagnostics(self, candidate_formulas, X, y, *, max_candidates=6, max_pairs=5):
         """Summarize coarse segment behavior and pair complementarity for top candidates."""
-        state = compute_specialist_state(
-            candidate_formulas,
-            X,
-            y,
-            evaluate_formula=self._safe_eval_formula_array,
-            complexity_fn=self._formula_complexity,
-            family_signature_fn=self._formula_family_signature,
-            max_candidates=max_candidates,
-            max_pairs=max_pairs,
-        )
+        import time as _time
+        _phase_start = _time.time()
+        try:
+            state = compute_specialist_state(
+                candidate_formulas,
+                X,
+                y,
+                evaluate_formula=self._safe_eval_formula_array,
+                complexity_fn=self._formula_complexity,
+                family_signature_fn=self._formula_family_signature,
+                max_candidates=max_candidates,
+                max_pairs=max_pairs,
+            )
+        finally:
+            self._add_phase_time("specialist_diagnostics", _time.time() - _phase_start)
         if state is None:
             self.specialist_state_ = None
             return None
@@ -728,65 +755,73 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
     def _compose_specialist_candidates(self, candidate_formulas, X, y, *, max_candidates=12):
         """Generate and validate a tiny set of specialist-driven formula compositions."""
+        import time as _time
+        _phase_start = _time.time()
         state = getattr(self, "specialist_state_", None)
         if state is None:
             return []
 
-        proposals = propose_specialist_compositions(
-            state,
-            X,
-            y,
-            evaluate_formula=self._safe_eval_formula_array,
-            max_pairs=3,
-            min_complementarity=0.30,
-        )
-        if not proposals:
-            return []
+        try:
+            proposals = propose_specialist_compositions(
+                state,
+                X,
+                y,
+                evaluate_formula=self._safe_eval_formula_array,
+                max_pairs=3,
+                min_complementarity=0.30,
+            )
+            if not proposals:
+                return []
 
-        raw_candidates = [proposal.to_candidate_dict() for proposal in proposals]
-        refined = self._refine_candidate_formulas(
-            raw_candidates,
-            X,
-            y,
-            max_candidates=max(4, int(max_candidates)),
-        )
-        if not refined:
-            return []
+            raw_candidates = [proposal.to_candidate_dict() for proposal in proposals]
+            refined = self._refine_candidate_formulas(
+                raw_candidates,
+                X,
+                y,
+                max_candidates=max(4, int(max_candidates)),
+            )
+            if not refined:
+                return []
 
-        accepted = []
-        seen = set()
-        for candidate in refined:
-            formula = str((candidate or {}).get("formula", "")).strip()
-            if not formula:
-                continue
-            val_r2 = _finite_float(candidate.get("validation_r2"), -1.0)
-            complexity = int(candidate.get("complexity") or self._formula_complexity(formula))
-            risk = _finite_float(candidate.get("risk_score"), 1.0)
-            gap = _finite_float(candidate.get("generalization_gap"), 1.0)
-            key = re.sub(r"\s+", "", formula.lower())
-            if key in seen:
-                continue
-            if val_r2 < 0.70 or complexity > 40 or risk > 0.55 or gap > 0.90:
-                continue
-            seen.add(key)
-            accepted.append(candidate)
+            accepted = []
+            seen = set()
+            for candidate in refined:
+                formula = str((candidate or {}).get("formula", "")).strip()
+                if not formula:
+                    continue
+                val_r2 = _finite_float(candidate.get("validation_r2"), -1.0)
+                complexity = int(candidate.get("complexity") or self._formula_complexity(formula))
+                risk = _finite_float(candidate.get("risk_score"), 1.0)
+                gap = _finite_float(candidate.get("generalization_gap"), 1.0)
+                key = re.sub(r"\s+", "", formula.lower())
+                if key in seen:
+                    continue
+                if val_r2 < 0.70 or complexity > 40 or risk > 0.55 or gap > 0.90:
+                    continue
+                seen.add(key)
+                accepted.append(candidate)
 
-        if isinstance(self.blackbox_diagnostics_, dict):
-            self.blackbox_diagnostics_["specialist_composition_screening"] = {
-                "proposal_count": len(raw_candidates),
-                "accepted_count": len(accepted),
-                "top_proposals": [
-                    {
-                        "formula": str(candidate.get("formula", ""))[:160],
-                        "validation_r2": candidate.get("validation_r2"),
-                        "validation_mse": candidate.get("validation_mse"),
-                        "complexity": candidate.get("complexity"),
-                        "operator": candidate.get("composition_operator"),
-                    }
-                    for candidate in accepted[:6]
-                ],
-            }
-        return accepted
+            if isinstance(self.blackbox_diagnostics_, dict):
+                self.blackbox_diagnostics_["specialist_composition_screening"] = {
+                    "proposal_count": len(raw_candidates),
+                    "accepted_count": len(accepted),
+                    "top_proposals": [
+                        {
+                            "formula": str(candidate.get("formula", ""))[:160],
+                            "validation_r2": candidate.get("validation_r2"),
+                            "validation_mse": candidate.get("validation_mse"),
+                            "complexity": candidate.get("complexity"),
+                            "operator": candidate.get("composition_operator"),
+                        }
+                        for candidate in accepted[:6]
+                    ],
+                }
+            if accepted:
+                self.composition_candidates_accepted_ = True
+                self.composition_candidate_count_ = int(getattr(self, "composition_candidate_count_", 0) or 0) + len(accepted)
+            return accepted
+        finally:
+            self._add_phase_time("specialist_composition", _time.time() - _phase_start)
 
     def _specialist_vault_enabled(self):
         return (
@@ -855,6 +890,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         if vault_candidates or vault_compositions:
             self.has_composed_seeds_ = bool(vault_compositions) or self.has_composed_seeds_
+            self.composition_seeded_evolution_ = bool(vault_compositions) or self.composition_seeded_evolution_
             combined = list(vault_compositions) + list(vault_candidates) + base_candidates
             return self._prune_blackbox_candidate_formulas(
                 combined,
@@ -1002,6 +1038,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
     def _run_inception_reuse(self, X, y, base_formula):
         """Phase 9: freeze useful subexpressions as temporary features and refit a compact basis."""
+        import time as _time
+        _phase_start = _time.time()
+        try:
+            return self._run_inception_reuse_impl(X, y, base_formula)
+        finally:
+            self._add_phase_time("inception_reuse", _time.time() - _phase_start)
+
+    def _run_inception_reuse_impl(self, X, y, base_formula):
+        """Implementation for _run_inception_reuse with timing wrapper."""
         self.inception_rounds_ = []
         self.inception_diagnostics_ = {
             "enabled": bool(getattr(self, "enable_inception_reuse", True)),
@@ -1449,6 +1494,35 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if split is None:
             return []
 
+        cpp_scores = {}
+        ordered_formulas = []
+        seen_cpp = set()
+        for candidate in candidate_formulas:
+            formula = str((candidate or {}).get("formula", "")).strip()
+            if not formula:
+                continue
+            key = re.sub(r"\s+", "", formula.lower())
+            if key in seen_cpp:
+                continue
+            seen_cpp.add(key)
+            ordered_formulas.append(formula)
+        if CPP_AVAILABLE and ordered_formulas:
+            try:
+                import _core  # type: ignore
+                if hasattr(_core, "score_formula_candidates"):
+                    scored_cpp = _core.score_formula_candidates(
+                        ordered_formulas,
+                        np.ascontiguousarray(split["X_fit"], dtype=np.float64),
+                        np.ascontiguousarray(split["y_fit"], dtype=np.float64),
+                        np.ascontiguousarray(split["X_val"], dtype=np.float64),
+                        np.ascontiguousarray(split["y_val"], dtype=np.float64),
+                    )
+                    for formula, scored in zip(ordered_formulas, list(scored_cpp)):
+                        if isinstance(scored, dict):
+                            cpp_scores[re.sub(r"\s+", "", formula.lower())] = dict(scored)
+            except Exception:
+                cpp_scores = {}
+
         ranked = []
         seen = set()
         for candidate in candidate_formulas:
@@ -1459,13 +1533,49 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             if key in seen:
                 continue
             seen.add(key)
-            scored = self._score_formula_candidate(
-                formula,
-                split["X_fit"],
-                split["y_fit"],
-                split["X_val"],
-                split["y_val"],
-            )
+            scored = None
+            cpp_scored = cpp_scores.get(key)
+            if cpp_scored is not None:
+                if not cpp_scored.get("ok"):
+                    error_text = str(cpp_scored.get("error", "")).lower()
+                    cpp_invalid_markers = (
+                        "nonfinite",
+                        "feature_index_out_of_range",
+                        "power_domain_error",
+                        "domain",
+                    )
+                    if any(marker in error_text for marker in cpp_invalid_markers):
+                        continue
+                else:
+                    scale = _finite_float(cpp_scored.get("scale"), 0.0)
+                    bias = _finite_float(cpp_scored.get("bias"), 0.0)
+                    refined_formula = formula
+                    if abs(scale - 1.0) > 1e-8 or abs(bias) > 1e-8:
+                        refined_formula = f"(({scale:.12g})*({formula})+({bias:.12g}))"
+                    val_mse = _finite_float(cpp_scored.get("mse"), float("inf"))
+                    fit_mse = _finite_float(cpp_scored.get("fit_mse"), float("inf"))
+                    val_r2 = _finite_float(cpp_scored.get("r2"), -float("inf"))
+                    if np.isfinite(val_mse) and np.isfinite(fit_mse) and np.isfinite(val_r2):
+                        scored = {
+                            "formula": refined_formula,
+                            "base_formula": formula,
+                            "fit_mse": fit_mse,
+                            "mse": val_mse,
+                            "r2": val_r2,
+                            "scale": scale,
+                            "bias": bias,
+                            "complexity": max(1, formula.count("+") + formula.count("-") + formula.count("*") + formula.count("/") + formula.count("^") + 1),
+                            "risk_score": self._formula_risk_score(refined_formula, split["X_val"]),
+                            "generalization_gap": float(max(0.0, val_mse - fit_mse) / max(float(np.var(split["y_val"])), 1e-12)),
+                        }
+            if scored is None:
+                scored = self._score_formula_candidate(
+                    formula,
+                    split["X_fit"],
+                    split["y_fit"],
+                    split["X_val"],
+                    split["y_val"],
+                )
             if scored is None:
                 continue
             constant_refined = self._refine_formula_constants(
@@ -1644,6 +1754,190 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         hints["active_terms"] = list(dict.fromkeys(hints["active_terms"]))[:12]
         return hints
 
+    def _targeted_specialist_probe_formulas(self, X, y, *, max_formulas=96):
+        """Generate deterministic probes for hard univariate composition families.
+
+        These are intentionally raw structural candidates. The existing
+        refinement/holdout scorer decides whether any of them are useful.
+        """
+        X_arr = np.asarray(X, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+        if X_arr.ndim != 2 or X_arr.shape[0] != y_arr.shape[0] or X_arr.shape[1] < 1:
+            return []
+
+        formulas = []
+        seen = set()
+
+        def add(text, source="targeted_specialist_probe", **extra):
+            formula = str(text or "").strip()
+            if not formula or formula == "0":
+                return
+            key = re.sub(r"\s+", "", formula.lower())
+            if key in seen:
+                return
+            seen.add(key)
+            item = {
+                "formula": formula,
+                "mse": float("inf"),
+                "source": source,
+                "from_targeted_specialist_probe": True,
+            }
+            item.update(extra)
+            formulas.append(item)
+
+        def _freq_text(value):
+            try:
+                v = float(value)
+            except Exception:
+                return None
+            if not np.isfinite(v) or abs(v) < 1e-8 or abs(v) > 20.0:
+                return None
+            for canonical, text in ((1.0, ""), (2.0, "2*"), (3.0, "3*"), (5.0, "5*"), (np.pi, "pi*")):
+                if abs(v - canonical) < 0.08:
+                    return text
+            return f"{v:.6g}*"
+
+        for feature_idx in range(min(int(X_arr.shape[1]), 2)):
+            x = f"x{feature_idx}"
+            x_values = X_arr[:, feature_idx]
+            if feature_idx > 0:
+                finite_steps = np.diff(x_values[np.isfinite(x_values)])
+                if finite_steps.size and not (
+                    np.mean(finite_steps >= -1e-12) >= 0.95
+                    or np.mean(finite_steps <= 1e-12) >= 0.95
+                ):
+                    continue
+            y_var = float(np.var(y_arr)) if y_arr.size else 0.0
+            finite_x = x_values[np.isfinite(x_values)]
+            crosses_zero = bool(finite_x.size and np.nanmin(finite_x) < 0.0 < np.nanmax(finite_x))
+
+            # Symmetry/cusp probes: target abs/even failures and cusp envelopes.
+            if crosses_zero:
+                add(f"abs({x})", "symmetry_cusp_probe")
+                add(f"{x}/(1+abs({x}))", "symmetry_cusp_probe")
+                add(f"sqrt(abs({x}))", "symmetry_cusp_probe")
+                add(f"exp(-abs({x}))", "symmetry_cusp_probe")
+
+            # Envelope/factor probes for exp damping and Gaussian damping.
+            envelopes = [
+                f"exp(-{x})",
+                f"exp(-2*{x})",
+                f"exp(-{x}^2)",
+                f"exp(-{x}^2/2)",
+                f"1/(1+exp(-{x}))",
+            ]
+            if crosses_zero:
+                envelopes.append(f"exp(-abs({x}))")
+            powers = ["1", x, f"{x}^2", f"{x}^3"]
+            for env in envelopes:
+                add(env, "envelope_probe")
+                for power in powers[1:]:
+                    add(f"{power}*{env}", "envelope_factor_probe")
+
+            # Frequency/carrier probes. Include FFT candidates and common hard-suite harmonics.
+            freq_values = [1.0, 2.0, 3.0, 5.0, np.pi]
+            try:
+                detected = self._detect_frequencies(X_arr[:, [feature_idx]], y_arr)
+            except Exception:
+                detected = []
+            for omega in list(detected or [])[:4]:
+                try:
+                    freq_values.append(float(omega))
+                except Exception:
+                    pass
+            freq_prefixes = []
+            for omega in freq_values:
+                text = _freq_text(omega)
+                if text is not None and text not in freq_prefixes:
+                    freq_prefixes.append(text)
+
+            carriers = []
+            for prefix in freq_prefixes[:8]:
+                sx = f"sin({prefix}{x})"
+                cx = f"cos({prefix}{x})"
+                carriers.extend([sx, cx])
+                add(sx, "carrier_probe")
+                add(cx, "carrier_probe")
+
+            for env in envelopes:
+                for carrier in carriers[:12]:
+                    add(f"{env}*{carrier}", "envelope_carrier_probe")
+                    add(f"{x}*{env}*{carrier}", "envelope_carrier_probe")
+                    add(f"{x}^2*{env}*{carrier}", "envelope_carrier_probe")
+
+            # Product-of-carriers probes for trig product failures.
+            for a in ("", "2*", "3*", "5*"):
+                for b in ("2*", "3*", "5*"):
+                    if a == b:
+                        continue
+                    add(f"sin({a}{x})*sin({b}{x})", "carrier_product_probe")
+                    add(f"sin({a}{x})*cos({b}{x})", "carrier_product_probe")
+            add(f"sin({x})*sin(3*{x})*sin(5*{x})", "carrier_product_probe")
+            add(f"{x}^2*exp(-{x})*cos(3*{x})", "envelope_carrier_probe")
+            add(f"{x}^2*exp(-{x})*sin({x})", "envelope_carrier_probe")
+
+            # Log/nested composition probes for formulas that fit poorly with
+            # additive Fourier/polynomial surrogates.
+            log_nested = [
+                f"log(1+{x}^2)",
+                f"log(1+sin({x})^2)",
+                f"log(1+exp({x}))",
+                f"sin({x}*cos({x}))",
+                f"sin(exp(-{x}))",
+                f"cos(sin({x}))",
+                f"sin({x}+sin({x}))",
+                f"sin({x}+exp(-{x}))",
+                f"sqrt(abs(sin({x})))",
+                f"sin({x})/sqrt(1+{x}^2)",
+            ]
+            for formula in log_nested:
+                add(formula, "nested_transform_probe")
+
+            if y_var > 1e-12 and crosses_zero:
+                # Cheap parity hints: keep both exact parity probes and their
+                # damped/carrier variants available to the ranker.
+                add(f"({x}^2-1)*exp(-{x}^2/2)", "symmetry_envelope_probe")
+                add(f"sin(pi*{x})*exp(-{x}^2)", "envelope_carrier_probe")
+
+        if formulas:
+            source_priority = {
+                "envelope_carrier_probe": 0,
+                "carrier_product_probe": 1,
+                "envelope_factor_probe": 2,
+                "envelope_probe": 3,
+                "carrier_probe": 4,
+            }
+            for item in formulas:
+                formula = str(item.get("formula", ""))
+                score_mse = float("inf")
+                try:
+                    pred = self._safe_eval_formula_array(formula, X_arr).reshape(-1)
+                    if pred.shape == y_arr.shape and np.all(np.isfinite(pred)):
+                        p_var = float(np.var(pred))
+                        if p_var > 1e-15:
+                            scale = float(np.cov(pred, y_arr, bias=True)[0, 1] / p_var)
+                            bias = float(np.mean(y_arr) - scale * np.mean(pred))
+                            pred = scale * pred + bias
+                        score_mse = float(np.mean((pred - y_arr) ** 2))
+                except Exception:
+                    score_mse = float("inf")
+                item["probe_mse"] = score_mse
+            formulas.sort(
+                key=lambda item: (
+                    float(item.get("probe_mse", float("inf"))),
+                    source_priority.get(str(item.get("source", "")), 9),
+                    len(str(item.get("formula", ""))),
+                    str(item.get("formula", "")),
+                )
+            )
+
+        if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+            self.blackbox_diagnostics_["targeted_specialist_probes"] = {
+                "count": len(formulas),
+                "sources": sorted({str(item.get("source", "")) for item in formulas}),
+            }
+        return formulas[: max(0, int(max_formulas))]
+
     def _build_blackbox_candidate_formulas(
         self,
         best_formula,
@@ -1656,61 +1950,69 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         max_candidates,
     ):
         """Build, refine, and prune a shared candidate pool for basis fitting and evolution."""
+        import time as _time
+        _phase_start = _time.time()
         raw_candidates = []
-        if best_formula:
-            raw_candidates.append({
-                "formula": best_formula,
-                "mse": best_mse if best_mse is not None else float("inf"),
-                "from_fast_path": True,
-            })
-
-        if isinstance(proposer_payload, dict):
-            for cand in proposer_payload.get("candidate_skeletons", [])[:10]:
-                formula = str(cand.get("formula", "")).strip()
-                if not formula:
-                    continue
+        try:
+            if best_formula:
                 raw_candidates.append({
-                    "formula": formula,
-                    "mse": cand.get("mse", float("inf")),
-                    "score": cand.get("score", 0.0),
-                    "active_terms": cand.get("active_terms", []),
-                    "from_proposer": True,
+                    "formula": best_formula,
+                    "mse": best_mse if best_mse is not None else float("inf"),
+                    "from_fast_path": True,
                 })
 
-        if blackbox_state is not None and getattr(blackbox_state, "enabled", False):
-            selected_features = list(getattr(blackbox_state, "selected_features", []) or [])
-            for term in list(getattr(blackbox_state, "interaction_terms", []) or [])[:8]:
-                seed_formula = remap_original_formula_to_reduced(term, selected_features)
-                raw_candidates.append({
-                    "formula": seed_formula,
-                    "mse": float("inf"),
-                    "score": float((getattr(blackbox_state, "interaction_scores", {}) or {}).get(term, 0.0)),
-                    "active_terms": [seed_formula],
-                    "from_blackbox_interaction": True,
-                })
-            for formula in list(getattr(blackbox_state, "candidate_seed_formulas", []) or [])[:16]:
-                seed_formula = remap_original_formula_to_reduced(formula, selected_features)
-                raw_candidates.append({
-                    "formula": seed_formula,
-                    "mse": float("inf"),
-                    "score": 0.2,
-                    "active_terms": [seed_formula],
-                    "from_blackbox_seed": True,
-                })
+            if isinstance(proposer_payload, dict):
+                for cand in proposer_payload.get("candidate_skeletons", [])[:10]:
+                    formula = str(cand.get("formula", "")).strip()
+                    if not formula:
+                        continue
+                    raw_candidates.append({
+                        "formula": formula,
+                        "mse": cand.get("mse", float("inf")),
+                        "score": cand.get("score", 0.0),
+                        "active_terms": cand.get("active_terms", []),
+                        "from_proposer": True,
+                    })
 
-        refined = self._refine_candidate_formulas(
-            raw_candidates,
-            X,
-            y,
-            max_candidates=max(
-                int(max_candidates),
-                8,
-            ),
-        )
-        return self._prune_blackbox_candidate_formulas(
-            refined,
-            max_candidates=max_candidates,
-        )
+            if blackbox_state is not None and getattr(blackbox_state, "enabled", False):
+                selected_features = list(getattr(blackbox_state, "selected_features", []) or [])
+                for term in list(getattr(blackbox_state, "interaction_terms", []) or [])[:8]:
+                    seed_formula = remap_original_formula_to_reduced(term, selected_features)
+                    raw_candidates.append({
+                        "formula": seed_formula,
+                        "mse": float("inf"),
+                        "score": float((getattr(blackbox_state, "interaction_scores", {}) or {}).get(term, 0.0)),
+                        "active_terms": [seed_formula],
+                        "from_blackbox_interaction": True,
+                    })
+                for formula in list(getattr(blackbox_state, "candidate_seed_formulas", []) or [])[:16]:
+                    seed_formula = remap_original_formula_to_reduced(formula, selected_features)
+                    raw_candidates.append({
+                        "formula": seed_formula,
+                        "mse": float("inf"),
+                        "score": 0.2,
+                        "active_terms": [seed_formula],
+                        "from_blackbox_seed": True,
+                    })
+
+            if np.asarray(X).ndim == 2 and int(np.asarray(X).shape[1]) == 1:
+                raw_candidates.extend(self._targeted_specialist_probe_formulas(X, y, max_formulas=64))
+
+            refined = self._refine_candidate_formulas(
+                raw_candidates,
+                X,
+                y,
+                max_candidates=max(
+                    int(max_candidates),
+                    8,
+                ),
+            )
+            return self._prune_blackbox_candidate_formulas(
+                refined,
+                max_candidates=max_candidates,
+            )
+        finally:
+            self._add_phase_time("candidate_building", _time.time() - _phase_start)
 
     def _build_univariate_specialist_candidate_formulas(
         self,
@@ -1730,6 +2032,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         pruning gates while sourcing candidates from fast-path alternates,
         proposer skeletons, and a small domain-native basis.
         """
+        import time as _time
+        _phase_start = _time.time()
         raw_candidates = []
         seen = set()
 
@@ -1781,13 +2085,24 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         for formula in self._build_blackbox_formula_pool(best_formula, proposer_payload, None, n_features)[:24]:
             add(formula, "specialist_basis_seed", float("inf"), from_specialist_basis_seed=True)
 
-        refined = self._refine_candidate_formulas(
-            raw_candidates,
-            X,
-            y,
-            max_candidates=max(int(max_candidates), 8),
-        )
-        return self._prune_blackbox_candidate_formulas(refined, max_candidates=max_candidates)
+        for cand in self._targeted_specialist_probe_formulas(X, y, max_formulas=64):
+            add(
+                (cand or {}).get("formula"),
+                (cand or {}).get("source") or "targeted_specialist_probe",
+                (cand or {}).get("mse", float("inf")),
+                from_targeted_specialist_probe=True,
+            )
+
+        try:
+            refined = self._refine_candidate_formulas(
+                raw_candidates,
+                X,
+                y,
+                max_candidates=max(int(max_candidates), 8),
+            )
+            return self._prune_blackbox_candidate_formulas(refined, max_candidates=max_candidates)
+        finally:
+            self._add_phase_time("univariate_candidate_building", _time.time() - _phase_start)
 
     def _run_specialist_candidate_screening(
         self,
@@ -1867,6 +2182,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         if specialist_candidates or residual_merged_candidates:
             self.has_composed_seeds_ = True
+            self.composition_seeded_evolution_ = True
             candidate_formulas = self._prune_blackbox_candidate_formulas(
                 list(residual_merged_candidates) + list(specialist_candidates) + list(candidate_formulas or []),
                 max_candidates=max(
@@ -2634,6 +2950,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "_signed_power": _signed_power,
             "pi": np.pi,
             "E": np.e,
+            "e": np.e,
         }
         for i in range(X.shape[1]):
             context[f"x{i}"] = X[:, i]
@@ -2651,6 +2968,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             except Exception:
                 pass
 
+        self.formula_eval_count_ = int(getattr(self, "formula_eval_count_", 0) or 0) + 1
+        cache = getattr(self, "_formula_eval_cache_", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._formula_eval_cache_ = cache
+        cache_key = (expr, id(X), tuple(getattr(X, "shape", ())), str(getattr(X, "dtype", "")))
+        cached = cache.get(cache_key)
+        if cached is not None:
+            self.formula_eval_cache_hits_ = int(getattr(self, "formula_eval_cache_hits_", 0) or 0) + 1
+            return np.asarray(cached, dtype=np.float64).copy()
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             y_pred = eval(expr, {"__builtins__": None}, context)
@@ -2659,7 +2987,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             y_pred = np.full(X.shape[0], y_pred, dtype=np.float64)
         else:
             y_pred = np.asarray(y_pred, dtype=np.float64)
-        return np.where(np.isfinite(y_pred), y_pred, 0.0)
+        out = np.where(np.isfinite(y_pred), y_pred, 0.0)
+        if len(cache) >= 512:
+            cache.clear()
+        cache[cache_key] = np.asarray(out, dtype=np.float64).copy()
+        return out
 
     def _formula_domain_failure_rate(self, formula, X):
         """Estimate how often a displayed formula leaves its numeric domain."""
@@ -2678,6 +3010,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "sign": np.sign,
             "pi": np.pi,
             "E": np.e,
+            "e": np.e,
         }
         for i in range(X.shape[1]):
             context[f"x{i}"] = X[:, i]
@@ -2872,6 +3205,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
     def _stage_residual_symbolic_fit(self, X, y, base_formula, *, _allow_recursion=False):
         """Fit a second symbolic stage on the residual when it improves holdout fit."""
+        import time as _time
+        _phase_start = _time.time()
+        try:
+            return self._stage_residual_symbolic_fit_impl(X, y, base_formula, _allow_recursion=_allow_recursion)
+        finally:
+            self._add_phase_time("residual_symbolic_fit", _time.time() - _phase_start)
+
+    def _stage_residual_symbolic_fit_impl(self, X, y, base_formula, *, _allow_recursion=False):
+        """Implementation for _stage_residual_symbolic_fit with timing wrapper."""
         if not self.enable_residual_stage or not _allow_recursion or not base_formula or not self.use_guided_evolution:
             return None
         if X.shape[1] < 1:
@@ -2915,7 +3257,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             simplification_int_tol=self.simplification_int_tol,
             simplification_zero_tol=self.simplification_zero_tol,
             max_power=self.max_power,
-            timeout=max(20, int(self.timeout // 2)),
+            timeout=max(1, min(3, int(max(1, self.timeout // 5)))),
             evolution_skip_r2=self.evolution_skip_r2,
             multi_start_runs=1,
             adaptive_compute_budget=self.adaptive_compute_budget,
@@ -2964,6 +3306,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
     def _run_residual_boosting(self, X, y, base_formula):
         """Run a multi-stage symbolic boosting loop on top of base_formula."""
+        import time as _time
+        _phase_start = _time.time()
+        try:
+            return self._run_residual_boosting_impl(X, y, base_formula)
+        finally:
+            self._add_phase_time("residual_boosting", _time.time() - _phase_start)
+
+    def _run_residual_boosting_impl(self, X, y, base_formula):
+        """Implementation for _run_residual_boosting with timing wrapper."""
         self.boosting_stages_ = []
         self.boosting_attempted_ = False
         self.boosting_improved_ = False
@@ -3138,6 +3489,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         X, y = check_X_y(X, y, accept_sparse=False)
         self.has_composed_seeds_ = False
+        self.composition_candidates_accepted_ = False
+        self.composition_candidate_count_ = 0
+        self.composition_seeded_evolution_ = False
+        self.composition_won_final_selection_ = False
+        self.composition_improved_mse_ = False
+        self.phase_timings_ = {}
+        self.formula_eval_count_ = 0
+        self.formula_eval_cache_hits_ = 0
+        self._formula_eval_cache_ = {}
         self.specialist_track_ = "incumbent path"
         self.specialist_vault_ = SpecialistVault(max_entries=int(getattr(self, "specialist_vault_size", 8) or 0))
         self.n_features_in_ = X.shape[1]
@@ -3525,73 +3885,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     ],
                     "interaction_operator_hints": sorted(operator_hints.get("operators", set())),
                 }
-                if self.enable_specialist_screening_diagnostics:
-                    specialist_screening = self._compute_specialist_screening_diagnostics(
-                        candidate_formulas,
-                        X,
-                        y,
-                        max_candidates=6,
-                        max_pairs=5,
-                    )
-                    if specialist_screening is not None:
-                        self.blackbox_diagnostics_["candidate_screening"]["specialist_screening"] = specialist_screening
-                        
-                        specialist_candidates = []
-                        if getattr(self, "enable_specialist_composition_screening", True):
-                            specialist_candidates = self._compose_specialist_candidates(
-                                candidate_formulas,
-                                X,
-                                y,
-                                max_candidates=max(
-                                    8,
-                                    int(blackbox_search_plan.get("screening_budget", 8)),
-                                ),
-                            )
-                        
-                        # Phase 4: Guided Residual Evolution From Merged Formulas
-                        residual_merged_candidates = []
-                        if self.enable_residual_stage and specialist_candidates:
-                            for cand in list(specialist_candidates)[:2]:  # Cap at top 2 compositions to keep compute budget small
-                                formula = cand.get("formula")
-                                if not formula:
-                                    continue
-                                val_r2 = _finite_float(cand.get("validation_r2"), -1.0)
-                                if val_r2 >= 0.75:
-                                    res_form = self._stage_residual_symbolic_fit(X, y, formula, _allow_recursion=True)
-                                    if res_form and res_form != "0":
-                                        combined_formula = f"({formula})+({res_form})"
-                                        refined_list = self._refine_candidate_formulas(
-                                            [{
-                                                "formula": combined_formula,
-                                                "source": "specialist_residual_composition",
-                                                "from_specialist_composition": True,
-                                            }],
-                                            X,
-                                            y,
-                                            max_candidates=1,
-                                        )
-                                        if refined_list:
-                                            residual_merged_candidates.extend(refined_list)
-
-                        if specialist_candidates or residual_merged_candidates:
-                            self.has_composed_seeds_ = True
-                            candidate_formulas = self._prune_blackbox_candidate_formulas(
-                                list(residual_merged_candidates) + list(specialist_candidates) + list(candidate_formulas or []),
-                                max_candidates=max(
-                                    8,
-                                    int(blackbox_search_plan.get("seed_budget", 8)),
-                                ),
-                            )
-                            self.blackbox_diagnostics_["candidate_screening"]["candidate_count"] = len(candidate_formulas or [])
-                            self.blackbox_diagnostics_["candidate_screening"]["top_candidates"] = [
-                                {
-                                    "formula": str(c.get("formula", ""))[:160],
-                                    "validation_r2": c.get("validation_r2"),
-                                    "validation_mse": c.get("validation_mse"),
-                                    "complexity": c.get("complexity"),
-                                }
-                                for c in (candidate_formulas or [])[:6]
-                            ]
+            candidate_formulas = self._run_specialist_candidate_screening(
+                candidate_formulas,
+                X,
+                y,
+                blackbox_search_plan,
+                diagnostics_key="candidate_screening",
+            )
 
         if (
             not (blackbox_state is not None and blackbox_state.enabled)
@@ -4319,10 +4619,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         if winner_source == "evolution":
                             if self.has_composed_seeds_:
                                 specialist_track = "composed seed + evolution"
+                                self.composition_seeded_evolution_ = True
                             else:
                                 specialist_track = "incumbent path"
                         elif winner_source in ("specialist_composition", "specialist_residual_composition", "candidate_screening", "proposer", "basis_model", "engineered_basis"):
                             specialist_track = "screening only"
+                            if winner_source in ("specialist_composition", "specialist_residual_composition"):
+                                self.composition_won_final_selection_ = True
+                                self.composition_improved_mse_ = True
                         elif winner_source == "incumbent":
                             specialist_track = "incumbent path"
                     elif selection_outcome["candidate_screening_win"]:
@@ -4346,6 +4650,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         self.formula_ = best_formula or "0"
         self.best_mse_ = best_mse
+        self._add_phase_time("total_fit", _time.time() - fit_start)
         return self
 
     def predict(self, X):

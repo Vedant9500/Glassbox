@@ -449,7 +449,8 @@ def _parse_formula(formula_str: str) -> Callable[[np.ndarray], np.ndarray]:
             "log": sp.log,
             "sqrt": sp.sqrt,
             "pi": sp.pi,
-            "E": sp.E
+            "E": sp.E,
+            "e": sp.E,
         }
         expr = parse_expr(formula, local_dict=local_dict, transformations=transformations, evaluate=False)     
         free_syms = sorted(expr.free_symbols, key=lambda sym: sym.name)
@@ -738,6 +739,31 @@ def _mse_divergence_stats(mse_display: Optional[float], mse_raw: Optional[float]
     return out
 
 
+def _display_eval_details(formula: str, x: np.ndarray, y: np.ndarray) -> Dict[str, Any]:
+    """Evaluate a displayed formula and return MSE plus parser diagnostics."""
+    X = np.asarray(x, dtype=np.float64).reshape(-1, 1)
+    y_pred, diagnostics = bc.evaluate_formula(formula, X, return_diagnostics=True)
+    return {
+        "mse": _evaluate_formula_mse(formula, x, y),
+        "diagnostics": diagnostics,
+    }
+
+
+def _record_display_eval_failure(
+    result: Dict[str, Any],
+    formula: str,
+    x: np.ndarray,
+    y: np.ndarray,
+) -> None:
+    """Attach display-evaluation failure details without changing scoring policy."""
+    details = _display_eval_details(formula, x, y)
+    result["display_eval_diagnostics"] = details.get("diagnostics")
+    if details.get("mse") is None and formula:
+        result["formula_before_display_error"] = formula
+        if result.get("error") is None:
+            result["error"] = "formula_eval_failed"
+
+
 def score_result(mse: float, formula: str) -> str:
     """Classify a result as EXACT / APPROX / LOOSE / FAIL."""
     if mse is None or not math.isfinite(mse):
@@ -881,6 +907,16 @@ def run_formula(
         "uncertainty": None,
         "residual_diagnostics": None,
         "candidate_formulas": None,
+        "fast_path_candidate_formulas": None,
+        "evolution_seed_candidates": None,
+        "proposer_candidate_formulas": None,
+        "winning_stage": None,
+        "engine_raw_mse": None,
+        "formula_before_postprocess_mse": None,
+        "formula_after_postprocess_mse": None,
+        "score_mse": None,
+        "display_eval_diagnostics": None,
+        "formula_before_display_error": None,
         "mse_divergence_abs": None,
         "mse_divergence_rel": None,
         "mse_divergence_flag": False,
@@ -903,8 +939,13 @@ def run_formula(
             result["formula_discovered"] = formula
             result["postprocess_guard"] = guard
             result["mse_raw"] = 0.0
+            result["engine_raw_mse"] = 0.0
+            result["formula_before_postprocess_mse"] = guard.get("postprocess_raw_mse")
+            result["formula_after_postprocess_mse"] = guard.get("postprocess_processed_mse")
             result["mse_display"] = 0.0
             result["mse"] = 0.0
+            result["score_mse"] = 0.0
+            result["winning_stage"] = "constant_shortcut"
             result["time"] = 0.0
             result["n_terms"] = _count_terms(formula)
             result["uncertainty"] = cfp._prediction_uncertainty_metrics({'identity': 1.0})
@@ -960,19 +1001,30 @@ def run_formula(
                 result["error"] = "fast_path_not_applicable"
                 result["time"] = elapsed
             else:
+                fp_formula = fp_result.get("formula", "")
                 result["formula_discovered"], result["postprocess_guard"] = _postprocess_formula_for_benchmark(
-                    fp_result.get("formula", ""),
+                    fp_formula,
                     x_np,
                     y_np,
                 )
                 result["mse_raw"] = fp_result.get("mse", float("inf"))
-                result["mse_display"] = _evaluate_formula_mse(result["formula_discovered"], x_np, y_np)
+                result["engine_raw_mse"] = fp_result.get("mse", float("inf"))
+                result["formula_before_postprocess_mse"] = result["postprocess_guard"].get("postprocess_raw_mse")
+                result["formula_after_postprocess_mse"] = result["postprocess_guard"].get("postprocess_processed_mse")
+                display_details = _display_eval_details(result["formula_discovered"], x_np, y_np)
+                result["mse_display"] = display_details["mse"]
+                result["display_eval_diagnostics"] = display_details["diagnostics"]
                 result["mse"] = _select_score_mse(result["mse_display"])
+                result["score_mse"] = result["mse"]
                 result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
                 result["uncertainty"] = fp_result.get("uncertainty")
                 result["candidate_formulas"] = fp_result.get("candidate_formulas")
-                if result["formula_discovered"] and result["mse_display"] is None and result["error"] is None:
-                    result["error"] = "formula_eval_failed"
+                result["fast_path_candidate_formulas"] = fp_result.get("candidate_formulas")
+                result["winning_stage"] = "fast_path"
+                if result["formula_discovered"] and result["mse_display"] is None:
+                    result["formula_before_display_error"] = result["formula_discovered"]
+                    if result["error"] is None:
+                        result["error"] = "formula_eval_failed"
                 result["time"] = elapsed
                 str_term_count = _count_terms(result["formula_discovered"])
                 details = fp_result.get("details", {}) if isinstance(fp_result, dict) else {}
@@ -1063,6 +1115,7 @@ def run_formula(
                                 if prob > 0.15:
                                     operator_hints["operators"].add(op)
                         proposer_skeletons = payload.get("candidate_skeletons", [])
+                        result["proposer_candidate_formulas"] = list(proposer_skeletons or [])
                         candidate_formulas = []
                         if fp_result and fp_result.get("formula"):
                             candidate_formulas.append({
@@ -1124,6 +1177,7 @@ def run_formula(
                     "mse": fp_result.get("mse", float("inf")),
                     "from_fast_path": True,
                 }]
+            result["evolution_seed_candidates"] = list(candidate_formulas or [])
 
             t1 = time.time()
             try:
@@ -1147,13 +1201,15 @@ def run_formula(
                 result["time"] = base_elapsed + guided_elapsed
 
                 if guided_result and guided_result.get("formula"):
+                    guided_raw_formula = guided_result.get("formula", "")
                     guided_formula, guided_guard = _postprocess_formula_for_benchmark(
-                        guided_result.get("formula", ""),
+                        guided_raw_formula,
                         x_np,
                         y_np,
                     )
-                    guided_mse_raw = guided_result.get("mse", float("inf"))
-                    guided_mse_display = _evaluate_formula_mse(guided_formula, x_np, y_np)
+                    guided_mse_raw = guided_result.get("raw_mse", guided_result.get("mse", float("inf")))
+                    guided_display_details = _display_eval_details(guided_formula, x_np, y_np)
+                    guided_mse_display = guided_display_details["mse"]
                     guided_mse_score = _select_score_mse(guided_mse_display)
                     guided_mse_for_compare = (
                         guided_mse_score if guided_mse_score is not None else float("inf")
@@ -1163,12 +1219,19 @@ def run_formula(
                     if evolution_only or fp_result is None or guided_mse_for_compare < baseline_mse:
                         result["formula_discovered"] = guided_formula
                         result["mse_raw"] = guided_mse_raw
+                        result["engine_raw_mse"] = guided_mse_raw
+                        result["formula_before_postprocess_mse"] = guided_guard.get("postprocess_raw_mse")
+                        result["formula_after_postprocess_mse"] = guided_guard.get("postprocess_processed_mse")
                         result["mse_display"] = guided_mse_display
                         result["mse"] = guided_mse_for_compare
+                        result["score_mse"] = result["mse"]
+                        result["display_eval_diagnostics"] = guided_display_details["diagnostics"]
                         result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
                         result["uncertainty"] = fp_result.get("uncertainty") if fp_result else None
-                        result["candidate_formulas"] = fp_result.get("candidate_formulas") if fp_result else None
+                        result["candidate_formulas"] = result["evolution_seed_candidates"]
+                        result["winning_stage"] = "guided_evolution"
                         if result["formula_discovered"] and result["mse_display"] is None:
+                            result["formula_before_display_error"] = result["formula_discovered"]
                             result["error"] = "formula_eval_failed"
                         else:
                             result["error"] = None
@@ -1183,8 +1246,11 @@ def run_formula(
 
         if result["formula_discovered"]:
             if result["mse_display"] is None:
-                result["mse_display"] = _evaluate_formula_mse(result["formula_discovered"], x_np, y_np)
+                display_details = _display_eval_details(result["formula_discovered"], x_np, y_np)
+                result["mse_display"] = display_details["mse"]
+                result["display_eval_diagnostics"] = display_details["diagnostics"]
             result["mse"] = _select_score_mse(result["mse_display"])
+            result["score_mse"] = result["mse"]
             result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
             y_pred = cfp._evaluate_formula_values(result["formula_discovered"], x_np)
             result["residual_diagnostics"] = (
@@ -1192,8 +1258,10 @@ def run_formula(
                 if y_pred is not None
                 else None
             )
-            if result["formula_discovered"] and result["mse_display"] is None and result["error"] is None:
-                result["error"] = "formula_eval_failed"
+            if result["formula_discovered"] and result["mse_display"] is None:
+                result["formula_before_display_error"] = result["formula_discovered"]
+                if result["error"] is None:
+                    result["error"] = "formula_eval_failed"
 
     except Exception as e:
         result["error"] = str(e)
@@ -1201,6 +1269,7 @@ def run_formula(
         result["time"] = 0.0
 
     # Score
+    result["score_mse"] = result["mse"]
     result["score"] = score_result(result["mse"], result["formula_discovered"])
     return result
 
@@ -1230,6 +1299,12 @@ def run_formula_cpp_evolution(
         "error": None,
         "n_terms": 0,
         "residual_diagnostics": None,
+        "engine_raw_mse": None,
+        "formula_before_postprocess_mse": None,
+        "formula_after_postprocess_mse": None,
+        "score_mse": None,
+        "display_eval_diagnostics": None,
+        "formula_before_display_error": None,
         "mse_divergence_abs": None,
         "mse_divergence_rel": None,
         "mse_divergence_flag": False,
@@ -1258,8 +1333,12 @@ def run_formula_cpp_evolution(
             result["formula_discovered"] = formula
             result["postprocess_guard"] = guard
             result["mse_raw"] = 0.0
+            result["engine_raw_mse"] = 0.0
+            result["formula_before_postprocess_mse"] = guard.get("postprocess_raw_mse")
+            result["formula_after_postprocess_mse"] = guard.get("postprocess_processed_mse")
             result["mse_display"] = 0.0
             result["mse"] = 0.0
+            result["score_mse"] = 0.0
             result["time"] = elapsed
             result["n_terms"] = 1
             result["residual_diagnostics"] = {
@@ -1313,8 +1392,14 @@ def run_formula_cpp_evolution(
             y_np,
         )
         result["mse_raw"] = cpp_result.get("best_mse", float("inf"))
-        result["mse_display"] = _evaluate_formula_mse(result["formula_discovered"], x_np, y_np)
+        result["engine_raw_mse"] = cpp_result.get("best_mse", float("inf"))
+        result["formula_before_postprocess_mse"] = result["postprocess_guard"].get("postprocess_raw_mse")
+        result["formula_after_postprocess_mse"] = result["postprocess_guard"].get("postprocess_processed_mse")
+        display_details = _display_eval_details(result["formula_discovered"], x_np, y_np)
+        result["mse_display"] = display_details["mse"]
+        result["display_eval_diagnostics"] = display_details["diagnostics"]
         result["mse"] = _select_score_mse(result["mse_display"])
+        result["score_mse"] = result["mse"]
         result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
         y_pred = cfp._evaluate_formula_values(result["formula_discovered"], x_np)
         result["residual_diagnostics"] = (
@@ -1322,8 +1407,10 @@ def run_formula_cpp_evolution(
             if y_pred is not None
             else None
         )
-        if result["formula_discovered"] and result["mse_display"] is None and result["error"] is None:
-            result["error"] = "formula_eval_failed"
+        if result["formula_discovered"] and result["mse_display"] is None:
+            result["formula_before_display_error"] = result["formula_discovered"]
+            if result["error"] is None:
+                result["error"] = "formula_eval_failed"
         result["time"] = elapsed
         result["n_terms"] = _count_terms(result["formula_discovered"])
         
@@ -1335,6 +1422,7 @@ def run_formula_cpp_evolution(
         import traceback; traceback.print_exc()
         result["time"] = 0.0
     
+    result["score_mse"] = result["mse"]
     result["score"] = score_result(result["mse"], result["formula_discovered"])
     return result
 
@@ -1350,9 +1438,19 @@ def run_formula_specialist_regressor(
     population_size: int = 50,
     generations: int = 150,
     specialist_enabled: bool = True,
+    specialist_diagnostics: bool = True,
+    specialist_composition: bool = True,
+    specialist_residual: bool = False,
+    specialist_vault: bool = True,
+    specialist_inception: bool = False,
 ) -> Dict[str, Any]:
     """Run the sklearn regressor path so specialist composition/boosting is measurable."""
     x_min, x_max = x_range
+    diagnostics_enabled = bool(specialist_enabled and specialist_diagnostics)
+    composition_enabled = bool(specialist_enabled and specialist_composition and diagnostics_enabled)
+    residual_enabled = bool(specialist_enabled and specialist_residual and composition_enabled)
+    vault_enabled = bool(specialist_enabled and specialist_vault and composition_enabled)
+    inception_enabled = bool(specialist_enabled and specialist_inception)
     result = {
         "formula_target": formula_str,
         "x_range": list(x_range),
@@ -1367,17 +1465,39 @@ def run_formula_specialist_regressor(
         "uncertainty": None,
         "residual_diagnostics": None,
         "candidate_formulas": None,
+        "engine_raw_mse": None,
+        "formula_before_postprocess_mse": None,
+        "formula_after_postprocess_mse": None,
+        "score_mse": None,
+        "display_eval_diagnostics": None,
+        "formula_before_display_error": None,
         "mse_divergence_abs": None,
         "mse_divergence_rel": None,
         "mse_divergence_flag": False,
         "benchmark_path": "specialist_regressor" if specialist_enabled else "regressor_baseline",
         "specialist_enabled": bool(specialist_enabled),
+        "specialist_phase_config": {
+            "diagnostics": diagnostics_enabled,
+            "composition": composition_enabled,
+            "residual": residual_enabled,
+            "vault": vault_enabled,
+            "inception": inception_enabled,
+        },
         "specialist_track": None,
         "has_composed_seeds": False,
+        "composition_candidates_accepted": False,
+        "composition_candidate_count": 0,
+        "composition_seeded_evolution": False,
+        "composition_won_final_selection": False,
+        "composition_improved_mse": False,
         "boosting_attempted": False,
         "boosting_improved": False,
         "boosting_stage_count": 0,
         "boosting_diagnostics": None,
+        "phase_timings": None,
+        "formula_eval_count": 0,
+        "formula_eval_cache_hits": 0,
+        "formula_eval_cache_size": 0,
         "specialist_diagnostics": None,
         "specialist_composition_screening": None,
     }
@@ -1397,8 +1517,12 @@ def run_formula_specialist_regressor(
             result["formula_discovered"] = formula
             result["postprocess_guard"] = guard
             result["mse_raw"] = 0.0
+            result["engine_raw_mse"] = 0.0
+            result["formula_before_postprocess_mse"] = guard.get("postprocess_raw_mse")
+            result["formula_after_postprocess_mse"] = guard.get("postprocess_processed_mse")
             result["mse_display"] = 0.0
             result["mse"] = 0.0
+            result["score_mse"] = 0.0
             result["time"] = 0.0
             result["n_terms"] = _count_terms(formula)
             result["score"] = score_result(0.0, formula)
@@ -1416,11 +1540,11 @@ def run_formula_specialist_regressor(
             blackbox_mode=True,
             blackbox_feature_selection=True,
             blackbox_standardize=True,
-            enable_specialist_screening_diagnostics=bool(specialist_enabled),
-            enable_specialist_composition_screening=bool(specialist_enabled),
-            enable_residual_stage=bool(specialist_enabled),
-            enable_specialist_vault_memory=bool(specialist_enabled),
-            enable_inception_reuse=bool(specialist_enabled),
+            enable_specialist_screening_diagnostics=diagnostics_enabled,
+            enable_specialist_composition_screening=composition_enabled,
+            enable_residual_stage=residual_enabled,
+            enable_specialist_vault_memory=vault_enabled,
+            enable_inception_reuse=inception_enabled,
             use_guided_evolution=True,
             use_fast_path=True,
             multi_start_runs=1,
@@ -1436,8 +1560,14 @@ def run_formula_specialist_regressor(
         result["formula_discovered"] = formula
         result["postprocess_guard"] = guard
         result["mse_raw"] = _finite_float(getattr(reg, "best_mse_", None), float("inf"))
-        result["mse_display"] = _evaluate_formula_mse(formula, x_np, y_np)
+        result["engine_raw_mse"] = result["mse_raw"]
+        result["formula_before_postprocess_mse"] = guard.get("postprocess_raw_mse")
+        result["formula_after_postprocess_mse"] = guard.get("postprocess_processed_mse")
+        display_details = _display_eval_details(formula, x_np, y_np)
+        result["mse_display"] = display_details["mse"]
+        result["display_eval_diagnostics"] = display_details["diagnostics"]
         result["mse"] = _select_score_mse(result["mse_display"])
+        result["score_mse"] = result["mse"]
         result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
         result["time"] = elapsed
         result["n_terms"] = _count_terms(formula)
@@ -1449,6 +1579,7 @@ def run_formula_specialist_regressor(
             else None
         )
         if formula and result["mse_display"] is None:
+            result["formula_before_display_error"] = formula
             result["error"] = "formula_eval_failed"
 
         result.update(bc.specialist_metadata_from_estimator(reg))
@@ -1458,6 +1589,7 @@ def run_formula_specialist_regressor(
         traceback.print_exc()
         result["time"] = 0.0
 
+    result["score_mse"] = result["mse"]
     result["score"] = score_result(result["mse"], result["formula_discovered"])
     return result
 
@@ -1557,8 +1689,8 @@ def generate_markdown_report(
         tier_name = ALL_TIERS[tier_num][0]
         results = all_results[tier_num]
         lines.append(f"\n## Tier {tier_num}: {tier_name}\n")
-        lines.append("| # | Score | Target | Discovered | MSE(score) | MSE(raw) | MSE(display) | Time | Terms |")
-        lines.append("|---|-------|--------|------------|------------|----------|--------------|------|-------|")
+        lines.append("| # | Score | Target | Discovered | MSE(score) | MSE(raw) | MSE(display) | Drift | Stage | Time | Terms |")
+        lines.append("|---|-------|--------|------------|------------|----------|--------------|-------|-------|------|-------|")
 
         for i, r in enumerate(results, 1):
             sym = SCORE_SYMBOLS.get(r["score"], "?")
@@ -1574,12 +1706,26 @@ def generate_markdown_report(
                 f"{mse_display:.2e}" if mse_display is not None and math.isfinite(mse_display) else "—"
             )
             time_s = f"{r['time']:.2f}s" if r["time"] is not None else "—"
+            drift_rel = r.get("mse_divergence_rel")
+            if drift_rel is not None and math.isfinite(drift_rel):
+                drift_s = f"{drift_rel:.1e}" if r.get("mse_divergence_flag") else ""
+            else:
+                drift_s = ""
+            stage = r.get("winning_stage") or r.get("benchmark_path") or ""
+            if r.get("composition_won_final_selection"):
+                stage = "composition"
+            elif r.get("composition_seeded_evolution") and stage:
+                stage = f"{stage}+comp"
+            elif r.get("composition_seeded_evolution"):
+                stage = "composition_seeded"
+            if len(stage) > 28:
+                stage = stage[:25] + "..."
             n_terms = r.get("n_terms", 0)
             err = r.get("error", "")
             if err:
                 disc = f"ERROR: {err[:40]}"
             lines.append(
-                f"| {i} | {sym} | `{target}` | `{disc}` | {mse_s} | {mse_raw_s} | {mse_display_s} | {time_s} | {n_terms} |"
+                f"| {i} | {sym} | `{target}` | `{disc}` | {mse_s} | {mse_raw_s} | {mse_display_s} | {drift_s} | {stage} | {time_s} | {n_terms} |"
             )
 
     output_path.write_text("\n".join(lines), encoding="utf-8")
@@ -1677,6 +1823,30 @@ Examples:
         help="With --specialist-regressor, disable specialist screening/composition/residual stages for A/B comparison",
     )
     parser.add_argument(
+        "--disable-specialist-diagnostics", action="store_true",
+        help="With --specialist-regressor, skip specialist pair/segment diagnostics",
+    )
+    parser.add_argument(
+        "--disable-specialist-composition", action="store_true",
+        help="With --specialist-regressor, keep diagnostics but skip specialist composition proposals",
+    )
+    parser.add_argument(
+        "--enable-specialist-residual", action="store_true",
+        help="With --specialist-regressor, enable the residual symbolic stage for accepted compositions",
+    )
+    parser.add_argument(
+        "--disable-specialist-vault", action="store_true",
+        help="With --specialist-regressor, disable cross-run specialist vault memory",
+    )
+    parser.add_argument(
+        "--enable-specialist-inception", action="store_true",
+        help="With --specialist-regressor, enable inception/subexpression reuse",
+    )
+    parser.add_argument(
+        "--specialist-full", action="store_true",
+        help="With --specialist-regressor, enable all specialist phases including residual and inception",
+    )
+    parser.add_argument(
         "--tier", type=int, action="append", default=None, dest="tiers",
         help="Run only specific tier(s). Can be repeated: --tier 1 --tier 2",
     )
@@ -1737,6 +1907,38 @@ Examples:
     if args.specialist_baseline and not args.specialist_regressor:
         print("Error: --specialist-baseline requires --specialist-regressor.")
         sys.exit(1)
+    specialist_phase_flags = (
+        args.disable_specialist_diagnostics,
+        args.disable_specialist_composition,
+        args.enable_specialist_residual,
+        args.disable_specialist_vault,
+        args.enable_specialist_inception,
+        args.specialist_full,
+    )
+    if any(specialist_phase_flags) and not args.specialist_regressor:
+        print("Error: specialist phase flags require --specialist-regressor.")
+        sys.exit(1)
+
+    specialist_diagnostics = not args.disable_specialist_diagnostics
+    specialist_composition = specialist_diagnostics and not args.disable_specialist_composition
+    specialist_residual = bool(args.enable_specialist_residual or args.specialist_full)
+    specialist_vault = not args.disable_specialist_vault
+    specialist_inception = bool(args.enable_specialist_inception or args.specialist_full)
+    if args.specialist_full:
+        specialist_diagnostics = True
+        specialist_composition = True
+        specialist_vault = True
+
+    # Validate report output before doing expensive formula work.
+    output_dir = Path(args.output_dir)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        probe_path = output_dir / ".benchmark_write_probe"
+        probe_path.write_text("", encoding="utf-8")
+        probe_path.unlink(missing_ok=True)
+    except Exception as exc:
+        print(f"Error: cannot write benchmark reports to '{output_dir}': {exc}")
+        sys.exit(2)
 
     # Resolve device
     device = args.device
@@ -1791,6 +1993,19 @@ Examples:
     elif args.specialist_regressor:
         print("  Strategy:    sklearn regressor path")
         print(f"  Specialist:  {'disabled baseline' if args.specialist_baseline else 'enabled'}")
+        if not args.specialist_baseline:
+            phase_txt = ", ".join(
+                name
+                for name, enabled in (
+                    ("diagnostics", specialist_diagnostics),
+                    ("composition", specialist_composition),
+                    ("residual", specialist_residual),
+                    ("vault", specialist_vault),
+                    ("inception", specialist_inception),
+                )
+                if enabled
+            ) or "none"
+            print(f"  Phases:      {phase_txt}")
     else:
         print(f"  Classifier:  {args.classifier_model}")
         proposer_txt = args.proposer_model if not args.disable_proposer else "DISABLED"
@@ -1849,6 +2064,11 @@ Examples:
                         population_size=args.guided_pop_size,
                         generations=args.guided_generations,
                         specialist_enabled=not args.specialist_baseline,
+                        specialist_diagnostics=specialist_diagnostics,
+                        specialist_composition=specialist_composition,
+                        specialist_residual=specialist_residual,
+                        specialist_vault=specialist_vault,
+                        specialist_inception=specialist_inception,
                     )
                 else:
                     result = run_formula(
@@ -1915,9 +2135,7 @@ Examples:
     print_summary(all_results)
 
     # Save reports
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
     json_path = output_dir / f"benchmark_{ts}.json"
     save_json_results(all_results, json_path, args.classifier_model, total_time)

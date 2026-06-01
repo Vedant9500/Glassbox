@@ -328,6 +328,7 @@ def evaluate_formula(formula_str, X, *, return_diagnostics=False):
         "_signed_power": _signed_power,
         "pi": np.pi,
         "E": np.e,
+        "e": np.e,
     }
     for i in range(X.shape[1]):
         context[f"x{i}"] = X[:, i]
@@ -435,12 +436,17 @@ def postprocess_formula_with_fidelity_guard(
     if processed_mse is None:
         fallback = protect_fractional_powers(normalize_formula_text(formula).replace("^", "**"))
         fallback_mse = evaluate_formula_mse_on_X(fallback, X, y)
+        X_diag = np.asarray(X, dtype=np.float64)
+        if X_diag.ndim == 1:
+            X_diag = X_diag.reshape(-1, 1)
+        _, processed_diag = evaluate_formula(processed, X_diag, return_diagnostics=True)
         return (fallback if fallback_mse is not None else processed), {
             "postprocess_guard_triggered": True,
             "postprocess_raw_mse": raw_mse,
             "postprocess_processed_mse": processed_mse,
             "postprocess_fallback_mse": fallback_mse,
             "postprocess_guard_reason": "processed_formula_eval_failed",
+            "postprocess_processed_eval_diagnostics": processed_diag,
         }
 
     if raw_mse is not None:
@@ -455,6 +461,7 @@ def postprocess_formula_with_fidelity_guard(
                     "postprocess_processed_mse": processed_mse,
                     "postprocess_fallback_mse": fallback_mse,
                     "postprocess_guard_reason": "processed_formula_worse",
+                    "postprocess_processed_eval_diagnostics": None,
                 }
 
     return processed, {
@@ -463,6 +470,7 @@ def postprocess_formula_with_fidelity_guard(
         "postprocess_processed_mse": processed_mse,
         "postprocess_fallback_mse": None,
         "postprocess_guard_reason": None,
+        "postprocess_processed_eval_diagnostics": None,
     }
 
 
@@ -651,10 +659,19 @@ def specialist_metadata_from_estimator(estimator):
     return {
         "specialist_track": getattr(estimator, "specialist_track_", None),
         "has_composed_seeds": bool(getattr(estimator, "has_composed_seeds_", False)),
+        "composition_candidates_accepted": bool(getattr(estimator, "composition_candidates_accepted_", False)),
+        "composition_candidate_count": int(getattr(estimator, "composition_candidate_count_", 0) or 0),
+        "composition_seeded_evolution": bool(getattr(estimator, "composition_seeded_evolution_", False)),
+        "composition_won_final_selection": bool(getattr(estimator, "composition_won_final_selection_", False)),
+        "composition_improved_mse": bool(getattr(estimator, "composition_improved_mse_", False)),
         "boosting_attempted": bool(getattr(estimator, "boosting_attempted_", False)),
         "boosting_improved": bool(getattr(estimator, "boosting_improved_", False)),
         "boosting_stage_count": len(getattr(estimator, "boosting_stages_", []) or []),
         "boosting_diagnostics": getattr(estimator, "boosting_diagnostics_", None),
+        "phase_timings": dict(getattr(estimator, "phase_timings_", {}) or {}),
+        "formula_eval_count": int(getattr(estimator, "formula_eval_count_", 0) or 0),
+        "formula_eval_cache_hits": int(getattr(estimator, "formula_eval_cache_hits_", 0) or 0),
+        "formula_eval_cache_size": len(getattr(estimator, "_formula_eval_cache_", {}) or {}),
         "specialist_vault": (
             getattr(estimator, "specialist_vault_", None).to_dict()
             if getattr(estimator, "specialist_vault_", None) is not None
