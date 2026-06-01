@@ -3193,26 +3193,32 @@ def beam_search_evolution(
         acceptable_complexity = int(search_plan.get("acceptable_complexity", 15) or 15)
         early_stop_max_nodes = int(search_plan.get("early_stop_max_nodes", 50) or 50)
         acceptable_mse = float(search_plan.get("acceptable_mse", 1e-8) or 1e-8)
-        result = _core.run_evolution(
-            X_list=X_list,
-            y=y_np,
-            pop_size=total_pop_size,
-            generations=total_generations,
-            early_stop_mse=1e-10,
-            use_nsga2=True,
-            num_islands=n_beams,
-            migration_interval=25,
-            migration_size=2,
-            p_min=adaptive_p_min,
-            p_max=adaptive_p_max,
-            acceptable_mse=acceptable_mse,
-            acceptable_complexity=max(1, acceptable_complexity),
-            early_stop_max_nodes=max(1, early_stop_max_nodes),
-            multi_op_priors=multi_op_priors,
-            multi_seed_omegas=multi_seed_omegas,
-            num_threads=max_physical_threads,  # Use all available cores via OpenMP
-            seed_graphs_py=seed_graphs_py,
-        )
+        timeout_seconds = search_plan.get("timeout_seconds")
+        if timeout_seconds is not None:
+            timeout_seconds = max(1, int(float(timeout_seconds)))
+        evolution_kwargs = {
+            "X_list": X_list,
+            "y": y_np,
+            "pop_size": total_pop_size,
+            "generations": total_generations,
+            "early_stop_mse": 1e-10,
+            "use_nsga2": True,
+            "num_islands": n_beams,
+            "migration_interval": 25,
+            "migration_size": 2,
+            "p_min": adaptive_p_min,
+            "p_max": adaptive_p_max,
+            "acceptable_mse": acceptable_mse,
+            "acceptable_complexity": max(1, acceptable_complexity),
+            "early_stop_max_nodes": max(1, early_stop_max_nodes),
+            "multi_op_priors": multi_op_priors,
+            "multi_seed_omegas": multi_seed_omegas,
+            "num_threads": max_physical_threads,  # Use all available cores via OpenMP
+            "seed_graphs_py": seed_graphs_py,
+        }
+        if timeout_seconds is not None:
+            evolution_kwargs["timeout_seconds"] = timeout_seconds
+        result = _core.run_evolution(**evolution_kwargs)
     except Exception as e:
         print(f"  \u274c Native Island Search failed: {e}")
         return None

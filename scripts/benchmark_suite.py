@@ -698,6 +698,14 @@ _postprocess_formula = bc.postprocess_formula
 _evaluate_formula_mse = bc.evaluate_formula_mse
 
 
+def _postprocess_formula_for_benchmark(formula: str, x: np.ndarray, y: np.ndarray) -> Tuple[str, Dict[str, Any]]:
+    return bc.postprocess_formula_with_fidelity_guard(
+        formula,
+        np.asarray(x, dtype=np.float64).reshape(-1, 1),
+        y,
+    )
+
+
 def _select_score_mse(mse_display: Optional[float]) -> Optional[float]:
     """Choose MSE for scoring: use displayed-formula MSE only."""
     if mse_display is not None and math.isfinite(mse_display):
@@ -891,8 +899,9 @@ def run_formula(
                 formula = str(int(round(const_val)))
             else:
                 formula = f"{const_val:.6g}"
-            formula = _postprocess_formula(formula)
+            formula, guard = _postprocess_formula_for_benchmark(formula, x_np, y_np)
             result["formula_discovered"] = formula
+            result["postprocess_guard"] = guard
             result["mse_raw"] = 0.0
             result["mse_display"] = 0.0
             result["mse"] = 0.0
@@ -951,7 +960,11 @@ def run_formula(
                 result["error"] = "fast_path_not_applicable"
                 result["time"] = elapsed
             else:
-                result["formula_discovered"] = _postprocess_formula(fp_result.get("formula", ""))
+                result["formula_discovered"], result["postprocess_guard"] = _postprocess_formula_for_benchmark(
+                    fp_result.get("formula", ""),
+                    x_np,
+                    y_np,
+                )
                 result["mse_raw"] = fp_result.get("mse", float("inf"))
                 result["mse_display"] = _evaluate_formula_mse(result["formula_discovered"], x_np, y_np)
                 result["mse"] = _select_score_mse(result["mse_display"])
@@ -1114,6 +1127,9 @@ def run_formula(
 
             t1 = time.time()
             try:
+                guided_plan = dict(guided_plan or {})
+                remaining_timeout = max(1, int(float(timeout) - float(t1 - (t0 if "t0" in locals() else t1))))
+                guided_plan.setdefault("timeout_seconds", remaining_timeout)
                 guided_result = run_guided_evolution(
                     x_2d,
                     y_2d,
@@ -1131,7 +1147,11 @@ def run_formula(
                 result["time"] = base_elapsed + guided_elapsed
 
                 if guided_result and guided_result.get("formula"):
-                    guided_formula = _postprocess_formula(guided_result.get("formula", ""))
+                    guided_formula, guided_guard = _postprocess_formula_for_benchmark(
+                        guided_result.get("formula", ""),
+                        x_np,
+                        y_np,
+                    )
                     guided_mse_raw = guided_result.get("mse", float("inf"))
                     guided_mse_display = _evaluate_formula_mse(guided_formula, x_np, y_np)
                     guided_mse_score = _select_score_mse(guided_mse_display)
@@ -1153,6 +1173,7 @@ def run_formula(
                         else:
                             result["error"] = None
                         result["n_terms"] = _count_terms(guided_formula)
+                        result["postprocess_guard"] = guided_guard
                 elif evolution_only or fp_result is None:
                     result["error"] = "guided_evolution_failed"
             except Exception as guided_err:
@@ -1233,8 +1254,9 @@ def run_formula_cpp_evolution(
                 formula = str(int(round(const_val)))
             else:
                 formula = f"{const_val:.6g}"
-            formula = _postprocess_formula(formula)
+            formula, guard = _postprocess_formula_for_benchmark(formula, x_np, y_np)
             result["formula_discovered"] = formula
+            result["postprocess_guard"] = guard
             result["mse_raw"] = 0.0
             result["mse_display"] = 0.0
             result["mse"] = 0.0
@@ -1285,7 +1307,11 @@ def run_formula_cpp_evolution(
         )
         elapsed = time.time() - t0
         
-        result["formula_discovered"] = _postprocess_formula(cpp_result.get("formula", ""))
+        result["formula_discovered"], result["postprocess_guard"] = _postprocess_formula_for_benchmark(
+            cpp_result.get("formula", ""),
+            x_np,
+            y_np,
+        )
         result["mse_raw"] = cpp_result.get("best_mse", float("inf"))
         result["mse_display"] = _evaluate_formula_mse(result["formula_discovered"], x_np, y_np)
         result["mse"] = _select_score_mse(result["mse_display"])
@@ -1309,6 +1335,127 @@ def run_formula_cpp_evolution(
         import traceback; traceback.print_exc()
         result["time"] = 0.0
     
+    result["score"] = score_result(result["mse"], result["formula_discovered"])
+    return result
+
+
+def run_formula_specialist_regressor(
+    formula_str: str,
+    x_range: Tuple[float, float],
+    classifier_path: str,
+    proposer_path: Optional[str],
+    n_samples: int = 300,
+    device: Optional[str] = None,
+    timeout: float = 60.0,
+    population_size: int = 50,
+    generations: int = 150,
+    specialist_enabled: bool = True,
+) -> Dict[str, Any]:
+    """Run the sklearn regressor path so specialist composition/boosting is measurable."""
+    x_min, x_max = x_range
+    result = {
+        "formula_target": formula_str,
+        "x_range": list(x_range),
+        "formula_discovered": "",
+        "mse": None,
+        "mse_raw": None,
+        "mse_display": None,
+        "time": None,
+        "score": "FAIL",
+        "error": None,
+        "n_terms": 0,
+        "uncertainty": None,
+        "residual_diagnostics": None,
+        "candidate_formulas": None,
+        "mse_divergence_abs": None,
+        "mse_divergence_rel": None,
+        "mse_divergence_flag": False,
+        "benchmark_path": "specialist_regressor" if specialist_enabled else "regressor_baseline",
+        "specialist_enabled": bool(specialist_enabled),
+        "specialist_track": None,
+        "has_composed_seeds": False,
+        "boosting_attempted": False,
+        "boosting_improved": False,
+        "boosting_stage_count": 0,
+        "boosting_diagnostics": None,
+        "specialist_diagnostics": None,
+        "specialist_composition_screening": None,
+    }
+
+    try:
+        from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
+        x_np, y_np = _generate_data(formula_str, x_min, x_max, n_samples)
+        X = np.asarray(x_np, dtype=np.float64).reshape(-1, 1)
+        y = np.asarray(y_np, dtype=np.float64).reshape(-1)
+
+        y_std = np.std(y)
+        if y_std < 1e-10:
+            const_val = float(np.mean(y))
+            formula = str(int(round(const_val))) if abs(const_val - round(const_val)) < 1e-6 else f"{const_val:.6g}"
+            formula, guard = _postprocess_formula_for_benchmark(formula, x_np, y_np)
+            result["formula_discovered"] = formula
+            result["postprocess_guard"] = guard
+            result["mse_raw"] = 0.0
+            result["mse_display"] = 0.0
+            result["mse"] = 0.0
+            result["time"] = 0.0
+            result["n_terms"] = _count_terms(formula)
+            result["score"] = score_result(0.0, formula)
+            return result
+
+        reg = GlassboxRegressor(
+            population_size=max(20, int(population_size)),
+            generations=max(20, int(generations)),
+            timeout=max(1, int(timeout)),
+            classifier_path=classifier_path,
+            universal_proposer_path=proposer_path or "models/universal_proposer_multi.pt",
+            use_universal_proposer=bool(proposer_path),
+            universal_proposer_shadow_mode=False,
+            universal_proposer_log_routing=False,
+            blackbox_mode=True,
+            blackbox_feature_selection=True,
+            blackbox_standardize=True,
+            enable_specialist_screening_diagnostics=bool(specialist_enabled),
+            enable_specialist_composition_screening=bool(specialist_enabled),
+            enable_residual_stage=bool(specialist_enabled),
+            use_guided_evolution=True,
+            use_fast_path=True,
+            multi_start_runs=1,
+            device=device,
+            random_state=0,
+        )
+
+        t0 = time.time()
+        reg.fit(X, y)
+        elapsed = time.time() - t0
+
+        formula, guard = _postprocess_formula_for_benchmark(reg.get_formula(), x_np, y_np)
+        result["formula_discovered"] = formula
+        result["postprocess_guard"] = guard
+        result["mse_raw"] = _finite_float(getattr(reg, "best_mse_", None), float("inf"))
+        result["mse_display"] = _evaluate_formula_mse(formula, x_np, y_np)
+        result["mse"] = _select_score_mse(result["mse_display"])
+        result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
+        result["time"] = elapsed
+        result["n_terms"] = _count_terms(formula)
+
+        y_pred = cfp._evaluate_formula_values(formula, x_np)
+        result["residual_diagnostics"] = (
+            cfp._residual_diagnostics(y_np, y_pred, x_np)
+            if y_pred is not None
+            else None
+        )
+        if formula and result["mse_display"] is None:
+            result["error"] = "formula_eval_failed"
+
+        result.update(bc.specialist_metadata_from_estimator(reg))
+
+    except Exception as e:
+        result["error"] = str(e)
+        traceback.print_exc()
+        result["time"] = 0.0
+
     result["score"] = score_result(result["mse"], result["formula_discovered"])
     return result
 
@@ -1520,6 +1667,14 @@ Examples:
         help="Skip fast-path and run latest guided evolution (beam-search path) for every formula",
     )
     parser.add_argument(
+        "--specialist-regressor", action="store_true",
+        help="Run formulas through GlassboxRegressor so specialist composition/boosting is measured",
+    )
+    parser.add_argument(
+        "--specialist-baseline", action="store_true",
+        help="With --specialist-regressor, disable specialist screening/composition/residual stages for A/B comparison",
+    )
+    parser.add_argument(
         "--tier", type=int, action="append", default=None, dest="tiers",
         help="Run only specific tier(s). Can be repeated: --tier 1 --tier 2",
     )
@@ -1573,8 +1728,12 @@ Examples:
     )
     args = parser.parse_args()
 
-    if args.cpp_evolution_only and args.evolution_only:
-        print("Error: --cpp-evolution-only and --evolution-only cannot be used together.")
+    exclusive_modes = sum(bool(v) for v in (args.cpp_evolution_only, args.evolution_only, args.specialist_regressor))
+    if exclusive_modes > 1:
+        print("Error: --cpp-evolution-only, --evolution-only, and --specialist-regressor are mutually exclusive.")
+        sys.exit(1)
+    if args.specialist_baseline and not args.specialist_regressor:
+        print("Error: --specialist-baseline requires --specialist-regressor.")
         sys.exit(1)
 
     # Resolve device
@@ -1615,6 +1774,8 @@ Examples:
     print("=" * 90)
     if args.cpp_evolution_only:
         mode_str = "Pure C++ Evolution (No Classifier/Proposer)"
+    elif args.specialist_regressor:
+        mode_str = "GlassboxRegressor Specialist" if not args.specialist_baseline else "GlassboxRegressor Baseline"
     elif args.evolution_only:
         mode_str = "Guided Evolution Only (latest path)"
     else:
@@ -1625,6 +1786,9 @@ Examples:
         print(f"  Generations: {args.generations}")
     elif args.evolution_only:
         print("  Strategy:    guided beam-search evolution")
+    elif args.specialist_regressor:
+        print("  Strategy:    sklearn regressor path")
+        print(f"  Specialist:  {'disabled baseline' if args.specialist_baseline else 'enabled'}")
     else:
         print(f"  Classifier:  {args.classifier_model}")
         proposer_txt = args.proposer_model if not args.disable_proposer else "DISABLED"
@@ -1670,6 +1834,19 @@ Examples:
                         pop_size=args.pop_size,
                         generations=args.generations,
                         device=device,
+                    )
+                elif args.specialist_regressor:
+                    result = run_formula_specialist_regressor(
+                        formula_str,
+                        x_range,
+                        classifier_path=args.classifier_model,
+                        proposer_path=None if args.disable_proposer else args.proposer_model,
+                        n_samples=args.n_samples,
+                        device=device,
+                        timeout=args.timeout,
+                        population_size=args.guided_pop_size,
+                        generations=args.guided_generations,
+                        specialist_enabled=not args.specialist_baseline,
                     )
                 else:
                     result = run_formula(

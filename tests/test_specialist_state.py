@@ -6,6 +6,7 @@ from glassbox.sr.specialist_state import (
     propose_specialist_compositions,
 )
 from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_candidates
+import glassbox.sr.cpp.seed_graph_builder as seed_graph_builder
 
 
 def _eval_formula(formula, X):
@@ -14,6 +15,7 @@ def _eval_formula(formula, X):
         "sin": np.sin,
         "cos": np.cos,
         "exp": np.exp,
+        "log": np.log,
         "sqrt": np.sqrt,
         "abs": np.abs,
     }
@@ -109,6 +111,29 @@ def test_build_seed_graphs_does_not_let_composed_seeds_dominate():
     assert len(seeds) <= 5
 
 
+def test_build_seed_graphs_enforces_composed_seed_cap(monkeypatch):
+    captured = {}
+
+    def fake_build(formulas, max_seeds=10):
+        captured["formulas"] = list(formulas)
+        return [{"formula": formula} for formula in formulas[:max_seeds]]
+
+    monkeypatch.setattr(seed_graph_builder, "build_seed_graphs_from_formulas", fake_build)
+    candidate_formulas = [
+        {"formula": f"comp_{i}", "mse": float(i), "from_specialist_composition": True}
+        for i in range(10)
+    ] + [
+        {"formula": f"std_{i}", "mse": 100.0 + i, "source": "candidate_screening"}
+        for i in range(2)
+    ]
+
+    build_seed_graphs_from_candidates(candidate_formulas, max_seeds=5)
+
+    formulas = captured["formulas"]
+    assert sum(formula.startswith("comp_") for formula in formulas) <= 2
+    assert sum(formula.startswith("std_") for formula in formulas) == 2
+
+
 def test_build_hot_spot_segments_and_compute_specialist_state_phase5():
     from glassbox.sr.specialist_state import build_hot_spot_segments
     x = np.linspace(-3.0, 3.0, 100)
@@ -143,6 +168,30 @@ def test_build_hot_spot_segments_and_compute_specialist_state_phase5():
     assert len(state.hot_spot_segments) >= 1
     for cand in state.candidates:
         assert len(cand.hot_spot_segment_scores) == len(state.hot_spot_segments)
+
+
+def test_hot_spot_segments_use_best_metric_candidate_as_base():
+    x = np.linspace(-3.0, 3.0, 100)
+    X = x.reshape(-1, 1)
+    y = x
+    candidates = [
+        {"formula": "0*x0", "validation_r2": -1.0, "validation_mse": 100.0, "source": "bad"},
+        {"formula": "x0", "validation_r2": 1.0, "validation_mse": 0.0, "source": "good"},
+    ]
+
+    state = compute_specialist_state(
+        candidates,
+        X,
+        y,
+        evaluate_formula=_eval_formula,
+        complexity_fn=lambda formula: 1,
+        family_signature_fn=lambda formula: "linear",
+        max_candidates=2,
+        max_pairs=1,
+    )
+
+    assert state is not None
+    assert state.hot_spot_base_formula == "x0"
 
 
 def test_propose_specialist_compositions_expanded_templates_phase6():
@@ -181,4 +230,38 @@ def test_propose_specialist_compositions_expanded_templates_phase6():
     operators = {proposal.operator for proposal in proposals}
     assert "nested" in operators or "affine" in operators or "add" in operators
 
+
+def test_propose_specialist_compositions_handles_reversed_nested_parent():
+    x = np.linspace(-1.0, 1.0, 80)
+    X = x.reshape(-1, 1)
+    y = np.sin(x + 1.0)
+    candidates = [
+        {"formula": "x0+1.0", "validation_r2": 0.4, "validation_mse": 0.2, "source": "inner"},
+        {"formula": "sin(x0)", "validation_r2": 0.4, "validation_mse": 0.2, "source": "outer"},
+    ]
+
+    state = compute_specialist_state(
+        candidates,
+        X,
+        y,
+        evaluate_formula=_eval_formula,
+        complexity_fn=lambda formula: 1,
+        family_signature_fn=lambda formula: "sin" if "sin" in str(formula) else "poly",
+        max_candidates=2,
+        max_pairs=1,
+    )
+
+    proposals = propose_specialist_compositions(
+        state,
+        X,
+        y,
+        evaluate_formula=_eval_formula,
+        max_pairs=1,
+        min_complementarity=0.0,
+    )
+
+    assert any(
+        proposal.operator == "nested" and "sin((x0+1.0))" in proposal.formula
+        for proposal in proposals
+    )
 

@@ -126,6 +126,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         enable_specialist_screening_diagnostics=True,
         enable_specialist_composition_screening=True,
         enable_residual_stage=True,
+        max_boosting_stages=3,
+        boosting_learning_rates=None,
         device=None,
         skip_evolution_if_bloated=False,
         bloat_term_threshold=20,
@@ -177,6 +179,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.enable_specialist_screening_diagnostics = enable_specialist_screening_diagnostics
         self.enable_specialist_composition_screening = enable_specialist_composition_screening
         self.enable_residual_stage = enable_residual_stage
+        self.max_boosting_stages = max(0, int(max_boosting_stages))
+        self.boosting_learning_rates = list(boosting_learning_rates or [0.5, 0.8, 1.0])
         self.device = device
         self.skip_evolution_if_bloated = skip_evolution_if_bloated
         self.bloat_term_threshold = bloat_term_threshold
@@ -185,6 +189,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.specialist_state_ = None
         self.specialist_track_ = "incumbent path"
         self.has_composed_seeds_ = False
+        self.boosting_stages_ = []
+        self.boosting_attempted_ = False
+        self.boosting_improved_ = False
+        self.boosting_diagnostics_ = {}
 
     def _estimate_compute_budget(self, X, current_r2, term_count, uncertainty=None):
         """Adaptive compute budget: easy problems get short runs, hard problems get longer runs.
@@ -2410,6 +2418,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             blackbox_standardize=self.blackbox_standardize,
             blackbox_min_features_to_select=self.blackbox_min_features_to_select,
             enable_residual_stage=False,
+            max_boosting_stages=self.max_boosting_stages,
+            boosting_learning_rates=self.boosting_learning_rates,
             device=self.device,
             skip_evolution_if_bloated=self.skip_evolution_if_bloated,
             bloat_term_threshold=self.bloat_term_threshold,
@@ -2435,6 +2445,16 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
     def _run_residual_boosting(self, X, y, base_formula):
         """Run a multi-stage symbolic boosting loop on top of base_formula."""
+        self.boosting_stages_ = []
+        self.boosting_attempted_ = False
+        self.boosting_improved_ = False
+        self.boosting_diagnostics_ = {
+            "enabled": bool(self.enable_residual_stage and base_formula and self.use_guided_evolution),
+            "base_formula": base_formula,
+            "initial_holdout_r2": None,
+            "final_holdout_r2": None,
+            "accepted_stages": 0,
+        }
         if not self.enable_residual_stage or not base_formula or not self.use_guided_evolution:
             return base_formula
 
@@ -2447,17 +2467,21 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return float(1.0 - np.mean((y_true - y_pred)**2) / var)
 
         max_boosting_stages = getattr(self, "max_boosting_stages", 3)
+        learning_rates = list(getattr(self, "boosting_learning_rates", [0.5, 0.8, 1.0]) or [0.5, 0.8, 1.0])
+        if int(max_boosting_stages) <= 0:
+            return base_formula
 
         try:
             pred = self._safe_eval_formula_array(base_formula, X)
             base_r2 = local_r2(y, pred)
             if base_r2 > 0.9999:
+                self.boosting_diagnostics_["initial_r2"] = float(base_r2)
+                self.boosting_diagnostics_["final_r2"] = float(base_r2)
                 return base_formula
         except Exception:
             return base_formula
 
         current_formula = base_formula
-        self.boosting_stages_ = []
 
         holdout_n = max(1, int(round(X.shape[0] * 0.2)))
         if X.shape[0] < 20 or holdout_n >= X.shape[0]:
@@ -2465,8 +2489,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         X_fit, X_holdout = X[:-holdout_n], X[-holdout_n:]
         y_fit, y_holdout = y[:-holdout_n], y[-holdout_n:]
-
-        learning_rates = [0.5, 0.8, 1.0]
+        del X_fit, y_fit
 
         for stage in range(max_boosting_stages):
             try:
@@ -2477,6 +2500,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
             current_holdout_mse = float(np.mean((pred_holdout - y_holdout)**2))
             current_holdout_r2 = local_r2(y_holdout, pred_holdout)
+            if self.boosting_diagnostics_.get("initial_holdout_r2") is None:
+                self.boosting_diagnostics_["initial_holdout_r2"] = float(current_holdout_r2)
 
             if current_holdout_r2 > 0.999:
                 break
@@ -2484,6 +2509,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             orig_timeout = self.timeout
             stage_timeout = max(5, orig_timeout // (2 ** (stage + 1)))
             self.timeout = stage_timeout
+            self.boosting_attempted_ = True
 
             try:
                 h_k = self._stage_residual_symbolic_fit(X, y, current_formula, _allow_recursion=True)
@@ -2542,12 +2568,24 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 "stage": stage,
                 "h_k": h_k,
                 "eta": best_eta,
+                "holdout_r2_before": float(current_holdout_r2),
+                "holdout_r2_after": float(best_holdout_r2),
+                "holdout_r2_improvement": float(r2_improvement),
                 "combined_formula": current_formula
             })
+            self.boosting_improved_ = True
+            self.boosting_diagnostics_["accepted_stages"] = len(self.boosting_stages_)
+            self.boosting_diagnostics_["final_holdout_r2"] = float(best_holdout_r2)
 
             if best_holdout_r2 > 0.999:
                 break
 
+        if self.boosting_diagnostics_.get("final_holdout_r2") is None:
+            try:
+                final_pred_holdout = self._safe_eval_formula_array(current_formula, X_holdout)
+                self.boosting_diagnostics_["final_holdout_r2"] = float(local_r2(y_holdout, final_pred_holdout))
+            except Exception:
+                self.boosting_diagnostics_["final_holdout_r2"] = self.boosting_diagnostics_.get("initial_holdout_r2")
         return current_formula
 
     def _detect_frequencies(self, X, y):

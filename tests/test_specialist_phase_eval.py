@@ -124,4 +124,30 @@ def test_phase7_harness_returns_summary_and_cases():
     assert summary["pass"] is True
 
 
+def test_residual_boosting_records_attempt_and_improvement():
+    class ProbeRegressor(GlassboxRegressor):
+        def _stage_residual_symbolic_fit(self, X, y, base_formula, *, _allow_recursion=False):
+            return "sin(x0)"
+
+        def _refine_candidate_formulas(self, candidate_formulas, X, y, *, max_candidates=12):
+            return list(candidate_formulas)[:max_candidates]
+
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = x + np.sin(x)
+    reg = ProbeRegressor(
+        use_guided_evolution=True,
+        enable_residual_stage=True,
+        max_boosting_stages=2,
+        boosting_learning_rates=[0.5, 1.0],
+    )
+
+    formula = reg._run_residual_boosting(X, y, "x0")
+
+    assert "sin(x0)" in formula
+    assert reg.boosting_attempted_ is True
+    assert reg.boosting_improved_ is True
+    assert len(reg.boosting_stages_) == 1
+    assert reg.boosting_diagnostics_["accepted_stages"] == 1
+
 

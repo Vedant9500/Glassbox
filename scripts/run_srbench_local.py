@@ -368,6 +368,7 @@ def _fit_worker(payload, queue):
         y_pred_full = est.predict(X_full) if X_full is not None else None
         raw_mse = getattr(est, "mse_", None)
         blackbox_diagnostics = getattr(est, "blackbox_diagnostics_", None)
+        specialist_metadata = bc.specialist_metadata_from_estimator(est)
         evolution_wall_time = getattr(est, "evolution_wall_time_sec_", None)
         time_to_first_exact = getattr(est, "time_to_first_exact_sec_", None)
         time_to_first_acceptable = getattr(est, "time_to_first_acceptable_sec_", None)
@@ -382,6 +383,7 @@ def _fit_worker(payload, queue):
             "y_pred_full": y_pred_full,
             "raw_mse": raw_mse,
             "blackbox_diagnostics": blackbox_diagnostics,
+            "specialist_metadata": specialist_metadata,
             "evolution_wall_time_sec": evolution_wall_time,
             "time_to_first_exact": time_to_first_exact,
             "time_to_first_acceptable": time_to_first_acceptable,
@@ -591,8 +593,9 @@ def run_track1_blackbox(
                                     run_result,
                                     eval_diag,
                                     split="test",
-                                )
+                            )
                             blackbox_diag = run_result.get("blackbox_diagnostics")
+                            specialist_metadata = run_result.get("specialist_metadata")
                         else:
                             est_copy = est.__class__(**params)
                             est_copy.fit(train_X, train_y)
@@ -602,6 +605,7 @@ def run_track1_blackbox(
                             y_pred, eval_diag = evaluate_formula(formula, test_X, return_diagnostics=True)
                             elapsed = time.time() - t0
                             blackbox_diag = getattr(est_copy, "blackbox_diagnostics_", None)
+                            specialist_metadata = bc.specialist_metadata_from_estimator(est_copy)
 
                         if y_pred is None:
                             error_reason = "formula_eval_failed"
@@ -615,6 +619,7 @@ def run_track1_blackbox(
                                 "formula": formula,
                                 "model_size": model_size(formula),
                                 "blackbox_diagnostics": blackbox_diag,
+                                "specialist_metadata": specialist_metadata,
                                 "formula_eval_diagnostics": eval_diag,
                                 "error": error_reason,
                                 "run_label": run_label,
@@ -631,6 +636,7 @@ def run_track1_blackbox(
                             "formula": formula,
                             "model_size": size,
                             "blackbox_diagnostics": blackbox_diag,
+                            "specialist_metadata": specialist_metadata,
                             "formula_eval_diagnostics": eval_diag,
                             "error": None,
                             "run_label": run_label,
@@ -827,6 +833,7 @@ def run_track2_ground_truth(
                                 eval_diag,
                                 split="full",
                             )
+                        specialist_metadata = run_result.get("specialist_metadata")
                     else:
                         est_copy = est.__class__(**est_params)
                         est_copy.fit(X_train, y_train)
@@ -835,6 +842,7 @@ def run_track2_ground_truth(
                             formula = simplify_formula_with_guard(formula, X_train, y_train)
                         y_pred_all, eval_diag = evaluate_formula(formula, X, return_diagnostics=True)
                         elapsed = time.time() - t0
+                        specialist_metadata = bc.specialist_metadata_from_estimator(est_copy)
 
                     if y_pred_all is None:
                         error_reason = "formula_eval_failed"
@@ -874,9 +882,10 @@ def run_track2_ground_truth(
                         "full_mse": full_mse,
                         "exact_match": exact_match,
                         "time": elapsed,
-                        "model_size": size,
-                        "failure_bucket": failure_bucket,
-                        "formula_eval_diagnostics": eval_diag,
+                            "model_size": size,
+                            "failure_bucket": failure_bucket,
+                            "specialist_metadata": specialist_metadata,
+                            "formula_eval_diagnostics": eval_diag,
                         "error": None,
                     })
                 except Exception as e:
@@ -1070,6 +1079,8 @@ def main():
                         help="Internal C++ restarts per seed; keep at 1 when using multi-seed SRBench runs")
     parser.add_argument("--enable-residual-stage", action="store_true",
                         help="Enable expensive residual symbolic stage during SRBench runs")
+    parser.add_argument("--disable-specialist", action="store_true",
+                        help="Disable specialist screening/composition diagnostics for SRBench ablation runs")
     parser.add_argument("--classifier-model", type=str, default="models/curve_classifier_multi.pt",
                         help="Classifier model path")
     parser.add_argument("--proposer-model", type=str, default="models/universal_proposer_multi.pt",
@@ -1128,7 +1139,9 @@ def main():
         migration_interval=args.migration_interval,
         migration_size=args.migration_size,
         multi_start_runs=args.multi_start_runs,
-        enable_residual_stage=args.enable_residual_stage,
+        enable_specialist_screening_diagnostics=not args.disable_specialist,
+        enable_specialist_composition_screening=not args.disable_specialist,
+        enable_residual_stage=args.enable_residual_stage and not args.disable_specialist,
         skip_evolution_if_bloated=args.skip_evolution_if_bloated,
         bloat_term_threshold=20,
         universal_proposer_path=args.proposer_model,

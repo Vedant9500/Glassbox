@@ -642,11 +642,6 @@ def build_seed_graphs_from_candidates(
     remaining_budget = max(0, max_seeds - len(selected_composed))
     selected_standard = standard_cands[:remaining_budget]
 
-    # If there is remaining budget, fill with leftover composed candidates
-    if len(selected_composed) + len(selected_standard) < max_seeds:
-        extra_budget = max_seeds - (len(selected_composed) + len(selected_standard))
-        selected_composed.extend(composed_cands[max_composed:max_composed + extra_budget])
-
     # Re-combine and sort by MSE
     combined = selected_composed + selected_standard
     combined.sort(key=lambda c: float(c.get("mse", float("inf")) or float("inf")))

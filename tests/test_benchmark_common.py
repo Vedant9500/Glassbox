@@ -1,0 +1,33 @@
+import numpy as np
+
+from scripts import benchmark_common as bc
+
+
+def test_postprocess_formula_rejects_sympy_piecewise_output():
+    formula = "-log(2) + 0.141*x**1.5 + sqrt(2)*x**0.67"
+
+    processed = bc.postprocess_formula(formula)
+
+    assert "Piecewise(" not in processed
+    assert "Eq(" not in processed
+
+    X = np.linspace(0.1, 5.0, 300).reshape(-1, 1)
+    y_pred, diagnostics = bc.evaluate_formula(processed, X, return_diagnostics=True)
+
+    assert diagnostics["ok"] is True
+    assert y_pred is not None
+    assert y_pred.shape == (300,)
+
+
+def test_postprocess_formula_fidelity_guard_rejects_worse_cleanup():
+    formula = "0.003746*x**2 - 0.07398*x + 0.03161*log(Abs(x)) - 0.07259*sin(0.7038*x + 1.448) + 0.13"
+    X = np.linspace(0.1, 5.0, 300).reshape(-1, 1)
+    y = bc.evaluate_formula(formula, X)
+
+    processed = bc.postprocess_formula(formula)
+    guarded, diagnostics = bc.postprocess_formula_with_fidelity_guard(formula, X, y)
+
+    assert processed != guarded
+    assert diagnostics["postprocess_guard_triggered"] is True
+    assert diagnostics["postprocess_guard_reason"] == "processed_formula_worse"
+    assert bc.evaluate_formula_mse_on_X(guarded, X, y) < bc.evaluate_formula_mse_on_X(processed, X, y)

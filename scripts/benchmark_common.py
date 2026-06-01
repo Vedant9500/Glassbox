@@ -256,7 +256,14 @@ def postprocess_formula(formula):
                 zero_tol=evo_zero_tol,
                 use_nsimplify=(formula_len <= 300 and term_estimate <= 16),
             )
-        return protect_fractional_powers(str(simplified_expr).replace("^", "**"))
+        simplified_text = str(simplified_expr)
+        if "Piecewise(" in simplified_text or "Eq(" in simplified_text:
+            snapped = snap_formula_floats(
+                normalized,
+                SnapConfig(int_tol=evo_int_tol, zero_tol=evo_zero_tol),
+            )
+            return protect_fractional_powers(snapped.replace("^", "**"))
+        return protect_fractional_powers(simplified_text.replace("^", "**"))
     except Exception:
         return protect_fractional_powers(normalized.replace("^", "**"))
 
@@ -387,6 +394,74 @@ def evaluate_formula_mse(formula, x, y):
     if not math.isfinite(mse):
         return None
     return mse
+
+
+def evaluate_formula_mse_on_X(formula, X, y):
+    """Evaluate displayed formula against ground-truth data for 1D or multivariate X."""
+    if not formula:
+        return None
+    X_arr = np.asarray(X, dtype=np.float64)
+    if X_arr.ndim == 1:
+        X_arr = X_arr.reshape(-1, 1)
+    y_true = np.asarray(y, dtype=np.float64).reshape(-1)
+    y_pred = evaluate_formula(formula, X_arr)
+    if y_pred is None:
+        return None
+    y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+    if y_pred.shape != y_true.shape:
+        return None
+    mask = np.isfinite(y_pred) & np.isfinite(y_true)
+    if mask.sum() < 10:
+        return None
+    mse = float(np.mean((y_pred[mask] - y_true[mask]) ** 2))
+    return mse if math.isfinite(mse) else None
+
+
+def postprocess_formula_with_fidelity_guard(
+    formula,
+    X,
+    y,
+    *,
+    relative_slack=0.10,
+    absolute_slack=1e-9,
+):
+    """Postprocess a formula, but keep the original if cleanup worsens benchmark fit."""
+    processed = postprocess_formula(formula)
+    raw_mse = evaluate_formula_mse_on_X(formula, X, y)
+    processed_mse = evaluate_formula_mse_on_X(processed, X, y)
+
+    if processed_mse is None:
+        fallback = protect_fractional_powers(normalize_formula_text(formula).replace("^", "**"))
+        fallback_mse = evaluate_formula_mse_on_X(fallback, X, y)
+        return (fallback if fallback_mse is not None else processed), {
+            "postprocess_guard_triggered": True,
+            "postprocess_raw_mse": raw_mse,
+            "postprocess_processed_mse": processed_mse,
+            "postprocess_fallback_mse": fallback_mse,
+            "postprocess_guard_reason": "processed_formula_eval_failed",
+        }
+
+    if raw_mse is not None:
+        allowed = raw_mse * (1.0 + max(0.0, float(relative_slack))) + max(0.0, float(absolute_slack))
+        if processed_mse > allowed:
+            fallback = protect_fractional_powers(normalize_formula_text(formula).replace("^", "**"))
+            fallback_mse = evaluate_formula_mse_on_X(fallback, X, y)
+            if fallback_mse is not None and fallback_mse <= processed_mse:
+                return fallback, {
+                    "postprocess_guard_triggered": True,
+                    "postprocess_raw_mse": raw_mse,
+                    "postprocess_processed_mse": processed_mse,
+                    "postprocess_fallback_mse": fallback_mse,
+                    "postprocess_guard_reason": "processed_formula_worse",
+                }
+
+    return processed, {
+        "postprocess_guard_triggered": False,
+        "postprocess_raw_mse": raw_mse,
+        "postprocess_processed_mse": processed_mse,
+        "postprocess_fallback_mse": None,
+        "postprocess_guard_reason": None,
+    }
 
 
 def estimate_timeout_budget(base_timeout, n_features, n_train, adaptive_timeout):
@@ -565,3 +640,27 @@ def apply_run_budget(est_params, timeout_budget):
     params["max_compute_budget"] = budget
     params["min_compute_budget"] = min(int(params.get("min_compute_budget", 10) or 10), budget)
     return params
+
+
+def specialist_metadata_from_estimator(estimator):
+    """Extract specialist/composition/boosting diagnostics from a GlassboxRegressor."""
+    diagnostics = getattr(estimator, "blackbox_diagnostics_", {}) or {}
+    candidate_screening = diagnostics.get("candidate_screening", {}) if isinstance(diagnostics, dict) else {}
+    return {
+        "specialist_track": getattr(estimator, "specialist_track_", None),
+        "has_composed_seeds": bool(getattr(estimator, "has_composed_seeds_", False)),
+        "boosting_attempted": bool(getattr(estimator, "boosting_attempted_", False)),
+        "boosting_improved": bool(getattr(estimator, "boosting_improved_", False)),
+        "boosting_stage_count": len(getattr(estimator, "boosting_stages_", []) or []),
+        "boosting_diagnostics": getattr(estimator, "boosting_diagnostics_", None),
+        "specialist_diagnostics": (
+            candidate_screening.get("specialist_screening")
+            if isinstance(candidate_screening, dict)
+            else None
+        ),
+        "specialist_composition_screening": (
+            diagnostics.get("specialist_composition_screening")
+            if isinstance(diagnostics, dict)
+            else None
+        ),
+    }

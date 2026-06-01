@@ -10,6 +10,7 @@ from glassbox.universal_proposer import (
     proposer_output_to_fpip_v2,
 )
 from scripts.train_universal_proposer import FormulaReplayDataset
+from glassbox.curve_classifier.generate_curve_data import FEATURE_DIM
 
 
 def test_universal_proposer_returns_topk_candidates():
@@ -92,14 +93,14 @@ def test_formula_replay_dataset_loads_npz(tmp_path: Path):
     labels = np.zeros((n, 14), dtype=np.float32)
     labels[:, 1] = 1.0  # sin
     formulas = np.array(["np.sin(x)" for _ in range(n)], dtype=object)
-    features = np.zeros((n, 366), dtype=np.float32)
+    features = np.zeros((n, FEATURE_DIM), dtype=np.float32)
     npz_path = tmp_path / "mini_dataset.npz"
     np.savez_compressed(npz_path, features=features, labels=labels, formulas=formulas)
 
     ds = FormulaReplayDataset(npz_path, n_points=64)
     points, op_target, skeleton_target = ds[0]
 
-    assert points.shape == (366,)
+    assert points.shape == (FEATURE_DIM,)
     assert op_target.shape[0] >= 8
     assert int(skeleton_target.item()) >= 0
 
@@ -109,7 +110,7 @@ def test_formula_replay_dataset_matches_multivariate_skeleton(tmp_path: Path):
     labels = np.zeros((n, 14), dtype=np.float32)
     labels[:, 7] = 1.0  # multiplication
     formulas = np.array(["x0*x1" for _ in range(n)], dtype=object)
-    features = np.zeros((n, 366), dtype=np.float32)
+    features = np.zeros((n, FEATURE_DIM), dtype=np.float32)
     npz_path = tmp_path / "multi_dataset.npz"
     np.savez_compressed(npz_path, features=features, labels=labels, formulas=formulas)
 

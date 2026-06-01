@@ -256,6 +256,10 @@ def _evaluate_run(
         "composition_accepted_count": int(composition.get("accepted_count", 0) or 0),
         "specialist_screening": specialist if enable_specialist_screening_diagnostics else None,
         "specialist_track": getattr(est, "specialist_track_", None),
+        "boosting_attempted": bool(getattr(est, "boosting_attempted_", False)),
+        "boosting_improved": bool(getattr(est, "boosting_improved_", False)),
+        "boosting_stage_count": len(getattr(est, "boosting_stages_", []) or []),
+        "boosting_diagnostics": getattr(est, "boosting_diagnostics_", None),
     }
 
 
@@ -587,7 +591,12 @@ def run_phase7(*, quick: bool = False) -> Dict[str, Any]:
             "phase7": phase7,
         })
 
-        if phase7.get("r2", 0.0) >= 0.99:
+        if (
+            phase7.get("r2", 0.0) >= 0.99
+            and phase7.get("boosting_attempted")
+            and phase7.get("boosting_improved")
+            and phase7.get("boosting_stage_count", 0) >= 1
+        ):
             phase7_hits += 1
 
     summary = {
@@ -638,6 +647,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
 
 

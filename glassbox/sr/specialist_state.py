@@ -122,6 +122,7 @@ class SpecialistState:
     candidates: List[SpecialistCandidate]
     top_pairs: List[SpecialistPairScore]
     hot_spot_segments: List[SpecialistSegment] = field(default_factory=list)
+    hot_spot_base_formula: Optional[str] = None
 
     @property
     def candidate_count(self) -> int:
@@ -139,6 +140,7 @@ class SpecialistState:
             "segment_count": self.segment_count,
             "segments": [segment.to_dict() for segment in self.segments],
             "hot_spot_segments": [segment.to_dict() for segment in self.hot_spot_segments],
+            "hot_spot_base_formula": self.hot_spot_base_formula,
             "top_candidates": [candidate.to_dict() for candidate in self.candidates],
             "top_pairs": [pair.to_dict() for pair in self.top_pairs],
         }
@@ -440,8 +442,19 @@ def compute_specialist_state(
     if not temp_candidates:
         return None
 
-    # Identify the best candidate's residual vector
-    best_residual = temp_candidates[0]["residual"]
+    def _candidate_rank(item: Dict[str, Any]) -> tuple:
+        candidate = item.get("candidate") or {}
+        val_mse = _clean_float(candidate.get("validation_mse"))
+        val_r2 = _clean_float(candidate.get("validation_r2"))
+        if val_mse is None:
+            val_mse = float(np.mean(np.asarray(item["residual"], dtype=np.float64) ** 2))
+        if val_r2 is None:
+            val_r2 = -float("inf")
+        return (float(val_mse), -float(val_r2))
+
+    best_temp_candidate = min(temp_candidates, key=_candidate_rank)
+    best_residual = best_temp_candidate["residual"]
+    best_formula_for_hot_spots = str(best_temp_candidate["formula"])
 
     # Build hot-spot segments using the best candidate's residual
     hot_spot_segments = build_hot_spot_segments(
@@ -645,6 +658,7 @@ def compute_specialist_state(
         candidates=candidates,
         top_pairs=pair_scores[: max(0, int(max_pairs))],
         hot_spot_segments=hot_spot_segments,
+        hot_spot_base_formula=best_formula_for_hot_spots,
     )
 
 
@@ -652,6 +666,12 @@ def nest_formulas(f: str, g: str) -> str:
     """Replace variable (e.g. x0, x1, x) in f with (g)."""
     import re
     return re.sub(r"\bx\d*\b", f"({g})", f)
+
+
+def _dedupe_append(forms: List[tuple[str, str]], operator: str, formula: str) -> None:
+    key = (operator, "".join(str(formula).lower().split()))
+    if key not in {(_op, "".join(str(_formula).lower().split())) for _op, _formula in forms}:
+        forms.append((operator, formula))
 
 
 def propose_specialist_compositions(
@@ -711,61 +731,69 @@ def propose_specialist_compositions(
             pred_f = left.residual_vector + y_arr
             pred_g = right.residual_vector + y_arr
 
-        forms = [
-            ("add", f"(({pair.formula_a})+({pair.formula_b}))"),
-            ("mul", f"(({pair.formula_a})*({pair.formula_b}))"),
-        ]
+        forms: List[tuple[str, str]] = []
+        _dedupe_append(forms, "add", f"(({pair.formula_a})+({pair.formula_b}))")
+        _dedupe_append(forms, "mul", f"(({pair.formula_a})*({pair.formula_b}))")
 
-        # 1. Division: f / g
-        if y is not None and pred_g is not None:
-            min_g = np.min(np.abs(pred_g))
-            if min_g > 0.01:
-                forms.append(("div", f"(({pair.formula_a})/({pair.formula_b}))"))
+        # 1. Division: f / g and g / f, guarded by the denominator prediction.
+        if y is not None and pred_f is not None and pred_g is not None:
+            if np.min(np.abs(pred_g)) > 0.01:
+                _dedupe_append(forms, "div", f"(({pair.formula_a})/({pair.formula_b}))")
+            if np.min(np.abs(pred_f)) > 0.01:
+                _dedupe_append(forms, "div", f"(({pair.formula_b})/({pair.formula_a}))")
         else:
-            forms.append(("div", f"(({pair.formula_a})/({pair.formula_b}))"))
+            _dedupe_append(forms, "div", f"(({pair.formula_a})/({pair.formula_b}))")
+            _dedupe_append(forms, "div", f"(({pair.formula_b})/({pair.formula_a}))")
 
         # 2. Nested: f(g)
-        is_unary_a = pair.family_a in {"sin", "cos", "exp", "log"}
-        if is_unary_a:
-            if y is not None and pred_g is not None:
-                std_g = np.std(pred_g)
-                range_g = np.max(pred_g) - np.min(pred_g)
-                if std_g > 1e-5 and range_g < 20.0:
-                    if pair.family_a == "exp" and np.max(pred_g) < 5.0:
-                        forms.append(("nested", nest_formulas(pair.formula_a, pair.formula_b)))
-                    elif pair.family_a == "log" and np.min(pred_g) > 0.01:
-                        forms.append(("nested", nest_formulas(pair.formula_a, pair.formula_b)))
-                    elif pair.family_a in {"sin", "cos"}:
-                        forms.append(("nested", nest_formulas(pair.formula_a, pair.formula_b)))
-            else:
-                forms.append(("nested", nest_formulas(pair.formula_a, pair.formula_b)))
+        def _maybe_add_nested(outer_formula: str, inner_formula: str, outer_family: str, inner_pred: Optional[np.ndarray]) -> None:
+            if outer_family not in {"sin", "cos", "exp", "log"}:
+                return
+            if y is not None and inner_pred is not None:
+                std_inner = np.std(inner_pred)
+                range_inner = np.max(inner_pred) - np.min(inner_pred)
+                if std_inner <= 1e-5 or range_inner >= 20.0:
+                    return
+                if outer_family == "exp" and np.max(inner_pred) >= 5.0:
+                    return
+                if outer_family == "log" and np.min(inner_pred) <= 0.01:
+                    return
+            _dedupe_append(forms, "nested", nest_formulas(outer_formula, inner_formula))
+
+        _maybe_add_nested(pair.formula_a, pair.formula_b, pair.family_a, pred_g)
+        _maybe_add_nested(pair.formula_b, pair.formula_a, pair.family_b, pred_f)
 
         # 3. Affine blend: a*f + (1-a)*g
         if y is not None and pred_f is not None and pred_g is not None:
             diff = pred_f - pred_g
             denom = np.sum(diff**2)
             alpha = np.sum(diff * (y_arr - pred_g)) / denom if denom > 1e-9 else 0.5
-            alpha = float(np.clip(alpha, 0.05, 0.95))
-            forms.append(("affine", f"(({alpha:.6g})*({pair.formula_a})) + (((1.0 - {alpha:.6g}))*({pair.formula_b}))"))
+            if 0.05 < float(alpha) < 0.95:
+                forms.append(("affine", f"(({alpha:.6g})*({pair.formula_a})) + (((1.0 - {alpha:.6g}))*({pair.formula_b}))"))
         else:
             forms.append(("affine", f"((0.5)*({pair.formula_a})) + (((1.0 - 0.5))*({pair.formula_b}))"))
 
         # 4. Damped product: f * exp(-beta * g^2)
-        if y is not None and pred_f is not None and pred_g is not None:
+        def _maybe_add_damped(base_formula: str, damp_formula: str, base_pred: np.ndarray, damp_pred: np.ndarray) -> None:
             betas = np.logspace(-3, 2, 15)
             best_beta = 0.1
             best_mse = float('inf')
             for b in betas:
-                pred_hs = pred_f * np.exp(-b * (pred_g**2))
+                pred_hs = base_pred * np.exp(-b * (damp_pred**2))
                 mse = np.mean((pred_hs - y_arr)**2)
                 if mse < best_mse:
                     best_mse = mse
                     best_beta = b
-            final_damp = np.exp(-best_beta * (pred_g**2))
+            final_damp = np.exp(-best_beta * (damp_pred**2))
             if np.mean(final_damp < 1e-3) <= 0.5:
-                forms.append(("damped_product", f"(({pair.formula_a}) * exp((-{best_beta:.6g}) * (({pair.formula_b})**2)))"))
+                _dedupe_append(forms, "damped_product", f"(({base_formula}) * exp((-{best_beta:.6g}) * (({damp_formula})**2)))")
+
+        if y is not None and pred_f is not None and pred_g is not None:
+            _maybe_add_damped(pair.formula_a, pair.formula_b, pred_f, pred_g)
+            _maybe_add_damped(pair.formula_b, pair.formula_a, pred_g, pred_f)
         else:
             forms.append(("damped_product", f"(({pair.formula_a}) * exp((-1.0) * (({pair.formula_b})**2)))"))
+            forms.append(("damped_product", f"(({pair.formula_b}) * exp((-1.0) * (({pair.formula_a})**2)))"))
 
         # 5. Sigmoid gate: f * sig + g * (1 - sig)
         if y is not None and X is not None and pred_f is not None and pred_g is not None:
@@ -807,7 +835,12 @@ def propose_specialist_compositions(
                         best_k = k_val
                         best_c = c_val
 
-            forms.append(("sigmoid_gate", f"(({pair.formula_a}) * (1.0 / (1.0 + exp((-{best_k:.6g}) * ({gate_var} - ({best_c:.6g})))))) + (({pair.formula_b}) * (1.0 - (1.0 / (1.0 + exp((-{best_k:.6g}) * ({gate_var} - ({best_c:.6g})))))))"))
+            parent_best_mse = min(
+                float(np.mean((pred_f - y_arr) ** 2)),
+                float(np.mean((pred_g - y_arr) ** 2)),
+            )
+            if best_mse + 1e-12 < parent_best_mse:
+                forms.append(("sigmoid_gate", f"(({pair.formula_a}) * (1.0 / (1.0 + exp((-{best_k:.6g}) * ({gate_var} - ({best_c:.6g})))))) + (({pair.formula_b}) * (1.0 - (1.0 / (1.0 + exp((-{best_k:.6g}) * ({gate_var} - ({best_c:.6g})))))))"))
         else:
             forms.append(("sigmoid_gate", f"(({pair.formula_a}) * (1.0 / (1.0 + exp((-1.0) * (x0 - (0.0)))))) + (({pair.formula_b}) * (1.0 - (1.0 / (1.0 + exp((-1.0) * (x0 - (0.0)))))))"))
 
@@ -848,18 +881,46 @@ def propose_specialist_compositions(
 
             total_comp = comp_f + comp_g + op_extra
             simpler_comp = min(comp_f, comp_g)
-            if total_comp > max(15, 2.0 * simpler_comp):
+            complexity_limit = max(15, 2.0 * simpler_comp)
+            if operator == "sigmoid_gate":
+                complexity_limit = max(30, 4.0 * simpler_comp)
+            elif operator in {"damped_product", "affine"}:
+                complexity_limit = max(20, 3.0 * simpler_comp)
+            if total_comp > complexity_limit:
                 continue
 
             candidate_templates.append((operator, formula, mse_val, total_comp))
 
         # Filter out invalid
         candidate_templates = [ct for ct in candidate_templates if ct[2] != float('inf')]
-        # Sort: lowest MSE first, then lowest complexity
-        candidate_templates.sort(key=lambda ct: (ct[2], ct[3]))
+        # Preserve operator diversity before validation. MSE still breaks ties within each template family.
+        priority = {
+            "nested": 0,
+            "div": 1,
+            "sigmoid_gate": 2,
+            "damped_product": 3,
+            "affine": 4,
+            "mul": 5,
+            "add": 6,
+        }
+        candidate_templates.sort(key=lambda ct: (priority.get(ct[0], 99), ct[2], ct[3]))
 
-        # Select top 3 templates
-        for operator, formula, _, _ in candidate_templates[:3]:
+        selected_templates = []
+        selected_ops = set()
+        for legacy_op in ("add", "mul"):
+            legacy_candidates = [ct for ct in candidate_templates if ct[0] == legacy_op]
+            if legacy_candidates:
+                selected_templates.append(min(legacy_candidates, key=lambda ct: (ct[2], ct[3])))
+                selected_ops.add(legacy_op)
+        for ct in candidate_templates:
+            if ct[0] in selected_ops:
+                continue
+            selected_templates.append(ct)
+            selected_ops.add(ct[0])
+            if len(selected_templates) >= 3:
+                break
+
+        for operator, formula, _, _ in selected_templates:
             key = "".join(str(formula).lower().split())
             if key in seen:
                 continue
@@ -879,4 +940,3 @@ def propose_specialist_compositions(
             )
 
     return proposals[:12]
-
