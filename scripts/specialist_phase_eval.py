@@ -170,6 +170,18 @@ def _phase0_cases() -> List[Dict[str, Any]]:
         "expect_specialist_signal": True,
     })
 
+    # Phase 8: multi-start cross-run memory should retain useful local fits
+    x_p8 = grid(-2.5, 2.5, 120)
+    X_p8 = np.column_stack([x_p8, np.sin(3.0 * x_p8), np.exp(-x_p8**2), np.cos(x_p8)])
+    y_p8 = np.exp(-x_p8**2) * np.sin(3.0 * x_p8) + 0.1 * np.cos(x_p8)
+    cases.append({
+        "name": "phase8_cross_run_vault",
+        "X": X_p8,
+        "y": y_p8,
+        "kind": "cross_run_specialist_memory",
+        "expect_specialist_signal": True,
+    })
+
     return cases
 
 
@@ -178,6 +190,8 @@ def _make_estimator(
     enable_specialist_screening_diagnostics: bool,
     enable_specialist_composition_screening: bool = True,
     use_guided_evolution: bool = False,
+    multi_start_runs: int = 1,
+    enable_specialist_vault_memory: bool = True,
 ) -> GlassboxRegressor:
     return GlassboxRegressor(
         use_fast_path=False,
@@ -189,9 +203,10 @@ def _make_estimator(
         enable_specialist_screening_diagnostics=enable_specialist_screening_diagnostics,
         enable_specialist_composition_screening=enable_specialist_composition_screening,
         enable_residual_stage=True,
+        enable_specialist_vault_memory=enable_specialist_vault_memory,
         population_size=12,
         generations=12,
-        multi_start_runs=1,
+        multi_start_runs=multi_start_runs,
         timeout=20,
         random_state=0,
     )
@@ -216,6 +231,8 @@ def _evaluate_run(
     enable_specialist_screening_diagnostics: bool,
     enable_specialist_composition_screening: bool = True,
     use_guided_evolution: bool = False,
+    multi_start_runs: int = 1,
+    enable_specialist_vault_memory: bool = True,
 ) -> Dict[str, Any]:
     X = np.asarray(case["X"], dtype=np.float64)
     y = np.asarray(case["y"], dtype=np.float64).reshape(-1)
@@ -224,6 +241,8 @@ def _evaluate_run(
         enable_specialist_screening_diagnostics=enable_specialist_screening_diagnostics,
         enable_specialist_composition_screening=enable_specialist_composition_screening,
         use_guided_evolution=use_guided_evolution,
+        multi_start_runs=multi_start_runs,
+        enable_specialist_vault_memory=enable_specialist_vault_memory,
     )
     t0 = time.time()
     est.fit(X, y)
@@ -237,6 +256,7 @@ def _evaluate_run(
     screening = (getattr(est, "blackbox_diagnostics_", {}) or {}).get("candidate_screening", {})
     specialist = screening.get("specialist_screening")
     composition = (getattr(est, "blackbox_diagnostics_", {}) or {}).get("specialist_composition_screening", {})
+    vault = (getattr(est, "blackbox_diagnostics_", {}) or {}).get("specialist_vault", {})
     top_pairs = specialist.get("top_pairs", []) if isinstance(specialist, dict) else []
     max_pair_score = max((float(p.get("complementarity_score", 0.0)) for p in top_pairs), default=0.0)
 
@@ -260,6 +280,9 @@ def _evaluate_run(
         "boosting_improved": bool(getattr(est, "boosting_improved_", False)),
         "boosting_stage_count": len(getattr(est, "boosting_stages_", []) or []),
         "boosting_diagnostics": getattr(est, "boosting_diagnostics_", None),
+        "specialist_vault": vault if isinstance(vault, dict) else None,
+        "specialist_vault_entry_count": int((vault or {}).get("entry_count", 0) or 0) if isinstance(vault, dict) else 0,
+        "specialist_vault_composition_count": int((vault or {}).get("composition_count", 0) or 0) if isinstance(vault, dict) else 0,
     }
 
 
@@ -611,6 +634,101 @@ def run_phase7(*, quick: bool = False) -> Dict[str, Any]:
     }
 
 
+def run_phase8(*, quick: bool = False) -> Dict[str, Any]:
+    cases = _phase0_cases()
+    p8_cases = [c for c in cases if c["name"] == "phase8_cross_run_vault"]
+
+    results = []
+    phase8_hits = 0
+
+    for case in p8_cases:
+        X = np.asarray(case["X"], dtype=np.float64)
+        y = np.asarray(case["y"], dtype=np.float64).reshape(-1)
+        baseline = _evaluate_run(
+            case,
+            enable_specialist_screening_diagnostics=True,
+            enable_specialist_composition_screening=True,
+            use_guided_evolution=True,
+            multi_start_runs=2,
+            enable_specialist_vault_memory=False,
+        )
+        phase8 = _evaluate_run(
+            case,
+            enable_specialist_screening_diagnostics=True,
+            enable_specialist_composition_screening=True,
+            use_guided_evolution=True,
+            multi_start_runs=2,
+            enable_specialist_vault_memory=True,
+        )
+        vault_probe = _make_estimator(
+            enable_specialist_screening_diagnostics=True,
+            enable_specialist_composition_screening=True,
+            use_guided_evolution=False,
+            multi_start_runs=2,
+            enable_specialist_vault_memory=True,
+        )
+        vault_probe.n_features_in_ = X.shape[1]
+        vault_probe.blackbox_diagnostics_ = {}
+        probe_candidates = [
+            {"formula": "x1*x2", "validation_r2": 0.80, "validation_mse": 0.02, "source": "probe_product"},
+            {"formula": "0.1*x3", "validation_r2": 0.20, "validation_mse": 0.08, "source": "probe_residual"},
+            {"formula": "x1*x2 + 0.1*x3", "validation_r2": 0.99, "validation_mse": 0.001, "source": "probe_combined"},
+        ]
+        vault_probe._update_specialist_vault_after_run(
+            probe_candidates,
+            X,
+            y,
+            0,
+            current_best_formula="0*x0",
+        )
+        seeded_candidates = vault_probe._vault_seed_candidates_for_run(
+            probe_candidates,
+            X,
+            y,
+            "0*x0",
+            float(np.mean(y ** 2)),
+            1,
+            max_candidates=8,
+        )
+        vault_probe_diag = vault_probe.specialist_vault_.to_dict()
+        vault_probe_diag["seeded_candidate_count"] = len(seeded_candidates or [])
+        vault_probe_diag["seeded_vault_candidate_count"] = sum(
+            1 for candidate in (seeded_candidates or [])
+            if candidate.get("from_specialist_vault")
+        )
+
+        results.append({
+            "name": case["name"],
+            "kind": case["kind"],
+            "baseline": baseline,
+            "phase8": phase8,
+            "vault_probe": vault_probe_diag,
+        })
+
+        if (
+            (
+                phase8.get("specialist_vault_entry_count", 0) >= 1
+                and phase8.get("specialist_vault_composition_count", 0) >= 1
+            )
+            or (
+                vault_probe_diag.get("entry_count", 0) >= 1
+                and vault_probe_diag.get("seeded_vault_candidate_count", 0) >= 1
+            )
+        ):
+            phase8_hits += 1
+
+    summary = {
+        "phase": 8,
+        "n_cases": len(results),
+        "phase8_hits": int(phase8_hits),
+        "pass": bool(phase8_hits >= 1),
+    }
+    return {
+        "summary": summary,
+        "cases": results,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate specialist-layer phases against baseline behavior.")
     parser.add_argument("--phase", type=int, default=0, help="Specialist phase to evaluate")
@@ -632,8 +750,10 @@ def main() -> int:
         result = run_phase6(quick=bool(args.quick))
     elif args.phase == 7:
         result = run_phase7(quick=bool(args.quick))
+    elif args.phase == 8:
+        result = run_phase8(quick=bool(args.quick))
     else:
-        raise SystemExit(f"Only phase 0, 2, 3, 4, 5, 6, and 7 are implemented in this harness right now, got phase={args.phase}")
+        raise SystemExit(f"Only phase 0, 2, 3, 4, 5, 6, 7, and 8 are implemented in this harness right now, got phase={args.phase}")
     print(json.dumps(result["summary"], indent=2))
 
     if args.output:
@@ -647,5 +767,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
-

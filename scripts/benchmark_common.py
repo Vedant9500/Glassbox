@@ -653,6 +653,11 @@ def specialist_metadata_from_estimator(estimator):
         "boosting_improved": bool(getattr(estimator, "boosting_improved_", False)),
         "boosting_stage_count": len(getattr(estimator, "boosting_stages_", []) or []),
         "boosting_diagnostics": getattr(estimator, "boosting_diagnostics_", None),
+        "specialist_vault": (
+            getattr(estimator, "specialist_vault_", None).to_dict()
+            if getattr(estimator, "specialist_vault_", None) is not None
+            else None
+        ),
         "specialist_diagnostics": (
             candidate_screening.get("specialist_screening")
             if isinstance(candidate_screening, dict)

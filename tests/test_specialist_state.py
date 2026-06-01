@@ -1,6 +1,7 @@
 import numpy as np
 
 from glassbox.sr.specialist_state import (
+    SpecialistVault,
     build_specialist_segment_slices,
     compute_specialist_state,
     propose_specialist_compositions,
@@ -265,3 +266,67 @@ def test_propose_specialist_compositions_handles_reversed_nested_parent():
         for proposal in proposals
     )
 
+
+def test_specialist_vault_dedupes_by_prediction_correlation_and_caps_entries():
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = np.sin(x)
+    vault = SpecialistVault(max_entries=2, corr_threshold=0.98)
+    candidates = [
+        {"formula": "sin(x0)", "validation_r2": 1.0, "validation_mse": 0.0, "source": "a"},
+        {"formula": "sin(x0) + 0", "validation_r2": 0.999, "validation_mse": 1e-9, "source": "dup"},
+        {"formula": "cos(x0)", "validation_r2": 0.1, "validation_mse": 0.8, "source": "b"},
+        {"formula": "x0", "validation_r2": 0.0, "validation_mse": 1.0, "source": "c"},
+    ]
+
+    added = vault.add_candidates(
+        candidates,
+        X,
+        y,
+        evaluate_formula=_eval_formula,
+        complexity_fn=lambda formula: len(str(formula)),
+        family_signature_fn=lambda formula: "periodic" if "sin" in formula or "cos" in formula else "poly",
+        run_index=0,
+        current_best_formula="0*x0",
+        max_new=4,
+    )
+
+    assert added >= 2
+    assert len(vault.entries) == 2
+    formulas = {entry.formula for entry in vault.entries}
+    assert not {"sin(x0)", "sin(x0) + 0"}.issubset(formulas)
+    assert vault.rejected_duplicate_count >= 1
+
+
+def test_specialist_vault_proposes_capped_composition_candidates():
+    x = np.linspace(-1.0, 1.0, 80)
+    X = x.reshape(-1, 1)
+    y = np.sin(x + 1.0)
+    vault = SpecialistVault(max_entries=8)
+    vault.add_candidates(
+        [
+            {"formula": "sin(x0)", "validation_r2": 0.5, "validation_mse": 0.2, "source": "outer"},
+            {"formula": "x0+1.0", "validation_r2": 0.5, "validation_mse": 0.2, "source": "inner"},
+        ],
+        X,
+        y,
+        evaluate_formula=_eval_formula,
+        complexity_fn=lambda formula: 1,
+        family_signature_fn=lambda formula: "sin" if "sin" in str(formula) else "poly",
+        run_index=0,
+        max_new=2,
+    )
+
+    proposals = vault.propose_compositions(
+        X,
+        y,
+        evaluate_formula=_eval_formula,
+        complexity_fn=lambda formula: 1,
+        family_signature_fn=lambda formula: "sin" if "sin" in str(formula) else "poly",
+        current_best_candidate={"formula": "x0", "validation_mse": 1.0, "validation_r2": 0.0, "source": "current"},
+    )
+
+    assert len(proposals) <= 6
+    assert proposals
+    assert all(candidate["from_specialist_vault"] for candidate in proposals)
+    assert all(candidate["from_specialist_composition"] for candidate in proposals)

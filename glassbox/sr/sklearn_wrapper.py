@@ -28,6 +28,7 @@ from glassbox.sr.blackbox_preprocessor import (
     remap_original_formula_to_reduced,
     state_to_dict,
 )
+from glassbox.sr.specialist_state import SpecialistVault
 from glassbox.sr.specialist_state import compute_specialist_state
 from glassbox.sr.specialist_state import propose_specialist_compositions
 
@@ -128,6 +129,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         enable_residual_stage=True,
         max_boosting_stages=3,
         boosting_learning_rates=None,
+        enable_specialist_vault_memory=True,
+        specialist_vault_size=8,
         device=None,
         skip_evolution_if_bloated=False,
         bloat_term_threshold=20,
@@ -181,12 +184,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.enable_residual_stage = enable_residual_stage
         self.max_boosting_stages = max(0, int(max_boosting_stages))
         self.boosting_learning_rates = list(boosting_learning_rates or [0.5, 0.8, 1.0])
+        self.enable_specialist_vault_memory = enable_specialist_vault_memory
+        self.specialist_vault_size = max(0, int(specialist_vault_size))
         self.device = device
         self.skip_evolution_if_bloated = skip_evolution_if_bloated
         self.bloat_term_threshold = bloat_term_threshold
 
         self._universal_proposer_model = None
         self.specialist_state_ = None
+        self.specialist_vault_ = SpecialistVault(max_entries=self.specialist_vault_size)
         self.specialist_track_ = "incumbent path"
         self.has_composed_seeds_ = False
         self.boosting_stages_ = []
@@ -773,6 +779,113 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 ],
             }
         return accepted
+
+    def _specialist_vault_enabled(self):
+        return (
+            bool(getattr(self, "enable_specialist_vault_memory", True))
+            and int(getattr(self, "specialist_vault_size", 0) or 0) > 0
+            and bool(getattr(self, "enable_specialist_composition_screening", True))
+        )
+
+    def _vault_seed_candidates_for_run(self, candidate_formulas, X, y, best_formula, best_mse, run_idx, *, max_candidates=8):
+        """Return per-run candidate list augmented with Phase 8 vault memory."""
+        base_candidates = list(candidate_formulas or [])
+        vault = getattr(self, "specialist_vault_", None)
+        if run_idx <= 0 or not self._specialist_vault_enabled() or vault is None or not vault.entries:
+            return base_candidates
+
+        vault.rescore_against_target(
+            X,
+            y,
+            evaluate_formula=self._safe_eval_formula_array,
+        )
+        current_best_candidate = None
+        if best_formula:
+            best_r2 = None
+            try:
+                best_pred = self._safe_eval_formula_array(best_formula, X)
+                best_pred = np.asarray(best_pred, dtype=np.float64).reshape(-1)
+                y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+                if best_pred.shape == y_arr.shape:
+                    var_y = float(np.var(y_arr))
+                    mse_y = float(np.mean((best_pred - y_arr) ** 2))
+                    best_r2 = 1.0 if var_y < 1e-15 and mse_y < 1e-15 else (0.0 if var_y < 1e-15 else 1.0 - mse_y / var_y)
+            except Exception:
+                best_r2 = None
+            current_best_candidate = {
+                "formula": best_formula,
+                "mse": best_mse,
+                "validation_mse": best_mse,
+                "validation_r2": best_r2,
+                "complexity": self._formula_complexity(best_formula),
+                "source": "current_best",
+            }
+        vault_candidates = vault.candidate_dicts()
+        vault_compositions = vault.propose_compositions(
+            X,
+            y,
+            evaluate_formula=self._safe_eval_formula_array,
+            complexity_fn=self._formula_complexity,
+            family_signature_fn=self._formula_family_signature,
+            current_best_candidate=current_best_candidate,
+            max_candidates=max(4, int(max_candidates)),
+        )
+        if vault_compositions:
+            refined = self._refine_candidate_formulas(
+                vault_compositions,
+                X,
+                y,
+                max_candidates=min(6, max(2, int(max_candidates))),
+            )
+            vault_compositions = []
+            for candidate in refined:
+                candidate = dict(candidate)
+                candidate["source"] = "specialist_vault_composition"
+                candidate["from_specialist_vault"] = True
+                candidate["from_specialist_composition"] = True
+                vault_compositions.append(candidate)
+
+        if vault_candidates or vault_compositions:
+            self.has_composed_seeds_ = bool(vault_compositions) or self.has_composed_seeds_
+            combined = list(vault_compositions) + list(vault_candidates) + base_candidates
+            return self._prune_blackbox_candidate_formulas(
+                combined,
+                max_candidates=max(8, int(max_candidates)),
+            )
+        return base_candidates
+
+    def _update_specialist_vault_after_run(self, candidate_formulas, X, y, run_idx, current_best_formula, run_formula=None, run_mse=None):
+        """Store structurally different useful formulas after a multi-start attempt."""
+        if not self._specialist_vault_enabled():
+            return 0
+        vault = getattr(self, "specialist_vault_", None)
+        if vault is None:
+            return 0
+        candidates = []
+        if run_formula:
+            candidates.append({
+                "formula": run_formula,
+                "mse": run_mse,
+                "validation_mse": run_mse,
+                "validation_r2": None,
+                "complexity": self._formula_complexity(run_formula),
+                "source": "evolution_run",
+            })
+        candidates.extend(list(candidate_formulas or [])[:8])
+        added = vault.add_candidates(
+            candidates,
+            X,
+            y,
+            evaluate_formula=self._safe_eval_formula_array,
+            complexity_fn=self._formula_complexity,
+            family_signature_fn=self._formula_family_signature,
+            run_index=int(run_idx),
+            current_best_formula=current_best_formula,
+            max_new=3,
+        )
+        if isinstance(self.blackbox_diagnostics_, dict):
+            self.blackbox_diagnostics_["specialist_vault"] = vault.to_dict()
+        return int(added)
 
     def _formula_mse(self, formula, X, y):
         """Evaluate a formula directly on data and return MSE, or inf on failure."""
@@ -2620,6 +2733,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         X, y = check_X_y(X, y, accept_sparse=False)
         self.has_composed_seeds_ = False
         self.specialist_track_ = "incumbent path"
+        self.specialist_vault_ = SpecialistVault(max_entries=int(getattr(self, "specialist_vault_size", 8) or 0))
         self.n_features_in_ = X.shape[1]
         self.original_n_features_in_ = X.shape[1]
         fit_start = _time.time()
@@ -3434,27 +3548,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                     pp.get("log", 0.05)
                                 ]
 
-                        seed_graphs_py = []
+                        build_seed_graphs_from_candidates_fn = None
                         try:
                             from glassbox.sr.cpp.seed_graph_builder import (
                                 build_seed_graphs_from_candidates,
                             )
-
-                            seed_graphs_py = build_seed_graphs_from_candidates(
-                                candidate_formulas if candidate_formulas else (
-                                    [{"formula": best_formula, "mse": best_mse}]
-                                    if best_formula else None
-                                ),
-                                max_seeds=max(
-                                    4,
-                                    min(
-                                        24,
-                                        int(blackbox_search_plan.get("seed_budget", 10)),
-                                    ),
-                                ),
-                            )
+                            build_seed_graphs_from_candidates_fn = build_seed_graphs_from_candidates
                         except Exception:
-                            seed_graphs_py = []
+                            build_seed_graphs_from_candidates_fn = None
 
                         for run_idx in range(n_runs):
                             if not need_evolution:
@@ -3474,6 +3575,37 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             run_seed = -1
                             if self.random_state is not None:
                                 run_seed = int(self.random_state) + run_idx * 9973
+
+                            run_candidate_formulas = self._vault_seed_candidates_for_run(
+                                candidate_formulas,
+                                X,
+                                y,
+                                best_formula,
+                                best_mse,
+                                run_idx,
+                                max_candidates=max(
+                                    8,
+                                    int(blackbox_search_plan.get("seed_budget", 8)),
+                                ),
+                            )
+                            seed_graphs_py = []
+                            if build_seed_graphs_from_candidates_fn is not None:
+                                try:
+                                    seed_graphs_py = build_seed_graphs_from_candidates_fn(
+                                        run_candidate_formulas if run_candidate_formulas else (
+                                            [{"formula": best_formula, "mse": best_mse}]
+                                            if best_formula else None
+                                        ),
+                                        max_seeds=max(
+                                            4,
+                                            min(
+                                                24,
+                                                int(blackbox_search_plan.get("seed_budget", 10)),
+                                            ),
+                                        ),
+                                    )
+                                except Exception:
+                                    seed_graphs_py = []
 
                             result = _core.run_evolution(
                                 X_list=X_list,
@@ -3527,6 +3659,16 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
                             raw_mse = result.get('best_mse', float('inf'))
                             raw_formula = result.get('formula', '')
+
+                            self._update_specialist_vault_after_run(
+                                run_candidate_formulas,
+                                X,
+                                y,
+                                run_idx,
+                                best_formula,
+                                run_formula=raw_formula,
+                                run_mse=raw_mse,
+                            )
 
                             if raw_mse < evo_mse:
                                 evo_formula = raw_formula

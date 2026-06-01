@@ -174,6 +174,283 @@ class SpecialistCompositionProposal:
         }
 
 
+@dataclass
+class SpecialistVaultEntry:
+    formula: str
+    source: str
+    validation_r2: Optional[float]
+    validation_mse: Optional[float]
+    complexity: int
+    family_signature: str
+    segment_scores: List[Dict[str, Any]]
+    residual_vector: np.ndarray = field(repr=False)
+    prediction_vector: np.ndarray = field(repr=False)
+    run_index: int = 0
+    last_improved_run: int = 0
+    residual_relevance: Optional[float] = None
+
+    def to_candidate_dict(self, *, source: str = "specialist_vault") -> Dict[str, Any]:
+        return {
+            "formula": self.formula,
+            "source": source,
+            "validation_r2": self.validation_r2,
+            "validation_mse": self.validation_mse,
+            "mse": self.validation_mse,
+            "complexity": self.complexity,
+            "family_signature": self.family_signature,
+            "from_specialist_vault": True,
+            "specialist_vault_run_index": int(self.run_index),
+            "specialist_vault_residual_relevance": self.residual_relevance,
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "formula": str(self.formula)[:160],
+            "source": self.source,
+            "validation_r2": self.validation_r2,
+            "validation_mse": self.validation_mse,
+            "complexity": int(self.complexity),
+            "family_signature": self.family_signature,
+            "run_index": int(self.run_index),
+            "last_improved_run": int(self.last_improved_run),
+            "residual_relevance": self.residual_relevance,
+            "segment_scores": list(self.segment_scores),
+        }
+
+
+@dataclass
+class SpecialistVault:
+    max_entries: int = 8
+    max_stale_runs: int = 3
+    corr_threshold: float = 0.98
+    entries: List[SpecialistVaultEntry] = field(default_factory=list)
+    added_count: int = 0
+    rejected_duplicate_count: int = 0
+    evicted_count: int = 0
+    composition_count: int = 0
+
+    def clear(self) -> None:
+        self.entries.clear()
+        self.added_count = 0
+        self.rejected_duplicate_count = 0
+        self.evicted_count = 0
+        self.composition_count = 0
+
+    @staticmethod
+    def _formula_key(formula: str) -> str:
+        return "".join(str(formula or "").lower().split())
+
+    @staticmethod
+    def _prediction_corr(left: np.ndarray, right: np.ndarray) -> float:
+        left = np.asarray(left, dtype=np.float64).reshape(-1)
+        right = np.asarray(right, dtype=np.float64).reshape(-1)
+        if left.size != right.size or left.size < 3:
+            return 0.0
+        if np.std(left) <= 1e-12 or np.std(right) <= 1e-12:
+            return 1.0 if np.allclose(left, right, atol=1e-9, rtol=1e-6) else 0.0
+        try:
+            corr = float(np.corrcoef(left, right)[0, 1])
+        except Exception:
+            return 0.0
+        return corr if np.isfinite(corr) else 0.0
+
+    def _evict_stale(self, run_index: int) -> None:
+        kept = []
+        for entry in self.entries:
+            if int(run_index) - int(entry.last_improved_run) > int(self.max_stale_runs):
+                self.evicted_count += 1
+            else:
+                kept.append(entry)
+        self.entries = kept
+
+    def add_candidates(
+        self,
+        candidate_formulas: Any,
+        X: Any,
+        y: Any,
+        *,
+        evaluate_formula: Callable[[str, Any], Any],
+        complexity_fn: Callable[[str], int],
+        family_signature_fn: Callable[[str], str],
+        run_index: int,
+        current_best_formula: Optional[str] = None,
+        max_new: int = 3,
+    ) -> int:
+        if not candidate_formulas:
+            self._evict_stale(run_index)
+            return 0
+
+        X_arr = np.asarray(X, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+        current_best_key = self._formula_key(current_best_formula or "")
+        existing_keys = {self._formula_key(entry.formula) for entry in self.entries}
+        y_var = max(float(np.var(y_arr)), 1e-15)
+
+        scored: List[tuple[float, Dict[str, Any], np.ndarray, np.ndarray]] = []
+        for candidate in list(candidate_formulas):
+            formula = str((candidate or {}).get("formula", "")).strip()
+            if not formula:
+                continue
+            key = self._formula_key(formula)
+            if key == current_best_key or key in existing_keys:
+                continue
+            try:
+                pred = np.asarray(evaluate_formula(formula, X_arr), dtype=np.float64).reshape(-1)
+            except Exception:
+                continue
+            if pred.shape != y_arr.shape or not np.all(np.isfinite(pred)):
+                continue
+            if any(abs(self._prediction_corr(pred, entry.prediction_vector)) >= self.corr_threshold for entry in self.entries):
+                self.rejected_duplicate_count += 1
+                continue
+            residual = pred - y_arr
+            mse = _clean_float((candidate or {}).get("validation_mse"))
+            if mse is None:
+                mse = float(np.mean(residual ** 2))
+            r2 = _clean_float((candidate or {}).get("validation_r2"))
+            if r2 is None:
+                r2 = float(1.0 - mse / y_var)
+            complexity = int((candidate or {}).get("complexity") or complexity_fn(formula))
+            rank = -float(r2) + 0.002 * float(complexity)
+            scored.append((rank, candidate, pred, residual))
+
+        scored.sort(key=lambda item: item[0])
+        added = 0
+        max_new = max(0, int(max_new))
+        for _, candidate, pred, residual in scored:
+            if added >= max_new:
+                break
+            formula = str((candidate or {}).get("formula", "")).strip()
+            key = self._formula_key(formula)
+            if key in existing_keys:
+                continue
+            if any(abs(self._prediction_corr(pred, entry.prediction_vector)) >= self.corr_threshold for entry in self.entries):
+                self.rejected_duplicate_count += 1
+                continue
+            segment_scores = []
+            for segment in (candidate or {}).get("segment_scores", []) or []:
+                if isinstance(segment, dict):
+                    segment_scores.append(dict(segment))
+            mse = _clean_float((candidate or {}).get("validation_mse"))
+            if mse is None:
+                mse = float(np.mean(residual ** 2))
+            r2 = _clean_float((candidate or {}).get("validation_r2"))
+            if r2 is None:
+                r2 = float(1.0 - mse / y_var)
+            entry = SpecialistVaultEntry(
+                formula=formula,
+                source=str((candidate or {}).get("source") or "candidate"),
+                validation_r2=r2,
+                validation_mse=mse,
+                complexity=int((candidate or {}).get("complexity") or complexity_fn(formula)),
+                family_signature=str((candidate or {}).get("family_signature") or family_signature_fn(formula)),
+                segment_scores=segment_scores,
+                residual_vector=np.asarray(residual, dtype=np.float64),
+                prediction_vector=np.asarray(pred, dtype=np.float64),
+                run_index=int(run_index),
+                last_improved_run=int(run_index),
+            )
+            self.entries.append(entry)
+            existing_keys.add(key)
+            self.added_count += 1
+            added += 1
+
+        self.entries.sort(key=lambda entry: (
+            float("inf") if entry.validation_mse is None else float(entry.validation_mse),
+            int(entry.complexity),
+            entry.formula,
+        ))
+        if len(self.entries) > int(self.max_entries):
+            self.evicted_count += len(self.entries) - int(self.max_entries)
+            self.entries = self.entries[: int(self.max_entries)]
+        self._evict_stale(run_index)
+        return int(added)
+
+    def rescore_against_target(
+        self,
+        X: Any,
+        y: Any,
+        *,
+        evaluate_formula: Callable[[str, Any], Any],
+    ) -> None:
+        if not self.entries:
+            return
+        X_arr = np.asarray(X, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+        for entry in self.entries:
+            try:
+                pred = np.asarray(evaluate_formula(entry.formula, X_arr), dtype=np.float64).reshape(-1)
+            except Exception:
+                entry.residual_relevance = None
+                continue
+            if pred.shape != y_arr.shape or not np.all(np.isfinite(pred)):
+                entry.residual_relevance = None
+                continue
+            residual = pred - y_arr
+            entry.prediction_vector = pred
+            entry.residual_vector = residual
+            target_residual = -residual
+            entry.residual_relevance = abs(self._prediction_corr(pred, target_residual))
+
+    def candidate_dicts(self) -> List[Dict[str, Any]]:
+        return [entry.to_candidate_dict() for entry in self.entries]
+
+    def propose_compositions(
+        self,
+        X: Any,
+        y: Any,
+        *,
+        evaluate_formula: Callable[[str, Any], Any],
+        complexity_fn: Callable[[str], int],
+        family_signature_fn: Callable[[str], str],
+        current_best_candidate: Optional[Dict[str, Any]] = None,
+        max_candidates: int = 6,
+    ) -> List[Dict[str, Any]]:
+        if not self.entries:
+            return []
+        raw_candidates = self.candidate_dicts()
+        if current_best_candidate and current_best_candidate.get("formula"):
+            raw_candidates.insert(0, dict(current_best_candidate))
+        state = compute_specialist_state(
+            raw_candidates,
+            X,
+            y,
+            evaluate_formula=evaluate_formula,
+            complexity_fn=complexity_fn,
+            family_signature_fn=family_signature_fn,
+            max_candidates=max(2, min(len(raw_candidates), int(max_candidates))),
+            max_pairs=4,
+        )
+        proposals = propose_specialist_compositions(
+            state,
+            X,
+            y,
+            evaluate_formula=evaluate_formula,
+            max_pairs=4,
+            min_complementarity=0.20,
+        )
+        out = []
+        for proposal in proposals[:6]:
+            candidate = proposal.to_candidate_dict()
+            candidate["source"] = "specialist_vault_composition"
+            candidate["from_specialist_vault"] = True
+            candidate["from_specialist_composition"] = True
+            out.append(candidate)
+        self.composition_count += len(out)
+        return out
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "entry_count": int(len(self.entries)),
+            "max_entries": int(self.max_entries),
+            "added_count": int(self.added_count),
+            "rejected_duplicate_count": int(self.rejected_duplicate_count),
+            "evicted_count": int(self.evicted_count),
+            "composition_count": int(self.composition_count),
+            "entries": [entry.to_dict() for entry in self.entries],
+        }
+
+
 def build_specialist_segment_slices(
     X: Any,
     *,

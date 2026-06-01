@@ -124,6 +124,22 @@ def test_phase7_harness_returns_summary_and_cases():
     assert summary["pass"] is True
 
 
+def test_phase8_harness_returns_summary_and_cases():
+    result = spe.run_phase8(quick=True)
+
+    assert isinstance(result, dict)
+    assert "summary" in result
+    assert "cases" in result
+
+    summary = result["summary"]
+    cases = result["cases"]
+
+    assert summary["phase"] == 8
+    assert summary["n_cases"] == len(cases)
+    assert len(cases) >= 1
+    assert summary["pass"] is True
+
+
 def test_residual_boosting_records_attempt_and_improvement():
     class ProbeRegressor(GlassboxRegressor):
         def _stage_residual_symbolic_fit(self, X, y, base_formula, *, _allow_recursion=False):
@@ -149,5 +165,4 @@ def test_residual_boosting_records_attempt_and_improvement():
     assert reg.boosting_improved_ is True
     assert len(reg.boosting_stages_) == 1
     assert reg.boosting_diagnostics_["accepted_stages"] == 1
-
 
