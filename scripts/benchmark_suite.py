@@ -1419,6 +1419,8 @@ def run_formula_specialist_regressor(
             enable_specialist_screening_diagnostics=bool(specialist_enabled),
             enable_specialist_composition_screening=bool(specialist_enabled),
             enable_residual_stage=bool(specialist_enabled),
+            enable_specialist_vault_memory=bool(specialist_enabled),
+            enable_inception_reuse=bool(specialist_enabled),
             use_guided_evolution=True,
             use_fast_path=True,
             multi_start_runs=1,

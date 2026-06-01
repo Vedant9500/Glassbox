@@ -31,3 +31,31 @@ def test_postprocess_formula_fidelity_guard_rejects_worse_cleanup():
     assert diagnostics["postprocess_guard_triggered"] is True
     assert diagnostics["postprocess_guard_reason"] == "processed_formula_worse"
     assert bc.evaluate_formula_mse_on_X(guarded, X, y) < bc.evaluate_formula_mse_on_X(processed, X, y)
+
+
+def test_postprocess_formula_preserves_signed_power_helper_call():
+    formula = "-0.2155*x*_signed_power(Abs(x),0.303)+0.4505*x+0.5"
+
+    processed = bc.postprocess_formula(formula)
+
+    assert "_signed_power(" in processed
+    assert "_signed_power*" not in processed
+    X = np.linspace(-3.0, 3.0, 200).reshape(-1, 1)
+    y_pred, diagnostics = bc.evaluate_formula(processed, X, return_diagnostics=True)
+
+    assert diagnostics["ok"] is True
+    assert y_pred is not None
+
+
+def test_postprocess_formula_preserves_abs_function_call():
+    formula = "0.158544597542*sin(1.201*log(Abs(x**2+1)))"
+
+    processed = bc.postprocess_formula(formula)
+
+    assert "Abs(" in processed
+    assert "Abs*" not in processed
+    X = np.linspace(-3.0, 3.0, 200).reshape(-1, 1)
+    y_pred, diagnostics = bc.evaluate_formula(processed, X, return_diagnostics=True)
+
+    assert diagnostics["ok"] is True
+    assert y_pred is not None

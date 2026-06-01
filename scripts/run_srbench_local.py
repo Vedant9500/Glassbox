@@ -1142,6 +1142,8 @@ def main():
         enable_specialist_screening_diagnostics=not args.disable_specialist,
         enable_specialist_composition_screening=not args.disable_specialist,
         enable_residual_stage=args.enable_residual_stage and not args.disable_specialist,
+        enable_specialist_vault_memory=not args.disable_specialist,
+        enable_inception_reuse=not args.disable_specialist,
         skip_evolution_if_bloated=args.skip_evolution_if_bloated,
         bloat_term_threshold=20,
         universal_proposer_path=args.proposer_model,

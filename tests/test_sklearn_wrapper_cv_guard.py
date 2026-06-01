@@ -103,6 +103,70 @@ def test_universal_proposer_dual_path_handles_missing_checkpoint():
     assert str(est.universal_proposer_status_).startswith("error:")
 
 
+def test_guided_evolution_receives_remaining_timeout(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    captured = {}
+
+    def _fake_fast_path(*args, **kwargs):
+        return {
+            "formula": "0",
+            "mse": 1.0,
+            "operator_hints": {"operators": {"sin"}, "frequencies": [1.0]},
+            "details": {"n_nonzero": 1, "y_variance": 0.5},
+            "uncertainty": {"entropy": 0.8, "margin": 0.1},
+        }
+
+    def _fake_guided_evolution(*args, **kwargs):
+        captured["search_plan"] = kwargs.get("search_plan")
+        return {"formula": "sin(x)", "mse": 0.0}
+
+    monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(
+            run_fast_path=_fake_fast_path,
+            run_guided_evolution=_fake_guided_evolution,
+        ),
+    )
+
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = np.sin(x)
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=True,
+        use_universal_proposer=False,
+        enable_specialist_screening_diagnostics=False,
+        population_size=20,
+        generations=30,
+        timeout=5,
+        evolution_skip_r2=0.999999,
+    )
+    est.fit(X, y)
+
+    search_plan = captured.get("search_plan")
+    assert isinstance(search_plan, dict)
+    assert 1 <= search_plan.get("timeout_seconds", 0) <= 5
+
+
+def test_regressor_formula_eval_uses_signed_fractional_powers():
+    from scripts import benchmark_common as bc
+
+    x = np.linspace(-2.0, 2.0, 41)
+    X = x.reshape(-1, 1)
+    formula = "x**1.5 - 0.25*x"
+
+    est = GlassboxRegressor()
+    reg_pred = est._safe_eval_formula_array(formula, X)
+    bench_pred = bc.evaluate_formula(bc.postprocess_formula(formula), X)
+
+    assert bench_pred is not None
+    np.testing.assert_allclose(reg_pred, bench_pred, rtol=1e-12, atol=1e-12)
+
+
 def test_blackbox_search_plan_expands_uncertain_breadth_and_interaction_depth():
     rng = np.random.RandomState(13)
     X = rng.randn(160, 5)

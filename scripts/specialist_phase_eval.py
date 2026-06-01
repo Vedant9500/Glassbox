@@ -182,6 +182,18 @@ def _phase0_cases() -> List[Dict[str, Any]]:
         "expect_specialist_signal": True,
     })
 
+    # Phase 9: frozen inner subexpression reuse for nested formulas
+    x_p9 = grid(-2.5, 2.5, 120)
+    X_p9 = x_p9.reshape(-1, 1)
+    y_p9 = np.sin(np.sin(x_p9)) + 0.15 * x_p9
+    cases.append({
+        "name": "phase9_frozen_nested_subexpression",
+        "X": X_p9,
+        "y": y_p9,
+        "kind": "frozen_subexpression_reuse",
+        "expect_specialist_signal": True,
+    })
+
     return cases
 
 
@@ -283,6 +295,8 @@ def _evaluate_run(
         "specialist_vault": vault if isinstance(vault, dict) else None,
         "specialist_vault_entry_count": int((vault or {}).get("entry_count", 0) or 0) if isinstance(vault, dict) else 0,
         "specialist_vault_composition_count": int((vault or {}).get("composition_count", 0) or 0) if isinstance(vault, dict) else 0,
+        "inception_round_count": len(getattr(est, "inception_rounds_", []) or []),
+        "inception_diagnostics": getattr(est, "inception_diagnostics_", None),
     }
 
 
@@ -729,6 +743,75 @@ def run_phase8(*, quick: bool = False) -> Dict[str, Any]:
     }
 
 
+def run_phase9(*, quick: bool = False) -> Dict[str, Any]:
+    cases = _phase0_cases()
+    p9_cases = [c for c in cases if c["name"] == "phase9_frozen_nested_subexpression"]
+
+    results = []
+    phase9_hits = 0
+
+    for case in p9_cases:
+        X = np.asarray(case["X"], dtype=np.float64)
+        y = np.asarray(case["y"], dtype=np.float64).reshape(-1)
+        probe = _make_estimator(
+            enable_specialist_screening_diagnostics=True,
+            enable_specialist_composition_screening=True,
+            use_guided_evolution=False,
+            enable_specialist_vault_memory=True,
+        )
+        probe.n_features_in_ = X.shape[1]
+        base_formula = "sin(x0) + 0.15*x0"
+        frozen = probe._extract_frozen_subexpressions(
+            base_formula,
+            X,
+            y,
+            max_subexpressions=3,
+        )
+        refined = probe._run_inception_reuse(X, y, base_formula)
+        base_pred = probe._safe_eval_formula_array(base_formula, X)
+        refined_pred = probe._safe_eval_formula_array(refined, X)
+        base_r2 = _r2(y, base_pred)
+        refined_r2 = _r2(y, refined_pred)
+
+        result = {
+            "name": case["name"],
+            "kind": case["kind"],
+            "base_formula": base_formula,
+            "refined_formula": refined,
+            "base_r2": float(base_r2),
+            "refined_r2": float(refined_r2),
+            "frozen_subexpressions": [
+                {
+                    "formula": item["formula"],
+                    "standalone_r2": item["standalone_r2"],
+                    "complexity": item["complexity"],
+                }
+                for item in frozen
+            ],
+            "inception_round_count": len(getattr(probe, "inception_rounds_", []) or []),
+            "inception_diagnostics": getattr(probe, "inception_diagnostics_", None),
+        }
+        results.append(result)
+
+        if (
+            result["frozen_subexpressions"]
+            and result["inception_round_count"] >= 1
+            and refined_r2 >= base_r2 + 0.01
+        ):
+            phase9_hits += 1
+
+    summary = {
+        "phase": 9,
+        "n_cases": len(results),
+        "phase9_hits": int(phase9_hits),
+        "pass": bool(phase9_hits >= 1),
+    }
+    return {
+        "summary": summary,
+        "cases": results,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate specialist-layer phases against baseline behavior.")
     parser.add_argument("--phase", type=int, default=0, help="Specialist phase to evaluate")
@@ -752,8 +835,10 @@ def main() -> int:
         result = run_phase7(quick=bool(args.quick))
     elif args.phase == 8:
         result = run_phase8(quick=bool(args.quick))
+    elif args.phase == 9:
+        result = run_phase9(quick=bool(args.quick))
     else:
-        raise SystemExit(f"Only phase 0, 2, 3, 4, 5, 6, 7, and 8 are implemented in this harness right now, got phase={args.phase}")
+        raise SystemExit(f"Only phase 0, 2, 3, 4, 5, 6, 7, 8, and 9 are implemented in this harness right now, got phase={args.phase}")
     print(json.dumps(result["summary"], indent=2))
 
     if args.output:

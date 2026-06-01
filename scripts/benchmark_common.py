@@ -224,10 +224,12 @@ def postprocess_formula(formula):
 
     evo_int_tol = 0.05
     evo_zero_tol = 1e-3
+    helper_unsafe = "_signed_power" in normalized or "Abs(" in normalized
 
-    native = simplify_formula_native(normalized, evo_int_tol, evo_zero_tol)
-    if native is not None:
-        normalized = native
+    if not helper_unsafe:
+        native = simplify_formula_native(normalized, evo_int_tol, evo_zero_tol)
+        if native is not None:
+            normalized = native
 
     try:
         try:
@@ -238,7 +240,7 @@ def postprocess_formula(formula):
         formula_len = len(normalized)
         term_estimate = max(1, len([t for t in re.split(r"\s*[+-]\s*", normalized) if t.strip()]))
         too_complex_for_symbolic = formula_len > 500 or term_estimate > 24
-        sympy_unsafe = "Piecewise(" in normalized or "Eq(" in normalized
+        sympy_unsafe = helper_unsafe or "Piecewise(" in normalized or "Eq(" in normalized
 
         if too_complex_for_symbolic or sympy_unsafe:
             snapped = snap_formula_floats(
@@ -658,6 +660,8 @@ def specialist_metadata_from_estimator(estimator):
             if getattr(estimator, "specialist_vault_", None) is not None
             else None
         ),
+        "inception_round_count": len(getattr(estimator, "inception_rounds_", []) or []),
+        "inception_diagnostics": getattr(estimator, "inception_diagnostics_", None),
         "specialist_diagnostics": (
             candidate_screening.get("specialist_screening")
             if isinstance(candidate_screening, dict)

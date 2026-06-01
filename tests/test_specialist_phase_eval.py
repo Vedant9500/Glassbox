@@ -140,6 +140,22 @@ def test_phase8_harness_returns_summary_and_cases():
     assert summary["pass"] is True
 
 
+def test_phase9_harness_returns_summary_and_cases():
+    result = spe.run_phase9(quick=True)
+
+    assert isinstance(result, dict)
+    assert "summary" in result
+    assert "cases" in result
+
+    summary = result["summary"]
+    cases = result["cases"]
+
+    assert summary["phase"] == 9
+    assert summary["n_cases"] == len(cases)
+    assert len(cases) >= 1
+    assert summary["pass"] is True
+
+
 def test_residual_boosting_records_attempt_and_improvement():
     class ProbeRegressor(GlassboxRegressor):
         def _stage_residual_symbolic_fit(self, X, y, base_formula, *, _allow_recursion=False):
@@ -166,3 +182,35 @@ def test_residual_boosting_records_attempt_and_improvement():
     assert len(reg.boosting_stages_) == 1
     assert reg.boosting_diagnostics_["accepted_stages"] == 1
 
+
+def test_univariate_fit_runs_specialist_candidate_screening(monkeypatch):
+    class ProbeRegressor(GlassboxRegressor):
+        def _build_univariate_specialist_candidate_formulas(self, best_formula, best_mse, proposer_payload, X, y, *, max_candidates):
+            return [
+                {"formula": "x0", "validation_r2": 0.5, "validation_mse": 0.1, "mse": 0.1, "complexity": 1},
+                {"formula": "sin(x0)", "validation_r2": 0.6, "validation_mse": 0.08, "mse": 0.08, "complexity": 2},
+            ]
+
+        def _run_residual_boosting(self, X, y, base_formula):
+            return base_formula
+
+        def _run_inception_reuse(self, X, y, base_formula):
+            return base_formula
+
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = np.sin(x)
+    reg = ProbeRegressor(
+        use_fast_path=False,
+        use_guided_evolution=False,
+        blackbox_mode=False,
+        enable_specialist_screening_diagnostics=True,
+        enable_specialist_composition_screening=False,
+        enable_residual_stage=False,
+    )
+
+    reg.fit(X, y)
+
+    screening = (reg.blackbox_diagnostics_ or {}).get("candidate_screening", {})
+    assert screening.get("candidate_count") == 2
+    assert isinstance(screening.get("specialist_screening"), dict)
