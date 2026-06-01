@@ -395,6 +395,8 @@ py::dict run_evolution_cpp(
 
     // Parse seed_graphs
     std::vector<sr::IndividualGraph> cpp_seed_graphs;
+    int seed_graphs_skipped_oversized = 0;
+    int seed_graph_node_limit = std::max(24, std::min(64, early_stop_max_nodes));
     for (auto item : seed_graphs_py) {
         auto gdict = item.cast<py::dict>();
         sr::IndividualGraph g;
@@ -431,6 +433,10 @@ py::dict run_evolution_cpp(
         
         if (gdict.contains("output_bias")) g.output_bias = gdict["output_bias"].cast<double>();
         
+        if (static_cast<int>(g.nodes.size()) > seed_graph_node_limit) {
+            ++seed_graphs_skipped_oversized;
+            continue;
+        }
         cpp_seed_graphs.push_back(g);
     }
 
@@ -534,6 +540,11 @@ py::dict run_evolution_cpp(
     result["evolution_wall_time_sec"] = engine.get_run_wall_time_sec();
     result["random_seed"] = engine.get_random_seed();
     result["openmp_threads"] = omp_get_max_threads();
+    result["island_outer_threads"] = engine.get_last_island_outer_threads();
+    result["island_inner_threads"] = engine.get_last_island_inner_threads();
+    result["seed_graphs_used"] = static_cast<int>(cpp_seed_graphs.size());
+    result["seed_graphs_skipped_oversized"] = seed_graphs_skipped_oversized;
+    result["seed_graph_node_limit"] = seed_graph_node_limit;
     
     // Serialize graph structure
     py::list nodes_list;

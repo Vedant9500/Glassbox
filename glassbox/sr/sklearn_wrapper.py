@@ -210,6 +210,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.formula_eval_count_ = 0
         self.formula_eval_cache_hits_ = 0
         self._formula_eval_cache_ = {}
+        self.fast_path_exact_skip_ = False
         self.boosting_stages_ = []
         self.boosting_attempted_ = False
         self.boosting_improved_ = False
@@ -1899,6 +1900,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 add(f"({x}^2-1)*exp(-{x}^2/2)", "symmetry_envelope_probe")
                 add(f"sin(pi*{x})*exp(-{x}^2)", "envelope_carrier_probe")
 
+        probe_scoring_backend = "none"
         if formulas:
             source_priority = {
                 "envelope_carrier_probe": 0,
@@ -1907,21 +1909,45 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 "envelope_probe": 3,
                 "carrier_probe": 4,
             }
-            for item in formulas:
-                formula = str(item.get("formula", ""))
-                score_mse = float("inf")
+            if CPP_AVAILABLE:
                 try:
-                    pred = self._safe_eval_formula_array(formula, X_arr).reshape(-1)
-                    if pred.shape == y_arr.shape and np.all(np.isfinite(pred)):
-                        p_var = float(np.var(pred))
-                        if p_var > 1e-15:
-                            scale = float(np.cov(pred, y_arr, bias=True)[0, 1] / p_var)
-                            bias = float(np.mean(y_arr) - scale * np.mean(pred))
-                            pred = scale * pred + bias
-                        score_mse = float(np.mean((pred - y_arr) ** 2))
+                    scored_cpp = _core.score_formula_candidates(
+                        [str(item.get("formula", "")) for item in formulas],
+                        np.ascontiguousarray(X_arr, dtype=np.float64),
+                        np.ascontiguousarray(y_arr, dtype=np.float64),
+                        np.ascontiguousarray(X_arr, dtype=np.float64),
+                        np.ascontiguousarray(y_arr, dtype=np.float64),
+                    )
+                    ok_count = 0
+                    for item, scored in zip(formulas, list(scored_cpp)):
+                        if isinstance(scored, dict) and scored.get("ok"):
+                            item["probe_mse"] = _finite_float(scored.get("mse"), float("inf"))
+                            ok_count += 1
+                        else:
+                            item["probe_mse"] = float("inf")
+                    if ok_count > 0:
+                        probe_scoring_backend = "cpp_batch"
                 except Exception:
+                    probe_scoring_backend = "python_fallback"
+
+            if probe_scoring_backend != "cpp_batch":
+                for item in formulas:
+                    formula = str(item.get("formula", ""))
                     score_mse = float("inf")
-                item["probe_mse"] = score_mse
+                    try:
+                        pred = self._safe_eval_formula_array(formula, X_arr).reshape(-1)
+                        if pred.shape == y_arr.shape and np.all(np.isfinite(pred)):
+                            p_var = float(np.var(pred))
+                            if p_var > 1e-15:
+                                scale = float(np.cov(pred, y_arr, bias=True)[0, 1] / p_var)
+                                bias = float(np.mean(y_arr) - scale * np.mean(pred))
+                                pred = scale * pred + bias
+                            score_mse = float(np.mean((pred - y_arr) ** 2))
+                    except Exception:
+                        score_mse = float("inf")
+                    item["probe_mse"] = score_mse
+                if probe_scoring_backend == "none":
+                    probe_scoring_backend = "python"
             formulas.sort(
                 key=lambda item: (
                     float(item.get("probe_mse", float("inf"))),
@@ -1935,6 +1961,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             self.blackbox_diagnostics_["targeted_specialist_probes"] = {
                 "count": len(formulas),
                 "sources": sorted({str(item.get("source", "")) for item in formulas}),
+                "scoring_backend": probe_scoring_backend,
             }
         return formulas[: max(0, int(max_formulas))]
 
@@ -2144,6 +2171,24 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return candidate_formulas or []
 
         screening_diag["specialist_screening"] = specialist_screening
+        best_existing_mse = float("inf")
+        best_existing_r2 = -float("inf")
+        for cand in candidate_formulas or []:
+            cand_mse = _finite_float((cand or {}).get("validation_mse"), float("inf"))
+            cand_r2 = _finite_float((cand or {}).get("validation_r2"), -float("inf"))
+            best_existing_mse = min(best_existing_mse, cand_mse)
+            best_existing_r2 = max(best_existing_r2, cand_r2)
+
+        existing_exact_candidate = (
+            best_existing_mse <= max(float(getattr(self, "early_stop_mse", 1e-10)), 1e-10)
+            or best_existing_r2 >= 0.999999999
+        )
+        if existing_exact_candidate:
+            screening_diag["residual_skipped_reason"] = "existing_exact_candidate"
+            screening_diag["best_existing_validation_mse"] = float(best_existing_mse)
+            screening_diag["best_existing_validation_r2"] = float(best_existing_r2)
+            return candidate_formulas or []
+
         specialist_candidates = []
         if getattr(self, "enable_specialist_composition_screening", True):
             specialist_candidates = self._compose_specialist_candidates(
@@ -3498,6 +3543,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.formula_eval_count_ = 0
         self.formula_eval_cache_hits_ = 0
         self._formula_eval_cache_ = {}
+        self.fast_path_exact_skip_ = False
         self.specialist_track_ = "incumbent path"
         self.specialist_vault_ = SpecialistVault(max_entries=int(getattr(self, "specialist_vault_size", 8) or 0))
         self.n_features_in_ = X.shape[1]
@@ -3611,6 +3657,34 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             if y_var < 1e-15:
                 return 1.0 if mse < 1e-15 else 0.0
             return 1.0 - mse / y_var
+
+        def _finish_with_formula(formula, mse, *, skip_reason=None):
+            final_formula = formula
+            final_mse = mse
+            if final_formula:
+                final_formula = self._reduce_formula_noise(final_formula, X, y)
+                final_formula = self._simplify_formula(final_formula)
+                if getattr(self, "blackbox_state_", None) is not None and self.blackbox_state_.enabled:
+                    final_formula = formula_from_search_to_original_space(
+                        final_formula,
+                        self.blackbox_state_,
+                    )
+                try:
+                    eval_X = X_original if (
+                        getattr(self, "blackbox_state_", None) is not None
+                        and self.blackbox_state_.enabled
+                    ) else X
+                    eval_y = y_original if eval_X is X_original else y
+                    pred = self._safe_eval_formula_array(final_formula, eval_X)
+                    final_mse = float(np.mean((pred - np.asarray(eval_y, dtype=np.float64).reshape(-1)) ** 2))
+                except Exception:
+                    pass
+            self.formula_ = final_formula or "0"
+            self.best_mse_ = final_mse
+            if skip_reason and isinstance(self.blackbox_diagnostics_, dict):
+                self.blackbox_diagnostics_["specialist_skipped_reason"] = skip_reason
+            self._add_phase_time("total_fit", _time.time() - fit_start)
+            return self
 
         # ── Stage 1: Classifier Fast Path ──
         if self.use_fast_path and _elapsed() < self.timeout:
@@ -3742,6 +3816,18 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 not fast_path_cv_ok or
                 term_count > 10 # Higher threshold for Stage 1 bloat
             )
+
+        if (
+            best_formula is not None
+            and best_mse is not None
+            and math.isfinite(best_mse)
+            and best_mse <= max(float(self.early_stop_mse), 1e-10)
+            and current_r2 >= min(float(self.evolution_skip_r2), 0.999999)
+            and fast_path_cv_ok
+        ):
+            self.fast_path_exact_skip_ = True
+            self.specialist_track_ = "incumbent path"
+            return _finish_with_formula(best_formula, best_mse, skip_reason="fast_path_exact")
 
         # Uncertainty-coupled budget routing: pass FPIP uncertainty metrics
         _fp_uncertainty = None

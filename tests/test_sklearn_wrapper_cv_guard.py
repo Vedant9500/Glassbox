@@ -152,6 +152,147 @@ def test_guided_evolution_receives_remaining_timeout(monkeypatch):
     assert 1 <= search_plan.get("timeout_seconds", 0) <= 5
 
 
+def test_exact_fast_path_skips_specialist_phases(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    def _fake_fast_path(*args, **kwargs):
+        return {
+            "formula": "x0",
+            "mse": 0.0,
+            "operator_hints": {"operators": {"identity"}, "frequencies": []},
+            "details": {"n_nonzero": 1, "y_variance": 1.0},
+            "uncertainty": {"prediction_entropy": 0.0, "prediction_margin": 1.0},
+        }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(run_fast_path=_fake_fast_path),
+    )
+
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = x.copy()
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=True,
+        use_universal_proposer=False,
+        enable_specialist_screening_diagnostics=True,
+        enable_specialist_composition_screening=True,
+        enable_residual_stage=True,
+        enable_inception_reuse=True,
+        enable_specialist_vault_memory=True,
+        random_state=0,
+    )
+
+    def _fail_specialist(*args, **kwargs):
+        raise AssertionError("specialist phases should not run after exact fast-path")
+
+    monkeypatch.setattr(est, "_build_univariate_specialist_candidate_formulas", _fail_specialist)
+    monkeypatch.setattr(est, "_run_specialist_candidate_screening", _fail_specialist)
+    monkeypatch.setattr(est, "_run_residual_boosting", _fail_specialist)
+    monkeypatch.setattr(est, "_run_inception_reuse", _fail_specialist)
+
+    est.fit(X, y)
+
+    assert est.fast_path_exact_skip_ is True
+    assert est.blackbox_diagnostics_.get("specialist_skipped_reason") == "fast_path_exact"
+    assert est.best_mse_ < 1e-12
+    assert est.get_formula()
+
+
+def test_exact_fast_path_skip_overrides_evolution_routing(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    formula = "+".join(["x0"] * 12)
+
+    def _fake_fast_path(*args, **kwargs):
+        return {
+            "formula": formula,
+            "mse": 0.0,
+            "operator_hints": {"operators": {"identity"}, "frequencies": []},
+            "details": {"n_nonzero": 12, "y_variance": 1.0},
+            "uncertainty": {"prediction_entropy": 0.0, "prediction_margin": 1.0},
+        }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(run_fast_path=_fake_fast_path),
+    )
+
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = 12.0 * x
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=True,
+        use_universal_proposer=False,
+        enable_specialist_screening_diagnostics=True,
+        enable_specialist_composition_screening=True,
+        enable_residual_stage=True,
+        enable_inception_reuse=True,
+        random_state=0,
+    )
+    monkeypatch.setattr(est, "_run_universal_proposer_dual_path", lambda *args, **kwargs: (None, True))
+
+    def _fail_specialist(*args, **kwargs):
+        raise AssertionError("specialist phases should not run after exact fast-path")
+
+    monkeypatch.setattr(est, "_build_univariate_specialist_candidate_formulas", _fail_specialist)
+    monkeypatch.setattr(est, "_run_specialist_candidate_screening", _fail_specialist)
+    monkeypatch.setattr(est, "_run_residual_boosting", _fail_specialist)
+    monkeypatch.setattr(est, "_run_inception_reuse", _fail_specialist)
+
+    est.fit(X, y)
+
+    assert est.fast_path_exact_skip_ is True
+    assert est.best_mse_ < 1e-12
+    assert set(est.phase_timings_) == {"total_fit"}
+
+
+def test_specialist_screening_skips_residual_when_candidate_is_exact(monkeypatch):
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = np.cos(np.pi * x)
+
+    est = GlassboxRegressor(
+        enable_specialist_screening_diagnostics=True,
+        enable_specialist_composition_screening=True,
+        enable_residual_stage=True,
+        random_state=0,
+    )
+    est.blackbox_diagnostics_ = {}
+
+    def _screening(candidates, X_arg, y_arg, **kwargs):
+        return {"top_candidates": [{"formula": "cos(pi*x0)", "validation_mse": 0.0, "validation_r2": 1.0}]}
+
+    def _compose(*args, **kwargs):
+        raise AssertionError("composition should not run when an exact candidate is already present")
+
+    def _residual(*args, **kwargs):
+        raise AssertionError("residual fit should not run when an exact candidate is already present")
+
+    monkeypatch.setattr(est, "_compute_specialist_screening_diagnostics", _screening)
+    monkeypatch.setattr(est, "_compose_specialist_candidates", _compose)
+    monkeypatch.setattr(est, "_stage_residual_symbolic_fit", _residual)
+
+    candidates = [{"formula": "cos(pi*x0)", "validation_mse": 0.0, "validation_r2": 1.0}]
+    returned = est._run_specialist_candidate_screening(
+        candidates,
+        X,
+        y,
+        {"screening_budget": 8, "seed_budget": 8},
+    )
+
+    assert returned == candidates
+    diag = est.blackbox_diagnostics_["candidate_screening"]
+    assert diag["residual_skipped_reason"] == "existing_exact_candidate"
+    assert diag["best_existing_validation_mse"] == 0.0
+
+
 def test_regressor_formula_eval_uses_signed_fractional_powers():
     from scripts import benchmark_common as bc
 

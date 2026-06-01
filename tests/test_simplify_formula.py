@@ -45,6 +45,20 @@ def test_float_snapping_then_simplification():
     assert _equivalent(simplified, 2 * x)
 
 
+def test_simple_fraction_snapping_is_opt_in():
+    """Near-fraction coefficients should only snap when explicitly requested."""
+    _, default_simplified = simplify_onn_formula("0.4965*x**2 + x")
+    snapped, fraction_simplified = simplify_onn_formula(
+        "0.4965*x**2 + x",
+        fraction_tol=0.01,
+    )
+    x = sp.Symbol("x")
+
+    assert not _equivalent(default_simplified, x**2 / 2 + x)
+    assert snapped == "0.5 * x ** 2 + x"
+    assert _equivalent(fraction_simplified, x**2 / 2 + x)
+
+
 def test_approximate_trig_collapse_is_opt_in():
     """Dominant Fourier cleanup should only run when explicitly enabled."""
     formula = "sin(x) + 0.02*sin(3*x)"

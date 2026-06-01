@@ -33,6 +33,21 @@ def test_postprocess_formula_fidelity_guard_rejects_worse_cleanup():
     assert bc.evaluate_formula_mse_on_X(guarded, X, y) < bc.evaluate_formula_mse_on_X(processed, X, y)
 
 
+def test_postprocess_formula_fidelity_guard_accepts_better_fraction_snap():
+    formula = "0.4965 * x ** 2 + x"
+    X = np.linspace(-2.0, 2.0, 300).reshape(-1, 1)
+    y = 0.5 * X[:, 0] ** 2 + X[:, 0]
+
+    processed = bc.postprocess_formula(formula)
+    guarded, diagnostics = bc.postprocess_formula_with_fidelity_guard(formula, X, y)
+
+    assert processed == formula
+    assert guarded != formula
+    assert diagnostics["postprocess_guard_triggered"] is False
+    assert diagnostics["postprocess_processed_mse"] == 0.0
+    assert bc.evaluate_formula_mse_on_X(guarded, X, y) == 0.0
+
+
 def test_postprocess_formula_preserves_signed_power_helper_call():
     formula = "-0.2155*x*_signed_power(Abs(x),0.303)+0.4505*x+0.5"
 

@@ -216,7 +216,12 @@ def simplify_formula_native(formula, int_tol=0.05, zero_tol=1e-3):
     return None
 
 
-def postprocess_formula(formula):
+def postprocess_formula(
+    formula,
+    *,
+    fraction_tol=0.0,
+    max_fraction_denominator=12,
+):
     """Apply the shared benchmark formula cleanup pipeline."""
     normalized = normalize_formula_text(formula)
     if not normalized or normalized in {"N/A", "ERROR", "?"}:
@@ -245,7 +250,12 @@ def postprocess_formula(formula):
         if too_complex_for_symbolic or sympy_unsafe:
             snapped = snap_formula_floats(
                 normalized,
-                SnapConfig(int_tol=evo_int_tol, zero_tol=evo_zero_tol),
+                SnapConfig(
+                    int_tol=evo_int_tol,
+                    zero_tol=evo_zero_tol,
+                    fraction_tol=fraction_tol,
+                    max_fraction_denominator=max_fraction_denominator,
+                ),
             )
             return protect_fractional_powers(snapped.replace("^", "**"))
 
@@ -256,13 +266,20 @@ def postprocess_formula(formula):
                 normalized,
                 int_tol=evo_int_tol,
                 zero_tol=evo_zero_tol,
+                fraction_tol=fraction_tol,
+                max_fraction_denominator=max_fraction_denominator,
                 use_nsimplify=(formula_len <= 300 and term_estimate <= 16),
             )
         simplified_text = str(simplified_expr)
         if "Piecewise(" in simplified_text or "Eq(" in simplified_text:
             snapped = snap_formula_floats(
                 normalized,
-                SnapConfig(int_tol=evo_int_tol, zero_tol=evo_zero_tol),
+                SnapConfig(
+                    int_tol=evo_int_tol,
+                    zero_tol=evo_zero_tol,
+                    fraction_tol=fraction_tol,
+                    max_fraction_denominator=max_fraction_denominator,
+                ),
             )
             return protect_fractional_powers(snapped.replace("^", "**"))
         return protect_fractional_powers(simplified_text.replace("^", "**"))
@@ -429,7 +446,7 @@ def postprocess_formula_with_fidelity_guard(
     absolute_slack=1e-9,
 ):
     """Postprocess a formula, but keep the original if cleanup worsens benchmark fit."""
-    processed = postprocess_formula(formula)
+    processed = postprocess_formula(formula, fraction_tol=0.01, max_fraction_denominator=12)
     raw_mse = evaluate_formula_mse_on_X(formula, X, y)
     processed_mse = evaluate_formula_mse_on_X(processed, X, y)
 

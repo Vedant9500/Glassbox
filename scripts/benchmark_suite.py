@@ -6,12 +6,12 @@ Comprehensive evaluation of the symbolic regression pipeline across ~200
 formulas of increasing complexity, organized into 8 difficulty tiers.
 
 Usage:
-  python scripts/benchmark_suite.py                                    # Full suite (fast-path only)
-  python scripts/benchmark_suite.py --tier 1                           # Only tier 1
-    python scripts/benchmark_suite.py --with-evolution                   # Include guided evolution (latest path)
-    python scripts/benchmark_suite.py --evolution-only                   # Guided evolution only (skip fast-path)
-  python scripts/benchmark_suite.py --classifier-model models/v3.pt   # Custom model
-  python scripts/benchmark_suite.py --output-dir results/              # Custom output dir
+  python scripts/benchmark_suite.py                                            # Full suite (fast-path only)
+  python scripts/benchmark_suite.py --tier 1                                   # Only tier 1
+  python scripts/benchmark_suite.py --specialist-regressor --specialist-full   # Include guided evolution (latest path)
+  python scripts/benchmark_suite.py --evolution-only                           # Guided evolution only (skip fast-path)
+  python scripts/benchmark_suite.py --classifier-model models/v3.pt            # Custom model
+  python scripts/benchmark_suite.py --output-dir results/                      # Custom output dir
 
 Scoring:
     Uses displayed-formula MSE only for scoring; raw MSE is diagnostic.

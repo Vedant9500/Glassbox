@@ -99,6 +99,64 @@ def test_timeout_parameter(simple_data):
 
 
 @requires_cpp
+def test_island_run_reports_thread_split(simple_data):
+    """Island-mode results expose the outer/inner OpenMP split for diagnostics."""
+    X_list, y = simple_data
+    result = _core.run_evolution(
+        X_list, y,
+        pop_size=12,
+        generations=2,
+        early_stop_mse=1e-12,
+        use_nsga2=True,
+        num_islands=3,
+        num_threads=4,
+        random_seed=7,
+    )
+
+    assert result["island_outer_threads"] == 3
+    assert result["island_inner_threads"] >= 1
+
+
+@requires_cpp
+def test_oversized_seed_graphs_are_skipped(simple_data):
+    """Huge candidate seeds should not enter native initialization/refinement."""
+    X_list, y = simple_data
+    node = {
+        "type": 1,
+        "feature_idx": 0,
+        "value": 1.0,
+        "unary_op": 0,
+        "binary_op": 0,
+        "p": 1.0,
+        "omega": 1.0,
+        "phi": 0.0,
+        "amplitude": 1.0,
+        "beta": 1.0,
+        "gamma": 1.0,
+        "tau": 1.0,
+        "left_child": -1,
+        "right_child": -1,
+    }
+    big_seed = {
+        "nodes": [dict(node, value=float(i)) for i in range(80)],
+        "output_weights": [0.0] * 80,
+        "output_bias": 0.0,
+    }
+
+    result = _core.run_evolution(
+        X_list, y,
+        pop_size=12,
+        generations=2,
+        early_stop_mse=1e-12,
+        seed_graphs_py=[big_seed],
+        random_seed=11,
+    )
+
+    assert result["seed_graphs_used"] == 0
+    assert result["seed_graphs_skipped_oversized"] == 1
+
+
+@requires_cpp
 def test_random_seed_determinism(simple_data):
     """Two runs with the same random_seed should produce identical results."""
     X_list, y = simple_data
