@@ -1361,3 +1361,55 @@ def test_constant_refinement_improves_candidate_validation_mse():
     assert refined is not None
     assert refined["validation_mse"] < base_mse
     assert refined["constant_refined"] is True
+
+
+def test_cleanup_guard_rejects_display_mse_regression(monkeypatch):
+    X = np.linspace(-1.0, 1.0, 40).reshape(-1, 1)
+    y = X[:, 0]
+    est = GlassboxRegressor(random_state=61)
+    est.blackbox_diagnostics_ = {}
+
+    monkeypatch.setattr(est, "_reduce_formula_noise", lambda formula, X_in, y_in: "display_bad")
+    monkeypatch.setattr(est, "_simplify_formula", lambda formula: formula)
+    monkeypatch.setattr(
+        est,
+        "_formula_mse",
+        lambda formula, X_in, y_in: {"display_good": 1e-4, "display_bad": 1e-5}.get(formula, float("inf")),
+    )
+    monkeypatch.setattr(
+        est,
+        "_display_formula_mse",
+        lambda formula, X_in, y_in: {"display_good": 1e-4, "display_bad": 1e-1}.get(formula, float("inf")),
+    )
+
+    selected = est._cleanup_formula_with_fidelity_guard("display_good", X, y)
+
+    assert selected == "display_good"
+    guard = est.blackbox_diagnostics_["formula_cleanup_guard"][-1]["steps"][0]
+    assert guard["accepted"] is False
+    assert guard["after_display_mse"] == 1e-1
+
+
+def test_final_formula_selection_prefers_display_score(monkeypatch):
+    X = np.linspace(-1.0, 1.0, 40).reshape(-1, 1)
+    y = X[:, 0]
+    est = GlassboxRegressor(random_state=62)
+
+    monkeypatch.setattr(
+        est,
+        "_formula_mse",
+        lambda formula, X_in, y_in: {"incumbent": 1e-4, "challenger": 1e-6}.get(formula, float("inf")),
+    )
+    monkeypatch.setattr(
+        est,
+        "_display_formula_mse",
+        lambda formula, X_in, y_in: {"incumbent": 1e-4, "challenger": 1e-1}.get(formula, float("inf")),
+    )
+
+    formula, mse, source = est._select_final_formula("incumbent", 1e-4, "challenger", 1e-6, X, y)
+
+    assert formula == "incumbent"
+    assert mse == 1e-4
+    assert source == "incumbent"
+    assert est.final_formula_selection_diagnostics_["selected"] == "incumbent"
+    assert est.final_formula_selection_diagnostics_["challenger_display_mse"] == 1e-1

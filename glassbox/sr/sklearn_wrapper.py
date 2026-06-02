@@ -1183,6 +1183,31 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         mse = float(np.mean((pred - target) ** 2))
         return mse if np.isfinite(mse) else float("inf")
 
+    def _display_formula_mse(self, formula, X, y):
+        """Evaluate a formula with the shared benchmark/display evaluator."""
+        text = str(formula or "").strip()
+        if not text:
+            return float("inf")
+        try:
+            from scripts import benchmark_common as bc
+            mse = bc.evaluate_formula_mse_on_X(text, X, y)
+        except Exception:
+            return float("inf")
+        if mse is None:
+            return float("inf")
+        try:
+            mse = float(mse)
+        except Exception:
+            return float("inf")
+        return mse if np.isfinite(mse) else float("inf")
+
+    def _final_formula_score(self, formula, X, y):
+        """Return the display-first score plus internal/display diagnostics."""
+        internal_mse = self._formula_mse(formula, X, y)
+        display_mse = self._display_formula_mse(formula, X, y)
+        score = display_mse if np.isfinite(display_mse) else internal_mse
+        return score, internal_mse, display_mse
+
     def _cleanup_formula_with_fidelity_guard(
         self,
         formula,
@@ -1199,15 +1224,27 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return formula
 
         current_mse = self._formula_mse(current, X, y)
+        current_display_mse = self._display_formula_mse(current, X, y)
         diagnostics = []
 
-        def _accepts(candidate_mse):
-            if not np.isfinite(candidate_mse):
+        def _accepts(candidate_mse, candidate_display_mse):
+            if not np.isfinite(candidate_mse) and not np.isfinite(candidate_display_mse):
                 return False
-            if not np.isfinite(current_mse):
-                return True
-            allowed = current_mse * (1.0 + max(0.0, float(relative_slack))) + max(0.0, float(absolute_slack))
-            return candidate_mse <= allowed
+            if np.isfinite(current_mse) and np.isfinite(candidate_mse):
+                internal_allowed = current_mse * (1.0 + max(0.0, float(relative_slack))) + max(0.0, float(absolute_slack))
+                if candidate_mse > internal_allowed:
+                    return False
+            elif np.isfinite(current_mse):
+                return False
+
+            if np.isfinite(current_display_mse) and np.isfinite(candidate_display_mse):
+                display_allowed = current_display_mse * (1.0 + max(0.0, float(relative_slack))) + max(0.0, float(absolute_slack))
+                if candidate_display_mse > display_allowed:
+                    return False
+            elif np.isfinite(current_display_mse):
+                return False
+
+            return True
 
         cleanup_steps = (
             ("reduce_formula_noise", lambda text: self._reduce_formula_noise(text, X, y)),
@@ -1222,16 +1259,20 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 continue
 
             candidate_mse = self._formula_mse(candidate, X, y)
-            accepted = _accepts(candidate_mse)
+            candidate_display_mse = self._display_formula_mse(candidate, X, y)
+            accepted = _accepts(candidate_mse, candidate_display_mse)
             diagnostics.append({
                 "step": step_name,
                 "accepted": bool(accepted),
                 "before_mse": float(current_mse) if np.isfinite(current_mse) else None,
                 "after_mse": float(candidate_mse) if np.isfinite(candidate_mse) else None,
+                "before_display_mse": float(current_display_mse) if np.isfinite(current_display_mse) else None,
+                "after_display_mse": float(candidate_display_mse) if np.isfinite(candidate_display_mse) else None,
             })
             if accepted:
                 current = candidate
                 current_mse = candidate_mse
+                current_display_mse = candidate_display_mse
 
         if diagnostics and isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
             self.blackbox_diagnostics_.setdefault("formula_cleanup_guard", []).append({
@@ -1275,15 +1316,55 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if not incumbent_text:
             return challenger_formula, challenger_mse, "challenger"
 
-        incumbent_eval = self._formula_mse(incumbent_text, X, y)
-        challenger_eval = self._formula_mse(challenger_text, X, y)
+        incumbent_score, incumbent_eval, incumbent_display = self._final_formula_score(incumbent_text, X, y)
+        challenger_score, challenger_eval, challenger_display = self._final_formula_score(challenger_text, X, y)
+        if not np.isfinite(incumbent_score):
+            incumbent_score = float(incumbent_mse or float("inf"))
+        if not np.isfinite(challenger_score):
+            challenger_score = float(challenger_mse or float("inf"))
 
-        incumbent_score = incumbent_eval if np.isfinite(incumbent_eval) else float(incumbent_mse or float("inf"))
-        challenger_score = challenger_eval if np.isfinite(challenger_eval) else float(challenger_mse or float("inf"))
+        self.final_formula_selection_diagnostics_ = {
+            "incumbent_internal_mse": float(incumbent_eval) if np.isfinite(incumbent_eval) else None,
+            "incumbent_display_mse": float(incumbent_display) if np.isfinite(incumbent_display) else None,
+            "challenger_internal_mse": float(challenger_eval) if np.isfinite(challenger_eval) else None,
+            "challenger_display_mse": float(challenger_display) if np.isfinite(challenger_display) else None,
+            "selected_by": "display_first_formula_score",
+        }
 
         if challenger_score + 1e-12 < incumbent_score:
+            self.final_formula_selection_diagnostics_["selected"] = "challenger"
             return challenger_formula, challenger_score, "challenger"
+        self.final_formula_selection_diagnostics_["selected"] = "incumbent"
         return incumbent_formula, incumbent_score, "incumbent"
+
+    def _final_holdout_scores(self, base_formula, candidate_formula, X, y):
+        """Score a final-stage candidate on a deterministic holdout slice."""
+        try:
+            split = self._domain_edge_validation_split(X, y, validation_fraction=0.25)
+        except Exception:
+            split = None
+        if split is None:
+            return None
+
+        base_score, base_internal, base_display = self._final_formula_score(
+            base_formula,
+            split["X_val"],
+            split["y_val"],
+        )
+        candidate_score, candidate_internal, candidate_display = self._final_formula_score(
+            candidate_formula,
+            split["X_val"],
+            split["y_val"],
+        )
+        return {
+            "base_score": base_score,
+            "candidate_score": candidate_score,
+            "base_internal_mse": base_internal,
+            "candidate_internal_mse": candidate_internal,
+            "base_display_mse": base_display,
+            "candidate_display_mse": candidate_display,
+            "n_val": int(len(split["y_val"])),
+        }
 
     def _compare_blackbox_formulas(self, incumbent_formula, challenger_formula, X, y):
         """Compare two formulas on validation, not just in-sample fit."""
@@ -4958,20 +5039,57 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     self.blackbox_diagnostics_["selection_outcome"] = selection_outcome
                     self.specialist_track_ = specialist_track
 
+            residual_X = X_original if (
+                getattr(self, "blackbox_state_", None) is not None
+                and self.blackbox_state_.enabled
+            ) else X
+            residual_y = y_original if residual_X is X_original else y
             residual_base_formula = best_formula
-            residual_candidate = self._run_residual_boosting(X, y, best_formula)
+            residual_prior_n_features = self.n_features_in_
+            try:
+                self.n_features_in_ = residual_X.shape[1]
+                residual_candidate = self._run_residual_boosting(residual_X, residual_y, best_formula)
+            finally:
+                self.n_features_in_ = residual_prior_n_features
             if residual_candidate and residual_candidate != residual_base_formula:
-                residual_base_mse = self._formula_mse(residual_base_formula, X, y)
-                residual_candidate_mse = self._formula_mse(residual_candidate, X, y)
-                residual_allowed = residual_base_mse * 1.01 + 1e-9 if np.isfinite(residual_base_mse) else float("inf")
-                residual_accepted = np.isfinite(residual_candidate_mse) and residual_candidate_mse <= residual_allowed
+                residual_prior_n_features = self.n_features_in_
+                self.n_features_in_ = residual_X.shape[1]
+                residual_base_score, residual_base_mse, residual_base_display_mse = self._final_formula_score(
+                    residual_base_formula,
+                    residual_X,
+                    residual_y,
+                )
+                residual_candidate_score, residual_candidate_mse, residual_candidate_display_mse = self._final_formula_score(
+                    residual_candidate,
+                    residual_X,
+                    residual_y,
+                )
+                residual_allowed = residual_base_score * 1.01 + 1e-9 if np.isfinite(residual_base_score) else float("inf")
+                residual_accepted = np.isfinite(residual_candidate_score) and residual_candidate_score <= residual_allowed
+                residual_holdout = self._final_holdout_scores(residual_base_formula, residual_candidate, residual_X, residual_y)
+                self.n_features_in_ = residual_prior_n_features
+                if residual_holdout is not None:
+                    holdout_base = residual_holdout["base_score"]
+                    holdout_candidate = residual_holdout["candidate_score"]
+                    holdout_allowed = holdout_base * 1.01 + 1e-9 if np.isfinite(holdout_base) else float("inf")
+                    residual_accepted = (
+                        residual_accepted
+                        and np.isfinite(holdout_candidate)
+                        and holdout_candidate <= holdout_allowed
+                    )
                 if residual_accepted:
                     best_formula = residual_candidate
-                elif isinstance(self.blackbox_diagnostics_, dict):
+                if isinstance(self.blackbox_diagnostics_, dict):
                     self.blackbox_diagnostics_["residual_boosting_final_guard"] = {
-                        "accepted": False,
+                        "accepted": bool(residual_accepted),
                         "base_mse": float(residual_base_mse) if np.isfinite(residual_base_mse) else None,
                         "candidate_mse": float(residual_candidate_mse) if np.isfinite(residual_candidate_mse) else None,
+                        "base_display_mse": float(residual_base_display_mse) if np.isfinite(residual_base_display_mse) else None,
+                        "candidate_display_mse": float(residual_candidate_display_mse) if np.isfinite(residual_candidate_display_mse) else None,
+                        "holdout": {
+                            key: (float(value) if isinstance(value, (int, float, np.floating)) and np.isfinite(value) else value)
+                            for key, value in (residual_holdout or {}).items()
+                        } if residual_holdout is not None else None,
                     }
             prior_n_features = self.n_features_in_
             try:
@@ -4979,17 +5097,46 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 inception_base_formula = best_formula
                 inception_candidate = self._run_inception_reuse(X_original, y_original, best_formula)
                 if inception_candidate and inception_candidate != inception_base_formula:
-                    inception_base_mse = self._formula_mse(inception_base_formula, X_original, y_original)
-                    inception_candidate_mse = self._formula_mse(inception_candidate, X_original, y_original)
-                    inception_allowed = inception_base_mse * 1.01 + 1e-9 if np.isfinite(inception_base_mse) else float("inf")
-                    inception_accepted = np.isfinite(inception_candidate_mse) and inception_candidate_mse <= inception_allowed
+                    inception_base_score, inception_base_mse, inception_base_display_mse = self._final_formula_score(
+                        inception_base_formula,
+                        X_original,
+                        y_original,
+                    )
+                    inception_candidate_score, inception_candidate_mse, inception_candidate_display_mse = self._final_formula_score(
+                        inception_candidate,
+                        X_original,
+                        y_original,
+                    )
+                    inception_allowed = inception_base_score * 1.01 + 1e-9 if np.isfinite(inception_base_score) else float("inf")
+                    inception_accepted = np.isfinite(inception_candidate_score) and inception_candidate_score <= inception_allowed
+                    inception_holdout = self._final_holdout_scores(
+                        inception_base_formula,
+                        inception_candidate,
+                        X_original,
+                        y_original,
+                    )
+                    if inception_holdout is not None:
+                        holdout_base = inception_holdout["base_score"]
+                        holdout_candidate = inception_holdout["candidate_score"]
+                        holdout_allowed = holdout_base * 1.01 + 1e-9 if np.isfinite(holdout_base) else float("inf")
+                        inception_accepted = (
+                            inception_accepted
+                            and np.isfinite(holdout_candidate)
+                            and holdout_candidate <= holdout_allowed
+                        )
                     if inception_accepted:
                         best_formula = inception_candidate
-                    elif isinstance(self.blackbox_diagnostics_, dict):
+                    if isinstance(self.blackbox_diagnostics_, dict):
                         self.blackbox_diagnostics_["inception_final_guard"] = {
-                            "accepted": False,
+                            "accepted": bool(inception_accepted),
                             "base_mse": float(inception_base_mse) if np.isfinite(inception_base_mse) else None,
                             "candidate_mse": float(inception_candidate_mse) if np.isfinite(inception_candidate_mse) else None,
+                            "base_display_mse": float(inception_base_display_mse) if np.isfinite(inception_base_display_mse) else None,
+                            "candidate_display_mse": float(inception_candidate_display_mse) if np.isfinite(inception_candidate_display_mse) else None,
+                            "holdout": {
+                                key: (float(value) if isinstance(value, (int, float, np.floating)) and np.isfinite(value) else value)
+                                for key, value in (inception_holdout or {}).items()
+                            } if inception_holdout is not None else None,
                         }
                 best_pred = self._safe_eval_formula_array(best_formula, X_original)
                 best_mse = float(np.mean((best_pred - np.asarray(y_original, dtype=np.float64).reshape(-1)) ** 2))

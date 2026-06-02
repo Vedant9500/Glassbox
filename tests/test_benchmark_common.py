@@ -85,3 +85,17 @@ def test_evaluate_formula_protects_log_abs_zero_endpoint():
     assert diagnostics["ok"] is True
     assert y_pred is not None
     assert np.all(np.isfinite(y_pred))
+
+
+def test_evaluate_formula_allows_harmless_underflow():
+    formula = (
+        "1.05796688054*sin(0.3112*exp(-0.00284495021337127*Abs(x)^7.725*sign(x))"
+        "*sin(1.779*x)*Abs(x)^0.6864*sign(x))"
+    )
+    X = np.linspace(0.0, 6.0, 300).reshape(-1, 1)
+
+    y_pred, diagnostics = bc.evaluate_formula(formula, X, return_diagnostics=True)
+
+    assert diagnostics["ok"] is True
+    assert y_pred is not None
+    assert np.all(np.isfinite(y_pred))

@@ -96,3 +96,29 @@ def test_exact_match_skips_large_combination_search():
     assert diagnostics["fallback_reason"] == "combo_cap_exceeded"
     assert diagnostics["combo_count"] > diagnostics["max_combos"]
     assert diagnostics["gpu_used"] is False
+
+
+def test_multivariate_fast_path_skips_univariate_frequency_refinement(monkeypatch):
+    X = np.random.RandomState(0).randn(48, 3)
+    y = X[:, 0] + 0.5 * X[:, 1]
+
+    def _fake_fast_path_regression(*args, **kwargs):
+        return "x0 + 0.5*x1", 0.05, {"n_nonzero": 2, "exact_match": False}
+
+    def _fail_refine(*args, **kwargs):
+        raise AssertionError("multivariate path should not call refine_frequencies")
+
+    monkeypatch.setattr(cfp, "fast_path_regression", _fake_fast_path_regression)
+    monkeypatch.setattr(cfp, "refine_frequencies", _fail_refine)
+
+    formula, mse, details = cfp.fast_path_with_refinement(
+        X,
+        y,
+        predictions={"periodic": 0.95, "sin": 0.95},
+        detected_omegas=[1.0, 2.0],
+        auto_expand=False,
+    )
+
+    assert formula == "x0 + 0.5*x1"
+    assert mse == 0.05
+    assert details["n_nonzero"] == 2

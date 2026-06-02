@@ -171,6 +171,33 @@ def test_apply_srbench_run_budget_caps_internal_adaptive_budget():
     assert params["max_compute_budget"] == 300
 
 
+def test_specialist_full_enables_residual_phase():
+    default = rsl.resolve_specialist_phase_config(
+        disable_specialist=False,
+        enable_residual_stage=False,
+        specialist_full=False,
+    )
+    full = rsl.resolve_specialist_phase_config(
+        disable_specialist=False,
+        enable_residual_stage=False,
+        specialist_full=True,
+    )
+    disabled = rsl.resolve_specialist_phase_config(
+        disable_specialist=True,
+        enable_residual_stage=True,
+        specialist_full=True,
+    )
+
+    assert default["diagnostics"] is True
+    assert default["composition"] is True
+    assert default["inception"] is True
+    assert default["residual"] is False
+    assert full["residual"] is True
+    assert full["full"] is True
+    assert disabled["enabled"] is False
+    assert disabled["residual"] is False
+
+
 def test_multivariate_universal_fast_path_basis_avoids_fragile_families():
     X = np.random.RandomState(5).randn(40, 3)
     basis, names = cfp.build_basis_from_predictions(

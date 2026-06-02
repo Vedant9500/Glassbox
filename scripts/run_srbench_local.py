@@ -8,7 +8,7 @@ Full SRBench-style benchmark for Glassbox, running across:
 
 Usage:
   python scripts/run_srbench_local.py                       # Full suite
-  python scripts/run_srbench_local.py --track 1             # Black-box only
+  python scripts/run_srbench_local.py --track 1 --no-hard-timeout --seeds 42 --specialist-full --post-simplify --max-datasets 1
   python scripts/run_srbench_local.py --track 2             # Ground-truth only
   python scripts/run_srbench_local.py --max-datasets 10     # Quick smoke test
   python scripts/run_srbench_local.py --pop-size 200 --gens 2000  # Higher budget
@@ -336,10 +336,13 @@ def _build_srbench_seed_graphs(x_np, y_np, detected_omegas, candidate_formulas=N
         return []
 
 
-def _fit_worker(payload, queue):
+def _fit_worker(payload, result_queue):
     """Child-process worker for hard timeout enforcement."""
     import signal
     import sys
+
+    def _send_result(result):
+        result_queue.put(result)
     
     def timeout_handler(signum, frame):
         raise TimeoutError(f"Process timeout after {payload.get('timeout_seconds', '?')}s")
@@ -375,7 +378,7 @@ def _fit_worker(payload, queue):
         generation_to_first_exact = getattr(est, "generation_to_first_exact_", None)
         generation_to_first_acceptable = getattr(est, "generation_to_first_acceptable_", None)
 
-        queue.put({
+        _send_result({
             "status": "ok",
             "fit_time": fit_time,
             "formula": formula,
@@ -391,15 +394,17 @@ def _fit_worker(payload, queue):
             "generation_to_first_acceptable": generation_to_first_acceptable,
         })
     except TimeoutError as te:
-        queue.put({"status": "timeout", "error": str(te)})
+        _send_result({"status": "timeout", "error": str(te)})
     except Exception as err:
-        queue.put({"status": "error", "error": str(err)})
+        _send_result({"status": "error", "error": str(err)})
 
 
 def run_with_hard_timeout(est_params, X_train, y_train, X_test, timeout_seconds, X_full=None):
     """Run fit/predict in a separate process and enforce a hard wall-clock timeout."""
+    import queue as queue_mod
+
     ctx = get_context("spawn")
-    queue = ctx.Queue(maxsize=1)
+    result_queue = ctx.Queue(maxsize=1)
     payload = {
         "est_params": est_params,
         "X_train": X_train,
@@ -410,36 +415,63 @@ def run_with_hard_timeout(est_params, X_train, y_train, X_test, timeout_seconds,
     }
 
     t0 = time.time()
-    process = ctx.Process(target=_fit_worker, args=(payload, queue), daemon=True)
+    process = ctx.Process(target=_fit_worker, args=(payload, result_queue), daemon=True)
     try:
         process.start()
-        wall_timeout = timeout_seconds + 2
-        process.join(timeout=wall_timeout)
+
+        # The child may finish fitting quickly but still need to serialize a
+        # large formula/diagnostics/prediction payload. Drain the queue while the
+        # child is alive; joining first can deadlock on Windows multiprocessing.
+        wall_grace = max(15.0, min(60.0, float(timeout_seconds) * 0.10))
+        deadline = t0 + float(timeout_seconds) + wall_grace
+        result = None
+        while time.time() < deadline:
+            try:
+                result = result_queue.get(timeout=0.25)
+                break
+            except queue_mod.Empty:
+                if not process.is_alive():
+                    break
+
+        if result is None:
+            try:
+                result = result_queue.get_nowait()
+            except queue_mod.Empty:
+                pass
 
         if process.is_alive():
-            elapsed = time.time() - t0
-            try:
-                process.terminate()
-                process.join(timeout=2)
-                if process.is_alive():
-                    process.kill()
-                    process.join(timeout=1)
-            except Exception:
-                pass
-            return {"status": "timeout", "error": f"hard timeout after {elapsed:.1f}s"}
+            if result is not None:
+                process.join(timeout=5)
+            else:
+                elapsed = time.time() - t0
+                try:
+                    process.terminate()
+                    process.join(timeout=2)
+                    if process.is_alive():
+                        process.kill()
+                        process.join(timeout=1)
+                except Exception:
+                    pass
+                return {"status": "timeout", "error": f"hard timeout after {elapsed:.1f}s"}
 
-        if not queue.empty():
-            result = queue.get()
+        if result is not None:
             if result.get("status") == "timeout":
                 result["error"] = f"process-level: {result['error']}"
             return result
 
+        process.join(timeout=1)
         if process.exitcode == 0:
             return {"status": "timeout", "error": f"no result after {time.time() - t0:.1f}s"}
         else:
             return {"status": "error", "error": f"worker crashed with code {process.exitcode}"}
     except Exception as outer_err:
-        return {"status": "error", "error": f"spawn error: {outer_err}"}
+        return {"status": "error", "error": f"spawn error: {type(outer_err).__name__}: {outer_err!r}"}
+    finally:
+        try:
+            result_queue.close()
+            result_queue.join_thread()
+        except Exception:
+            pass
 
 
 get_official_pmlb_regression_datasets = lambda: (
@@ -465,6 +497,21 @@ _apply_srbench_run_budget = bc.apply_run_budget
 
 _fallback_estimator_predictions = bc.fallback_estimator_predictions
 _apply_srbench_run_budget = bc.apply_run_budget
+
+
+def resolve_specialist_phase_config(*, disable_specialist=False, enable_residual_stage=False, specialist_full=False):
+    """Resolve SRBench specialist phase flags into estimator constructor booleans."""
+    enabled = not bool(disable_specialist)
+    full = bool(specialist_full and enabled)
+    return {
+        "enabled": enabled,
+        "diagnostics": enabled,
+        "composition": enabled,
+        "residual": enabled and bool(enable_residual_stage or full),
+        "vault": enabled,
+        "inception": enabled,
+        "full": full,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1079,6 +1126,8 @@ def main():
                         help="Internal C++ restarts per seed; keep at 1 when using multi-seed SRBench runs")
     parser.add_argument("--enable-residual-stage", action="store_true",
                         help="Enable expensive residual symbolic stage during SRBench runs")
+    parser.add_argument("--specialist-full", action="store_true",
+                        help="Enable all specialist phases for SRBench, including residual search")
     parser.add_argument("--disable-specialist", action="store_true",
                         help="Disable specialist screening/composition diagnostics for SRBench ablation runs")
     parser.add_argument("--classifier-model", type=str, default="models/curve_classifier_multi.pt",
@@ -1120,11 +1169,19 @@ def main():
     parser.add_argument("--blackbox-ablation", action="store_true",
                         help="Run an additional all-features baseline alongside reduced search")
     args = parser.parse_args()
+    if args.specialist_full and args.disable_specialist:
+        print("Error: --specialist-full conflicts with --disable-specialist.")
+        sys.exit(1)
 
     seeds = parse_seed_list(args.seeds)
     use_fast_path = not args.no_fast_path
     use_guided_evolution = not args.no_guided_evolution
     effective_pop_size = int(args.pop_size) * max(1, int(args.num_islands))
+    specialist_phase_config = resolve_specialist_phase_config(
+        disable_specialist=args.disable_specialist,
+        enable_residual_stage=args.enable_residual_stage,
+        specialist_full=args.specialist_full,
+    )
 
     est = GlassboxRegressor(
         population_size=effective_pop_size,
@@ -1139,11 +1196,11 @@ def main():
         migration_interval=args.migration_interval,
         migration_size=args.migration_size,
         multi_start_runs=args.multi_start_runs,
-        enable_specialist_screening_diagnostics=not args.disable_specialist,
-        enable_specialist_composition_screening=not args.disable_specialist,
-        enable_residual_stage=args.enable_residual_stage and not args.disable_specialist,
-        enable_specialist_vault_memory=not args.disable_specialist,
-        enable_inception_reuse=not args.disable_specialist,
+        enable_specialist_screening_diagnostics=specialist_phase_config["diagnostics"],
+        enable_specialist_composition_screening=specialist_phase_config["composition"],
+        enable_residual_stage=specialist_phase_config["residual"],
+        enable_specialist_vault_memory=specialist_phase_config["vault"],
+        enable_inception_reuse=specialist_phase_config["inception"],
         skip_evolution_if_bloated=args.skip_evolution_if_bloated,
         bloat_term_threshold=20,
         universal_proposer_path=args.proposer_model,
@@ -1171,7 +1228,17 @@ def main():
     print(
         f"  Runs/formula: {args.runs_per_formula}  |  "
         f"Internal starts/seed: {args.multi_start_runs}  |  "
-        f"Residual stage: {args.enable_residual_stage}"
+        f"Specialist full: {specialist_phase_config['full']}"
+    )
+    print(
+        "  Specialist phases: "
+        + ", ".join(
+            name
+            for name in ("diagnostics", "composition", "residual", "vault", "inception")
+            if specialist_phase_config[name]
+        )
+        if specialist_phase_config["enabled"]
+        else "  Specialist phases: disabled"
     )
     print(f"  Acceptable criteria: R2>={args.acceptable_r2:.2f}, size<={args.complexity_cap}")
     print(f"  Reduced search max features: {args.blackbox_max_features}")

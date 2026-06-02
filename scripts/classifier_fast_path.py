@@ -2184,7 +2184,13 @@ def fast_path_with_refinement(
         predictions.get('sin', 0.0) >= 0.5 or
         predictions.get('cos', 0.0) >= 0.5
     )
-    should_try_freq = bool(detected_omegas) and has_periodic_signal and (1e-4 <= best_mse <= 0.2)
+    is_univariate_input = x.ndim == 1 or (x.ndim == 2 and x.shape[1] == 1)
+    should_try_freq = (
+        is_univariate_input
+        and bool(detected_omegas)
+        and has_periodic_signal
+        and (1e-4 <= best_mse <= 0.2)
+    )
 
     if should_try_freq:
         print(f"  Attempting frequency refinement (initial MSE={best_mse:.4f})...")

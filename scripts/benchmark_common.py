@@ -359,7 +359,7 @@ def evaluate_formula(formula_str, X, *, return_diagnostics=False):
         context["x"] = X[:, 0]
 
     try:
-        with np.errstate(all="raise"):
+        with np.errstate(divide="raise", invalid="raise", over="raise", under="ignore"):
             y_pred = eval(formula, {"__builtins__": None}, context)
         if isinstance(y_pred, (int, float)):
             y_pred = np.full(X.shape[0], y_pred, dtype=np.float64)
@@ -692,6 +692,7 @@ def specialist_metadata_from_estimator(estimator):
         "boosting_stage_count": len(getattr(estimator, "boosting_stages_", []) or []),
         "boosting_diagnostics": getattr(estimator, "boosting_diagnostics_", None),
         "residual_stage_guard": getattr(estimator, "_residual_stage_guard_", None),
+        "final_formula_selection": getattr(estimator, "final_formula_selection_diagnostics_", None),
         "phase_timings": dict(getattr(estimator, "phase_timings_", {}) or {}),
         "exact_match_diagnostics": getattr(estimator, "fast_path_exact_match_diagnostics_", None),
         "formula_eval_count": int(getattr(estimator, "formula_eval_count_", 0) or 0),
