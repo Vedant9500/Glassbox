@@ -30,6 +30,7 @@ _FREQ_COS_PATTERN = re.compile(r'cos\(([0-9.]+)\*?x', re.IGNORECASE)
 _POWER_PATTERN = re.compile(r'x\^([0-9.]+)', re.IGNORECASE)
 
 DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_wide.pt"
+DEFAULT_EXACT_MATCH_MIN_GPU_WORK = 250_000
 
 
 def _with_derived_predictions(predictions: Dict[str, float]) -> Dict[str, float]:
@@ -162,6 +163,69 @@ def _resolve_device(device: Optional[str] = None) -> torch.device:
         return torch.device("cpu")
 
     return resolved
+
+
+def _estimate_exact_match_work(n_samples: int, n_basis: int, max_terms: int) -> int:
+    """Estimate batched exact-match work for backend selection."""
+    max_r = min(int(max_terms), 3)
+    if max_r < 2 or n_samples <= 0 or n_basis <= 0:
+        return 0
+
+    combos = 0
+    for r in range(2, max_r + 1):
+        if n_basis >= r:
+            combos += math.comb(n_basis, r)
+    return int(n_samples * combos)
+
+
+def _select_exact_match_torch_device(
+    backend: str,
+    device: Optional[str],
+    estimated_work: int,
+    min_gpu_work: int,
+) -> Tuple[Optional[torch.device], Dict[str, Any]]:
+    """Select the torch device for exact-match search and explain the choice."""
+    backend_norm = (backend or "auto").strip().lower()
+    diagnostics: Dict[str, Any] = {
+        "backend_requested": backend_norm,
+        "estimated_work": int(estimated_work),
+        "min_gpu_work": int(min_gpu_work),
+        "torch_used": False,
+        "gpu_used": False,
+        "resolved_device": None,
+        "fallback_reason": None,
+    }
+
+    if backend_norm in {"numpy", "np", "off", "none"}:
+        diagnostics["fallback_reason"] = "torch_backend_disabled"
+        return None, diagnostics
+
+    if backend_norm in {"cuda", "gpu", "torch_cuda"}:
+        if not torch.cuda.is_available():
+            diagnostics["fallback_reason"] = "cuda_unavailable"
+            return None, diagnostics
+        selected = torch.device("cuda")
+    elif backend_norm in {"cpu", "torch_cpu"}:
+        selected = torch.device("cpu")
+    elif backend_norm in {"torch"}:
+        selected = _resolve_device(device)
+    elif backend_norm == "auto":
+        requested = _resolve_device(device)
+        explicit_cuda = device is not None and requested.type == "cuda"
+        if explicit_cuda and estimated_work >= int(min_gpu_work):
+            selected = requested
+        else:
+            selected = torch.device("cpu")
+            if explicit_cuda:
+                diagnostics["fallback_reason"] = "below_gpu_work_threshold"
+    else:
+        diagnostics["fallback_reason"] = f"unknown_backend:{backend_norm}"
+        selected = torch.device("cpu")
+
+    diagnostics["torch_used"] = True
+    diagnostics["gpu_used"] = selected.type == "cuda"
+    diagnostics["resolved_device"] = str(selected)
+    return selected, diagnostics
 
 
 def _join_formula_terms(terms: List[str]) -> str:
@@ -1003,6 +1067,10 @@ def find_exact_symbolic_match(
     max_terms: int = 3,
     tolerance: float = 1e-6,
     num_threads: int = 1,
+    device: Optional[str] = None,
+    exact_match_backend: str = "auto",
+    exact_match_min_gpu_work: int = DEFAULT_EXACT_MATCH_MIN_GPU_WORK,
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Optional[Tuple[str, float, np.ndarray]]:
     """
     Search for exact symbolic matches before falling back to LASSO.
@@ -1016,6 +1084,10 @@ def find_exact_symbolic_match(
         y: Target values (N,)
         max_terms: Maximum number of terms to try in combination
         tolerance: MSE threshold for "exact" match
+        device: Preferred torch device for accelerated batched search
+        exact_match_backend: "auto", "cpu", "cuda"/"torch_cuda", "torch", or "numpy"
+        exact_match_min_gpu_work: Minimum estimated work before auto uses CUDA
+        diagnostics: Optional dict populated with backend selection/fallback details
         
     Returns:
         (formula, mse, coefficients) if exact match found, else None
@@ -1089,27 +1161,34 @@ def find_exact_symbolic_match(
                 except (np.linalg.LinAlgError, ValueError):
                     pass
     
-    # Optional PyTorch acceleration for pairs and triples
-    try:
-        import torch
-        has_torch = True
-    except ImportError:
-        has_torch = False
+    def update_diagnostics(values: Dict[str, Any]) -> None:
+        if diagnostics is not None:
+            diagnostics.update(values)
 
-    if has_torch and max_terms >= 2:
+    # Optional PyTorch acceleration for pairs and triples
+    selected_device, torch_diagnostics = _select_exact_match_torch_device(
+        exact_match_backend,
+        device,
+        _estimate_exact_match_work(len(y), n_basis, max_terms),
+        exact_match_min_gpu_work,
+    )
+    update_diagnostics(torch_diagnostics)
+
+    if selected_device is not None and max_terms >= 2:
         try:
-            basis_t = torch.from_numpy(basis).float()
-            y_t = torch.from_numpy(y).float().unsqueeze(1)
+            basis_t = torch.as_tensor(np.ascontiguousarray(basis), dtype=torch.float32, device=selected_device)
+            y_t = torch.as_tensor(np.ascontiguousarray(y), dtype=torch.float32, device=selected_device).unsqueeze(1)
             N = basis_t.shape[0]
 
             def fast_torch_search(r: int):
-                idx = torch.combinations(torch.arange(n_basis), r=r)
-                n_combos = len(idx)
+                idx_cpu = torch.combinations(torch.arange(n_basis, device="cpu"), r=r)
+                idx_len = int(idx_cpu.shape[0])
+                n_combos = idx_len
                 chunk_size = 50000
 
                 for start in range(0, n_combos, chunk_size):
                     end = min(start + chunk_size, n_combos)
-                    chunk_idx = idx[start:end]
+                    chunk_idx = idx_cpu[start:end].to(selected_device)
                     
                     X = basis_t[:, chunk_idx] # N x C x r
                     X = X.permute(1, 0, 2) # C x N x r
@@ -1124,25 +1203,38 @@ def find_exact_symbolic_match(
                     if best_mse < tolerance:
                         idx_in_chunk = best_idx.item()
                         real_idx = start + idx_in_chunk
-                        return idx[real_idx].tolist(), sol[idx_in_chunk].flatten().tolist(), best_mse.item()
+                        return idx_cpu[real_idx].tolist(), sol[idx_in_chunk].flatten().detach().cpu().numpy(), best_mse.item()
                 return None
 
             if max_terms >= 2:
                 res = fast_torch_search(2)
                 if res is not None:
                     indices, coeffs, mse = res
-                    formula, full_coeffs = build_formula(indices, np.array(coeffs))
-                    return formula, mse, full_coeffs
+                    coeffs_arr = np.asarray(coeffs, dtype=np.float64)
+                    y_pred = basis[:, indices] @ coeffs_arr
+                    mse_cpu = float(np.mean((y - y_pred) ** 2))
+                    if mse_cpu < tolerance:
+                        update_diagnostics({"match_backend": str(selected_device), "validated_on_cpu": True})
+                        formula, full_coeffs = build_formula(indices, coeffs_arr)
+                        return formula, mse_cpu, full_coeffs
 
             if max_terms >= 3:
                 res = fast_torch_search(3)
                 if res is not None:
                     indices, coeffs, mse = res
-                    formula, full_coeffs = build_formula(indices, np.array(coeffs))
-                    return formula, mse, full_coeffs
+                    coeffs_arr = np.asarray(coeffs, dtype=np.float64)
+                    y_pred = basis[:, indices] @ coeffs_arr
+                    mse_cpu = float(np.mean((y - y_pred) ** 2))
+                    if mse_cpu < tolerance:
+                        update_diagnostics({"match_backend": str(selected_device), "validated_on_cpu": True})
+                        formula, full_coeffs = build_formula(indices, coeffs_arr)
+                        return formula, mse_cpu, full_coeffs
             
             return None
         except Exception as e:
+            if selected_device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            update_diagnostics({"fallback_reason": f"torch_search_failed:{type(e).__name__}"})
             print(f"  [PyTorch fast search failed: {e}]")
             pass # Fall back to numpy implementation on any PyTorch error
     
@@ -1237,6 +1329,9 @@ def fast_path_regression(
     exact_match_max_basis: int = 150,
     max_power: int = 6,
     holdout_fraction: float = 0.10,
+    device: Optional[str] = None,
+    exact_match_backend: str = "auto",
+    exact_match_min_gpu_work: int = DEFAULT_EXACT_MATCH_MIN_GPU_WORK,
 ) -> Tuple[str, float, Dict]:
     """
     Directly solve for coefficients using least squares regression.
@@ -1263,6 +1358,7 @@ def fast_path_regression(
         raise ValueError(f"Expected x to be 1D or 2D, got shape {x.shape}")
     y = y.flatten()
     y_variance = float(np.var(y)) if y.size > 0 else 0.0
+    exact_match_diagnostics: Dict[str, Any] = {}
 
     # ── Out-of-domain holdout: hold back domain-edge points ──
     holdout_mask = None
@@ -1351,6 +1447,12 @@ def fast_path_regression(
                 'basis_names': names,
                 'n_nonzero': sum(1 for c in coeffs if abs(c) >= sparsity_threshold),
                 'exact_match': True,
+                'exact_match_diagnostics': {
+                    'backend_requested': exact_match_backend,
+                    'fallback_reason': 'polynomial_shortcut',
+                    'torch_used': False,
+                    'gpu_used': False,
+                },
                 'candidate_formulas': [{
                     'formula': formula,
                     'mse': float(mse),
@@ -1374,6 +1476,10 @@ def fast_path_regression(
             max_terms=exact_max_terms,
             tolerance=1e-5,
             num_threads=exact_match_threads,
+            device=device,
+            exact_match_backend=exact_match_backend,
+            exact_match_min_gpu_work=exact_match_min_gpu_work,
+            diagnostics=exact_match_diagnostics,
         )
         if exact_match:
             formula, mse, coeffs = exact_match
@@ -1384,6 +1490,7 @@ def fast_path_regression(
                 'basis_names': names,
                 'n_nonzero': sum(1 for c in coeffs if abs(c) >= sparsity_threshold),
                 'exact_match': True,
+                'exact_match_diagnostics': exact_match_diagnostics,
                 'candidate_formulas': [{
                     'formula': formula,
                     'mse': float(mse),
@@ -1395,6 +1502,12 @@ def fast_path_regression(
             }
     elif exact_match_enabled:
         print(f"  Skipping exact-match search (basis={basis.shape[1]} > {exact_match_max_basis})")
+        exact_match_diagnostics = {
+            'backend_requested': exact_match_backend,
+            'fallback_reason': 'basis_exceeds_exact_match_max',
+            'basis_terms': int(basis.shape[1]),
+            'exact_match_max_basis': int(exact_match_max_basis),
+        }
     
     # Normalize basis for numerical stability
     basis_std = np.std(basis, axis=0, keepdims=True)
@@ -1582,6 +1695,7 @@ def fast_path_regression(
         'exact_match': exact_match_flag,
         'compact_multivariate_basis': bool(x.ndim == 2 and x.shape[1] > 1 and len(names) <= 120),
         'y_variance': y_variance,
+        'exact_match_diagnostics': exact_match_diagnostics,
         'candidate_formulas': candidate_formulas,
         'holdout_mse': _holdout_mse_for_best(coeffs) if holdout_mask is not None else None,
     }
@@ -1971,6 +2085,8 @@ def fast_path_with_refinement(
     exact_match_enabled: bool = True,
     exact_match_max_basis: int = 150,
     max_power: int = 6,
+    exact_match_backend: str = "auto",
+    exact_match_min_gpu_work: int = DEFAULT_EXACT_MATCH_MIN_GPU_WORK,
 ) -> Tuple[str, float, Dict]:
     """
     Fast-path with optional frequency refinement.
@@ -2015,6 +2131,9 @@ def fast_path_with_refinement(
             exact_match_enabled=exact_match_enabled,
             exact_match_max_basis=exact_match_max_basis,
             max_power=max_power,
+            device=device,
+            exact_match_backend=exact_match_backend,
+            exact_match_min_gpu_work=exact_match_min_gpu_work,
         )
         if candidate_score(mse, details) < candidate_score(best_mse, best_details):
             best_mse = mse
@@ -2061,6 +2180,9 @@ def fast_path_with_refinement(
                 exact_match_enabled=exact_match_enabled,
                 exact_match_max_basis=exact_match_max_basis,
                 max_power=max_power,
+                device=device,
+                exact_match_backend=exact_match_backend,
+                exact_match_min_gpu_work=exact_match_min_gpu_work,
             )
             if should_accept_candidate(mse2, details2):
                 return formula2, mse2, details2
@@ -2189,6 +2311,8 @@ def run_fast_path(
     simplification_zero_tol: float = 1e-8,
     simplification_log: bool = True,
     max_power: int = 6,
+    exact_match_backend: str = "auto",
+    exact_match_min_gpu_work: int = DEFAULT_EXACT_MATCH_MIN_GPU_WORK,
 ) -> Optional[Dict]:
     """
     Run the complete fast-path pipeline.
@@ -2346,6 +2470,8 @@ def run_fast_path(
         exact_match_enabled=exact_match_enabled,
         exact_match_max_basis=exact_match_max_basis,
         max_power=max_power,
+        exact_match_backend=exact_match_backend,
+        exact_match_min_gpu_work=exact_match_min_gpu_work,
     )
 
     raw_formula = formula

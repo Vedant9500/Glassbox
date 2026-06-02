@@ -61,6 +61,62 @@ def test_cv_skip_guard_fails_for_unstable_formula(monkeypatch):
     assert est.fast_path_cv_guard_["reason"] == "unstable_fold_performance"
 
 
+def test_formula_cleanup_guard_rejects_worse_simplification(monkeypatch):
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = np.sin(x)
+    est = GlassboxRegressor(random_state=3)
+    est.n_features_in_ = 1
+    est.blackbox_diagnostics_ = {}
+
+    monkeypatch.setattr(est, "_reduce_formula_noise", lambda formula, X_in, y_in: formula)
+    monkeypatch.setattr(est, "_simplify_formula", lambda formula: "0")
+
+    cleaned = est._cleanup_formula_with_fidelity_guard("sin(x)", X, y, stage="unit")
+
+    assert cleaned == "sin(x)"
+    steps = est.blackbox_diagnostics_["formula_cleanup_guard"][0]["steps"]
+    assert steps[0]["step"] == "simplify_formula"
+    assert steps[0]["accepted"] is False
+
+
+def test_formula_cleanup_guard_accepts_equivalent_cleanup(monkeypatch):
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = np.sin(x)
+    est = GlassboxRegressor(random_state=4)
+    est.n_features_in_ = 1
+    est.blackbox_diagnostics_ = {}
+
+    monkeypatch.setattr(est, "_reduce_formula_noise", lambda formula, X_in, y_in: formula)
+    monkeypatch.setattr(est, "_simplify_formula", lambda formula: "sin(x0)")
+
+    cleaned = est._cleanup_formula_with_fidelity_guard("sin(x)", X, y, stage="unit")
+
+    assert cleaned == "sin(x0)"
+    steps = est.blackbox_diagnostics_["formula_cleanup_guard"][0]["steps"]
+    assert steps[0]["accepted"] is True
+
+
+def test_actionable_specialist_candidate_pool_is_retained_without_composition():
+    est = GlassboxRegressor(random_state=5)
+    est.early_stop_mse = 1e-12
+    est.evolution_skip_r2 = 0.999
+
+    candidates = [{
+        "formula": "exp(-2*x0)",
+        "mse": 0.0,
+        "validation_mse": 0.0,
+        "validation_r2": 1.0,
+    }]
+
+    assert est._candidate_pool_has_actionable_fit(
+        candidates,
+        incumbent_mse=0.1,
+        search_plan={"candidate_acceptance_r2": 0.985},
+    ) is True
+
+
 def test_universal_proposer_dual_path_handles_multivariate_proxy(monkeypatch):
     n = 64
     x1 = np.linspace(-2.0, 2.0, n)
