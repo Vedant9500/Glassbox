@@ -72,3 +72,27 @@ def test_exact_match_backend_cuda_matches_cpu_solution():
     assert cuda_diagnostics["validated_on_cpu"] is True
     assert cuda_result[1] < 1e-8
     assert np.allclose(cuda_result[2], cpu_result[2], atol=1e-4)
+
+
+def test_exact_match_skips_large_combination_search():
+    x = np.linspace(-1.0, 1.0, 64, dtype=np.float64)
+    basis = np.column_stack([x ** (i % 7 + 1) + 0.001 * i for i in range(110)])
+    names = [f"b{i}" for i in range(basis.shape[1])]
+    y = x + x ** 2
+    diagnostics = {}
+
+    result = cfp.find_exact_symbolic_match(
+        basis,
+        names,
+        y,
+        max_terms=3,
+        tolerance=1e-8,
+        exact_match_backend="torch_cuda",
+        exact_match_max_combos=50_000,
+        diagnostics=diagnostics,
+    )
+
+    assert result is None
+    assert diagnostics["fallback_reason"] == "combo_cap_exceeded"
+    assert diagnostics["combo_count"] > diagnostics["max_combos"]
+    assert diagnostics["gpu_used"] is False

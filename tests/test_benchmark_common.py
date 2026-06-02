@@ -74,3 +74,14 @@ def test_postprocess_formula_preserves_abs_function_call():
 
     assert diagnostics["ok"] is True
     assert y_pred is not None
+
+
+def test_evaluate_formula_protects_log_abs_zero_endpoint():
+    formula = "-0.1111111111111111*x + 0.4*sin(1.125*log(Abs(x)) - 1.4166666666666667) + 0.5555555555555556"
+    X = np.linspace(0.0, 8.0, 300).reshape(-1, 1)
+
+    y_pred, diagnostics = bc.evaluate_formula(formula, X, return_diagnostics=True)
+
+    assert diagnostics["ok"] is True
+    assert y_pred is not None
+    assert np.all(np.isfinite(y_pred))

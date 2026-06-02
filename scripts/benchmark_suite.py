@@ -890,6 +890,9 @@ def run_formula(
     evolution_generations: int = 150,
     evolution_population: int = 50,
     trust_proposer_plan: bool = False,
+    exact_match_backend: str = "auto",
+    exact_match_min_gpu_work: int = 250_000,
+    exact_match_max_combos: int = 50_000,
 ) -> Dict[str, Any]:
     """Run fast-path and/or guided evolution on a single formula."""
     x_min, x_max = x_range
@@ -920,6 +923,7 @@ def run_formula(
         "mse_divergence_abs": None,
         "mse_divergence_rel": None,
         "mse_divergence_flag": False,
+        "exact_match_diagnostics": None,
     }
 
     try:
@@ -955,6 +959,13 @@ def run_formula(
                 if y_pred is not None
                 else None
             )
+            result["exact_match_diagnostics"] = {
+                    "backend_requested": exact_match_backend,
+                    "fallback_reason": "constant_shortcut",
+                    "max_combos": int(exact_match_max_combos),
+                    "torch_used": False,
+                    "gpu_used": False,
+                }
             result["candidate_formulas"] = [{
                 "formula": formula,
                 "mse": 0.0,
@@ -993,6 +1004,9 @@ def run_formula(
                 exact_match_threads=1,
                 exact_match_enabled=True,
                 exact_match_max_basis=150,
+                exact_match_backend=exact_match_backend,
+                exact_match_min_gpu_work=exact_match_min_gpu_work,
+                exact_match_max_combos=exact_match_max_combos,
                 simplify_formula_output=False,
             )
             elapsed = time.time() - t0
@@ -1030,6 +1044,7 @@ def run_formula(
                 details = fp_result.get("details", {}) if isinstance(fp_result, dict) else {}
                 structural_terms = details.get("n_nonzero", 0)
                 simplified_terms = details.get("n_nonzero_simplified", 0)
+                result["exact_match_diagnostics"] = details.get("exact_match_diagnostics")
                 result["n_terms"] = max(
                     int(str_term_count),
                     int(structural_terms) if structural_terms is not None else 0,
@@ -1443,6 +1458,9 @@ def run_formula_specialist_regressor(
     specialist_residual: bool = False,
     specialist_vault: bool = True,
     specialist_inception: bool = False,
+    exact_match_backend: str = "auto",
+    exact_match_min_gpu_work: int = 250_000,
+    exact_match_max_combos: int = 50_000,
 ) -> Dict[str, Any]:
     """Run the sklearn regressor path so specialist composition/boosting is measurable."""
     x_min, x_max = x_range
@@ -1474,6 +1492,7 @@ def run_formula_specialist_regressor(
         "mse_divergence_abs": None,
         "mse_divergence_rel": None,
         "mse_divergence_flag": False,
+        "exact_match_diagnostics": None,
         "benchmark_path": "specialist_regressor" if specialist_enabled else "regressor_baseline",
         "specialist_enabled": bool(specialist_enabled),
         "specialist_phase_config": {
@@ -1525,6 +1544,13 @@ def run_formula_specialist_regressor(
             result["score_mse"] = 0.0
             result["time"] = 0.0
             result["n_terms"] = _count_terms(formula)
+            result["exact_match_diagnostics"] = {
+                "backend_requested": exact_match_backend,
+                "fallback_reason": "constant_shortcut",
+                "max_combos": int(exact_match_max_combos),
+                "torch_used": False,
+                "gpu_used": False,
+            }
             result["score"] = score_result(0.0, formula)
             return result
 
@@ -1549,6 +1575,9 @@ def run_formula_specialist_regressor(
             use_fast_path=True,
             multi_start_runs=1,
             device=device,
+            exact_match_backend=exact_match_backend,
+            exact_match_min_gpu_work=exact_match_min_gpu_work,
+            exact_match_max_combos=exact_match_max_combos,
             random_state=0,
         )
 
@@ -1583,6 +1612,7 @@ def run_formula_specialist_regressor(
             result["error"] = "formula_eval_failed"
 
         result.update(bc.specialist_metadata_from_estimator(reg))
+        result["exact_match_diagnostics"] = getattr(reg, "fast_path_exact_match_diagnostics_", None)
 
     except Exception as e:
         result["error"] = str(e)
@@ -1863,6 +1893,28 @@ Examples:
         help="Device for classifier inference (default: auto)",
     )
     parser.add_argument(
+        "--exact-match-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "torch_cuda", "torch", "numpy"],
+        help=(
+            "Backend for fast-path exact symbolic matching. In auto mode, CUDA is used "
+            "only when device resolves to cuda and the work threshold is met."
+        ),
+    )
+    parser.add_argument(
+        "--exact-match-min-gpu-work",
+        type=int,
+        default=250_000,
+        help="Minimum estimated exact-match work before auto mode uses CUDA (default: 250000)",
+    )
+    parser.add_argument(
+        "--exact-match-max-combos",
+        type=int,
+        default=50_000,
+        help="Maximum pair/triple exact-match combinations before falling back to sparse search (default: 50000)",
+    )
+    parser.add_argument(
         "--timeout", type=float, default=60.0,
         help="Timeout per formula in seconds (default: 60)",
     )
@@ -1944,6 +1996,8 @@ Examples:
     device = args.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
+    args.exact_match_min_gpu_work = max(0, int(args.exact_match_min_gpu_work))
+    args.exact_match_max_combos = max(0, int(args.exact_match_max_combos))
 
     # Determine which tiers to run
     tiers_to_run = args.tiers if args.tiers else list(ALL_TIERS.keys())
@@ -2014,6 +2068,11 @@ Examples:
             print("  Planner:     universal proposer search plan")
         print("  Strategy:    optimized")
     print(f"  Device:      {device}")
+    if not args.cpp_evolution_only:
+        print(
+            f"  Exact match: {args.exact_match_backend} "
+            f"(min GPU work={args.exact_match_min_gpu_work}, max combos={args.exact_match_max_combos})"
+        )
     print(f"  Tiers:       {tiers_to_run}")
     print(f"  Formulas:    {total_formulas}")
     print(f"  Samples/ea:  {args.n_samples}")
@@ -2069,6 +2128,9 @@ Examples:
                         specialist_residual=specialist_residual,
                         specialist_vault=specialist_vault,
                         specialist_inception=specialist_inception,
+                        exact_match_backend=args.exact_match_backend,
+                        exact_match_min_gpu_work=args.exact_match_min_gpu_work,
+                        exact_match_max_combos=args.exact_match_max_combos,
                     )
                 else:
                     result = run_formula(
@@ -2085,6 +2147,9 @@ Examples:
                         evolution_generations=args.guided_generations,
                         evolution_population=args.guided_pop_size,
                         trust_proposer_plan=args.trust_proposer_plan,
+                        exact_match_backend=args.exact_match_backend,
+                        exact_match_min_gpu_work=args.exact_match_min_gpu_work,
+                        exact_match_max_combos=args.exact_match_max_combos,
                     )
                 
                 # Keep the best result based on displayed MSE (or just any valid MSE if best_result is None)

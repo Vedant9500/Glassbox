@@ -31,6 +31,7 @@ _POWER_PATTERN = re.compile(r'x\^([0-9.]+)', re.IGNORECASE)
 
 DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_wide.pt"
 DEFAULT_EXACT_MATCH_MIN_GPU_WORK = 250_000
+DEFAULT_EXACT_MATCH_MAX_COMBOS = 50_000
 
 
 def _with_derived_predictions(predictions: Dict[str, float]) -> Dict[str, float]:
@@ -1070,6 +1071,7 @@ def find_exact_symbolic_match(
     device: Optional[str] = None,
     exact_match_backend: str = "auto",
     exact_match_min_gpu_work: int = DEFAULT_EXACT_MATCH_MIN_GPU_WORK,
+    exact_match_max_combos: int = DEFAULT_EXACT_MATCH_MAX_COMBOS,
     diagnostics: Optional[Dict[str, Any]] = None,
 ) -> Optional[Tuple[str, float, np.ndarray]]:
     """
@@ -1087,6 +1089,7 @@ def find_exact_symbolic_match(
         device: Preferred torch device for accelerated batched search
         exact_match_backend: "auto", "cpu", "cuda"/"torch_cuda", "torch", or "numpy"
         exact_match_min_gpu_work: Minimum estimated work before auto uses CUDA
+        exact_match_max_combos: Maximum pair/triple combinations to search exhaustively
         diagnostics: Optional dict populated with backend selection/fallback details
         
     Returns:
@@ -1164,6 +1167,25 @@ def find_exact_symbolic_match(
     def update_diagnostics(values: Dict[str, Any]) -> None:
         if diagnostics is not None:
             diagnostics.update(values)
+
+    combo_count = 0
+    for r in range(2, min(int(max_terms), 3) + 1):
+        if n_basis >= r:
+            combo_count += math.comb(n_basis, r)
+    if exact_match_max_combos is not None and combo_count > int(exact_match_max_combos):
+        update_diagnostics({
+            "backend_requested": exact_match_backend,
+            "fallback_reason": "combo_cap_exceeded",
+            "combo_count": int(combo_count),
+            "max_combos": int(exact_match_max_combos),
+            "torch_used": False,
+            "gpu_used": False,
+        })
+        print(
+            "  Skipping exhaustive exact-match search "
+            f"(combos={combo_count} > cap={int(exact_match_max_combos)})"
+        )
+        return None
 
     # Optional PyTorch acceleration for pairs and triples
     selected_device, torch_diagnostics = _select_exact_match_torch_device(
@@ -1332,6 +1354,7 @@ def fast_path_regression(
     device: Optional[str] = None,
     exact_match_backend: str = "auto",
     exact_match_min_gpu_work: int = DEFAULT_EXACT_MATCH_MIN_GPU_WORK,
+    exact_match_max_combos: int = DEFAULT_EXACT_MATCH_MAX_COMBOS,
 ) -> Tuple[str, float, Dict]:
     """
     Directly solve for coefficients using least squares regression.
@@ -1479,6 +1502,7 @@ def fast_path_regression(
             device=device,
             exact_match_backend=exact_match_backend,
             exact_match_min_gpu_work=exact_match_min_gpu_work,
+            exact_match_max_combos=exact_match_max_combos,
             diagnostics=exact_match_diagnostics,
         )
         if exact_match:
@@ -2087,6 +2111,7 @@ def fast_path_with_refinement(
     max_power: int = 6,
     exact_match_backend: str = "auto",
     exact_match_min_gpu_work: int = DEFAULT_EXACT_MATCH_MIN_GPU_WORK,
+    exact_match_max_combos: int = DEFAULT_EXACT_MATCH_MAX_COMBOS,
 ) -> Tuple[str, float, Dict]:
     """
     Fast-path with optional frequency refinement.
@@ -2134,6 +2159,7 @@ def fast_path_with_refinement(
             device=device,
             exact_match_backend=exact_match_backend,
             exact_match_min_gpu_work=exact_match_min_gpu_work,
+            exact_match_max_combos=exact_match_max_combos,
         )
         if candidate_score(mse, details) < candidate_score(best_mse, best_details):
             best_mse = mse
@@ -2183,6 +2209,7 @@ def fast_path_with_refinement(
                 device=device,
                 exact_match_backend=exact_match_backend,
                 exact_match_min_gpu_work=exact_match_min_gpu_work,
+                exact_match_max_combos=exact_match_max_combos,
             )
             if should_accept_candidate(mse2, details2):
                 return formula2, mse2, details2
@@ -2313,6 +2340,7 @@ def run_fast_path(
     max_power: int = 6,
     exact_match_backend: str = "auto",
     exact_match_min_gpu_work: int = DEFAULT_EXACT_MATCH_MIN_GPU_WORK,
+    exact_match_max_combos: int = DEFAULT_EXACT_MATCH_MAX_COMBOS,
 ) -> Optional[Dict]:
     """
     Run the complete fast-path pipeline.
@@ -2472,6 +2500,7 @@ def run_fast_path(
         max_power=max_power,
         exact_match_backend=exact_match_backend,
         exact_match_min_gpu_work=exact_match_min_gpu_work,
+        exact_match_max_combos=exact_match_max_combos,
     )
 
     raw_formula = formula

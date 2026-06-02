@@ -316,7 +316,13 @@ def evaluate_formula(formula_str, X, *, return_diagnostics=False):
 
     def _safe_numpy_log(x, base=None):
         with np.errstate(divide="ignore", invalid="ignore"):
-            out = np.log(x)
+            x_arr = np.asarray(x, dtype=np.float64)
+            # The estimator's formula evaluator treats log(Abs(x)) at x=0 as a
+            # protected boundary value. Mirror that here so valid displayed
+            # formulas are not rejected only because the benchmark grid includes
+            # an endpoint at zero.
+            x_arr = np.where(x_arr == 0.0, 1e-300, x_arr)
+            out = np.log(x_arr)
             if base is not None:
                 out = out / np.log(base)
         return out
@@ -685,7 +691,9 @@ def specialist_metadata_from_estimator(estimator):
         "boosting_improved": bool(getattr(estimator, "boosting_improved_", False)),
         "boosting_stage_count": len(getattr(estimator, "boosting_stages_", []) or []),
         "boosting_diagnostics": getattr(estimator, "boosting_diagnostics_", None),
+        "residual_stage_guard": getattr(estimator, "_residual_stage_guard_", None),
         "phase_timings": dict(getattr(estimator, "phase_timings_", {}) or {}),
+        "exact_match_diagnostics": getattr(estimator, "fast_path_exact_match_diagnostics_", None),
         "formula_eval_count": int(getattr(estimator, "formula_eval_count_", 0) or 0),
         "formula_eval_cache_hits": int(getattr(estimator, "formula_eval_cache_hits_", 0) or 0),
         "formula_eval_cache_size": len(getattr(estimator, "_formula_eval_cache_", {}) or {}),

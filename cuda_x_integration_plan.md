@@ -9,13 +9,15 @@ CUDA-X can help this project, but the highest-return path is not a blanket GPU r
 Recommended integration order:
 
 1. Add benchmark instrumentation and CPU/GPU parity guardrails.
-2. Use the existing PyTorch CUDA install for Python fast-path exact matching and large basis solves.
+2. Keep CPU as the default for fast-path exact symbolic matching; use the PyTorch CUDA exact-match backend only as diagnostic infrastructure or for unusually large dense batches that prove faster in benchmarks.
 3. Rewrite the residual symbolic stage into a bounded mini-search before pushing more work to CUDA.
-4. Add optional native CUDA C++ linear algebra via cuBLAS/cuSOLVER for dense solves inside evolution/refinement.
-5. Add optional RAPIDS/cuML paths for blackbox preprocessing on Linux/WSL2, not native Windows.
+4. Profile native C++ dense linear algebra hot spots, then add optional cuBLAS/cuSOLVER only where the CPU path is demonstrably solve-bound.
+5. Add optional RAPIDS/cuML paths for blackbox preprocessing on Linux/WSL2 only if preprocessing becomes a measured bottleneck.
 6. Consider TensorRT/ONNX and nvmath-python only after profiling shows inference or Python math dispatch is a bottleneck.
 
 On this machine, CUDA is real and usable: PyTorch 2.5.1+cu121 reports CUDA available on an NVIDIA GeForce RTX 4060 Laptop GPU with 8 GB VRAM. The CUDA toolkit is installed as nvcc 13.0. CuPy and RAPIDS are not currently installed.
+
+Update from initial benchmarking: forced PyTorch CUDA exact-match on a 24-to-110-term fast-path basis was slower than CPU. CPU completed the tested exact-match workload in roughly 0.5-1s, while forced GPU took roughly 10-12s. This is the expected failure mode for small/skinny least-squares batches: transfer, launch, and batched solver overhead dominate. The plan below has been revised so these CPU-fast paths are not treated as GPU optimization targets.
 
 ## Research Sources
 
@@ -120,10 +122,10 @@ Several optimizations exist in both Python and C++ or are orchestrated in Python
 
 | Library | Fit | Where It Applies | Priority |
 | --- | --- | --- | --- |
-| PyTorch CUDA | Already installed and working | Python fast-path exact search, batched least squares, neural inference/training | Very high |
-| CuPy | NumPy-like GPU arrays | Basis generation, large candidate matrices, optional GPU array backend | Medium |
-| cuBLAS | NVIDIA dense BLAS | C++ Gramian, matrix multiply, dot products, batched dense math | High after Python pilot |
-| cuSOLVER | NVIDIA dense/sparse solvers | C++ QR/SVD/Cholesky/ridge/LM solves | High after Python pilot |
+| PyTorch CUDA | Already installed and working | Neural inference/training; diagnostic exact-match backend only when benchmarks prove it | Medium-low for exact match, high for training |
+| CuPy | NumPy-like GPU arrays | Only for large GPU-resident arrays after profiling; not for current small fast-path bases | Low initially |
+| cuBLAS | NVIDIA dense BLAS | C++ Gramian, matrix multiply, dot products, repeated dense math | Medium after C++ profiling |
+| cuSOLVER | NVIDIA dense/sparse solvers | C++ QR/SVD/Cholesky/ridge/LM solves when solve-bound | Medium after C++ profiling |
 | cuRAND | GPU RNG | Full GPU evolution/mutation if population becomes GPU resident | Low initially |
 | CCCL/Thrust/CUB | GPU primitives | Reductions, top-k, sort/select, population scoring kernels | Medium-late |
 | RAPIDS cuML | GPU sklearn-like ML | Blackbox preprocessing, feature selection, RF/linear models on Linux/WSL2 | Optional |
@@ -162,9 +164,9 @@ Acceptance criteria:
 - GPU paths can be disabled globally.
 - Final formula validation MSE is always computed through the existing trusted CPU/display path before accepting a GPU-derived candidate.
 
-## Phase 1: Python Fast-Path CUDA Pilot
+## Phase 1: Fast-Path Exact-Match Guardrails
 
-Goal: accelerate the dense exact-match and basis search path with the PyTorch CUDA stack already present.
+Goal: keep the fast-path exact-match search cheap and observable. Based on initial CPU/GPU timing, this is not a primary GPU speedup target.
 
 Primary targets:
 
@@ -173,30 +175,33 @@ Primary targets:
   - `build_basis_from_predictions`
   - exact polynomial/symbolic matching sections in `fast_path_regression`
 
-Current opportunity:
+Measured result:
 
-- The PyTorch least-squares branch builds tensors using `torch.from_numpy(...).float()` but does not explicitly move them to CUDA.
-- This means a path that looks GPU-friendly is currently CPU-bound unless a global default tensor setting has been changed.
+- CPU solved the tested exact-match workload in roughly 0.5-1s.
+- Forced PyTorch CUDA took roughly 10-12s on the same workload.
+- The expanded 110-term basis creates a large combinatorial search space, but each individual least-squares problem is too small and skinny to amortize CUDA overhead.
 
 Plan:
 
-1. Add backend selection: `cpu`, `torch_cuda`, `auto`.
-2. Move eligible dense basis and target tensors to CUDA when `auto` decides the work is large enough.
-3. Use VRAM-aware chunking for combinations and candidate matrix blocks.
-4. Keep CPU for small matrices where GPU launch and transfer overhead will dominate.
-5. Compare GPU-derived candidates with CPU final scoring before acceptance.
-6. Log whether CUDA was used or skipped and why.
+1. Keep CPU as the default exact-match backend.
+2. Keep the PyTorch CUDA backend only behind explicit flags for diagnostics and future large-batch experiments.
+3. Add and enforce an exhaustive-combination cap, e.g. `exact_match_max_combos`, so expanded bases do not spend seconds searching triples before falling through to sparse search.
+4. Log `exact_match_diagnostics`, including backend, GPU usage, estimated work, combo count, cap hits, and CPU validation.
+5. Compare GPU-derived candidates with CPU final scoring before acceptance whenever the diagnostic CUDA path is used.
+6. Prefer pruning, basis ranking, and candidate caps over GPU acceleration for this stage.
 
 Expected improvement:
 
-- Large basis exact-match workloads can plausibly see 2x to 20x speedup in the exact search/least-squares portion.
-- End-to-end speedup depends on whether residual/evolution dominates the run.
-- Small datasets may be slower on GPU, so thresholding is required.
+- The expected win is wall-time stability, not GPU speedup.
+- Skipping excessive exact-match combinations can avoid 10s-style slowdowns on expanded bases.
+- CPU remains faster for the currently observed benchmark workload.
 
 Regression risks and solutions:
 
-- Risk: tensor transfer overhead erases the win.
-  - Solution: use CUDA only above a work threshold such as `n_samples * n_basis` and candidate combination count.
+- Risk: skipping exhaustive triples misses a rare exact low-term formula.
+  - Solution: keep the first compact-basis exact pass, keep single-term and polynomial shortcuts, and fall through to LASSO/candidate scoring rather than terminating the fast path.
+- Risk: forced CUDA is slower than CPU.
+  - Solution: keep `torch_cuda` as an explicit diagnostic mode; default `auto` should choose CPU unless a benchmarked threshold proves otherwise.
 - Risk: GPU OOM on large bases.
   - Solution: chunk by estimated bytes, catch CUDA OOM, clear cache, and fall back to CPU.
 - Risk: numeric drift from float32.
@@ -458,14 +463,30 @@ Acceptance rule:
 
 | Area | Expected Speedup | Confidence | Notes |
 | --- | --- | --- | --- |
-| Python exact basis search with PyTorch CUDA | 2x-20x for large workloads | High | Existing CUDA stack works; current tensors stay on CPU |
+| Fast-path exact-match guardrails | Stability win, not GPU speedup | High | CPU is faster on observed 24/110-term basis workloads; cap exhaustive combos and keep CUDA diagnostic-only |
 | Residual bounded mini-search | Potentially very large wall-time reduction | High | Removes recursive estimator overhead; not purely CUDA |
-| C++ dense linear solves with cuBLAS/cuSOLVER | 1.5x-8x for solve-heavy large runs | Medium | Requires native CUDA backend and thresholding |
+| C++ dense linear solves with cuBLAS/cuSOLVER | Unknown until profiled; possible 1.5x-8x for solve-heavy large runs | Medium-low | Requires native CUDA backend, thresholds, and evidence that Eigen/OpenMP solve time dominates |
 | GPU candidate reductions/top-k | 2x-10x for large dense batches | Medium | Useful after dense candidate representation exists |
 | RAPIDS/cuML preprocessing | 2x-10x for large tabular preprocessing | Medium-low | Platform/install constraints |
 | TensorRT/ONNX inference | 1.2x-5x for repeated inference | Low initially | Probably not the current bottleneck |
 
 Small workloads can regress because GPU launch, transfer, and allocation overhead can exceed compute savings. The project should use dynamic thresholds and CPU fallbacks instead of forcing GPU everywhere.
+
+## Do Not Move To GPU Without New Evidence
+
+These paths are fast enough on CPU or have the wrong shape for CUDA based on current measurements:
+
+- Fast-path exact symbolic matching for compact and moderately expanded bases.
+  - Observed result: CPU around 0.5-1s, forced CUDA around 10-12s.
+  - Keep CPU default and cap exhaustive combinations.
+- Single-term, polynomial shortcut, coefficient snapping, and final display validation.
+  - These are latency-sensitive CPU scalar/vector operations.
+- SymPy/C++ formula simplification.
+  - Keep deterministic CPU behavior.
+- Small least-squares systems inside candidate screening.
+  - Route to GPU only if a profiler shows large repeated dense solves with enough arithmetic intensity.
+- RAPIDS/cuML preprocessing for small benchmark formulas.
+  - Install/platform overhead and data transfer are unlikely to pay off unless tabular preprocessing is measured as a bottleneck.
 
 ## Potential Regressions And Solutions
 
@@ -602,13 +623,14 @@ Solutions:
 First implementation wave:
 
 - `scripts/classifier_fast_path.py`
-  - Add PyTorch CUDA placement and auto thresholding for exact symbolic matching.
-  - Add chunked GPU least-squares/search helpers.
+  - Keep exact symbolic matching on CPU by default.
+  - Add backend diagnostics and a hard cap for exhaustive pair/triple combinations.
+  - Keep PyTorch CUDA exact-match only as an explicit diagnostic backend.
   - Keep CPU validation.
 
 - `glassbox/sr/sklearn_wrapper.py`
   - Add clearer phase timing/fallback reporting.
-  - Add GPU backend configuration propagation.
+  - Add exact-match backend/cap diagnostics propagation.
   - Replace recursive residual symbolic fit with bounded residual candidate search.
 
 - `tests/`
@@ -646,34 +668,38 @@ Optional later wave:
    - No behavior change.
    - Produce timing and quality reports.
 
-2. PyTorch CUDA exact-match pilot
-   - Behind `gpu_backend`.
-   - Local RTX 4060 should be enough for useful validation.
+2. Fast-path exact-match guardrails
+   - CPU default.
+   - Add `exact_match_max_combos` and diagnostics.
+   - Keep CUDA exact-match only as an opt-in diagnostic mode.
 
 3. Residual bounded mini-search
    - CPU/C++ first.
    - Compare against old recursive residual path.
 
-4. Native CUDA C++ dense-linalg backend
+4. C++ dense-linalg profiling
+   - Add timers around Gramian construction, output-weight solves, LM refinement, and candidate scoring.
+   - Only proceed to CUDA if dense solve time is a real wall-time bottleneck.
+
+5. Native CUDA C++ dense-linalg backend
    - Optional compile flag.
    - Start with Gramian/ridge/least-squares paths.
 
-5. GPU candidate reductions/templates
+6. GPU candidate reductions/templates
    - Only after dense matrix representation and thresholds are proven.
 
-6. RAPIDS/cuML and TensorRT optional paths
+7. RAPIDS/cuML and TensorRT optional paths
    - Add only when benchmark data shows these stages matter.
 
-## First Change To Make
+## Next Change To Make
 
-The first real implementation should be the PyTorch CUDA exact-match pilot in `scripts/classifier_fast_path.py`, plus instrumentation in `glassbox/sr/sklearn_wrapper.py`.
+The next real implementation should be the residual bounded mini-search and finer phase profiling, not more GPU exact-match work.
 
 Reason:
 
-- PyTorch CUDA is already installed and working locally.
-- It avoids immediate native build complexity.
-- The current PyTorch least-squares branch appears to remain on CPU.
-- The exact-match/basis path is dense and batched, which is the right shape for GPU acceleration.
-- CPU validation can preserve correctness while we learn real speedup numbers.
+- The measured exact-match workload is faster on CPU than forced CUDA.
+- The expanded basis can create expensive combinatorial search, so pruning/capping is more valuable than GPU acceleration.
+- Residual recursion and C++ refinement/evolution are more likely to dominate hard benchmark wall time.
+- Native cuBLAS/cuSOLVER should wait until phase timings show dense solve kernels are a true bottleneck.
 
-The native cuBLAS/cuSOLVER backend is promising, but it should come after profiling and after the residual stage is bounded. Otherwise the project may speed up inner math while still losing wall time to recursive orchestration.
+The native cuBLAS/cuSOLVER backend remains possible, but it should come after profiling and after the residual stage is bounded. Otherwise the project may speed up inner math while still losing wall time to recursive orchestration or CPU-fast exact-match overhead.

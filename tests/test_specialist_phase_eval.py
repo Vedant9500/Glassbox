@@ -283,6 +283,37 @@ def test_residual_boosting_records_attempt_and_improvement():
     assert reg.boosting_diagnostics_["accepted_stages"] == 1
 
 
+def test_residual_symbolic_fit_uses_bounded_mini_search_without_recursing():
+    class NoRecursiveRegressor(GlassboxRegressor):
+        def fit(self, X, y):
+            raise AssertionError("residual stage should not launch a nested estimator")
+
+    x = np.linspace(-2.0, 2.0, 96)
+    X = x.reshape(-1, 1)
+    y = x + x ** 2
+    reg = NoRecursiveRegressor(
+        use_guided_evolution=True,
+        enable_residual_stage=True,
+        residual_mini_search_max_candidates=16,
+        residual_mini_search_refine_top_k=4,
+        random_state=13,
+    )
+
+    residual_formula = reg._stage_residual_symbolic_fit(
+        X,
+        y,
+        "x0",
+        _allow_recursion=True,
+    )
+
+    assert residual_formula
+    base_mse = reg._formula_mse("x0", X, y)
+    combined_mse = reg._formula_mse(f"(x0)+({residual_formula})", X, y)
+    assert combined_mse < base_mse * 0.1
+    assert reg._residual_stage_guard_["mode"] == "bounded_mini_search"
+    assert reg._residual_stage_guard_["accepted"] is True
+
+
 def test_univariate_fit_runs_specialist_candidate_screening(monkeypatch):
     class ProbeRegressor(GlassboxRegressor):
         def _build_univariate_specialist_candidate_formulas(self, best_formula, best_mse, proposer_payload, X, y, *, max_candidates):

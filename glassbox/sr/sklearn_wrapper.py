@@ -129,12 +129,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         enable_residual_stage=True,
         max_boosting_stages=3,
         boosting_learning_rates=None,
+        residual_mini_search_max_candidates=64,
+        residual_mini_search_refine_top_k=6,
         enable_specialist_vault_memory=True,
         specialist_vault_size=8,
         enable_inception_reuse=True,
         max_inception_rounds=2,
         max_frozen_subexpressions=3,
         device=None,
+        exact_match_backend="auto",
+        exact_match_min_gpu_work=250_000,
+        exact_match_max_combos=50_000,
         skip_evolution_if_bloated=False,
         bloat_term_threshold=20,
     ):
@@ -187,12 +192,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.enable_residual_stage = enable_residual_stage
         self.max_boosting_stages = max(0, int(max_boosting_stages))
         self.boosting_learning_rates = list(boosting_learning_rates or [0.5, 0.8, 1.0])
+        self.residual_mini_search_max_candidates = max(1, int(residual_mini_search_max_candidates))
+        self.residual_mini_search_refine_top_k = max(1, int(residual_mini_search_refine_top_k))
         self.enable_specialist_vault_memory = enable_specialist_vault_memory
         self.specialist_vault_size = max(0, int(specialist_vault_size))
         self.enable_inception_reuse = enable_inception_reuse
         self.max_inception_rounds = max(0, int(max_inception_rounds))
         self.max_frozen_subexpressions = max(0, int(max_frozen_subexpressions))
         self.device = device
+        self.exact_match_backend = exact_match_backend
+        self.exact_match_min_gpu_work = exact_match_min_gpu_work
+        self.exact_match_max_combos = exact_match_max_combos
         self.skip_evolution_if_bloated = skip_evolution_if_bloated
         self.bloat_term_threshold = bloat_term_threshold
 
@@ -211,6 +221,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.formula_eval_cache_hits_ = 0
         self._formula_eval_cache_ = {}
         self.fast_path_exact_skip_ = False
+        self.fast_path_exact_match_diagnostics_ = {}
         self.boosting_stages_ = []
         self.boosting_attempted_ = False
         self.boosting_improved_ = False
@@ -3360,81 +3371,189 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if not np.all(np.isfinite(residual)) or float(np.var(residual)) < 1e-12:
             return None
 
-        residual_state = discover_blackbox_interactions(X, residual)
-        self.residual_blackbox_diagnostics_ = residual_state
-        self._residual_stage_guard_ = {"enabled": True, "allowed": bool(_allow_recursion)}
-
-        holdout_n = max(1, int(round(X.shape[0] * 0.2)))
-        if X.shape[0] < 20 or holdout_n >= X.shape[0]:
-            return None
-        X_fit, X_holdout = X[:-holdout_n], X[-holdout_n:]
-        y_fit, y_holdout = residual[:-holdout_n], residual[-holdout_n:]
-
-        residual_est = self.__class__(
-            population_size=max(20, int(self.population_size // 2)),
-            generations=max(20, int(self.generations // 3)),
-            early_stop_mse=self.early_stop_mse,
-            random_state=self.random_state,
-            p_min=self.p_min,
-            p_max=self.p_max,
-            use_nsga2=self.use_nsga2,
-            num_islands=self.num_islands,
-            migration_interval=self.migration_interval,
-            migration_size=self.migration_size,
-            arithmetic_temperature=self.arithmetic_temperature,
-            use_fast_path=self.use_fast_path,
-            use_guided_evolution=self.use_guided_evolution,
-            use_simplification=self.use_simplification,
-            classifier_path=self.classifier_path,
-            simplification_int_tol=self.simplification_int_tol,
-            simplification_zero_tol=self.simplification_zero_tol,
-            max_power=self.max_power,
-            timeout=max(1, min(3, int(max(1, self.timeout // 5)))),
-            evolution_skip_r2=self.evolution_skip_r2,
-            multi_start_runs=1,
-            adaptive_compute_budget=self.adaptive_compute_budget,
-            min_compute_budget=self.min_compute_budget,
-            max_compute_budget=self.max_compute_budget,
-            cv_skip_guard_enabled=self.cv_skip_guard_enabled,
-            cv_skip_guard_folds=self.cv_skip_guard_folds,
-            cv_skip_guard_min_fold_r2=self.cv_skip_guard_min_fold_r2,
-            cv_skip_guard_max_r2_std=self.cv_skip_guard_max_r2_std,
-            cv_skip_guard_min_samples=self.cv_skip_guard_min_samples,
-            use_universal_proposer=self.use_universal_proposer,
-            universal_proposer_path=self.universal_proposer_path,
-            universal_proposer_shadow_mode=self.universal_proposer_shadow_mode,
-            universal_proposer_log_routing=False,
-            universal_proposer_top_k=self.universal_proposer_top_k,
-            blackbox_feature_selection=False,
-            blackbox_mode=False,
-            blackbox_max_features=self.blackbox_max_features,
-            blackbox_standardize=self.blackbox_standardize,
-            blackbox_min_features_to_select=self.blackbox_min_features_to_select,
-            enable_residual_stage=False,
-            max_boosting_stages=self.max_boosting_stages,
-            boosting_learning_rates=self.boosting_learning_rates,
-            device=self.device,
-            skip_evolution_if_bloated=self.skip_evolution_if_bloated,
-            bloat_term_threshold=self.bloat_term_threshold,
+        candidate_pool = self._build_residual_mini_search_candidates(
+            X,
+            residual,
+            base_formula,
+            max_candidates=getattr(self, "residual_mini_search_max_candidates", 64),
         )
+        self._residual_stage_guard_ = {
+            "enabled": True,
+            "allowed": bool(_allow_recursion),
+            "mode": "bounded_mini_search",
+            "candidate_count": len(candidate_pool),
+        }
+        if not candidate_pool:
+            self._residual_stage_guard_["accepted"] = False
+            self._residual_stage_guard_["reason"] = "no_candidate_pool"
+            return None
+
+        top_k = max(1, int(getattr(self, "residual_mini_search_refine_top_k", 6)))
+        refined = self._refine_candidate_formulas(
+            candidate_pool,
+            X,
+            residual,
+            max_candidates=top_k,
+        )
+        if not refined:
+            self._residual_stage_guard_["accepted"] = False
+            self._residual_stage_guard_["reason"] = "no_refined_residual_candidates"
+            return None
+
+        split = self._domain_edge_validation_split(X, y, validation_fraction=0.2)
+        if split is None:
+            self._residual_stage_guard_["accepted"] = False
+            self._residual_stage_guard_["reason"] = "no_validation_split"
+            return None
 
         try:
-            residual_est.fit(X_fit, y_fit)
-            residual_formula = residual_est.get_formula()
-            if residual_formula and residual_formula != "0":
-                try:
-                    base_pred = self._safe_eval_formula_array(base_formula, X_holdout)
-                    res_pred = residual_est._safe_eval_formula_array(residual_formula, X_holdout)
-                    combined = base_pred + res_pred
-                    base_mse = float(np.mean((base_pred - (y[-holdout_n:])) ** 2))
-                    combined_mse = float(np.mean((combined - (y[-holdout_n:])) ** 2))
-                    if np.isfinite(combined_mse) and combined_mse < base_mse:
-                        return residual_formula
-                except Exception:
-                    return None
+            base_pred = self._safe_eval_formula_array(base_formula, split["X_val"])
         except Exception:
             return None
-        return None
+
+        base_mse = float(np.mean((base_pred - split["y_val"]) ** 2))
+        if not np.isfinite(base_mse):
+            return None
+
+        best = None
+        for cand in refined:
+            formula = str((cand or {}).get("formula", "")).strip()
+            if not formula or formula == "0":
+                continue
+            try:
+                res_pred = self._safe_eval_formula_array(formula, split["X_val"])
+                combined = base_pred + res_pred
+                combined_mse = float(np.mean((combined - split["y_val"]) ** 2))
+            except Exception:
+                continue
+            if not np.isfinite(combined_mse):
+                continue
+            improvement = base_mse - combined_mse
+            if improvement <= max(1e-10, base_mse * 0.002):
+                continue
+            score = (
+                combined_mse,
+                _finite_float((cand or {}).get("risk_score"), 0.0),
+                _finite_float((cand or {}).get("complexity"), float("inf")),
+            )
+            if best is None or score < best[0]:
+                best = (score, formula, combined_mse, cand)
+
+        if best is None:
+            self._residual_stage_guard_.update({
+                "accepted": False,
+                "reason": "no_holdout_improvement",
+                "base_mse": float(base_mse),
+                "refined_count": len(refined),
+            })
+            return None
+
+        _, formula, combined_mse, cand = best
+        self._residual_stage_guard_.update({
+            "accepted": True,
+            "formula": formula[:240],
+            "base_mse": float(base_mse),
+            "combined_mse": float(combined_mse),
+            "validation_r2": cand.get("validation_r2"),
+            "refined_count": len(refined),
+        })
+        return formula
+
+    def _build_residual_mini_search_candidates(self, X, residual, base_formula, *, max_candidates=64):
+        """Build a bounded residual candidate pool without launching a nested estimator."""
+        X_arr = np.asarray(X, dtype=np.float64)
+        residual = np.asarray(residual, dtype=np.float64).reshape(-1)
+        if X_arr.ndim != 2 or X_arr.shape[0] != residual.size:
+            return []
+
+        max_candidates = max(1, int(max_candidates))
+        candidates = []
+        seen = set()
+
+        def add(formula, source):
+            text = str(formula or "").strip()
+            if not text or text == "0":
+                return
+            key = re.sub(r"\s+", "", text.lower())
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append({
+                "formula": text,
+                "source": source,
+                "residual_mini_search": True,
+                "complexity": self._formula_complexity(text),
+            })
+
+        n_features = int(X_arr.shape[1])
+        feature_terms = []
+        for j in range(n_features):
+            name = f"x{j}"
+            feature_terms.append(name)
+            templates = [
+                name,
+                f"{name}^2",
+                f"{name}^3",
+                f"sin({name})",
+                f"cos({name})",
+                f"sin(2*{name})",
+                f"cos(2*{name})",
+                f"sin(3*{name})",
+                f"cos(3*{name})",
+                f"exp(-{name})",
+                f"exp(-{name}^2)",
+                f"{name}*sin({name})",
+                f"{name}*cos({name})",
+                f"{name}*exp(-{name})",
+                f"1/(1+{name}^2)",
+                f"{name}/(1+{name}^2)",
+            ]
+            for formula in templates:
+                add(formula, "residual_template")
+
+        if n_features >= 2:
+            for i in range(n_features):
+                for j in range(i + 1, n_features):
+                    xi = f"x{i}"
+                    xj = f"x{j}"
+                    add(f"{xi}*{xj}", "residual_interaction_template")
+                    add(f"sin({xi})*cos({xj})", "residual_interaction_template")
+                    add(f"{xi}/(1+{xj}^2)", "residual_interaction_template")
+
+        for cand in list(((getattr(self, "_fp_result", {}) or {}).get("candidate_formulas") or []))[:8]:
+            add((cand or {}).get("formula"), "residual_fast_path_candidate")
+
+        # Cheap correlation prefilter so refinement sees the most residual-relevant templates first.
+        scored = []
+        for cand in candidates:
+            formula = cand.get("formula")
+            try:
+                values = self._safe_eval_formula_array(formula, X_arr).reshape(-1)
+            except Exception:
+                continue
+            mask = np.isfinite(values) & np.isfinite(residual)
+            if int(mask.sum()) < 8:
+                continue
+            vals = values[mask]
+            res = residual[mask]
+            if float(np.std(vals)) < 1e-12:
+                corr = 0.0
+            else:
+                corr = float(abs(np.corrcoef(vals, res)[0, 1]))
+                if not np.isfinite(corr):
+                    corr = 0.0
+            merged = dict(cand)
+            merged["residual_corr"] = corr
+            scored.append(merged)
+
+        scored.sort(
+            key=lambda c: (
+                -_finite_float(c.get("residual_corr"), 0.0),
+                _finite_float(c.get("complexity"), float("inf")),
+                str(c.get("formula", "")),
+            )
+        )
+        return scored[:max_candidates]
 
     def _run_residual_boosting(self, X, y, base_formula):
         """Run a multi-stage symbolic boosting loop on top of base_formula."""
@@ -3631,6 +3750,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.formula_eval_cache_hits_ = 0
         self._formula_eval_cache_ = {}
         self.fast_path_exact_skip_ = False
+        self.fast_path_exact_match_diagnostics_ = {}
         self.specialist_track_ = "incumbent path"
         self.specialist_vault_ = SpecialistVault(max_entries=int(getattr(self, "specialist_vault_size", 8) or 0))
         self.n_features_in_ = X.shape[1]
@@ -3797,12 +3917,18 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     exact_match_enabled=True,
                     exact_match_max_basis=200,
                     max_power=self.max_power,
+                    exact_match_backend=self.exact_match_backend,
+                    exact_match_min_gpu_work=self.exact_match_min_gpu_work,
+                    exact_match_max_combos=self.exact_match_max_combos,
                     simplify_formula_output=False,
                 )
 
                 if fp_result and fp_result.get('formula'):
                     fp_uncertainty = fp_result.get("uncertainty") or {}
                     fp_details = fp_result.get("details") or {}
+                    self.fast_path_exact_match_diagnostics_ = dict(fp_details.get("exact_match_diagnostics") or {})
+                    if isinstance(self.blackbox_diagnostics_, dict):
+                        self.blackbox_diagnostics_["fast_path_exact_match"] = self.fast_path_exact_match_diagnostics_
                     already_compact = bool(fp_details.get("compact_multivariate_basis", False))
                     if (
                         blackbox_state.enabled
@@ -3822,8 +3948,16 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             exact_match_enabled=True,
                             exact_match_max_basis=200,
                             max_power=self.max_power,
+                            exact_match_backend=self.exact_match_backend,
+                            exact_match_min_gpu_work=self.exact_match_min_gpu_work,
+                            exact_match_max_combos=self.exact_match_max_combos,
                             simplify_formula_output=False,
                         )
+                        if fp_result and fp_result.get('formula'):
+                            fp_details = fp_result.get("details") or {}
+                            self.fast_path_exact_match_diagnostics_ = dict(fp_details.get("exact_match_diagnostics") or {})
+                            if isinstance(self.blackbox_diagnostics_, dict):
+                                self.blackbox_diagnostics_["fast_path_exact_match"] = self.fast_path_exact_match_diagnostics_
                     elif isinstance(self.blackbox_diagnostics_, dict) and blackbox_state.enabled:
                         self.blackbox_diagnostics_["fast_path_auto_expand"] = not already_compact
                     best_formula = fp_result['formula']
