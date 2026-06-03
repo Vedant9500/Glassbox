@@ -286,35 +286,6 @@ def simplify_formula_with_guard(formula, X_ref, y_ref, mse_slack=0.02):
     return formula
 
 
-    """Aggregate per-seed runs into protocol-compliant stability summaries."""
-    valid = [r for r in seed_runs if r.get("r2") is not None]
-    if not valid:
-        return {
-            "seed_count": len(seed_runs),
-            "valid_seed_count": 0,
-            "r2_stats": compute_stability_stats([]),
-            "mse_stats": compute_stability_stats([]),
-            "time_stats": compute_stability_stats([]),
-            "exact_recovery_rate": None,
-            "exact_recovery_stats": compute_stability_stats([]),
-        }
-
-    r2_vals = [r["r2"] for r in valid if np.isfinite(r["r2"])]
-    mse_vals = [r["mse"] for r in valid if r.get("mse") is not None and np.isfinite(r["mse"])]
-    time_vals = [r["time"] for r in valid if r.get("time") is not None and np.isfinite(r["time"])]
-    exact_binary = [1.0 if r.get("exact_match") else 0.0 for r in valid]
-
-    return {
-        "seed_count": len(seed_runs),
-        "valid_seed_count": len(valid),
-        "r2_stats": compute_stability_stats(r2_vals),
-        "mse_stats": compute_stability_stats(mse_vals),
-        "time_stats": compute_stability_stats(time_vals),
-        "exact_recovery_rate": float(np.mean(exact_binary)) if exact_binary else None,
-        "exact_recovery_stats": compute_stability_stats(exact_binary),
-    }
-
-
 def _build_srbench_seed_graphs(x_np, y_np, detected_omegas, candidate_formulas=None, max_seeds=12):
     """Build seed graphs with the current shared signal-based helper."""
     try:
@@ -474,31 +445,6 @@ def run_with_hard_timeout(est_params, X_train, y_train, X_test, timeout_seconds,
             pass
 
 
-get_official_pmlb_regression_datasets = lambda: (
-    bc.get_official_pmlb_regression_datasets() or list(PMLB_DATASETS)
-)
-discover_official_ground_truth_problems = bc.discover_official_ground_truth_problems
-r2_score = bc.r2_score
-mse_score = bc.mse_score
-model_size = bc.model_size
-postprocess_formula = bc.postprocess_formula
-evaluate_formula = bc.evaluate_formula
-estimate_timeout_budget = bc.estimate_timeout_budget
-parse_seed_list = bc.parse_seed_list
-compute_stability_stats = bc.compute_stability_stats
-classify_failure_taxonomy = bc.classify_failure_taxonomy
-summarize_time_to_discovery = bc.summarize_time_to_discovery
-summarize_seed_runs = bc.summarize_seed_runs
-_fallback_estimator_predictions = bc.fallback_estimator_predictions
-_apply_srbench_run_budget = bc.apply_run_budget
-
-
-
-
-_fallback_estimator_predictions = bc.fallback_estimator_predictions
-_apply_srbench_run_budget = bc.apply_run_budget
-
-
 def resolve_specialist_phase_config(*, disable_specialist=False, enable_residual_stage=False, specialist_full=False):
     """Resolve SRBench specialist phase flags into estimator constructor booleans."""
     enabled = not bool(disable_specialist)
@@ -512,6 +458,23 @@ def resolve_specialist_phase_config(*, disable_specialist=False, enable_residual
         "inception": enabled,
         "full": full,
     }
+
+
+def make_seeded_train_test_split(X, y, *, n_samples, seed, train_fraction=0.8):
+    """Create a deterministic per-seed SRBench subsample and train/test split."""
+    X_arr = np.asarray(X)
+    y_arr = np.asarray(y)
+    rng = np.random.RandomState(int(seed))
+    n_total = len(y_arr)
+    if n_total > int(n_samples):
+        indices = rng.choice(n_total, int(n_samples), replace=False)
+    else:
+        indices = rng.permutation(n_total)
+    X_sel = X_arr[indices]
+    y_sel = y_arr[indices]
+    n_train = int(float(train_fraction) * len(y_sel))
+    n_train = max(1, min(len(y_sel) - 1, n_train))
+    return X_sel[:n_train], X_sel[n_train:], y_sel[:n_train], y_sel[n_train:]
 
 
 # ---------------------------------------------------------------------------
@@ -579,29 +542,24 @@ def run_track1_blackbox(
             results.append({"dataset": ds_name, "r2": None, "mse": None, "error": str(e)})
             continue
 
-        # Subsample if too large
-        if len(y) > n_samples:
-            rng = np.random.RandomState(42)
-            idx_sub = rng.choice(len(y), n_samples, replace=False)
-            X, y = X[idx_sub], y[idx_sub]
-
-        # Train/test split (80/20)
-        n_train = int(0.8 * len(y))
-        X_train, X_test = X[:n_train], X[n_train:]
-        y_train, y_test = y[:n_train], y[n_train:]
-
-        timeout_budget = estimate_timeout_budget(
-            base_timeout=est.get_params().get("timeout", 120),
-            n_features=X.shape[1],
-            n_train=n_train,
-            adaptive_timeout=adaptive_timeout,
-        )
-
         seed_runs = []
         for seed in seeds:
             for run_idx in range(max(1, int(runs_per_formula))):
                 repeat_seed = int(seed) + run_idx * 10007
                 try:
+                    X_train, X_test, y_train, y_test = make_seeded_train_test_split(
+                        X,
+                        y,
+                        n_samples=n_samples,
+                        seed=repeat_seed,
+                    )
+                    n_train = len(y_train)
+                    timeout_budget = estimate_timeout_budget(
+                        base_timeout=est.get_params().get("timeout", 120),
+                        n_features=X_train.shape[1],
+                        n_train=n_train,
+                        adaptive_timeout=adaptive_timeout,
+                    )
                     est_params = _apply_srbench_run_budget(est.get_params(), timeout_budget)
                     est_params["random_state"] = repeat_seed
 
@@ -629,6 +587,10 @@ def run_track1_blackbox(
                                     "time": elapsed,
                                     "error": run_result.get("error", run_result["status"]),
                                     "run_label": run_label,
+                                    "n_train": len(train_y),
+                                    "n_test": len(test_X),
+                                    "n_features": train_X.shape[1],
+                                    "timeout_budget": timeout_budget,
                                 }
 
                             formula = postprocess_formula(run_result.get("formula", ""))
@@ -670,6 +632,10 @@ def run_track1_blackbox(
                                 "formula_eval_diagnostics": eval_diag,
                                 "error": error_reason,
                                 "run_label": run_label,
+                                "n_train": len(train_y),
+                                "n_test": len(test_X),
+                                "n_features": train_X.shape[1],
+                                "timeout_budget": timeout_budget,
                             }
 
                         r2 = r2_score(y_test, y_pred)
@@ -687,6 +653,10 @@ def run_track1_blackbox(
                             "formula_eval_diagnostics": eval_diag,
                             "error": None,
                             "run_label": run_label,
+                            "n_train": len(train_y),
+                            "n_test": len(y_test),
+                            "n_features": train_X.shape[1],
+                            "timeout_budget": timeout_budget,
                             }
 
                     selected_result = _run_once("selected_features", X_train, y_train, X_test, est_params)
@@ -762,9 +732,9 @@ def run_track1_blackbox(
             "time": stability["time_stats"]["median"],
             "formula": best_run.get("formula", ""),
             "model_size": best_run.get("model_size"),
-            "n_train": n_train,
-            "n_test": len(y_test),
-            "n_features": X.shape[1],
+            "n_train": best_run.get("n_train"),
+            "n_test": best_run.get("n_test"),
+            "n_features": best_run.get("n_features"),
             "error": None,
             "seed_runs": seed_runs,
             "stability": stability,
@@ -773,6 +743,7 @@ def run_track1_blackbox(
             "runs_per_formula": int(max(1, int(runs_per_formula))),
             "ablation_mode": bool(ablation_mode),
             "best_blackbox_search_plan": best_search_plan,
+            "timeout_budget": best_run.get("timeout_budget"),
         }
         results.append(aggregate)
 
@@ -785,7 +756,7 @@ def run_track1_blackbox(
                 f"  [{idx+1:3d}/{len(ds_list)}] {ds_name:40s} "
                 f"R²(med)={median_r2:7.4f}  MSE(med)={median_mse:.3e}  "
                 f"{median_time:5.1f}s  {symbol}  "
-                f"(budget={timeout_budget}s, seeds={len(seeds)})"
+                f"(budget={aggregate.get('timeout_budget')}s, seeds={len(seeds)})"
             )
 
     return results

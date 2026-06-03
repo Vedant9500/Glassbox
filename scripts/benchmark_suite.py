@@ -25,9 +25,11 @@ import argparse
 import json
 import math
 import os
+import pickle
 import platform
 import random
 import re
+import subprocess
 import sys
 import time
 import warnings
@@ -1320,7 +1322,10 @@ def run_formula(
 
     # Score
     result["score_mse"] = result["mse"]
-    result["score"] = score_result(result["mse"], result["formula_discovered"])
+    if result.get("error") and "timeout" in str(result.get("error")).lower():
+        result["score"] = "FAIL"
+    else:
+        result["score"] = score_result(result["mse"], result["formula_discovered"])
     return result
 
 
@@ -1331,6 +1336,7 @@ def run_formula_cpp_evolution(
     pop_size: int = 100,
     generations: int = 1000,
     device: Optional[str] = None,
+    timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run pure C++ evolution on a single formula (no classifier fast-path)."""
     import sys
@@ -1463,6 +1469,9 @@ def run_formula_cpp_evolution(
                 result["error"] = "formula_eval_failed"
         result["time"] = elapsed
         result["n_terms"] = _count_terms(result["formula_discovered"])
+        if timeout is not None and elapsed > float(timeout):
+            result["error"] = f"timeout_exceeded after {elapsed:.1f}s"
+            result["score"] = "FAIL"
         
     except ImportError as e:
         result["error"] = f"C++ backend not available: {e}"
@@ -1473,7 +1482,10 @@ def run_formula_cpp_evolution(
         result["time"] = 0.0
     
     result["score_mse"] = result["mse"]
-    result["score"] = score_result(result["mse"], result["formula_discovered"])
+    if result.get("error") and "timeout" in str(result.get("error")).lower():
+        result["score"] = "FAIL"
+    else:
+        result["score"] = score_result(result["mse"], result["formula_discovered"])
     return result
 
 
@@ -1657,6 +1669,111 @@ def run_formula_specialist_regressor(
     result["score_mse"] = result["mse"]
     result["score"] = score_result(result["mse"], result["formula_discovered"])
     return result
+
+
+def _timeout_result(formula_str: str, x_range: Tuple[float, float], elapsed: float, error: str) -> Dict[str, Any]:
+    return {
+        "formula_target": formula_str,
+        "x_range": list(x_range),
+        "formula_discovered": "",
+        "mse": None,
+        "mse_raw": None,
+        "mse_display": None,
+        "time": float(elapsed),
+        "score": "FAIL",
+        "error": error,
+        "n_terms": 0,
+        "score_mse": None,
+        "display_eval_diagnostics": None,
+    }
+
+
+def _benchmark_worker_cli(input_path: str, output_path: str) -> int:
+    try:
+        with open(input_path, "rb") as fh:
+            call_spec = pickle.load(fh)
+        fn = globals()[call_spec["function"]]
+        payload = {"status": "ok", "result": fn(**call_spec["kwargs"])}
+    except Exception as exc:
+        payload = {
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    with open(output_path, "wb") as fh:
+        pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    return 0
+
+
+def run_benchmark_call_with_timeout(
+    function_name: str,
+    kwargs: Dict[str, Any],
+    timeout_seconds: Optional[float],
+) -> Dict[str, Any]:
+    """Run a benchmark formula call in a child process with hard wall-clock timeout."""
+    timeout_seconds = float(timeout_seconds or 0.0)
+    if timeout_seconds <= 0:
+        return globals()[function_name](**kwargs)
+
+    worker_dir = Path("scratch") / "benchmark_workers"
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    unique = f"{os.getpid()}_{time.time_ns()}"
+    input_path = worker_dir / f"{unique}.in.pkl"
+    output_path = worker_dir / f"{unique}.out.pkl"
+    t0 = time.time()
+    with open(input_path, "wb") as fh:
+        pickle.dump({"function": function_name, "kwargs": kwargs}, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    try:
+        cmd = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--_benchmark-worker",
+            str(input_path),
+            str(output_path),
+        ]
+        completed = subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent.parent), timeout=timeout_seconds)
+        elapsed = time.time() - t0
+        if completed.returncode != 0:
+            return _timeout_result(
+                kwargs.get("formula_str", ""),
+                kwargs.get("x_range", (0.0, 0.0)),
+                elapsed,
+                f"worker exited with code {completed.returncode}",
+            )
+        if not output_path.exists():
+            return _timeout_result(
+                kwargs.get("formula_str", ""),
+                kwargs.get("x_range", (0.0, 0.0)),
+                elapsed,
+                "worker produced no result",
+            )
+        with open(output_path, "rb") as fh:
+            payload = pickle.load(fh)
+        if payload.get("status") == "ok":
+            result = payload["result"]
+            elapsed = float(result.get("time") or (time.time() - t0))
+            if elapsed > timeout_seconds:
+                result["error"] = f"timeout_exceeded after {elapsed:.1f}s"
+                result["score"] = "FAIL"
+            return result
+
+        error = payload.get("error", "worker error")
+        return _timeout_result(kwargs.get("formula_str", ""), kwargs.get("x_range", (0.0, 0.0)), elapsed, error)
+    except subprocess.TimeoutExpired:
+        elapsed = time.time() - t0
+        return _timeout_result(
+            kwargs.get("formula_str", ""),
+            kwargs.get("x_range", (0.0, 0.0)),
+            elapsed,
+            f"hard timeout after {elapsed:.1f}s",
+        )
+    finally:
+        for path in (input_path, output_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -2000,11 +2117,22 @@ def compare_benchmark_results(
         else:
             direction = "same"
             summary["same"] += 1
-        if direction != "same" or prev_score != cur_score:
-            summary["changed"] += 1
 
         prev_mse = prev.get("mse")
         cur_mse = cur.get("mse")
+        prev_formula = prev.get("formula_discovered")
+        cur_formula = cur.get("formula_discovered")
+        mse_changed = False
+        try:
+            if prev_mse is None or cur_mse is None:
+                mse_changed = prev_mse != cur_mse
+            else:
+                mse_changed = not math.isclose(float(prev_mse), float(cur_mse), rel_tol=1e-9, abs_tol=1e-12)
+        except Exception:
+            mse_changed = prev_mse != cur_mse
+        formula_changed = prev_formula != cur_formula
+        if direction != "same" or prev_score != cur_score or mse_changed or formula_changed:
+            summary["changed"] += 1
         transitions.append({
             "formula": key,
             "previous_score": prev_score,
@@ -2012,8 +2140,10 @@ def compare_benchmark_results(
             "direction": direction,
             "previous_mse": prev_mse,
             "current_mse": cur_mse,
-            "previous_formula": prev.get("formula_discovered"),
-            "current_formula": cur.get("formula_discovered"),
+            "previous_formula": prev_formula,
+            "current_formula": cur_formula,
+            "mse_changed": mse_changed,
+            "formula_changed": formula_changed,
         })
 
     for key in sorted(set(previous) - set(current)):
@@ -2149,7 +2279,11 @@ Examples:
     )
     parser.add_argument(
         "--timeout", type=float, default=60.0,
-        help="Timeout per formula in seconds (default: 60)",
+        help="Engine timeout budget per formula in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--hard-timeout", action="store_true",
+        help="Run each formula in a subprocess and enforce --timeout as a hard wall-clock limit",
     )
     parser.add_argument(
         "--quiet", action="store_true",
@@ -2360,54 +2494,62 @@ Examples:
             
             for _ in range(args.runs):
                 if args.cpp_evolution_only:
-                    result = run_formula_cpp_evolution(
-                        formula_str,
-                        x_range,
-                        n_samples=args.n_samples,
-                        pop_size=args.pop_size,
-                        generations=args.generations,
-                        device=device,
-                    )
+                    call_name = "run_formula_cpp_evolution"
+                    call_kwargs = {
+                        "formula_str": formula_str,
+                        "x_range": x_range,
+                        "n_samples": args.n_samples,
+                        "pop_size": args.pop_size,
+                        "generations": args.generations,
+                        "device": device,
+                        "timeout": args.timeout,
+                    }
                 elif args.specialist_regressor:
-                    result = run_formula_specialist_regressor(
-                        formula_str,
-                        x_range,
-                        classifier_path=args.classifier_model,
-                        proposer_path=None if args.disable_proposer else args.proposer_model,
-                        n_samples=args.n_samples,
-                        device=device,
-                        timeout=args.timeout,
-                        population_size=args.guided_pop_size,
-                        generations=args.guided_generations,
-                        specialist_enabled=not args.specialist_baseline,
-                        specialist_diagnostics=specialist_diagnostics,
-                        specialist_composition=specialist_composition,
-                        specialist_residual=specialist_residual,
-                        specialist_vault=specialist_vault,
-                        specialist_inception=specialist_inception,
-                        exact_match_backend=args.exact_match_backend,
-                        exact_match_min_gpu_work=args.exact_match_min_gpu_work,
-                        exact_match_max_combos=args.exact_match_max_combos,
-                    )
+                    call_name = "run_formula_specialist_regressor"
+                    call_kwargs = {
+                        "formula_str": formula_str,
+                        "x_range": x_range,
+                        "classifier_path": args.classifier_model,
+                        "proposer_path": None if args.disable_proposer else args.proposer_model,
+                        "n_samples": args.n_samples,
+                        "device": device,
+                        "timeout": args.timeout,
+                        "population_size": args.guided_pop_size,
+                        "generations": args.guided_generations,
+                        "specialist_enabled": not args.specialist_baseline,
+                        "specialist_diagnostics": specialist_diagnostics,
+                        "specialist_composition": specialist_composition,
+                        "specialist_residual": specialist_residual,
+                        "specialist_vault": specialist_vault,
+                        "specialist_inception": specialist_inception,
+                        "exact_match_backend": args.exact_match_backend,
+                        "exact_match_min_gpu_work": args.exact_match_min_gpu_work,
+                        "exact_match_max_combos": args.exact_match_max_combos,
+                    }
                 else:
-                    result = run_formula(
-                        formula_str,
-                        x_range,
-                        classifier_path=args.classifier_model,
-                        n_samples=args.n_samples,
-                        device=device,
-                        timeout=args.timeout,
-                        with_evolution=args.with_evolution,
-                        evolution_only=args.evolution_only,
-                        proposer_path=args.proposer_model,
-                        disable_proposer=args.disable_proposer,
-                        evolution_generations=args.guided_generations,
-                        evolution_population=args.guided_pop_size,
-                        trust_proposer_plan=args.trust_proposer_plan,
-                        exact_match_backend=args.exact_match_backend,
-                        exact_match_min_gpu_work=args.exact_match_min_gpu_work,
-                        exact_match_max_combos=args.exact_match_max_combos,
-                    )
+                    call_name = "run_formula"
+                    call_kwargs = {
+                        "formula_str": formula_str,
+                        "x_range": x_range,
+                        "classifier_path": args.classifier_model,
+                        "n_samples": args.n_samples,
+                        "device": device,
+                        "timeout": args.timeout,
+                        "with_evolution": args.with_evolution,
+                        "evolution_only": args.evolution_only,
+                        "proposer_path": args.proposer_model,
+                        "disable_proposer": args.disable_proposer,
+                        "evolution_generations": args.guided_generations,
+                        "evolution_population": args.guided_pop_size,
+                        "trust_proposer_plan": args.trust_proposer_plan,
+                        "exact_match_backend": args.exact_match_backend,
+                        "exact_match_min_gpu_work": args.exact_match_min_gpu_work,
+                        "exact_match_max_combos": args.exact_match_max_combos,
+                    }
+                if args.hard_timeout:
+                    result = run_benchmark_call_with_timeout(call_name, call_kwargs, args.timeout)
+                else:
+                    result = globals()[call_name](**call_kwargs)
                 
                 # Keep the best result based on displayed MSE (or just any valid MSE if best_result is None)
                 if best_result is None:
@@ -2499,4 +2641,6 @@ Examples:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--_benchmark-worker":
+        raise SystemExit(_benchmark_worker_cli(sys.argv[2], sys.argv[3]))
     main()

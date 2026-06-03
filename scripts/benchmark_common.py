@@ -130,19 +130,29 @@ def normalize_formula_text(formula):
     """Normalize common unicode/operator variants to a parser-friendly form."""
     if not formula:
         return formula
-    formula = (
-        str(formula)
-        .replace("Â²", "^2")
-        .replace("Â³", "^3")
-        .replace("Â·", "*")
-        .replace("â‹…", "*")
-        .replace("Ã—", "*")
-        .replace("Ï€", "pi")
-        .replace("âˆš", "sqrt")
-        .replace("Ï†", "phi")
-        .replace("Ï‰", "omega")
-        .replace("np.", "")
-    )
+    replacements = {
+        "\u00b2": "^2",
+        "\u00b3": "^3",
+        "\u00b7": "*",
+        "\u22c5": "*",
+        "\u00d7": "*",
+        "\u03c0": "pi",
+        "\u221a": "sqrt",
+        "\u03c6": "phi",
+        "\u03c9": "omega",
+    }
+    for src, dst in list(replacements.items()):
+        variant = src
+        for _ in range(2):
+            try:
+                variant = variant.encode("utf-8").decode("latin-1")
+            except UnicodeError:
+                break
+            replacements.setdefault(variant, dst)
+
+    formula = str(formula).replace("np.", "")
+    for src, dst in replacements.items():
+        formula = formula.replace(src, dst)
     return re.sub(r"\s+", "", formula)
 
 
@@ -427,6 +437,15 @@ def evaluate_formula(formula_str, X, *, return_diagnostics=False):
 
     if not formula_str:
         return _finish(None, reason="empty_formula")
+
+    try:
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+        if X.ndim != 2:
+            return _finish(None, reason="invalid_X_shape")
+    except Exception as exc:
+        return _finish(None, reason="invalid_X", exc=exc)
 
     formula = normalize_formula_text(formula_str).strip()
     formula = re.sub(r"\|([^|]+)\|", r"abs(\1)", formula)
@@ -713,10 +732,10 @@ def postprocess_formula_with_fidelity_guard(
     processed = postprocess_formula(formula, fraction_tol=0.01, max_fraction_denominator=12)
     raw_mse = evaluate_formula_mse_on_X(formula, X, y)
     processed_mse = evaluate_formula_mse_on_X(processed, X, y)
+    fallback = protect_fractional_powers(normalize_formula_text(formula).replace("^", "**"))
+    fallback_mse = evaluate_formula_mse_on_X(fallback, X, y)
 
     if processed_mse is None:
-        fallback = protect_fractional_powers(normalize_formula_text(formula).replace("^", "**"))
-        fallback_mse = evaluate_formula_mse_on_X(fallback, X, y)
         X_diag = np.asarray(X, dtype=np.float64)
         if X_diag.ndim == 1:
             X_diag = X_diag.reshape(-1, 1)
@@ -730,11 +749,19 @@ def postprocess_formula_with_fidelity_guard(
             "postprocess_processed_eval_diagnostics": processed_diag,
         }
 
+    if raw_mse is None and processed != fallback:
+        return fallback, {
+            "postprocess_guard_triggered": True,
+            "postprocess_raw_mse": raw_mse,
+            "postprocess_processed_mse": processed_mse,
+            "postprocess_fallback_mse": fallback_mse,
+            "postprocess_guard_reason": "raw_formula_eval_failed_after_rewrite",
+            "postprocess_processed_eval_diagnostics": None,
+        }
+
     if raw_mse is not None:
         allowed = raw_mse * (1.0 + max(0.0, float(relative_slack))) + max(0.0, float(absolute_slack))
         if processed_mse > allowed:
-            fallback = protect_fractional_powers(normalize_formula_text(formula).replace("^", "**"))
-            fallback_mse = evaluate_formula_mse_on_X(fallback, X, y)
             if fallback_mse is not None and fallback_mse <= processed_mse:
                 return fallback, {
                     "postprocess_guard_triggered": True,
@@ -781,7 +808,7 @@ def parse_seed_list(seed_text):
     return sorted(set(seeds))
 
 
-def compute_stability_stats(values):
+def compute_stability_stats(values, *, higher_is_better=True):
     """Compute median/IQR/std and worst-decile summary for a metric list."""
     if not values:
         return {
@@ -796,10 +823,11 @@ def compute_stability_stats(values):
     q75 = float(np.percentile(arr, 75))
     if arr.size >= 10:
         worst_count = max(1, int(np.ceil(arr.size * 0.1)))
-        worst = np.sort(arr)[:worst_count]
+        sorted_arr = np.sort(arr)
+        worst = sorted_arr[:worst_count] if higher_is_better else sorted_arr[-worst_count:]
         worst_decile = float(np.mean(worst))
     else:
-        worst_decile = float(np.min(arr))
+        worst_decile = float(np.min(arr) if higher_is_better else np.max(arr))
     return {
         "median": q50,
         "iqr": float(q75 - q25),
@@ -882,8 +910,8 @@ def summarize_seed_runs(seed_runs):
             "seed_count": len(seed_runs),
             "valid_seed_count": 0,
             "r2_stats": compute_stability_stats([]),
-            "mse_stats": compute_stability_stats([]),
-            "time_stats": compute_stability_stats([]),
+            "mse_stats": compute_stability_stats([], higher_is_better=False),
+            "time_stats": compute_stability_stats([], higher_is_better=False),
             "exact_recovery_rate": None,
             "exact_recovery_stats": compute_stability_stats([]),
         }
@@ -897,8 +925,8 @@ def summarize_seed_runs(seed_runs):
         "seed_count": len(seed_runs),
         "valid_seed_count": len(valid),
         "r2_stats": compute_stability_stats(r2_vals),
-        "mse_stats": compute_stability_stats(mse_vals),
-        "time_stats": compute_stability_stats(time_vals),
+        "mse_stats": compute_stability_stats(mse_vals, higher_is_better=False),
+        "time_stats": compute_stability_stats(time_vals, higher_is_better=False),
         "exact_recovery_rate": float(np.mean(exact_binary)) if exact_binary else None,
         "exact_recovery_stats": compute_stability_stats(exact_binary),
     }

@@ -81,6 +81,23 @@ def test_srbench_runner_uses_shared_benchmark_helpers():
     assert rsl.evaluate_formula is bc.evaluate_formula
 
 
+def test_make_seeded_train_test_split_changes_with_seed_and_preserves_size():
+    X = np.arange(100, dtype=float).reshape(50, 2)
+    y = np.arange(50, dtype=float)
+
+    split_a = rsl.make_seeded_train_test_split(X, y, n_samples=20, seed=1)
+    split_b = rsl.make_seeded_train_test_split(X, y, n_samples=20, seed=2)
+    X_train_a, X_test_a, y_train_a, y_test_a = split_a
+    X_train_b, X_test_b, y_train_b, y_test_b = split_b
+
+    assert len(y_train_a) == 16
+    assert len(y_test_a) == 4
+    assert X_train_a.shape == (16, 2)
+    assert X_test_a.shape == (4, 2)
+    assert not np.array_equal(y_train_a, y_train_b)
+    assert not np.array_equal(y_test_a, y_test_b)
+
+
 def test_evaluate_formula_supports_log_with_base():
     X = np.random.RandomState(0).randn(10, 3)
     y_pred, diag = rsl.evaluate_formula("log(E,10)", X, return_diagnostics=True)

@@ -1,5 +1,8 @@
 """Regression tests for benchmark scoring reliability contracts."""
 
+import json
+from pathlib import Path
+
 import numpy as np
 
 from scripts import benchmark_suite as bs
@@ -18,6 +21,42 @@ def test_formula_mse_eval_returns_none_on_parse_failure():
 def test_benchmark_suite_uses_shared_formula_helpers():
     assert bs._postprocess_formula is bc.postprocess_formula
     assert bs._evaluate_formula_mse is bc.evaluate_formula_mse
+
+
+def test_compare_benchmark_results_counts_same_score_formula_and_mse_changes():
+    scratch = Path("scratch")
+    scratch.mkdir(exist_ok=True)
+    previous_path = scratch / "test_compare_previous.json"
+    previous_path.write_text(json.dumps({
+        "tiers": {
+            "1": {
+                "results": [{
+                    "formula_target": "x",
+                    "score": "EXACT",
+                    "mse": 1e-8,
+                    "formula_discovered": "x",
+                }]
+            }
+        }
+    }), encoding="utf-8")
+    current = {
+        1: [{
+            "formula_target": "x",
+            "score": "EXACT",
+            "mse": 5e-8,
+            "formula_discovered": "1*x",
+        }]
+    }
+
+    try:
+        comparison = bs.compare_benchmark_results(previous_path, current)
+    finally:
+        previous_path.unlink(missing_ok=True)
+
+    assert comparison["summary"]["same"] == 1
+    assert comparison["summary"]["changed"] == 1
+    assert comparison["transitions"][0]["formula_changed"] is True
+    assert comparison["transitions"][0]["mse_changed"] is True
 
 
 def test_formula_mse_eval_handles_base_log_constants():
