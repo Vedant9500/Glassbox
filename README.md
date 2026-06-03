@@ -115,8 +115,7 @@ python scripts/sr_tester.py --mode single --formula "x^2 + sin(x)"
 - `scripts/specialist_phase_eval.py`: phase harnesses for specialist composition
   and residual/inception features.
 - `scripts/train_universal_proposer.py`: proposer training and replay-data path.
-- `scripts/train_xgboost_classifier.py` and
-  `glassbox/curve_classifier/train_curve_classifier.py`: classifier training.
+- `glassbox/curve_classifier/train_curve_classifier.py`: classifier training.
 
 ## Project Map
 

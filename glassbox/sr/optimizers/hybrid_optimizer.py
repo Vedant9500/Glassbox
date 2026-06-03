@@ -377,6 +377,7 @@ class EvolutionaryOptimizer:
         self.generation += 1
         
         # Stats
+        self.evaluate_population(x_eval, y_eval)
         fitnesses = [ind.fitness for ind in self.population]
         return {
             'generation': self.generation,

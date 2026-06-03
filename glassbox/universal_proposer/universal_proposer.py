@@ -9,6 +9,7 @@ Phase 1 MVP module:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Sequence, Set
 
@@ -18,6 +19,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from glassbox.sr.fpip_v2 import validate_fpip_v2_payload
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 DEFAULT_OPERATOR_VOCAB: List[str] = [
@@ -321,6 +324,7 @@ def _safe_formula_eval(formula: str, x: np.ndarray) -> Optional[np.ndarray]:
         "cos": np.cos,
         "exp": lambda z: np.exp(np.clip(z, -30.0, 30.0)),
         "log": lambda z: np.log(np.abs(z) + 1e-6),
+        "sqrt": lambda z: np.sqrt(np.abs(z) + 1e-6),
         "abs": np.abs,
     }
     expr = formula.replace("^", "**")
@@ -425,6 +429,7 @@ def grammar_decode_multivariate_skeletons(
             mask = np.isfinite(xi) & np.isfinite(xj) & np.isfinite(y)
             if int(mask.sum()) < 8:
                 continue
+            x_pair_full = x[mask, :]
             xi = xi[mask]
             xj = xj[mask]
             yj = y[mask]
@@ -446,7 +451,7 @@ def grammar_decode_multivariate_skeletons(
                 f"{vi}*{vj}+{vi}+{vj}",
             ]
             for formula in candidates:
-                basis = _safe_formula_eval_multivariate(formula, np.column_stack([xi, xj]))
+                basis = _safe_formula_eval_multivariate(formula, x_pair_full)
                 mse = float("inf")
                 fit_score = 0.0
                 if basis is not None:
@@ -712,10 +717,12 @@ def propose_from_xy(
     features: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Run proposer on a single curve and return decoded candidates + priors."""
+    x = np.asarray(x)
+    y = np.asarray(y)
     if x.ndim == 2 and x.shape[1] == 1:
         x = x[:, 0]
-    if x.ndim != 1:
-        raise ValueError(f"Expected x to be 1D or [N,1], got shape {x.shape}")
+    elif x.ndim not in (1, 2):
+        raise ValueError(f"Expected x to be 1D, [N,1], or [N,D], got shape {x.shape}")
 
     y = y.reshape(-1)
     if x.shape[0] != y.shape[0]:
@@ -853,12 +860,37 @@ def proposer_output_to_fpip_v2(
     return payload
 
 
+def _is_trusted_checkpoint_path(checkpoint_path: Path) -> bool:
+    resolved = checkpoint_path.resolve()
+    trusted_roots = [
+        (_REPO_ROOT / "models").resolve(),
+        (_REPO_ROOT / "artifacts").resolve(),
+    ]
+    return any(resolved == root or root in resolved.parents for root in trusted_roots)
+
+
+def _load_torch_checkpoint(checkpoint_path: Path):
+    try:
+        return torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except Exception as safe_error:
+        if not _is_trusted_checkpoint_path(checkpoint_path):
+            raise RuntimeError(
+                "Refusing unsafe pickle checkpoint load outside trusted local model directories. "
+                f"Move {checkpoint_path} under models/ or artifacts/, or convert it to a weights-only checkpoint."
+            ) from safe_error
+        print(
+            "Warning: weights-only checkpoint load failed; falling back to trusted local "
+            f"pickle checkpoint at {checkpoint_path}."
+        )
+        return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+
 def load_universal_proposer_checkpoint(
     checkpoint_path: str,
     device: Optional[str] = None,
 ) -> UniversalProposer:
     """Load UniversalProposer from checkpoint saved by train_universal_proposer.py."""
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    ckpt = _load_torch_checkpoint(Path(checkpoint_path))
     cfg_raw = ckpt.get("config", {})
     state_dict = ckpt["model_state_dict"]
     skeleton_vocab = cfg_raw.get("skeleton_vocab")

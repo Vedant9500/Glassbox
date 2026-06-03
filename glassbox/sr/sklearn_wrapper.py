@@ -31,6 +31,7 @@ from glassbox.sr.blackbox_preprocessor import (
 from glassbox.sr.specialist_state import SpecialistVault
 from glassbox.sr.specialist_state import compute_specialist_state
 from glassbox.sr.specialist_state import propose_specialist_compositions
+from glassbox.model_registry import DEFAULT_CURVE_CLASSIFIER_PATH
 
 
 def _clamp_int(value, default, lo, hi):
@@ -99,7 +100,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         use_fast_path=True,
         use_guided_evolution=True,
         use_simplification=True,
-        classifier_path="models/curve_classifier_multi.pt",
+        classifier_path=DEFAULT_CURVE_CLASSIFIER_PATH,
         simplification_int_tol=0.05,
         simplification_zero_tol=1e-3,
         max_power=6,
@@ -3076,8 +3077,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         }
 
         if proposer_plan:
-            # The current multivariate proposer is a proxy. Let it add seeds,
-            # but do not let it undo blackbox screening-first caps.
+            # Let proposer guidance add seeds, but keep blackbox screening-first caps.
             raw_generation_multiplier = plan["generation_multiplier"] * float(
                 _clamp_float(proposer_plan.get("generation_multiplier"), 1.0, 0.5, 4.0)
             )
@@ -3351,9 +3351,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 x1 = X_arr.reshape(-1)
                 proposer_status = "ok"
             else:
-                x_centered = X_arr - np.mean(X_arr, axis=0, keepdims=True)
-                x1 = np.linalg.norm(x_centered, axis=1)
-                proposer_status = "ok_multivariate_proxy"
+                x1 = X_arr
+                proposer_status = "ok_multivariate"
 
             y1 = np.asarray(y, dtype=np.float64).reshape(-1)
 
@@ -3371,7 +3370,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 top_k=int(max(1, self.universal_proposer_top_k)),
                 fit_diagnostics=fit_diag,
                 interaction_hints={
-                    "multivariate_proxy": bool(int(np.asarray(X).ndim) > 1 and np.asarray(X).shape[1] > 1),
+                    "multivariate_proxy": False,
                     "selected_feature_count": int(np.asarray(X).shape[1]) if np.asarray(X).ndim > 1 else 1,
                     "selected_features": list(getattr(blackbox_state, "selected_features", [])) if blackbox_state is not None else [],
                     "dropped_features": list(getattr(blackbox_state, "dropped_features", [])) if blackbox_state is not None else [],

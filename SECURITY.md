@@ -34,4 +34,12 @@ Security reports are especially helpful for:
 - Unsafe input handling in formula parsing, simplification, or evaluation paths
 - Dependency vulnerabilities with practical impact on this project
 
+## Trusted Local Artifacts
+
+Glassbox model checkpoints are treated as trusted local artifacts. PyTorch
+loaders first attempt weights-only loading. If an older pickle-backed checkpoint
+is required, fallback loading is restricted to repository-local `models/` and
+`artifacts/` paths. Do not load checkpoints from untrusted users or remote
+locations without converting them to a weights-only format first.
+
 Thank you for helping keep Glassbox and its users safe.

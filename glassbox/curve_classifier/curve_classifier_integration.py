@@ -5,7 +5,7 @@ Uses the trained curve classifier to predict operators and warm-start ONN evolut
 
 Usage:
     # Test on synthetic data
-    python scripts/curve_classifier_integration.py --model models/curve_classifier_wide.pt --formula "sin(x) + x**2"
+    python -m glassbox.curve_classifier.curve_classifier_integration --model models/curve_classifier_multi.pt --formula "sin(x) + x**2"
     
     # Integrate with ONN (in your training script)
     from scripts.curve_classifier_integration import predict_operators, bias_onn_from_predictions
@@ -18,6 +18,10 @@ import torch.nn.functional as F
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import sys
+from glassbox.model_registry import (
+    DEFAULT_CURVE_CLASSIFIER_PATH,
+    resolve_curve_classifier_path,
+)
 
 # Add repo root to path for imports
 _ROOT = Path(__file__).resolve().parent.parent.parent
@@ -36,16 +40,6 @@ except (ImportError, ValueError):
             OPERATOR_CLASSES = gcd.OPERATOR_CLASSES
         except ImportError:
             from glassbox.curve_classifier.generate_curve_data import extract_all_features, OPERATOR_CLASSES
-
-
-DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_wide.pt"
-PYTORCH_CLASSIFIER_FALLBACKS = (
-    "models/curve_classifier_mlp_eql.pt",
-    "models/curve_classfier_v4.pt",
-    "models/curve_classifier_wider.pt",
-    "models/curve_classifier.pt",
-)
-
 
 # =============================================================================
 # MODEL DEFINITION (must match training)
@@ -399,76 +393,62 @@ def _make_cache_key(model_path: str, resolved_device: torch.device) -> str:
     return f"{str(resolved_device)}:{str(Path(model_path).resolve())}"
 
 
+def _is_trusted_checkpoint_path(model_path: Path) -> bool:
+    resolved = model_path.resolve()
+    trusted_roots = [
+        (_ROOT / "models").resolve(),
+        (_ROOT / "artifacts").resolve(),
+    ]
+    return any(resolved == root or root in resolved.parents for root in trusted_roots)
+
+
+def _load_torch_checkpoint(model_path: Path):
+    try:
+        return torch.load(model_path, map_location='cpu', weights_only=True)
+    except Exception as safe_error:
+        if not _is_trusted_checkpoint_path(model_path):
+            raise RuntimeError(
+                "Refusing unsafe pickle checkpoint load outside trusted local model directories. "
+                f"Move {model_path} under models/ or artifacts/, or convert it to a weights-only checkpoint."
+            ) from safe_error
+        print(
+            "Warning: weights-only checkpoint load failed; falling back to trusted local "
+            f"pickle checkpoint at {model_path}."
+        )
+        return torch.load(model_path, map_location='cpu', weights_only=False)
+
+
 def _resolve_model_path(model_path: str) -> Path:
-    model_path_obj = Path(model_path)
-    if model_path_obj.exists():
-        return model_path_obj
-
-    if model_path == DEFAULT_CURVE_CLASSIFIER_PATH:
-        for candidate in PYTORCH_CLASSIFIER_FALLBACKS:
-            candidate_path = Path(candidate)
-            if candidate_path.exists():
-                print(
-                    f"Curve classifier model not found at {model_path}; "
-                    f"using {candidate_path} instead."
-                )
-                return candidate_path
-
-    raise FileNotFoundError(f"Classifier model not found at {model_path}")
+    resolved = resolve_curve_classifier_path(model_path)
+    if str(resolved) != str(Path(model_path)):
+        print(
+            f"Curve classifier model not found at {model_path}; "
+            f"using {resolved} instead."
+        )
+    return resolved
 
 
 def load_classifier(
     model_path: str = DEFAULT_CURVE_CLASSIFIER_PATH,
     device: Optional[str] = None,
 ):
-    """Load the trained curve classifier (supports PyTorch .pt and XGBoost .pkl)."""
+    """Load the trained PyTorch curve classifier."""
     global _cached_classifier_by_device
     
     resolved_device = _resolve_device(device)
     model_path_obj = _resolve_model_path(model_path)
+    if model_path_obj.suffix.lower() not in ('.pt', '.pth'):
+        raise ValueError(
+            f"Unsupported classifier artifact {model_path_obj}. "
+            "Legacy non-PyTorch classifier payloads have been removed; use a PyTorch .pt checkpoint."
+        )
+
     # Create cache key using both device and absolute model path
     cache_key = _make_cache_key(str(model_path_obj), resolved_device)
     if cache_key in _cached_classifier_by_device:
         return _cached_classifier_by_device[cache_key]
-    
-    # Check file extension to determine model type
-    if model_path_obj.suffix in ('.pkl', '.joblib'):
-        # XGBoost model
-        return _load_xgboost_classifier(model_path_obj, cache_key)
-    else:
-        # PyTorch model
-        return _load_pytorch_classifier(model_path_obj, resolved_device, cache_key)
 
-
-def _load_xgboost_classifier(model_path: Path, cache_key: str):
-    """Load XGBoost classifier from .pkl file."""
-    global _cached_classifier_by_device, _cached_operator_classes_by_key, _cached_metadata_by_device
-    
-    import joblib
-    
-    payload = joblib.load(model_path)
-    
-    operator_classes = payload.get('operator_classes', list(OPERATOR_CLASSES.keys()))
-    _cached_operator_classes_by_key[cache_key] = operator_classes
-    
-    # Store the XGBoost models and metadata
-    _cached_classifier_by_device[cache_key] = {
-        'type': 'xgboost',
-        'models': payload['models'],
-        'thresholds': payload.get('thresholds'),
-    }
-    _cached_metadata_by_device[cache_key] = {
-        'thresholds': payload.get('thresholds'),
-        'feature_scaler': payload.get('feature_scaler'),
-        'type': 'xgboost',
-        'operator_classes': operator_classes,
-        'isotonic_calibration': payload.get('isotonic_calibration'),
-    }
-    
-    print(f"Loaded XGBoost curve classifier from {model_path}")
-    print(f"  {len([m for m in payload['models'] if m is not None])} active classifiers")
-    
-    return _cached_classifier_by_device[cache_key]
+    return _load_pytorch_classifier(model_path_obj, resolved_device, cache_key)
 
 
 def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, cache_key: str) -> nn.Module:
@@ -476,7 +456,7 @@ def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, ca
     global _cached_classifier_by_device, _cached_operator_classes_by_key, _cached_metadata_by_device
     
     try:
-        checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+        checkpoint = _load_torch_checkpoint(model_path)
     except Exception as e:
         print(f"Error loading checkpoint from {model_path}: {e}")
         raise
@@ -553,27 +533,6 @@ def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, ca
 # PREDICTION
 # =============================================================================
 
-def _predict_xgboost(model_dict: dict, features: np.ndarray, metadata: dict | None = None) -> np.ndarray:
-    """Predict using XGBoost models, with optional isotonic calibration."""
-    models = model_dict['models']
-    n_classes = len(models)
-    probs = np.zeros(n_classes, dtype=np.float32)
-    
-    features_2d = features.reshape(1, -1)
-    
-    for i, m in enumerate(models):
-        if m is None:
-            probs[i] = 0.0
-        else:
-            probs[i] = m.predict_proba(features_2d)[0, 1]
-    
-    # Apply per-class isotonic calibration if available
-    if metadata and metadata.get('isotonic_calibration'):
-        probs = _apply_isotonic_calibration(probs, metadata['isotonic_calibration'])
-    
-    return probs
-
-
 def _predict_pytorch(model: nn.Module, features: np.ndarray, metadata: dict, device: torch.device) -> np.ndarray:
     """Predict using PyTorch model, with optional isotonic calibration."""
     features_tensor = torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(device)
@@ -623,6 +582,31 @@ def _apply_isotonic_calibration(
     if single:
         return calibrated[0]
     return calibrated
+
+
+def _evaluate_demo_formula(formula: str, x: np.ndarray) -> np.ndarray:
+    """Evaluate CLI demo formulas through the shared restricted evaluator."""
+    from glassbox.universal_proposer.universal_proposer import _safe_formula_eval
+
+    y = _safe_formula_eval(formula, x)
+    if y is None:
+        raise ValueError("formula could not be evaluated safely over the requested x range")
+    return np.asarray(y, dtype=np.float64)
+
+
+def _prepare_curve_features(features: np.ndarray, scaler: Optional[dict] = None) -> np.ndarray:
+    """Apply the classifier feature transform used by training and inference."""
+    prepared = np.asarray(features, dtype=np.float32).copy()
+    end = min(prepared.shape[0], 398)
+    if end > 192:
+        prepared[192:end] = np.sign(prepared[192:end]) * np.log1p(np.abs(prepared[192:end]))
+
+    if scaler is not None:
+        dim = len(scaler['mean'])
+        prepared = prepared[:dim]
+        prepared = (prepared - scaler['mean']) / (scaler['std'] + 1e-8)
+
+    return prepared
 
 
 def predict_operators(
@@ -686,22 +670,11 @@ def predict_operators(
         )
     
     # Single-input: standard prediction
-    features = extract_all_features(y)
-    # Match IndexedFeatureDataset/compute_feature_stats preprocessing from
-    # training. Without this, scaler statistics are applied to uncompressed
-    # derivative/curvature/invariant features at inference time.
-    features[192:398] = np.sign(features[192:398]) * np.log1p(np.abs(features[192:398]))
-    scaler = metadata.get('feature_scaler')
-    if scaler is not None:
-        dim = len(scaler['mean'])
-        features = features[:dim]
-        features = (features - scaler['mean']) / (scaler['std'] + 1e-8)
-    
-    # Check if this is XGBoost or PyTorch model
-    if metadata.get('type') == 'xgboost':
-        probs = _predict_xgboost(model, features, metadata)
-    else:
-        probs = _predict_pytorch(model, features, metadata, resolved_device)
+    features = _prepare_curve_features(
+        extract_all_features(y),
+        metadata.get('feature_scaler'),
+    )
+    probs = _predict_pytorch(model, features, metadata, resolved_device)
     
     return _build_result_dict(probs, threshold, metadata, cache_key)
 
@@ -864,20 +837,8 @@ def _predict_operators_multi_input(
         
         # Extract features and predict
         try:
-            features = extract_all_features(y_slice_valid)
-            
-            # Apply SymLog compression selectively to non-raw/fft features
-            features[192:398] = np.sign(features[192:398]) * np.log1p(np.abs(features[192:398]))
-            
-            if scaler is not None:
-                dim = len(scaler['mean'])
-                features = features[:dim]
-                features = (features - scaler['mean']) / (scaler['std'] + 1e-8)
-            
-            if metadata.get('type') == 'xgboost':
-                probs = _predict_xgboost(model, features, metadata)
-            else:
-                probs = _predict_pytorch(model, features, metadata, device)
+            features = _prepare_curve_features(extract_all_features(y_slice_valid), scaler)
+            probs = _predict_pytorch(model, features, metadata, device)
             
             all_probs[var_idx] = probs
         except Exception as e:
@@ -927,16 +888,8 @@ def _predict_operators_multi_input(
             y_slice_valid = y_slice[valid_mask]
             
             try:
-                features = extract_all_features(y_slice_valid)
-                if scaler is not None:
-                    dim = len(scaler['mean'])
-                    features = features[:dim]
-                    features = (features - scaler['mean']) / (scaler['std'] + 1e-8)
-                
-                if metadata.get('type') == 'xgboost':
-                    probs = _predict_xgboost(model, features, metadata)
-                else:
-                    probs = _predict_pytorch(model, features, metadata, device)
+                features = _prepare_curve_features(extract_all_features(y_slice_valid), scaler)
+                probs = _predict_pytorch(model, features, metadata, device)
                 
                 all_probs = np.vstack([all_probs, probs])
             except Exception as e:
@@ -1108,7 +1061,7 @@ def main():
     x = np.linspace(args.x_min, args.x_max, args.n_points)
     
     try:
-        y = eval(args.formula, {"x": x, "np": np})
+        y = _evaluate_demo_formula(args.formula, x)
     except Exception as e:
         print(f"Error evaluating formula: {e}")
         return

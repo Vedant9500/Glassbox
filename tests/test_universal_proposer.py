@@ -46,6 +46,22 @@ def test_proposer_output_maps_to_valid_fpip_v2():
     assert "generation_multiplier" in payload["search_plan"]
 
 
+def test_universal_proposer_accepts_multivariate_input():
+    model = UniversalProposer(UniversalProposerConfig(hidden_dim=32, max_input_vars=3))
+    x0 = np.linspace(-1.0, 1.0, 64, dtype=np.float32)
+    x1 = np.linspace(0.5, 2.0, 64, dtype=np.float32)
+    X = np.stack([x0, x1], axis=1)
+    y = (x0 * x1).astype(np.float32)
+
+    out = propose_from_xy(model, X, y, top_k=4)
+
+    assert out["supports_multivariate_formulas"] is True
+    assert out["input_variables"] == ["x0", "x1"]
+    assert len(out["candidate_skeletons"]) == 4
+    joined = " | ".join(c["formula"] for c in out["candidate_skeletons"])
+    assert "x0" in joined and "x1" in joined
+
+
 def test_grammar_decoder_prefers_periodic_candidates():
     x = np.linspace(-2.0, 2.0, 128, dtype=np.float64)
     y = np.sin(x)
@@ -86,6 +102,27 @@ def test_multivariate_grammar_decoder_returns_cross_terms():
     assert len(top) == 5
     joined = " | ".join([c["formula"] for c in top])
     assert "x0*x1" in joined or "x0+x1" in joined
+
+
+def test_multivariate_grammar_decoder_preserves_feature_names_after_first_pair():
+    x0 = np.linspace(-1.0, 1.0, 80, dtype=np.float64)
+    x1 = np.linspace(0.2, 1.4, 80, dtype=np.float64)
+    x2 = np.linspace(1.0, 2.0, 80, dtype=np.float64)
+    X = np.stack([x0, x1, x2], axis=1)
+    y = x1 * x2
+    priors = {
+        "identity": 0.8,
+        "power": 0.2,
+        "rational": 0.1,
+        "sin": 0.05,
+        "cos": 0.05,
+        "periodic": 0.05,
+    }
+
+    top = grammar_decode_multivariate_skeletons(priors, X, y, top_k=8, max_rank=3)
+    joined = " | ".join([c["formula"] for c in top])
+
+    assert "x1*x2" in joined
 
 
 def test_formula_replay_dataset_loads_npz(tmp_path: Path):

@@ -7,13 +7,13 @@ the updated checkpoint with calibration metadata.
 
 Usage:
     # Calibrate using existing dataset
-    python scripts/calibrate_classifier.py --model models/curve_classifier_wide.pt --data data/curve_dataset_500k_v2.npz
+    python scripts/calibrate_classifier.py --model models/curve_classifier_multi.pt --data data/curve_dataset_500k_v2.npz
 
     # Calibrate with custom split ratio
-    python scripts/calibrate_classifier.py --model models/curve_classifier_wide.pt --data data/curve_dataset_500k_v2.npz --val-ratio 0.2
+    python scripts/calibrate_classifier.py --model models/curve_classifier_multi.pt --data data/curve_dataset_500k_v2.npz --val-ratio 0.2
 
     # Calibrate and save to new path
-    python scripts/calibrate_classifier.py --model models/curve_classifier_wide.pt --data data/curve_dataset_500k_v2.npz --output models/curve_classifier_v3.2_calibrated.pt
+    python scripts/calibrate_classifier.py --model models/curve_classifier_multi.pt --data data/curve_dataset_500k_v2.npz --output models/curve_classifier_multi_calibrated.pt
 """
 
 import numpy as np
@@ -39,9 +39,10 @@ from glassbox.curve_classifier.train_curve_classifier import (
 from glassbox.curve_classifier.generate_curve_data import OPERATOR_CLASSES
 
 try:
-    from curve_classifier_integration import (
+    from glassbox.curve_classifier.curve_classifier_integration import (
         load_classifier,
         _cached_metadata_by_device,
+        _load_torch_checkpoint,
         _make_cache_key,
         _resolve_device,
         predict_operators,
@@ -72,6 +73,10 @@ def load_calibration_data(
     rng.shuffle(indices)
     
     n_val = int(len(indices) * val_ratio)
+    if n_val < 1:
+        raise ValueError(
+            f"val_ratio={val_ratio} with {len(indices)} samples creates an empty calibration split."
+        )
     val_indices = indices[:n_val]
     
     val_features = features[val_indices]
@@ -111,7 +116,7 @@ def calibrate_existing_model(
         retune_thresholds: Whether to re-tune thresholds on calibrated probs
     """
     # Load existing checkpoint
-    checkpoint = torch.load(model_path, map_location='cpu', weights_only=False)
+    checkpoint = _load_torch_checkpoint(Path(model_path))
     
     operator_classes = checkpoint.get('operator_classes', list(OPERATOR_CLASSES.keys()))
     n_classes = len(operator_classes)

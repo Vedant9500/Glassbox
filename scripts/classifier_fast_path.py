@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from typing import Any, Dict, List, Tuple, Optional
 
+from glassbox.model_registry import DEFAULT_CURVE_CLASSIFIER_PATH
 from glassbox.sr.operations.meta_ops import get_constant_symbol, normalize_formula_ascii
 from glassbox.sr.fpip_v2 import build_fpip_v2_from_fast_path, validate_fpip_v2_payload
 
@@ -29,7 +30,6 @@ _FREQ_SIN_PATTERN = re.compile(r'sin\(([0-9.]+)\*?x', re.IGNORECASE)
 _FREQ_COS_PATTERN = re.compile(r'cos\(([0-9.]+)\*?x', re.IGNORECASE)
 _POWER_PATTERN = re.compile(r'x\^([0-9.]+)', re.IGNORECASE)
 
-DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_wide.pt"
 DEFAULT_EXACT_MATCH_MIN_GPU_WORK = 250_000
 DEFAULT_EXACT_MATCH_MAX_COMBOS = 50_000
 

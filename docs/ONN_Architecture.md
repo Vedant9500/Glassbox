@@ -41,7 +41,7 @@ GlassboxRegressor.fit()
 |---|---|---|
 | Estimator/orchestrator | `glassbox/sr/sklearn_wrapper.py` | Main runtime path and sklearn API. |
 | Fast path | `scripts/classifier_fast_path.py` | Basis generation, exact match, regression, FPIP v2 handoff, guided evolution wrapper. |
-| Curve classifier | `glassbox/curve_classifier/curve_classifier_integration.py` | PyTorch/XGBoost model loading and operator prediction. |
+| Curve classifier | `glassbox/curve_classifier/curve_classifier_integration.py` | PyTorch model loading and operator prediction. |
 | Feature extraction | `glassbox/curve_classifier/generate_curve_data.py` | FFT, derivative, curvature, invariant, PCFG, and synthetic-data helpers. |
 | Universal proposer | `glassbox/universal_proposer/universal_proposer.py` | GLU proposer, grammar-constrained skeletons, uncertainty, search planning, FPIP v2 adapter. |
 | FPIP v2 | `glassbox/sr/fpip_v2.py` | Stable payload schema for fast-path/proposer-to-evolution handoff. |

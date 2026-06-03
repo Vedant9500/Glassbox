@@ -117,12 +117,28 @@ def test_actionable_specialist_candidate_pool_is_retained_without_composition():
     ) is True
 
 
-def test_universal_proposer_dual_path_handles_multivariate_proxy(monkeypatch):
+def test_universal_proposer_dual_path_handles_multivariate_input(monkeypatch):
+    import glassbox.universal_proposer as up
+
     n = 64
     x1 = np.linspace(-2.0, 2.0, n)
     x2 = np.linspace(1.0, 3.0, n)
     X = np.stack([x1, x2], axis=1)
     y = x1 + x2
+    captured = {}
+
+    def fake_propose(model, x, y, top_k, fit_diagnostics, interaction_hints, device):
+        captured["x_shape"] = np.asarray(x).shape
+        return {
+            "valid": True,
+            "candidate_skeletons": [],
+            "interaction_hints": dict(interaction_hints),
+            "search_plan": {"supports_multivariate_formulas": np.asarray(x).ndim == 2},
+            "routing_signal": {"recommend_guided_evolution": False},
+        }
+
+    monkeypatch.setattr(up, "load_universal_proposer_checkpoint", lambda *args, **kwargs: object())
+    monkeypatch.setattr(up, "propose_fpip_v2_from_xy", fake_propose)
 
     est = GlassboxRegressor(
         use_universal_proposer=True,
@@ -134,8 +150,10 @@ def test_universal_proposer_dual_path_handles_multivariate_proxy(monkeypatch):
 
     assert payload is not None
     assert force is False
-    assert est.universal_proposer_status_ == "ok_multivariate_proxy"
-    assert payload["interaction_hints"]["multivariate_proxy"] is True
+    assert est.universal_proposer_status_ == "ok_multivariate"
+    assert captured["x_shape"] == X.shape
+    assert payload["interaction_hints"]["multivariate_proxy"] is False
+    assert payload["search_plan"]["supports_multivariate_formulas"] is True
 
 
 def test_universal_proposer_dual_path_handles_missing_checkpoint():

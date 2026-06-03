@@ -61,7 +61,7 @@ Primary files:
 
 ### 2. Classifier/Proposer Inference Runtime
 
-Classifier/proposer loading currently uses PyTorch or XGBoost. ONNX Runtime or a
+Classifier/proposer loading currently uses PyTorch. ONNX Runtime or a
 small Eigen inference path could reduce startup overhead, but only after the
 model format and feature preprocessing are stable.
 

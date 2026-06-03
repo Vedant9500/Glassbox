@@ -819,6 +819,11 @@ def multilabel_stratified_split(labels: np.ndarray, val_ratio: float, seed: int)
     rng = np.random.RandomState(seed)
     n_samples = labels.shape[0]
     n_val = int(n_samples * val_ratio)
+    if n_val < 1 or n_samples - n_val < 1:
+        raise ValueError(
+            f"val_ratio={val_ratio} creates train={n_samples - n_val} val={n_val}; "
+            "both splits must contain at least one sample."
+        )
 
     # Fast path for large datasets: random split approximates stratification well
     if n_samples >= 200_000:
@@ -1176,6 +1181,11 @@ def main():
         train_idx, val_idx = multilabel_stratified_split(labels, args.val_split, args.seed)
     else:
         n_val = int(len(features) * args.val_split)
+        if n_val < 1 or len(features) - n_val < 1:
+            raise ValueError(
+                f"--val-split={args.val_split} creates train={len(features) - n_val} "
+                f"val={n_val}; both splits must contain at least one sample."
+            )
         indices = np.random.permutation(len(features))
         val_idx = indices[:n_val]
         train_idx = indices[n_val:]

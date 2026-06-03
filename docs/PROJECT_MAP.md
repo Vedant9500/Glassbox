@@ -91,7 +91,7 @@ The active pybind11 exports include `run_evolution`,
 
 | File | Current purpose |
 |---|---|
-| `curve_classifier_integration.py` | Loads PyTorch/XGBoost classifiers, resolves devices, predicts operators, detects multi-input interactions, and biases ONN/evolution priors. |
+| `curve_classifier_integration.py` | Loads PyTorch classifiers, resolves devices, predicts operators, detects multi-input interactions, and biases ONN/evolution priors. |
 | `generate_curve_data.py` | Synthetic formula generation, PCFG/depth-annealed generation, noise augmentation, feature extraction, invariant/FFT/derivative/curvature features. |
 | `train_curve_classifier.py` | PyTorch classifier training path. |
 
@@ -124,7 +124,6 @@ benchmark path prefers C++ evolution when available.
 | `scripts/evolution_pipeline_log.py` | Pipeline tracing and C++ JSONL population snapshots. |
 | `scripts/sr_tester.py` | Interactive/single-formula tester. |
 | `scripts/train_universal_proposer.py` | Universal proposer training and replay-data loading. |
-| `scripts/train_xgboost_classifier.py` | XGBoost classifier training. |
 | `scripts/calibrate_classifier.py` | Classifier calibration. |
 | `scripts/verify_fast_path.py` | Fast-path smoke verification. |
 

@@ -30,8 +30,7 @@ from itertools import combinations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
-
-DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_wide.pt"
+from glassbox.model_registry import DEFAULT_CURVE_CLASSIFIER_PATH
 
 # Configure module-level logger
 logger = logging.getLogger(__name__)
@@ -2546,6 +2545,9 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         # for a massive speedup (100x+), skipping the PyTorch loop.
         # ---------------------------------------------------------------------
         try:
+            if self.normalize_data:
+                raise ImportError("C++ backend disabled when normalize_data=True to preserve output-space scoring")
+
             import sys
             import os
             from pathlib import Path

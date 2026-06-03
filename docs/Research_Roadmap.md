@@ -40,7 +40,7 @@ Primary files:
 
 ### Fast Path and Exact Match
 
-- Curve classifier integration supports PyTorch and XGBoost payloads.
+- Curve classifier integration supports PyTorch checkpoints.
 - Fast path builds basis terms, exact-match candidates, and regression formulas.
 - Exact-match backend routing supports NumPy/torch CPU/CUDA controls.
 - FPIP v2 payloads expose candidate skeletons, priors, uncertainty, diagnostics,

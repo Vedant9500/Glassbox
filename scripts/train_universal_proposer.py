@@ -583,6 +583,11 @@ def main():
         np.random.shuffle(indices)
         
         n_val = int(len(features) * args.val_split)
+        if n_val < 1 or len(features) - n_val < 1:
+            raise ValueError(
+                f"--val-split={args.val_split} creates train={len(features) - n_val} "
+                f"val={n_val}; both splits must contain at least one sample."
+            )
         val_idx = indices[:n_val]
         train_idx = indices[n_val:]
         
@@ -606,9 +611,15 @@ def main():
             print(f"  Feature schema: {feature_schema}")
     else:
         feature_scaler = None
+        n_val = int(args.n_samples * args.val_split)
+        if n_val < 1 or args.n_samples < 1:
+            raise ValueError(
+                f"--val-split={args.val_split} with --n-samples={args.n_samples} "
+                "must create at least one validation sample."
+            )
         # Minimal synthetic dataset fallback
         train_ds = SyntheticCurveDataset(n_samples=args.n_samples, n_points=args.n_points)
-        val_ds = SyntheticCurveDataset(n_samples=int(args.n_samples * args.val_split), n_points=args.n_points)
+        val_ds = SyntheticCurveDataset(n_samples=n_val, n_points=args.n_points)
         print(f"train_samples={len(train_ds)} val_samples={len(val_ds)}")
         
     import os
