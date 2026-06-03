@@ -1,5 +1,13 @@
 # 🔬 Curve Classifier Architectural Audit
 
+## Current Status (2026-06-03)
+
+This is a historical architectural audit. Several recommendations influenced the
+current codebase: richer feature extraction, PCFG-style generation, calibration,
+multi-input interaction diagnostics, and universal-proposer seeding. The current
+runtime map is in `docs/PROJECT_MAP.md`; this file is not a source-of-truth map
+for active defaults.
+
 > **Component:** `glassbox/curve_classifier/`  
 > **Files analyzed:** `generate_curve_data.py` (1858 lines), `curve_classifier_integration.py` (785 lines), `train_curve_classifier.py` (980 lines), `classifier_fast_path.py` (3194 lines)  
 > **Goal:** Make the classifier smarter, more accurate, more robust, and basis-independent.

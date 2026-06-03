@@ -1,5 +1,13 @@
 # Areas to Improve
 
+## Current Status (2026-06-03)
+
+This is a research backlog, not a current implementation map. Several items now
+have partial implementations: adaptive compute budgets, displayed-formula
+scoring, blackbox feature ranking, interaction discovery, C++ candidate scoring,
+specialist composition, residual stages, and universal-proposer seeding. For the
+live pipeline, see `docs/PROJECT_MAP.md` and `docs/Research_Roadmap.md`.
+
 ## Research Direction
 
 The strongest future direction is reliable symbolic regression under messy, real-world conditions, not only clean Nguyen/Feynman-style toy formulas.
@@ -95,4 +103,3 @@ Compare against strong or commonly used SR systems where feasible:
 - Make errors user-facing instead of internal messages like `Guided evolution skipped`.
 - Keep displayed-formula scoring as the primary metric.
 - Add confidence and routing diagnostics to result objects.
-

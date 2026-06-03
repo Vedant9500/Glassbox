@@ -2,6 +2,14 @@
 
 Date: 2026-06-02
 
+## Current Status (2026-06-03)
+
+This is a forward-looking plan. The active code currently supports torch-backed
+exact-match backend routing and CPU fallback controls, but native C++ evolution
+is still primarily CPU/OpenMP-oriented. Treat CUDA-X sections as proposed work
+unless a referenced file/test shows an implemented feature. Current runtime
+architecture is documented in `docs/PROJECT_MAP.md`.
+
 ## Executive Summary
 
 CUDA-X can help this project, but the highest-return path is not a blanket GPU rewrite. Glassbox already has a fast native C++ backend, OpenMP parallelism, PyTorch CUDA support for neural training/inference, and GPU-capable XGBoost training. The best plan is to add GPU acceleration where the workload is dense, batched, and numerically stable, while keeping CPU fallbacks for small jobs and exact validation.

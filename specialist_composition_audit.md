@@ -1,5 +1,12 @@
 # Specialist Composition Integration Audit
 
+## Current Status (2026-06-03)
+
+This audit documents bugs, fixes, and design tradeoffs from the specialist
+composition rollout. Several findings have since been fixed or downgraded in
+code and tests. The live implementation map is in `docs/PROJECT_MAP.md`; keep
+using this audit for historical rationale and regression context.
+
 Date: 2026-06-01
 
 Scope:

@@ -1,5 +1,15 @@
 # Specialist Composition Layer Plan
 
+## Current Status (2026-06-03)
+
+The specialist layer described here is now substantially implemented. Current
+code includes specialist state, pair scoring, safe composition proposals,
+composed seed caps, hot-spot segments, residual symbolic stages, vault memory,
+and inception/subexpression reuse. Main files are
+`glassbox/sr/specialist_state.py`, `glassbox/sr/sklearn_wrapper.py`, and
+`scripts/specialist_phase_eval.py`. Use this file for design history and
+`docs/PROJECT_MAP.md` for the current implementation map.
+
 ## Goal
 
 Build a shared specialist-state layer that captures promising partial formulas, detects complementary behavior, composes a small number of high-value candidates, and reuses the existing refinement, postprocessing, and seeded evolution pipeline.

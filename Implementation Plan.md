@@ -1,5 +1,13 @@
 # Replace SymPy with Native C++ Formula Simplification
 
+## Current Status (2026-06-03)
+
+This plan is partially implemented. Native simplification, float snapping,
+formula-to-seed-graph parsing, noise reduction, and candidate scoring are
+available through `_core`, but SymPy remains in `requirements.txt` as a guarded
+fallback in active Python paths. See `docs/CPP_Migration_Roadmap.md` for the
+current native-backend status.
+
 ## Problem Statement
 
 The Glassbox SR pipeline currently depends on SymPy (pure Python) for formula simplification, parsing, and display. This creates two major problems:

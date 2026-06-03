@@ -1,5 +1,15 @@
 # Blackbox Optimization Plan
 
+## Current Status (2026-06-03)
+
+This plan is partially implemented. The live implementation is in
+`glassbox/sr/blackbox_preprocessor.py` and the orchestration is in
+`glassbox/sr/sklearn_wrapper.py`. Current behavior includes feature ranking,
+reduced search-space preparation, interaction discovery, formula remapping,
+blackbox seed formulas, validation-aware candidate checks, and specialist
+diagnostics/composition hooks. Use `docs/PROJECT_MAP.md` for the current
+codebase map and this file for the design history and remaining blackbox ideas.
+
 ## Why Blackbox Problems Are Hard Here
 
 Glassbox currently performs best on clean, low-dimensional symbolic problems. Blackbox SRBench/PMLB-style problems are harder because they often have:
