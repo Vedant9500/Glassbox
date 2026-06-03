@@ -18,6 +18,7 @@ import torch.nn.functional as F
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import sys
+import os
 from glassbox.model_registry import (
     DEFAULT_CURVE_CLASSIFIER_PATH,
     resolve_curve_classifier_path,
@@ -411,10 +412,11 @@ def _load_torch_checkpoint(model_path: Path):
                 "Refusing unsafe pickle checkpoint load outside trusted local model directories. "
                 f"Move {model_path} under models/ or artifacts/, or convert it to a weights-only checkpoint."
             ) from safe_error
-        print(
-            "Warning: weights-only checkpoint load failed; falling back to trusted local "
-            f"pickle checkpoint at {model_path}."
-        )
+        if os.environ.get("GLASSBOX_VERBOSE_CHECKPOINT_LOAD"):
+            print(
+                "weights-only checkpoint load failed; falling back to trusted local "
+                f"pickle checkpoint at {model_path}."
+            )
         return torch.load(model_path, map_location='cpu', weights_only=False)
 
 

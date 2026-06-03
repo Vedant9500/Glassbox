@@ -138,6 +138,21 @@ def compute_feature_stats(
     return mean.astype(np.float32), std.astype(np.float32)
 
 
+def weights_only_safe_scaler(scaler):
+    """Convert NumPy scaler values to plain Python data for weights-only loading."""
+    if not isinstance(scaler, dict):
+        return scaler
+    safe = {}
+    for key, value in scaler.items():
+        if isinstance(value, np.ndarray):
+            safe[key] = value.astype(np.float32).tolist()
+        elif isinstance(value, np.generic):
+            safe[key] = value.item()
+        else:
+            safe[key] = value
+    return safe
+
+
 class SyntheticCurveDataset(Dataset):
     def __init__(self, n_samples: int = 2000, n_points: int = 128, seed: int = 0):
         self.n_samples = int(n_samples)
@@ -688,7 +703,7 @@ def main():
                         "operator_vocab": model.operator_vocab,
                         "skeleton_vocab": model.skeleton_vocab,
                     },
-                    "feature_scaler": feature_scaler,
+                    "feature_scaler": weights_only_safe_scaler(feature_scaler),
                     "epoch": epoch,
                     "val_f1": best_f1,
                 },

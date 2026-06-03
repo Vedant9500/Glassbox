@@ -84,6 +84,121 @@ def test_prediction_uncertainty_metrics():
     assert metrics["prediction_uncertain"] is False
 
 
+def test_fast_path_direct_transform_template_recovers_log_affine():
+    x = np.linspace(0.0, 5.0, 80)
+    y = np.log(2.0 * x + 1.0)
+
+    formula, mse, details = cfp.fast_path_regression(
+        x,
+        y,
+        {"log": 0.94, "exponential": 0.94},
+        exact_match_enabled=True,
+    )
+
+    assert mse < 1e-10
+    assert details["exact_match"] is True
+    assert details["template_match"] == "log_affine_direct"
+    assert "log" in formula
+
+
+def test_fast_path_direct_transform_template_preempts_exp_polynomial_surrogate():
+    x = np.linspace(-1.0, 2.0, 80)
+    y = 3.0 + 2.0 * np.exp(0.7 * x)
+
+    formula, mse, details = cfp.fast_path_regression(
+        x,
+        y,
+        {"exp": 0.9, "exponential": 0.9},
+        exact_match_enabled=True,
+    )
+
+    assert mse < 1e-10
+    assert details["exact_match"] is True
+    assert details["template_match"] == "shifted_exp_affine"
+    assert "exp" in formula
+
+
+def test_fast_path_candidate_pool_reports_semantic_dedup():
+    x = np.linspace(-2.0, 2.0, 80)
+    y = np.sin(x) + 0.1 * x
+
+    _, _, details = cfp.fast_path_regression(
+        x,
+        y,
+        {"sin": 0.9, "addition": 0.8, "polynomial": 0.4},
+        exact_match_enabled=False,
+    )
+
+    dedup = details["candidate_semantic_dedup"]
+    assert dedup["enabled"] is True
+    assert dedup["before"] >= dedup["after"]
+    assert dedup["removed"] == dedup["before"] - dedup["after"]
+    assert "numpy" in details["solver_backends"]
+    assert any(c.get("solver_backend") for c in details["candidate_formulas"])
+
+
+def test_decomposition_probe_candidates_capture_product_sum():
+    x = np.linspace(-2.0, 2.0, 80)
+    y = np.sin(x) * np.cos(x) + 0.25 * x
+
+    candidates = cfp.build_decomposition_probe_candidates(
+        x,
+        y,
+        {"sin": 0.8, "cos": 0.8, "multiplication": 0.8, "addition": 0.8},
+        max_candidates=5,
+    )
+
+    assert candidates
+    assert candidates[0]["mse"] < 1e-10
+    assert candidates[0]["source"] == "decomposition_probe"
+    assert candidates[0]["decomposition_probe_type"] in {"additive_pair", "multiplicative_pair"}
+
+
+def test_benchmark_guided_evolution_receives_fast_path_candidate_pool(monkeypatch):
+    sent_candidates = [
+        {"formula": "x", "mse": 1.0, "source": "fast_path"},
+        {
+            "formula": "sin(x)*cos(x) + 0.25*x",
+            "mse": 0.0,
+            "source": "decomposition_probe",
+            "decomposition_probe_type": "multiplicative_pair",
+        },
+    ]
+    captured = {}
+
+    def _fake_fast_path(*args, **kwargs):
+        return {
+            "formula": "x",
+            "mse": 1.0,
+            "details": {"n_nonzero": 1, "n_nonzero_simplified": 1, "y_variance": 1.0},
+            "candidate_formulas": sent_candidates,
+            "operator_hints": {},
+            "residual_diagnostics": {"residual_suspicious": False},
+        }
+
+    def _fake_guided(*args, **kwargs):
+        captured["candidate_formulas"] = kwargs.get("candidate_formulas")
+        return {"formula": "sin(x)*cos(x) + 0.25*x", "mse": 0.0, "raw_mse": 0.0}
+
+    monkeypatch.setattr(bs, "run_fast_path", _fake_fast_path)
+    monkeypatch.setattr(bs, "run_guided_evolution", _fake_guided)
+    monkeypatch.setattr(bs, "_evaluate_formula_mse", lambda formula, *a, **k: 1.0 if formula == "x" else 0.0)
+
+    result = bs.run_formula(
+        formula_str="sin(x)*cos(x)+0.25*x",
+        x_range=(-2.0, 2.0),
+        classifier_path="unused.pt",
+        n_samples=64,
+        device="cpu",
+        with_evolution=True,
+        disable_proposer=True,
+    )
+
+    formulas = [c["formula"] for c in captured["candidate_formulas"]]
+    assert "sin(x)*cos(x) + 0.25*x" in formulas
+    assert result["evolution_seed_candidates"] == captured["candidate_formulas"]
+
+
 def test_residual_diagnostics_handles_nan_mask_with_holdout():
     x = np.linspace(-3.0, 3.0, 128)
     y_true = np.sin(x)

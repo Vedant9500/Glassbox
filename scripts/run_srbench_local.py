@@ -1166,6 +1166,12 @@ def main():
                         help="Complexity cap (model size) for acceptable discovery metric")
     parser.add_argument("--blackbox-max-features", type=int, default=6,
                         help="Max selected features used by the reduced search path")
+    parser.add_argument("--blackbox-mode", choices=["auto", "on", "off"], default="auto",
+                        help="Blackbox preprocessing mode for Track 1 runs")
+    parser.add_argument("--no-blackbox-feature-selection", action="store_true",
+                        help="Disable blackbox feature selection/reduction")
+    parser.add_argument("--blackbox-interactions", action=argparse.BooleanOptionalAction, default=True,
+                        help="Enable or disable blackbox interaction discovery")
     parser.add_argument("--blackbox-ablation", action="store_true",
                         help="Run an additional all-features baseline alongside reduced search")
     args = parser.parse_args()
@@ -1204,7 +1210,14 @@ def main():
         skip_evolution_if_bloated=args.skip_evolution_if_bloated,
         bloat_term_threshold=20,
         universal_proposer_path=args.proposer_model,
+        blackbox_mode={
+            "auto": "auto",
+            "on": True,
+            "off": False,
+        }[args.blackbox_mode],
         blackbox_max_features=args.blackbox_max_features,
+        blackbox_feature_selection=not args.no_blackbox_feature_selection,
+        blackbox_interaction_search=bool(args.blackbox_interactions),
     )
 
     print(f"\n  Glassbox SRBench Benchmark")
@@ -1241,7 +1254,12 @@ def main():
         else "  Specialist phases: disabled"
     )
     print(f"  Acceptable criteria: R2>={args.acceptable_r2:.2f}, size<={args.complexity_cap}")
-    print(f"  Reduced search max features: {args.blackbox_max_features}")
+    print(
+        f"  Blackbox mode: {args.blackbox_mode}  |  "
+        f"feature selection: {not args.no_blackbox_feature_selection}  |  "
+        f"interactions: {bool(args.blackbox_interactions)}  |  "
+        f"max features: {args.blackbox_max_features}"
+    )
 
     blackbox_datasets = get_official_pmlb_regression_datasets() if args.official else list(PMLB_DATASETS)
     discovered_gt = discover_official_ground_truth_problems(args.data_dir) if args.data_dir else []

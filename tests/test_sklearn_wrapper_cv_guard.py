@@ -739,6 +739,41 @@ def test_blackbox_candidate_screening_handles_none_validation_values():
     assert isinstance(hints, dict)
 
 
+def test_univariate_specialist_candidate_pool_preserves_decomposition_seeds(monkeypatch):
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = np.sin(x) * np.cos(x) + 0.25 * x
+    est = GlassboxRegressor(random_state=68)
+    est._fp_result = {
+        "candidate_formulas": [
+            {
+                "formula": "sin(x)*cos(x) + 0.25*x",
+                "mse": 0.0,
+                "source": "decomposition_probe",
+                "decomposition_probe_type": "multiplicative_pair",
+            }
+        ],
+        "details": {},
+    }
+
+    monkeypatch.setattr(est, "_targeted_specialist_probe_formulas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(est, "_build_blackbox_formula_pool", lambda *args, **kwargs: [])
+    monkeypatch.setattr(est, "_refine_candidate_formulas", lambda candidates, *args, **kwargs: candidates)
+    monkeypatch.setattr(est, "_prune_blackbox_candidate_formulas", lambda candidates, **kwargs: candidates)
+
+    candidates = est._build_univariate_specialist_candidate_formulas(
+        "x",
+        1.0,
+        None,
+        X,
+        y,
+        max_candidates=8,
+    )
+
+    assert any(c.get("source") == "decomposition_probe" for c in candidates)
+    assert any(c.get("formula") == "sin(x)*cos(x) + 0.25*x" for c in candidates)
+
+
 def test_blackbox_evolution_comparison_uses_validation_not_incumbent_train_mse():
     rng = np.random.RandomState(71)
     X = rng.randn(180, 2)

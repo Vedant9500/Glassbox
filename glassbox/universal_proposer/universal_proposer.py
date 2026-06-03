@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import re
 from typing import Any, Dict, List, Optional, Sequence, Set
 
@@ -878,10 +879,11 @@ def _load_torch_checkpoint(checkpoint_path: Path):
                 "Refusing unsafe pickle checkpoint load outside trusted local model directories. "
                 f"Move {checkpoint_path} under models/ or artifacts/, or convert it to a weights-only checkpoint."
             ) from safe_error
-        print(
-            "Warning: weights-only checkpoint load failed; falling back to trusted local "
-            f"pickle checkpoint at {checkpoint_path}."
-        )
+        if os.environ.get("GLASSBOX_VERBOSE_CHECKPOINT_LOAD"):
+            print(
+                "weights-only checkpoint load failed; falling back to trusted local "
+                f"pickle checkpoint at {checkpoint_path}."
+            )
         return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
 
@@ -922,6 +924,11 @@ def load_universal_proposer_checkpoint(
         and "std" in feature_scaler
     ):
         feature_scaler = None
+    else:
+        feature_scaler = {
+            "mean": np.asarray(feature_scaler["mean"], dtype=np.float32),
+            "std": np.asarray(feature_scaler["std"], dtype=np.float32),
+        }
     model.feature_scaler = feature_scaler
     
     if device is not None:

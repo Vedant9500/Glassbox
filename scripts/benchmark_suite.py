@@ -25,6 +25,8 @@ import argparse
 import json
 import math
 import os
+import platform
+import random
 import re
 import sys
 import time
@@ -47,6 +49,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+try:
+    from sympy.utilities.exceptions import SymPyDeprecationWarning
+except Exception:  # pragma: no cover - SymPy warning class may be absent
+    SymPyDeprecationWarning = DeprecationWarning
+
+warnings.filterwarnings("ignore", category=SymPyDeprecationWarning)
 
 # ---------------------------------------------------------------------------
 # Path setup
@@ -640,8 +648,9 @@ def _postprocess_formula(formula: str) -> str:
             )
 
         with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=SymPyDeprecationWarning)
             warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"sympy\..*")
-            warnings.filterwarnings("ignore", message=r".*Using non-Expr arguments in Mul.*")
+            warnings.filterwarnings("ignore", message=r"\s*Using non-Expr arguments in Mul.*")
             _, simplified_expr = simplify_onn_formula(
                 normalized,
                 int_tol=evo_int_tol,
@@ -863,6 +872,8 @@ SCORE_SYMBOLS = {
     "LOOSE":  "[LOOSE]",
     "FAIL":   "[FAIL]",
 }
+
+_SCORE_POINTS = {"FAIL": 0, "LOOSE": 1, "APPROX": 2, "EXACT": 3}
 
 
 _PROPOSER_CACHE = {}
@@ -1192,6 +1203,30 @@ def run_formula(
                     "mse": fp_result.get("mse", float("inf")),
                     "from_fast_path": True,
                 }]
+
+            if fp_result:
+                fp_seed_candidates = list(fp_result.get("candidate_formulas") or [])
+                if fp_seed_candidates:
+                    if candidate_formulas is None:
+                        candidate_formulas = []
+                    seen_seed_formulas = {
+                        str(c.get("formula", "")).replace(" ", "")
+                        for c in candidate_formulas
+                        if isinstance(c, dict)
+                    }
+                    for cand in fp_seed_candidates:
+                        if not isinstance(cand, dict):
+                            continue
+                        formula_seed = str(cand.get("formula", "") or "").strip()
+                        if not formula_seed:
+                            continue
+                        seed_key = formula_seed.replace(" ", "")
+                        if seed_key in seen_seed_formulas:
+                            continue
+                        merged = dict(cand)
+                        merged.setdefault("from_fast_path_candidate_pool", True)
+                        candidate_formulas.append(merged)
+                        seen_seed_formulas.add(seed_key)
             result["evolution_seed_candidates"] = list(candidate_formulas or [])
 
             t1 = time.time()
@@ -1683,6 +1718,7 @@ def generate_markdown_report(
     output_path: Path,
     classifier_path: str,
     total_time: float,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Write a detailed Markdown report."""
     lines = []
@@ -1690,6 +1726,12 @@ def generate_markdown_report(
     lines.append(f"**Date**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     lines.append(f"**Classifier**: `{classifier_path}`\n")
     lines.append(f"**Total runtime**: {total_time:.1f}s\n")
+    if metadata:
+        lines.append(f"**Mode**: `{metadata.get('mode', '')}`\n")
+        lines.append(f"**Python ABI**: `{metadata.get('python_abi', '')}`\n")
+        lines.append(f"**C++ core**: `{metadata.get('cpp_core_status', {}).get('status', 'unknown')}`\n")
+        if metadata.get("seed") is not None:
+            lines.append(f"**Seed**: `{metadata.get('seed')}`\n")
 
     # Overall summary table
     lines.append("\n## Summary\n")
@@ -1766,12 +1808,14 @@ def save_json_results(
     output_path: Path,
     classifier_path: str,
     total_time: float,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Save full results to JSON."""
     data = {
         "timestamp": datetime.now().isoformat(),
         "classifier": classifier_path,
         "total_time_seconds": round(total_time, 2),
+        "metadata": metadata or {},
         "tiers": {},
     }
 
@@ -1800,6 +1844,194 @@ def save_json_results(
     output_path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
 
 
+def _cpp_core_status() -> Dict[str, Any]:
+    core, reason = cfp._load_cpp_core()
+    built_extensions: List[str] = []
+    try:
+        cpp_dir = _REPO_ROOT / "glassbox" / "sr" / "cpp"
+        built_extensions = sorted(p.name for p in cpp_dir.glob("_core.*"))
+    except Exception:
+        built_extensions = []
+    return {
+        "status": "available" if core is not None else "unavailable",
+        "reason": reason,
+        "built_extensions": built_extensions,
+    }
+
+
+def _collect_report_diagnostics(all_results: Dict[int, List[Dict]]) -> Dict[str, int]:
+    diagnostics = {
+        "exact_match_combo_cap_count": 0,
+        "bounded_sparse_beam_count": 0,
+        "display_eval_failure_count": 0,
+        "mse_divergence_flag_count": 0,
+        "candidate_governor_count": 0,
+    }
+    for results in all_results.values():
+        for result in results:
+            exact_diag = result.get("exact_match_diagnostics")
+            if isinstance(exact_diag, dict):
+                if exact_diag.get("combo_count", 0) and exact_diag.get("max_combos", 0):
+                    if exact_diag.get("combo_count", 0) > exact_diag.get("max_combos", 0):
+                        diagnostics["exact_match_combo_cap_count"] += 1
+                if str(exact_diag.get("fallback_reason", "")).startswith("bounded_sparse_beam"):
+                    diagnostics["bounded_sparse_beam_count"] += 1
+            if result.get("display_eval_diagnostics") and result.get("mse_display") is None:
+                diagnostics["display_eval_failure_count"] += 1
+            if result.get("mse_divergence_flag"):
+                diagnostics["mse_divergence_flag_count"] += 1
+            details = result.get("details")
+            if isinstance(details, dict) and details.get("candidate_governor"):
+                diagnostics["candidate_governor_count"] += 1
+            for cand in result.get("candidate_formulas") or []:
+                if isinstance(cand, dict) and cand.get("governor"):
+                    diagnostics["candidate_governor_count"] += 1
+                    break
+    return diagnostics
+
+
+def _build_run_metadata(
+    args: argparse.Namespace,
+    *,
+    device: str,
+    mode: str,
+    tiers_to_run: List[int],
+    total_formulas: int,
+    all_results: Optional[Dict[int, List[Dict]]] = None,
+) -> Dict[str, Any]:
+    metadata = {
+        "mode": mode,
+        "device": device,
+        "seed": args.seed,
+        "runs": int(args.runs),
+        "tiers": list(tiers_to_run),
+        "total_formulas": int(total_formulas),
+        "n_samples": int(args.n_samples),
+        "python_version": platform.python_version(),
+        "python_abi": getattr(sys.implementation, "cache_tag", "unknown"),
+        "platform": platform.platform(),
+        "classifier_model": args.classifier_model,
+        "proposer_model": None if args.disable_proposer else args.proposer_model,
+        "exact_match_backend": args.exact_match_backend,
+        "exact_match_min_gpu_work": int(args.exact_match_min_gpu_work),
+        "exact_match_max_combos": int(args.exact_match_max_combos),
+        "cpp_core_status": _cpp_core_status(),
+        "specialist_phase_config": {
+            "specialist_regressor": bool(args.specialist_regressor),
+            "specialist_baseline": bool(args.specialist_baseline),
+            "diagnostics": not bool(args.disable_specialist_diagnostics),
+            "composition": not bool(args.disable_specialist_composition),
+            "residual": bool(args.enable_specialist_residual or args.specialist_full),
+            "vault": not bool(args.disable_specialist_vault),
+            "inception": bool(args.enable_specialist_inception or args.specialist_full),
+        },
+    }
+    if all_results is not None:
+        metadata["report_diagnostics"] = _collect_report_diagnostics(all_results)
+    return metadata
+
+
+def _flatten_json_report_results(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    flattened: Dict[str, Dict[str, Any]] = {}
+    tiers = report.get("tiers", {})
+    if not isinstance(tiers, dict):
+        return flattened
+    for tier_payload in tiers.values():
+        if not isinstance(tier_payload, dict):
+            continue
+        for result in tier_payload.get("results", []) or []:
+            if not isinstance(result, dict):
+                continue
+            key = str(result.get("formula_target") or result.get("human_name") or "").strip()
+            if key:
+                flattened[key] = result
+    return flattened
+
+
+def _flatten_current_results(all_results: Dict[int, List[Dict]]) -> Dict[str, Dict[str, Any]]:
+    flattened: Dict[str, Dict[str, Any]] = {}
+    for results in all_results.values():
+        for result in results:
+            key = str(result.get("formula_target") or result.get("human_name") or "").strip()
+            if key:
+                flattened[key] = result
+    return flattened
+
+
+def compare_benchmark_results(
+    previous_report_path: Path,
+    current_results: Dict[int, List[Dict]],
+) -> Dict[str, Any]:
+    previous_report = json.loads(previous_report_path.read_text(encoding="utf-8"))
+    previous = _flatten_json_report_results(previous_report)
+    current = _flatten_current_results(current_results)
+    transitions: List[Dict[str, Any]] = []
+    summary = {
+        "previous_only": 0,
+        "current_only": 0,
+        "same": 0,
+        "improved": 0,
+        "regressed": 0,
+        "changed": 0,
+    }
+
+    for key, cur in sorted(current.items()):
+        prev = previous.get(key)
+        if prev is None:
+            summary["current_only"] += 1
+            transitions.append({
+                "formula": key,
+                "previous_score": None,
+                "current_score": cur.get("score"),
+                "direction": "new",
+            })
+            continue
+
+        prev_score = str(prev.get("score", "FAIL"))
+        cur_score = str(cur.get("score", "FAIL"))
+        prev_points = _SCORE_POINTS.get(prev_score, 0)
+        cur_points = _SCORE_POINTS.get(cur_score, 0)
+        if cur_points > prev_points:
+            direction = "improved"
+            summary["improved"] += 1
+        elif cur_points < prev_points:
+            direction = "regressed"
+            summary["regressed"] += 1
+        else:
+            direction = "same"
+            summary["same"] += 1
+        if direction != "same" or prev_score != cur_score:
+            summary["changed"] += 1
+
+        prev_mse = prev.get("mse")
+        cur_mse = cur.get("mse")
+        transitions.append({
+            "formula": key,
+            "previous_score": prev_score,
+            "current_score": cur_score,
+            "direction": direction,
+            "previous_mse": prev_mse,
+            "current_mse": cur_mse,
+            "previous_formula": prev.get("formula_discovered"),
+            "current_formula": cur.get("formula_discovered"),
+        })
+
+    for key in sorted(set(previous) - set(current)):
+        summary["previous_only"] += 1
+        transitions.append({
+            "formula": key,
+            "previous_score": previous[key].get("score"),
+            "current_score": None,
+            "direction": "missing",
+        })
+
+    return {
+        "previous_report": str(previous_report_path),
+        "summary": summary,
+        "transitions": transitions,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1815,6 +2047,7 @@ Examples:
   python scripts/benchmark_suite.py --tier 1 --tier 2                  # Tiers 1 & 2
   python scripts/benchmark_suite.py --classifier-model models/v3.pt   # Custom model
   python scripts/benchmark_suite.py --output-dir results/              # Custom output
+  python scripts/benchmark_suite.py --compare-to results/old.json      # Compare reports
         """,
     )
     parser.add_argument(
@@ -1950,6 +2183,14 @@ Examples:
         "--runs", type=int, default=1,
         help="Number of times to run each formula. Returns best result. (default: 1)",
     )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Set Python, NumPy, and Torch random seeds for repeatable benchmark runs",
+    )
+    parser.add_argument(
+        "--compare-to", type=str, default=None,
+        help="Compare this run against a prior benchmark JSON report",
+    )
     args = parser.parse_args()
 
     exclusive_modes = sum(bool(v) for v in (args.cpp_evolution_only, args.evolution_only, args.specialist_regressor))
@@ -1980,6 +2221,18 @@ Examples:
         specialist_diagnostics = True
         specialist_composition = True
         specialist_vault = True
+
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+
+    compare_to_path = Path(args.compare_to) if args.compare_to else None
+    if compare_to_path is not None and not compare_to_path.exists():
+        print(f"Error: --compare-to report does not exist: {compare_to_path}")
+        sys.exit(2)
 
     # Validate report output before doing expensive formula work.
     output_dir = Path(args.output_dir)
@@ -2076,6 +2329,10 @@ Examples:
     print(f"  Tiers:       {tiers_to_run}")
     print(f"  Formulas:    {total_formulas}")
     print(f"  Samples/ea:  {args.n_samples}")
+    if args.seed is not None:
+        print(f"  Seed:        {args.seed}")
+    if compare_to_path is not None:
+        print(f"  Compare to:  {compare_to_path}")
     print("=" * 90)
 
     # Run benchmark
@@ -2201,21 +2458,41 @@ Examples:
 
     # Save reports
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    metadata = _build_run_metadata(
+        args,
+        device=device,
+        mode=mode_str,
+        tiers_to_run=tiers_to_run,
+        total_formulas=total_formulas,
+        all_results=all_results,
+    )
 
     json_path = output_dir / f"benchmark_{ts}.json"
-    save_json_results(all_results, json_path, args.classifier_model, total_time)
+    save_json_results(all_results, json_path, args.classifier_model, total_time, metadata=metadata)
     print(f"JSON report: {json_path}")
 
     md_path = output_dir / f"benchmark_{ts}.md"
-    generate_markdown_report(all_results, md_path, args.classifier_model, total_time)
+    generate_markdown_report(all_results, md_path, args.classifier_model, total_time, metadata=metadata)
     print(f"Markdown report: {md_path}")
+
+    if compare_to_path is not None:
+        comparison = compare_benchmark_results(compare_to_path, all_results)
+        compare_path = output_dir / f"benchmark_compare_{ts}.json"
+        compare_path.write_text(json.dumps(comparison, indent=2, default=str), encoding="utf-8")
+        summary = comparison["summary"]
+        print(
+            "Comparison: "
+            f"+{summary['improved']} / -{summary['regressed']} / "
+            f"{summary['same']} same / {summary['current_only']} new"
+        )
+        print(f"Comparison report: {compare_path}")
 
     # Also save a "latest" copy for easy access
     json_latest = output_dir / "benchmark_latest.json"
-    save_json_results(all_results, json_latest, args.classifier_model, total_time)
+    save_json_results(all_results, json_latest, args.classifier_model, total_time, metadata=metadata)
 
     md_latest = output_dir / "benchmark_latest.md"
-    generate_markdown_report(all_results, md_latest, args.classifier_model, total_time)
+    generate_markdown_report(all_results, md_latest, args.classifier_model, total_time, metadata=metadata)
     print(f"Latest links: {json_latest}, {md_latest}")
 
     print(f"\nTotal time: {total_time:.1f}s")

@@ -124,6 +124,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         blackbox_max_features=6,
         blackbox_feature_selection=True,
         blackbox_standardize=True,
+        blackbox_interaction_search=True,
         blackbox_min_features_to_select=5,
         enable_specialist_screening_diagnostics=True,
         enable_specialist_composition_screening=True,
@@ -187,6 +188,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.blackbox_max_features = blackbox_max_features
         self.blackbox_feature_selection = blackbox_feature_selection
         self.blackbox_standardize = blackbox_standardize
+        self.blackbox_interaction_search = blackbox_interaction_search
         self.blackbox_min_features_to_select = blackbox_min_features_to_select
         self.enable_specialist_screening_diagnostics = enable_specialist_screening_diagnostics
         self.enable_specialist_composition_screening = enable_specialist_composition_screening
@@ -1437,6 +1439,26 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             if edge_mse is not None and np.isfinite(edge_mse):
                 blend_mse = 0.72 * val_mse + 0.28 * edge_mse
             score = blend_mse * (1.0 + 0.030 * complexity + 0.50 * risk + 0.25 * gap)
+            governor = None
+            try:
+                from scripts import benchmark_common as bc
+                governor = bc.score_display_candidate(
+                    formula,
+                    X,
+                    y,
+                    raw_mse=(candidate or {}).get("mse", val_mse),
+                    fit_mse=fit_mse,
+                    holdout_mse=edge_mse,
+                    complexity=complexity,
+                    postprocess=False,
+                )
+                governor_score = float(governor.get("score", float("inf")))
+                governor_display = governor.get("display_mse")
+                if np.isfinite(governor_score):
+                    score = 0.82 * score + 0.18 * governor_score
+            except Exception:
+                governor_score = None
+                governor_display = None
             scored.append({
                 "formula": formula,
                 "mse": float(np.mean((self._safe_eval_formula_array(formula, X) - y) ** 2)),
@@ -1450,6 +1472,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 "risk_score": risk,
                 "generalization_gap": gap,
                 "pareto_score": float(score),
+                "display_governor_score": governor_score,
+                "display_mse": governor_display,
+                "display_governor": governor,
                 "source": (candidate or {}).get("source") or (candidate or {}).get("run_label"),
             })
         if not scored:
@@ -1726,7 +1751,12 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         "domain",
                     )
                     if any(marker in error_text for marker in cpp_invalid_markers):
-                        continue
+                        source = str((candidate or {}).get("source", "")).lower()
+                        if (
+                            not (candidate or {}).get("from_specialist_composition")
+                            and not source.startswith("specialist_")
+                        ):
+                            continue
                 else:
                     scale = _finite_float(cpp_scored.get("scale"), 0.0)
                     bias = _finite_float(cpp_scored.get("bias"), 0.0)
@@ -3860,6 +3890,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             max_features=int(self.blackbox_max_features),
             standardize=bool(self.blackbox_standardize),
             min_features_to_select=int(self.blackbox_min_features_to_select),
+            interaction_search=bool(self.blackbox_interaction_search),
         )
         feature_selection_fallback = None
         if (
@@ -4929,6 +4960,20 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         "mse": getattr(self, "evolution_candidate_mse_", float("inf")),
                         "complexity": self._formula_complexity(self.evolution_candidate_formula_),
                         "source": "evolution",
+                    })
+                for idx, front_item in enumerate(getattr(self, "pareto_front_", []) or []):
+                    if not isinstance(front_item, dict):
+                        continue
+                    formula = str(front_item.get("formula", "") or "").strip()
+                    if not formula:
+                        continue
+                    pareto_candidates.append({
+                        "formula": formula,
+                        "mse": front_item.get("mse", float("inf")),
+                        "complexity": front_item.get("complexity", self._formula_complexity(formula)),
+                        "source": f"evolution_pareto_{idx}",
+                        "pareto_rank": front_item.get("pareto_rank"),
+                        "raw_nodes": front_item.get("raw_nodes"),
                     })
                 pareto_choice = self._select_blackbox_pareto_formula(pareto_candidates, X, y)
                 if pareto_choice is not None:

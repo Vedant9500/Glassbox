@@ -74,7 +74,7 @@ def test_exact_match_backend_cuda_matches_cpu_solution():
     assert np.allclose(cuda_result[2], cpu_result[2], atol=1e-4)
 
 
-def test_exact_match_skips_large_combination_search():
+def test_exact_match_uses_bounded_fallback_after_large_combination_skip():
     x = np.linspace(-1.0, 1.0, 64, dtype=np.float64)
     basis = np.column_stack([x ** (i % 7 + 1) + 0.001 * i for i in range(110)])
     names = [f"b{i}" for i in range(basis.shape[1])]
@@ -92,10 +92,11 @@ def test_exact_match_skips_large_combination_search():
         diagnostics=diagnostics,
     )
 
-    assert result is None
-    assert diagnostics["fallback_reason"] == "combo_cap_exceeded"
+    assert result is not None
+    assert diagnostics["fallback_reason"] == "bounded_sparse_beam_match"
     assert diagnostics["combo_count"] > diagnostics["max_combos"]
     assert diagnostics["gpu_used"] is False
+    assert result[1] < 1e-8
 
 
 def test_multivariate_fast_path_skips_univariate_frequency_refinement(monkeypatch):

@@ -76,6 +76,30 @@ def test_postprocess_formula_preserves_abs_function_call():
     assert y_pred is not None
 
 
+def test_canonical_rewrites_exp_log_and_trig_identities():
+    rewritten = bc.apply_canonical_rewrites("exp(log(x+1)) + log(exp(x))")
+    assert "exp(log" not in rewritten
+    assert "log(exp" not in rewritten
+
+    trig_product = bc.apply_canonical_rewrites("sin(x)*cos(x)")
+    assert "sin(2 * x) / 2" == trig_product
+
+    trig_identity = bc.apply_canonical_rewrites("sin(x)**2 + cos(x)**2")
+    assert trig_identity == "1"
+
+
+def test_postprocess_formula_with_fidelity_guard_accepts_safe_trig_rewrite():
+    formula = "sin(x)*cos(x)"
+    X = np.linspace(-2.0, 2.0, 200).reshape(-1, 1)
+    y = np.sin(X[:, 0]) * np.cos(X[:, 0])
+
+    guarded, diagnostics = bc.postprocess_formula_with_fidelity_guard(formula, X, y)
+
+    assert diagnostics["postprocess_guard_triggered"] is False
+    assert guarded.replace(" ", "") == "sin(2*x)/2"
+    assert bc.evaluate_formula_mse_on_X(guarded, X, y) < 1e-12
+
+
 def test_evaluate_formula_protects_log_abs_zero_endpoint():
     formula = "-0.1111111111111111*x + 0.4*sin(1.125*log(Abs(x)) - 1.4166666666666667) + 0.5555555555555556"
     X = np.linspace(0.0, 8.0, 300).reshape(-1, 1)

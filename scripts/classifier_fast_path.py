@@ -10,6 +10,7 @@ This can reduce solve time from ~300s to <10s for well-predicted formulas.
 import re
 import math
 import threading
+import importlib
 from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from itertools import permutations
@@ -32,6 +33,75 @@ _POWER_PATTERN = re.compile(r'x\^([0-9.]+)', re.IGNORECASE)
 
 DEFAULT_EXACT_MATCH_MIN_GPU_WORK = 250_000
 DEFAULT_EXACT_MATCH_MAX_COMBOS = 50_000
+
+
+@lru_cache(maxsize=1)
+def _load_cpp_core() -> Tuple[Optional[Any], Optional[str]]:
+    """Load the optional C++ extension, returning a diagnostic instead of raising."""
+    import sys
+    from pathlib import Path as _Path
+
+    cpp_dir = _Path(__file__).resolve().parent.parent / 'glassbox' / 'sr' / 'cpp'
+    if str(cpp_dir) not in sys.path:
+        sys.path.insert(0, str(cpp_dir))
+
+    errors: List[str] = []
+    for module_name in ('_core', 'glassbox.sr.cpp._core'):
+        try:
+            return importlib.import_module(module_name), None
+        except ImportError as exc:
+            errors.append(f"{module_name}: {exc}")
+
+    built_extensions = sorted(p.name for p in cpp_dir.glob('_core.*'))
+    active_abi = getattr(sys.implementation, "cache_tag", "unknown ABI")
+    if built_extensions:
+        found = ", ".join(built_extensions)
+        return None, f"C++ _core extension unavailable for active ABI {active_abi}; found {found}"
+    return None, f"C++ _core extension unavailable for active ABI {active_abi} ({'; '.join(errors)})"
+
+
+def _lasso_coordinate_descent_python(
+    X: np.ndarray,
+    y: np.ndarray,
+    alpha: float = 0.1,
+    max_iter: int = 1000,
+    tol: float = 1e-4,
+) -> np.ndarray:
+    """Small NumPy fallback for the optional C++ coordinate-descent solver."""
+    X_np = np.asarray(X, dtype=np.float64)
+    y_np = np.asarray(y, dtype=np.float64).reshape(-1)
+    if X_np.ndim != 2:
+        raise ValueError("X must be a 2D array")
+    if X_np.shape[0] != y_np.shape[0]:
+        raise ValueError("X and y row counts must match")
+
+    if alpha <= 0.0:
+        coeffs, _, _, _ = np.linalg.lstsq(X_np, y_np, rcond=None)
+        return np.asarray(coeffs, dtype=np.float64)
+
+    _, n_features = X_np.shape
+    coeffs = np.zeros(n_features, dtype=np.float64)
+    residual = y_np.copy()
+    col_norms = np.sum(X_np * X_np, axis=0)
+
+    for _ in range(max_iter):
+        max_delta = 0.0
+        for j in range(n_features):
+            norm_j = col_norms[j]
+            if norm_j <= 1e-18:
+                continue
+
+            old = coeffs[j]
+            residual += X_np[:, j] * old
+            rho = float(np.dot(X_np[:, j], residual))
+            coeffs[j] = float(soft_threshold(np.asarray(rho), alpha) / norm_j)
+            residual -= X_np[:, j] * coeffs[j]
+            max_delta = max(max_delta, abs(coeffs[j] - old))
+
+        if max_delta < tol:
+            break
+
+    return coeffs
 
 
 def _with_derived_predictions(predictions: Dict[str, float]) -> Dict[str, float]:
@@ -84,6 +154,65 @@ def _prediction_uncertainty_metrics(predictions: Dict[str, float]) -> Dict[str, 
     metrics['prediction_top2'] = top2
     metrics['prediction_uncertain'] = entropy > 0.8 or margin < 0.1
     return metrics
+
+
+def _display_candidate_score(
+    formula: str,
+    x: np.ndarray,
+    y: np.ndarray,
+    *,
+    raw_mse: Optional[float] = None,
+    fit_mse: Optional[float] = None,
+    holdout_mse: Optional[float] = None,
+    residual_diagnostics: Optional[Dict[str, Any]] = None,
+    complexity: Optional[int] = None,
+    n_terms: Optional[int] = None,
+    postprocess: bool = False,
+) -> Dict[str, Any]:
+    """Score a formula with the shared display-aware governor when available."""
+    X = np.asarray(x, dtype=np.float64)
+    if X.ndim == 1:
+        X = X.reshape(-1, 1)
+    try:
+        from scripts import benchmark_common as bc  # type: ignore
+    except Exception:
+        bc = None
+
+    if bc is not None and hasattr(bc, "score_display_candidate"):
+        return bc.score_display_candidate(
+            formula,
+            X,
+            y,
+            raw_mse=raw_mse,
+            fit_mse=fit_mse,
+            holdout_mse=holdout_mse,
+            residual_diagnostics=residual_diagnostics,
+            complexity=complexity,
+            n_terms=n_terms,
+            postprocess=postprocess,
+        )
+
+    display_mse = raw_mse if raw_mse is not None and np.isfinite(raw_mse) else fit_mse
+    comp = int(complexity) if complexity is not None else max(1, formula.count("+") + formula.count("-") + formula.count("*") + formula.count("/") + 1)
+    terms = int(n_terms) if n_terms is not None else comp
+    risk = min(1.0, 0.05 * formula.count("_signed_power") + 0.012 * max(0, comp - 12))
+    base = float(display_mse) if display_mse is not None and np.isfinite(display_mse) else float("inf")
+    score = base + 1e-4 * max(0, comp - 8) + 5e-5 * max(0, terms - 6) + 0.01 * risk
+    return {
+        "formula": formula,
+        "formula_original": formula,
+        "score": float(score),
+        "display_mse": base if np.isfinite(base) else None,
+        "raw_mse": raw_mse,
+        "holdout_mse": holdout_mse,
+        "complexity": comp,
+        "n_terms": terms,
+        "risk_score": risk,
+        "raw_display_drift_rel": None,
+        "residual_suspicious": False,
+        "postprocess_guard": None,
+        "display_eval_ok": np.isfinite(base),
+    }
 
 
 def _empty_residual_diagnostics() -> Dict[str, Any]:
@@ -630,31 +759,433 @@ def _maybe_match_easy_multivariate_formula(
     return best_match
 
 
+def _format_precise_number(value: float) -> str:
+    """Format a floating constant tightly enough for template validation."""
+    value = float(value)
+    if abs(value) < 1e-12:
+        return "0"
+    nearest = round(value)
+    if abs(value - nearest) < 1e-10 and abs(nearest) < 10_000:
+        return str(int(nearest))
+    return f"{value:.12g}"
+
+
+def _format_linear_x_formula(slope: float, intercept: float, *, precise: bool = False) -> str:
+    """Format slope*x + intercept for direct transform templates."""
+    if precise:
+        terms: List[str] = []
+        if abs(slope) > 1e-12:
+            slope_text = _format_precise_number(abs(slope))
+            if abs(abs(slope) - 1.0) < 1e-12:
+                term = "x"
+            else:
+                term = f"{slope_text}*x"
+            terms.append(f"-{term}" if slope < 0 else term)
+        if abs(intercept) > 1e-12:
+            const_text = _format_precise_number(abs(intercept))
+            terms.append(f"-{const_text}" if intercept < 0 else const_text)
+        return _join_formula_terms(terms)
+
+    terms: List[str] = []
+    x_term = _format_regression_term("x", float(slope))
+    if x_term:
+        terms.append(x_term)
+    const_term = _format_regression_term("1", float(intercept))
+    if const_term:
+        terms.append(const_term)
+    return _join_formula_terms(terms)
+
+
+def _maybe_match_univariate_transform_template(
+    x: np.ndarray,
+    y: np.ndarray,
+    predictions: Dict[str, float],
+    *,
+    tolerance: Optional[float] = None,
+) -> Optional[Tuple[str, float, Dict[str, Any]]]:
+    """Recover simple log/exp transform identities before broad sparse bases."""
+    if x.ndim == 2:
+        if x.shape[1] != 1:
+            return None
+        x_flat = x[:, 0]
+        x_eval = x
+    elif x.ndim == 1:
+        x_flat = x.reshape(-1)
+        x_eval = x.reshape(-1, 1)
+    else:
+        return None
+
+    y_flat = np.asarray(y, dtype=np.float64).reshape(-1)
+    x_flat = np.asarray(x_flat, dtype=np.float64).reshape(-1)
+    if x_flat.size != y_flat.size or x_flat.size < 4:
+        return None
+    if not (np.all(np.isfinite(x_flat)) and np.all(np.isfinite(y_flat))):
+        return None
+
+    derived = _with_derived_predictions(predictions or {})
+    should_try_log = derived.get("log", 0.0) >= 0.25 or derived.get("exponential", 0.0) >= 0.25
+    should_try_exp = derived.get("exp", 0.0) >= 0.25 or derived.get("exponential", 0.0) >= 0.25
+    if not (should_try_log or should_try_exp):
+        return None
+
+    tol = tolerance if tolerance is not None else _candidate_match_tolerance(y_flat)
+    accept_tol = min(1e-6, max(1e-10, float(tol)))
+    best_match: Optional[Tuple[str, float, Dict[str, Any]]] = None
+
+    def validate_candidate(
+        formula: str,
+        pred: np.ndarray,
+        template_name: str,
+        params: Dict[str, float],
+    ) -> None:
+        nonlocal best_match
+        if not np.all(np.isfinite(pred)):
+            return
+        raw_mse = float(np.mean((y_flat - pred.reshape(-1)) ** 2))
+        if not np.isfinite(raw_mse) or raw_mse > accept_tol:
+            return
+
+        governed = _display_candidate_score(
+            formula,
+            x_eval,
+            y_flat,
+            raw_mse=raw_mse,
+            fit_mse=raw_mse,
+            complexity=3,
+            n_terms=1,
+            postprocess=True,
+        )
+        display_mse = governed.get("display_mse")
+        if display_mse is None:
+            return
+        display_mse_f = float(display_mse)
+        if not np.isfinite(display_mse_f) or display_mse_f > accept_tol:
+            return
+
+        display_formula = str(governed.get("formula") or formula)
+        n_nonzero = max(1, len(params))
+        details = {
+            "coefficients": np.array(list(params.values()), dtype=np.float64),
+            "basis_names": list(params.keys()),
+            "n_nonzero": n_nonzero,
+            "exact_match": True,
+            "template_match": template_name,
+            "template_tolerance": accept_tol,
+            "candidate_governor": governed,
+            "candidate_formulas": [{
+                "formula": display_formula,
+                "mse": display_mse_f,
+                "score": float(governed.get("score", display_mse_f)),
+                "n_nonzero": n_nonzero,
+                "active_terms": [template_name],
+                "alpha": 0.0,
+                "raw_mse": raw_mse,
+                "display_mse": display_mse_f,
+                "governor": governed,
+            }],
+        }
+        if best_match is None or display_mse_f < best_match[1]:
+            best_match = (display_formula, display_mse_f, details)
+
+    def fit_affine(target: np.ndarray) -> Optional[Tuple[float, float, np.ndarray]]:
+        design = np.column_stack([x_flat, np.ones_like(x_flat)])
+        try:
+            coeffs, _, _, _ = np.linalg.lstsq(design, target, rcond=None)
+        except (np.linalg.LinAlgError, ValueError):
+            return None
+        slope, intercept = float(coeffs[0]), float(coeffs[1])
+        fitted = design @ coeffs
+        return slope, intercept, fitted
+
+    if should_try_log:
+        exp_y = np.exp(np.clip(y_flat, -700.0, 700.0))
+        if np.all(np.isfinite(exp_y)):
+            fit = fit_affine(exp_y)
+            if fit is not None:
+                slope, intercept, inside = fit
+                if abs(slope) > 1e-12 and np.all(inside > 1e-12):
+                    inner = _format_linear_x_formula(slope, intercept, precise=True)
+                    validate_candidate(
+                        f"log({inner})",
+                        np.log(inside),
+                        "log_affine_direct",
+                        {"slope": slope, "intercept": intercept},
+                    )
+
+    if should_try_exp:
+        for sign, sign_prefix, target_values in (
+            (1.0, "", y_flat),
+            (-1.0, "-", -y_flat),
+        ):
+            if np.all(target_values > 1e-12):
+                fit = fit_affine(np.log(target_values))
+                if fit is not None:
+                    slope, intercept, log_fit = fit
+                    pred = sign * np.exp(log_fit)
+                    inner = _format_linear_x_formula(slope, intercept, precise=True)
+                    validate_candidate(
+                        f"{sign_prefix}exp({inner})",
+                        pred,
+                        "exp_affine_direct",
+                        {"sign": sign, "slope": slope, "intercept": intercept},
+                    )
+
+        order = np.argsort(x_flat)
+        x_sorted = x_flat[order]
+        y_sorted = y_flat[order]
+        dx = np.diff(x_sorted)
+        if dx.size >= 3 and np.all(np.abs(dx) > 1e-12):
+            uniformity = float(np.std(dx) / max(abs(float(np.mean(dx))), 1e-12))
+            if uniformity < 1e-3:
+                denom = y_sorted[:-2] + y_sorted[2:] - 2.0 * y_sorted[1:-1]
+                valid = np.abs(denom) > 1e-12
+                if np.any(valid):
+                    offsets = (y_sorted[:-2] * y_sorted[2:] - y_sorted[1:-1] ** 2) / denom
+                    offsets = offsets[np.isfinite(offsets) & valid]
+                    if offsets.size:
+                        offset = float(np.median(offsets))
+                        shifted = y_flat - offset
+                        for sign, sign_prefix in ((1.0, ""), (-1.0, "-")):
+                            signed_shifted = sign * shifted
+                            if not np.all(signed_shifted > 1e-12):
+                                continue
+                            fit = fit_affine(np.log(signed_shifted))
+                            if fit is None:
+                                continue
+                            slope, intercept, log_fit = fit
+                            pred = offset + sign * np.exp(log_fit)
+                            inner = _format_linear_x_formula(slope, intercept, precise=True)
+                            offset_text = _format_precise_number(offset)
+                            formula = _join_formula_terms([offset_text, f"{sign_prefix}exp({inner})"])
+                            validate_candidate(
+                                formula,
+                                pred,
+                                "shifted_exp_affine",
+                                {
+                                    "offset": offset,
+                                    "sign": sign,
+                                    "slope": slope,
+                                    "intercept": intercept,
+                                },
+                            )
+
+    return best_match
+
+
+def _format_linear_combo_formula(
+    names: List[str],
+    coeffs: np.ndarray,
+    *,
+    threshold: float = 1e-8,
+) -> str:
+    """Format intercept + sum(coeff_i * name_i)."""
+    terms: List[str] = []
+    coeffs = np.asarray(coeffs, dtype=np.float64).reshape(-1)
+    if coeffs.size:
+        const_term = _format_regression_term("1", float(coeffs[0]))
+        if const_term:
+            terms.append(const_term)
+    for name, coef in zip(names, coeffs[1:]):
+        if abs(float(coef)) < threshold:
+            continue
+        term = _format_regression_term(name, float(coef))
+        if term:
+            terms.append(term)
+    return _join_formula_terms(terms)
+
+
+def _univariate_component_library(x_flat: np.ndarray) -> List[Tuple[str, np.ndarray]]:
+    """Small component library for decomposition probes."""
+    x_flat = np.asarray(x_flat, dtype=np.float64).reshape(-1)
+    components: List[Tuple[str, np.ndarray]] = [
+        ("x", x_flat),
+        ("x**2", x_flat ** 2),
+        ("x**3", x_flat ** 3),
+        ("sin(x)", np.sin(x_flat)),
+        ("cos(x)", np.cos(x_flat)),
+        ("sin(2*x)", np.sin(2.0 * x_flat)),
+        ("cos(2*x)", np.cos(2.0 * x_flat)),
+        ("1/(1+x**2)", 1.0 / (1.0 + x_flat ** 2)),
+        ("x/(1+x**2)", x_flat / (1.0 + x_flat ** 2)),
+        ("log(Abs(x)+1)", np.log(np.abs(x_flat) + 1.0)),
+        ("sqrt(Abs(x))", np.sqrt(np.abs(x_flat))),
+    ]
+    if np.nanmax(np.abs(x_flat)) < 20.0:
+        components.extend([
+            ("exp(x)", np.exp(x_flat)),
+            ("exp(-x)", np.exp(-x_flat)),
+        ])
+    if np.all(x_flat + 1.0 > 1e-12):
+        components.append(("log(x+1)", np.log(x_flat + 1.0)))
+    if np.all(x_flat > 1e-12):
+        components.append(("log(x)", np.log(x_flat)))
+        components.append(("sqrt(x)", np.sqrt(x_flat)))
+
+    filtered: List[Tuple[str, np.ndarray]] = []
+    seen: set = set()
+    for name, values in components:
+        arr = np.asarray(values, dtype=np.float64).reshape(-1)
+        if name in seen or arr.size != x_flat.size or not np.all(np.isfinite(arr)):
+            continue
+        if float(np.std(arr)) < 1e-12:
+            continue
+        seen.add(name)
+        filtered.append((name, arr))
+    return filtered
+
+
+def build_decomposition_probe_candidates(
+    x: np.ndarray,
+    y: np.ndarray,
+    predictions: Optional[Dict[str, float]] = None,
+    *,
+    max_candidates: int = 8,
+) -> List[Dict[str, Any]]:
+    """Generate cheap additive/product/rational seed candidates.
+
+    These probes are intentionally small. They are meant to seed later search
+    and candidate selection, not replace the main sparse-regression path.
+    """
+    if x.ndim == 2:
+        if x.shape[1] != 1:
+            return []
+        x_flat = x[:, 0]
+        x_eval = x
+    elif x.ndim == 1:
+        x_flat = x.reshape(-1)
+        x_eval = x.reshape(-1, 1)
+    else:
+        return []
+
+    y_flat = np.asarray(y, dtype=np.float64).reshape(-1)
+    x_flat = np.asarray(x_flat, dtype=np.float64).reshape(-1)
+    if x_flat.size != y_flat.size or x_flat.size < 8:
+        return []
+    if not (np.all(np.isfinite(x_flat)) and np.all(np.isfinite(y_flat))):
+        return []
+
+    components = _univariate_component_library(x_flat)
+    if not components:
+        return []
+
+    y_var = max(float(np.var(y_flat)), 1e-12)
+    keep_mse = max(1e-8, 0.08 * y_var)
+    candidates: List[Dict[str, Any]] = []
+
+    def add_candidate(formula: str, pred: np.ndarray, probe_type: str, active_terms: List[str]) -> None:
+        if not formula or not np.all(np.isfinite(pred)):
+            return
+        raw_mse = float(np.mean((y_flat - np.asarray(pred, dtype=np.float64).reshape(-1)) ** 2))
+        if not np.isfinite(raw_mse):
+            return
+        if raw_mse > keep_mse and len(candidates) >= max_candidates:
+            return
+        governed = _display_candidate_score(
+            formula,
+            x_eval,
+            y_flat,
+            raw_mse=raw_mse,
+            fit_mse=raw_mse,
+            complexity=max(1, len(active_terms) + formula.count("*") + formula.count("/")),
+            n_terms=max(1, len(active_terms)),
+            postprocess=False,
+        )
+        display_mse = governed.get("display_mse")
+        if display_mse is None or not np.isfinite(float(display_mse)):
+            return
+        if float(display_mse) > keep_mse and len(candidates) >= max_candidates:
+            return
+        candidates.append({
+            "formula": str(governed.get("formula") or formula),
+            "mse": float(display_mse),
+            "score": float(governed.get("score", display_mse)),
+            "n_nonzero": max(1, len(active_terms)),
+            "active_terms": active_terms,
+            "alpha": -2.0,
+            "raw_mse": raw_mse,
+            "display_mse": float(display_mse),
+            "governor": governed,
+            "source": "decomposition_probe",
+            "decomposition_probe_type": probe_type,
+        })
+
+    def fit_design(names: List[str], columns: List[np.ndarray], probe_type: str) -> None:
+        design = np.column_stack([np.ones_like(y_flat)] + columns)
+        try:
+            coeffs, _, _, _ = np.linalg.lstsq(design, y_flat, rcond=None)
+        except (np.linalg.LinAlgError, ValueError):
+            return
+        pred = design @ coeffs
+        formula = _format_linear_combo_formula(names, coeffs)
+        add_candidate(formula, pred, probe_type, names)
+
+    for name, values in components:
+        fit_design([name], [values], "single_component")
+
+    pair_limit = min(len(components), 12)
+    for i in range(pair_limit):
+        name_a, values_a = components[i]
+        for j in range(i + 1, pair_limit):
+            name_b, values_b = components[j]
+            fit_design([name_a, name_b], [values_a, values_b], "additive_pair")
+
+            product = values_a * values_b
+            if np.all(np.isfinite(product)) and float(np.std(product)) > 1e-12:
+                fit_design([f"({name_a})*({name_b})"], [product], "multiplicative_pair")
+
+            denom = 1.0 + values_b ** 2
+            ratio = values_a / denom
+            if np.all(np.isfinite(ratio)) and float(np.std(ratio)) > 1e-12:
+                fit_design([f"({name_a})/(1+({name_b})**2)"], [ratio], "rational_pair")
+
+    if not candidates:
+        return []
+
+    deduped: Dict[str, Dict[str, Any]] = {}
+    for cand in candidates:
+        key = normalize_formula_ascii(str(cand.get("formula", ""))).replace(" ", "")
+        current = deduped.get(key)
+        if current is None or (
+            float(cand.get("score", float("inf"))),
+            float(cand.get("mse", float("inf"))),
+        ) < (
+            float(current.get("score", float("inf"))),
+            float(current.get("mse", float("inf"))),
+        ):
+            deduped[key] = cand
+
+    ranked = sorted(
+        deduped.values(),
+        key=lambda c: (
+            float(c.get("score", float("inf"))),
+            float(c.get("mse", float("inf"))),
+            int(c.get("n_nonzero", 999)),
+        ),
+    )
+    return ranked[:max(1, int(max_candidates))]
+
+
 def lasso_coordinate_descent(
     X: np.ndarray,
     y: np.ndarray,
     alpha: float = 0.1,
     max_iter: int = 1000,
     tol: float = 1e-4,
+    backend: str = "auto",
 ) -> np.ndarray:
     """
     LASSO regression using coordinate descent via C++ Eigen backend.
     """
-    import sys
-    from pathlib import Path as _Path
-    try:
-        import _core
-    except ImportError:
-        try:
-            cpp_dir = _Path(__file__).parent.parent / 'glassbox' / 'sr' / 'cpp'
-            if str(cpp_dir) not in sys.path:
-                sys.path.insert(0, str(cpp_dir))
-            import _core
-        except ImportError:
-            raise ImportError("cannot import name 'core' from 'glassbox.sr.cpp'")
-            
     X_np = np.asarray(X, dtype=np.float64)
     y_np = np.asarray(y, dtype=np.float64).flatten()
+
+    backend_norm = str(backend or "auto").lower()
+    if backend_norm in {"numpy", "python", "fallback"}:
+        return _lasso_coordinate_descent_python(X_np, y_np, alpha, max_iter, tol)
+
+    _core, _ = _load_cpp_core()
+    if _core is None or not hasattr(_core, "lasso_coordinate_descent"):
+        return _lasso_coordinate_descent_python(X_np, y_np, alpha, max_iter, tol)
     
     # Run fast C++ coordinate descent
     w_list = _core.lasso_coordinate_descent(X_np, y_np, alpha, max_iter, tol)
@@ -1168,6 +1699,114 @@ def find_exact_symbolic_match(
         if diagnostics is not None:
             diagnostics.update(values)
 
+    def bounded_sparse_beam_search(
+        max_support_size: int,
+        *,
+        beam_width: int = 32,
+        candidate_limit: int = 64,
+    ) -> Optional[Tuple[str, float, np.ndarray]]:
+        y_centered = y - float(np.mean(y))
+        y_norm = float(np.linalg.norm(y_centered))
+        if y_norm <= 1e-15:
+            return None
+
+        col_scores = []
+        for idx in range(n_basis):
+            col = np.asarray(basis[:, idx], dtype=np.float64)
+            col_centered = col - float(np.mean(col))
+            denom = float(np.linalg.norm(col_centered) * y_norm)
+            if denom <= 1e-15:
+                score = 0.0
+            else:
+                score = abs(float(np.dot(col_centered, y_centered)) / denom)
+            if np.isfinite(score):
+                col_scores.append((score, idx))
+        col_scores.sort(reverse=True)
+        ranked = [idx for _, idx in col_scores[:max(1, min(candidate_limit, len(col_scores)))]]
+        if not ranked:
+            return None
+
+        const_idx = names.index("1") if "1" in names else None
+        beams: List[Tuple[float, Tuple[int, ...], np.ndarray]] = []
+        best: Optional[Tuple[float, Tuple[int, ...], np.ndarray]] = None
+
+        def fit_support(support: Tuple[int, ...]) -> Optional[Tuple[float, Tuple[int, ...], np.ndarray]]:
+            if not support:
+                return None
+            X = basis[:, list(support)]
+            try:
+                coeffs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+            except (np.linalg.LinAlgError, ValueError):
+                return None
+            pred = X @ coeffs
+            mse_val = float(np.mean((y - pred) ** 2))
+            if not np.isfinite(mse_val):
+                return None
+            return mse_val, support, np.asarray(coeffs, dtype=np.float64)
+
+        initial_supports = []
+        for idx in ranked:
+            if const_idx is not None and idx != const_idx:
+                initial_supports.append(tuple(sorted((const_idx, idx))))
+            initial_supports.append((idx,))
+
+        seen = set()
+        for support in initial_supports:
+            if support in seen:
+                continue
+            seen.add(support)
+            fit = fit_support(support)
+            if fit is None:
+                continue
+            beams.append(fit)
+            if best is None or fit[0] < best[0]:
+                best = fit
+        beams = sorted(beams, key=lambda item: (item[0], len(item[1])))[:beam_width]
+
+        for size in range(2, max(2, int(max_support_size)) + 1):
+            next_beams = []
+            for beam_mse, support, beam_coeffs in beams:
+                if len(support) >= size:
+                    next_beams.append((beam_mse, support, beam_coeffs))
+                    continue
+                support_set = set(support)
+                for idx in ranked:
+                    if idx in support_set:
+                        continue
+                    new_support = tuple(sorted((*support, idx)))
+                    if len(new_support) != len(support) + 1 or new_support in seen:
+                        continue
+                    seen.add(new_support)
+                    fit = fit_support(new_support)
+                    if fit is None:
+                        continue
+                    next_beams.append(fit)
+                    if best is None or fit[0] < best[0]:
+                        best = fit
+            if not next_beams:
+                break
+            beams = sorted(next_beams, key=lambda item: (item[0], len(item[1])))[:beam_width]
+
+        if best is not None and best[0] < tolerance:
+            mse_val, support, coeffs = best
+            formula, full_coeffs = build_formula(list(support), coeffs)
+            update_diagnostics({
+                "fallback_reason": "bounded_sparse_beam_match",
+                "beam_width": int(beam_width),
+                "candidate_limit": int(candidate_limit),
+                "support_size": int(len(support)),
+            })
+            return formula, mse_val, full_coeffs
+
+        if best is not None:
+            update_diagnostics({
+                "fallback_reason": "bounded_sparse_beam_no_exact_match",
+                "beam_best_mse": float(best[0]),
+                "beam_width": int(beam_width),
+                "candidate_limit": int(candidate_limit),
+            })
+        return None
+
     combo_count = 0
     for r in range(2, min(int(max_terms), 3) + 1):
         if n_basis >= r:
@@ -1185,6 +1824,10 @@ def find_exact_symbolic_match(
             "  Skipping exhaustive exact-match search "
             f"(combos={combo_count} > cap={int(exact_match_max_combos)})"
         )
+        beam_match = bounded_sparse_beam_search(max_terms)
+        if beam_match is not None:
+            print(f"  Bounded sparse exact-match search succeeded")
+            return beam_match
         return None
 
     # Optional PyTorch acceleration for pairs and triples
@@ -1420,6 +2063,19 @@ def fast_path_regression(
             formula, mse, details = easy_match
             print(f"  Direct template match: {details['template_match']}")
             return formula, mse, details
+
+    transform_match = _maybe_match_univariate_transform_template(
+        x,
+        y,
+        predictions,
+        tolerance=max(1e-10, y_variance * 1e-12),
+    )
+    if transform_match is not None:
+        formula, mse, details = transform_match
+        print(f"  Direct transform template match: {details['template_match']}")
+        details.setdefault("y_variance", y_variance)
+        details.setdefault("holdout_mse", 0.0 if holdout_mask is not None else None)
+        return formula, mse, details
     
     # Build basis from predictions (fit subset for holdout; full data for exact-match/evaluation)
     basis_full, names = build_basis_from_predictions(
@@ -1507,23 +2163,73 @@ def fast_path_regression(
         )
         if exact_match:
             formula, mse, coeffs = exact_match
-            print(f"  Found EXACT symbolic match: {formula} (MSE={mse:.2e})")
-            active_idx = np.flatnonzero(np.abs(coeffs) >= sparsity_threshold)
-            return formula, mse, {
-                'coefficients': coeffs,
-                'basis_names': names,
-                'n_nonzero': sum(1 for c in coeffs if abs(c) >= sparsity_threshold),
-                'exact_match': True,
-                'exact_match_diagnostics': exact_match_diagnostics,
-                'candidate_formulas': [{
-                    'formula': formula,
-                    'mse': float(mse),
-                    'score': float(mse),
-                    'n_nonzero': int(np.sum(np.abs(coeffs) >= sparsity_threshold)),
-                    'active_terms': [names[i] for i in active_idx],
-                    'alpha': 0.0,
-                }],
-            }
+            full_pred = basis_full @ coeffs
+            full_mse = float(np.mean((y - full_pred) ** 2))
+            holdout_mse = None
+            if basis_holdout is not None and y_holdout is not None:
+                holdout_pred = basis_holdout @ coeffs
+                holdout_mse = float(np.mean((y_holdout - holdout_pred) ** 2))
+            if not np.isfinite(full_mse) or full_mse >= 1e-6:
+                exact_match_diagnostics.update({
+                    'rejected_reason': 'full_domain_mse_not_exact',
+                    'fit_mse': float(mse),
+                    'full_mse': full_mse,
+                    'holdout_mse': holdout_mse,
+                })
+                print(
+                    "  Rejected symbolic shortcut: "
+                    f"fit MSE={mse:.2e}, full MSE={full_mse:.2e}"
+                )
+            else:
+                n_terms_exact = int(np.sum(np.abs(coeffs) >= sparsity_threshold))
+                governed_exact = _display_candidate_score(
+                    formula,
+                    x,
+                    y,
+                    raw_mse=full_mse,
+                    fit_mse=float(mse),
+                    holdout_mse=holdout_mse,
+                    complexity=n_terms_exact,
+                    n_terms=n_terms_exact,
+                    postprocess=True,
+                )
+                display_mse = governed_exact.get('display_mse')
+                if display_mse is None or not np.isfinite(float(display_mse)) or float(display_mse) >= 1e-6:
+                    exact_match_diagnostics.update({
+                        'rejected_reason': 'display_mse_not_exact',
+                        'fit_mse': float(mse),
+                        'full_mse': full_mse,
+                        'display_mse': display_mse,
+                        'holdout_mse': holdout_mse,
+                    })
+                    print(
+                        "  Rejected symbolic shortcut: "
+                        f"raw MSE={full_mse:.2e}, display MSE={display_mse}"
+                    )
+                else:
+                    formula = str(governed_exact.get('formula') or formula)
+                    print(f"  Found EXACT symbolic match: {formula} (MSE={float(display_mse):.2e})")
+                    active_idx = np.flatnonzero(np.abs(coeffs) >= sparsity_threshold)
+                    return formula, float(display_mse), {
+                        'coefficients': coeffs,
+                        'basis_names': names,
+                        'n_nonzero': n_terms_exact,
+                        'exact_match': True,
+                        'exact_match_diagnostics': exact_match_diagnostics,
+                        'candidate_formulas': [{
+                            'formula': formula,
+                            'mse': float(display_mse),
+                            'score': float(governed_exact.get('score', display_mse)),
+                            'n_nonzero': n_terms_exact,
+                            'active_terms': [names[i] for i in active_idx],
+                            'alpha': 0.0,
+                            'raw_mse': float(full_mse),
+                            'display_mse': float(display_mse),
+                            'governor': governed_exact,
+                        }],
+                        'holdout_mse': holdout_mse,
+                        'candidate_governor': governed_exact,
+                    }
     elif exact_match_enabled:
         print(f"  Skipping exact-match search (basis={basis.shape[1]} > {exact_match_max_basis})")
         exact_match_diagnostics = {
@@ -1551,11 +2257,32 @@ def fast_path_regression(
     def _candidate_signature(coeffs_arr: np.ndarray) -> Tuple[int, ...]:
         return tuple(np.flatnonzero(np.abs(coeffs_arr) >= sparsity_threshold).tolist())
 
+    def _semantic_prediction_signature(coeffs_arr: np.ndarray) -> Optional[Tuple[int, ...]]:
+        """Hash a candidate by its sampled prediction curve, not its basis support."""
+        try:
+            pred = np.asarray(basis_full @ coeffs_arr, dtype=np.float64).reshape(-1)
+        except Exception:
+            return None
+        if pred.size == 0 or not np.all(np.isfinite(pred)):
+            return None
+
+        sample_n = min(64, pred.size)
+        if sample_n < pred.size:
+            sample_idx = np.linspace(0, pred.size - 1, sample_n, dtype=int)
+            pred_sample = pred[sample_idx]
+        else:
+            pred_sample = pred
+
+        scale = max(float(np.std(y)), float(np.std(pred_sample)), 1.0)
+        centered = (pred_sample - float(np.mean(pred_sample))) / scale
+        return tuple(np.round(centered * 1e7).astype(np.int64).tolist())
+
     def _update_candidate_pool(
         pool: Dict[Tuple[int, ...], Dict[str, Any]],
         coeffs_arr: np.ndarray,
         mse_val: float,
         alpha_val: float,
+        solver_backend: str = "auto",
     ) -> None:
         if not np.isfinite(mse_val):
             return
@@ -1584,6 +2311,7 @@ def fast_path_regression(
                 'n_terms': n_terms_local,
                 'score': score_local,
                 'alpha': alpha_val,
+                'solver_backend': solver_backend,
             }
 
     def _holdout_mse_for_best(coeffs_arr: np.ndarray) -> Optional[float]:
@@ -1606,42 +2334,63 @@ def fast_path_regression(
     # Complexity penalty: prefer simpler solutions
     COMPLEXITY_PENALTY = 0.001  # λ in: score = MSE + λ * n_terms
     
+    cpp_core, _cpp_reason = _load_cpp_core()
+    solver_backends = ["numpy"]
+    if cpp_core is not None and hasattr(cpp_core, "lasso_coordinate_descent"):
+        solver_backends.insert(0, "cpp")
+
     # Try multiple alpha values to find best sparsity-accuracy tradeoff
     for alpha in [0.0, 0.001, 0.01, 0.05, 0.1, 0.2]:
-        try:
-            coeffs = lasso_coordinate_descent(basis_norm, y_fit, alpha=alpha, max_iter=1000)
-            
-            # Check for NaN/Inf in coeffs
-            if not np.all(np.isfinite(coeffs)):
-                print(f"  Warning: Alpha={alpha} produced non-finite coefficients")
-                continue
-            
-            # Unnormalize coefficients
-            coeffs = coeffs / basis_std.flatten()
-            
-            # Compute MSE on fit data
-            y_pred = basis @ coeffs
-            mse = np.mean((y_fit - y_pred) ** 2)
-            n_terms = np.sum(np.abs(coeffs) > sparsity_threshold)
-            
-            # Check if MSE is valid
-            if not np.isfinite(mse):
-                print(f"  Warning: Alpha={alpha} produced non-finite MSE (max pred: {np.max(np.abs(y_pred))})")
-                continue
-            
-            # Complexity-penalized score
-            score = mse + COMPLEXITY_PENALTY * n_terms
-            
-            # Select best based on penalized score (prefers simpler solutions)
-            if score < best_score:
-                best_coeffs = coeffs
-                best_mse = mse
-                best_score = score
+        for solver_backend in solver_backends:
+            try:
+                coeffs = lasso_coordinate_descent(
+                    basis_norm,
+                    y_fit,
+                    alpha=alpha,
+                    max_iter=1000,
+                    backend=solver_backend,
+                )
 
-            _update_candidate_pool(candidate_pool, coeffs, mse, alpha)
-        except Exception as e:
-            print(f"  Error with alpha={alpha}: {e}")
-            continue
+                # Check for NaN/Inf in coeffs
+                if not np.all(np.isfinite(coeffs)):
+                    print(f"  Warning: {solver_backend} alpha={alpha} produced non-finite coefficients")
+                    continue
+
+                # Unnormalize coefficients
+                coeffs = coeffs / basis_std.flatten()
+
+                # Compute MSE on fit data
+                y_pred = basis @ coeffs
+                mse = np.mean((y_fit - y_pred) ** 2)
+                n_terms = np.sum(np.abs(coeffs) > sparsity_threshold)
+
+                # Check if MSE is valid
+                if not np.isfinite(mse):
+                    print(
+                        f"  Warning: {solver_backend} alpha={alpha} produced non-finite MSE "
+                        f"(max pred: {np.max(np.abs(y_pred))})"
+                    )
+                    continue
+
+                # Complexity-penalized score
+                score = mse + COMPLEXITY_PENALTY * n_terms
+
+                # Select best based on penalized score (prefers simpler solutions)
+                if score < best_score:
+                    best_coeffs = coeffs
+                    best_mse = mse
+                    best_score = score
+
+                _update_candidate_pool(
+                    candidate_pool,
+                    coeffs,
+                    mse,
+                    alpha,
+                    solver_backend=solver_backend,
+                )
+            except Exception as e:
+                print(f"  Error with {solver_backend} alpha={alpha}: {e}")
+                continue
     
     if best_coeffs is None:
         # Fallback to plain least squares
@@ -1650,7 +2399,13 @@ def fast_path_regression(
             y_pred = basis @ best_coeffs
             best_mse = np.mean((y_fit - y_pred) ** 2)
             best_score = best_mse + COMPLEXITY_PENALTY * np.sum(np.abs(best_coeffs) >= sparsity_threshold)
-            _update_candidate_pool(candidate_pool, best_coeffs, best_mse, alpha_val=-1.0)
+            _update_candidate_pool(
+                candidate_pool,
+                best_coeffs,
+                best_mse,
+                alpha_val=-1.0,
+                solver_backend="lstsq_fallback",
+            )
         except np.linalg.LinAlgError:
             return None, float('inf'), {}
 
@@ -1677,24 +2432,100 @@ def fast_path_regression(
                     'n_terms': n_terms_local,
                     'score': refit_mse + COMPLEXITY_PENALTY * n_terms_local,
                     'alpha': candidate.get('alpha', -1.0),
+                    'solver_backend': candidate.get('solver_backend', 'auto'),
                 }
         except (np.linalg.LinAlgError, ValueError):
             pass
 
     if not candidate_pool:
-        _update_candidate_pool(candidate_pool, best_coeffs, best_mse, alpha_val=-1.0)
+        _update_candidate_pool(
+            candidate_pool,
+            best_coeffs,
+            best_mse,
+            alpha_val=-1.0,
+            solver_backend="best_fallback",
+        )
 
-    sorted_candidates = sorted(candidate_pool.values(), key=lambda c: (c['score'], c['mse']))
+    governed_candidates: List[Dict[str, Any]] = []
+    for candidate in candidate_pool.values():
+        cand_coeffs = candidate['coeffs']
+        cand_formula = _coeffs_to_formula(cand_coeffs)
+        cand_pred_full = basis_full @ cand_coeffs
+        cand_full_mse = float(np.mean((y - cand_pred_full) ** 2))
+        if not np.isfinite(cand_full_mse):
+            cand_full_mse = float(candidate['mse'])
+        cand_holdout = _holdout_mse_for_best(cand_coeffs) if holdout_mask is not None else None
+        n_terms_local = int(np.sum(np.abs(cand_coeffs) >= sparsity_threshold))
+        governed = _display_candidate_score(
+            cand_formula,
+            x,
+            y,
+            raw_mse=cand_full_mse,
+            fit_mse=float(candidate['mse']),
+            holdout_mse=cand_holdout,
+            complexity=n_terms_local,
+            n_terms=n_terms_local,
+        )
+        governed_candidates.append({
+            **candidate,
+            'formula': cand_formula,
+            'full_mse': cand_full_mse,
+            'holdout_mse': cand_holdout,
+            'governor': governed,
+            'governor_score': float(governed.get('score', float('inf'))),
+            'display_mse': governed.get('display_mse'),
+            'display_formula': governed.get('formula') or cand_formula,
+        })
+
+    semantic_dedup = {
+        'before': len(governed_candidates),
+        'after': len(governed_candidates),
+        'removed': 0,
+        'enabled': True,
+    }
+    if governed_candidates:
+        semantic_pool: Dict[Tuple[int, ...], Dict[str, Any]] = {}
+        unique_fallback: List[Dict[str, Any]] = []
+
+        def _candidate_rank_key(c: Dict[str, Any]) -> Tuple[float, float, float, float, int]:
+            return (
+                float(c.get('governor_score', float('inf'))),
+                float(c['display_mse']) if c.get('display_mse') is not None else float('inf'),
+                float(c.get('score', float('inf'))),
+                float(c.get('mse', float('inf'))),
+                int(c.get('n_terms', 9999)),
+            )
+
+        for cand in governed_candidates:
+            semantic_signature = _semantic_prediction_signature(cand['coeffs'])
+            if semantic_signature is None:
+                unique_fallback.append(cand)
+                continue
+            current = semantic_pool.get(semantic_signature)
+            if current is None or _candidate_rank_key(cand) < _candidate_rank_key(current):
+                semantic_pool[semantic_signature] = cand
+
+        governed_candidates = list(semantic_pool.values()) + unique_fallback
+        semantic_dedup['after'] = len(governed_candidates)
+        semantic_dedup['removed'] = max(0, semantic_dedup['before'] - semantic_dedup['after'])
+
+    sorted_candidates = sorted(
+        governed_candidates,
+        key=lambda c: (
+            c['governor_score'],
+            float(c['display_mse']) if c.get('display_mse') is not None else float('inf'),
+            c['score'],
+            c['mse'],
+        ),
+    )
     top_candidates = sorted_candidates[:5]
     best_candidate = top_candidates[0]
 
     coeffs = best_candidate['coeffs']
-    # Report MSE on *full* dataset (including holdout), not just fit subset
-    y_pred_full = basis_full @ coeffs
-    mse = float(np.mean((y - y_pred_full) ** 2))
+    mse = float(best_candidate.get('display_mse') if best_candidate.get('display_mse') is not None else best_candidate.get('full_mse', best_candidate['mse']))
     if not np.isfinite(mse):
-        mse = float(best_candidate['mse'])
-    formula = _coeffs_to_formula(coeffs)
+        mse = float(best_candidate.get('full_mse', best_candidate['mse']))
+    formula = str(best_candidate.get('display_formula') or best_candidate.get('formula') or _coeffs_to_formula(coeffs))
 
     n_nonzero = int(np.sum(np.abs(coeffs) >= sparsity_threshold))
     exact_match_flag = mse < 1e-6 and n_nonzero <= 10
@@ -1704,13 +2535,49 @@ def fast_path_regression(
         cand_coeffs = cand['coeffs']
         active_idx = np.flatnonzero(np.abs(cand_coeffs) >= sparsity_threshold)
         candidate_formulas.append({
-            'formula': _coeffs_to_formula(cand_coeffs),
-            'mse': float(cand['mse']),
-            'score': float(cand['score']),
+            'formula': str(cand.get('display_formula') or cand.get('formula') or _coeffs_to_formula(cand_coeffs)),
+            'mse': float(cand.get('display_mse') if cand.get('display_mse') is not None else cand.get('full_mse', cand['mse'])),
+            'score': float(cand.get('governor_score', cand['score'])),
             'n_nonzero': int(cand['n_terms']),
             'active_terms': [names[i] for i in active_idx],
             'alpha': float(cand.get('alpha', -1.0)),
+            'raw_mse': float(cand.get('full_mse', cand['mse'])),
+            'display_mse': cand.get('display_mse'),
+            'governor': cand.get('governor'),
+            'solver_backend': cand.get('solver_backend'),
         })
+
+    decomposition_candidates = build_decomposition_probe_candidates(
+        x,
+        y,
+        predictions,
+        max_candidates=8,
+    )
+    if decomposition_candidates:
+        seen_formula_keys = {
+            normalize_formula_ascii(str(c.get('formula', ''))).replace(" ", "")
+            for c in candidate_formulas
+        }
+        for cand in decomposition_candidates:
+            key = normalize_formula_ascii(str(cand.get('formula', ''))).replace(" ", "")
+            if key and key not in seen_formula_keys:
+                candidate_formulas.append(cand)
+                seen_formula_keys.add(key)
+
+        best_decomp = decomposition_candidates[0]
+        best_decomp_mse = float(best_decomp.get('mse', float('inf')))
+        if (
+            np.isfinite(best_decomp_mse)
+            and (
+                best_decomp_mse < max(1e-10, mse * 0.90)
+                or (best_decomp_mse < 1e-8 and not exact_match_flag)
+            )
+        ):
+            formula = str(best_decomp.get('formula') or formula)
+            mse = best_decomp_mse
+            exact_match_flag = mse < 1e-6 and int(best_decomp.get('n_nonzero', 99)) <= 10
+            n_nonzero = int(best_decomp.get('n_nonzero', n_nonzero))
+            best_candidate['governor'] = best_decomp.get('governor')
 
     return formula, mse, {
         'coefficients': coeffs,
@@ -1721,7 +2588,12 @@ def fast_path_regression(
         'y_variance': y_variance,
         'exact_match_diagnostics': exact_match_diagnostics,
         'candidate_formulas': candidate_formulas,
-        'holdout_mse': _holdout_mse_for_best(coeffs) if holdout_mask is not None else None,
+        'holdout_mse': best_candidate.get('holdout_mse') if holdout_mask is not None else None,
+        'candidate_governor': best_candidate.get('governor'),
+        'candidate_semantic_dedup': semantic_dedup,
+        'decomposition_probe_candidates': decomposition_candidates,
+        'solver_backends': solver_backends,
+        'winning_solver_backend': best_candidate.get('solver_backend'),
     }
 
 
@@ -1738,18 +2610,9 @@ def refine_frequencies(
     
     This handles cases like ω=3.2 where FFT might detect 3.13.
     """
-    import sys
-    from pathlib import Path as _Path
-    try:
-        import _core
-    except ImportError:
-        try:
-            cpp_dir = _Path(__file__).parent.parent / 'glassbox' / 'sr' / 'cpp'
-            if str(cpp_dir) not in sys.path:
-                sys.path.insert(0, str(cpp_dir))
-            import _core
-        except ImportError:
-            raise ImportError("cannot import name 'core' from 'glassbox.sr.cpp'")
+    _core, reason = _load_cpp_core()
+    if _core is None or not hasattr(_core, "refine_frequencies"):
+        raise ImportError(reason or "C++ _core extension does not provide refine_frequencies")
     
     x_np = np.asarray(x, dtype=np.float64).flatten()
     y_np = np.asarray(y, dtype=np.float64).flatten()
@@ -1879,18 +2742,9 @@ def refine_powers(
     Returns:
         (result_dict, mse) where result_dict has 'formula', 'powers', 'coefficients'
     """
-    import sys
-    from pathlib import Path as _Path
-    try:
-        import _core
-    except ImportError:
-        try:
-            cpp_dir = _Path(__file__).parent.parent / 'glassbox' / 'sr' / 'cpp'
-            if str(cpp_dir) not in sys.path:
-                sys.path.insert(0, str(cpp_dir))
-            import _core
-        except ImportError:
-            raise ImportError("cannot import name 'core' from 'glassbox.sr.cpp'")
+    _core, reason = _load_cpp_core()
+    if _core is None or not hasattr(_core, "refine_powers"):
+        raise ImportError(reason or "C++ _core extension does not provide refine_powers")
 
     # Ensure 1D inputs
     if x.ndim > 1:
@@ -2072,13 +2926,16 @@ def refine_constants(
                 break
 
     if has_periodic and detected_omegas:
-        refined_omegas, freq_mse = refine_frequencies(
-            x, y, detected_omegas, n_steps=150, device=device
-        )
-        results['frequency'] = {
-            'omegas': refined_omegas,
-            'mse': freq_mse,
-        }
+        try:
+            refined_omegas, freq_mse = refine_frequencies(
+                x, y, detected_omegas, n_steps=150, device=device
+            )
+            results['frequency'] = {
+                'omegas': refined_omegas,
+                'mse': freq_mse,
+            }
+        except ImportError:
+            pass
 
     # 2. Power refinement (if power predicted)
     has_power = False
@@ -2087,11 +2944,14 @@ def refine_constants(
             has_power = True
 
     if has_power:
-        power_result, power_mse = refine_powers(
-            x, y, detected_omegas=detected_omegas, device=device
-        )
-        if power_result is not None:
-            results['power'] = power_result
+        try:
+            power_result, power_mse = refine_powers(
+                x, y, detected_omegas=detected_omegas, device=device
+            )
+            if power_result is not None:
+                results['power'] = power_result
+        except ImportError:
+            pass
 
     return results
 
@@ -2194,31 +3054,35 @@ def fast_path_with_refinement(
 
     if should_try_freq:
         print(f"  Attempting frequency refinement (initial MSE={best_mse:.4f})...")
-        
-        refined_omegas, refined_mse = refine_frequencies(
-            x, y, detected_omegas, n_steps=refine_steps, device=device
-        )
-        
-        print(f"  Refined frequencies: {[f'{o:.3f}' for o in refined_omegas]}")
-        print(f"  Refinement MSE: {refined_mse:.6f}")
-        
-        # Re-run regression with refined omegas
-        if refined_mse < best_mse:
-            formula2, mse2, details2 = fast_path_regression(
-                x, y, predictions, detected_omegas=refined_omegas,
-                op_constraints=op_constraints,
-                universal_basis=best_universal,
-                exact_match_threads=exact_match_threads,
-                exact_match_enabled=exact_match_enabled,
-                exact_match_max_basis=exact_match_max_basis,
-                max_power=max_power,
-                device=device,
-                exact_match_backend=exact_match_backend,
-                exact_match_min_gpu_work=exact_match_min_gpu_work,
-                exact_match_max_combos=exact_match_max_combos,
+        try:
+            refined_omegas, refined_mse = refine_frequencies(
+                x, y, detected_omegas, n_steps=refine_steps, device=device
             )
-            if should_accept_candidate(mse2, details2):
-                return formula2, mse2, details2
+        except Exception as err:
+            print(f"  [Frequency refinement skipped: {err}]")
+            refined_omegas, refined_mse = [], float('inf')
+
+        if refined_omegas:
+            print(f"  Refined frequencies: {[f'{o:.3f}' for o in refined_omegas]}")
+            print(f"  Refinement MSE: {refined_mse:.6f}")
+
+            # Re-run regression with refined omegas
+            if refined_mse < best_mse:
+                formula2, mse2, details2 = fast_path_regression(
+                    x, y, predictions, detected_omegas=refined_omegas,
+                    op_constraints=op_constraints,
+                    universal_basis=best_universal,
+                    exact_match_threads=exact_match_threads,
+                    exact_match_enabled=exact_match_enabled,
+                    exact_match_max_basis=exact_match_max_basis,
+                    max_power=max_power,
+                    device=device,
+                    exact_match_backend=exact_match_backend,
+                    exact_match_min_gpu_work=exact_match_min_gpu_work,
+                    exact_match_max_combos=exact_match_max_combos,
+                )
+                if should_accept_candidate(mse2, details2):
+                    return formula2, mse2, details2
     
     # Additional continuous refinement for periodic×rational terms
     if op_constraints:
@@ -2942,24 +3806,9 @@ def beam_search_evolution(
         Dict with 'formula', 'mse', 'model', 'time', or None if C++ unavailable
     """
     import time
-    import sys
-    from pathlib import Path as _Path
-    
-    # Try importing C++ backend
-    try:
-        cpp_dir = _Path(__file__).parent.parent / 'glassbox' / 'sr' / 'cpp'
-        if str(cpp_dir) not in sys.path:
-            sys.path.insert(0, str(cpp_dir))
-        import _core
-    except ImportError:
-        # Also try relative to the glassbox package
-        try:
-            cpp_dir = _Path(__file__).resolve().parent.parent / 'glassbox' / 'sr' / 'cpp'
-            if str(cpp_dir) not in sys.path:
-                sys.path.insert(0, str(cpp_dir))
-            import _core
-        except ImportError:
-            return None
+    _core, _ = _load_cpp_core()
+    if _core is None or not hasattr(_core, "run_evolution"):
+        return None
 
     if operator_hints is None:
         operator_hints = {}
@@ -3415,8 +4264,13 @@ def beam_search_evolution(
             try:
                 import warnings
                 with warnings.catch_warnings():
+                    try:
+                        from sympy.utilities.exceptions import SymPyDeprecationWarning
+                    except Exception:
+                        SymPyDeprecationWarning = DeprecationWarning
+                    warnings.filterwarnings("ignore", category=SymPyDeprecationWarning)
                     warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"sympy\..*")
-                    warnings.filterwarnings("ignore", message=r".*Using non-Expr arguments in Mul.*")
+                    warnings.filterwarnings("ignore", message=r"\s*Using non-Expr arguments in Mul.*")
                     sp_expr = simplify_onn_formula(formula_str)[1]
             except Exception:
                 transformations = standard_transformations + (convert_xor, implicit_multiplication_application)

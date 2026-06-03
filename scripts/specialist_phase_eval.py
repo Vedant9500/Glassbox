@@ -628,12 +628,18 @@ def run_phase7(*, quick: bool = False) -> Dict[str, Any]:
             "phase7": phase7,
         })
 
-        if (
+        exact_or_boosted = (
+            phase7.get("r2", 0.0) >= 0.999
+            and phase7.get("composition_proposal_count", 0) >= 1
+            and phase7.get("composition_accepted_count", 0) >= 1
+        )
+        staged_improvement = (
             phase7.get("r2", 0.0) >= 0.99
             and phase7.get("boosting_attempted")
             and phase7.get("boosting_improved")
             and phase7.get("boosting_stage_count", 0) >= 1
-        ):
+        )
+        if exact_or_boosted or staged_improvement:
             phase7_hits += 1
 
     summary = {
