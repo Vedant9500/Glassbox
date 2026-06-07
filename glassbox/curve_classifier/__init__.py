@@ -1,5 +1,8 @@
 # Curve Classifier module
 from .curve_classifier_integration import (
+    CURVE_CLASSIFIER_MULTIVARIATE_NEURAL_MODE,
+    CURVE_CLASSIFIER_UNIVARIATE_NEURAL_MODE,
+    describe_curve_classifier_inference,
     predict_operators,
     validate_curve_classifier_checkpoint_metadata,
 )
@@ -23,6 +26,9 @@ from .model_registry import DEFAULT_CURVE_CLASSIFIER_PATH, resolve_curve_classif
 
 __all__ = [
     'predict_operators',
+    'describe_curve_classifier_inference',
+    'CURVE_CLASSIFIER_MULTIVARIATE_NEURAL_MODE',
+    'CURVE_CLASSIFIER_UNIVARIATE_NEURAL_MODE',
     'validate_curve_classifier_checkpoint_metadata',
     'CURVE_CLASSIFIER_ARCHITECTURE_VERSION',
     'CurveClassifierMLP',

@@ -43,6 +43,43 @@ except (ImportError, ValueError):
         except ImportError:
             from glassbox.curve_classifier.generate_curve_data import extract_all_features, extract_all_features_xy, OPERATOR_CLASSES
 
+CURVE_CLASSIFIER_UNIVARIATE_NEURAL_MODE = "canonical_univariate_xy"
+CURVE_CLASSIFIER_MULTIVARIATE_NEURAL_MODE = "heuristic_slice_aggregation"
+
+
+def describe_curve_classifier_inference(x: np.ndarray) -> Dict[str, object]:
+    """Describe the public classifier inference contract for the given input shape."""
+    x_arr = np.asarray(x)
+    if x_arr.ndim == 1:
+        n_vars = 1
+    elif x_arr.ndim == 2:
+        n_vars = int(x_arr.shape[1])
+    else:
+        raise ValueError(f"Expected x to be 1D, [N,1], or [N,D], got shape {x_arr.shape}")
+
+    if n_vars <= 1:
+        return {
+            "input_mode": "univariate",
+            "n_input_features": 1,
+            "status": "trained_univariate_neural",
+            "neural_feature_mode": CURVE_CLASSIFIER_UNIVARIATE_NEURAL_MODE,
+            "supports_trained_multivariate_neural_model": False,
+            "operator_prior_source": "canonicalized_univariate_xy_features",
+        }
+
+    return {
+        "input_mode": "multivariate",
+        "n_input_features": n_vars,
+        "status": "heuristic_multivariate",
+        "neural_feature_mode": CURVE_CLASSIFIER_MULTIVARIATE_NEURAL_MODE,
+        "supports_trained_multivariate_neural_model": False,
+        "operator_prior_source": "per_variable_xy_slices_plus_interaction_diagonal_slices",
+        "notes": [
+            "The neural classifier is trained on one-dimensional curve features.",
+            "Multivariate inference uses interpolation slices and max-aggregated univariate priors.",
+        ],
+    }
+
 # =============================================================================
 # MODEL DEFINITION (must match training)
 # =============================================================================
@@ -709,10 +746,12 @@ def predict_operators(
     """
     Predict which operators are likely present in the data.
     
-    For multi-input data (n_vars > 1), uses per-variable 1D slicing:
+    For multi-input data (n_vars > 1), uses heuristic per-variable 1D slicing:
     - Takes 1D cross-sections through the data (fixing other vars at midpoint)
     - Runs classifier on each slice
     - Aggregates predictions across all variables
+    This is not a trained multivariate neural model; call
+    describe_curve_classifier_inference(x) for the explicit inference contract.
     
     Args:
         x: Input values - 1D array (N,) or 2D array (N, n_vars)

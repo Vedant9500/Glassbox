@@ -383,7 +383,6 @@ try:
         family_holdout_split,
         formula_keys_from_metadata_or_formulas,
         grouped_train_val_split,
-        metrics_to_json_dict,
         row_train_val_split,
         write_validation_report,
     )
@@ -402,7 +401,6 @@ except (ImportError, ValueError):
         family_holdout_split,
         formula_keys_from_metadata_or_formulas,
         grouped_train_val_split,
-        metrics_to_json_dict,
         row_train_val_split,
         write_validation_report,
     )

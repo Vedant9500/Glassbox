@@ -150,7 +150,7 @@ def test_universal_proposer_dual_path_handles_multivariate_input(monkeypatch):
 
     assert payload is not None
     assert force is False
-    assert est.universal_proposer_status_ == "ok_multivariate"
+    assert est.universal_proposer_status_ == "ok_multivariate_heuristic"
     assert captured["x_shape"] == X.shape
     assert payload["interaction_hints"]["multivariate_proxy"] is False
     assert payload["search_plan"]["supports_multivariate_formulas"] is True

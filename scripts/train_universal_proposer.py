@@ -30,6 +30,8 @@ from glassbox.universal_proposer import (
     DEFAULT_UNIVARIATE_SKELETON_VOCAB,
     DEFAULT_MULTIVARIATE_SKELETON_VOCAB,
     UNIVERSAL_PROPOSER_ARCHITECTURE_VERSION,
+    UNIVERSAL_PROPOSER_CONTRACT_VERSION,
+    UNIVERSAL_PROPOSER_ROLE,
     normalize_formula_key,
 )
 
@@ -284,7 +286,6 @@ class FormulaReplayDataset(Dataset):
                 operator_classes,
                 _feature_dim,
                 _feature_schema,
-                _metadata,
             ) = load_training_data(str(features), n_classes=N_CLASSES)
 
         if labels is None:
@@ -662,6 +663,8 @@ def main():
                         help="Generator family to hold out when --split-policy=family_holdout")
     parser.add_argument("--validation-report", type=str, default="",
                         help="Optional output path for Phase 3 validation report JSON")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -672,6 +675,11 @@ def main():
     # Enable TF32 for better performance on Ampere+ GPUs (as suggested by the warning)
     if device.type == 'cuda':
         torch.set_float32_matmul_precision('high')
+
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if device.type == 'cuda':
+        torch.cuda.manual_seed_all(args.seed)
 
     config = UniversalProposerConfig(hidden_dim=args.hidden)
     model = UniversalProposer(config).to(device)
@@ -746,10 +754,10 @@ def main():
             train_idx, val_idx, split_details = family_holdout_split(generator_families, heldout_family)
             split_policy = "family_holdout"
         elif split_policy in {"auto", "formula_group"} and formula_keys is not None:
-            train_idx, val_idx, split_details = grouped_train_val_split(formula_keys, args.val_split, 42)
+            train_idx, val_idx, split_details = grouped_train_val_split(formula_keys, args.val_split, args.seed)
             split_policy = str(split_details.get("policy", "formula_group"))
         else:
-            train_idx, val_idx = row_train_val_split(len(features), args.val_split, 42)
+            train_idx, val_idx = row_train_val_split(len(features), args.val_split, args.seed)
             split_policy = "row"
             split_details = {"policy": "row", "exclusive_groups": False}
         
@@ -875,12 +883,21 @@ def main():
                         "hidden_dim": config.hidden_dim,
                         "n_features": config.n_features,
                         "supports_multivariate_formulas": config.supports_multivariate_formulas,
+                        "multivariate_neural_mode": config.multivariate_neural_mode,
+                        "proposer_contract_version": config.proposer_contract_version,
                         "max_input_vars": config.max_input_vars,
                         "operator_vocab": model.operator_vocab,
                         "skeleton_vocab": model.skeleton_vocab,
                         "architecture_version": UNIVERSAL_PROPOSER_ARCHITECTURE_VERSION,
                     },
                     "architecture_version": UNIVERSAL_PROPOSER_ARCHITECTURE_VERSION,
+                    "proposer_contract_version": UNIVERSAL_PROPOSER_CONTRACT_VERSION,
+                    "proposer_role": UNIVERSAL_PROPOSER_ROLE,
+                    "routing_calibration": {
+                        "status": "uncalibrated",
+                        "method": "candidate_mse_gate_plus_validation_gated_skeleton_confidence",
+                        "requires": "downstream_candidate_success_benchmark",
+                    },
                     "feature_scaler": weights_only_safe_scaler(feature_scaler),
                     "epoch": epoch,
                     "val_f1": best_f1,

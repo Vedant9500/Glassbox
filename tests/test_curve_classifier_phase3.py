@@ -113,6 +113,28 @@ def test_training_data_loader_reads_phase2_validation_metadata():
     assert metadata["labels_match_semantic"].tolist() == [True, True, True, True]
 
 
+def test_proposer_replay_dataset_preserves_loader_compatibility():
+    formulas = ["np.sin(x)", "x ** 2"]
+    labels = np.vstack([operators_to_labels(set(), formula=f) for f in formulas])
+    features = np.zeros((len(formulas), FEATURE_DIM), dtype=np.float32)
+    out = Path("scratch") / "pytest_phase3_proposer_dataset.npz"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    save_dataset(out, features, labels, formulas)
+
+    old_shape_loaded = tup.load_training_data(str(out), n_classes=N_CLASSES)
+    assert len(old_shape_loaded) == 6
+
+    metadata_shape_loaded = tup.load_training_data(str(out), n_classes=N_CLASSES, return_metadata=True)
+    assert len(metadata_shape_loaded) == 7
+
+    ds = tup.FormulaReplayDataset(out)
+    sample_features, op_target, skeleton_target = ds[0]
+
+    assert sample_features.shape == (FEATURE_DIM,)
+    assert op_target.shape[0] == len(tup.DEFAULT_OPERATOR_VOCAB)
+    assert int(skeleton_target.item()) >= 0
+
+
 def test_proposer_skeleton_metric_summary_reports_topk_and_calibration():
     logits = torch.tensor([
         [5.0, 0.0, 0.0],

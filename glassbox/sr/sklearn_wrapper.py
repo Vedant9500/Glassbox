@@ -3382,7 +3382,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 proposer_status = "ok"
             else:
                 x1 = X_arr
-                proposer_status = "ok_multivariate"
+                proposer_status = "ok_multivariate_heuristic"
 
             y1 = np.asarray(y, dtype=np.float64).reshape(-1)
 
@@ -4607,7 +4607,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             p_unc = proposer_payload.get("sequence_uncertainty", {})
                             if not isinstance(p_unc, dict):
                                 p_unc = {}
-                            confidence = 1.0 - p_unc.get("entropy", 0.5)
+                            p_entropy = p_unc.get("entropy")
+                            confidence = 1.0 - (0.5 if p_entropy is None else float(p_entropy))
                             guided_generations = _clamp_int(
                                 min(40, self.generations // 10)
                                 * float(blackbox_search_plan.get("generation_multiplier", 1.0)),
