@@ -12,7 +12,11 @@ from .models import (
     SemanticFeatureAttention,
 )
 from .generate_curve_data import (
+    SEMANTIC_LABELER_VERSION,
+    build_formula_audit_metadata,
+    derive_semantic_operators_from_formula,
     extract_all_features_xy,
+    formula_to_key,
     prepare_univariate_curve_xy,
 )
 from .model_registry import DEFAULT_CURVE_CLASSIFIER_PATH, resolve_curve_classifier_path
@@ -26,7 +30,11 @@ __all__ = [
     'CurveClassifierGLU',
     'EQLLayer',
     'SemanticFeatureAttention',
+    'SEMANTIC_LABELER_VERSION',
+    'build_formula_audit_metadata',
+    'derive_semantic_operators_from_formula',
     'extract_all_features_xy',
+    'formula_to_key',
     'prepare_univariate_curve_xy',
     'DEFAULT_CURVE_CLASSIFIER_PATH',
     'resolve_curve_classifier_path',

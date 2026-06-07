@@ -16,7 +16,12 @@ from torch.utils.data import DataLoader, Dataset
 import argparse
 from pathlib import Path
 from tqdm import tqdm
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Dict
+import sys
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 # =============================================================================
@@ -372,6 +377,16 @@ try:
         EQLLayer as EQLLayer,
         SemanticFeatureAttention as SemanticFeatureAttention,
     )
+    from .validation import (
+        build_validation_report,
+        default_validation_report_path,
+        family_holdout_split,
+        formula_keys_from_metadata_or_formulas,
+        grouped_train_val_split,
+        metrics_to_json_dict,
+        row_train_val_split,
+        write_validation_report,
+    )
 except (ImportError, ValueError):
     from glassbox.curve_classifier.models import (
         CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
@@ -380,6 +395,16 @@ except (ImportError, ValueError):
         CurveClassifierMLP as CurveClassifierMLP,
         EQLLayer as EQLLayer,
         SemanticFeatureAttention as SemanticFeatureAttention,
+    )
+    from glassbox.curve_classifier.validation import (
+        build_validation_report,
+        default_validation_report_path,
+        family_holdout_split,
+        formula_keys_from_metadata_or_formulas,
+        grouped_train_val_split,
+        metrics_to_json_dict,
+        row_train_val_split,
+        write_validation_report,
     )
 
 
@@ -973,6 +998,7 @@ def train_model(
                 'val_loss': val_metrics['loss'],
                 'val_acc': val_metrics['accuracy'],
                 'val_f1': val_metrics['f1_mean'],
+                'val_micro_f1': val_metrics['micro_f1'],
                 'operator_classes': operator_classes,
                 'model_type': model_type,
                 'model_config': {
@@ -1046,8 +1072,10 @@ def load_training_data(
     feature_dim: int,
     n_classes: int,
     load_into_ram: bool,
+    return_metadata: bool = False,
 ):
     """Load training data from .npz or streamed .dat files."""
+    dataset_metadata: Dict[str, object] = {}
     # Case 1: single .npz file
     if len(data_args) == 1 and data_args[0].endswith(".npz"):
         data = np.load(data_args[0], allow_pickle=True)
@@ -1056,6 +1084,32 @@ def load_training_data(
         operator_classes = data["operator_classes"].tolist()
         detected_feature_dim = int(data["feature_dim"]) if "feature_dim" in data else features.shape[1]
         feature_schema = data["feature_schema"].item() if "feature_schema" in data else None
+        formulas = data["formulas"].tolist() if "formulas" in data else None
+        n_loaded = int(features.shape[0])
+        dataset_metadata = {
+            "dataset_path": str(data_args[0]),
+            "formulas": formulas,
+            "formula_keys": formula_keys_from_metadata_or_formulas(
+                data["formula_keys"] if "formula_keys" in data else None,
+                formulas,
+                limit=n_loaded,
+            ),
+            "generator_families": (
+                np.asarray(data["generator_families"][:n_loaded], dtype=object)
+                if "generator_families" in data else None
+            ),
+            "template_ids": (
+                np.asarray(data["template_ids"][:n_loaded], dtype=object)
+                if "template_ids" in data else None
+            ),
+            "labeler_version": str(data["labeler_version"]) if "labeler_version" in data else None,
+            "labels_match_semantic": (
+                np.asarray(data["labels_match_semantic"][:n_loaded], dtype=bool)
+                if "labels_match_semantic" in data else None
+            ),
+        }
+        if return_metadata:
+            return features, labels, operator_classes, detected_feature_dim, feature_schema, dataset_metadata
         return features, labels, operator_classes, detected_feature_dim, feature_schema
 
     # Case 2: base path or explicit feature/label files
@@ -1097,6 +1151,9 @@ def load_training_data(
         "identity", "sin", "cos", "power", "exp",
         "log", "addition", "multiplication", "rational",
     ][:n_classes]
+    dataset_metadata = {"dataset_path": str(data_args[0]) if data_args else None}
+    if return_metadata:
+        return features, labels, operator_classes, feature_dim, None, dataset_metadata
     return features, labels, operator_classes, feature_dim, None
 
 
@@ -1150,6 +1207,13 @@ def main():
                         help="Use approximate multi-label stratified train/val split (default: on)")
     parser.add_argument("--no-stratified-split", action="store_true",
                         help="Disable stratified split")
+    parser.add_argument("--split-policy", type=str, default="auto",
+                        choices=["auto", "row", "stratified", "formula_group", "family_holdout"],
+                        help="Validation split policy. auto uses formula groups when dataset metadata is present.")
+    parser.add_argument("--heldout-family", type=str, default="",
+                        help="Generator family to hold out when --split-policy=family_holdout")
+    parser.add_argument("--validation-report", type=str, default="",
+                        help="Optional output path for Phase 3 validation report JSON")
     parser.add_argument("--calibrate", action="store_true",
                         help="Calibrate probabilities with temperature scaling")
     parser.add_argument("--class-weights", action="store_true",
@@ -1182,12 +1246,13 @@ def main():
     
     # Load data
     print(f"Loading data from {args.data}...")
-    features, labels, operator_classes, feature_dim, feature_schema = load_training_data(
+    features, labels, operator_classes, feature_dim, feature_schema, dataset_metadata = load_training_data(
         args.data,
         args.n_samples,
         args.feature_dim,
         args.n_classes,
         args.load_into_ram,
+        return_metadata=True,
     )
     
     print(f"  Features: {features.shape}")
@@ -1200,26 +1265,70 @@ def main():
     if feature_schema is not None:
         print(f"  Feature schema: {feature_schema}")
     
-    # Train/val split
-    if stratified_split:
+    formula_keys = dataset_metadata.get("formula_keys")
+    generator_families = dataset_metadata.get("generator_families")
+    template_ids = dataset_metadata.get("template_ids")
+    split_details = {}
+    split_policy = args.split_policy
+
+    # Train/val split. Phase 3 defaults dataset-backed training to formula
+    # groups when metadata is present so checkpoint metrics are not row-leaky.
+    if split_policy == "family_holdout" or args.heldout_family:
+        if generator_families is None:
+            raise ValueError("--split-policy=family_holdout requires generator_families metadata")
+        heldout_family = args.heldout_family
+        if not heldout_family:
+            family_counts = {}
+            for family in np.asarray(generator_families, dtype=object).astype(str):
+                family_counts[family] = family_counts.get(family, 0) + 1
+            if not family_counts:
+                raise ValueError("No generator families available for family_holdout split")
+            heldout_family = min(family_counts, key=family_counts.get)
+        train_idx, val_idx, split_details = family_holdout_split(generator_families, heldout_family)
+        split_policy = "family_holdout"
+    elif split_policy in {"auto", "formula_group"} and formula_keys is not None:
+        train_idx, val_idx, split_details = grouped_train_val_split(formula_keys, args.val_split, args.seed)
+        split_policy = str(split_details.get("policy", "formula_group"))
+    elif split_policy in {"auto", "stratified"} and stratified_split:
         train_idx, val_idx = multilabel_stratified_split(labels, args.val_split, args.seed)
+        split_policy = "stratified"
+        split_details = {"policy": "stratified", "exclusive_groups": False}
     else:
-        n_val = int(len(features) * args.val_split)
-        if n_val < 1 or len(features) - n_val < 1:
-            raise ValueError(
-                f"--val-split={args.val_split} creates train={len(features) - n_val} "
-                f"val={n_val}; both splits must contain at least one sample."
-            )
-        indices = np.random.permutation(len(features))
-        val_idx = indices[:n_val]
-        train_idx = indices[n_val:]
+        train_idx, val_idx = row_train_val_split(len(features), args.val_split, args.seed)
+        split_policy = "row"
+        split_details = {"policy": "row", "exclusive_groups": False}
 
     scaler = None
     if standardize:
         mean, std = compute_feature_stats(features, train_idx)
         scaler = {'mean': mean, 'std': std}
 
+    validation_report = build_validation_report(
+        dataset_path=str(args.data[0]) if args.data else None,
+        split_policy=split_policy,
+        train_idx=train_idx,
+        val_idx=val_idx,
+        labels=np.asarray(labels, dtype=np.float32),
+        operator_classes=operator_classes,
+        formula_keys=formula_keys,
+        generator_families=generator_families,
+        template_ids=template_ids,
+        split_details=split_details,
+        notes=[
+            "Phase 3 report uses formula-key group validation when metadata is available.",
+            "Row-permutation stress is covered by Phase 1 univariate feature/inference regression tests.",
+        ],
+    )
+
+    print(f"  Split policy: {split_policy}")
     print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}")
+    if validation_report["formula_overlap"].get("available"):
+        overlap = validation_report["formula_overlap"]
+        print(
+            "  Formula overlap: "
+            f"{overlap['overlap_unique_formulas']} unique, "
+            f"{overlap['val_rows_with_train_formula_fraction']:.3f} val-row fraction"
+        )
     
     # Data loaders with optimizations and lazy memmap-backed access
     train_dataset = IndexedFeatureDataset(
@@ -1352,9 +1461,28 @@ def main():
         checkpoint['feature_scaler'] = scaler
     checkpoint['feature_schema'] = feature_schema
     checkpoint['feature_dim'] = feature_dim or features.shape[1]
+    checkpoint['validation_split_policy'] = split_policy
+    checkpoint['validation_split_details'] = dict(split_details)
+    validation_report_path = (
+        Path(args.validation_report)
+        if args.validation_report
+        else default_validation_report_path(output_path)
+    )
+    validation_report["metrics"] = {
+        "best_checkpoint": {
+            "epoch": checkpoint.get("epoch"),
+            "val_loss": checkpoint.get("val_loss"),
+            "val_acc": checkpoint.get("val_acc"),
+            "val_f1": checkpoint.get("val_f1"),
+            "val_micro_f1": checkpoint.get("val_micro_f1"),
+        }
+    }
+    write_validation_report(validation_report_path, validation_report)
+    checkpoint['validation_report_path'] = str(validation_report_path)
     torch.save(checkpoint, output_path)
     
     print(f"\nModel saved to {output_path}")
+    print(f"Validation report saved to {validation_report_path}")
 
 
 if __name__ == "__main__":

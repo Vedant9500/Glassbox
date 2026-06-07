@@ -42,6 +42,16 @@ try:
         FEATURE_SCHEMA,
         N_CLASSES,
     )
+    from glassbox.curve_classifier.validation import (
+        build_validation_report,
+        default_validation_report_path,
+        family_holdout_split,
+        formula_keys_from_metadata_or_formulas,
+        grouped_train_val_split,
+        metrics_to_json_dict,
+        row_train_val_split,
+        write_validation_report,
+    )
 except Exception:
     from glassbox.curve_classifier.generate_curve_data import (
         extract_all_features,
@@ -50,6 +60,16 @@ except Exception:
         FEATURE_DIM,
         FEATURE_SCHEMA,
         N_CLASSES,
+    )
+    from glassbox.curve_classifier.validation import (
+        build_validation_report,
+        default_validation_report_path,
+        family_holdout_split,
+        formula_keys_from_metadata_or_formulas,
+        grouped_train_val_split,
+        metrics_to_json_dict,
+        row_train_val_split,
+        write_validation_report,
     )
 
 
@@ -92,7 +112,8 @@ def _canonicalize_formula_for_vocab(formula: str, n_input_vars: int = 1) -> str:
 def load_training_data(
     data_path: str,
     n_classes: int,
-) -> tuple[np.ndarray, np.ndarray, Optional[List[str]], Optional[List[str]], Optional[int], Optional[dict]]:
+    return_metadata: bool = False,
+) -> tuple:
     """Load proposer training data from the current curve dataset format."""
     blob = np.load(data_path, allow_pickle=True)
     features = np.asarray(blob["features"], dtype=np.float32)
@@ -104,6 +125,30 @@ def load_training_data(
     )
     feature_dim = int(blob["feature_dim"]) if "feature_dim" in blob else int(features.shape[1])
     feature_schema = blob["feature_schema"].item() if "feature_schema" in blob else None
+    n_loaded = int(features.shape[0])
+    metadata = {
+        "dataset_path": str(data_path),
+        "formula_keys": formula_keys_from_metadata_or_formulas(
+            blob["formula_keys"] if "formula_keys" in blob else None,
+            formulas,
+            limit=n_loaded,
+        ),
+        "generator_families": (
+            np.asarray(blob["generator_families"][:n_loaded], dtype=object)
+            if "generator_families" in blob else None
+        ),
+        "template_ids": (
+            np.asarray(blob["template_ids"][:n_loaded], dtype=object)
+            if "template_ids" in blob else None
+        ),
+        "labeler_version": str(blob["labeler_version"]) if "labeler_version" in blob else None,
+        "labels_match_semantic": (
+            np.asarray(blob["labels_match_semantic"][:n_loaded], dtype=bool)
+            if "labels_match_semantic" in blob else None
+        ),
+    }
+    if return_metadata:
+        return features, labels, formulas, operator_classes, feature_dim, feature_schema, metadata
     return features, labels, formulas, operator_classes, feature_dim, feature_schema
 
 
@@ -239,6 +284,7 @@ class FormulaReplayDataset(Dataset):
                 operator_classes,
                 _feature_dim,
                 _feature_schema,
+                _metadata,
             ) = load_training_data(str(features), n_classes=N_CLASSES)
 
         if labels is None:
@@ -440,12 +486,65 @@ def _train_epoch(model, loader, optimizer, device, scaler=None) -> float:
     return float((total_loss / max(total_samples, 1)).item())
 
 
+def _skeleton_metric_summary(logits: torch.Tensor, targets: torch.Tensor) -> dict:
+    if logits.numel() == 0 or targets.numel() == 0:
+        return {
+            "skeleton_valid_count": 0,
+            "skeleton_top1_acc": None,
+            "skeleton_top5_acc": None,
+            "skeleton_ece_10": None,
+            "skeleton_confidence_mean": None,
+        }
+
+    valid = targets >= 0
+    valid_count = int(valid.sum().item())
+    if valid_count == 0:
+        return {
+            "skeleton_valid_count": 0,
+            "skeleton_top1_acc": None,
+            "skeleton_top5_acc": None,
+            "skeleton_ece_10": None,
+            "skeleton_confidence_mean": None,
+        }
+
+    logits_valid = logits[valid]
+    targets_valid = targets[valid]
+    probs = torch.softmax(logits_valid, dim=1)
+    conf, pred = probs.max(dim=1)
+    correct = (pred == targets_valid).float()
+    top_k = min(5, probs.shape[1])
+    topk = torch.topk(probs, k=top_k, dim=1).indices
+    top5_correct = (topk == targets_valid.unsqueeze(1)).any(dim=1).float()
+
+    ece = torch.tensor(0.0)
+    bin_edges = torch.linspace(0.0, 1.0, 11)
+    for start, end in zip(bin_edges[:-1], bin_edges[1:]):
+        mask = (conf >= start) & (conf < end)
+        if end >= 1.0:
+            mask = (conf >= start) & (conf <= end)
+        if not mask.any():
+            continue
+        bin_acc = correct[mask].mean()
+        bin_conf = conf[mask].mean()
+        ece = ece + (mask.float().mean() * torch.abs(bin_acc - bin_conf))
+
+    return {
+        "skeleton_valid_count": valid_count,
+        "skeleton_top1_acc": float(correct.mean().item()),
+        "skeleton_top5_acc": float(top5_correct.mean().item()),
+        "skeleton_ece_10": float(ece.item()),
+        "skeleton_confidence_mean": float(conf.mean().item()),
+    }
+
+
 def _evaluate(model, loader, device) -> dict:
     model.eval()
     
     ds = loader.dataset
     all_preds = []
     all_labels = []
+    all_skeleton_logits = []
+    all_skeleton_targets = []
     
     if hasattr(ds, "is_on_device") and ds.is_on_device and device.type == 'cuda':
         total_loss = 0.0
@@ -473,6 +572,8 @@ def _evaluate(model, loader, device) -> dict:
                 total_loss += loss.item() * (end_idx - start_idx)
                 all_preds.append(torch.sigmoid(out["operator_logits"]).cpu())
                 all_labels.append(op_target.cpu())
+                all_skeleton_logits.append(out["skeleton_logits"].detach().cpu())
+                all_skeleton_targets.append(skeleton_target.detach().cpu())
                 
         avg_loss = total_loss / max(n_samples, 1)
     else:
@@ -499,6 +600,8 @@ def _evaluate(model, loader, device) -> dict:
                 total_samples += features.shape[0]
                 all_preds.append(torch.sigmoid(out["operator_logits"]).cpu())
                 all_labels.append(op_target.cpu())
+                all_skeleton_logits.append(out["skeleton_logits"].detach().cpu())
+                all_skeleton_targets.append(skeleton_target.detach().cpu())
                 
         avg_loss = total_loss / max(total_samples, 1)
 
@@ -506,17 +609,33 @@ def _evaluate(model, loader, device) -> dict:
     all_labels = torch.cat(all_labels)
     
     binary_preds = (all_preds > 0.5).float()
-    tp = ((binary_preds == 1) & (all_labels == 1)).float().sum()
-    fp = ((binary_preds == 1) & (all_labels == 0)).float().sum()
-    fn = ((binary_preds == 0) & (all_labels == 1)).float().sum()
+    tp_class = ((binary_preds == 1) & (all_labels == 1)).float().sum(dim=0)
+    fp_class = ((binary_preds == 1) & (all_labels == 0)).float().sum(dim=0)
+    fn_class = ((binary_preds == 0) & (all_labels == 1)).float().sum(dim=0)
     
-    precision = tp / (tp + fp + 1e-10)
-    recall = tp / (tp + fn + 1e-10)
+    precision = tp_class / (tp_class + fp_class + 1e-10)
+    recall = tp_class / (tp_class + fn_class + 1e-10)
     f1 = 2 * precision * recall / (precision + recall + 1e-10)
+    tp = tp_class.sum()
+    fp = fp_class.sum()
+    fn = fn_class.sum()
+    micro_f1 = 2 * tp / (2 * tp + fp + fn + 1e-10)
+
+    skeleton_logits = torch.cat(all_skeleton_logits) if all_skeleton_logits else torch.empty(0, 0)
+    skeleton_targets = torch.cat(all_skeleton_targets) if all_skeleton_targets else torch.empty(0, dtype=torch.long)
+    skeleton_metrics = _skeleton_metric_summary(skeleton_logits, skeleton_targets)
     
     return {
         "loss": avg_loss,
-        "f1": f1.mean().item()
+        "f1": f1.mean().item(),
+        "micro_f1": micro_f1.item(),
+        "f1_per_operator": f1.numpy(),
+        "skeleton_coverage": skeleton_metrics["skeleton_valid_count"] / max(1, int(all_labels.shape[0])),
+        "candidate_recall_after_affine_fit": None,
+        "candidate_recall_after_affine_fit_note": (
+            "Not computed from precomputed feature datasets; requires raw (x, y) curves."
+        ),
+        **skeleton_metrics,
     }
 
 def main():
@@ -536,6 +655,13 @@ def main():
     parser.add_argument("--load-into-ram", "--load-into-vram", dest="load_into_ram", action="store_true",
                         help="Load dataset fully into RAM/VRAM for maximum throughput")
     parser.add_argument("--compile", action="store_true", help="Use torch.compile (PyTorch 2.0+)")
+    parser.add_argument("--split-policy", type=str, default="auto",
+                        choices=["auto", "row", "formula_group", "family_holdout"],
+                        help="Validation split policy. auto uses formula groups when dataset metadata is present.")
+    parser.add_argument("--heldout-family", type=str, default="",
+                        help="Generator family to hold out when --split-policy=family_holdout")
+    parser.add_argument("--validation-report", type=str, default="",
+                        help="Optional output path for Phase 3 validation report JSON")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -568,7 +694,8 @@ def main():
                 operator_classes,
                 feature_dim,
                 feature_schema,
-            ) = load_training_data(args.data, n_classes=N_CLASSES)
+                dataset_metadata,
+            ) = load_training_data(args.data, n_classes=N_CLASSES, return_metadata=True)
         else:
             # Try loading streamed .dat files
             base = Path(args.data)
@@ -590,22 +717,41 @@ def main():
             formulas = None
             operator_classes = list(OPERATOR_CLASSES.keys())[:n_classes]
             feature_schema = None
+            dataset_metadata = {"dataset_path": str(args.data)}
             
         if args.max_samples > 0:
             features = features[:args.max_samples]
             labels = labels[:args.max_samples]
+            if formulas is not None:
+                formulas = formulas[:args.max_samples]
+            for key in ("formula_keys", "generator_families", "template_ids", "labels_match_semantic"):
+                value = dataset_metadata.get(key)
+                if value is not None:
+                    dataset_metadata[key] = np.asarray(value)[:args.max_samples]
 
-        indices = np.arange(len(features))
-        np.random.shuffle(indices)
-        
-        n_val = int(len(features) * args.val_split)
-        if n_val < 1 or len(features) - n_val < 1:
-            raise ValueError(
-                f"--val-split={args.val_split} creates train={len(features) - n_val} "
-                f"val={n_val}; both splits must contain at least one sample."
-            )
-        val_idx = indices[:n_val]
-        train_idx = indices[n_val:]
+        formula_keys = dataset_metadata.get("formula_keys")
+        generator_families = dataset_metadata.get("generator_families")
+        template_ids = dataset_metadata.get("template_ids")
+        split_policy = args.split_policy
+        split_details = {}
+        if split_policy == "family_holdout" or args.heldout_family:
+            if generator_families is None:
+                raise ValueError("--split-policy=family_holdout requires generator_families metadata")
+            heldout_family = args.heldout_family
+            if not heldout_family:
+                family_counts = {}
+                for family in np.asarray(generator_families, dtype=object).astype(str):
+                    family_counts[family] = family_counts.get(family, 0) + 1
+                heldout_family = min(family_counts, key=family_counts.get)
+            train_idx, val_idx, split_details = family_holdout_split(generator_families, heldout_family)
+            split_policy = "family_holdout"
+        elif split_policy in {"auto", "formula_group"} and formula_keys is not None:
+            train_idx, val_idx, split_details = grouped_train_val_split(formula_keys, args.val_split, 42)
+            split_policy = str(split_details.get("policy", "formula_group"))
+        else:
+            train_idx, val_idx = row_train_val_split(len(features), args.val_split, 42)
+            split_policy = "row"
+            split_details = {"policy": "row", "exclusive_groups": False}
         
         print("Computing feature statistics (SymLog + Standardize)...")
         mean, std = compute_feature_stats(features, train_idx)
@@ -623,10 +769,37 @@ def main():
             device=device if load_to_vram else None
         )
         print(f"train_samples={len(train_ds)} val_samples={len(val_ds)} path={args.data}")
+        validation_report = build_validation_report(
+            dataset_path=str(args.data),
+            split_policy=split_policy,
+            train_idx=train_idx,
+            val_idx=val_idx,
+            labels=np.asarray(labels, dtype=np.float32),
+            operator_classes=operator_classes,
+            formula_keys=formula_keys,
+            generator_families=generator_families,
+            template_ids=template_ids,
+            split_details=split_details,
+            notes=[
+                "Proposer Phase 3 report includes skeleton top-k metrics on formulas covered by the fixed skeleton vocabulary.",
+                "candidate_recall_after_affine_fit is not computed for feature-only datasets because raw (x, y) curves are unavailable.",
+            ],
+        )
+        print(f"  Split policy: {split_policy}")
+        if validation_report["formula_overlap"].get("available"):
+            overlap = validation_report["formula_overlap"]
+            print(
+                "  Formula overlap: "
+                f"{overlap['overlap_unique_formulas']} unique, "
+                f"{overlap['val_rows_with_train_formula_fraction']:.3f} val-row fraction"
+            )
         if feature_schema is not None:
             print(f"  Feature schema: {feature_schema}")
     else:
         feature_scaler = None
+        validation_report = None
+        split_policy = "synthetic_row"
+        split_details = {"policy": "synthetic_row", "exclusive_groups": False}
         n_val = int(args.n_samples * args.val_split)
         if n_val < 1 or args.n_samples < 1:
             raise ValueError(
@@ -665,6 +838,7 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     best_f1 = -1.0
+    best_metrics = {}
     patience_counter = 0
 
     print(f"Training GLU Proposer on {device}...")
@@ -692,6 +866,7 @@ def main():
         
         if val_f1 > best_f1:
             best_f1 = val_f1
+            best_metrics = metrics_to_json_dict(val_metrics)
             patience_counter = 0
             torch.save(
                 {
@@ -709,6 +884,10 @@ def main():
                     "feature_scaler": weights_only_safe_scaler(feature_scaler),
                     "epoch": epoch,
                     "val_f1": best_f1,
+                    "val_micro_f1": val_metrics.get("micro_f1"),
+                    "validation_split_policy": split_policy,
+                    "validation_split_details": dict(split_details),
+                    "validation_metrics": best_metrics,
                 },
                 out_path,
             )
@@ -718,6 +897,21 @@ def main():
             if patience_counter >= args.patience:
                 print(f"\nEarly stopping at epoch {epoch} (no improvement for {args.patience} epochs)")
                 break
+
+    checkpoint = torch.load(out_path, weights_only=False)
+    if validation_report is not None:
+        validation_report["metrics"] = {
+            "best_checkpoint": dict(checkpoint.get("validation_metrics") or best_metrics)
+        }
+        report_path = (
+            Path(args.validation_report)
+            if args.validation_report
+            else default_validation_report_path(out_path)
+        )
+        write_validation_report(report_path, validation_report)
+        checkpoint["validation_report_path"] = str(report_path)
+        torch.save(checkpoint, out_path)
+        print(f"Validation report saved to {report_path}")
 
     print(f"\nTraining complete. Best Val F1: {best_f1:.4f}. Model saved to {out_path}")
 
