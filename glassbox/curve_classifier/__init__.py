@@ -1,11 +1,33 @@
 # Curve Classifier module
-from .curve_classifier_integration import predict_operators, CurveClassifierMLP, CurveClassifierCNN
+from .curve_classifier_integration import (
+    predict_operators,
+    validate_curve_classifier_checkpoint_metadata,
+)
+from .models import (
+    CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
+    CurveClassifierMLP,
+    CurveClassifierCNN,
+    CurveClassifierGLU,
+    EQLLayer,
+    SemanticFeatureAttention,
+)
+from .generate_curve_data import (
+    extract_all_features_xy,
+    prepare_univariate_curve_xy,
+)
 from .model_registry import DEFAULT_CURVE_CLASSIFIER_PATH, resolve_curve_classifier_path
 
 __all__ = [
     'predict_operators',
+    'validate_curve_classifier_checkpoint_metadata',
+    'CURVE_CLASSIFIER_ARCHITECTURE_VERSION',
     'CurveClassifierMLP',
     'CurveClassifierCNN',
+    'CurveClassifierGLU',
+    'EQLLayer',
+    'SemanticFeatureAttention',
+    'extract_all_features_xy',
+    'prepare_univariate_curve_xy',
     'DEFAULT_CURVE_CLASSIFIER_PATH',
     'resolve_curve_classifier_path',
 ]

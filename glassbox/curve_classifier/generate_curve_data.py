@@ -406,9 +406,13 @@ class PCFGFormulaGenerator:
         Returns:
             (formula_string, operator_set) matching template interface.
         """
-        ops: Set[str] = set()
-        formula = self._generate_expr(self.max_depth, ops)
-        return formula, ops
+        for _ in range(8):
+            ops: Set[str] = set()
+            formula = self._generate_expr(self.max_depth, ops)
+            if ops:
+                return formula, ops
+
+        return "x", {"identity"}
     
     def _generate_expr(self, depth_budget: int, ops: Set[str]) -> str:
         """Recursively generate an expression with given depth budget."""
@@ -1164,6 +1168,66 @@ def extract_all_features(y: np.ndarray) -> np.ndarray:
     return features
 
 
+def prepare_univariate_curve_xy(
+    x: np.ndarray,
+    y: np.ndarray,
+    n_points: int = 256,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Canonicalize univariate samples before curve feature extraction.
+
+    Runtime datasets may arrive in arbitrary row order. The classifier and
+    proposer feature extractors operate on curve order, so the univariate
+    contract is:
+      1. drop non-finite `(x, y)` rows,
+      2. sort by `x`,
+      3. average duplicate `x` targets,
+      4. resample to a canonical fixed grid.
+    """
+    n_points = int(n_points)
+    if n_points < 2:
+        raise ValueError("n_points must be at least 2")
+
+    x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
+    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+    if x_arr.shape[0] != y_arr.shape[0]:
+        raise ValueError("x and y must have the same number of samples")
+
+    finite = np.isfinite(x_arr) & np.isfinite(y_arr)
+    if not np.any(finite):
+        return np.linspace(0.0, 1.0, n_points), np.zeros(n_points, dtype=np.float64)
+
+    x_arr = x_arr[finite]
+    y_arr = y_arr[finite]
+
+    order = np.argsort(x_arr, kind="mergesort")
+    x_sorted = x_arr[order]
+    y_sorted = y_arr[order]
+
+    x_unique, inverse = np.unique(x_sorted, return_inverse=True)
+    sums = np.bincount(inverse, weights=y_sorted)
+    counts = np.bincount(inverse)
+    y_unique = sums / np.maximum(counts, 1)
+
+    if x_unique.shape[0] == 1:
+        x_grid = np.linspace(0.0, 1.0, n_points)
+        y_grid = np.full(n_points, float(y_unique[0]), dtype=np.float64)
+    else:
+        x_grid = np.linspace(float(x_unique[0]), float(x_unique[-1]), n_points)
+        y_grid = np.interp(x_grid, x_unique, y_unique)
+
+    return x_grid, y_grid
+
+
+def extract_all_features_xy(
+    x: np.ndarray,
+    y: np.ndarray,
+    n_points: int = 256,
+) -> np.ndarray:
+    """Extract features from univariate `(x, y)` samples using the Phase 0 contract."""
+    _, y_grid = prepare_univariate_curve_xy(x, y, n_points=n_points)
+    return extract_all_features(y_grid)
+
+
 # =============================================================================
 # DATA GENERATION
 # =============================================================================
@@ -1537,43 +1601,45 @@ def generate_dataset(
     
     print(f"Generating data using {n_workers} workers...")
     
-    with multiprocessing.Pool(n_workers) as pool:
-        # Create partial function with fixed arguments
-        worker_func = partial(
-            generate_chunk, 
-            x_range=x_range, 
-            n_points=n_points,
-            templates=templates,
-            balance_templates=balance_templates,
-            balance_classes=balance_classes,
-            class_to_templates=class_to_templates,
-            class_sampling_weights=class_sampling_weights,
-            x_ranges=x_ranges,
-            x_scale_min=x_scale_min,
-            x_scale_max=x_scale_max,
-            x_shift_std=x_shift_std,
-            noise_std=noise_std,
-            y_scale_min=y_scale_min,
-            y_scale_max=y_scale_max,
-            y_offset_std=y_offset_std,
-            safe_eval=safe_eval,
-            signed_bd=signed_bd,
-            pcfg_ratio=pcfg_ratio,
-            pcfg_max_depth=pcfg_max_depth,
-            noise_profile=noise_profile,
-            multivariate_ratio=multivariate_ratio,
-            n_inputs=n_inputs,
-        )
-        
-        # Run workers
-        if show_progress:
-            results = list(tqdm(
-                pool.imap(worker_func, work_items),
-                total=n_workers,
-                desc="Generating chunks"
-            ))
-        else:
-            results = list(pool.imap(worker_func, work_items))
+    worker_func = partial(
+        generate_chunk,
+        x_range=x_range,
+        n_points=n_points,
+        templates=templates,
+        balance_templates=balance_templates,
+        balance_classes=balance_classes,
+        class_to_templates=class_to_templates,
+        class_sampling_weights=class_sampling_weights,
+        x_ranges=x_ranges,
+        x_scale_min=x_scale_min,
+        x_scale_max=x_scale_max,
+        x_shift_std=x_shift_std,
+        noise_std=noise_std,
+        y_scale_min=y_scale_min,
+        y_scale_max=y_scale_max,
+        y_offset_std=y_offset_std,
+        safe_eval=safe_eval,
+        signed_bd=signed_bd,
+        pcfg_ratio=pcfg_ratio,
+        pcfg_max_depth=pcfg_max_depth,
+        noise_profile=noise_profile,
+        multivariate_ratio=multivariate_ratio,
+        n_inputs=n_inputs,
+    )
+
+    if n_workers == 1:
+        iterable = tqdm(work_items, total=1, desc="Generating chunks") if show_progress else work_items
+        results = [worker_func(item) for item in iterable]
+    else:
+        with multiprocessing.Pool(n_workers) as pool:
+            if show_progress:
+                results = list(tqdm(
+                    pool.imap(worker_func, work_items),
+                    total=n_workers,
+                    desc="Generating chunks"
+                ))
+            else:
+                results = list(pool.imap(worker_func, work_items))
     
     # Combine results
     features_list = []

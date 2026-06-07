@@ -363,6 +363,26 @@ class CurveClassifierGLU(nn.Module):
         return self.classifier(x)
 
 
+try:
+    from .models import (
+        CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
+        CurveClassifierCNN as CurveClassifierCNN,
+        CurveClassifierGLU as CurveClassifierGLU,
+        CurveClassifierMLP as CurveClassifierMLP,
+        EQLLayer as EQLLayer,
+        SemanticFeatureAttention as SemanticFeatureAttention,
+    )
+except (ImportError, ValueError):
+    from glassbox.curve_classifier.models import (
+        CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
+        CurveClassifierCNN as CurveClassifierCNN,
+        CurveClassifierGLU as CurveClassifierGLU,
+        CurveClassifierMLP as CurveClassifierMLP,
+        EQLLayer as EQLLayer,
+        SemanticFeatureAttention as SemanticFeatureAttention,
+    )
+
+
 class IndexedFeatureDataset(Dataset):
     """Dataset view over feature/label arrays using explicit indices.
     Supports pre-loading entire dataset into RAM or VRAM for maximum throughput.
@@ -955,7 +975,11 @@ def train_model(
                 'val_f1': val_metrics['f1_mean'],
                 'operator_classes': operator_classes,
                 'model_type': model_type,
-                'model_config': model_config,
+                'model_config': {
+                    **model_config,
+                    'architecture_version': CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
+                },
+                'architecture_version': CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
             }, save_path)
             print(f"  -> Saved best model (val_loss: {val_metrics['loss']:.4f}, val_f1: {val_metrics['f1_mean']:.4f})")
         else:

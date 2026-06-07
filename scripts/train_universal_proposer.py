@@ -29,6 +29,7 @@ from glassbox.universal_proposer import (
     DEFAULT_SKELETON_VOCAB,
     DEFAULT_UNIVARIATE_SKELETON_VOCAB,
     DEFAULT_MULTIVARIATE_SKELETON_VOCAB,
+    UNIVERSAL_PROPOSER_ARCHITECTURE_VERSION,
     normalize_formula_key,
 )
 
@@ -702,7 +703,9 @@ def main():
                         "max_input_vars": config.max_input_vars,
                         "operator_vocab": model.operator_vocab,
                         "skeleton_vocab": model.skeleton_vocab,
+                        "architecture_version": UNIVERSAL_PROPOSER_ARCHITECTURE_VERSION,
                     },
+                    "architecture_version": UNIVERSAL_PROPOSER_ARCHITECTURE_VERSION,
                     "feature_scaler": weights_only_safe_scaler(feature_scaler),
                     "epoch": epoch,
                     "val_f1": best_f1,

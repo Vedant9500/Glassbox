@@ -72,6 +72,8 @@ DEFAULT_SKELETON_VOCAB: List[str] = list(dict.fromkeys(
     DEFAULT_UNIVARIATE_SKELETON_VOCAB + DEFAULT_MULTIVARIATE_SKELETON_VOCAB
 ))
 
+UNIVERSAL_PROPOSER_ARCHITECTURE_VERSION = "universal-proposer-glu-v1"
+
 
 def normalize_formula_key(formula: str) -> str:
     text = str(formula)
@@ -731,8 +733,17 @@ def propose_from_xy(
 
     # If features are not provided, we must extract them (legacy behavior)
     if features is None:
-        from glassbox.curve_classifier.generate_curve_data import extract_all_features
-        features = extract_all_features(y)
+        from glassbox.curve_classifier.generate_curve_data import (
+            extract_all_features,
+            extract_all_features_xy,
+        )
+        if x.ndim == 1 or (x.ndim == 2 and x.shape[1] <= 1):
+            x_univariate = x.reshape(-1)
+            features = extract_all_features_xy(x_univariate, y)
+        else:
+            # Multivariate neural features remain heuristic until the point-set
+            # model phase; runtime candidates still use the multivariate grammar.
+            features = extract_all_features(y)
     
     # Handle dimension mismatch (e.g. model trained with 370 features, codebase extracts 398)
     expected_dim = model.config.n_features
@@ -887,12 +898,71 @@ def _load_torch_checkpoint(checkpoint_path: Path):
         return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
 
+def validate_universal_proposer_checkpoint_metadata(
+    checkpoint: Dict[str, Any],
+    *,
+    strict: bool = False,
+) -> Dict[str, Any]:
+    """Validate proposer checkpoint metadata with legacy compatibility."""
+    warnings: List[str] = []
+    errors: List[str] = []
+
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Checkpoint must be a dictionary")
+    if "model_state_dict" not in checkpoint:
+        errors.append("missing model_state_dict")
+
+    cfg = checkpoint.get("config")
+    if not isinstance(cfg, dict):
+        errors.append("missing config")
+        cfg = {}
+
+    n_features = cfg.get("n_features")
+    try:
+        n_features = int(n_features)
+        if n_features <= 0:
+            errors.append("config.n_features must be positive")
+    except Exception:
+        warnings.append("missing or invalid config.n_features")
+        n_features = None
+
+    skeleton_vocab = cfg.get("skeleton_vocab")
+    if skeleton_vocab is not None and not isinstance(skeleton_vocab, list):
+        errors.append("config.skeleton_vocab must be a list when present")
+
+    operator_vocab = cfg.get("operator_vocab")
+    if operator_vocab is not None and not isinstance(operator_vocab, list):
+        errors.append("config.operator_vocab must be a list when present")
+
+    architecture_version = (
+        checkpoint.get("architecture_version")
+        or cfg.get("architecture_version")
+    )
+    if architecture_version is None:
+        architecture_version = "legacy_unversioned"
+        warnings.append("missing architecture_version; treating checkpoint as legacy")
+
+    if errors or (strict and warnings):
+        details = "; ".join(errors + warnings)
+        raise ValueError(f"Invalid universal proposer checkpoint metadata: {details}")
+
+    return {
+        "n_features": n_features,
+        "architecture_version": architecture_version,
+        "warnings": warnings,
+    }
+
+
 def load_universal_proposer_checkpoint(
     checkpoint_path: str,
     device: Optional[str] = None,
 ) -> UniversalProposer:
     """Load UniversalProposer from checkpoint saved by train_universal_proposer.py."""
     ckpt = _load_torch_checkpoint(Path(checkpoint_path))
+    metadata_report = validate_universal_proposer_checkpoint_metadata(ckpt)
+    if os.environ.get("GLASSBOX_VERBOSE_CHECKPOINT_LOAD"):
+        for warning in metadata_report.get("warnings", []):
+            print(f"  Proposer checkpoint metadata warning: {warning}")
     cfg_raw = ckpt.get("config", {})
     state_dict = ckpt["model_state_dict"]
     skeleton_vocab = cfg_raw.get("skeleton_vocab")
@@ -914,6 +984,7 @@ def load_universal_proposer_checkpoint(
     )
     model = UniversalProposer(config)
     model.load_state_dict(state_dict)
+    model.architecture_version = metadata_report.get("architecture_version")
     
     # Attach scaler for automatic normalization during inference. Some older
     # proposer checkpoints accidentally stored an AMP GradScaler here.

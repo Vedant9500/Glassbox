@@ -16,10 +16,12 @@ from .universal_proposer import (
     build_search_plan,
     build_multivariate_search_plan,
     validate_fpip_v2_payload,
+    validate_universal_proposer_checkpoint_metadata,
     DEFAULT_OPERATOR_VOCAB,
     DEFAULT_SKELETON_VOCAB,
     DEFAULT_UNIVARIATE_SKELETON_VOCAB,
     DEFAULT_MULTIVARIATE_SKELETON_VOCAB,
+    UNIVERSAL_PROPOSER_ARCHITECTURE_VERSION,
     normalize_formula_key,
 )
 
@@ -35,9 +37,11 @@ __all__ = [
     'build_search_plan',
     'build_multivariate_search_plan',
     'validate_fpip_v2_payload',
+    'validate_universal_proposer_checkpoint_metadata',
     'DEFAULT_OPERATOR_VOCAB',
     'DEFAULT_SKELETON_VOCAB',
     'DEFAULT_UNIVARIATE_SKELETON_VOCAB',
     'DEFAULT_MULTIVARIATE_SKELETON_VOCAB',
+    'UNIVERSAL_PROPOSER_ARCHITECTURE_VERSION',
     'normalize_formula_key',
 ]

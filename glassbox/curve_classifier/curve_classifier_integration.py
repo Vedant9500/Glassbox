@@ -30,17 +30,18 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 try:
-    from .generate_curve_data import extract_all_features, OPERATOR_CLASSES
+    from .generate_curve_data import extract_all_features, extract_all_features_xy, OPERATOR_CLASSES
 except (ImportError, ValueError):
     try:
-        from glassbox.curve_classifier.generate_curve_data import extract_all_features, OPERATOR_CLASSES
+        from glassbox.curve_classifier.generate_curve_data import extract_all_features, extract_all_features_xy, OPERATOR_CLASSES
     except ImportError:
         try:
             import glassbox.curve_classifier.generate_curve_data as gcd
             extract_all_features = gcd.extract_all_features
+            extract_all_features_xy = gcd.extract_all_features_xy
             OPERATOR_CLASSES = gcd.OPERATOR_CLASSES
         except ImportError:
-            from glassbox.curve_classifier.generate_curve_data import extract_all_features, OPERATOR_CLASSES
+            from glassbox.curve_classifier.generate_curve_data import extract_all_features, extract_all_features_xy, OPERATOR_CLASSES
 
 # =============================================================================
 # MODEL DEFINITION (must match training)
@@ -364,6 +365,26 @@ class CurveClassifierGLU(nn.Module):
         return self.classifier(x)
 
 
+try:
+    from .models import (
+        CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
+        CurveClassifierCNN as CurveClassifierCNN,
+        CurveClassifierGLU as CurveClassifierGLU,
+        CurveClassifierMLP as CurveClassifierMLP,
+        EQLLayer as EQLLayer,
+        SemanticFeatureAttention as SemanticFeatureAttention,
+    )
+except (ImportError, ValueError):
+    from glassbox.curve_classifier.models import (
+        CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
+        CurveClassifierCNN as CurveClassifierCNN,
+        CurveClassifierGLU as CurveClassifierGLU,
+        CurveClassifierMLP as CurveClassifierMLP,
+        EQLLayer as EQLLayer,
+        SemanticFeatureAttention as SemanticFeatureAttention,
+    )
+
+
 # =============================================================================
 # CLASSIFIER LOADING
 # =============================================================================
@@ -420,6 +441,67 @@ def _load_torch_checkpoint(model_path: Path):
         return torch.load(model_path, map_location='cpu', weights_only=False)
 
 
+def validate_curve_classifier_checkpoint_metadata(
+    checkpoint: dict,
+    *,
+    strict: bool = False,
+) -> Dict[str, object]:
+    """Validate classifier checkpoint metadata with legacy compatibility.
+
+    Current checkpoints should include model type, feature dimension, feature
+    schema, and architecture version. Older local checkpoints may be missing
+    some metadata; non-strict validation returns warnings instead of failing so
+    existing artifacts remain loadable.
+    """
+    warnings: List[str] = []
+    errors: List[str] = []
+
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Checkpoint must be a dictionary")
+    if "model_state_dict" not in checkpoint:
+        errors.append("missing model_state_dict")
+
+    model_config = checkpoint.get("model_config") or {}
+    model_type = checkpoint.get("model_type")
+    if model_type is None:
+        warnings.append("missing model_type; falling back to state_dict architecture detection")
+    elif model_type not in {"glu", "mlp", "cnn"}:
+        errors.append(f"unsupported model_type={model_type!r}")
+
+    feature_dim = checkpoint.get("feature_dim", model_config.get("n_features"))
+    try:
+        feature_dim = int(feature_dim)
+        if feature_dim <= 0:
+            errors.append("feature_dim must be positive")
+    except Exception:
+        feature_dim = None
+        warnings.append("missing or invalid feature_dim")
+
+    feature_schema = checkpoint.get("feature_schema")
+    if feature_schema is None:
+        warnings.append("missing feature_schema")
+
+    architecture_version = (
+        checkpoint.get("architecture_version")
+        or model_config.get("architecture_version")
+    )
+    if architecture_version is None:
+        architecture_version = "legacy_unversioned"
+        warnings.append("missing architecture_version; treating checkpoint as legacy")
+
+    if errors or (strict and warnings):
+        details = "; ".join(errors + warnings)
+        raise ValueError(f"Invalid curve classifier checkpoint metadata: {details}")
+
+    return {
+        "model_type": model_type,
+        "feature_dim": feature_dim,
+        "feature_schema": feature_schema,
+        "architecture_version": architecture_version,
+        "warnings": warnings,
+    }
+
+
 def _resolve_model_path(model_path: str) -> Path:
     resolved = resolve_curve_classifier_path(model_path)
     if str(resolved) != str(Path(model_path)):
@@ -462,6 +544,11 @@ def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, ca
     except Exception as e:
         print(f"Error loading checkpoint from {model_path}: {e}")
         raise
+
+    metadata_report = validate_curve_classifier_checkpoint_metadata(checkpoint)
+    if os.environ.get("GLASSBOX_VERBOSE_CHECKPOINT_LOAD"):
+        for warning in metadata_report.get("warnings", []):
+            print(f"  Checkpoint metadata warning: {warning}")
     
     # Get operator classes
     operator_classes = checkpoint.get('operator_classes', list(OPERATOR_CLASSES.keys()))
@@ -522,6 +609,7 @@ def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, ca
         'model_type': model_type,
         'operator_classes': operator_classes,
         'isotonic_calibration': checkpoint.get('isotonic_calibration'),
+        'architecture_version': metadata_report.get('architecture_version'),
     }
     print(f"Loaded PyTorch curve classifier from {model_path}")
     if 'val_acc' in checkpoint:
@@ -673,7 +761,7 @@ def predict_operators(
     
     # Single-input: standard prediction
     features = _prepare_curve_features(
-        extract_all_features(y),
+        extract_all_features_xy(x[:, 0], y),
         metadata.get('feature_scaler'),
     )
     probs = _predict_pytorch(model, features, metadata, resolved_device)
@@ -839,7 +927,10 @@ def _predict_operators_multi_input(
         
         # Extract features and predict
         try:
-            features = _prepare_curve_features(extract_all_features(y_slice_valid), scaler)
+            features = _prepare_curve_features(
+                extract_all_features_xy(x_slice_1d[valid_mask], y_slice_valid),
+                scaler,
+            )
             probs = _predict_pytorch(model, features, metadata, device)
             
             all_probs[var_idx] = probs
@@ -890,7 +981,10 @@ def _predict_operators_multi_input(
             y_slice_valid = y_slice[valid_mask]
             
             try:
-                features = _prepare_curve_features(extract_all_features(y_slice_valid), scaler)
+                features = _prepare_curve_features(
+                    extract_all_features_xy(xi_slice[valid_mask], y_slice_valid),
+                    scaler,
+                )
                 probs = _predict_pytorch(model, features, metadata, device)
                 
                 all_probs = np.vstack([all_probs, probs])
