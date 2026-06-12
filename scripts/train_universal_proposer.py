@@ -50,6 +50,7 @@ try:
         family_holdout_split,
         formula_keys_from_metadata_or_formulas,
         grouped_train_val_split,
+        multilabel_metrics_by_group,
         metrics_to_json_dict,
         row_train_val_split,
         write_validation_report,
@@ -78,6 +79,7 @@ except Exception:
         family_holdout_split,
         formula_keys_from_metadata_or_formulas,
         grouped_train_val_split,
+        multilabel_metrics_by_group,
         metrics_to_json_dict,
         row_train_val_split,
         write_validation_report,
@@ -219,7 +221,12 @@ def weights_only_safe_scaler(scaler):
     return safe
 
 
-def compute_operator_pos_weight(labels: np.ndarray, indices: np.ndarray, operator_classes: Sequence[str]) -> torch.Tensor:
+def compute_operator_pos_weight(
+    labels: np.ndarray,
+    indices: np.ndarray,
+    operator_classes: Sequence[str],
+    cap: float = 3.0,
+) -> torch.Tensor:
     """Compute BCE positive weights for the proposer operator vocabulary."""
     subset = np.asarray(labels[np.asarray(indices, dtype=np.int64)], dtype=np.float32)
     source_idx = {name: i for i, name in enumerate(_coerce_operator_classes(operator_classes, subset.shape[1]))}
@@ -236,7 +243,7 @@ def compute_operator_pos_weight(labels: np.ndarray, indices: np.ndarray, operato
             positive = subset[:, idx] if idx is not None and idx < subset.shape[1] else np.zeros(subset.shape[0])
         pos = float(np.sum(positive > 0.5))
         neg = float(max(0, subset.shape[0] - pos))
-        weights.append(np.clip(neg / max(pos, 1.0), 0.5, 8.0))
+        weights.append(np.clip(neg / max(pos, 1.0), 0.5, float(cap)))
     return torch.tensor(weights, dtype=torch.float32)
 
 
@@ -732,12 +739,16 @@ def _evaluate(
         "loss": avg_loss,
         "f1": f1.mean().item(),
         "micro_f1": micro_f1.item(),
+        "precision_per_operator": precision.numpy(),
+        "recall_per_operator": recall.numpy(),
         "f1_per_operator": f1.numpy(),
         "skeleton_coverage": skeleton_metrics["skeleton_valid_count"] / max(1, int(all_labels.shape[0])),
         "candidate_recall_after_affine_fit": None,
         "candidate_recall_after_affine_fit_note": (
             "Not computed from precomputed feature datasets; requires raw (x, y) curves."
         ),
+        "preds": all_preds,
+        "labels": all_labels,
         **skeleton_metrics,
     }
 
@@ -781,6 +792,8 @@ def main():
                         help="Minimum relative improvement over the baseline metric for rollout readiness")
     parser.add_argument("--no-class-weights", action="store_true",
                         help="Disable inverse-frequency positive weights for operator BCE")
+    parser.add_argument("--class-weight-cap", type=float, default=3.0,
+                        help="Maximum positive class weight for operator BCE")
     parser.add_argument("--skeleton-min-coverage", type=float, default=0.80,
                         help="Minimum train-set fixed-vocab skeleton coverage required to train skeleton loss")
     parser.add_argument("--skeleton-loss-weight", type=float, default=0.2,
@@ -899,7 +912,12 @@ def main():
         )
         operator_pos_weight = None
         if not args.no_class_weights:
-            operator_pos_weight = compute_operator_pos_weight(labels, train_idx, operator_classes).to(device)
+            operator_pos_weight = compute_operator_pos_weight(
+                labels,
+                train_idx,
+                operator_classes,
+                cap=args.class_weight_cap,
+            ).to(device)
             print(f"  Operator pos_weight: {operator_pos_weight.detach().cpu().numpy().round(2).tolist()}")
         skeleton_enabled, skeleton_coverage = skeleton_loss_enabled_from_coverage(
             train_ds,
@@ -939,11 +957,17 @@ def main():
             )
         if feature_schema is not None:
             print(f"  Feature schema: {feature_schema}")
+        val_groups_for_metrics = (
+            np.asarray(generator_families, dtype=object)[val_idx]
+            if generator_families is not None
+            else None
+        )
     else:
         feature_scaler = None
         operator_pos_weight = None
         skeleton_loss_weight = float(args.skeleton_loss_weight)
         skeleton_coverage = 1.0
+        val_groups_for_metrics = None
         validation_report = None
         split_policy = "synthetic_row"
         split_details = {"policy": "synthetic_row", "exclusive_groups": False}
@@ -1049,6 +1073,13 @@ def main():
                 if val_metrics.get("candidate_recall_after_affine_fit") is not None
                 else "micro_f1"
             )
+            if val_groups_for_metrics is not None:
+                best_metrics["by_family"] = multilabel_metrics_by_group(
+                    val_metrics["preds"].detach().cpu().numpy(),
+                    val_metrics["labels"].detach().cpu().numpy(),
+                    val_groups_for_metrics,
+                    model.operator_vocab,
+                )
             best_metrics["skeleton_loss_weight"] = float(skeleton_loss_weight)
             best_metrics["train_skeleton_coverage"] = float(skeleton_coverage)
             patience_counter = 0

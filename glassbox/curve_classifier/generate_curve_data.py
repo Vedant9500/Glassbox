@@ -74,7 +74,7 @@ N_CLASSES = len(OPERATOR_CLASSES)
 # Feature dimensionality (see extract_all_features)
 FEATURE_DIM = 398
 
-SEMANTIC_LABELER_VERSION = "semantic-labeler-v1"
+SEMANTIC_LABELER_VERSION = "semantic-labeler-v2"
 
 # Feature schema (slices into feature vector)
 FEATURE_SCHEMA = {
@@ -1601,7 +1601,6 @@ def _semantic_visit(node: ast.AST, ops: Set[str], role: str = "root") -> None:
 
         if func_name in {"sinh", "cosh"}:
             ops.add("exp")
-            ops.add("addition")
             for arg in node.args:
                 _semantic_visit(arg, ops, role="function_arg")
             return
@@ -1627,12 +1626,8 @@ def _semantic_visit(node: ast.AST, ops: Set[str], role: str = "root") -> None:
         right_dep = _ast_contains_x(node.right)
 
         if isinstance(node.op, (ast.Add, ast.Sub)):
-            constant_guard = role == "domain_guard" and (not left_dep or not right_dep)
             if left_dep and right_dep:
                 ops.add("addition")
-            elif left_dep or right_dep:
-                if role not in {"domain_guard", "safety_wrapper"} and not constant_guard:
-                    ops.add("addition")
             _semantic_visit(node.left, ops, role=role)
             _semantic_visit(node.right, ops, role=role)
             return

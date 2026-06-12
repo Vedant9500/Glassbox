@@ -42,7 +42,13 @@ def test_semantic_labeler_filters_domain_guard_wrappers():
 def test_semantic_labeler_keeps_affine_structure_inside_function_arguments():
     ops = derive_semantic_operators_from_formula("np.sin(2 * x + 0.5)")
 
-    assert ops == {"sin", "addition", "multiplication"}
+    assert ops == {"sin", "multiplication"}
+
+
+def test_semantic_labeler_treats_addition_as_two_dependent_terms():
+    assert derive_semantic_operators_from_formula("x + 1") == {"identity"}
+    assert derive_semantic_operators_from_formula("np.sin(x) + x") == {"identity", "sin", "addition"}
+    assert derive_semantic_operators_from_formula("np.sinh(x)") == {"exp"}
 
 
 def test_operators_to_labels_defaults_to_semantic_when_formula_is_available():

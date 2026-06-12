@@ -15,6 +15,8 @@ from glassbox.curve_classifier.validation import (
     family_holdout_split,
     formula_overlap_report,
     grouped_train_val_split,
+    multilabel_metrics_by_group,
+    multilabel_metric_summary,
     row_train_val_split,
 )
 from glassbox.curve_classifier import train_curve_classifier as tcc
@@ -88,6 +90,31 @@ def test_validation_report_includes_overlap_and_distributions():
     assert report["label_distribution"]["val"]["power"] == 2
     assert report["template_distribution"]["val"]["2"] == 2
     assert report["metrics"]["best_checkpoint"]["val_f1"] == 0.5
+
+
+def test_multilabel_metric_summary_reports_precision_recall_and_group_breakdown():
+    probs = np.array([
+        [0.9, 0.1],
+        [0.8, 0.7],
+        [0.2, 0.6],
+        [0.1, 0.4],
+    ], dtype=np.float32)
+    labels = np.array([
+        [1, 0],
+        [1, 0],
+        [0, 1],
+        [0, 1],
+    ], dtype=np.float32)
+    groups = np.array(["simple", "simple", "pcfg", "pcfg"], dtype=object)
+
+    summary = multilabel_metric_summary(probs, labels, ["a", "b"])
+    by_group = multilabel_metrics_by_group(probs, labels, groups, ["a", "b"], min_rows=1)
+
+    assert summary["precision_per_class"][0] == 1.0
+    assert summary["recall_per_class"][0] == 1.0
+    assert summary["recall_per_class"][1] == 0.5
+    assert by_group["simple"]["rows"] == 2
+    assert by_group["pcfg"]["rows"] == 2
 
 
 def test_training_data_loader_reads_phase2_validation_metadata():
@@ -173,6 +200,7 @@ def test_proposer_operator_pos_weight_maps_periodic_from_sin_cos():
         labels,
         np.arange(10),
         ["identity", "sin", "cos", "power", "exp", "log", "addition", "multiplication", "rational"],
+        cap=8.0,
     )
 
     sin_weight = weights[tup.DEFAULT_OPERATOR_VOCAB.index("sin")]
@@ -204,3 +232,32 @@ def test_row_train_val_split_preserves_sizes():
     assert len(train_idx) == 7
     assert len(val_idx) == 3
     assert set(train_idx).isdisjoint(set(val_idx))
+
+
+def test_classifier_validation_calibration_split_keeps_eval_disjoint():
+    labels = np.zeros((20, N_CLASSES), dtype=np.float32)
+    labels[:10, 1] = 1.0
+    labels[10:, 2] = 1.0
+    val_idx = np.arange(20)
+
+    eval_idx, calibration_idx, details = tcc.split_validation_calibration(
+        val_idx,
+        labels,
+        calibration_ratio=0.25,
+        seed=5,
+    )
+
+    assert details["calibration_split"] is True
+    assert calibration_idx is not None
+    assert set(eval_idx).isdisjoint(set(calibration_idx))
+    assert sorted(np.concatenate([eval_idx, calibration_idx]).tolist()) == val_idx.tolist()
+
+
+def test_classifier_threshold_beta_can_prefer_precision():
+    preds = torch.tensor([0.95, 0.80, 0.70, 0.60, 0.40, 0.30]).reshape(-1, 1)
+    labels = torch.tensor([1, 0, 0, 0, 1, 1], dtype=torch.float32).reshape(-1, 1)
+
+    f1_threshold = tcc.tune_thresholds(preds, labels, beta=1.0, steps=19)
+    precision_threshold = tcc.tune_thresholds(preds, labels, beta=0.5, steps=19)
+
+    assert float(precision_threshold[0]) >= float(f1_threshold[0])

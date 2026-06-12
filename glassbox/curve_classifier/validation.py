@@ -212,6 +212,65 @@ def label_distribution(labels: np.ndarray, operator_classes: Sequence[str], indi
     }
 
 
+def multilabel_metric_summary(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    operator_classes: Sequence[str],
+    thresholds: np.ndarray | None = None,
+) -> Dict[str, Any]:
+    """Compute per-class precision/recall/F1/support from probabilities."""
+    probs_arr = np.asarray(probs, dtype=np.float32)
+    labels_arr = np.asarray(labels, dtype=np.float32)
+    if thresholds is None:
+        binary = probs_arr > 0.5
+    else:
+        binary = probs_arr > np.asarray(thresholds, dtype=np.float32).reshape(1, -1)
+    truth = labels_arr > 0.5
+
+    tp = np.logical_and(binary, truth).sum(axis=0).astype(np.float64)
+    fp = np.logical_and(binary, ~truth).sum(axis=0).astype(np.float64)
+    fn = np.logical_and(~binary, truth).sum(axis=0).astype(np.float64)
+    support = truth.sum(axis=0).astype(np.float64)
+    precision = tp / np.maximum(tp + fp, 1e-10)
+    recall = tp / np.maximum(tp + fn, 1e-10)
+    f1 = 2.0 * precision * recall / np.maximum(precision + recall, 1e-10)
+
+    return {
+        "operator_classes": [str(x) for x in operator_classes],
+        "precision_per_class": precision.tolist(),
+        "recall_per_class": recall.tolist(),
+        "f1_per_class": f1.tolist(),
+        "support_per_class": support.astype(int).tolist(),
+        "macro_f1": float(np.mean(f1)) if len(f1) else None,
+    }
+
+
+def multilabel_metrics_by_group(
+    probs: np.ndarray,
+    labels: np.ndarray,
+    groups: Sequence[Any] | None,
+    operator_classes: Sequence[str],
+    min_rows: int = 25,
+) -> Dict[str, Any]:
+    """Compute class metrics per generator family/template group."""
+    if groups is None:
+        return {}
+    groups_arr = np.asarray(groups, dtype=object).astype(str)
+    out: Dict[str, Any] = {}
+    for group in sorted(set(groups_arr.tolist())):
+        mask = groups_arr == group
+        if int(mask.sum()) < min_rows:
+            continue
+        summary = multilabel_metric_summary(
+            np.asarray(probs)[mask],
+            np.asarray(labels)[mask],
+            operator_classes,
+        )
+        summary["rows"] = int(mask.sum())
+        out[str(group)] = summary
+    return out
+
+
 def build_validation_report(
     *,
     dataset_path: str | None,
