@@ -99,15 +99,21 @@ def grouped_train_val_split(
         }
 
     target_val = max(1, int(round(n_samples * val_ratio)))
+    target_groups = max(1, int(round(len(by_group) * val_ratio)))
+    if len(by_group) > 2:
+        target_groups = max(2, target_groups)
+    target_groups = min(target_groups, len(by_group) - 1)
     rng = np.random.RandomState(seed)
     group_items = list(by_group.items())
     rng.shuffle(group_items)
-    group_items.sort(key=lambda item: len(item[1]), reverse=True)
+    # Prefer formula diversity over row-count-perfect validation. Large duplicate
+    # formula groups can otherwise dominate validation and hide whole operators.
+    group_items.sort(key=lambda item: len(item[1]))
 
     val_groups: set[str] = set()
     val_count = 0
     for group, members in group_items:
-        if val_count >= target_val and val_groups:
+        if val_count >= target_val and len(val_groups) >= target_groups:
             continue
         if len(val_groups) < len(group_items) - 1:
             val_groups.add(group)
@@ -138,6 +144,7 @@ def grouped_train_val_split(
         "val_group_count": len(val_groups),
         "exclusive_groups": True,
         "target_val_rows": target_val,
+        "target_val_groups": target_groups,
     }
 
 

@@ -34,6 +34,17 @@ def test_grouped_train_val_split_has_no_formula_overlap():
     assert overlap["val_rows_with_train_formula_fraction"] == 0.0
 
 
+def test_grouped_train_val_split_prefers_formula_diversity_over_largest_groups():
+    groups = np.array(["huge_a"] * 40 + ["huge_b"] * 35 + [f"small_{i}" for i in range(20)], dtype=object)
+
+    train_idx, val_idx, details = grouped_train_val_split(groups, val_ratio=0.2, seed=3)
+
+    overlap = formula_overlap_report(groups, train_idx, val_idx)
+    assert overlap["overlap_unique_formulas"] == 0
+    assert details["val_group_count"] >= details["target_val_groups"]
+    assert overlap["val_unique_formulas"] > 4
+
+
 def test_family_holdout_split_uses_only_heldout_family_for_validation():
     families = np.array(["simple", "simple", "pcfg", "pcfg", "nested"], dtype=object)
 
@@ -151,6 +162,40 @@ def test_proposer_skeleton_metric_summary_reports_topk_and_calibration():
     assert metrics["skeleton_top5_acc"] == 1.0
     assert metrics["skeleton_confidence_mean"] is not None
     assert metrics["skeleton_ece_10"] is not None
+
+
+def test_proposer_operator_pos_weight_maps_periodic_from_sin_cos():
+    labels = np.zeros((10, N_CLASSES), dtype=np.float32)
+    labels[:2, 1] = 1.0  # sin
+    labels[:1, 2] = 1.0  # cos
+
+    weights = tup.compute_operator_pos_weight(
+        labels,
+        np.arange(10),
+        ["identity", "sin", "cos", "power", "exp", "log", "addition", "multiplication", "rational"],
+    )
+
+    sin_weight = weights[tup.DEFAULT_OPERATOR_VOCAB.index("sin")]
+    periodic_weight = weights[tup.DEFAULT_OPERATOR_VOCAB.index("periodic")]
+    assert float(sin_weight) == 4.0
+    assert float(periodic_weight) == 4.0
+
+
+def test_proposer_skeleton_loss_gate_disables_low_coverage_dataset():
+    formulas = ["not_in_vocab(x)" for _ in range(10)] + ["np.sin(x)"]
+    labels = np.zeros((len(formulas), N_CLASSES), dtype=np.float32)
+    features = np.zeros((len(formulas), FEATURE_DIM), dtype=np.float32)
+    ds = tup.FormulaReplayDataset(features, labels, formulas=formulas)
+
+    enabled, coverage = tup.skeleton_loss_enabled_from_coverage(ds, min_coverage=0.8)
+
+    assert enabled is False
+    assert coverage < 0.8
+
+
+def test_proposer_checkpoint_metric_prefers_candidate_recall_then_micro_f1():
+    assert tup.select_checkpoint_metric({"candidate_recall_after_affine_fit": 0.7, "micro_f1": 0.2}) == 0.7
+    assert tup.select_checkpoint_metric({"candidate_recall_after_affine_fit": None, "micro_f1": 0.8}) == 0.8
 
 
 def test_row_train_val_split_preserves_sizes():

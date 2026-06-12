@@ -219,6 +219,60 @@ def weights_only_safe_scaler(scaler):
     return safe
 
 
+def compute_operator_pos_weight(labels: np.ndarray, indices: np.ndarray, operator_classes: Sequence[str]) -> torch.Tensor:
+    """Compute BCE positive weights for the proposer operator vocabulary."""
+    subset = np.asarray(labels[np.asarray(indices, dtype=np.int64)], dtype=np.float32)
+    source_idx = {name: i for i, name in enumerate(_coerce_operator_classes(operator_classes, subset.shape[1]))}
+    weights = []
+    for name in DEFAULT_OPERATOR_VOCAB:
+        if name == "periodic":
+            sin_idx = source_idx.get("sin")
+            cos_idx = source_idx.get("cos")
+            sin_val = subset[:, sin_idx] if sin_idx is not None and sin_idx < subset.shape[1] else 0.0
+            cos_val = subset[:, cos_idx] if cos_idx is not None and cos_idx < subset.shape[1] else 0.0
+            positive = np.maximum(sin_val, cos_val)
+        else:
+            idx = source_idx.get(name)
+            positive = subset[:, idx] if idx is not None and idx < subset.shape[1] else np.zeros(subset.shape[0])
+        pos = float(np.sum(positive > 0.5))
+        neg = float(max(0, subset.shape[0] - pos))
+        weights.append(np.clip(neg / max(pos, 1.0), 0.5, 8.0))
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def skeleton_loss_enabled_from_coverage(dataset: Dataset, min_coverage: float = 0.80) -> tuple[bool, float]:
+    """Enable skeleton loss only when fixed vocab covers enough training rows."""
+    targets = getattr(dataset, "skeleton_targets", None)
+    if targets is not None:
+        valid = (targets >= 0).float().mean().item() if len(dataset) else 0.0
+        return bool(valid >= min_coverage), float(valid)
+
+    valid = 0
+    total = len(dataset)
+    for i in range(total):
+        _features, _op_target, skeleton_target = dataset[i]
+        if int(skeleton_target.item()) >= 0:
+            valid += 1
+    coverage = valid / max(1, total)
+    return bool(coverage >= min_coverage), float(coverage)
+
+
+def select_checkpoint_metric(metrics: dict) -> float:
+    """Use runtime-relevant metric when present; otherwise micro-F1 operator prior quality."""
+    recall = metrics.get("candidate_recall_after_affine_fit")
+    if recall is not None:
+        try:
+            recall_val = float(recall)
+            if np.isfinite(recall_val):
+                return recall_val
+        except (TypeError, ValueError):
+            pass
+    micro_f1 = metrics.get("micro_f1")
+    if micro_f1 is not None:
+        return float(micro_f1)
+    return float(metrics.get("f1", 0.0))
+
+
 class SyntheticCurveDataset(Dataset):
     def __init__(self, n_samples: int = 2000, n_points: int = 128, seed: int = 0):
         self.n_samples = int(n_samples)
@@ -424,7 +478,15 @@ class FormulaReplayDataset(Dataset):
         )
 
 
-def _train_epoch(model, loader, optimizer, device, scaler=None) -> float:
+def _train_epoch(
+    model,
+    loader,
+    optimizer,
+    device,
+    scaler=None,
+    operator_pos_weight: Optional[torch.Tensor] = None,
+    skeleton_loss_weight: float = 0.2,
+) -> float:
     model.train()
     
     # Fast-path for VRAM-resident datasets (Bypasses Python DataLoader overhead)
@@ -448,11 +510,15 @@ def _train_epoch(model, loader, optimizer, device, scaler=None) -> float:
             # Automatic Mixed Precision for max Tensor Core utilization
             with torch.autocast(device_type='cuda', dtype=torch.float16):
                 out = model(features)
-                loss = F.binary_cross_entropy_with_logits(out["operator_logits"], op_target)
+                loss = F.binary_cross_entropy_with_logits(
+                    out["operator_logits"],
+                    op_target,
+                    pos_weight=operator_pos_weight,
+                )
                 skeleton_target = ds.skeleton_targets[batch_idx]
                 valid_skeleton = skeleton_target >= 0
-                if valid_skeleton.any():
-                    loss = loss + 0.2 * F.cross_entropy(
+                if skeleton_loss_weight > 0.0 and valid_skeleton.any():
+                    loss = loss + skeleton_loss_weight * F.cross_entropy(
                         out["skeleton_logits"][valid_skeleton],
                         skeleton_target[valid_skeleton],
                     )
@@ -483,10 +549,14 @@ def _train_epoch(model, loader, optimizer, device, scaler=None) -> float:
         
         with torch.autocast(device_type=device.type, enabled=device.type=='cuda', dtype=torch.float16):
             out = model(features)
-            loss = F.binary_cross_entropy_with_logits(out["operator_logits"], op_target)
+            loss = F.binary_cross_entropy_with_logits(
+                out["operator_logits"],
+                op_target,
+                pos_weight=operator_pos_weight,
+            )
             valid_skeleton = skeleton_target >= 0
-            if valid_skeleton.any():
-                loss = loss + 0.2 * F.cross_entropy(
+            if skeleton_loss_weight > 0.0 and valid_skeleton.any():
+                loss = loss + skeleton_loss_weight * F.cross_entropy(
                     out["skeleton_logits"][valid_skeleton],
                     skeleton_target[valid_skeleton],
                 )
@@ -556,7 +626,13 @@ def _skeleton_metric_summary(logits: torch.Tensor, targets: torch.Tensor) -> dic
     }
 
 
-def _evaluate(model, loader, device) -> dict:
+def _evaluate(
+    model,
+    loader,
+    device,
+    operator_pos_weight: Optional[torch.Tensor] = None,
+    skeleton_loss_weight: float = 0.2,
+) -> dict:
     model.eval()
     
     ds = loader.dataset
@@ -579,11 +655,15 @@ def _evaluate(model, loader, device) -> dict:
                 
                 with torch.autocast(device_type='cuda', dtype=torch.float16):
                     out = model(features)
-                    loss = F.binary_cross_entropy_with_logits(out["operator_logits"], op_target)
+                    loss = F.binary_cross_entropy_with_logits(
+                        out["operator_logits"],
+                        op_target,
+                        pos_weight=operator_pos_weight,
+                    )
                     skeleton_target = ds.skeleton_targets[start_idx:end_idx]
                     valid_skeleton = skeleton_target >= 0
-                    if valid_skeleton.any():
-                        loss = loss + 0.2 * F.cross_entropy(
+                    if skeleton_loss_weight > 0.0 and valid_skeleton.any():
+                        loss = loss + skeleton_loss_weight * F.cross_entropy(
                             out["skeleton_logits"][valid_skeleton],
                             skeleton_target[valid_skeleton],
                         )
@@ -607,10 +687,14 @@ def _evaluate(model, loader, device) -> dict:
                 
                 with torch.autocast(device_type=device.type, enabled=device.type=='cuda', dtype=torch.float16):
                     out = model(features)
-                    loss = F.binary_cross_entropy_with_logits(out["operator_logits"], op_target)
+                    loss = F.binary_cross_entropy_with_logits(
+                        out["operator_logits"],
+                        op_target,
+                        pos_weight=operator_pos_weight,
+                    )
                     valid_skeleton = skeleton_target >= 0
-                    if valid_skeleton.any():
-                        loss = loss + 0.2 * F.cross_entropy(
+                    if skeleton_loss_weight > 0.0 and valid_skeleton.any():
+                        loss = loss + skeleton_loss_weight * F.cross_entropy(
                             out["skeleton_logits"][valid_skeleton],
                             skeleton_target[valid_skeleton],
                         )
@@ -695,6 +779,12 @@ def main():
                         help="Metric name used for optional baseline comparison")
     parser.add_argument("--min-relative-improvement", type=float, default=0.0,
                         help="Minimum relative improvement over the baseline metric for rollout readiness")
+    parser.add_argument("--no-class-weights", action="store_true",
+                        help="Disable inverse-frequency positive weights for operator BCE")
+    parser.add_argument("--skeleton-min-coverage", type=float, default=0.80,
+                        help="Minimum train-set fixed-vocab skeleton coverage required to train skeleton loss")
+    parser.add_argument("--skeleton-loss-weight", type=float, default=0.2,
+                        help="Skeleton cross-entropy loss weight when coverage gate passes")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -807,6 +897,21 @@ def main():
             features, labels, val_idx, operator_classes=operator_classes, formulas=formulas, scaler=feature_scaler,
             device=device if load_to_vram else None
         )
+        operator_pos_weight = None
+        if not args.no_class_weights:
+            operator_pos_weight = compute_operator_pos_weight(labels, train_idx, operator_classes).to(device)
+            print(f"  Operator pos_weight: {operator_pos_weight.detach().cpu().numpy().round(2).tolist()}")
+        skeleton_enabled, skeleton_coverage = skeleton_loss_enabled_from_coverage(
+            train_ds,
+            min_coverage=args.skeleton_min_coverage,
+        )
+        skeleton_loss_weight = float(args.skeleton_loss_weight if skeleton_enabled else 0.0)
+        print(
+            "  Skeleton loss: "
+            f"{'enabled' if skeleton_enabled else 'disabled'} "
+            f"(coverage={skeleton_coverage:.3f}, min={args.skeleton_min_coverage:.3f}, "
+            f"weight={skeleton_loss_weight:.3f})"
+        )
         print(f"train_samples={len(train_ds)} val_samples={len(val_ds)} path={args.data}")
         validation_report = build_validation_report(
             dataset_path=str(args.data),
@@ -836,6 +941,9 @@ def main():
             print(f"  Feature schema: {feature_schema}")
     else:
         feature_scaler = None
+        operator_pos_weight = None
+        skeleton_loss_weight = float(args.skeleton_loss_weight)
+        skeleton_coverage = 1.0
         validation_report = None
         split_policy = "synthetic_row"
         split_details = {"policy": "synthetic_row", "exclusive_groups": False}
@@ -877,13 +985,22 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     best_f1 = -1.0
+    best_selection_metric = -1.0
     best_metrics = {}
     patience_counter = 0
 
     print(f"Training GLU Proposer on {device}...")
     for epoch in range(1, args.epochs + 1):
         try:
-            train_loss = _train_epoch(model, train_loader, opt, device, amp_scaler)
+            train_loss = _train_epoch(
+                model,
+                train_loader,
+                opt,
+                device,
+                amp_scaler,
+                operator_pos_weight=operator_pos_weight,
+                skeleton_loss_weight=skeleton_loss_weight,
+            )
         except Exception as e:
             if args.compile and "inductor" in str(e).lower():
                 print(f"\n[!] torch.compile failed during first forward pass: {e}")
@@ -891,21 +1008,49 @@ def main():
                 if hasattr(model, "_orig_mod"):
                     model = model._orig_mod
                 args.compile = False 
-                train_loss = _train_epoch(model, train_loader, opt, device, amp_scaler)
+                train_loss = _train_epoch(
+                    model,
+                    train_loader,
+                    opt,
+                    device,
+                    amp_scaler,
+                    operator_pos_weight=operator_pos_weight,
+                    skeleton_loss_weight=skeleton_loss_weight,
+                )
             else:
                 raise e
         
-        val_metrics = _evaluate(model, val_loader, device)
+        val_metrics = _evaluate(
+            model,
+            val_loader,
+            device,
+            operator_pos_weight=operator_pos_weight,
+            skeleton_loss_weight=skeleton_loss_weight,
+        )
         val_loss = val_metrics["loss"]
         val_f1 = val_metrics["f1"]
+        selection_metric = select_checkpoint_metric(val_metrics)
         
-        scheduler.step(val_f1)
+        scheduler.step(selection_metric)
 
-        print(f"Epoch {epoch:03d}/{args.epochs} | Train Loss: {train_loss:.5f} | Val Loss: {val_loss:.5f} | Val F1: {val_f1:.4f}")
+        print(
+            f"Epoch {epoch:03d}/{args.epochs} | Train Loss: {train_loss:.5f} | "
+            f"Val Loss: {val_loss:.5f} | Val F1: {val_f1:.4f} | "
+            f"Val Micro F1: {val_metrics['micro_f1']:.4f} | Select: {selection_metric:.4f}"
+        )
         
-        if val_f1 > best_f1:
+        if selection_metric > best_selection_metric:
             best_f1 = val_f1
+            best_selection_metric = selection_metric
             best_metrics = metrics_to_json_dict(val_metrics)
+            best_metrics["selection_metric"] = float(selection_metric)
+            best_metrics["selection_metric_name"] = (
+                "candidate_recall_after_affine_fit"
+                if val_metrics.get("candidate_recall_after_affine_fit") is not None
+                else "micro_f1"
+            )
+            best_metrics["skeleton_loss_weight"] = float(skeleton_loss_weight)
+            best_metrics["train_skeleton_coverage"] = float(skeleton_coverage)
             patience_counter = 0
             torch.save(
                 {
@@ -932,14 +1077,23 @@ def main():
                     "feature_scaler": weights_only_safe_scaler(feature_scaler),
                     "epoch": epoch,
                     "val_f1": best_f1,
+                    "selection_metric": best_selection_metric,
+                    "selection_metric_name": best_metrics["selection_metric_name"],
                     "val_micro_f1": val_metrics.get("micro_f1"),
                     "validation_split_policy": split_policy,
                     "validation_split_details": dict(split_details),
                     "validation_metrics": best_metrics,
+                    "operator_pos_weight": (
+                        operator_pos_weight.detach().cpu().numpy().astype(np.float32).tolist()
+                        if operator_pos_weight is not None
+                        else None
+                    ),
+                    "skeleton_loss_weight": float(skeleton_loss_weight),
+                    "train_skeleton_coverage": float(skeleton_coverage),
                 },
                 out_path,
             )
-            print(f"  -> Saved best model (val_f1: {val_f1:.4f})")
+            print(f"  -> Saved best model (select={selection_metric:.4f}, val_f1={val_f1:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
@@ -992,26 +1146,33 @@ def main():
     checkpoint["checkpoint_card_path"] = str(checkpoint_card_path)
 
     if args.baseline_card:
-        baseline_card = load_json_report(Path(args.baseline_card))
-        rollout_comparison = build_rollout_comparison(
-            candidate_card=checkpoint_card,
-            baseline_card=baseline_card,
-            metric_name=args.rollout_metric,
-            min_relative_improvement=args.min_relative_improvement,
-        )
-        rollout_comparison_path = (
-            Path(args.rollout_comparison)
-            if args.rollout_comparison
-            else default_rollout_comparison_path(out_path)
-        )
-        write_rollout_comparison(rollout_comparison_path, rollout_comparison)
-        checkpoint["rollout_comparison_path"] = str(rollout_comparison_path)
+        baseline_card_path = Path(args.baseline_card)
+        if baseline_card_path.exists():
+            baseline_card = load_json_report(baseline_card_path)
+            rollout_comparison = build_rollout_comparison(
+                candidate_card=checkpoint_card,
+                baseline_card=baseline_card,
+                metric_name=args.rollout_metric,
+                min_relative_improvement=args.min_relative_improvement,
+            )
+            rollout_comparison_path = (
+                Path(args.rollout_comparison)
+                if args.rollout_comparison
+                else default_rollout_comparison_path(out_path)
+            )
+            write_rollout_comparison(rollout_comparison_path, rollout_comparison)
+            checkpoint["rollout_comparison_path"] = str(rollout_comparison_path)
+        else:
+            print(
+                f"Warning: baseline card not found at {baseline_card_path}; "
+                "skipping rollout comparison."
+            )
 
     torch.save(checkpoint, out_path)
 
     print(f"\nTraining complete. Best Val F1: {best_f1:.4f}. Model saved to {out_path}")
     print(f"Checkpoint card saved to {checkpoint_card_path}")
-    if args.baseline_card:
+    if checkpoint.get("rollout_comparison_path"):
         print(f"Rollout comparison saved to {checkpoint['rollout_comparison_path']}")
 
 
