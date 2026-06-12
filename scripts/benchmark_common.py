@@ -372,7 +372,24 @@ def postprocess_formula(
 
         formula_len = len(normalized)
         term_estimate = max(1, len([t for t in re.split(r"\s*[+-]\s*", normalized) if t.strip()]))
-        too_complex_for_symbolic = formula_len > 500 or term_estimate > 24
+        nonlinear_families = sum(
+            1
+            for pattern in (
+                r"\bsin\s*\(",
+                r"\bcos\s*\(",
+                r"\bexp\s*\(",
+                r"\blog\s*\(",
+                r"/",
+                r"\*\*",
+                r"\b_signed_power\s*\(",
+            )
+            if re.search(pattern, normalized)
+        )
+        too_complex_for_symbolic = (
+            formula_len > 500
+            or term_estimate > 24
+            or (term_estimate > 10 and nonlinear_families >= 3)
+        )
         sympy_unsafe = helper_unsafe or "Piecewise(" in normalized or "Eq(" in normalized
 
         if too_complex_for_symbolic or sympy_unsafe:

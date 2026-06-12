@@ -106,6 +106,24 @@ def test_postprocess_formula_with_fidelity_guard_accepts_safe_trig_rewrite():
     assert bc.evaluate_formula_mse_on_X(guarded, X, y) < 1e-12
 
 
+def test_postprocess_formula_uses_snap_only_for_mixed_complex_formula():
+    formula = (
+        "-5.853 + 0.1074*x + 0.04159*sin(2*x) - 3.86*cos(x/2) + 11.59*exp(-x) "
+        "+ 8.403*x**2/(exp(x)-1) + 0.8905*x**3/(exp(x)-1) "
+        "+ 0.09981*x**3/(x**4+0.5) - 1/4*x**2/(x**4+1.0) "
+        "+ 0.1158*x**2/(x**4+2.0) - 0.1806*cos(2.00*x)/(x**2+1.0) "
+        "+ (2/pi)*cos(2.00*x)/(x**2+2.0)"
+    )
+    X = np.linspace(-1.0, 5.0, 300).reshape(-1, 1)
+
+    processed = bc.postprocess_formula(formula)
+    y_pred, diagnostics = bc.evaluate_formula(processed, X, return_diagnostics=True)
+
+    assert diagnostics["ok"] is True
+    assert y_pred is not None
+    assert np.all(np.isfinite(y_pred))
+
+
 def test_postprocess_formula_guard_rejects_domain_unsafe_raw_eval_failure():
     X = np.linspace(-2.0, -0.1, 80).reshape(-1, 1)
     y = X[:, 0]

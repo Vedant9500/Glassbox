@@ -54,6 +54,15 @@ try:
         row_train_val_split,
         write_validation_report,
     )
+    from glassbox.curve_classifier.rollout import (
+        build_checkpoint_card,
+        build_rollout_comparison,
+        default_checkpoint_card_path,
+        default_rollout_comparison_path,
+        load_json_report,
+        write_checkpoint_card,
+        write_rollout_comparison,
+    )
 except Exception:
     from glassbox.curve_classifier.generate_curve_data import (
         extract_all_features,
@@ -72,6 +81,15 @@ except Exception:
         metrics_to_json_dict,
         row_train_val_split,
         write_validation_report,
+    )
+    from glassbox.curve_classifier.rollout import (
+        build_checkpoint_card,
+        build_rollout_comparison,
+        default_checkpoint_card_path,
+        default_rollout_comparison_path,
+        load_json_report,
+        write_checkpoint_card,
+        write_rollout_comparison,
     )
 
 
@@ -665,6 +683,18 @@ def main():
                         help="Optional output path for Phase 3 validation report JSON")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
+    parser.add_argument("--checkpoint-card", type=str, default="",
+                        help="Optional output path for Phase 6 checkpoint card JSON")
+    parser.add_argument("--data-generation-command", type=str, default="",
+                        help="Command used to generate this training dataset, saved in the checkpoint card")
+    parser.add_argument("--baseline-card", type=str, default="",
+                        help="Optional baseline checkpoint card for Phase 6 rollout comparison")
+    parser.add_argument("--rollout-comparison", type=str, default="",
+                        help="Optional output path for Phase 6 rollout comparison JSON")
+    parser.add_argument("--rollout-metric", type=str, default="val_f1",
+                        help="Metric name used for optional baseline comparison")
+    parser.add_argument("--min-relative-improvement", type=float, default=0.0,
+                        help="Minimum relative improvement over the baseline metric for rollout readiness")
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -683,6 +713,7 @@ def main():
 
     config = UniversalProposerConfig(hidden_dim=args.hidden)
     model = UniversalProposer(config).to(device)
+    dataset_metadata = {}
     
     if args.compile and hasattr(torch, "compile"):
         print("Compiling model with torch.compile...")
@@ -916,10 +947,11 @@ def main():
                 break
 
     checkpoint = torch.load(out_path, weights_only=False)
+    best_checkpoint_metrics = dict(checkpoint.get("validation_metrics") or best_metrics)
+    best_checkpoint_metrics.setdefault("val_f1", checkpoint.get("val_f1"))
+    best_checkpoint_metrics.setdefault("val_micro_f1", checkpoint.get("val_micro_f1"))
     if validation_report is not None:
-        validation_report["metrics"] = {
-            "best_checkpoint": dict(checkpoint.get("validation_metrics") or best_metrics)
-        }
+        validation_report["metrics"] = {"best_checkpoint": dict(best_checkpoint_metrics)}
         report_path = (
             Path(args.validation_report)
             if args.validation_report
@@ -930,7 +962,57 @@ def main():
         torch.save(checkpoint, out_path)
         print(f"Validation report saved to {report_path}")
 
+    validation_report_for_card = validation_report or {
+        "split_policy": split_policy,
+        "split_details": dict(split_details),
+        "metrics": {"best_checkpoint": dict(best_checkpoint_metrics)},
+        "notes": ["Synthetic proposer training run; production rollout requires dataset-backed grouped validation."],
+    }
+    checkpoint["labeler_version"] = dataset_metadata.get("labeler_version")
+    checkpoint["data_generation_command"] = args.data_generation_command or "not_provided"
+    checkpoint_card = build_checkpoint_card(
+        model_kind="universal_proposer",
+        checkpoint_path=out_path,
+        validation_report=validation_report_for_card,
+        checkpoint_metadata=checkpoint,
+        data_generation_command=args.data_generation_command,
+        training_command=" ".join(sys.argv),
+        runtime_contract={
+            "role": UNIVERSAL_PROPOSER_ROLE,
+            "contract_version": UNIVERSAL_PROPOSER_CONTRACT_VERSION,
+            "candidate_generation": "grammar_decode_with_mse_ranking",
+        },
+    )
+    checkpoint_card_path = (
+        Path(args.checkpoint_card)
+        if args.checkpoint_card
+        else default_checkpoint_card_path(out_path)
+    )
+    write_checkpoint_card(checkpoint_card_path, checkpoint_card)
+    checkpoint["checkpoint_card_path"] = str(checkpoint_card_path)
+
+    if args.baseline_card:
+        baseline_card = load_json_report(Path(args.baseline_card))
+        rollout_comparison = build_rollout_comparison(
+            candidate_card=checkpoint_card,
+            baseline_card=baseline_card,
+            metric_name=args.rollout_metric,
+            min_relative_improvement=args.min_relative_improvement,
+        )
+        rollout_comparison_path = (
+            Path(args.rollout_comparison)
+            if args.rollout_comparison
+            else default_rollout_comparison_path(out_path)
+        )
+        write_rollout_comparison(rollout_comparison_path, rollout_comparison)
+        checkpoint["rollout_comparison_path"] = str(rollout_comparison_path)
+
+    torch.save(checkpoint, out_path)
+
     print(f"\nTraining complete. Best Val F1: {best_f1:.4f}. Model saved to {out_path}")
+    print(f"Checkpoint card saved to {checkpoint_card_path}")
+    if args.baseline_card:
+        print(f"Rollout comparison saved to {checkpoint['rollout_comparison_path']}")
 
 
 if __name__ == "__main__":
