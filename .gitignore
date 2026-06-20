@@ -103,3 +103,5 @@ scripts/_tmp_*.py
 
 grokking_experiments/
 diffusion/
+scratch/
+.tmp/
