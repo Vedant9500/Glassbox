@@ -1,14 +1,15 @@
 """Universal fast-path proposer scaffold.
 
-Phase 1 MVP module:
-- point-set encoder model
-- grammar-constrained top-k skeleton decoding
-- FPIP v2 adapter for downstream evolution
+The current neural model consumes precomputed one-dimensional curve features.
+For multivariate inputs it supplies heuristic operator priors while grammar
+decoding and downstream search use the original multivariate `X`.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+import os
 import re
 from typing import Any, Dict, List, Optional, Sequence, Set
 
@@ -18,6 +19,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from glassbox.sr.fpip_v2 import validate_fpip_v2_payload
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 DEFAULT_OPERATOR_VOCAB: List[str] = [
@@ -68,6 +71,17 @@ DEFAULT_SKELETON_VOCAB: List[str] = list(dict.fromkeys(
     DEFAULT_UNIVARIATE_SKELETON_VOCAB + DEFAULT_MULTIVARIATE_SKELETON_VOCAB
 ))
 
+UNIVERSAL_PROPOSER_ARCHITECTURE_VERSION = "universal-proposer-glu-v1"
+UNIVERSAL_PROPOSER_MULTIVARIATE_CONTRACT_VERSION = "multivariate-contract-v1"
+UNIVERSAL_PROPOSER_CONTRACT_VERSION = "operator-prior-grammar-planner-v1"
+UNIVERSAL_PROPOSER_ROLE = "learned_operator_priors_plus_grammar_mse_planner"
+UNIVERSAL_PROPOSER_MULTIVARIATE_NEURAL_MODE = "heuristic_y_projection"
+UNIVERSAL_PROPOSER_UNIVARIATE_NEURAL_MODE = "canonical_univariate_xy"
+SKELETON_CONFIDENCE_MIN_COVERAGE = 0.80
+SKELETON_CONFIDENCE_MIN_TOP1_ACC = 0.60
+SKELETON_CONFIDENCE_MIN_TOP5_ACC = 0.80
+CANDIDATE_SUCCESS_REL_MSE_THRESHOLD = 1e-8
+
 
 def normalize_formula_key(formula: str) -> str:
     text = str(formula)
@@ -96,6 +110,8 @@ class UniversalProposerConfig:
     hidden_dim: int = 256
     n_features: int = 398
     supports_multivariate_formulas: bool = True
+    multivariate_neural_mode: str = UNIVERSAL_PROPOSER_MULTIVARIATE_NEURAL_MODE
+    proposer_contract_version: str = UNIVERSAL_PROPOSER_CONTRACT_VERSION
     max_input_vars: int = 4
     operator_vocab: Optional[List[str]] = None
     skeleton_vocab: Optional[List[str]] = None
@@ -321,6 +337,7 @@ def _safe_formula_eval(formula: str, x: np.ndarray) -> Optional[np.ndarray]:
         "cos": np.cos,
         "exp": lambda z: np.exp(np.clip(z, -30.0, 30.0)),
         "log": lambda z: np.log(np.abs(z) + 1e-6),
+        "sqrt": lambda z: np.sqrt(np.abs(z) + 1e-6),
         "abs": np.abs,
     }
     expr = formula.replace("^", "**")
@@ -425,6 +442,7 @@ def grammar_decode_multivariate_skeletons(
             mask = np.isfinite(xi) & np.isfinite(xj) & np.isfinite(y)
             if int(mask.sum()) < 8:
                 continue
+            x_pair_full = x[mask, :]
             xi = xi[mask]
             xj = xj[mask]
             yj = y[mask]
@@ -446,7 +464,7 @@ def grammar_decode_multivariate_skeletons(
                 f"{vi}*{vj}+{vi}+{vj}",
             ]
             for formula in candidates:
-                basis = _safe_formula_eval_multivariate(formula, np.column_stack([xi, xj]))
+                basis = _safe_formula_eval_multivariate(formula, x_pair_full)
                 mse = float("inf")
                 fit_score = 0.0
                 if basis is not None:
@@ -502,10 +520,151 @@ def _operator_priors(operator_logits: Sequence[float], operator_vocab: Sequence[
     return predictions
 
 
-def _uncertainty_from_logits(logits: Sequence[float]) -> Dict[str, Any]:
+def _proposer_model_contract(
+    *,
+    is_multivariate: bool,
+    n_input_vars: int,
+    neural_feature_mode: str,
+) -> Dict[str, Any]:
+    if is_multivariate:
+        operator_prior_source = (
+            "caller_supplied_features"
+            if neural_feature_mode == "caller_supplied_features"
+            else "one_dimensional_y_projection_features"
+        )
+        return {
+            "contract_version": UNIVERSAL_PROPOSER_MULTIVARIATE_CONTRACT_VERSION,
+            "input_mode": "multivariate",
+            "n_input_features": int(n_input_vars),
+            "supports_multivariate_formulas": True,
+            "multivariate_candidate_mode": "grammar_search_original_X",
+            "neural_multivariate_support": "heuristic",
+            "neural_feature_mode": neural_feature_mode,
+            "supports_trained_multivariate_neural_model": False,
+            "operator_prior_source": operator_prior_source,
+            "notes": [
+                "Neural operator priors are not produced by a trained multivariate point-set model.",
+                "Multivariate candidates and search planning use the original X through grammar/MSE heuristics.",
+            ],
+        }
+    operator_prior_source = (
+        "caller_supplied_features"
+        if neural_feature_mode == "caller_supplied_features"
+        else "canonicalized_univariate_xy_features"
+    )
+    return {
+        "contract_version": UNIVERSAL_PROPOSER_MULTIVARIATE_CONTRACT_VERSION,
+        "input_mode": "univariate",
+        "n_input_features": 1,
+        "supports_multivariate_formulas": False,
+        "multivariate_candidate_mode": "not_applicable",
+        "neural_multivariate_support": "not_applicable",
+        "neural_feature_mode": neural_feature_mode,
+        "supports_trained_multivariate_neural_model": False,
+        "operator_prior_source": operator_prior_source,
+    }
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        out = float(value)
+        return out if np.isfinite(out) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _skeleton_confidence_reliability(metrics: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    metrics = metrics if isinstance(metrics, dict) else {}
+    coverage = _float_or_none(metrics.get("skeleton_coverage"))
+    top1 = _float_or_none(metrics.get("skeleton_top1_acc"))
+    top5 = _float_or_none(metrics.get("skeleton_top5_acc"))
+
+    missing = []
+    if coverage is None:
+        missing.append("skeleton_coverage")
+    if top1 is None:
+        missing.append("skeleton_top1_acc")
+    if top5 is None:
+        missing.append("skeleton_top5_acc")
+
+    reliable = (
+        coverage is not None and coverage >= SKELETON_CONFIDENCE_MIN_COVERAGE
+        and top1 is not None and top1 >= SKELETON_CONFIDENCE_MIN_TOP1_ACC
+        and top5 is not None and top5 >= SKELETON_CONFIDENCE_MIN_TOP5_ACC
+    )
+    reasons = []
+    if coverage is None or coverage < SKELETON_CONFIDENCE_MIN_COVERAGE:
+        reasons.append("insufficient_skeleton_coverage")
+    if top1 is None or top1 < SKELETON_CONFIDENCE_MIN_TOP1_ACC:
+        reasons.append("insufficient_skeleton_top1_acc")
+    if top5 is None or top5 < SKELETON_CONFIDENCE_MIN_TOP5_ACC:
+        reasons.append("insufficient_skeleton_top5_acc")
+
+    return {
+        "reliable": bool(reliable),
+        "coverage": coverage,
+        "top1_acc": top1,
+        "top5_acc": top5,
+        "required_coverage": SKELETON_CONFIDENCE_MIN_COVERAGE,
+        "required_top1_acc": SKELETON_CONFIDENCE_MIN_TOP1_ACC,
+        "required_top5_acc": SKELETON_CONFIDENCE_MIN_TOP5_ACC,
+        "missing_metrics": missing,
+        "reasons": [] if reliable else reasons,
+    }
+
+
+def _routing_calibration_status(model: Optional[UniversalProposer]) -> Dict[str, Any]:
+    calibration = getattr(model, "routing_calibration", None)
+    if isinstance(calibration, dict):
+        return dict(calibration)
+    return {
+        "status": "uncalibrated",
+        "method": "candidate_mse_gate_plus_validation_gated_skeleton_confidence",
+        "requires": "downstream_candidate_success_benchmark",
+    }
+
+
+def _proposer_contract(
+    *,
+    skeleton_reliability: Dict[str, Any],
+    routing_calibration: Dict[str, Any],
+) -> Dict[str, Any]:
+    skeleton_role = (
+        "validated_confidence_signal"
+        if skeleton_reliability.get("reliable")
+        else "diagnostic_only"
+    )
+    return {
+        "contract_version": UNIVERSAL_PROPOSER_CONTRACT_VERSION,
+        "role": UNIVERSAL_PROPOSER_ROLE,
+        "operator_prior_role": "learned_neural_hint",
+        "candidate_generation": "grammar_decode_with_mse_ranking",
+        "skeleton_head_role": skeleton_role,
+        "skeleton_confidence_reliability": dict(skeleton_reliability),
+        "routing_calibration": dict(routing_calibration),
+    }
+
+
+def _uncertainty_from_logits(
+    logits: Sequence[float],
+    skeleton_reliability: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     probs = _safe_softmax(np.asarray(logits, dtype=np.float64))
+    skeleton_reliability = skeleton_reliability or _skeleton_confidence_reliability(None)
     if probs.size == 0:
-        return {"entropy": None, "margin": None, "confident": None}
+        return {
+            "entropy": None,
+            "margin": None,
+            "raw_entropy": None,
+            "raw_margin": None,
+            "confident": False,
+            "raw_confident": False,
+            "skeleton_confidence_reliable": bool(skeleton_reliability.get("reliable", False)),
+            "confidence_source": "no_skeleton_logits",
+            "skeleton_reliability": dict(skeleton_reliability),
+        }
 
     sorted_probs = np.sort(probs)[::-1]
     top1 = float(sorted_probs[0])
@@ -514,10 +673,27 @@ def _uncertainty_from_logits(logits: Sequence[float]) -> Dict[str, Any]:
     if sorted_probs.size > 1:
         entropy = float(-np.sum(sorted_probs * np.log(sorted_probs + 1e-12)) / np.log(sorted_probs.size))
     margin = top1 - top2
+    raw_confident = bool(entropy < 0.65 and margin > 0.12)
+    reliable = bool(skeleton_reliability.get("reliable", False))
+    confident = bool(raw_confident and reliable)
+    if reliable:
+        confidence_source = "validated_skeleton_logits"
+        routed_entropy = entropy
+        routed_margin = margin
+    else:
+        confidence_source = "disabled_unvalidated_skeleton_head"
+        routed_entropy = None
+        routed_margin = None
     return {
-        "entropy": entropy,
-        "margin": margin,
-        "confident": bool(entropy < 0.65 and margin > 0.12),
+        "entropy": routed_entropy,
+        "margin": routed_margin,
+        "raw_entropy": entropy,
+        "raw_margin": margin,
+        "confident": confident,
+        "raw_confident": raw_confident,
+        "skeleton_confidence_reliable": reliable,
+        "confidence_source": confidence_source,
+        "skeleton_reliability": dict(skeleton_reliability),
     }
 
 
@@ -691,6 +867,12 @@ def build_multivariate_search_plan(
             interaction_strength = max(interaction_strength, float(term.get("probability", 0.0)))
 
     plan["supports_multivariate_formulas"] = True
+    plan["contract_version"] = UNIVERSAL_PROPOSER_MULTIVARIATE_CONTRACT_VERSION
+    plan["neural_multivariate_support"] = "heuristic"
+    plan["neural_feature_mode"] = UNIVERSAL_PROPOSER_MULTIVARIATE_NEURAL_MODE
+    plan["supports_trained_multivariate_neural_model"] = False
+    plan["operator_prior_source"] = "one_dimensional_y_projection_features"
+    plan["candidate_source"] = "multivariate_grammar_with_mse_ranking"
     plan["input_variables"] = input_variables[: min(len(input_variables), n_features)]
     plan["feature_count"] = n_features
     plan["interaction_strength"] = float(interaction_strength)
@@ -712,19 +894,35 @@ def propose_from_xy(
     features: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Run proposer on a single curve and return decoded candidates + priors."""
+    x = np.asarray(x)
+    y = np.asarray(y)
     if x.ndim == 2 and x.shape[1] == 1:
         x = x[:, 0]
-    if x.ndim != 1:
-        raise ValueError(f"Expected x to be 1D or [N,1], got shape {x.shape}")
+    elif x.ndim not in (1, 2):
+        raise ValueError(f"Expected x to be 1D, [N,1], or [N,D], got shape {x.shape}")
 
     y = y.reshape(-1)
     if x.shape[0] != y.shape[0]:
         raise ValueError("x and y must have same length")
 
+    is_multivariate = bool(x.ndim == 2 and x.shape[1] > 1)
+    neural_feature_mode = "caller_supplied_features"
+
     # If features are not provided, we must extract them (legacy behavior)
     if features is None:
-        from glassbox.curve_classifier.generate_curve_data import extract_all_features
-        features = extract_all_features(y)
+        from glassbox.curve_classifier.generate_curve_data import (
+            extract_all_features,
+            extract_all_features_xy,
+        )
+        if not is_multivariate:
+            x_univariate = x.reshape(-1)
+            features = extract_all_features_xy(x_univariate, y)
+            neural_feature_mode = UNIVERSAL_PROPOSER_UNIVARIATE_NEURAL_MODE
+        else:
+            # Multivariate neural features remain heuristic until the point-set
+            # model phase; runtime candidates still use the multivariate grammar.
+            features = extract_all_features(y)
+            neural_feature_mode = UNIVERSAL_PROPOSER_MULTIVARIATE_NEURAL_MODE
     
     # Handle dimension mismatch (e.g. model trained with 370 features, codebase extracts 398)
     expected_dim = model.config.n_features
@@ -764,6 +962,7 @@ def propose_from_xy(
     priors = _operator_priors(operator_logits, model.operator_vocab)
     x_for_plan = x.astype(np.float64)
     y_for_plan = y.astype(np.float64)
+    n_input_vars = int(x_for_plan.shape[1]) if is_multivariate else 1
 
     if x_for_plan.ndim == 1 or (x_for_plan.ndim == 2 and x_for_plan.shape[1] <= 1):
         candidates = grammar_decode_topk_skeletons(
@@ -786,7 +985,15 @@ def propose_from_xy(
     if not candidates:
         candidates = decode_topk_skeletons(skeleton_logits, model.skeleton_vocab, top_k=top_k)
 
-    uncertainty = _uncertainty_from_logits(skeleton_logits)
+    skeleton_reliability = _skeleton_confidence_reliability(
+        getattr(model, "validation_metrics", None)
+    )
+    routing_calibration = _routing_calibration_status(model)
+    proposer_contract = _proposer_contract(
+        skeleton_reliability=skeleton_reliability,
+        routing_calibration=routing_calibration,
+    )
+    uncertainty = _uncertainty_from_logits(skeleton_logits, skeleton_reliability)
     if x_for_plan.ndim == 1 or (x_for_plan.ndim == 2 and x_for_plan.shape[1] <= 1):
         search_plan = build_search_plan(
             operator_priors=priors,
@@ -805,13 +1012,81 @@ def propose_from_xy(
             input_variables=[f"x{i}" for i in range(x_for_plan.shape[1])],
         )
 
+    model_contract = _proposer_model_contract(
+        is_multivariate=is_multivariate,
+        n_input_vars=n_input_vars,
+        neural_feature_mode=neural_feature_mode,
+    )
+    search_plan["model_contract"] = dict(model_contract)
+    search_plan["proposer_contract"] = dict(proposer_contract)
+    search_plan["contract_version"] = model_contract["contract_version"]
+    search_plan["neural_feature_mode"] = model_contract["neural_feature_mode"]
+    search_plan["operator_prior_source"] = model_contract["operator_prior_source"]
+    search_plan["supports_trained_multivariate_neural_model"] = model_contract[
+        "supports_trained_multivariate_neural_model"
+    ]
+    if is_multivariate:
+        search_plan["neural_multivariate_support"] = model_contract["neural_multivariate_support"]
+
     return {
         "candidate_skeletons": candidates,
         "operator_priors": priors,
         "sequence_uncertainty": uncertainty,
         "search_plan": search_plan,
-        "supports_multivariate_formulas": bool(x_for_plan.ndim == 2 and x_for_plan.shape[1] > 1),
+        "supports_multivariate_formulas": is_multivariate,
+        "model_contract": model_contract,
+        "proposer_contract": proposer_contract,
+        "neural_feature_mode": neural_feature_mode,
         "input_variables": [f"x{i}" for i in range(x_for_plan.shape[1])] if x_for_plan.ndim == 2 else ["x"],
+    }
+
+
+def _routing_signal_from_proposer_output(
+    proposer_output: Dict[str, Any],
+    search_plan: Dict[str, Any],
+    confident: bool,
+) -> Dict[str, Any]:
+    uncertainty = proposer_output.get("sequence_uncertainty", {})
+    if not isinstance(uncertainty, dict):
+        uncertainty = {}
+    signals = search_plan.get("signals", {}) if isinstance(search_plan, dict) else {}
+    best_rel_mse = _float_or_none(signals.get("best_relative_mse"))
+    skeleton_reliable = bool(uncertainty.get("skeleton_confidence_reliable", False))
+    confidence_source = str(uncertainty.get("confidence_source") or "unknown")
+
+    if best_rel_mse is not None and best_rel_mse <= CANDIDATE_SUCCESS_REL_MSE_THRESHOLD:
+        return {
+            "recommend_guided_evolution": False,
+            "reason": "candidate_verified_by_mse",
+            "confidence_source": "grammar_candidate_mse",
+            "best_relative_mse": best_rel_mse,
+            "candidate_success_threshold": CANDIDATE_SUCCESS_REL_MSE_THRESHOLD,
+            "skeleton_confidence_reliable": skeleton_reliable,
+            "calibration_status": "per_curve_candidate_success",
+        }
+
+    if confident and skeleton_reliable:
+        return {
+            "recommend_guided_evolution": False,
+            "reason": "validated_skeleton_confidence",
+            "confidence_source": confidence_source,
+            "best_relative_mse": best_rel_mse,
+            "candidate_success_threshold": CANDIDATE_SUCCESS_REL_MSE_THRESHOLD,
+            "skeleton_confidence_reliable": True,
+            "calibration_status": "validation_metric_gated",
+        }
+
+    reason = "proposer_low_confidence"
+    if not skeleton_reliable:
+        reason = "unvalidated_skeleton_confidence"
+    return {
+        "recommend_guided_evolution": True,
+        "reason": reason,
+        "confidence_source": confidence_source,
+        "best_relative_mse": best_rel_mse,
+        "candidate_success_threshold": CANDIDATE_SUCCESS_REL_MSE_THRESHOLD,
+        "skeleton_confidence_reliable": skeleton_reliable,
+        "calibration_status": "requires_downstream_success_benchmark",
     }
 
 
@@ -825,8 +1100,16 @@ def proposer_output_to_fpip_v2(
     interaction_hints = interaction_hints or {}
 
     uncertainty = proposer_output.get("sequence_uncertainty", {})
-    confident = uncertainty.get("confident")
-    recommend_guided = False if confident is True else True
+    if not isinstance(uncertainty, dict):
+        uncertainty = {}
+    confident = bool(uncertainty.get("confident") is True)
+    raw_search_plan = proposer_output.get("search_plan", {})
+    search_plan = dict(raw_search_plan) if isinstance(raw_search_plan, dict) else {}
+    routing_signal = _routing_signal_from_proposer_output(proposer_output, search_plan, confident)
+    raw_model_contract = proposer_output.get("model_contract", {})
+    model_contract = dict(raw_model_contract) if isinstance(raw_model_contract, dict) else {}
+    raw_proposer_contract = proposer_output.get("proposer_contract", {})
+    proposer_contract = dict(raw_proposer_contract) if isinstance(raw_proposer_contract, dict) else {}
 
     payload = {
         "schema_version": "fpip.v2",
@@ -835,15 +1118,19 @@ def proposer_output_to_fpip_v2(
             "entropy": uncertainty.get("entropy"),
             "margin": uncertainty.get("margin"),
             "confident": confident,
+            "raw_entropy": uncertainty.get("raw_entropy"),
+            "raw_margin": uncertainty.get("raw_margin"),
+            "raw_confident": uncertainty.get("raw_confident"),
+            "confidence_source": uncertainty.get("confidence_source"),
+            "skeleton_confidence_reliable": uncertainty.get("skeleton_confidence_reliable"),
         },
         "operator_priors": dict(proposer_output.get("operator_priors", {})),
         "interaction_hints": dict(interaction_hints),
         "fit_diagnostics": dict(fit_diagnostics),
-        "search_plan": dict(proposer_output.get("search_plan", {})),
-        "routing_signal": {
-            "recommend_guided_evolution": bool(recommend_guided),
-            "reason": "proposer_low_confidence" if recommend_guided else "proposer_confident",
-        },
+        "search_plan": search_plan,
+        "model_contract": model_contract,
+        "proposer_contract": proposer_contract,
+        "routing_signal": routing_signal,
     }
 
     valid, errors = validate_fpip_v2_payload(payload)
@@ -853,12 +1140,105 @@ def proposer_output_to_fpip_v2(
     return payload
 
 
+def _is_trusted_checkpoint_path(checkpoint_path: Path) -> bool:
+    resolved = checkpoint_path.resolve()
+    trusted_roots = [
+        (_REPO_ROOT / "models").resolve(),
+        (_REPO_ROOT / "artifacts").resolve(),
+    ]
+    return any(resolved == root or root in resolved.parents for root in trusted_roots)
+
+
+def _load_torch_checkpoint(checkpoint_path: Path):
+    try:
+        return torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    except Exception as safe_error:
+        if not _is_trusted_checkpoint_path(checkpoint_path):
+            raise RuntimeError(
+                "Refusing unsafe pickle checkpoint load outside trusted local model directories. "
+                f"Move {checkpoint_path} under models/ or artifacts/, or convert it to a weights-only checkpoint."
+            ) from safe_error
+        if os.environ.get("GLASSBOX_VERBOSE_CHECKPOINT_LOAD"):
+            print(
+                "weights-only checkpoint load failed; falling back to trusted local "
+                f"pickle checkpoint at {checkpoint_path}."
+            )
+        return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+
+
+def validate_universal_proposer_checkpoint_metadata(
+    checkpoint: Dict[str, Any],
+    *,
+    strict: bool = False,
+) -> Dict[str, Any]:
+    """Validate proposer checkpoint metadata with legacy compatibility."""
+    warnings: List[str] = []
+    errors: List[str] = []
+
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Checkpoint must be a dictionary")
+    if "model_state_dict" not in checkpoint:
+        errors.append("missing model_state_dict")
+
+    cfg = checkpoint.get("config")
+    if not isinstance(cfg, dict):
+        errors.append("missing config")
+        cfg = {}
+
+    n_features = cfg.get("n_features")
+    try:
+        n_features = int(n_features)
+        if n_features <= 0:
+            errors.append("config.n_features must be positive")
+    except Exception:
+        warnings.append("missing or invalid config.n_features")
+        n_features = None
+
+    skeleton_vocab = cfg.get("skeleton_vocab")
+    if skeleton_vocab is not None and not isinstance(skeleton_vocab, list):
+        errors.append("config.skeleton_vocab must be a list when present")
+
+    operator_vocab = cfg.get("operator_vocab")
+    if operator_vocab is not None and not isinstance(operator_vocab, list):
+        errors.append("config.operator_vocab must be a list when present")
+
+    architecture_version = (
+        checkpoint.get("architecture_version")
+        or cfg.get("architecture_version")
+    )
+    if architecture_version is None:
+        architecture_version = "legacy_unversioned"
+        warnings.append("missing architecture_version; treating checkpoint as legacy")
+
+    if errors or (strict and warnings):
+        details = "; ".join(errors + warnings)
+        raise ValueError(f"Invalid universal proposer checkpoint metadata: {details}")
+
+    return {
+        "n_features": n_features,
+        "architecture_version": architecture_version,
+        "multivariate_neural_mode": str(
+            cfg.get("multivariate_neural_mode", UNIVERSAL_PROPOSER_MULTIVARIATE_NEURAL_MODE)
+        ),
+        "proposer_contract_version": str(
+            checkpoint.get("proposer_contract_version")
+            or cfg.get("proposer_contract_version")
+            or UNIVERSAL_PROPOSER_CONTRACT_VERSION
+        ),
+        "warnings": warnings,
+    }
+
+
 def load_universal_proposer_checkpoint(
     checkpoint_path: str,
     device: Optional[str] = None,
 ) -> UniversalProposer:
     """Load UniversalProposer from checkpoint saved by train_universal_proposer.py."""
-    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    ckpt = _load_torch_checkpoint(Path(checkpoint_path))
+    metadata_report = validate_universal_proposer_checkpoint_metadata(ckpt)
+    if os.environ.get("GLASSBOX_VERBOSE_CHECKPOINT_LOAD"):
+        for warning in metadata_report.get("warnings", []):
+            print(f"  Proposer checkpoint metadata warning: {warning}")
     cfg_raw = ckpt.get("config", {})
     state_dict = ckpt["model_state_dict"]
     skeleton_vocab = cfg_raw.get("skeleton_vocab")
@@ -874,12 +1254,24 @@ def load_universal_proposer_checkpoint(
         hidden_dim=int(cfg_raw.get("hidden_dim", 256)),
         n_features=int(cfg_raw.get("n_features", 370)),
         supports_multivariate_formulas=bool(cfg_raw.get("supports_multivariate_formulas", True)),
+        multivariate_neural_mode=str(
+            cfg_raw.get("multivariate_neural_mode", UNIVERSAL_PROPOSER_MULTIVARIATE_NEURAL_MODE)
+        ),
+        proposer_contract_version=str(
+            cfg_raw.get("proposer_contract_version", UNIVERSAL_PROPOSER_CONTRACT_VERSION)
+        ),
         max_input_vars=int(cfg_raw.get("max_input_vars", 4)),
         operator_vocab=cfg_raw.get("operator_vocab"),
         skeleton_vocab=skeleton_vocab,
     )
     model = UniversalProposer(config)
     model.load_state_dict(state_dict)
+    model.architecture_version = metadata_report.get("architecture_version")
+    model.proposer_contract_version = metadata_report.get("proposer_contract_version")
+    validation_metrics = ckpt.get("validation_metrics")
+    model.validation_metrics = dict(validation_metrics) if isinstance(validation_metrics, dict) else {}
+    routing_calibration = ckpt.get("routing_calibration")
+    model.routing_calibration = dict(routing_calibration) if isinstance(routing_calibration, dict) else None
     
     # Attach scaler for automatic normalization during inference. Some older
     # proposer checkpoints accidentally stored an AMP GradScaler here.
@@ -890,6 +1282,11 @@ def load_universal_proposer_checkpoint(
         and "std" in feature_scaler
     ):
         feature_scaler = None
+    else:
+        feature_scaler = {
+            "mean": np.asarray(feature_scaler["mean"], dtype=np.float32),
+            "std": np.asarray(feature_scaler["std"], dtype=np.float32),
+        }
     model.feature_scaler = feature_scaler
     
     if device is not None:

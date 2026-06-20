@@ -74,6 +74,8 @@ N_CLASSES = len(OPERATOR_CLASSES)
 # Feature dimensionality (see extract_all_features)
 FEATURE_DIM = 398
 
+SEMANTIC_LABELER_VERSION = "semantic-labeler-v2"
+
 # Feature schema (slices into feature vector)
 FEATURE_SCHEMA = {
     "raw": (0, 128),
@@ -344,6 +346,21 @@ ALL_TEMPLATES = (
     PHYSICS_TEMPLATES
 )
 
+_TEMPLATE_FAMILY_BY_TEMPLATE: Dict[str, str] = {}
+for _family_name, _template_group in [
+    ("simple", SIMPLE_TEMPLATES),
+    ("compound", COMPOUND_TEMPLATES),
+    ("rational", RATIONAL_TEMPLATES),
+    ("nested", NESTED_TEMPLATES),
+    ("product", PRODUCT_TEMPLATES),
+    ("irrational", IRRATIONAL_TEMPLATES),
+    ("hyperbolic", HYPERBOLIC_TEMPLATES),
+    ("physics", PHYSICS_TEMPLATES),
+    ("multivariate", MULTIVARIATE_TEMPLATES),
+]:
+    for _template_text, _ in _template_group:
+        _TEMPLATE_FAMILY_BY_TEMPLATE.setdefault(_template_text, _family_name)
+
 
 # =============================================================================
 # PCFG-BASED FORMULA GENERATION
@@ -406,9 +423,13 @@ class PCFGFormulaGenerator:
         Returns:
             (formula_string, operator_set) matching template interface.
         """
-        ops: Set[str] = set()
-        formula = self._generate_expr(self.max_depth, ops)
-        return formula, ops
+        for _ in range(8):
+            ops: Set[str] = set()
+            formula = self._generate_expr(self.max_depth, ops)
+            if ops:
+                return formula, ops
+
+        return "x", {"identity"}
     
     def _generate_expr(self, depth_budget: int, ops: Set[str]) -> str:
         """Recursively generate an expression with given depth budget."""
@@ -1164,6 +1185,66 @@ def extract_all_features(y: np.ndarray) -> np.ndarray:
     return features
 
 
+def prepare_univariate_curve_xy(
+    x: np.ndarray,
+    y: np.ndarray,
+    n_points: int = 256,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Canonicalize univariate samples before curve feature extraction.
+
+    Runtime datasets may arrive in arbitrary row order. The classifier and
+    proposer feature extractors operate on curve order, so the univariate
+    contract is:
+      1. drop non-finite `(x, y)` rows,
+      2. sort by `x`,
+      3. average duplicate `x` targets,
+      4. resample to a canonical fixed grid.
+    """
+    n_points = int(n_points)
+    if n_points < 2:
+        raise ValueError("n_points must be at least 2")
+
+    x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
+    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+    if x_arr.shape[0] != y_arr.shape[0]:
+        raise ValueError("x and y must have the same number of samples")
+
+    finite = np.isfinite(x_arr) & np.isfinite(y_arr)
+    if not np.any(finite):
+        return np.linspace(0.0, 1.0, n_points), np.zeros(n_points, dtype=np.float64)
+
+    x_arr = x_arr[finite]
+    y_arr = y_arr[finite]
+
+    order = np.argsort(x_arr, kind="mergesort")
+    x_sorted = x_arr[order]
+    y_sorted = y_arr[order]
+
+    x_unique, inverse = np.unique(x_sorted, return_inverse=True)
+    sums = np.bincount(inverse, weights=y_sorted)
+    counts = np.bincount(inverse)
+    y_unique = sums / np.maximum(counts, 1)
+
+    if x_unique.shape[0] == 1:
+        x_grid = np.linspace(0.0, 1.0, n_points)
+        y_grid = np.full(n_points, float(y_unique[0]), dtype=np.float64)
+    else:
+        x_grid = np.linspace(float(x_unique[0]), float(x_unique[-1]), n_points)
+        y_grid = np.interp(x_grid, x_unique, y_unique)
+
+    return x_grid, y_grid
+
+
+def extract_all_features_xy(
+    x: np.ndarray,
+    y: np.ndarray,
+    n_points: int = 256,
+) -> np.ndarray:
+    """Extract features from univariate `(x, y)` samples using the Phase 0 contract."""
+    _, y_grid = prepare_univariate_curve_xy(x, y, n_points=n_points)
+    return extract_all_features(y_grid)
+
+
 # =============================================================================
 # DATA GENERATION
 # =============================================================================
@@ -1184,17 +1265,24 @@ def generate_random_formula() -> Tuple[str, Set[str]]:
     return formula, operators
 
 
-def generate_random_multivariate_formula(n_inputs: int = 2) -> Tuple[str, Set[str]]:
-    """Pick a multivariate template and fill in coefficients."""
+def _choose_multivariate_template(n_inputs: int = 2) -> Tuple[int, str, Set[str]]:
+    """Choose a multivariate template and return its global template id."""
     n_inputs = max(2, int(n_inputs))
     if n_inputs <= 2:
-        candidates = [
-            tpl for tpl in MULTIVARIATE_TEMPLATES
-            if ("x2" not in tpl[0] and "x3" not in tpl[0])
+        candidate_indices = [
+            i for i, (tpl, _) in enumerate(MULTIVARIATE_TEMPLATES)
+            if ("x2" not in tpl and "x3" not in tpl)
         ]
     else:
-        candidates = list(MULTIVARIATE_TEMPLATES)
-    template, operators = random.choice(candidates)
+        candidate_indices = list(range(len(MULTIVARIATE_TEMPLATES)))
+    template_id = random.choice(candidate_indices)
+    template, operators = MULTIVARIATE_TEMPLATES[template_id]
+    return template_id, template, set(operators)
+
+
+def generate_random_multivariate_formula(n_inputs: int = 2) -> Tuple[str, Set[str]]:
+    """Pick a multivariate template and fill in coefficients."""
+    _, template, operators = _choose_multivariate_template(n_inputs=n_inputs)
     formula = template.format(
         a=np.random.uniform(-3, 3),
         b=np.random.uniform(0.5, 3),
@@ -1203,6 +1291,21 @@ def generate_random_multivariate_formula(n_inputs: int = 2) -> Tuple[str, Set[st
         p=np.random.choice([0.5, 2, 3, 4, -1, -0.5]),
     )
     return formula, operators
+
+
+def _template_family_for(template: str | None) -> str:
+    if not template:
+        return "unknown"
+    return _TEMPLATE_FAMILY_BY_TEMPLATE.get(template, "template")
+
+
+def formula_to_key(formula: str) -> str:
+    """Normalize formula text for duplicate/grouped dataset audits."""
+    text = str(formula)
+    text = text.replace("np.", "")
+    text = re.sub(r"\s+", "", text)
+    text = text.replace("**", "^")
+    return text
 
 
 def _sample_multivariate_x(
@@ -1433,6 +1536,163 @@ def derive_operators_from_formula(formula: str) -> Set[str]:
     return ops
 
 
+def _ast_is_variable(node: ast.AST) -> bool:
+    return isinstance(node, ast.Name) and (node.id == 'x' or re.fullmatch(r"x\d+", node.id) is not None)
+
+
+def _ast_is_constant_expr(node: ast.AST) -> bool:
+    return not _ast_contains_x(node)
+
+
+def _ast_contains_safety_wrapper(node: ast.AST) -> bool:
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
+            continue
+        func = child.func
+        if (
+            isinstance(func, ast.Attribute)
+            and isinstance(func.value, ast.Name)
+            and func.value.id == 'np'
+            and func.attr in {"abs", "clip"}
+        ):
+            return True
+    return False
+
+
+def _semantic_visit(node: ast.AST, ops: Set[str], role: str = "root") -> None:
+    """Visit AST nodes and emit semantic operator labels.
+
+    Semantic labels describe the formula family we want to train on. They avoid
+    treating domain guards such as `abs(x) + eps` as addition/identity labels.
+    """
+    if _ast_is_variable(node):
+        if role in {"root", "linear", "factor"}:
+            ops.add("identity")
+        return
+
+    if isinstance(node, ast.Constant):
+        return
+
+    if isinstance(node, ast.Attribute):
+        return
+
+    if isinstance(node, ast.UnaryOp):
+        _semantic_visit(node.operand, ops, role=role)
+        return
+
+    if isinstance(node, ast.Call):
+        func = node.func
+        func_name = None
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == 'np':
+            func_name = func.attr
+
+        if func_name in {"sin", "cos", "exp", "log"}:
+            ops.add(func_name)
+            child_role = "domain_guard" if func_name == "log" else "function_arg"
+            for arg in node.args:
+                _semantic_visit(arg, ops, role=child_role)
+            return
+
+        if func_name == "sqrt":
+            ops.add("power")
+            for arg in node.args:
+                _semantic_visit(arg, ops, role="domain_guard")
+            return
+
+        if func_name in {"sinh", "cosh"}:
+            ops.add("exp")
+            for arg in node.args:
+                _semantic_visit(arg, ops, role="function_arg")
+            return
+
+        if func_name == "tanh":
+            ops.add("exp")
+            ops.add("rational")
+            for arg in node.args:
+                _semantic_visit(arg, ops, role="function_arg")
+            return
+
+        if func_name in {"abs", "clip"}:
+            for arg in node.args:
+                _semantic_visit(arg, ops, role="domain_guard" if role == "domain_guard" else "safety_wrapper")
+            return
+
+        for child in ast.iter_child_nodes(node):
+            _semantic_visit(child, ops, role=role)
+        return
+
+    if isinstance(node, ast.BinOp):
+        left_dep = _ast_contains_x(node.left)
+        right_dep = _ast_contains_x(node.right)
+
+        if isinstance(node.op, (ast.Add, ast.Sub)):
+            if left_dep and right_dep:
+                ops.add("addition")
+            _semantic_visit(node.left, ops, role=role)
+            _semantic_visit(node.right, ops, role=role)
+            return
+
+        if isinstance(node.op, ast.Mult):
+            if left_dep or right_dep:
+                ops.add("multiplication")
+            if role == "root" and (
+                (_ast_is_variable(node.left) and right_dep and not _ast_is_constant_expr(node.right))
+                or (_ast_is_variable(node.right) and left_dep and not _ast_is_constant_expr(node.left))
+            ):
+                ops.add("power")
+            if role in {"function_arg", "domain_guard", "safety_wrapper"}:
+                child_role = role
+            else:
+                child_role = "linear" if role == "root" and (not left_dep or not right_dep) else "factor"
+            _semantic_visit(node.left, ops, role=child_role)
+            _semantic_visit(node.right, ops, role=child_role)
+            return
+
+        if isinstance(node.op, ast.Div):
+            if right_dep:
+                ops.add("rational")
+                _semantic_visit(node.left, ops, role="factor")
+                _semantic_visit(node.right, ops, role="domain_guard")
+            else:
+                if left_dep:
+                    ops.add("multiplication")
+                _semantic_visit(node.left, ops, role=role)
+                _semantic_visit(node.right, ops, role=role)
+            return
+
+        if isinstance(node.op, ast.Pow):
+            if _ast_is_np_constant(node.left, 'e') and right_dep:
+                ops.add("exp")
+                _semantic_visit(node.right, ops, role="function_arg")
+                return
+            exponent = _ast_numeric_constant(node.right)
+            if left_dep or right_dep:
+                ops.add("power")
+                if exponent is not None and exponent < 0 and left_dep:
+                    ops.add("rational")
+            base_role = "power_base"
+            if (exponent is not None and exponent < 0) or _ast_contains_safety_wrapper(node.left):
+                base_role = "domain_guard"
+            _semantic_visit(node.left, ops, role=base_role)
+            _semantic_visit(node.right, ops, role="function_arg" if right_dep else role)
+            return
+
+    for child in ast.iter_child_nodes(node):
+        _semantic_visit(child, ops, role=role)
+
+
+def derive_semantic_operators_from_formula(formula: str) -> Set[str]:
+    """Derive canonical semantic labels from the final formula string."""
+    try:
+        tree = ast.parse(formula, mode='eval')
+    except Exception:
+        return set()
+
+    ops: Set[str] = set()
+    _semantic_visit(tree.body, ops, role="root")
+    return {op for op in ops if op in OPERATOR_CLASSES}
+
+
 def normalize_operators(operators: Set[str], formula: str) -> Set[str]:
     """Normalize operator labels to reduce template noise."""
     ops = set(operators)
@@ -1440,12 +1700,26 @@ def normalize_operators(operators: Set[str], formula: str) -> Set[str]:
     return ops
 
 
-def operators_to_labels(operators: Set[str], formula: str | None = None) -> np.ndarray:
-    """Convert operator set to multi-hot label vector (optionally normalized)."""
-    if formula is not None and not operators:
-        derived = derive_operators_from_formula(formula)
-        if derived:
-            operators = derived
+def operators_to_labels(
+    operators: Set[str],
+    formula: str | None = None,
+    label_mode: str = "semantic",
+) -> np.ndarray:
+    """Convert operator set to multi-hot labels.
+
+    When a formula is available, Phase 2 trains on canonical semantic labels by
+    default. Pass `label_mode="provided"` to encode a caller-supplied operator
+    set, or `label_mode="syntax"` to encode raw AST syntax operators.
+    """
+    if formula is not None:
+        if label_mode == "semantic":
+            operators = derive_semantic_operators_from_formula(formula)
+        elif label_mode == "syntax":
+            operators = derive_operators_from_formula(formula)
+        elif label_mode != "provided":
+            raise ValueError(f"Unknown label_mode={label_mode!r}")
+
+    if formula is not None:
         operators = normalize_operators(operators, formula)
 
     labels = np.zeros(N_CLASSES, dtype=np.float32)
@@ -1453,6 +1727,88 @@ def operators_to_labels(operators: Set[str], formula: str | None = None) -> np.n
         if op in OPERATOR_CLASSES:
             labels[OPERATOR_CLASSES[op]] = 1.0
     return labels
+
+
+def _sorted_operator_tuple(operators: Set[str]) -> Tuple[str, ...]:
+    return tuple(sorted(op for op in operators if op in OPERATOR_CLASSES))
+
+
+def _object_array(items: List[object]) -> np.ndarray:
+    arr = np.empty(len(items), dtype=object)
+    arr[:] = list(items)
+    return arr
+
+
+def _make_generation_metadata(
+    formula: str,
+    *,
+    generator_family: str,
+    template_id: int,
+    provided_operators: Set[str],
+) -> Dict[str, object]:
+    syntax_operators = derive_operators_from_formula(formula)
+    semantic_operators = derive_semantic_operators_from_formula(formula)
+    return {
+        "formula_key": formula_to_key(formula),
+        "generator_family": str(generator_family),
+        "template_id": int(template_id),
+        "provided_operators": _sorted_operator_tuple(provided_operators),
+        "syntax_operators": _sorted_operator_tuple(syntax_operators),
+        "semantic_operators": _sorted_operator_tuple(semantic_operators),
+        "labeler_version": SEMANTIC_LABELER_VERSION,
+    }
+
+
+def build_formula_audit_metadata(
+    formulas: List[str],
+    labels: np.ndarray | None = None,
+    generation_metadata: List[Dict[str, object]] | None = None,
+) -> Dict[str, object]:
+    """Build per-row Phase 2 audit metadata for saved datasets."""
+    n = len(formulas)
+    if generation_metadata is None or len(generation_metadata) != n:
+        generation_metadata = [
+            _make_generation_metadata(
+                str(formula),
+                generator_family="unknown",
+                template_id=-1,
+                provided_operators=set(),
+            )
+            for formula in formulas
+        ]
+
+    semantic_operator_sets = [
+        tuple(row.get("semantic_operators", ())) for row in generation_metadata
+    ]
+    syntax_operator_sets = [
+        tuple(row.get("syntax_operators", ())) for row in generation_metadata
+    ]
+    provided_operator_sets = [
+        tuple(row.get("provided_operators", ())) for row in generation_metadata
+    ]
+
+    semantic_labels = np.vstack([
+        operators_to_labels(set(), formula=str(formula), label_mode="semantic")
+        for formula in formulas
+    ]).astype(np.float32) if n else np.zeros((0, N_CLASSES), dtype=np.float32)
+
+    payload: Dict[str, object] = {
+        "labeler_version": SEMANTIC_LABELER_VERSION,
+        "formula_keys": np.array([row.get("formula_key", formula_to_key(str(formulas[i]))) for i, row in enumerate(generation_metadata)], dtype=object),
+        "generator_families": np.array([row.get("generator_family", "unknown") for row in generation_metadata], dtype=object),
+        "template_ids": np.array([int(row.get("template_id", -1)) for row in generation_metadata], dtype=np.int32),
+        "provided_operators": _object_array(provided_operator_sets),
+        "syntax_operators": _object_array(syntax_operator_sets),
+        "semantic_operators": _object_array(semantic_operator_sets),
+        "semantic_labels": semantic_labels,
+    }
+    if labels is not None:
+        labels_arr = np.asarray(labels, dtype=np.float32)
+        payload["labels_match_semantic"] = np.all(
+            np.isclose(labels_arr, semantic_labels, atol=1e-6),
+            axis=1,
+        )
+    return payload
 
 
 def generate_dataset(
@@ -1480,7 +1836,8 @@ def generate_dataset(
     noise_profile: str = 'legacy',
     multivariate_ratio: float = 0.0,
     n_inputs: int = 2,
-) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    return_metadata: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, List[str]] | Tuple[np.ndarray, np.ndarray, List[str], List[Dict[str, object]]]:
     """
     Generate labeled curve dataset.
     
@@ -1488,6 +1845,7 @@ def generate_dataset(
         features: (n_samples, 334) feature vectors
         labels: (n_samples, n_classes) multi-hot labels
         formulas: list of formula strings (for debugging)
+        generation_metadata: optional per-row audit metadata if return_metadata=True
     """
     if templates is None:
         templates = ALL_TEMPLATES
@@ -1497,6 +1855,7 @@ def generate_dataset(
     features_list = []
     labels_list = []
     formulas_list = []
+    metadata_list = []
     
     # Multiprocessing for speed
     import multiprocessing
@@ -1537,43 +1896,45 @@ def generate_dataset(
     
     print(f"Generating data using {n_workers} workers...")
     
-    with multiprocessing.Pool(n_workers) as pool:
-        # Create partial function with fixed arguments
-        worker_func = partial(
-            generate_chunk, 
-            x_range=x_range, 
-            n_points=n_points,
-            templates=templates,
-            balance_templates=balance_templates,
-            balance_classes=balance_classes,
-            class_to_templates=class_to_templates,
-            class_sampling_weights=class_sampling_weights,
-            x_ranges=x_ranges,
-            x_scale_min=x_scale_min,
-            x_scale_max=x_scale_max,
-            x_shift_std=x_shift_std,
-            noise_std=noise_std,
-            y_scale_min=y_scale_min,
-            y_scale_max=y_scale_max,
-            y_offset_std=y_offset_std,
-            safe_eval=safe_eval,
-            signed_bd=signed_bd,
-            pcfg_ratio=pcfg_ratio,
-            pcfg_max_depth=pcfg_max_depth,
-            noise_profile=noise_profile,
-            multivariate_ratio=multivariate_ratio,
-            n_inputs=n_inputs,
-        )
-        
-        # Run workers
-        if show_progress:
-            results = list(tqdm(
-                pool.imap(worker_func, work_items),
-                total=n_workers,
-                desc="Generating chunks"
-            ))
-        else:
-            results = list(pool.imap(worker_func, work_items))
+    worker_func = partial(
+        generate_chunk,
+        x_range=x_range,
+        n_points=n_points,
+        templates=templates,
+        balance_templates=balance_templates,
+        balance_classes=balance_classes,
+        class_to_templates=class_to_templates,
+        class_sampling_weights=class_sampling_weights,
+        x_ranges=x_ranges,
+        x_scale_min=x_scale_min,
+        x_scale_max=x_scale_max,
+        x_shift_std=x_shift_std,
+        noise_std=noise_std,
+        y_scale_min=y_scale_min,
+        y_scale_max=y_scale_max,
+        y_offset_std=y_offset_std,
+        safe_eval=safe_eval,
+        signed_bd=signed_bd,
+        pcfg_ratio=pcfg_ratio,
+        pcfg_max_depth=pcfg_max_depth,
+        noise_profile=noise_profile,
+        multivariate_ratio=multivariate_ratio,
+        n_inputs=n_inputs,
+    )
+
+    if n_workers == 1:
+        iterable = tqdm(work_items, total=1, desc="Generating chunks") if show_progress else work_items
+        results = [worker_func(item) for item in iterable]
+    else:
+        with multiprocessing.Pool(n_workers) as pool:
+            if show_progress:
+                results = list(tqdm(
+                    pool.imap(worker_func, work_items),
+                    total=n_workers,
+                    desc="Generating chunks"
+                ))
+            else:
+                results = list(pool.imap(worker_func, work_items))
     
     # Combine results
     features_list = []
@@ -1588,10 +1949,24 @@ def generate_dataset(
         'max_attempts': 0,
     }
 
-    for feats, lbls, forms, stats in results:
+    for result in results:
+        if len(result) == 5:
+            feats, lbls, forms, meta, stats = result
+        else:
+            feats, lbls, forms, stats = result
+            meta = [
+                _make_generation_metadata(
+                    str(formula),
+                    generator_family="unknown",
+                    template_id=-1,
+                    provided_operators=set(),
+                )
+                for formula in forms
+            ]
         features_list.extend(feats)
         labels_list.extend(lbls)
         formulas_list.extend(forms)
+        metadata_list.extend(meta)
         for k in reject_stats:
             reject_stats[k] += stats.get(k, 0)
     
@@ -1600,17 +1975,21 @@ def generate_dataset(
     features = np.array(features_list, dtype=np.float32)[indices]
     labels = np.array(labels_list, dtype=np.float32)[indices]
     formulas = [formulas_list[i] for i in indices]
+    generation_metadata = [metadata_list[i] for i in indices]
     
     # Trim to exact size
     features = features[:n_samples]
     labels = labels[:n_samples]
     formulas = formulas[:n_samples]
+    generation_metadata = generation_metadata[:n_samples]
     
     if sum(reject_stats.values()) > 0:
         print("\nRejection summary:")
         for k, v in reject_stats.items():
             print(f"  {k:15s}: {v}")
 
+    if return_metadata:
+        return features, labels, formulas, generation_metadata
     return features, labels, formulas
 
 
@@ -1737,7 +2116,11 @@ def generate_dataset_streamed(
         else:
             results = pool.imap(worker_func, work_items)
 
-        for feats, lbls, forms, stats in results:
+        for result in results:
+            if len(result) == 5:
+                feats, lbls, forms, _meta, stats = result
+            else:
+                feats, lbls, forms, stats = result
             count = len(feats)
             if count == 0:
                 continue
@@ -1800,7 +2183,7 @@ def generate_chunk(
     noise_profile: str = 'legacy',
     multivariate_ratio: float = 0.0,
     n_inputs: int = 2,
-) -> Tuple[List, List, List, Dict[str, int]]:
+) -> Tuple[List, List, List, List[Dict[str, object]], Dict[str, int]]:
     """Generate a chunk of samples (worker function)."""
     n, seed = task
 
@@ -1817,6 +2200,7 @@ def generate_chunk(
     features_local = []
     labels_local = []
     formulas_local = []
+    metadata_local: List[Dict[str, object]] = []
     
     # Generate batch with some buffer for failures
     target = n
@@ -1853,15 +2237,28 @@ def generate_chunk(
             and n_inputs >= 2
             and not use_pcfg
         )
+        generator_family = "template"
+        template_id = -1
+        template_text: str | None = None
+        provided_operators: Set[str] = set()
         
         if use_pcfg:
             # PCFG-based generation
             formula, _ = pcfg_gen.generate()
-            # Deriving operators from AST ensures labels match the final string exactly
-            # (fixes issue where generator tracking missed implicit ops or drifted)
-            operators = derive_operators_from_formula(formula)
+            operators = derive_semantic_operators_from_formula(formula)
+            provided_operators = set()
+            generator_family = "pcfg"
         elif use_multivariate:
-            formula, operators = generate_random_multivariate_formula(n_inputs=n_inputs)
+            template_id, template_text, operators = _choose_multivariate_template(n_inputs=n_inputs)
+            formula = template_text.format(
+                a=np.random.uniform(-3, 3),
+                b=np.random.uniform(0.5, 3),
+                c=np.random.uniform(-2, 2),
+                d=np.random.uniform(0.5, 3),
+                p=np.random.choice([0.5, 2, 3, 4, -1, -0.5]),
+            )
+            provided_operators = set(operators)
+            generator_family = "multivariate"
         elif balance_classes and class_to_templates:
             if class_sampling_weights is not None:
                 classes, weights = class_sampling_weights
@@ -1871,13 +2268,29 @@ def generate_chunk(
                 target_class = random.choice(available)
             template_idx = random.choice(class_to_templates[target_class])
             template, operators = templates[template_idx]
+            template_id = int(template_idx)
+            template_text = template
+            provided_operators = set(operators)
+            generator_family = _template_family_for(template)
         elif balance_templates:
             if template_idx % len(templates) == 0:
                 random.shuffle(template_indices)
-            template, operators = templates[template_indices[template_idx % len(templates)]]
+            selected_template_idx = template_indices[template_idx % len(templates)]
+            template, operators = templates[selected_template_idx]
+            template_id = int(selected_template_idx)
+            template_text = template
+            provided_operators = set(operators)
+            generator_family = _template_family_for(template)
             template_idx += 1
         else:
             template, operators = random.choice(templates)
+            try:
+                template_id = int(templates.index((template, operators)))
+            except ValueError:
+                template_id = -1
+            template_text = template
+            provided_operators = set(operators)
+            generator_family = _template_family_for(template)
         
         # Fill in template coefficients (only for template-based formulas)
         if not use_pcfg and not use_multivariate:
@@ -1957,16 +2370,23 @@ def generate_chunk(
             continue
         
         # Create labels
-        labels = operators_to_labels(operators, formula=formula)
+        labels = operators_to_labels(operators, formula=formula, label_mode="semantic")
+        row_metadata = _make_generation_metadata(
+            formula,
+            generator_family=generator_family,
+            template_id=template_id,
+            provided_operators=provided_operators,
+        )
         
         features_local.append(features)
         labels_local.append(labels)
         formulas_local.append(formula)
+        metadata_local.append(row_metadata)
             
     if len(features_local) < target:
         stats['max_attempts'] += 1
 
-    return features_local, labels_local, formulas_local, stats
+    return features_local, labels_local, formulas_local, metadata_local, stats
 
 
 def save_dataset(
@@ -1975,8 +2395,14 @@ def save_dataset(
     labels: np.ndarray,
     formulas: List[str],
     metadata: Dict[str, object] | None = None,
+    generation_metadata: List[Dict[str, object]] | None = None,
 ):
     """Save dataset to npz file."""
+    audit_metadata = build_formula_audit_metadata(
+        formulas,
+        labels=labels,
+        generation_metadata=generation_metadata,
+    )
     payload = {
         "features": features,
         "labels": labels,
@@ -1984,6 +2410,7 @@ def save_dataset(
         "operator_classes": list(OPERATOR_CLASSES.keys()),
         "feature_dim": FEATURE_DIM,
         "feature_schema": FEATURE_SCHEMA,
+        **audit_metadata,
     }
     if metadata:
         payload.update(metadata)
@@ -2118,7 +2545,7 @@ def main():
         n_general = args.n_samples - n_rational
         print(f"  Generating {n_rational} rational + {n_general} general samples")
         
-        feats_r, labels_r, forms_r = generate_dataset(
+        feats_r, labels_r, forms_r, meta_r = generate_dataset(
             n_samples=n_rational,
             x_range=(args.x_min, args.x_max),
             n_points=args.n_points,
@@ -2142,8 +2569,9 @@ def main():
             noise_profile=args.noise_profile,
             multivariate_ratio=args.multivariate_ratio,
             n_inputs=args.n_inputs,
+            return_metadata=True,
         )
-        feats_g, labels_g, forms_g = generate_dataset(
+        feats_g, labels_g, forms_g, meta_g = generate_dataset(
             n_samples=n_general,
             x_range=(args.x_min, args.x_max),
             n_points=args.n_points,
@@ -2167,17 +2595,21 @@ def main():
             noise_profile=args.noise_profile,
             multivariate_ratio=args.multivariate_ratio,
             n_inputs=args.n_inputs,
+            return_metadata=True,
         )
         
         features = np.concatenate([feats_r, feats_g], axis=0)
         labels = np.concatenate([labels_r, labels_g], axis=0)
         formulas = forms_r + forms_g
+        generation_metadata = meta_r + meta_g
         
         indices = np.random.permutation(len(features))
         features = features[indices]
         labels = labels[indices]
         formulas = [formulas[i] for i in indices]
+        generation_metadata = [generation_metadata[i] for i in indices]
     else:
+        generation_metadata = None
         if args.stream:
             features, labels, formulas = generate_dataset_streamed(
                 n_samples=args.n_samples,
@@ -2206,7 +2638,7 @@ def main():
                 n_inputs=args.n_inputs,
             )
         else:
-            features, labels, formulas = generate_dataset(
+            features, labels, formulas, generation_metadata = generate_dataset(
                 n_samples=args.n_samples,
                 x_range=(args.x_min, args.x_max),
                 n_points=args.n_points,
@@ -2229,6 +2661,7 @@ def main():
                 noise_profile=args.noise_profile,
                 multivariate_ratio=args.multivariate_ratio,
                 n_inputs=args.n_inputs,
+                return_metadata=True,
             )
     
     # Stats
@@ -2261,6 +2694,7 @@ def main():
                 "multivariate_ratio": float(args.multivariate_ratio),
                 "multivariate_templates": np.array([tpl for tpl, _ in MULTIVARIATE_TEMPLATES], dtype=object),
             },
+            generation_metadata=generation_metadata,
         )
     
     # Show some examples (only if formulas were saved and not too many)

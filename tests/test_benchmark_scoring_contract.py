@@ -1,5 +1,8 @@
 """Regression tests for benchmark scoring reliability contracts."""
 
+import json
+from pathlib import Path
+
 import numpy as np
 
 from scripts import benchmark_suite as bs
@@ -20,12 +23,54 @@ def test_benchmark_suite_uses_shared_formula_helpers():
     assert bs._evaluate_formula_mse is bc.evaluate_formula_mse
 
 
+def test_compare_benchmark_results_counts_same_score_formula_and_mse_changes():
+    scratch = Path("scratch")
+    scratch.mkdir(exist_ok=True)
+    previous_path = scratch / "test_compare_previous.json"
+    previous_path.write_text(json.dumps({
+        "tiers": {
+            "1": {
+                "results": [{
+                    "formula_target": "x",
+                    "score": "EXACT",
+                    "mse": 1e-8,
+                    "formula_discovered": "x",
+                }]
+            }
+        }
+    }), encoding="utf-8")
+    current = {
+        1: [{
+            "formula_target": "x",
+            "score": "EXACT",
+            "mse": 5e-8,
+            "formula_discovered": "1*x",
+        }]
+    }
+
+    try:
+        comparison = bs.compare_benchmark_results(previous_path, current)
+    finally:
+        previous_path.unlink(missing_ok=True)
+
+    assert comparison["summary"]["same"] == 1
+    assert comparison["summary"]["changed"] == 1
+    assert comparison["transitions"][0]["formula_changed"] is True
+    assert comparison["transitions"][0]["mse_changed"] is True
+
+
 def test_formula_mse_eval_handles_base_log_constants():
     x = np.linspace(-2.0, 2.0, 64)
     y = np.log(np.e) / np.log(10.0) * x
 
     assert bs._evaluate_formula_mse("log(E, 10)*x", x, y) is not None
     assert bs.cfp._evaluate_formula_values("log(E, 2)*x", x) is not None
+
+
+def test_benchmark_target_parser_treats_lowercase_e_as_euler_constant():
+    x, y = bs._generate_data("e*x", -2.0, 2.0, 64)
+
+    assert np.allclose(y, np.e * x)
 
 
 def test_run_formula_flags_formula_eval_failed(monkeypatch):
@@ -51,6 +96,8 @@ def test_run_formula_flags_formula_eval_failed(monkeypatch):
     assert result["formula_discovered"]
     assert result["mse_display"] is None
     assert result["error"] == "formula_eval_failed"
+    assert result["formula_before_display_error"]
+    assert result["display_eval_diagnostics"]["ok"] is False
     assert result["score"] == "FAIL"
 
 
@@ -74,6 +121,121 @@ def test_prediction_uncertainty_metrics():
     assert abs(metrics["prediction_top1"] - 0.7) < 1e-12
     assert abs(metrics["prediction_top2"] - 0.2) < 1e-12
     assert metrics["prediction_uncertain"] is False
+
+
+def test_fast_path_direct_transform_template_recovers_log_affine():
+    x = np.linspace(0.0, 5.0, 80)
+    y = np.log(2.0 * x + 1.0)
+
+    formula, mse, details = cfp.fast_path_regression(
+        x,
+        y,
+        {"log": 0.94, "exponential": 0.94},
+        exact_match_enabled=True,
+    )
+
+    assert mse < 1e-10
+    assert details["exact_match"] is True
+    assert details["template_match"] == "log_affine_direct"
+    assert "log" in formula
+
+
+def test_fast_path_direct_transform_template_preempts_exp_polynomial_surrogate():
+    x = np.linspace(-1.0, 2.0, 80)
+    y = 3.0 + 2.0 * np.exp(0.7 * x)
+
+    formula, mse, details = cfp.fast_path_regression(
+        x,
+        y,
+        {"exp": 0.9, "exponential": 0.9},
+        exact_match_enabled=True,
+    )
+
+    assert mse < 1e-10
+    assert details["exact_match"] is True
+    assert details["template_match"] == "shifted_exp_affine"
+    assert "exp" in formula
+
+
+def test_fast_path_candidate_pool_reports_semantic_dedup():
+    x = np.linspace(-2.0, 2.0, 80)
+    y = np.sin(x) + 0.1 * x
+
+    _, _, details = cfp.fast_path_regression(
+        x,
+        y,
+        {"sin": 0.9, "addition": 0.8, "polynomial": 0.4},
+        exact_match_enabled=False,
+    )
+
+    dedup = details["candidate_semantic_dedup"]
+    assert dedup["enabled"] is True
+    assert dedup["before"] >= dedup["after"]
+    assert dedup["removed"] == dedup["before"] - dedup["after"]
+    assert "numpy" in details["solver_backends"]
+    assert any(c.get("solver_backend") for c in details["candidate_formulas"])
+
+
+def test_decomposition_probe_candidates_capture_product_sum():
+    x = np.linspace(-2.0, 2.0, 80)
+    y = np.sin(x) * np.cos(x) + 0.25 * x
+
+    candidates = cfp.build_decomposition_probe_candidates(
+        x,
+        y,
+        {"sin": 0.8, "cos": 0.8, "multiplication": 0.8, "addition": 0.8},
+        max_candidates=5,
+    )
+
+    assert candidates
+    assert candidates[0]["mse"] < 1e-10
+    assert candidates[0]["source"] == "decomposition_probe"
+    assert candidates[0]["decomposition_probe_type"] in {"additive_pair", "multiplicative_pair"}
+
+
+def test_benchmark_guided_evolution_receives_fast_path_candidate_pool(monkeypatch):
+    sent_candidates = [
+        {"formula": "x", "mse": 1.0, "source": "fast_path"},
+        {
+            "formula": "sin(x)*cos(x) + 0.25*x",
+            "mse": 0.0,
+            "source": "decomposition_probe",
+            "decomposition_probe_type": "multiplicative_pair",
+        },
+    ]
+    captured = {}
+
+    def _fake_fast_path(*args, **kwargs):
+        return {
+            "formula": "x",
+            "mse": 1.0,
+            "details": {"n_nonzero": 1, "n_nonzero_simplified": 1, "y_variance": 1.0},
+            "candidate_formulas": sent_candidates,
+            "operator_hints": {},
+            "residual_diagnostics": {"residual_suspicious": False},
+        }
+
+    def _fake_guided(*args, **kwargs):
+        captured["candidate_formulas"] = kwargs.get("candidate_formulas")
+        return {"formula": "sin(x)*cos(x) + 0.25*x", "mse": 0.0, "raw_mse": 0.0}
+
+    monkeypatch.setattr(bs, "run_fast_path", _fake_fast_path)
+    monkeypatch.setattr(bs, "run_guided_evolution", _fake_guided)
+    monkeypatch.setattr(bs, "_evaluate_formula_mse", lambda formula, *a, **k: 1.0 if formula == "x" else 0.0)
+
+    result = bs.run_formula(
+        formula_str="sin(x)*cos(x)+0.25*x",
+        x_range=(-2.0, 2.0),
+        classifier_path="unused.pt",
+        n_samples=64,
+        device="cpu",
+        with_evolution=True,
+        disable_proposer=True,
+    )
+
+    formulas = [c["formula"] for c in captured["candidate_formulas"]]
+    assert "sin(x)*cos(x) + 0.25*x" in formulas
+    assert result["evolution_seed_candidates"] == captured["candidate_formulas"]
 
 
 def test_residual_diagnostics_handles_nan_mask_with_holdout():
@@ -271,6 +433,139 @@ def test_run_formula_passes_candidate_formulas(monkeypatch):
     )
 
     assert result["candidate_formulas"] == candidates
+    assert result["fast_path_candidate_formulas"] == candidates
+    assert result["winning_stage"] == "fast_path"
+
+
+def test_run_formula_preserves_guided_raw_mse_and_seed_candidates(monkeypatch):
+    sent_candidates = [
+        {"formula": "x", "mse": 1.0, "from_fast_path": True},
+    ]
+
+    def _fake_fast_path(*args, **kwargs):
+        return {
+            "formula": "x",
+            "mse": 1.0,
+            "details": {"n_nonzero": 1, "n_nonzero_simplified": 1},
+            "candidate_formulas": sent_candidates,
+            "operator_hints": {},
+        }
+
+    def _fake_guided(*args, **kwargs):
+        return {"formula": "x^2", "mse": 0.0, "raw_mse": 0.123}
+
+    monkeypatch.setattr(bs, "run_fast_path", _fake_fast_path)
+    monkeypatch.setattr(bs, "run_guided_evolution", _fake_guided)
+    monkeypatch.setattr(bs, "_evaluate_formula_mse", lambda formula, *a, **k: 1.0 if formula == "x" else 0.0)
+
+    result = bs.run_formula(
+        formula_str="x^2",
+        x_range=(-2.0, 2.0),
+        classifier_path="unused.pt",
+        n_samples=64,
+        device="cpu",
+        with_evolution=True,
+        evolution_only=False,
+    )
+
+    assert result["winning_stage"] == "guided_evolution"
+    assert result["mse_raw"] == 0.123
+    assert result["engine_raw_mse"] == 0.123
+    assert result["evolution_seed_candidates"]
+    assert result["candidate_formulas"] == result["evolution_seed_candidates"]
+
+
+def test_specialist_regressor_benchmark_defaults_keep_expensive_phases_off(monkeypatch):
+    captured = {}
+
+    class FakeRegressor:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.best_mse_ = 0.0
+            self.specialist_track_ = "incumbent path"
+            self.has_composed_seeds_ = False
+            self.phase_timings_ = {"total_fit": 0.0}
+            self.boosting_stages_ = []
+            self.boosting_attempted_ = False
+            self.boosting_improved_ = False
+            self.boosting_diagnostics_ = {}
+            self.blackbox_diagnostics_ = {}
+            self.inception_rounds_ = []
+            self.inception_diagnostics_ = {}
+            self.specialist_vault_ = None
+
+        def fit(self, X, y):
+            return self
+
+        def get_formula(self):
+            return "x"
+
+    import glassbox.sr.sklearn_wrapper as sw
+
+    monkeypatch.setattr(sw, "GlassboxRegressor", FakeRegressor)
+
+    result = bs.run_formula_specialist_regressor(
+        formula_str="x",
+        x_range=(-2.0, 2.0),
+        classifier_path="unused.pt",
+        proposer_path=None,
+        n_samples=64,
+        device="cpu",
+    )
+
+    assert captured["enable_specialist_screening_diagnostics"] is True
+    assert captured["enable_specialist_composition_screening"] is True
+    assert captured["enable_specialist_vault_memory"] is True
+    assert captured["enable_residual_stage"] is False
+    assert captured["enable_inception_reuse"] is False
+    assert result["specialist_phase_config"]["residual"] is False
+    assert result["specialist_phase_config"]["inception"] is False
+
+
+def test_specialist_regressor_benchmark_can_enable_full_phases(monkeypatch):
+    captured = {}
+
+    class FakeRegressor:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.best_mse_ = 0.0
+            self.specialist_track_ = "incumbent path"
+            self.has_composed_seeds_ = False
+            self.phase_timings_ = {"total_fit": 0.0}
+            self.boosting_stages_ = []
+            self.boosting_attempted_ = False
+            self.boosting_improved_ = False
+            self.boosting_diagnostics_ = {}
+            self.blackbox_diagnostics_ = {}
+            self.inception_rounds_ = []
+            self.inception_diagnostics_ = {}
+            self.specialist_vault_ = None
+
+        def fit(self, X, y):
+            return self
+
+        def get_formula(self):
+            return "x"
+
+    import glassbox.sr.sklearn_wrapper as sw
+
+    monkeypatch.setattr(sw, "GlassboxRegressor", FakeRegressor)
+
+    result = bs.run_formula_specialist_regressor(
+        formula_str="x",
+        x_range=(-2.0, 2.0),
+        classifier_path="unused.pt",
+        proposer_path=None,
+        n_samples=64,
+        device="cpu",
+        specialist_residual=True,
+        specialist_inception=True,
+    )
+
+    assert captured["enable_residual_stage"] is True
+    assert captured["enable_inception_reuse"] is True
+    assert result["specialist_phase_config"]["residual"] is True
+    assert result["specialist_phase_config"]["inception"] is True
 
 
 def test_classifier_prior_trust_from_uncertainty_extremes():

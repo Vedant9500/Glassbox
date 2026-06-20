@@ -1,23 +1,117 @@
 # C++ Migration Roadmap
 
-This document outlines computationally expensive Python steps identified in the Glassbox SR pipeline that are prime candidates for migration to the C++ backend for massive performance gains and dependency reduction.
+Last updated: 2026-06-03.
 
-## 1. Multi-Start LBFGS Regularized Pruning (`bfgs_optimizer.py`)
-Currently, `RegularizedBFGS` uses PyTorch's `LBFGS` optimizer with L1/L2 penalties to prune formulas (e.g., zeroing out terms so `sin(x) + 0.001*x^2` becomes `sin(x)`).
-* **The Bottleneck:** Runs a complex PyTorch autograd graph iteratively over scalar equations.
-* **The C++ Fix:** Implement a Regularized Least Squares solver natively in Eigen. Eigen supports Ridge (L2) and Lasso (L1) regression via proximal gradient methods or coordinate descent. Migrating this makes the final pruning step instantaneous.
+Glassbox already has a substantial native backend. This document tracks what is
+implemented and what remains worth migrating.
 
-## 2. The SymPy Algebraic Simplification Pipeline (`simplify_formula.py`)
-A heavily customized pipeline parses strings, applies trigonometric transformations, and simplifies formulas.
-* **The Bottleneck:** SymPy is written in pure Python, is notoriously slow, and adds 1-5 seconds just to print the final formula.
-* **The C++ Fix:** Implement a lightweight native algebraic simplifier using the existing C++ AST in `ast.h`. It can recursively walk the tree and merge terms (e.g., `x + x -> 2*x`, `sin(x)*sin(x) -> sin(x)^2`). This removes the `sympy` dependency and drastically reduces CLI startup time.
+## Current Native Surface
 
-## 3. Neural Network Inference (Curve Classifier & Universal Proposer)
-The fast-path uses PyTorch to load `.pt` files to predict probabilities for mathematical operators.
-* **The Bottleneck:** Loading PyTorch runtime takes >1s, and batch-size 1 inference on a small MLP is overkill.
-* **The C++ Fix:** Export these models to ONNX and use `ONNXRuntime` in C++, or implement matrix multiplications directly in Eigen. This drops PyTorch from runtime dependencies entirely.
+The pybind11 bridge is `glassbox/sr/cpp/core.cpp`. Current exports include:
 
-## 4. Legacy PyTorch Evolution Code (`glassbox/evolution/` & `hybrid_optimizer.py`)
-Hundreds of lines of legacy PyTorch-based neural evolution loops exist.
-* **The Bottleneck:** Technical debt. The Python interpreter parses these files, cluttering the architecture.
-* **The Fix:** Deep clean the repository to delete the legacy Python evolution engine once the C++ `core.run_evolution` is fully feature-complete.
+- `run_evolution`
+- `score_formula_candidates`
+- `refine_frequencies`
+- `refine_powers`
+- `refine_periodic_rational`
+- `iterative_elastic_net`
+- `lasso_coordinate_descent`
+- `simplify_formula_cpp`
+- `formula_to_seed_graph_cpp`
+- `snap_formula_floats_cpp`
+- `reduce_formula_noise_cpp`
+
+Supporting native/source files:
+
+- `evolution.h`: island evolution/search.
+- `eval.h`: evaluation helpers.
+- `ast.h`: expression graph structures.
+- `formula_parser.h`: formula parsing into seed graphs.
+- `simplify.h` and `simplify_advanced.h`: native simplification and float
+  snapping.
+- `refine.h`: numerical refinement helpers.
+- `seed_graph_builder.py`: Python helper that prepares seed graphs for the C++
+  bridge.
+
+## Implemented Migrations
+
+| Area | Status |
+|---|---|
+| Guided evolution | Implemented through `_core.run_evolution`. |
+| Candidate formula scoring | Implemented through `score_formula_candidates`; covered by tests. |
+| Seed graph parsing/bridge | Implemented through formula-to-seed helpers and tests. |
+| Native formula simplification/snap | Implemented as C++ bridge helpers with Python/SymPy fallback. |
+| Native LASSO/elastic-net helpers | Exposed through pybind11. |
+| Frequency/power/periodic-rational refinement | Exposed through pybind11. |
+
+## Remaining Migration Opportunities
+
+### 1. Full Simplification Parity
+
+SymPy remains in `requirements.txt` because Python fallback simplification is
+still used in several paths. Continue migrating only when native output is
+covered by fidelity tests and does not increase displayed/raw drift.
+
+Primary files:
+
+- `scripts/simplify_formula.py`
+- `scripts/benchmark_common.py`
+- `glassbox/sr/sklearn_wrapper.py`
+- `glassbox/sr/cpp/simplify*.h`
+
+### 2. Classifier/Proposer Inference Runtime
+
+Classifier/proposer loading currently uses PyTorch. ONNX Runtime or a
+small Eigen inference path could reduce startup overhead, but only after the
+model format and feature preprocessing are stable.
+
+Primary files:
+
+- `glassbox/curve_classifier/curve_classifier_integration.py`
+- `glassbox/universal_proposer/universal_proposer.py`
+- `scripts/train_universal_proposer.py`
+
+### 3. More Formula Evaluation and Guarding
+
+Shared formula evaluation still has Python/SymPy parsing paths. Native
+evaluation could speed scoring, but it must match the project's protected
+semantics for signed fractional powers, log handling, constants, and displayed
+formula syntax.
+
+Primary files:
+
+- `scripts/benchmark_common.py`
+- `scripts/benchmark_suite.py`
+- `scripts/run_srbench_local.py`
+- `glassbox/sr/cpp/eval.h`
+
+### 4. Specialist Candidate Screening
+
+Specialist screening can generate and score many candidate formulas. Native
+batch scoring is partially available; more candidate preparation/refinement
+could move native if tests prove parity.
+
+Primary files:
+
+- `glassbox/sr/specialist_state.py`
+- `glassbox/sr/sklearn_wrapper.py`
+- `glassbox/sr/cpp/core.cpp`
+
+## Guardrails
+
+- Native helpers must preserve displayed-formula scoring semantics.
+- Python fallbacks should remain available for fresh installs without `_core`.
+- Tests should cover every pybind11 behavior change.
+- Do not remove SymPy or PyTorch from dependencies until all active runtime paths
+  that require them have native or optional alternatives.
+
+## Verification
+
+Useful focused tests:
+
+```bash
+pytest tests/test_cpp_candidate_scoring.py -q
+pytest tests/test_cpp_simplification.py -q
+pytest tests/test_benchmark_common.py -q
+pytest tests/test_benchmark_scoring_contract.py -q
+```

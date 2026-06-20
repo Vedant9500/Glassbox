@@ -16,6 +16,7 @@ import argparse
 import math
 import re
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Callable, Dict, Iterable, Optional, Set
 
 import sympy as sp
@@ -33,6 +34,8 @@ class SnapConfig:
 
     int_tol: float = 1e-5
     zero_tol: float = 1e-8
+    fraction_tol: float = 0.0
+    max_fraction_denominator: int = 12
 
 
 @dataclass(frozen=True)
@@ -127,13 +130,23 @@ def _normalize_formula_syntax(formula: str) -> str:
 
 
 def _snap_float(value: float, cfg: SnapConfig) -> float | int:
-    """Snap a float to 0 or nearest integer when inside tolerance windows."""
+    """Snap a float to simple numeric targets when inside tolerance windows."""
     if abs(value) <= cfg.zero_tol:
         return 0
 
     nearest_int = round(value)
     if math.isclose(value, nearest_int, rel_tol=0.0, abs_tol=cfg.int_tol + 1e-12):
         return int(nearest_int)
+
+    if cfg.fraction_tol > 0.0 and math.isfinite(value) and cfg.max_fraction_denominator >= 2:
+        nearest_fraction = Fraction(value).limit_denominator(cfg.max_fraction_denominator)
+        if nearest_fraction.denominator > 1 and math.isclose(
+            value,
+            float(nearest_fraction),
+            rel_tol=0.0,
+            abs_tol=cfg.fraction_tol + 1e-12,
+        ):
+            return float(nearest_fraction)
 
     return value
 
@@ -524,6 +537,8 @@ def simplify_onn_formula(
     *,
     int_tol: float = 1e-5,
     zero_tol: float = 1e-8,
+    fraction_tol: float = 0.0,
+    max_fraction_denominator: int = 12,
     use_nsimplify: bool = True,
     max_passes: int = 6,
     use_identities: bool = True,
@@ -536,7 +551,12 @@ def simplify_onn_formula(
     Returns:
         (snapped_formula_string, simplified_sympy_expression)
     """
-    cfg = SnapConfig(int_tol=int_tol, zero_tol=zero_tol)
+    cfg = SnapConfig(
+        int_tol=int_tol,
+        zero_tol=zero_tol,
+        fraction_tol=fraction_tol,
+        max_fraction_denominator=max_fraction_denominator,
+    )
     snapped = snap_formula_floats(raw_formula, cfg)
     simplified = sympy_simplify_formula(
         snapped,

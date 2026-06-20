@@ -142,7 +142,7 @@ def list_models():
     models = []
     if MODELS_DIR.exists():
         for f in MODELS_DIR.iterdir():
-            if f.suffix in ('.pt', '.pkl', '.joblib'):
+            if f.suffix == '.pt':
                 models.append(f)
     return models
 

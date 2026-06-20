@@ -12,6 +12,14 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 
+try:
+    from sympy.utilities.exceptions import SymPyDeprecationWarning
+except Exception:  # pragma: no cover - SymPy is optional for some helper use
+    SymPyDeprecationWarning = DeprecationWarning
+
+warnings.filterwarnings("ignore", category=SymPyDeprecationWarning)
+warnings.filterwarnings("ignore", message=r"\s*Using non-Expr arguments in Mul.*")
+
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _SCRIPT_DIR.parent
@@ -122,20 +130,139 @@ def normalize_formula_text(formula):
     """Normalize common unicode/operator variants to a parser-friendly form."""
     if not formula:
         return formula
-    formula = (
-        str(formula)
-        .replace("Â²", "^2")
-        .replace("Â³", "^3")
-        .replace("Â·", "*")
-        .replace("â‹…", "*")
-        .replace("Ã—", "*")
-        .replace("Ï€", "pi")
-        .replace("âˆš", "sqrt")
-        .replace("Ï†", "phi")
-        .replace("Ï‰", "omega")
-        .replace("np.", "")
-    )
+    replacements = {
+        "\u00b2": "^2",
+        "\u00b3": "^3",
+        "\u00b7": "*",
+        "\u22c5": "*",
+        "\u00d7": "*",
+        "\u03c0": "pi",
+        "\u221a": "sqrt",
+        "\u03c6": "phi",
+        "\u03c9": "omega",
+    }
+    for src, dst in list(replacements.items()):
+        variant = src
+        for _ in range(2):
+            try:
+                variant = variant.encode("utf-8").decode("latin-1")
+            except UnicodeError:
+                break
+            replacements.setdefault(variant, dst)
+
+    formula = str(formula).replace("np.", "")
+    for src, dst in replacements.items():
+        formula = formula.replace(src, dst)
     return re.sub(r"\s+", "", formula)
+
+
+def apply_canonical_rewrites(formula):
+    """Apply a small deterministic rewrite set before heavier simplification."""
+    text = normalize_formula_text(formula)
+    if not text:
+        return text
+    text = text.replace("^", "**")
+
+    class _CanonicalRewrite(ast.NodeTransformer):
+        @staticmethod
+        def _same(left, right):
+            return ast.dump(left) == ast.dump(right)
+
+        @staticmethod
+        def _call_name(node):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                return node.func.id
+            return None
+
+        @classmethod
+        def _is_func_square(cls, node, func_name):
+            return (
+                isinstance(node, ast.BinOp)
+                and isinstance(node.op, ast.Pow)
+                and isinstance(node.right, ast.Constant)
+                and node.right.value == 2
+                and cls._call_name(node.left) == func_name
+                and len(node.left.args) == 1
+            )
+
+        def visit_BinOp(self, node):  # noqa: N802 - ast API name
+            node = self.generic_visit(node)
+            if isinstance(node.op, ast.Pow) and isinstance(node.left, ast.Name) and node.left.id in {"E", "e"}:
+                return ast.copy_location(
+                    ast.Call(func=ast.Name(id="exp", ctx=ast.Load()), args=[node.right], keywords=[]),
+                    node,
+                )
+            if isinstance(node.op, ast.Add):
+                left_sin = self._is_func_square(node.left, "sin")
+                right_cos = self._is_func_square(node.right, "cos")
+                left_cos = self._is_func_square(node.left, "cos")
+                right_sin = self._is_func_square(node.right, "sin")
+                if left_sin and right_cos and self._same(node.left.left.args[0], node.right.left.args[0]):
+                    return ast.copy_location(ast.Constant(value=1), node)
+                if left_cos and right_sin and self._same(node.left.left.args[0], node.right.left.args[0]):
+                    return ast.copy_location(ast.Constant(value=1), node)
+            if isinstance(node.op, ast.Mult) and ast.dump(node.left) == ast.dump(node.right):
+                return ast.copy_location(
+                    ast.BinOp(left=node.left, op=ast.Pow(), right=ast.Constant(value=2)),
+                    node,
+                )
+            if isinstance(node.op, ast.Mult):
+                left_name = self._call_name(node.left)
+                right_name = self._call_name(node.right)
+                if (
+                    {left_name, right_name} == {"sin", "cos"}
+                    and len(node.left.args) == 1
+                    and len(node.right.args) == 1
+                    and self._same(node.left.args[0], node.right.args[0])
+                ):
+                    doubled_arg = ast.BinOp(
+                        left=ast.Constant(value=2),
+                        op=ast.Mult(),
+                        right=node.left.args[0],
+                    )
+                    replacement = ast.BinOp(
+                        left=ast.Call(
+                            func=ast.Name(id="sin", ctx=ast.Load()),
+                            args=[doubled_arg],
+                            keywords=[],
+                        ),
+                        op=ast.Div(),
+                        right=ast.Constant(value=2),
+                    )
+                    return ast.copy_location(replacement, node)
+            return node
+
+        def visit_Call(self, node):  # noqa: N802 - ast API name
+            node = self.generic_visit(node)
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "log"
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Call)
+                and isinstance(node.args[0].func, ast.Name)
+                and node.args[0].func.id == "exp"
+                and len(node.args[0].args) == 1
+            ):
+                return ast.copy_location(node.args[0].args[0], node)
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "exp"
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Call)
+                and isinstance(node.args[0].func, ast.Name)
+                and node.args[0].func.id == "log"
+                and len(node.args[0].args) == 1
+            ):
+                return ast.copy_location(node.args[0].args[0], node)
+            return node
+
+    try:
+        tree = ast.parse(text, mode="eval")
+        tree = _CanonicalRewrite().visit(tree)
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree).replace("^", "**")
+    except Exception:
+        return text
 
 
 def infer_formula_n_features(formula):
@@ -216,18 +343,26 @@ def simplify_formula_native(formula, int_tol=0.05, zero_tol=1e-3):
     return None
 
 
-def postprocess_formula(formula):
+def postprocess_formula(
+    formula,
+    *,
+    fraction_tol=0.0,
+    max_fraction_denominator=12,
+):
     """Apply the shared benchmark formula cleanup pipeline."""
     normalized = normalize_formula_text(formula)
     if not normalized or normalized in {"N/A", "ERROR", "?"}:
         return normalized
+    normalized = apply_canonical_rewrites(normalized)
 
     evo_int_tol = 0.05
     evo_zero_tol = 1e-3
+    helper_unsafe = "_signed_power" in normalized or "Abs(" in normalized
 
-    native = simplify_formula_native(normalized, evo_int_tol, evo_zero_tol)
-    if native is not None:
-        normalized = native
+    if not helper_unsafe:
+        native = simplify_formula_native(normalized, evo_int_tol, evo_zero_tol)
+        if native is not None:
+            normalized = native
 
     try:
         try:
@@ -237,26 +372,63 @@ def postprocess_formula(formula):
 
         formula_len = len(normalized)
         term_estimate = max(1, len([t for t in re.split(r"\s*[+-]\s*", normalized) if t.strip()]))
-        too_complex_for_symbolic = formula_len > 500 or term_estimate > 24
-        sympy_unsafe = "Piecewise(" in normalized or "Eq(" in normalized
+        nonlinear_families = sum(
+            1
+            for pattern in (
+                r"\bsin\s*\(",
+                r"\bcos\s*\(",
+                r"\bexp\s*\(",
+                r"\blog\s*\(",
+                r"/",
+                r"\*\*",
+                r"\b_signed_power\s*\(",
+            )
+            if re.search(pattern, normalized)
+        )
+        too_complex_for_symbolic = (
+            formula_len > 500
+            or term_estimate > 24
+            or (term_estimate > 10 and nonlinear_families >= 3)
+        )
+        sympy_unsafe = helper_unsafe or "Piecewise(" in normalized or "Eq(" in normalized
 
         if too_complex_for_symbolic or sympy_unsafe:
             snapped = snap_formula_floats(
                 normalized,
-                SnapConfig(int_tol=evo_int_tol, zero_tol=evo_zero_tol),
+                SnapConfig(
+                    int_tol=evo_int_tol,
+                    zero_tol=evo_zero_tol,
+                    fraction_tol=fraction_tol,
+                    max_fraction_denominator=max_fraction_denominator,
+                ),
             )
             return protect_fractional_powers(snapped.replace("^", "**"))
 
         with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=SymPyDeprecationWarning)
             warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"sympy\..*")
-            warnings.filterwarnings("ignore", message=r".*Using non-Expr arguments in Mul.*")
+            warnings.filterwarnings("ignore", message=r"\s*Using non-Expr arguments in Mul.*")
             _, simplified_expr = simplify_onn_formula(
                 normalized,
                 int_tol=evo_int_tol,
                 zero_tol=evo_zero_tol,
+                fraction_tol=fraction_tol,
+                max_fraction_denominator=max_fraction_denominator,
                 use_nsimplify=(formula_len <= 300 and term_estimate <= 16),
             )
-        return protect_fractional_powers(str(simplified_expr).replace("^", "**"))
+        simplified_text = str(simplified_expr)
+        if "Piecewise(" in simplified_text or "Eq(" in simplified_text:
+            snapped = snap_formula_floats(
+                normalized,
+                SnapConfig(
+                    int_tol=evo_int_tol,
+                    zero_tol=evo_zero_tol,
+                    fraction_tol=fraction_tol,
+                    max_fraction_denominator=max_fraction_denominator,
+                ),
+            )
+            return protect_fractional_powers(snapped.replace("^", "**"))
+        return protect_fractional_powers(simplified_text.replace("^", "**"))
     except Exception:
         return protect_fractional_powers(normalized.replace("^", "**"))
 
@@ -283,6 +455,15 @@ def evaluate_formula(formula_str, X, *, return_diagnostics=False):
     if not formula_str:
         return _finish(None, reason="empty_formula")
 
+    try:
+        X = np.asarray(X, dtype=np.float64)
+        if X.ndim == 1:
+            X = X.reshape(-1, 1)
+        if X.ndim != 2:
+            return _finish(None, reason="invalid_X_shape")
+    except Exception as exc:
+        return _finish(None, reason="invalid_X", exc=exc)
+
     formula = normalize_formula_text(formula_str).strip()
     formula = re.sub(r"\|([^|]+)\|", r"abs(\1)", formula)
     formula = formula.replace("^", "**")
@@ -290,7 +471,13 @@ def evaluate_formula(formula_str, X, *, return_diagnostics=False):
 
     def _safe_numpy_log(x, base=None):
         with np.errstate(divide="ignore", invalid="ignore"):
-            out = np.log(x)
+            x_arr = np.asarray(x, dtype=np.float64)
+            # The estimator's formula evaluator treats log(Abs(x)) at x=0 as a
+            # protected boundary value. Mirror that here so valid displayed
+            # formulas are not rejected only because the benchmark grid includes
+            # an endpoint at zero.
+            x_arr = np.where(x_arr == 0.0, 1e-300, x_arr)
+            out = np.log(x_arr)
             if base is not None:
                 out = out / np.log(base)
         return out
@@ -319,6 +506,7 @@ def evaluate_formula(formula_str, X, *, return_diagnostics=False):
         "_signed_power": _signed_power,
         "pi": np.pi,
         "E": np.e,
+        "e": np.e,
     }
     for i in range(X.shape[1]):
         context[f"x{i}"] = X[:, i]
@@ -326,7 +514,7 @@ def evaluate_formula(formula_str, X, *, return_diagnostics=False):
         context["x"] = X[:, 0]
 
     try:
-        with np.errstate(all="raise"):
+        with np.errstate(divide="raise", invalid="raise", over="raise", under="ignore"):
             y_pred = eval(formula, {"__builtins__": None}, context)
         if isinstance(y_pred, (int, float)):
             y_pred = np.full(X.shape[0], y_pred, dtype=np.float64)
@@ -389,6 +577,228 @@ def evaluate_formula_mse(formula, x, y):
     return mse
 
 
+def evaluate_formula_mse_on_X(formula, X, y):
+    """Evaluate displayed formula against ground-truth data for 1D or multivariate X."""
+    if not formula:
+        return None
+    X_arr = np.asarray(X, dtype=np.float64)
+    if X_arr.ndim == 1:
+        X_arr = X_arr.reshape(-1, 1)
+    y_true = np.asarray(y, dtype=np.float64).reshape(-1)
+    y_pred = evaluate_formula(formula, X_arr)
+    if y_pred is None:
+        return None
+    y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+    if y_pred.shape != y_true.shape:
+        return None
+    mask = np.isfinite(y_pred) & np.isfinite(y_true)
+    if mask.sum() < 10:
+        return None
+    mse = float(np.mean((y_pred[mask] - y_true[mask]) ** 2))
+    return mse if math.isfinite(mse) else None
+
+
+def formula_complexity_score(formula) -> int:
+    """Small shared complexity proxy for candidate ranking."""
+    text = normalize_formula_text(formula)
+    if not text:
+        return 0
+    operator_count = sum(text.count(op) for op in ("+", "-", "*", "/", "**", "^"))
+    function_count = len(re.findall(r"\b(?:sin|cos|exp|log|sqrt|abs|Abs|_signed_power|Piecewise)\s*\(", text))
+    protected_power_count = text.count("_signed_power")
+    return max(1, operator_count + 2 * function_count + protected_power_count + 1)
+
+
+def formula_family_risk_score(formula, *, complexity=None) -> float:
+    """Heuristic risk score for formulas that often overfit or fail display evaluation."""
+    text = normalize_formula_text(formula)
+    if not text:
+        return 1.0
+    comp = formula_complexity_score(text) if complexity is None else int(complexity)
+    risk = 0.0
+    risk += 0.012 * max(0, comp - 12)
+    risk += 0.050 * text.count("_signed_power")
+    risk += 0.035 * len(re.findall(r"\*\*\s*[-+]?(?:0?\.\d+|[1-9]\d*\.\d+)", text))
+    risk += 0.080 * text.count("Piecewise(")
+    risk += 0.040 * text.count("Abs(")
+    risk += 0.025 * max(0, text.count("sin(") + text.count("cos(") - 4)
+    risk += 0.020 * max(0, text.count("exp(") - 2)
+    return float(min(1.0, max(0.0, risk)))
+
+
+def score_display_candidate(
+    formula,
+    X,
+    y,
+    *,
+    raw_mse=None,
+    fit_mse=None,
+    holdout_mse=None,
+    residual_diagnostics=None,
+    complexity=None,
+    n_terms=None,
+    postprocess=True,
+    complexity_lambda=1e-4,
+    holdout_lambda=0.05,
+    drift_lambda=0.10,
+    risk_lambda=0.01,
+):
+    """Return a display-aware candidate score and diagnostics.
+
+    The score is meant for comparing candidate formulas, not for benchmark
+    grading. Benchmark grading still uses displayed-formula MSE directly.
+    """
+    X_arr = np.asarray(X, dtype=np.float64)
+    if X_arr.ndim == 1:
+        X_arr = X_arr.reshape(-1, 1)
+    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+
+    original_formula = str(formula or "")
+    if postprocess:
+        display_formula, guard = postprocess_formula_with_fidelity_guard(original_formula, X_arr, y_arr)
+    else:
+        display_formula, guard = original_formula, {
+            "postprocess_guard_triggered": False,
+            "postprocess_raw_mse": evaluate_formula_mse_on_X(original_formula, X_arr, y_arr),
+            "postprocess_processed_mse": None,
+            "postprocess_fallback_mse": None,
+            "postprocess_guard_reason": None,
+            "postprocess_processed_eval_diagnostics": None,
+        }
+
+    display_mse = evaluate_formula_mse_on_X(display_formula, X_arr, y_arr)
+    raw_val = None
+    for candidate in (raw_mse, fit_mse, guard.get("postprocess_raw_mse")):
+        if candidate is None:
+            continue
+        try:
+            candidate_f = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(candidate_f):
+            raw_val = candidate_f
+            break
+
+    comp = formula_complexity_score(display_formula) if complexity is None else int(complexity)
+    terms = int(n_terms) if n_terms is not None else max(1, len([t for t in re.split(r"\s*[+-]\s*", str(display_formula)) if t.strip()]))
+    risk = formula_family_risk_score(display_formula, complexity=comp)
+
+    base = display_mse if display_mse is not None and math.isfinite(display_mse) else float("inf")
+    holdout_gap = 0.0
+    holdout_val = None
+    if holdout_mse is not None:
+        try:
+            holdout_val = float(holdout_mse)
+        except (TypeError, ValueError):
+            holdout_val = None
+        if holdout_val is not None and math.isfinite(holdout_val) and math.isfinite(base):
+            holdout_gap = max(0.0, holdout_val - base)
+
+    drift_rel = None
+    drift_penalty = 0.0
+    if raw_val is not None and math.isfinite(raw_val) and math.isfinite(base):
+        drift_rel = abs(base - raw_val) / max(abs(base), 1e-12)
+        drift_penalty = drift_rel * max(base, 1e-12)
+
+    residual_penalty = 0.0
+    residual_suspicious = False
+    if isinstance(residual_diagnostics, dict):
+        residual_suspicious = bool(residual_diagnostics.get("residual_suspicious", False))
+        if residual_suspicious and math.isfinite(base):
+            residual_penalty = 0.05 * max(base, 1e-12)
+
+    score = (
+        base
+        + complexity_lambda * max(0, comp - 8)
+        + 5e-5 * max(0, terms - 6)
+        + holdout_lambda * holdout_gap
+        + drift_lambda * drift_penalty
+        + risk_lambda * risk
+        + residual_penalty
+    )
+
+    if display_mse is None or not math.isfinite(base):
+        score = float("inf")
+
+    return {
+        "formula": display_formula,
+        "formula_original": original_formula,
+        "score": float(score),
+        "display_mse": display_mse,
+        "raw_mse": raw_val,
+        "holdout_mse": holdout_val,
+        "complexity": comp,
+        "n_terms": terms,
+        "risk_score": risk,
+        "raw_display_drift_rel": drift_rel,
+        "residual_suspicious": residual_suspicious,
+        "postprocess_guard": guard,
+        "display_eval_ok": display_mse is not None and math.isfinite(display_mse),
+    }
+
+
+def postprocess_formula_with_fidelity_guard(
+    formula,
+    X,
+    y,
+    *,
+    relative_slack=0.10,
+    absolute_slack=1e-9,
+):
+    """Postprocess a formula, but keep the original if cleanup worsens benchmark fit."""
+    processed = postprocess_formula(formula, fraction_tol=0.01, max_fraction_denominator=12)
+    raw_mse = evaluate_formula_mse_on_X(formula, X, y)
+    processed_mse = evaluate_formula_mse_on_X(processed, X, y)
+    fallback = protect_fractional_powers(normalize_formula_text(formula).replace("^", "**"))
+    fallback_mse = evaluate_formula_mse_on_X(fallback, X, y)
+
+    if processed_mse is None:
+        X_diag = np.asarray(X, dtype=np.float64)
+        if X_diag.ndim == 1:
+            X_diag = X_diag.reshape(-1, 1)
+        _, processed_diag = evaluate_formula(processed, X_diag, return_diagnostics=True)
+        return (fallback if fallback_mse is not None else processed), {
+            "postprocess_guard_triggered": True,
+            "postprocess_raw_mse": raw_mse,
+            "postprocess_processed_mse": processed_mse,
+            "postprocess_fallback_mse": fallback_mse,
+            "postprocess_guard_reason": "processed_formula_eval_failed",
+            "postprocess_processed_eval_diagnostics": processed_diag,
+        }
+
+    if raw_mse is None and processed != fallback:
+        return fallback, {
+            "postprocess_guard_triggered": True,
+            "postprocess_raw_mse": raw_mse,
+            "postprocess_processed_mse": processed_mse,
+            "postprocess_fallback_mse": fallback_mse,
+            "postprocess_guard_reason": "raw_formula_eval_failed_after_rewrite",
+            "postprocess_processed_eval_diagnostics": None,
+        }
+
+    if raw_mse is not None:
+        allowed = raw_mse * (1.0 + max(0.0, float(relative_slack))) + max(0.0, float(absolute_slack))
+        if processed_mse > allowed:
+            if fallback_mse is not None and fallback_mse <= processed_mse:
+                return fallback, {
+                    "postprocess_guard_triggered": True,
+                    "postprocess_raw_mse": raw_mse,
+                    "postprocess_processed_mse": processed_mse,
+                    "postprocess_fallback_mse": fallback_mse,
+                    "postprocess_guard_reason": "processed_formula_worse",
+                    "postprocess_processed_eval_diagnostics": None,
+                }
+
+    return processed, {
+        "postprocess_guard_triggered": False,
+        "postprocess_raw_mse": raw_mse,
+        "postprocess_processed_mse": processed_mse,
+        "postprocess_fallback_mse": None,
+        "postprocess_guard_reason": None,
+        "postprocess_processed_eval_diagnostics": None,
+    }
+
+
 def estimate_timeout_budget(base_timeout, n_features, n_train, adaptive_timeout):
     """Scale timeout by problem size when adaptive timeout is enabled."""
     if not adaptive_timeout:
@@ -415,7 +825,7 @@ def parse_seed_list(seed_text):
     return sorted(set(seeds))
 
 
-def compute_stability_stats(values):
+def compute_stability_stats(values, *, higher_is_better=True):
     """Compute median/IQR/std and worst-decile summary for a metric list."""
     if not values:
         return {
@@ -430,10 +840,11 @@ def compute_stability_stats(values):
     q75 = float(np.percentile(arr, 75))
     if arr.size >= 10:
         worst_count = max(1, int(np.ceil(arr.size * 0.1)))
-        worst = np.sort(arr)[:worst_count]
+        sorted_arr = np.sort(arr)
+        worst = sorted_arr[:worst_count] if higher_is_better else sorted_arr[-worst_count:]
         worst_decile = float(np.mean(worst))
     else:
-        worst_decile = float(np.min(arr))
+        worst_decile = float(np.min(arr) if higher_is_better else np.max(arr))
     return {
         "median": q50,
         "iqr": float(q75 - q25),
@@ -516,8 +927,8 @@ def summarize_seed_runs(seed_runs):
             "seed_count": len(seed_runs),
             "valid_seed_count": 0,
             "r2_stats": compute_stability_stats([]),
-            "mse_stats": compute_stability_stats([]),
-            "time_stats": compute_stability_stats([]),
+            "mse_stats": compute_stability_stats([], higher_is_better=False),
+            "time_stats": compute_stability_stats([], higher_is_better=False),
             "exact_recovery_rate": None,
             "exact_recovery_stats": compute_stability_stats([]),
         }
@@ -531,8 +942,8 @@ def summarize_seed_runs(seed_runs):
         "seed_count": len(seed_runs),
         "valid_seed_count": len(valid),
         "r2_stats": compute_stability_stats(r2_vals),
-        "mse_stats": compute_stability_stats(mse_vals),
-        "time_stats": compute_stability_stats(time_vals),
+        "mse_stats": compute_stability_stats(mse_vals, higher_is_better=False),
+        "time_stats": compute_stability_stats(time_vals, higher_is_better=False),
         "exact_recovery_rate": float(np.mean(exact_binary)) if exact_binary else None,
         "exact_recovery_stats": compute_stability_stats(exact_binary),
     }
@@ -565,3 +976,46 @@ def apply_run_budget(est_params, timeout_budget):
     params["max_compute_budget"] = budget
     params["min_compute_budget"] = min(int(params.get("min_compute_budget", 10) or 10), budget)
     return params
+
+
+def specialist_metadata_from_estimator(estimator):
+    """Extract specialist/composition/boosting diagnostics from a GlassboxRegressor."""
+    diagnostics = getattr(estimator, "blackbox_diagnostics_", {}) or {}
+    candidate_screening = diagnostics.get("candidate_screening", {}) if isinstance(diagnostics, dict) else {}
+    return {
+        "specialist_track": getattr(estimator, "specialist_track_", None),
+        "has_composed_seeds": bool(getattr(estimator, "has_composed_seeds_", False)),
+        "composition_candidates_accepted": bool(getattr(estimator, "composition_candidates_accepted_", False)),
+        "composition_candidate_count": int(getattr(estimator, "composition_candidate_count_", 0) or 0),
+        "composition_seeded_evolution": bool(getattr(estimator, "composition_seeded_evolution_", False)),
+        "composition_won_final_selection": bool(getattr(estimator, "composition_won_final_selection_", False)),
+        "composition_improved_mse": bool(getattr(estimator, "composition_improved_mse_", False)),
+        "boosting_attempted": bool(getattr(estimator, "boosting_attempted_", False)),
+        "boosting_improved": bool(getattr(estimator, "boosting_improved_", False)),
+        "boosting_stage_count": len(getattr(estimator, "boosting_stages_", []) or []),
+        "boosting_diagnostics": getattr(estimator, "boosting_diagnostics_", None),
+        "residual_stage_guard": getattr(estimator, "_residual_stage_guard_", None),
+        "final_formula_selection": getattr(estimator, "final_formula_selection_diagnostics_", None),
+        "phase_timings": dict(getattr(estimator, "phase_timings_", {}) or {}),
+        "exact_match_diagnostics": getattr(estimator, "fast_path_exact_match_diagnostics_", None),
+        "formula_eval_count": int(getattr(estimator, "formula_eval_count_", 0) or 0),
+        "formula_eval_cache_hits": int(getattr(estimator, "formula_eval_cache_hits_", 0) or 0),
+        "formula_eval_cache_size": len(getattr(estimator, "_formula_eval_cache_", {}) or {}),
+        "specialist_vault": (
+            getattr(estimator, "specialist_vault_", None).to_dict()
+            if getattr(estimator, "specialist_vault_", None) is not None
+            else None
+        ),
+        "inception_round_count": len(getattr(estimator, "inception_rounds_", []) or []),
+        "inception_diagnostics": getattr(estimator, "inception_diagnostics_", None),
+        "specialist_diagnostics": (
+            candidate_screening.get("specialist_screening")
+            if isinstance(candidate_screening, dict)
+            else None
+        ),
+        "specialist_composition_screening": (
+            diagnostics.get("specialist_composition_screening")
+            if isinstance(diagnostics, dict)
+            else None
+        ),
+    }

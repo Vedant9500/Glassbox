@@ -39,8 +39,8 @@ class TestDimensions:
     """Verify extract_all_features returns exactly FEATURE_DIM floats, no NaN/Inf."""
 
     def test_feature_dim_constant(self):
-        """FEATURE_DIM should be 366 after Phase 2A."""
-        assert FEATURE_DIM == 366
+        """FEATURE_DIM should include the expanded invariant feature block."""
+        assert FEATURE_DIM == 398
 
     def test_feature_schema_consistency(self):
         """FEATURE_SCHEMA slices should cover [0, FEATURE_DIM) without gaps or overlaps."""
@@ -60,7 +60,7 @@ class TestDimensions:
         lambda x: 1.0 / (1.0 + x ** 2),
     ], ids=["sin", "quadratic", "gaussian", "constant", "lorentzian"])
     def test_extract_all_features_shape(self, signal_fn):
-        """extract_all_features should return exactly 366 floats."""
+        """extract_all_features should return exactly FEATURE_DIM floats."""
         x = np.linspace(-5, 5, 256)
         y = signal_fn(x)
         features = extract_all_features(y)

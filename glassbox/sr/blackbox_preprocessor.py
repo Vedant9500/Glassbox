@@ -46,7 +46,8 @@ class BlackboxState:
 
 
 def _safe_std(values: np.ndarray) -> np.ndarray:
-    scale = np.asarray(np.nanstd(values, axis=0), dtype=np.float64)
+    finite_values = np.where(np.isfinite(values), values, np.nan)
+    scale = np.asarray(np.nanstd(finite_values, axis=0), dtype=np.float64)
     scale[~np.isfinite(scale) | (scale < 1e-12)] = 1.0
     return scale
 
@@ -599,17 +600,23 @@ def prepare_blackbox_search(
     max_features: int = 6,
     standardize: bool = True,
     min_features_to_select: int = 5,
+    interaction_search: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, BlackboxState]:
     """Return reduced/standardized search data and remapping metadata."""
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
     n_features = int(X.shape[1])
 
-    x_mean = np.nanmean(X, axis=0)
+    X_finite = np.where(np.isfinite(X), X, np.nan)
+    y_finite = np.where(np.isfinite(y), y, np.nan)
+    x_mean = np.nanmean(X_finite, axis=0)
     x_mean = np.where(np.isfinite(x_mean), x_mean, 0.0)
+    X_clean = np.where(np.isfinite(X), X, x_mean.reshape(1, -1))
     x_scale = _safe_std(X)
-    y_mean = float(np.nanmean(y)) if np.isfinite(np.nanmean(y)) else 0.0
-    y_scale = float(np.nanstd(y))
+    y_mean_raw = float(np.nanmean(y_finite)) if np.any(np.isfinite(y_finite)) else 0.0
+    y_mean = y_mean_raw if np.isfinite(y_mean_raw) else 0.0
+    y_clean = np.where(np.isfinite(y), y, y_mean)
+    y_scale = float(np.nanstd(y_finite)) if np.any(np.isfinite(y_finite)) else 1.0
     if not np.isfinite(y_scale) or y_scale < 1e-12:
         y_scale = 1.0
 
@@ -627,9 +634,9 @@ def prepare_blackbox_search(
             standardized=False,
             reason="disabled_or_low_dimensional",
         )
-        return X, y, state
+        return X_clean, y_clean, state
 
-    variances = np.nanvar(X, axis=0)
+    variances = np.nanvar(X_clean, axis=0)
     usable = [j for j in range(n_features) if np.isfinite(variances[j]) and variances[j] > 1e-12]
     if not usable:
         state = BlackboxState(
@@ -645,10 +652,10 @@ def prepare_blackbox_search(
             standardized=False,
             reason="no_variable_features",
         )
-        return X, y, state
+        return X_clean, y_clean, state
 
-    X_scaled_all = (X - x_mean) / x_scale if standardize else X.copy()
-    y_scaled = (y - y_mean) / y_scale if standardize else y.copy()
+    X_scaled_all = (X_clean - x_mean) / x_scale if standardize else X_clean.copy()
+    y_scaled = (y_clean - y_mean) / y_scale if standardize else y_clean.copy()
     if n_features < int(min_features_to_select):
         selected = sorted(usable)
         feature_scores = {idx: 0.0 for idx in usable}
@@ -702,11 +709,18 @@ def prepare_blackbox_search(
         selected = sorted(selected)
         dropped = [j for j in range(n_features) if j not in selected]
 
-    interaction_state = discover_blackbox_interactions(
-        X_scaled_all[:, selected],
-        y_scaled,
-        selected_features=selected,
-    )
+    if interaction_search:
+        interaction_state = discover_blackbox_interactions(
+            X_scaled_all[:, selected],
+            y_scaled,
+            selected_features=selected,
+        )
+    else:
+        interaction_state = {
+            "interaction_pairs": [],
+            "interaction_terms": [],
+            "interaction_scores": {},
+        }
 
     state = BlackboxState(
         enabled=True,

@@ -666,7 +666,7 @@ def run_single_mode(config: Config):
         if getattr(config, 'use_curve_classifier', False) or getattr(config, 'fast_path_only', False):
             fast_path_result = run_fast_path(
                 x_tensor, y_tensor,
-                classifier_path=getattr(config, 'curve_classifier_model', None) or "models/curve_classifier_wide.pt",
+                classifier_path=getattr(config, 'curve_classifier_model', None) or "models/curve_classifier_multi.pt",
                 detected_omegas=detected_omegas,
                 op_constraints=op_constraints,
                 auto_expand=True,
@@ -1185,7 +1185,7 @@ Examples:
                      help='Use curve classifier to warm-start operator selection')
     evo.add_argument('--no-curve-classifier', dest='use_curve_classifier', action='store_false')
     evo.add_argument('--curve-classifier-model', type=str, default=None,
-                     help='Path to curve classifier model (.pt or .pkl)')
+                     help='Path to curve classifier model (.pt)')
     
     # Data
     data = parser.add_argument_group('Data Generation')

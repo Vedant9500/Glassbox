@@ -42,7 +42,7 @@ DATASETS: List[Dict[str, str]] = [
     },
 ]
 
-DEFAULT_CLASSIFIER_PATH = "models/curve_classifier_wide.pt"
+DEFAULT_CLASSIFIER_PATH = "models/curve_classifier_multi.pt"
 
 
 def resolve_repo_path(path_str: str) -> Path:
@@ -60,7 +60,7 @@ def validate_classifier_path(classifier_path: str) -> Path:
     models_dir = REPO_ROOT / "models"
     available: List[str] = []
     if models_dir.exists():
-        for pattern in ("curve_classifier*.pt", "*.pkl", "*.joblib"):
+        for pattern in ("curve_classifier*.pt",):
             available.extend(sorted(path.name for path in models_dir.glob(pattern)))
 
     available_text = ", ".join(dict.fromkeys(available)) if available else "none found in models/"

@@ -55,6 +55,48 @@ def test_prepare_blackbox_search_keeps_small_multivariate_inputs():
     assert y_search.shape == y.shape
 
 
+def test_prepare_blackbox_search_imputes_non_finite_values():
+    rng = np.random.RandomState(21)
+    X = rng.randn(80, 4)
+    y = X[:, 0] + X[:, 2]
+    X[3, 0] = np.nan
+    X[7, 2] = np.inf
+    y[5] = np.nan
+
+    X_search, y_search, state = prepare_blackbox_search(
+        X,
+        y,
+        enabled=True,
+        max_features=3,
+        standardize=True,
+        min_features_to_select=2,
+    )
+
+    assert state.enabled is True
+    assert np.all(np.isfinite(X_search))
+    assert np.all(np.isfinite(y_search))
+
+
+def test_prepare_blackbox_search_can_disable_interaction_discovery():
+    rng = np.random.RandomState(22)
+    X = rng.randn(120, 3)
+    y = X[:, 0] * X[:, 1]
+
+    _, _, state = prepare_blackbox_search(
+        X,
+        y,
+        enabled=True,
+        max_features=3,
+        standardize=False,
+        min_features_to_select=2,
+        interaction_search=False,
+    )
+
+    assert state.interaction_pairs == []
+    assert state.interaction_terms == []
+    assert state.interaction_scores == {}
+
+
 def test_reduced_formula_remaps_to_original_features():
     mapped = remap_reduced_formula_to_original("x0 + sin(x2)", [3, 5, 7])
     assert mapped == "x3 + sin(x7)"

@@ -16,7 +16,12 @@ from torch.utils.data import DataLoader, Dataset
 import argparse
 from pathlib import Path
 from tqdm import tqdm
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Dict
+import sys
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 
 # =============================================================================
@@ -363,6 +368,64 @@ class CurveClassifierGLU(nn.Module):
         return self.classifier(x)
 
 
+try:
+    from .models import (
+        CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
+        CurveClassifierCNN as CurveClassifierCNN,
+        CurveClassifierGLU as CurveClassifierGLU,
+        CurveClassifierMLP as CurveClassifierMLP,
+        EQLLayer as EQLLayer,
+        SemanticFeatureAttention as SemanticFeatureAttention,
+    )
+    from .validation import (
+        build_validation_report,
+        default_validation_report_path,
+        family_holdout_split,
+        formula_keys_from_metadata_or_formulas,
+        grouped_train_val_split,
+        multilabel_metrics_by_group,
+        row_train_val_split,
+        write_validation_report,
+    )
+    from .rollout import (
+        build_checkpoint_card,
+        build_rollout_comparison,
+        default_checkpoint_card_path,
+        default_rollout_comparison_path,
+        load_json_report,
+        write_checkpoint_card,
+        write_rollout_comparison,
+    )
+except (ImportError, ValueError):
+    from glassbox.curve_classifier.models import (
+        CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
+        CurveClassifierCNN as CurveClassifierCNN,
+        CurveClassifierGLU as CurveClassifierGLU,
+        CurveClassifierMLP as CurveClassifierMLP,
+        EQLLayer as EQLLayer,
+        SemanticFeatureAttention as SemanticFeatureAttention,
+    )
+    from glassbox.curve_classifier.validation import (
+        build_validation_report,
+        default_validation_report_path,
+        family_holdout_split,
+        formula_keys_from_metadata_or_formulas,
+        grouped_train_val_split,
+        multilabel_metrics_by_group,
+        row_train_val_split,
+        write_validation_report,
+    )
+    from glassbox.curve_classifier.rollout import (
+        build_checkpoint_card,
+        build_rollout_comparison,
+        default_checkpoint_card_path,
+        default_rollout_comparison_path,
+        load_json_report,
+        write_checkpoint_card,
+        write_rollout_comparison,
+    )
+
+
 class IndexedFeatureDataset(Dataset):
     """Dataset view over feature/label arrays using explicit indices.
     Supports pre-loading entire dataset into RAM or VRAM for maximum throughput.
@@ -622,7 +685,8 @@ def evaluate(
     if thresholds is None:
         binary_preds = (all_preds > 0.5).float()
     else:
-        binary_preds = (all_preds > thresholds).float()
+        thresholds_cpu = thresholds.detach().cpu() if isinstance(thresholds, torch.Tensor) else torch.as_tensor(thresholds)
+        binary_preds = (all_preds > thresholds_cpu).float()
     per_class_acc = ((binary_preds == all_labels).float().mean(dim=0))
     overall_acc = (binary_preds == all_labels).float().mean()
     
@@ -647,6 +711,8 @@ def evaluate(
         'per_class_acc': per_class_acc.numpy(),
         'f1_mean': f1.mean().item(),
         'micro_f1': micro_f1.item(),
+        'precision_per_class': precision.numpy(),
+        'recall_per_class': recall.numpy(),
         'f1_per_class': f1.numpy(),
     }
 
@@ -789,13 +855,19 @@ def apply_isotonic_calibration(
     return calibrated
 
 
-def tune_thresholds(all_preds: torch.Tensor, all_labels: torch.Tensor, steps: int = 19) -> torch.Tensor:
-    """Tune per-class thresholds to maximize F1 on validation data."""
+def tune_thresholds(
+    all_preds: torch.Tensor,
+    all_labels: torch.Tensor,
+    steps: int = 19,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    """Tune per-class thresholds to maximize F-beta on calibration data."""
     thresholds = torch.full((all_labels.shape[1],), 0.5, dtype=torch.float32)
     candidates = torch.linspace(0.05, 0.95, steps)
+    beta_sq = float(beta) ** 2
 
     for c in range(all_labels.shape[1]):
-        best_f1 = -1.0
+        best_score = -1.0
         best_t = 0.5
         for t in candidates:
             preds = (all_preds[:, c] > t).float()
@@ -805,9 +877,9 @@ def tune_thresholds(all_preds: torch.Tensor, all_labels: torch.Tensor, steps: in
             fn = ((preds == 0) & (labels == 1)).float().sum()
             precision = tp / (tp + fp + 1e-10)
             recall = tp / (tp + fn + 1e-10)
-            f1 = 2 * precision * recall / (precision + recall + 1e-10)
-            if f1 > best_f1:
-                best_f1 = f1
+            score = (1.0 + beta_sq) * precision * recall / (beta_sq * precision + recall + 1e-10)
+            if score > best_score:
+                best_score = score
                 best_t = float(t)
         thresholds[c] = best_t
 
@@ -819,6 +891,11 @@ def multilabel_stratified_split(labels: np.ndarray, val_ratio: float, seed: int)
     rng = np.random.RandomState(seed)
     n_samples = labels.shape[0]
     n_val = int(n_samples * val_ratio)
+    if n_val < 1 or n_samples - n_val < 1:
+        raise ValueError(
+            f"val_ratio={val_ratio} creates train={n_samples - n_val} val={n_val}; "
+            "both splits must contain at least one sample."
+        )
 
     # Fast path for large datasets: random split approximates stratification well
     if n_samples >= 200_000:
@@ -866,6 +943,36 @@ def multilabel_stratified_split(labels: np.ndarray, val_ratio: float, seed: int)
     return np.array(train_indices), np.array(val_indices)
 
 
+def split_validation_calibration(
+    val_idx: np.ndarray,
+    labels: np.ndarray,
+    calibration_ratio: float,
+    seed: int,
+) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, object]]:
+    """Split validation rows into report and calibration/threshold rows."""
+    val_idx = np.asarray(val_idx, dtype=np.int64)
+    calibration_ratio = float(calibration_ratio)
+    if calibration_ratio <= 0.0 or len(val_idx) < 4:
+        return val_idx, None, {
+            "calibration_split": False,
+            "reason": "disabled_or_too_small",
+        }
+
+    local_train, local_cal = multilabel_stratified_split(
+        np.asarray(labels[val_idx], dtype=np.float32),
+        calibration_ratio,
+        seed,
+    )
+    eval_idx = val_idx[local_train]
+    cal_idx = val_idx[local_cal]
+    return eval_idx, cal_idx, {
+        "calibration_split": True,
+        "calibration_ratio": calibration_ratio,
+        "eval_rows": int(len(eval_idx)),
+        "calibration_rows": int(len(cal_idx)),
+    }
+
+
 def train_model(
     model,
     train_loader,
@@ -880,13 +987,17 @@ def train_model(
     patience: int = 10,
     early_stop_metric: str = "f1",
     tune_thresholds_flag: bool = True,
+    threshold_beta: float = 0.5,
     calibrate_flag: bool = False,
     class_weights: Optional[torch.Tensor] = None,
+    calibration_loader=None,
+    val_groups: Optional[np.ndarray] = None,
 ):
     """Full training loop with early stopping."""
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler_mode = "max" if early_stop_metric == "f1" else "min"
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5
+        optimizer, mode=scheduler_mode, factor=0.5, patience=5
     )
     
     # Use class weights for imbalanced labels if provided
@@ -921,7 +1032,8 @@ def train_model(
         val_metrics = evaluate(model, val_loader, criterion, device)
         
         # Scheduler step
-        scheduler.step(val_metrics['loss'])
+        scheduler_value = val_metrics['f1_mean'] if early_stop_metric == "f1" else val_metrics['loss']
+        scheduler.step(scheduler_value)
         
         # Logging
         print(f"Epoch {epoch+1:3d}/{epochs} | "
@@ -948,9 +1060,18 @@ def train_model(
                 'val_loss': val_metrics['loss'],
                 'val_acc': val_metrics['accuracy'],
                 'val_f1': val_metrics['f1_mean'],
+                'val_micro_f1': val_metrics['micro_f1'],
+                'val_precision_per_class': val_metrics['precision_per_class'],
+                'val_recall_per_class': val_metrics['recall_per_class'],
+                'val_f1_per_class': val_metrics['f1_per_class'],
+                'val_per_class_acc': val_metrics['per_class_acc'],
                 'operator_classes': operator_classes,
                 'model_type': model_type,
-                'model_config': model_config,
+                'model_config': {
+                    **model_config,
+                    'architecture_version': CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
+                },
+                'architecture_version': CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
             }, save_path)
             print(f"  -> Saved best model (val_loss: {val_metrics['loss']:.4f}, val_f1: {val_metrics['f1_mean']:.4f})")
         else:
@@ -965,6 +1086,18 @@ def train_model(
     checkpoint = torch.load(save_path, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     val_metrics = evaluate(model, val_loader, criterion, device, return_preds=True, return_logits=True)
+    if val_groups is not None:
+        checkpoint['val_metrics_by_family'] = multilabel_metrics_by_group(
+            val_metrics['preds'].detach().cpu().numpy(),
+            val_metrics['labels'].detach().cpu().numpy(),
+            val_groups,
+            operator_classes,
+        )
+    calibration_metrics = (
+        evaluate(model, calibration_loader, criterion, device, return_preds=True, return_logits=True)
+        if calibration_loader is not None
+        else val_metrics
+    )
     
     # Final per-class report using best model
     print("\nPer-class F1 scores (best model):")
@@ -976,35 +1109,54 @@ def train_model(
 
     # Optional calibration
     temperature = None
+    isotonic_maps = []
     if calibrate_flag:
-        temperature = calibrate_temperature(val_metrics['logits'], val_metrics['labels'])
+        temperature = calibrate_temperature(calibration_metrics['logits'], calibration_metrics['labels'])
         checkpoint['temperature'] = temperature
         print(f"\nCalibrated temperature saved to checkpoint: {temperature:.4f}")
 
-    # Isotonic per-class calibration (more expressive than temperature scaling)
-    isotonic_maps = calibrate_isotonic_per_class(
-        val_metrics['logits'],
-        val_metrics['labels'],
-        temperature=temperature,
-    )
-    if isotonic_maps:
-        checkpoint['isotonic_calibration'] = isotonic_maps
-        print(f"Per-class isotonic calibration maps saved ({len(isotonic_maps)} classes)")
+        # Isotonic per-class calibration (more expressive than temperature scaling)
+        isotonic_maps = calibrate_isotonic_per_class(
+            calibration_metrics['logits'],
+            calibration_metrics['labels'],
+            temperature=temperature,
+        )
+        if isotonic_maps:
+            checkpoint['isotonic_calibration'] = isotonic_maps
+            print(f"Per-class isotonic calibration maps saved ({len(isotonic_maps)} classes)")
 
     # Threshold tuning (optionally on calibrated probabilities)
     if tune_thresholds_flag:
-        preds_for_tuning = val_metrics['preds']
+        preds_for_tuning = calibration_metrics['preds']
         if temperature is not None:
-            preds_for_tuning = torch.sigmoid(val_metrics['logits'] / temperature)
+            preds_for_tuning = torch.sigmoid(calibration_metrics['logits'] / temperature)
         if isotonic_maps:
             calibrated_np = apply_isotonic_calibration(
                 preds_for_tuning.detach().cpu().numpy(),
                 isotonic_maps,
             )
             preds_for_tuning = torch.from_numpy(calibrated_np).to(preds_for_tuning.dtype)
-        thresholds = tune_thresholds(preds_for_tuning, val_metrics['labels'])
+        thresholds = tune_thresholds(
+            preds_for_tuning,
+            calibration_metrics['labels'],
+            beta=threshold_beta,
+        )
         checkpoint['thresholds'] = thresholds.numpy()
-        print("\nTuned per-class thresholds saved to checkpoint")
+        checkpoint['threshold_beta'] = float(threshold_beta)
+        thresholded_metrics = evaluate(
+            model,
+            val_loader,
+            criterion,
+            device,
+            thresholds=thresholds.to(device),
+            temperature=temperature,
+        )
+        checkpoint['thresholded_val_f1'] = thresholded_metrics['f1_mean']
+        checkpoint['thresholded_val_micro_f1'] = thresholded_metrics['micro_f1']
+        checkpoint['thresholded_precision_per_class'] = thresholded_metrics['precision_per_class']
+        checkpoint['thresholded_recall_per_class'] = thresholded_metrics['recall_per_class']
+        checkpoint['thresholded_f1_per_class'] = thresholded_metrics['f1_per_class']
+        print(f"\nTuned per-class thresholds saved to checkpoint (F-beta beta={threshold_beta:.2f})")
 
     torch.save(checkpoint, save_path)
     
@@ -1017,8 +1169,10 @@ def load_training_data(
     feature_dim: int,
     n_classes: int,
     load_into_ram: bool,
+    return_metadata: bool = False,
 ):
     """Load training data from .npz or streamed .dat files."""
+    dataset_metadata: Dict[str, object] = {}
     # Case 1: single .npz file
     if len(data_args) == 1 and data_args[0].endswith(".npz"):
         data = np.load(data_args[0], allow_pickle=True)
@@ -1027,6 +1181,32 @@ def load_training_data(
         operator_classes = data["operator_classes"].tolist()
         detected_feature_dim = int(data["feature_dim"]) if "feature_dim" in data else features.shape[1]
         feature_schema = data["feature_schema"].item() if "feature_schema" in data else None
+        formulas = data["formulas"].tolist() if "formulas" in data else None
+        n_loaded = int(features.shape[0])
+        dataset_metadata = {
+            "dataset_path": str(data_args[0]),
+            "formulas": formulas,
+            "formula_keys": formula_keys_from_metadata_or_formulas(
+                data["formula_keys"] if "formula_keys" in data else None,
+                formulas,
+                limit=n_loaded,
+            ),
+            "generator_families": (
+                np.asarray(data["generator_families"][:n_loaded], dtype=object)
+                if "generator_families" in data else None
+            ),
+            "template_ids": (
+                np.asarray(data["template_ids"][:n_loaded], dtype=object)
+                if "template_ids" in data else None
+            ),
+            "labeler_version": str(data["labeler_version"]) if "labeler_version" in data else None,
+            "labels_match_semantic": (
+                np.asarray(data["labels_match_semantic"][:n_loaded], dtype=bool)
+                if "labels_match_semantic" in data else None
+            ),
+        }
+        if return_metadata:
+            return features, labels, operator_classes, detected_feature_dim, feature_schema, dataset_metadata
         return features, labels, operator_classes, detected_feature_dim, feature_schema
 
     # Case 2: base path or explicit feature/label files
@@ -1068,6 +1248,9 @@ def load_training_data(
         "identity", "sin", "cos", "power", "exp",
         "log", "addition", "multiplication", "rational",
     ][:n_classes]
+    dataset_metadata = {"dataset_path": str(data_args[0]) if data_args else None}
+    if return_metadata:
+        return features, labels, operator_classes, feature_dim, None, dataset_metadata
     return features, labels, operator_classes, feature_dim, None
 
 
@@ -1117,14 +1300,39 @@ def main():
                         help="Tune per-class thresholds on validation set (default: on)")
     parser.add_argument("--no-tune-thresholds", action="store_true",
                         help="Disable per-class threshold tuning")
+    parser.add_argument("--threshold-beta", type=float, default=0.5,
+                        help="F-beta used for threshold tuning; beta<1 favors precision")
     parser.add_argument("--stratified-split", action="store_true",
                         help="Use approximate multi-label stratified train/val split (default: on)")
     parser.add_argument("--no-stratified-split", action="store_true",
                         help="Disable stratified split")
+    parser.add_argument("--split-policy", type=str, default="auto",
+                        choices=["auto", "row", "stratified", "formula_group", "family_holdout"],
+                        help="Validation split policy. auto uses formula groups when dataset metadata is present.")
+    parser.add_argument("--heldout-family", type=str, default="",
+                        help="Generator family to hold out when --split-policy=family_holdout")
+    parser.add_argument("--validation-report", type=str, default="",
+                        help="Optional output path for Phase 3 validation report JSON")
+    parser.add_argument("--checkpoint-card", type=str, default="",
+                        help="Optional output path for Phase 6 checkpoint card JSON")
+    parser.add_argument("--data-generation-command", type=str, default="",
+                        help="Command used to generate this training dataset, saved in the checkpoint card")
+    parser.add_argument("--baseline-card", type=str, default="",
+                        help="Optional baseline checkpoint card for Phase 6 rollout comparison")
+    parser.add_argument("--rollout-comparison", type=str, default="",
+                        help="Optional output path for Phase 6 rollout comparison JSON")
+    parser.add_argument("--rollout-metric", type=str, default="val_f1",
+                        help="Metric name used for optional baseline comparison")
+    parser.add_argument("--min-relative-improvement", type=float, default=0.0,
+                        help="Minimum relative improvement over the baseline metric for rollout readiness")
     parser.add_argument("--calibrate", action="store_true",
                         help="Calibrate probabilities with temperature scaling")
+    parser.add_argument("--calibration-split", type=float, default=0.25,
+                        help="Fraction of validation rows reserved for calibration/threshold tuning")
     parser.add_argument("--class-weights", action="store_true",
                         help="Use inverse frequency class weights for imbalanced labels")
+    parser.add_argument("--class-weight-cap", type=float, default=3.0,
+                        help="Maximum positive class weight when --class-weights is enabled")
     parser.add_argument("--compile", action="store_true",
                         help="Use torch.compile (PyTorch 2.0+) for kernel fusion")
     
@@ -1153,12 +1361,13 @@ def main():
     
     # Load data
     print(f"Loading data from {args.data}...")
-    features, labels, operator_classes, feature_dim, feature_schema = load_training_data(
+    features, labels, operator_classes, feature_dim, feature_schema, dataset_metadata = load_training_data(
         args.data,
         args.n_samples,
         args.feature_dim,
         args.n_classes,
         args.load_into_ram,
+        return_metadata=True,
     )
     
     print(f"  Features: {features.shape}")
@@ -1171,21 +1380,80 @@ def main():
     if feature_schema is not None:
         print(f"  Feature schema: {feature_schema}")
     
-    # Train/val split
-    if stratified_split:
+    formula_keys = dataset_metadata.get("formula_keys")
+    generator_families = dataset_metadata.get("generator_families")
+    template_ids = dataset_metadata.get("template_ids")
+    split_details = {}
+    split_policy = args.split_policy
+
+    # Train/val split. Phase 3 defaults dataset-backed training to formula
+    # groups when metadata is present so checkpoint metrics are not row-leaky.
+    if split_policy == "family_holdout" or args.heldout_family:
+        if generator_families is None:
+            raise ValueError("--split-policy=family_holdout requires generator_families metadata")
+        heldout_family = args.heldout_family
+        if not heldout_family:
+            family_counts = {}
+            for family in np.asarray(generator_families, dtype=object).astype(str):
+                family_counts[family] = family_counts.get(family, 0) + 1
+            if not family_counts:
+                raise ValueError("No generator families available for family_holdout split")
+            heldout_family = min(family_counts, key=family_counts.get)
+        train_idx, val_idx, split_details = family_holdout_split(generator_families, heldout_family)
+        split_policy = "family_holdout"
+    elif split_policy in {"auto", "formula_group"} and formula_keys is not None:
+        train_idx, val_idx, split_details = grouped_train_val_split(formula_keys, args.val_split, args.seed)
+        split_policy = str(split_details.get("policy", "formula_group"))
+    elif split_policy in {"auto", "stratified"} and stratified_split:
         train_idx, val_idx = multilabel_stratified_split(labels, args.val_split, args.seed)
+        split_policy = "stratified"
+        split_details = {"policy": "stratified", "exclusive_groups": False}
     else:
-        n_val = int(len(features) * args.val_split)
-        indices = np.random.permutation(len(features))
-        val_idx = indices[:n_val]
-        train_idx = indices[n_val:]
+        train_idx, val_idx = row_train_val_split(len(features), args.val_split, args.seed)
+        split_policy = "row"
+        split_details = {"policy": "row", "exclusive_groups": False}
+
+    eval_idx, calibration_idx, calibration_split_details = split_validation_calibration(
+        val_idx,
+        np.asarray(labels, dtype=np.float32),
+        args.calibration_split,
+        args.seed + 1,
+    )
+    split_details["calibration"] = calibration_split_details
 
     scaler = None
     if standardize:
         mean, std = compute_feature_stats(features, train_idx)
         scaler = {'mean': mean, 'std': std}
 
-    print(f"  Train: {len(train_idx)}, Val: {len(val_idx)}")
+    validation_report = build_validation_report(
+        dataset_path=str(args.data[0]) if args.data else None,
+        split_policy=split_policy,
+        train_idx=train_idx,
+        val_idx=eval_idx,
+        labels=np.asarray(labels, dtype=np.float32),
+        operator_classes=operator_classes,
+        formula_keys=formula_keys,
+        generator_families=generator_families,
+        template_ids=template_ids,
+        split_details=split_details,
+        notes=[
+            "Phase 3 report uses formula-key group validation when metadata is available.",
+            "Row-permutation stress is covered by Phase 1 univariate feature/inference regression tests.",
+        ],
+    )
+
+    print(f"  Split policy: {split_policy}")
+    print(f"  Train: {len(train_idx)}, Val(eval): {len(eval_idx)}")
+    if calibration_idx is not None:
+        print(f"  Calibration/threshold rows: {len(calibration_idx)}")
+    if validation_report["formula_overlap"].get("available"):
+        overlap = validation_report["formula_overlap"]
+        print(
+            "  Formula overlap: "
+            f"{overlap['overlap_unique_formulas']} unique, "
+            f"{overlap['val_rows_with_train_formula_fraction']:.3f} val-row fraction"
+        )
     
     # Data loaders with optimizations and lazy memmap-backed access
     train_dataset = IndexedFeatureDataset(
@@ -1193,8 +1461,16 @@ def main():
         device=device if args.load_into_ram else None
     )
     val_dataset = IndexedFeatureDataset(
-        features, labels, val_idx, scaler=scaler, 
+        features, labels, eval_idx, scaler=scaler, 
         device=device if args.load_into_ram else None
+    )
+    calibration_dataset = (
+        IndexedFeatureDataset(
+            features, labels, calibration_idx, scaler=scaler,
+            device=device if args.load_into_ram else None,
+        )
+        if calibration_idx is not None
+        else None
     )
     
     # Use pin_memory for GPU and num_workers for parallel data loading
@@ -1229,6 +1505,15 @@ def main():
         val_dataset, 
         batch_size=args.batch_size,
         **loader_kwargs
+    )
+    calibration_loader = (
+        DataLoader(
+            calibration_dataset,
+            batch_size=args.batch_size,
+            **loader_kwargs,
+        )
+        if calibration_dataset is not None
+        else None
     )
     
     # Model
@@ -1287,7 +1572,7 @@ def main():
         # pos_weight is applied to positive samples: weight = neg/pos
         pos_weights = neg_counts / (pos_counts + 1e-6)
         # Normalize to reasonable range
-        pos_weights = np.clip(pos_weights, 0.5, 5.0)
+        pos_weights = np.clip(pos_weights, 0.5, float(args.class_weight_cap))
         class_weights = torch.tensor(pos_weights, dtype=torch.float32)
         print(f"Class label counts: {pos_counts.astype(int)}")
         print(f"Computed pos_weights: {pos_weights.round(2)}")
@@ -1308,8 +1593,15 @@ def main():
         patience=args.patience,
         early_stop_metric=args.early_stop,
         tune_thresholds_flag=tune_thresholds_flag,
+        threshold_beta=args.threshold_beta,
         calibrate_flag=args.calibrate,
         class_weights=class_weights,
+        calibration_loader=calibration_loader,
+        val_groups=(
+            np.asarray(generator_families, dtype=object)[eval_idx]
+            if generator_families is not None
+            else None
+        ),
     )
 
     # Persist scaler and schema metadata
@@ -1318,9 +1610,89 @@ def main():
         checkpoint['feature_scaler'] = scaler
     checkpoint['feature_schema'] = feature_schema
     checkpoint['feature_dim'] = feature_dim or features.shape[1]
+    checkpoint['validation_split_policy'] = split_policy
+    checkpoint['validation_split_details'] = dict(split_details)
+    validation_report_path = (
+        Path(args.validation_report)
+        if args.validation_report
+        else default_validation_report_path(output_path)
+    )
+    validation_report["metrics"] = {
+        "best_checkpoint": {
+            "epoch": checkpoint.get("epoch"),
+            "val_loss": checkpoint.get("val_loss"),
+            "val_acc": checkpoint.get("val_acc"),
+            "val_f1": checkpoint.get("val_f1"),
+            "val_micro_f1": checkpoint.get("val_micro_f1"),
+            "f1_per_class": checkpoint.get("val_f1_per_class"),
+            "precision_per_class": checkpoint.get("val_precision_per_class"),
+            "recall_per_class": checkpoint.get("val_recall_per_class"),
+            "per_class_acc": checkpoint.get("val_per_class_acc"),
+            "threshold_beta": checkpoint.get("threshold_beta"),
+            "thresholds": checkpoint.get("thresholds"),
+            "thresholded_val_f1": checkpoint.get("thresholded_val_f1"),
+            "thresholded_val_micro_f1": checkpoint.get("thresholded_val_micro_f1"),
+            "thresholded_f1_per_class": checkpoint.get("thresholded_f1_per_class"),
+            "thresholded_precision_per_class": checkpoint.get("thresholded_precision_per_class"),
+            "thresholded_recall_per_class": checkpoint.get("thresholded_recall_per_class"),
+            "operator_classes": checkpoint.get("operator_classes"),
+            "by_family": checkpoint.get("val_metrics_by_family"),
+        }
+    }
+    write_validation_report(validation_report_path, validation_report)
+    checkpoint['validation_report_path'] = str(validation_report_path)
+    checkpoint['labeler_version'] = dataset_metadata.get("labeler_version")
+    checkpoint['data_generation_command'] = args.data_generation_command or "not_provided"
+    checkpoint_card = build_checkpoint_card(
+        model_kind="curve_classifier",
+        checkpoint_path=output_path,
+        validation_report=validation_report,
+        checkpoint_metadata=checkpoint,
+        data_generation_command=args.data_generation_command,
+        training_command=" ".join(sys.argv),
+        runtime_contract={
+            "univariate": "trained_univariate_neural",
+            "multivariate": "heuristic_slice_aggregation",
+        },
+    )
+    checkpoint_card_path = (
+        Path(args.checkpoint_card)
+        if args.checkpoint_card
+        else default_checkpoint_card_path(output_path)
+    )
+    write_checkpoint_card(checkpoint_card_path, checkpoint_card)
+    checkpoint['checkpoint_card_path'] = str(checkpoint_card_path)
+
+    if args.baseline_card:
+        baseline_card_path = Path(args.baseline_card)
+        if baseline_card_path.exists():
+            baseline_card = load_json_report(baseline_card_path)
+            rollout_comparison = build_rollout_comparison(
+                candidate_card=checkpoint_card,
+                baseline_card=baseline_card,
+                metric_name=args.rollout_metric,
+                min_relative_improvement=args.min_relative_improvement,
+            )
+            rollout_comparison_path = (
+                Path(args.rollout_comparison)
+                if args.rollout_comparison
+                else default_rollout_comparison_path(output_path)
+            )
+            write_rollout_comparison(rollout_comparison_path, rollout_comparison)
+            checkpoint['rollout_comparison_path'] = str(rollout_comparison_path)
+        else:
+            print(
+                f"Warning: baseline card not found at {baseline_card_path}; "
+                "skipping rollout comparison."
+            )
+
     torch.save(checkpoint, output_path)
     
     print(f"\nModel saved to {output_path}")
+    print(f"Validation report saved to {validation_report_path}")
+    print(f"Checkpoint card saved to {checkpoint_card_path}")
+    if checkpoint.get('rollout_comparison_path'):
+        print(f"Rollout comparison saved to {checkpoint['rollout_comparison_path']}")
 
 
 if __name__ == "__main__":

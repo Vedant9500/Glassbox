@@ -14,6 +14,7 @@
 #include <sstream>
 #include <unordered_set>
 #include <utility>
+#include <atomic>
 
 #include <omp.h>
 
@@ -471,6 +472,8 @@ public:
     double get_first_acceptable_time_sec() const { return first_acceptable_time_sec_; }
     double get_run_wall_time_sec() const { return run_wall_time_sec_; }
     int get_random_seed() const { return config_.random_seed; }
+    int get_last_island_outer_threads() const { return last_island_outer_threads_; }
+    int get_last_island_inner_threads() const { return last_island_inner_threads_; }
 
     // P5: Return entire Pareto front (rank-0 individuals)
     // Re-runs non_dominated_sort on the current population to get clean ranks.
@@ -528,6 +531,12 @@ public:
 
         int island_size = config_.pop_size / config_.num_islands;
         if (island_size < 4) { run(); return; } // Too small for islands
+        auto start_time = std::chrono::steady_clock::now();
+        auto timed_out = [&]() {
+            return std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start_time
+            ).count() >= static_cast<double>(config_.timeout_seconds);
+        };
 
         // Create per-island engines with split configs
         std::vector<EvolutionEngine> islands;
@@ -561,27 +570,49 @@ public:
             islands.emplace_back(current_island_cfg, X_, y_, current_seed_omegas, seed_graphs_);
         }
 
-        // Initialize all islands
-        for (auto& island : islands) {
+        // Initialize all islands. This includes constant refinement and can be
+        // expensive, so run islands concurrently and keep inner OpenMP regions
+        // small to avoid oversubscription.
+        int requested_threads = std::max(1, omp_get_max_threads());
+        int previous_nested = omp_get_nested();
+        int outer_threads = std::min(config_.num_islands, requested_threads);
+        int inner_threads = std::max(1, requested_threads / std::max(1, outer_threads));
+        last_island_outer_threads_ = outer_threads;
+        last_island_inner_threads_ = inner_threads;
+        omp_set_nested(1);
+        std::atomic<bool> init_timed_out(false);
+        #pragma omp parallel for schedule(dynamic) num_threads(outer_threads)
+        for (int i = 0; i < static_cast<int>(islands.size()); ++i) {
+            omp_set_num_threads(inner_threads);
+            auto& island = islands[i];
             island.initialize_population();
             for (auto& ind : island.population_) {
+                if (init_timed_out.load(std::memory_order_relaxed) || timed_out()) {
+                    init_timed_out.store(true, std::memory_order_relaxed);
+                    break;
+                }
                 island.refine_constants(ind);
             }
+            if (init_timed_out.load(std::memory_order_relaxed)) {
+                island.evaluate_population();
+            }
         }
-
-        auto start_time = std::chrono::steady_clock::now();
+        omp_set_num_threads(requested_threads);
 
         // Run generations with periodic migration
         for (int gen = 0; gen < config_.generations; ++gen) {
-            auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() > config_.timeout_seconds) {
+            if (init_timed_out.load(std::memory_order_relaxed) || timed_out()) {
                 break;
             }
 
-            // Evolve each island one generation
-            for (auto& island : islands) {
-                island.evolve_one_generation(gen);
+            // Evolve islands independently in parallel. Each island uses a
+            // bounded inner OpenMP team for population evaluation.
+            #pragma omp parallel for schedule(dynamic) num_threads(outer_threads)
+            for (int i = 0; i < static_cast<int>(islands.size()); ++i) {
+                omp_set_num_threads(inner_threads);
+                islands[i].evolve_one_generation(gen);
             }
+            omp_set_num_threads(requested_threads);
 
             // Migration: ring topology (island i → island i+1)
             if (gen > 0 && gen % config_.migration_interval == 0) {
@@ -624,6 +655,7 @@ public:
 
             if (config_.use_early_stop && should_stop) break;
         }
+        omp_set_nested(previous_nested);
 
         // Collect the best overall across all islands and run cleanup
         for (auto& island : islands) {
@@ -669,6 +701,8 @@ private:
     double first_exact_time_sec_ = -1.0;
     int first_acceptable_generation_ = -1;
     double first_acceptable_time_sec_ = -1.0;
+    int last_island_outer_threads_ = 1;
+    int last_island_inner_threads_ = 1;
 
     static void normalize_prior_vector(std::vector<double>& priors) {
         double sum = 0.0;

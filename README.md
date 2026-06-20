@@ -1,420 +1,210 @@
-# Glassbox: Symbolic Regression with Operation Neural Networks
+# Glassbox
 
-**Glassbox** is an experimental symbolic regression framework that discovers interpretable mathematical formulas from data. Unlike black-box neural networks, Glassbox produces human-readable equations like `y = x² + sin(x)` or `y = m₀/√(1-v²/c²)`.
+Glassbox is an experimental symbolic regression project. It tries to recover
+readable formulas from data by combining:
 
-## Key Features
+- classifier-guided and exact-match fast paths,
+- a universal neural proposer that emits candidate formula skeletons,
+- C++ island evolution for structural search and constant fitting,
+- blackbox feature reduction and interaction discovery for tabular problems,
+- specialist composition, residual, vault, and inception passes for hard cases,
+- formula post-processing and displayed-formula scoring guards.
 
-- **Operation Neural Networks (ONN)**: Neural architecture where neurons represent mathematical operations rather than weights
-- **Meta-Operations**: Parametric operations (MetaPower, MetaPeriodic, MetaExp) that smoothly interpolate between functions
-- **Curve Classifier Fast-Path**: Pre-trained classifier predicts likely operators, enabling direct regression without evolution
-- **Optimized Fast-Path (Default)**: Single strategy with refinement gating and acceptance guardrails for stable runtime
-- **Formula Post-Processing**: Tolerance-based float snapping + SymPy simplification with snap-only fallback for very large expressions
-- **Fast C++ Backend**: Native C++ engine for topology evolution and constant fitting
-- **Reliability-First Scoring**: Benchmarks score by displayed-formula MSE (`mse_display`) and keep engine raw MSE (`mse_raw`) as diagnostics
-- **Native C++ JSONL Tracing**: Per-run/per-generation population snapshots for the C++ evolution path
-- **Phase 4 Evolution Controls**: Staged topology-first schedule plus adaptive restart/diversity triggers in the C++ engine
-- **Hybrid Optimization**: Combines evolutionary search (topology) with analytical SVD-based linear fitting
-- **OpenMP Multithreading**: Utilizes all CPU cores for massively parallel population evaluation
-- **Comprehensive Benchmark Suite**: 8-tier evaluation framework covering ~200 formulas
-- **GPU Acceleration**: CUDA support for classifier inference and refinement
-- **Flexible Classifier Inference**: Supports PyTorch checkpoints (MLP/CNN) and XGBoost payloads
+The current repository is no longer an ONN-only prototype. The ONN code is still
+present and used as a research/legacy path, but the default sklearn-style runtime
+is the hybrid pipeline in `glassbox/sr/sklearn_wrapper.py`.
+
+## Current Runtime Pipeline
+
+For a normal `GlassboxRegressor.fit(X, y)` call:
+
+1. Input validation and optional blackbox preprocessing run in
+   `glassbox/sr/blackbox_preprocessor.py`.
+2. The classifier fast path in `scripts/classifier_fast_path.py` builds basis
+   terms, runs exact-match/regression checks, and emits FPIP v2 diagnostics.
+3. The universal proposer in `glassbox/universal_proposer/universal_proposer.py`
+   can add grammar-constrained skeletons, operator priors, uncertainty, and a
+   search plan.
+4. Specialist screening/composition in `glassbox/sr/specialist_state.py` can
+   build local candidates, composed seeds, residual candidates, vault reuse, and
+   inception candidates.
+5. Guided evolution calls the native `_core.run_evolution` bridge in
+   `glassbox/sr/cpp/core.cpp`, seeded by fast-path/proposer/specialist formulas
+   when available.
+6. Final cleanup uses native C++ simplification when possible and guarded
+   Python/SymPy helpers as fallback. Final benchmark scoring uses the displayed
+   formula, not raw engine fitness.
 
 ## Installation
 
 ```bash
-# Clone the repository
 git clone https://github.com/Vedant9500/Glassbox.git
-cd glassbox
+cd Glassbox
 
-# Create virtual environment
 python -m venv .venv
-.venv\Scripts\activate  # Windows
-source .venv/bin/activate  # Linux/Mac
-
-# Install dependencies
+.venv\Scripts\activate
 pip install -r requirements.txt
-
-# (Optional) For GPU support, install PyTorch with CUDA
-pip install torch --index-url https://download.pytorch.org/whl/cu118
 ```
 
-### Requirements
+The Python dependencies are listed in `requirements.txt`. The C++ extension uses
+pybind11 and Eigen. A built Windows extension may already be present in a local
+workspace, but source installs should rebuild it:
 
-- Python 3.8+
-- PyTorch 1.12+
-- NumPy, SciPy, Matplotlib
-- Rich (for TUI)
-- Graphviz (optional, for visualization)
+```bash
+cd glassbox/sr/cpp
+python setup.py build_ext --inplace
+cd ../../..
+```
+
+Optional GPU support is through PyTorch/CUDA. Fast-path exact matching can use a
+torch backend, while most native evolution still runs through C++/OpenMP CPU
+code.
 
 ## Quick Start
 
-### Interactive Mode (TUI)
+Use the sklearn-compatible estimator:
 
-```bash
-python scripts/sr_tester.py
+```python
+import numpy as np
+from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
+X = np.linspace(-3, 3, 300).reshape(-1, 1)
+y = X[:, 0] ** 2 + np.sin(X[:, 0])
+
+est = GlassboxRegressor(timeout=60, random_state=42)
+est.fit(X, y)
+
+print(est.get_formula())
+print(est.best_mse_)
 ```
 
-### Single Formula Test
+Run the local benchmark suite:
+
+```bash
+python scripts/benchmark_suite.py --tier 1 --device cpu --quiet
+python scripts/benchmark_suite.py --tier 6 --with-evolution --device cpu
+```
+
+Run the SRBench-style local harness:
+
+```bash
+python scripts/run_srbench_local.py --track 2 --max-datasets 5 --no-hard-timeout
+```
+
+Run the interactive/single-formula tester:
 
 ```bash
 python scripts/sr_tester.py --mode single --formula "x^2 + sin(x)"
 ```
 
-### Comprehensive Benchmark
-```bash
-python scripts/benchmark_suite.py --with-evolution
-```
+## Important CLIs
 
-### Fast-Path Benchmark (AI-Feynman)
+- `scripts/benchmark_suite.py`: 8-tier synthetic benchmark. Current defaults are
+  `models/curve_classifier_multi.pt` and `models/universal_proposer_multi.pt`.
+  Supports `--with-evolution`, `--evolution-only`, `--specialist-regressor`,
+  `--specialist-full`, `--exact-match-backend`, repeated `--tier`, and report
+  output under `results/`.
+- `scripts/run_srbench_local.py`: local SRBench-style Track 1/Track 2 harness
+  with multi-seed reporting, hard-timeout support, adaptive timeouts,
+  specialist flags, blackbox feature limits, and optional official dataset
+  discovery.
+- `scripts/benchmark_feynman_easy.py`: AI-Feynman easy benchmark runner.
+- `scripts/classifier_fast_path.py`: fast-path basis construction, exact match,
+  guided evolution handoff, and C++ beam/island evolution wrapper.
+- `scripts/simplify_formula.py`: guarded Python/SymPy simplification fallback.
+- `scripts/specialist_phase_eval.py`: phase harnesses for specialist composition
+  and residual/inception features.
+- `scripts/train_universal_proposer.py`: proposer training and replay-data path.
+- `glassbox/curve_classifier/train_curve_classifier.py`: classifier training.
 
-```bash
-python scripts/benchmark_feynman_easy.py --evolution-fallback
-```
+## Project Map
 
-### Native C++ Pipeline Trace
+See `docs/PROJECT_MAP.md` for a detailed repository map. The short version:
 
-```bash
-python scripts/evolution_pipeline_log.py \
-  --formula "x^2+sin(x)" \
-  --cpp-trace \
-  --generations 50 \
-  --population-size 40 \
-  --run-name cpp_trace_run
-```
-
-Output is written to `results/pipeline_logs/<run-name>.jsonl`.
-
-## Architecture Overview
-
-### Operation Neural Network (ONN)
-
-```
-Input (x) → [Layer 1] → [Layer 2] → [Output Projection] → Prediction (ŷ)
-               ↓            ↓
-            [Node 1]    [Node 1]    ← Each node selects ONE operation
-            [Node 2]    [Node 2]
-            [Node 3]    [Node 3]
-```
-
-Each **OperationNode** performs:
-1. **Routing**: Select input sources from previous layers
-2. **Operation Selection**: Choose unary (sin, power, exp) or binary (+, ×)
-3. **Apply**: Compute the selected operation
-4. **Scale**: Learnable output scaling
-
-### Meta-Operations
-
-Instead of discrete operations, ONN uses **parametric meta-operations**:
-
-| Meta-Operation | Formula | Recovers |
-|----------------|---------|----------|
-| `MetaPeriodic` | `A·sin(ωx + φ)` | sin, cos, linear |
-| `MetaPower` | `sign(x)·\|x\|^p` | identity, square, sqrt, inverse |
-| `MetaArithmetic` | `(2-β)(x+y) + (β-1)(xy)` | add, multiply |
-| `MetaExp` | `exp(αx)` | exp, decay |
-
-### Fast-Path Pipeline
-
-For well-characterized curves, the fast-path bypasses evolution:
-
-```
-Data (x, y)
-    ↓
-[Curve Classifier] → Predict operators (sin, power, exp, ...)
-    ↓
-[Basis Builder] → Generate candidate terms (x, x², sin(x), ...)
-    ↓
-[LASSO/OLS Regression] → Fit coefficients
-    ↓
-[Post-Processing] → Float snapping + symbolic simplify → Output: "2*x^2 + sin(x)"
-```
-
-## Usage Examples
-
-### Basic Symbolic Regression
-
-```python
-import torch
-from glassbox.evolution import train_onn_evolutionary
-
-# Generate data
-x = torch.linspace(-3, 3, 100).reshape(-1, 1)
-y = x**2 + torch.sin(x)
-
-# Train ONN
-result = train_onn_evolutionary(x, y, generations=50)
-print(f"Discovered formula: {result['formula']}")
-print(f"MSE: {result['final_mse']:.6f}")
-```
-
-### Full Suite Benchmark
-```bash
-python scripts/benchmark_suite.py --tier 4 --with-evolution
-```
-
-### Fast-Path with Classifier
-```bash
-from scripts.classifier_fast_path import run_fast_path
-
-result = run_fast_path(
-    x, y,
-    classifier_path="models/curve_classifier_v3.1.pt",
-    device="cuda",  # or "cpu", "auto"
-)
-print(f"Formula: {result['formula']}")
-```
-
-### Custom Benchmark
-
-```bash
-python scripts/benchmark_feynman_easy.py \
-  --dataset example1 \
-  --classifier-path models/curve_classifier_v3.1.pt \
-  --sample 500 \
-  --device auto \
-  --evolution-fallback
-```
-
-## CLI Options
-
-### sr_tester.py
-
-```bash
-python scripts/sr_tester.py [OPTIONS]
-
-Options:
-  --mode {interactive,single,evolution,viz,pruning}
-  --formula FORMULA       Target formula (for single mode)
-  --generations N         Number of evolution generations
-  --population N          Population size
-  --hidden-layers N       ONN hidden layers
-  --nodes-per-layer N     Nodes per layer
-  --precision {32,64}     Float precision
-  --curve-classifier      Enable curve classifier warm-start
-  --fast-path-only        Skip evolution, use fast-path only
-  --ops-periodic          Enable/disable periodic operators
-  --ops-exp               Enable/disable exponential operators
-  --ops-log               Enable/disable logarithmic operators
-  --ops-power             Enable/disable power operators
-```
-
-### benchmark_suite.py
-```bash
-python scripts/benchmark_suite.py [OPTIONS]
-
-Options:
-  --classifier-model PATH      Path to curve classifier (default: models/curve_classifier_v3.1.pt)
-  --with-evolution             Enable C++ evolution fallback for approximate fast-path results
-  --tier N                     Target specific tier(s), repeatable: --tier 2 --tier 3
-  --output-dir PATH            Results directory (default: results/)
-  --n-samples N                Number of points per formula (default: 300)
-  --device {auto,cpu,cuda}     Device for classifier inference (default: auto)
-  --timeout SEC                Timeout per formula (default: 60)
-  --quiet                      Suppress per-formula logs
-  --formula TEXT               Run only formulas matching text
-  --cpp-evolution-only         Skip fast-path and run pure C++ evolution
-  --pop-size N                 C++ evolution population size
-  --generations N              C++ evolution generations
-```
-
-### evolution_pipeline_log.py
-```bash
-python scripts/evolution_pipeline_log.py [OPTIONS]
-
-Options:
-  --formula TEXT               Target formula, e.g. "x^2+sin(x)"
-  --data-npz PATH              NPZ dataset with X/y arrays
-  --x-min FLOAT                Formula sampling minimum
-  --x-max FLOAT                Formula sampling maximum
-  --n-samples N                Formula sampling size
-  --cpp-trace                  Run native C++ evolution and emit C++ JSONL trace
-  --include-formulas           Include formulas in each population snapshot
-  --generations N              Evolution generations
-  --population-size N          Evolution population size
-  --early-stop-mse FLOAT       C++ early stop threshold
-  --arithmetic-temperature FLOAT  C++ arithmetic softness/sharpness
-  --output-dir PATH            Trace output directory
-  --run-name TEXT              Output run name
-```
-
-### benchmark_feynman_easy.py
-```bash
-python scripts/benchmark_feynman_easy.py [OPTIONS]
-
-Options:
-  --data-dir PATH         Directory for datasets
-  --classifier-path PATH  Path to curve classifier model (default: models/curve_classifier_v3.1.pt)
-  --precision {32,64}     Float precision
-  --max-rows N            Limit loaded rows for smoke tests
-  --sample N              Random sample size
-  --seed N                Random seed
-  --device {auto,cpu,cuda}  Device for inference
-  --no-auto-expand        Disable auto basis expansion
-  --skip-exact-match      Skip exact-match combinatorial search
-  --exact-match-threads N Threads for exact-match search
-  --exact-match-max-basis N  Skip exact-match when basis exceeds this size
-  --mse-threshold FLOAT   Fallback/reporting threshold
-  --evolution-fallback    Run evolution when fast-path is insufficient
-  --evolution-generations N  Evolution generations for fallback
-  --evolution-population N   Evolution population for fallback
-  --dataset NAME          Run only a matching dataset name
-```
-
-## Project Structure
- 
-```
+```text
 glassbox/
-├── glassbox/
-│   ├── curve_classifier/           # Curve classification components
-│   │   ├── __init__.py
-│   │   ├── curve_classifier_integration.py  # Classifier loading & integration
-│   │   ├── generate_curve_data.py    # Training data generation
-│   │   └── train_curve_classifier.py # Classifier training
-│   ├── universal_proposer/         # Universal proposer components
-│   │   ├── __init__.py
-│   │   └── universal_proposer.py  # Fast-path skeleton generator
-│   ├── evolution/                  # Evolutionary training components
-│   │   ├── __init__.py
-│   │   └── evolution.py           # Python evolutionary trainer
-│   └── sr/                        # Core ONN components
-│       ├── __init__.py
-│       ├── core/
-│       │   ├── __init__.py
-│       │   ├── operation_dag.py     # Main ONN model (DAG)
-│       │   └── operation_node.py    # Individual operation nodes
-│       ├── operations/
-│       │   ├── __init__.py
-│       │   └── meta_ops.py          # Parametric meta-operations
-│       ├── optimizers/
-│       │   ├── __init__.py
-│       │   ├── bfgs_optimizer.py    # BFGS optimization
-│       │   └── hybrid_optimizer.py  # Hybrid optimization
-│       ├── cpp/                      # High-performance C++ backend
-│       │   ├── evolution.h           # C++ Evolution Engine (OpenMP + SVD)
-│       │   ├── ast.h                 # C++ Expression DAG structures
-│       │   └── core.cpp              # Pybind11 bridge
-│       ├── hard_concrete.py          # Differentiable selection
-│       ├── pruning.py                # Post-training pruning
-│       ├── visualization.py          # Training visualization
-│       └── (other supporting modules)
-├── scripts/
-│   ├── sr_tester.py              # Main testing tool (TUI)
-│   ├── benchmark_suite.py        # Comprehensive 8-tier benchmark
-│   ├── classifier_fast_path.py   # Fast-path regression
-│   ├── benchmark_feynman_easy.py # AI-Feynman benchmark
-│   └── (other scripts)
-├── models/
-│   └── curve_classifier_v3.1.pt  # Pre-trained classifier
-├── data/
-│   └── feynman_easy/             # Benchmark datasets
-├── docs/
-│   ├── README.md                 # Docs index
-│   ├── ONN_Architecture.md       # Technical documentation
-│   ├── Research_Roadmap.md       # Development roadmap
-│   └── onn_runbook.md            # Operational runbook
-├── research_notes/
-│   ├── README.md                 # Research note index
-│   ├── onn_advanced_optimization.md
-│   ├── onn_comparative_audit.md
-│   ├── onn_theoretical_framework.md
-│   └── sr_architectural_critique.md
-└── requirements.txt
+  curve_classifier/        classifier models, feature extraction, integration
+  evolution/               Python ONN/evolution research path
+  sr/
+    core/                  OperationDAG and OperationNode
+    operations/            meta operations
+    optimizers/            BFGS and hybrid optimizers
+    cpp/                   pybind11 bridge, C++ evolution, parser/simplifier
+    blackbox_preprocessor.py
+    fpip_v2.py
+    sklearn_wrapper.py     main sklearn estimator and orchestration layer
+    specialist_state.py
+  universal_proposer/      neural proposer and FPIP v2 adapter
+scripts/                   benchmarks, training, simplification, SRBench
+tests/                     unit and regression tests for the active pipeline
+docs/                      source documentation and project map
+research_notes/            forward-looking research/audit notes
+results/                   generated benchmark reports
+models/                    local model checkpoints
 ```
 
-## How It Works
+## C++ Backend
 
-### 1. Evolutionary Search (Phase 1)
+The native extension is exposed as `_core` from `glassbox/sr/cpp/core.cpp`.
+Current exported functions include:
 
-The evolutionary trainer maintains a population of ONN models:
+- `run_evolution`
+- `score_formula_candidates`
+- `refine_frequencies`
+- `refine_powers`
+- `refine_periodic_rational`
+- `iterative_elastic_net`
+- `lasso_coordinate_descent`
+- `simplify_formula_cpp`
+- `formula_to_seed_graph_cpp`
+- `snap_formula_floats_cpp`
+- `reduce_formula_noise_cpp`
 
-1. **Initialize**: Random operation selections
-2. **Evaluate**: Compute MSE fitness on training data
-3. **Select**: Keep elite performers
-4. **Mutate**: Perturb operation selections and parameters
-5. **Crossover**: Combine successful topologies
-6. **Repeat**: Until convergence or generation limit
+The Python code should continue to treat C++ as an optional acceleration path and
+fall back cleanly when `_core` is unavailable.
 
-### 2. Constant Fitting (Phase 2)
+## Scoring Contract
 
-After topology discovery, L-BFGS refines constants:
+Benchmarks must score the displayed formula whenever it can be evaluated.
+Engine-internal MSE is diagnostic only. Reports should keep both:
 
-- Fix operation selections
-- Optimize meta-operation parameters (ω, φ, p, etc.)
-- Fine-tune output projection weights
+- `mse` / `mse_display`: displayed-formula score used for status labels.
+- `mse_raw`: native or fast-path internal score used to detect drift.
 
-### 3. Pruning (Phase 3)
+This contract is covered by tests in `tests/test_benchmark_scoring_contract.py`,
+`tests/test_benchmark_common.py`, and related SRBench tests.
 
-Remove inactive or redundant nodes:
+## Testing
 
-- Analyze coefficient magnitudes
-- Prune near-zero contributions
-- Simplify formula representation
-### 4. High-Performance C++ Backend (Phase 4)
-For complex formulas where the fast-path fails, Glassbox triggers a native C++ evolution engine:
-- **Topology Mutation**: Efficient DAG structural mutations beyond rigid layer formats.
-- **Analytical Constant Fitting**: Uses Eigen SVD to solve for linear parameters in O(1) time per graph.
-- **OpenMP Multithreading**: Parallelizes population evaluation across all CPU cores.
-- **Staged Schedule**: Topology-first exploration with delayed/periodic refinement, then regular exploitation.
-- **Adaptive Restart**: Detects low-improvement + low-diversity windows and injects restart candidates.
-- **Traceability**: Optional JSONL trace stream records generation-level population snapshots.
-
-### 5. Reliability Contract (Benchmark + Runtime)
-
-- **Formula-honest scoring**: final benchmark score uses displayed-formula MSE when evaluable.
-- **Dual diagnostics**: both `mse_display` (score) and `mse_raw` (engine internal) are reported.
-- **Drift visibility**: benchmark output includes divergence metrics between raw and displayed errors.
-
-## Performance Tips
-
-1. **Use Fast-Path for Simple Formulas**: `--fast-path-only` can solve polynomial/trigonometric formulas in <1 second
-
-2. **Skip Exact-Match for Large Basis**: When basis >150 terms, exact-match search is slow; use `--skip-exact-match` or let the auto-skip handle it
-
-3. **GPU for Classifier**: Use `--device cuda` for faster classifier inference
-
-4. **Reduce Sample Size**: For quick iteration, use `--sample 500` instead of full dataset
-
-5. **Operator Constraints**: If you know the formula family, disable irrelevant operators (e.g., `--no-ops-periodic` for purely polynomial targets)
-
-## Troubleshooting
-
-### "Stalling at Fast-path basis: N terms"
-
-The exact-match search is slow for large bases. Solutions:
-- Use `--skip-exact-match`
-- Reduce `--exact-match-max-basis` (default: 150)
-- Use `--no-auto-expand` for smaller basis
-
-### "Stalling at [Post] Running simplify_formula pipeline..."
-
-Large symbolic expressions can be expensive to simplify. Current fast-path includes a large-expression guard that switches to snap-only mode automatically. If you still hit stalls, reduce basis growth (`--no-auto-expand` in Feynman benchmark) or test with fewer samples first.
-
-### "CUDA not available"
-
-Your PyTorch installation is CPU-only. Install CUDA version:
 ```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu118
+pytest tests -q
+pytest tests/test_benchmark_scoring_contract.py -q
+pytest tests/test_sklearn_wrapper_cv_guard.py -q
 ```
 
-### "Classifier model not found"
+Use focused benchmark smoke checks before changing defaults:
 
-Use the shipped checkpoint `models/curve_classifier_v3.1.pt`, or train a fresh model and point the benchmark at it:
 ```bash
-python scripts/train_curve_classifier.py --output models/curve_classifier_v3.1.pt
+python scripts/benchmark_suite.py --tier 2 --tier 3 --device cpu --quiet
+python scripts/run_srbench_local.py --track 2 --max-datasets 3 --no-hard-timeout
 ```
+
+## Documentation
+
+- `docs/PROJECT_MAP.md`: current codebase map and pipeline trace.
+- `docs/ONN_Architecture.md`: ONN and active hybrid architecture notes.
+- `docs/onn_runbook.md`: operating and release-gate runbook.
+- `docs/Research_Roadmap.md`: current roadmap and status.
+- `docs/CPP_Migration_Roadmap.md`: native backend migration status.
+- `research_notes/`: research/audit notes that may propose features not yet
+  implemented.
 
 ## Citation
 
-If you use Glassbox in your research, please cite:
-
 ```bibtex
 @software{glassbox2026,
-  title={Glassbox: Symbolic Regression with Operation Neural Networks},
+  title={Glassbox: Symbolic Regression with Hybrid Fast Path and C++ Evolution},
   year={2026},
   url={https://github.com/Vedant9500/Glassbox}
 }
 ```
-
-## Contributing
-
-Contributions welcome! Open an issue or pull request with a clear description and reproducible steps.

@@ -1,353 +1,193 @@
-# Glassbox Research Roadmap (Evolution-First)
+# Glassbox Research Roadmap
 
-## Strategic Shift (March 2026)
+Last updated: 2026-06-03.
 
-- Evolution path is now the primary research focus.
-- Fast path (v3.1 MLP trained on about 500K curve-formula pairs) is retained as a baseline and optional hint source only.
-- Core objective: beat PySR on the evolution path under fair compute and complexity budgets.
-- **v2 milestone (March 21, 2026)**: Pure evolution exact recovery improved from 41% → 52% via P0-P3 fixes + clamp/epsilon corrections. See `results/v2_pure_evolution.md`.
+This roadmap supersedes older evolution-only framing. The current project is a
+hybrid symbolic regression system with a fast path, universal proposer, C++
+guided evolution, blackbox preprocessing, and specialist composition layers. The
+research goal remains reliable formula discovery under honest displayed-formula
+scoring.
 
----
+## Current Position
 
-## Baseline vs Main Engine
+Glassbox should be evaluated as a hybrid system:
 
-**Current state**: Fast path is a useful baseline for easy formulas, but thesis value now comes from making evolution competitive on medium/hard symbolic discovery.
+- Easy formulas should be solved quickly by classifier/basis/exact-match paths.
+- Uncertain or compositional formulas should receive proposer/specialist seeds
+  and bounded guided C++ evolution.
+- Blackbox/multivariate datasets should use feature ranking, interaction probes,
+  reduced-space search, validation guards, and remapping to original variables.
+- All benchmarks should score displayed formulas, not raw native fitness.
 
-| Difficulty | Example | Fast-Path Baseline | Evolution Path (Main) | Axe (PySR) |
-|------------|---------|--------------------|------------------------|------------|
-| Easy | `sin(x) + x^2` | ✅ very fast | ✅ should match quickly | ✅ |
-| Medium | `sin(3.7x) + x^2.3` | ⚠️ often approximate | 🎯 exact or near-exact target | ✅ exact |
-| Hard | `sin(x^2) + log(1+x)` | ❌ | 🎯 exact target | ✅ |
-| Very Hard | `exp(-x^2)*sin(1/x)` | ❌ | 🎯 robust approximation target | ⚠️ |
+## Implemented Capabilities
 
----
+### Benchmark Integrity
 
-## Thesis Positioning
+- Displayed-formula scoring is the benchmark contract.
+- Raw MSE remains as `mse_raw` or diagnostic fields.
+- Drift and formula-evaluation failure paths are covered by tests.
+- Benchmark reports use JSON/Markdown outputs under `results/`.
+- Local SRBench runner supports multi-seed summaries, time-to-discovery style
+  fields, hard-timeout control, adaptive budget control, and failure taxonomy.
 
-> **"Glassbox delivers an evolution-first symbolic regression engine that approaches or exceeds PySR on exact recovery and time-to-discovery, with strict formula-fidelity scoring and reproducible multi-seed performance."**
+Primary files:
 
-**Key claim**: The main contribution is not fast-path speed alone; it is an evolution system that is accurate, stable, and scientifically trustworthy.
+- `scripts/benchmark_suite.py`
+- `scripts/benchmark_common.py`
+- `scripts/run_srbench_local.py`
+- `tests/test_benchmark_scoring_contract.py`
+- `tests/test_run_srbench_local.py`
 
----
+### Fast Path and Exact Match
 
-## Research Phases
+- Curve classifier integration supports PyTorch checkpoints.
+- Fast path builds basis terms, exact-match candidates, and regression formulas.
+- Exact-match backend routing supports NumPy/torch CPU/CUDA controls.
+- FPIP v2 payloads expose candidate skeletons, priors, uncertainty, diagnostics,
+  and routing signals.
 
-### Phase 0: Benchmark Integrity and Evaluation Discipline (Immediate, 2-4 weeks) — NEW
+Primary files:
 
-**Goal**: Eliminate false progress and enforce fair, reproducible comparison before algorithmic changes.
+- `scripts/classifier_fast_path.py`
+- `glassbox/curve_classifier/curve_classifier_integration.py`
+- `glassbox/sr/fpip_v2.py`
+- `tests/test_exact_match_backend_plumbing.py`
+- `tests/test_fpip_v2_schema.py`
 
-- [ ] **Standardized benchmark protocol (Glassbox vs PySR parity)** *(partial: fixed multi-seed set + core/thread reporting now implemented; full PySR operator/budget parity table still pending)*
-  - Same operator sets, complexity limits, data ranges, noise levels, and timeout/wall-clock budgets
-  - Same core/thread budget and hardware reporting
-  - Fixed seed set (for example 10-20 seeds) for all comparisons
+### Universal Proposer
+
+- GLU proposer model implemented.
+- Grammar-constrained univariate and multivariate skeleton decoding implemented.
+- Proposer output maps to FPIP v2.
+- Search-plan generation emits budget/beam/power/seed hints.
+- Default benchmark model path is `models/universal_proposer_multi.pt`.
 
-- [ ] **Objective-formula alignment (hard requirement)**
-  - Always score exported/displayed formula on evaluation data
-  - Keep raw internal fitness for diagnostics only
-  - Add drift metric between raw and displayed MSE; do not allow exact labels from raw-only fit
+Primary files:
+
+- `glassbox/universal_proposer/universal_proposer.py`
+- `scripts/train_universal_proposer.py`
+- `tests/test_universal_proposer.py`
+
+### C++ Evolution and Native Helpers
+
+- Native `_core.run_evolution` is the preferred guided evolution backend.
+- Seed graph ingestion is wired from candidates and signal heuristics.
+- Native candidate scoring, simplification, float snapping, noise reduction, and
+  refinement helpers are exposed through pybind11.
+- Tests cover candidate scoring, simplification, and seed graph behavior.
 
-- [x] **Multi-seed stability reporting by default** *(completed March 22, 2026)*
-  - Report median, IQR/std, and worst-decile performance
-  - Track variance of exact recovery, not only best run
+Primary files:
 
-- [x] **Time-to-discovery metrics** *(completed March 22, 2026)*
-  - Time to first exact expression
-  - Time to first acceptable expression under complexity cap
-  - Track budget-to-quality curve, not just end-of-run quality
+- `glassbox/sr/cpp/core.cpp`
+- `glassbox/sr/cpp/evolution.h`
+- `glassbox/sr/cpp/seed_graph_builder.py`
+- `tests/test_cpp_candidate_scoring.py`
+- `tests/test_cpp_simplification.py`
+- `glassbox/sr/test_seed_graph_builder.py`
 
-- [x] **Failure taxonomy pipeline** *(completed March 22, 2026; heuristic auto-bucketing in SRBench track 2)*
-  - Auto-bucket failures: exp sign errors, product-to-sum collapse, missing high-order terms, rational denominator instability, etc.
-  - Use taxonomy as a closed-loop input to mutation/operator updates
+### Specialist and Blackbox Layers
 
-- [ ] **Data leakage and identifiability audit**
-  - Formula-family split checks between train/test generation grammars
-  - Multi-range evaluation to reduce local-shape aliasing
+- Specialist state, pair scoring, safe compositions, hot-spot segments, vault
+  memory, residual symbolic stages, and inception reuse are implemented.
+- Benchmark and SRBench CLIs expose specialist modes and ablations.
+- Blackbox preprocessing implements feature ranking, interaction discovery,
+  reduced-space search, remapping, and seed formulas.
 
----
+Primary files:
 
-### Phase 1: Fast-Path Baseline Track (Months 1-3) — COMPLETED, FROZEN
-
-**Goal**: Keep as baseline; avoid spending core research bandwidth here.
-
-- [x] **Expand classifier coverage**
-  - Added rational, sqrt, inverse, abs, sigmoid
-  - Trained on 500K synthetic formulas
-  - Achieved target F1 on v3-class models
-
-- [x] **Smarter basis construction**
-  - Added nested terms and product terms
-  - Added ratio-aware terms for rational forms
-
-- [x] **Better constant detection**
-  - Added symbolic constants and wider FFT harmonic range
-  - Added frequency/power refinement helpers
-
-**Policy for Phase 1 artifacts**:
-- Fast-path improvements are maintenance only.
-- No major roadmap decisions should depend on fast-path gains.
-
----
-
-### Phase 2: Evolution Core Reliability (Months 4-6)
-
-**Goal**: Improve pure evolution quality, fidelity, and robustness without full architecture replacement.
-
-#### 2A — Search and Mutation Quality
-
-- [ ] **Enhance gradient-informed mutation**
-  - Upgrade current gradient-informed mutation with subtree-level sensitivity masks
-  - Partially implemented: sensitivity-aware rate and noise scaling now protects high-gradient logits while mutating low-sensitivity ones more aggressively
-  - Protect high-sensitivity subtrees; mutate low-sensitivity regions more aggressively
-
-- [ ] **Structure-preserving crossover/mutation**
-  - Preserve useful blocks (products, compositions, rational skeletons) during crossover
-  - Reduce product-to-sum collapse and sign-flip degeneration
-
-- [ ] **Adaptive parsimony and bloat control**
-  - Dynamic complexity pressure based on generation statistics
-  - Monitor complexity distribution drift and prune bloat systematically
-
-- [ ] **Operator and nesting constraints**
-  - Add explicit nesting constraints to block pathological expressions
-  - Constrain high-risk operator compositions for better search efficiency
-
-- [x] **Exp-decay robustness** *(completed v2)*
-  - Added `exp(omega*x + phi)` parameterization enabling `exp(-x)` discovery
-  - Seeded Exp nodes with `omega ∈ {-2,-1,-0.5,0.5,1,2}`
-  - Added Exp omega/phi snapping in cleanup_graph
-
-- [x] **Product-aware mutation** *(completed v2)*
-  - Zero out children's output weights after Multiply macro-mutation
-  - Forces Ridge to use product node instead of additive decomposition
-
-- [ ] **Native integer-power operator** *(NEW — from SOTA comparison)*
-  - Add `IntPow(x, n)` for `n ∈ {2,3,4,5,6}` instead of continuous `Power(p)`
-  - Avoids fractional p drift that causes ~0.25% coefficient error on high-degree polys
-
-- [ ] **Proper division node** *(NEW — from SOTA comparison)*
-  - Replace soft Arithmetic blending with explicit `x/y` primitive
-  - Fixes Tier 6 rational functions (`1/(1+x²)`, sigmoid, etc.) — currently 12% exact
-
-#### 2B — Objective-Formula Alignment in Search Loop
-
-- [x] **Displayed-formula-first ranking** *(partially completed v2)*
-  - Widened simplification tolerances (`int_tol` 1e-5→0.01, `zero_tol` 1e-8→1e-3) for evolution output
-  - Fixed Log formula display `|x|` pipe chars breaking Python eval
-
-- [x] **Drift-aware selection** *(partially completed v2)*
-  - Added arithmetic entropy penalty pushing soft ops toward discrete selection
-  - Tightened backward elimination (2.0×→1.05×) and inner-param snap (1.5×→1.02×)
-
-- [ ] **Exactness policy hardening**
-  - Exact status requires displayed-formula criteria, complexity criteria, and domain check
-
-#### 2C — Constant Optimization and Numerical Robustness
-
-- [x] **Increase constant optimization cadence/restarts** *(completed v2)*
-  - Boosted Adam steps per round 10→25; frequency every 20→10 generations
-  - Refine top 5 elite individuals per round (was top 3 in some paths)
-
-- [x] **Protected operator policy audit** *(completed v2)*
-  - Fixed Power output clamp ±100→±1e8 (was truncating x³ on [-5,5])
-  - Reduced Power epsilon 1e-6→1e-10 for better coefficient precision
-  - Raised Exp/Log/Arithmetic clamps to ±1e6
-
-- [ ] **Mutation schedule for constants and structure**
-  - Tune relative rates for structure vs parameter changes based on failure taxonomy
-
-- [ ] **Multi-start evolution** *(NEW — from SOTA comparison)*
-  - Run 3-5 independent evolutions and pick best
-  - Matches PySR's multi-population/multi-run protocol
-
-- [ ] **Adaptive compute budget** *(NEW — from SOTA comparison)*
-  - Scale time budget to problem difficulty (10s trivial → 5min hard)
-  - Early-stop successful runs to save total benchmark time
-
-#### 2D — Decomposition and Grammar-Guided Evolution
-
-- [ ] **Recursive decomposition**
-  - Detect `f(g(x))` patterns and decompose search when warranted
-
-- [ ] **Grammar-guided search**
-  - Use grammar priors and optional look-ahead search (including MCTS option)
-
-- [ ] **Segmented/orchestrated regression (optional)**
-  - Explore local-to-global assembly with overlap and consistency constraints
-
-#### 2E — Baseline Support (Low Priority, Completed)
-
-- [x] Added FFT phase features
-- [x] Added derivative smoothing
-- [x] Added curvature-aware resampling
-- [x] Added PCFG-style generation and better noise robustness
-
----
-
-### Phase 3: Evolution Intelligence for Complex and Multi-Variate Problems (Months 7-9)
-
-**Goal**: Solve multivariate bottlenecks and hard compositions with evolution-first mechanisms.
-
-#### 3A — Multi-Variate Structure Discovery
-
-- [ ] **AI Feynman separability tests before decomposition**
-- [ ] **Symmetry detection (translation/scale/rotation patterns)**
-- [ ] **Interaction-aware attention/graph constraints for non-separable functions**
-
-#### 3B — Structural Seeding for Evolution (Not Fast-Path Dependent)
-
-- [ ] **Autoregressive formula proposal model**
-  - Generate candidate symbolic structures from data features
-
-- [ ] **Population seeding from proposals (PIGP-style)**
-  - Seed top candidate structures into initial population, keep random remainder for diversity
-
-- [ ] **Failure-taxonomy-driven seeding**
-  - Convert recurring failure classes into targeted seed templates/guesses
-
-- [ ] **Hybrid proposal verification loop**
-  - Proposal model suggests structure, evolution verifies and refines constants/structure
-
-#### 3C — Leakage and Identifiability Hardening
-
-- [ ] **Family-level split validation**
-  - Ensure proposal/search gains are not from train/test symbolic overlap
-
-- [ ] **Multi-range and multi-resolution scoring**
-  - Require candidates to hold across domain shifts to reduce alias fits
-
-- [ ] **OOD stress test integration in development loop**
-  - Add OOD checks before accepting major search changes
-
----
-
-### Phase 4: Competitive Benchmarking and Paper (Months 10-12)
-
-**Goal**: Rigorous, evolution-centered evaluation and publication.
-
-- [ ] **Standard benchmarks**
-  - Nguyen, Keijzer, Feynman suites with strict protocol from Phase 0
-
-- [ ] **Real-world noisy dataset track**
-  - Add at least one non-synthetic scientific track to avoid synthetic-only claims
-
-- [ ] **Glassbox vs PySR parity study**
-  - Equal budgets, same operators/constraints where possible, multi-seed statistics
-
-- [ ] **Speed vs accuracy Pareto and time-to-discovery plots**
-  - Include both final quality and budget efficiency
-
-- [ ] **Ablation studies**
-  - Mutation strategy, parsimony schedule, structural seeding, decomposition, drift-aware ranking
-
-- [ ] **OOD generalization test**
-  - Strogatz/Black-Box (or equivalent unseen-family) evaluation
-
-- [ ] **Paper draft and submission**
-  - NeurIPS/ICML/AAAI style benchmark + methods paper
-
----
-
-## Risk Gates and Pivot Criteria — NEW
-
-- [ ] **Gate A (end of Phase 0)**
-  - No algorithm work accepted without reproducible multi-seed protocol and formula-fidelity scoring
-
-- [ ] **Gate B (end of Phase 2)**
-  - Require clear gains in median exact recovery and drift reduction on hard tiers
-  - If not achieved: prioritize objective alignment and mutation redesign before new model complexity
-
-- [ ] **Gate C (end of Phase 3)**
-  - Require measurable multivariate gains under parity budgets
-  - If not achieved: pivot to stronger structural constraints/template-guided evolution for multivariate tasks
-
-- [ ] **Gate D (Phase 4 readiness)**
-  - Require stable gains across seeds and at least one real-data track before paper claims
-
----
-
-## Future / Long-Term (Post-Thesis)
-
-These are higher-impact but more disruptive changes.
-
-- [ ] **Dual-Encoder contrastive architecture (MMSR-style)**
-  - Set Transformer/PointNet++ style data encoder plus equation skeleton encoder
-
-- [ ] **LLM-distilled data generation (EQUATE-style)**
-  - Domain-specific equation mining with numerical verification
-
-- [ ] **GNN variable interaction priors (EvoNUDGE-style)**
-  - Learn variable interaction graph to constrain multivariate search
-
-- [ ] **Fast-path distillation into evolution seeding (optional)**
-  - Only if it improves evolution metrics under parity protocol
-
----
-
-## Honest Limitations to Address in Thesis
-
-1. **Evolution is compute-heavy** compared with baseline heuristics — v2 runtime 2.5× longer due to refinement budget boost
-2. **Hard composition search remains brittle** without strong structural bias
-3. **Multi-variate coupling is still the largest unresolved bottleneck**
-4. **Train-test symbolic aliasing can inflate apparent performance** without strict audits
-5. ~~**Raw-fit vs displayed-formula drift can mislead results**~~ — *partially resolved in v2 via entropy penalty and tighter tolerances, but still present in some Tier 6-8 formulas*
-6. **Synthetic-only evaluations can overstate practical utility**
-7. **Fast-path can bias priorities** unless kept explicitly as baseline-only
-8. **No native division/rational operator** — soft Arithmetic blending cannot represent exact `1/(1+x²)` *(NEW)*
-
----
-
-## Success Metrics (Evolution-First)
-
-| Metric | Pre-v2 (March 19) | v2 (March 21) | Phase 2 Target | Phase 3 Target | Phase 4 Target |
-|--------|---------|--------|----------------|----------------|----------------|
-| Nguyen exact recovery (median over seeds) | 41% | **52%** | 65%+ | 75%+ | 85%+ |
-| Hard tiers (6-8) exact recovery | 8% | **9%** | 20%+ | 35%+ | 50%+ |
-| Time to first exact (median, benchmark-defined) | Untracked | ~20s | Track + improve 25% | Improve 40% | Improve 50% |
-| Formula-fidelity drift rate (high-drift rows) | High | **Reduced ~50%** | Reduce by 70% | Reduce by 85% | Reduce by 90% |
-| Stability (IQR/std of exact recovery) | Untracked | Untracked | Track + reduce variance | 30% variance reduction | 50% variance reduction |
-| PySR parity score under equal budget | Below parity | ~80% parity (est.) | Close gap significantly | Reach parity on selected suites | Beat parity on at least one major suite |
-| Multi-variate accuracy | Poor | Poor | Poor-to-moderate | 70%+ | 80%+ |
-| OOD generalization (Strogatz/Black-Box) | Untested | Untested | Baseline run complete | 50%+ | 65%+ |
-| Fast-path baseline speed (reference only) | Strong | Strong | Maintain | Maintain | Maintain |
-
----
-
-## Architecture Critique Coverage Map
-
-Every change from [SR_architecture.md](SR_architecture.md) is accounted for:
-
-| Critique Section | Recommendation | Roadmap Location |
-|---|---|---|
-| §1.1.1 FFT phase erasure | Add phase features | Phase 2E |
-| §1.1.2 Derivative instability | Savitzky-Golay smoothing | Phase 2E |
-| §1.1.3 Fixed resampling | Adaptive curvature resampling | Phase 2E |
-| §1.2 E2E representation learning | Set Transformer / PointNet | Future |
-| §1.3 PointNet encoder | PointNet++ data encoder | Future |
-| §2.1 Template bias | PCFG formula generation | Phase 2E |
-| §2.2 PCFG data generation | Recursive grammar rules | Phase 2E |
-| §2.3 LLM distillation (EQUATE) | LLM-generated equations | Future |
-| §2.4 OOD generalization | Strogatz/Black-Box benchmarks | Phase 3C + Phase 4 |
-| §3.1 1D slicing failure modes | Separability pre-check | Phase 3A |
-| §3.2 AI Feynman symmetry detection | Symmetry tests | Phase 3A |
-| §3.3 GNN interaction (EvoNUDGE) | GNN variable interaction | Future |
-| §3.3 Attention interaction map | Interaction-aware attention | Phase 3A |
-| §3.4 Interpolation artifacts | Interaction-aware alternatives | Phase 3A |
-| §4.1 Logit biasing weakness | Structural seeding for evolution | Phase 3B |
-| §4.2 PIGP structural seeding | Autoregressive generator + population seeding | Phase 3B |
-| §4.3 StruSR guided mutation | Enhanced gradient-informed mutation | Phase 2A |
-| §4.4 LogicSR MCTS | MCTS option in grammar-guided search | Phase 2D |
-
----
-
-## Added 2026 Evolution-Focus Coverage Map
-
-| Added Requirement | Roadmap Location |
+- `glassbox/sr/specialist_state.py`
+- `glassbox/sr/blackbox_preprocessor.py`
+- `glassbox/sr/sklearn_wrapper.py`
+- `scripts/specialist_phase_eval.py`
+- `tests/test_specialist_state.py`
+- `tests/test_specialist_phase_eval.py`
+- `tests/test_sklearn_wrapper_cv_guard.py`
+
+## Near-Term Priorities
+
+### 1. Benchmark Discipline and Comparability
+
+- Keep displayed-formula scoring as a hard invariant.
+- Add clearer parity tables for PySR/SRBench-style comparisons: operator set,
+  time budget, core/thread budget, seeds, complexity limit, and data splits.
+- Avoid treating generated benchmark artifacts as source documentation.
+- Expand smoke checks that combine proposer, specialist, blackbox, and C++ paths.
+
+### 2. Blackbox/SRBench Reliability
+
+- Improve validation-gated feature reduction and interaction selection.
+- Make reduced-space vs original-space formula selection more transparent in
+  reports.
+- Continue capping fragile formula families under low trust.
+- Improve official SRBench dataset discovery/metadata alignment where local data
+  is available.
+
+### 3. Specialist Cost Control
+
+- Keep expensive residual/inception phases opt-in or strongly budget-gated.
+- Reduce duplicate screening work.
+- Improve metadata that distinguishes screening-only wins, composed-seed wins,
+  residual wins, and evolution wins.
+- Keep composed seeds capped so they do not dominate C++ initial populations.
+
+### 4. C++/Python Synchronization
+
+- Move more hot formula scoring and simplification work to native C++ where tests
+  prove parity.
+- Keep Python fallbacks for fresh installs.
+- Add bridge tests whenever adding or changing native functions.
+- Watch for raw/display drift introduced by native graph simplification.
+
+### 5. Proposer Quality
+
+- Improve replay-data coverage and multivariate skeleton vocabulary.
+- Add stronger calibration for uncertainty and prior trust.
+- Treat proposer output as guidance, not truth; maintain random/evolution
+  diversity.
+- Evaluate proposer benefits under displayed-formula and time-to-discovery
+  metrics, not only candidate MSE.
+
+## Medium-Term Research Work
+
+- Better decomposition tests for sums, products, separability, symmetry, and
+  rational structure.
+- More principled multivariate interaction models beyond pairwise heuristics.
+- Better bloat/parsimony control inside C++ evolution.
+- Stronger coefficient refinement around selected symbolic structures.
+- OOD/family-split validation to reduce train/test grammar aliasing.
+- Real-world noisy dataset evaluation with stability summaries.
+
+## Known Risks
+
+- Hard nested/composed formulas remain brittle.
+- Blackbox feature selection can overfit unless validation guards are enforced.
+- Proposer seeds can bias evolution incorrectly when uncertainty is high.
+- SymPy fallback can be slow or produce display changes; native simplification
+  needs continued parity checks.
+- CPU C++ evolution can consume all cores; benchmarks must report budgets.
+- Local generated reports may reflect old code and should not be used as
+  authoritative architecture docs.
+
+## Success Metrics
+
+Use these as current targets:
+
+| Area | Metric |
 |---|---|
-| Benchmark integrity and fairness protocol | Phase 0 |
-| Objective-formula alignment | Phase 0 + Phase 2B |
-| Stability and variance reporting | Phase 0 + Phase 4 |
-| Time-to-discovery metrics | Phase 0 + Phase 4 |
-| Failure taxonomy loop | Phase 0 + Phase 2D + Phase 3B |
-| Data leakage/identifiability checks | Phase 0 + Phase 3C |
-| Real-data evaluation track | Phase 4 |
-| Risk gates and pivot criteria | Risk Gates section |
+| Formula fidelity | Displayed-formula MSE is always available or failure is explicit. |
+| Easy-case speed | Fast path preserves low latency on tier 1-3 exact cases. |
+| Hard-case recovery | Guided/proposer/specialist modes improve tiers 6-8 without hiding drift. |
+| Blackbox robustness | Median and worst-decile R2 improve under multi-seed SRBench-style runs. |
+| Stability | Multi-seed variance, failure taxonomy, and time-to-discovery are reported. |
+| Native parity | C++ helpers match Python expectations in focused tests before becoming default. |
+
+## Documentation Rule
+
+When CLI defaults, model paths, pipeline stages, or scoring contracts change,
+update:
+
+1. `README.md`
+2. `docs/PROJECT_MAP.md`
+3. `docs/ONN_Architecture.md`
+4. `docs/onn_runbook.md`
+5. any plan/audit file directly tied to the changed component

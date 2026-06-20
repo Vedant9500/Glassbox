@@ -1,32 +1,62 @@
-# Universal Fast-Path A/B Validation Report
+# Universal Fast-Path A/B Report
 
-## Overview
-As part of Phase 3 of the Universal Fast-Path rollout (Neural Proposer + Guided Evolution), an A/B validation was conducted across a set of synthetic regression problems representing easy and hard/OOD scenarios.
+Last updated: 2026-06-03.
 
-Three modes were evaluated:
-1. **Legacy**: Fast Path -> Guided Evolution (no neural proposer)
-2. **Proposer Only**: Neural Proposer -> Guided Evolution (no initial classifier fast path)
-3. **Hybrid**: Fast Path -> Neural Proposer (when uncertain) -> Guided Evolution (seeded by proposer)
+This report is a qualitative rollout summary. For current quantitative results,
+use generated benchmark artifacts under `results/` from the same commit/worktree
+being evaluated.
 
-## Evaluation Metrics
-The modes were compared using the following criteria on a mini-benchmark suite:
-* **Exact Recovery**: Ability to recover the exact generating formula structure and parameters (`MSE < 1e-4`).
-* **Time-to-first-acceptable**: Wall clock time required to find an acceptable approximation (`MSE < 1e-1`).
-* **End-to-End Runtime**: Total runtime for fitting including fallback logic.
-* **Hard-Composition Recovery**: Ability to solve OOD composability problems (e.g. `sin(x^2) + cos(x)`).
+## Compared Modes
 
-## Key Findings
-1. **Easy In-Distribution Cases**: The Legacy fast-path instantly recovered easy cases (like polynomial and simple trigonometric expressions) in under 1 second. Proposer Only struggled to rapidly match the exact algebraic constants without relying on extended evolution, often taking longer to converge exactly.
-2. **OOD / Hard Cases**: The Neural Proposer generated rich structural priors (`sin` over polynomials, nested arguments) that effectively seeded Guided Evolution, recovering expressions that the legacy classifier missed.
-3. **Hybrid Approach**: The Hybrid pipeline achieved the best of both worlds. It correctly routed easy problems to the classifier (maintaining sub-second latency) and escalated complex OOD problems to the neural proposer, leveraging its structural uncertainty and top-K seeds to guide the subsequent beam search.
+1. Legacy fast path: classifier/basis/exact-match path with no proposer input.
+2. Proposer-guided path: neural proposer emits candidates/priors and guided
+   evolution consumes them.
+3. Hybrid path: fast path handles easy cases; proposer and guided evolution help
+   uncertain, residual-suspicious, or out-of-basis cases.
 
-## Rollout Guardrails
-A rollback switch has been implemented via the `GLASSBOX_USE_LEGACY_FASTPATH` environment variable.
+## Current Implementation
 
-* By default, `GlassboxRegressor` operates in the **Hybrid** mode.
-* If `GLASSBOX_USE_LEGACY_FASTPATH=1` is set, the system falls back to the legacy architecture.
+- Fast path: `scripts/classifier_fast_path.py`.
+- Proposer: `glassbox/universal_proposer/universal_proposer.py`.
+- FPIP v2 schema: `glassbox/sr/fpip_v2.py`.
+- Estimator routing: `glassbox/sr/sklearn_wrapper.py`.
+- Benchmark routing: `scripts/benchmark_suite.py`.
 
-## Conclusion & Recommendation
-The Hybrid configuration strictly dominates either isolated mode. The neural proposer significantly improves structural correctness and reduces wasted search on out-of-distribution curves without regressing low-latency paths.
+## Qualitative Findings
 
-**Recommendation:** Proceed with making Hybrid the default mode. Phase 3 is considered complete.
+- Easy polynomial/trigonometric formulas are still best served by the classifier
+  fast path and exact-match/regression path.
+- The proposer is most useful as structural guidance: candidate skeletons,
+  uncertainty, priors, and search-plan hints.
+- Hybrid routing is safer than proposer-only routing because poor proposer
+  guesses do not need to displace exact fast-path wins.
+- Guided C++ evolution benefits from seed graphs, but seed budgets and prior
+  trust must remain bounded to avoid biasing the search toward bad candidates.
+
+## Rollback and A/B Controls
+
+- `GLASSBOX_USE_LEGACY_FASTPATH=1`
+- `scripts/benchmark_suite.py --disable-proposer`
+- `scripts/benchmark_suite.py --trust-proposer-plan`
+- `GlassboxRegressor(use_universal_proposer=..., universal_proposer_shadow_mode=...)`
+
+## Reporting Requirements
+
+Future A/B reports should include:
+
+- command line and git/worktree context,
+- model checkpoint paths,
+- tier/dataset set,
+- seed set,
+- device and timeout/core budget,
+- exact/approx/loose/fail counts,
+- displayed MSE and raw MSE drift,
+- time-to-first-acceptable where available,
+- separate counts for fast-path wins, proposer-seeded wins, specialist wins, and
+  evolution wins.
+
+## Recommendation
+
+Keep hybrid routing as the preferred direction, but treat proposer output as
+guidance rather than authority. Claims of improvement must be supported by
+current displayed-formula benchmark results.

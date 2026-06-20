@@ -61,12 +61,84 @@ def test_cv_skip_guard_fails_for_unstable_formula(monkeypatch):
     assert est.fast_path_cv_guard_["reason"] == "unstable_fold_performance"
 
 
-def test_universal_proposer_dual_path_handles_multivariate_proxy(monkeypatch):
+def test_formula_cleanup_guard_rejects_worse_simplification(monkeypatch):
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = np.sin(x)
+    est = GlassboxRegressor(random_state=3)
+    est.n_features_in_ = 1
+    est.blackbox_diagnostics_ = {}
+
+    monkeypatch.setattr(est, "_reduce_formula_noise", lambda formula, X_in, y_in: formula)
+    monkeypatch.setattr(est, "_simplify_formula", lambda formula: "0")
+
+    cleaned = est._cleanup_formula_with_fidelity_guard("sin(x)", X, y, stage="unit")
+
+    assert cleaned == "sin(x)"
+    steps = est.blackbox_diagnostics_["formula_cleanup_guard"][0]["steps"]
+    assert steps[0]["step"] == "simplify_formula"
+    assert steps[0]["accepted"] is False
+
+
+def test_formula_cleanup_guard_accepts_equivalent_cleanup(monkeypatch):
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = np.sin(x)
+    est = GlassboxRegressor(random_state=4)
+    est.n_features_in_ = 1
+    est.blackbox_diagnostics_ = {}
+
+    monkeypatch.setattr(est, "_reduce_formula_noise", lambda formula, X_in, y_in: formula)
+    monkeypatch.setattr(est, "_simplify_formula", lambda formula: "sin(x0)")
+
+    cleaned = est._cleanup_formula_with_fidelity_guard("sin(x)", X, y, stage="unit")
+
+    assert cleaned == "sin(x0)"
+    steps = est.blackbox_diagnostics_["formula_cleanup_guard"][0]["steps"]
+    assert steps[0]["accepted"] is True
+
+
+def test_actionable_specialist_candidate_pool_is_retained_without_composition():
+    est = GlassboxRegressor(random_state=5)
+    est.early_stop_mse = 1e-12
+    est.evolution_skip_r2 = 0.999
+
+    candidates = [{
+        "formula": "exp(-2*x0)",
+        "mse": 0.0,
+        "validation_mse": 0.0,
+        "validation_r2": 1.0,
+    }]
+
+    assert est._candidate_pool_has_actionable_fit(
+        candidates,
+        incumbent_mse=0.1,
+        search_plan={"candidate_acceptance_r2": 0.985},
+    ) is True
+
+
+def test_universal_proposer_dual_path_handles_multivariate_input(monkeypatch):
+    import glassbox.universal_proposer as up
+
     n = 64
     x1 = np.linspace(-2.0, 2.0, n)
     x2 = np.linspace(1.0, 3.0, n)
     X = np.stack([x1, x2], axis=1)
     y = x1 + x2
+    captured = {}
+
+    def fake_propose(model, x, y, top_k, fit_diagnostics, interaction_hints, device):
+        captured["x_shape"] = np.asarray(x).shape
+        return {
+            "valid": True,
+            "candidate_skeletons": [],
+            "interaction_hints": dict(interaction_hints),
+            "search_plan": {"supports_multivariate_formulas": np.asarray(x).ndim == 2},
+            "routing_signal": {"recommend_guided_evolution": False},
+        }
+
+    monkeypatch.setattr(up, "load_universal_proposer_checkpoint", lambda *args, **kwargs: object())
+    monkeypatch.setattr(up, "propose_fpip_v2_from_xy", fake_propose)
 
     est = GlassboxRegressor(
         use_universal_proposer=True,
@@ -78,8 +150,10 @@ def test_universal_proposer_dual_path_handles_multivariate_proxy(monkeypatch):
 
     assert payload is not None
     assert force is False
-    assert est.universal_proposer_status_ == "ok_multivariate_proxy"
-    assert payload["interaction_hints"]["multivariate_proxy"] is True
+    assert est.universal_proposer_status_ == "ok_multivariate_heuristic"
+    assert captured["x_shape"] == X.shape
+    assert payload["interaction_hints"]["multivariate_proxy"] is False
+    assert payload["search_plan"]["supports_multivariate_formulas"] is True
 
 
 def test_universal_proposer_dual_path_handles_missing_checkpoint():
@@ -101,6 +175,211 @@ def test_universal_proposer_dual_path_handles_missing_checkpoint():
     assert payload is None
     assert force is False
     assert str(est.universal_proposer_status_).startswith("error:")
+
+
+def test_guided_evolution_receives_remaining_timeout(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    captured = {}
+
+    def _fake_fast_path(*args, **kwargs):
+        return {
+            "formula": "0",
+            "mse": 1.0,
+            "operator_hints": {"operators": {"sin"}, "frequencies": [1.0]},
+            "details": {"n_nonzero": 1, "y_variance": 0.5},
+            "uncertainty": {"entropy": 0.8, "margin": 0.1},
+        }
+
+    def _fake_guided_evolution(*args, **kwargs):
+        captured["search_plan"] = kwargs.get("search_plan")
+        return {"formula": "sin(x)", "mse": 0.0}
+
+    monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(
+            run_fast_path=_fake_fast_path,
+            run_guided_evolution=_fake_guided_evolution,
+        ),
+    )
+
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = np.sin(x)
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=True,
+        use_universal_proposer=False,
+        enable_specialist_screening_diagnostics=False,
+        population_size=20,
+        generations=30,
+        timeout=5,
+        evolution_skip_r2=0.999999,
+    )
+    est.fit(X, y)
+
+    search_plan = captured.get("search_plan")
+    assert isinstance(search_plan, dict)
+    assert 1 <= search_plan.get("timeout_seconds", 0) <= 5
+
+
+def test_exact_fast_path_skips_specialist_phases(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    def _fake_fast_path(*args, **kwargs):
+        return {
+            "formula": "x0",
+            "mse": 0.0,
+            "operator_hints": {"operators": {"identity"}, "frequencies": []},
+            "details": {"n_nonzero": 1, "y_variance": 1.0},
+            "uncertainty": {"prediction_entropy": 0.0, "prediction_margin": 1.0},
+        }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(run_fast_path=_fake_fast_path),
+    )
+
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = x.copy()
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=True,
+        use_universal_proposer=False,
+        enable_specialist_screening_diagnostics=True,
+        enable_specialist_composition_screening=True,
+        enable_residual_stage=True,
+        enable_inception_reuse=True,
+        enable_specialist_vault_memory=True,
+        random_state=0,
+    )
+
+    def _fail_specialist(*args, **kwargs):
+        raise AssertionError("specialist phases should not run after exact fast-path")
+
+    monkeypatch.setattr(est, "_build_univariate_specialist_candidate_formulas", _fail_specialist)
+    monkeypatch.setattr(est, "_run_specialist_candidate_screening", _fail_specialist)
+    monkeypatch.setattr(est, "_run_residual_boosting", _fail_specialist)
+    monkeypatch.setattr(est, "_run_inception_reuse", _fail_specialist)
+
+    est.fit(X, y)
+
+    assert est.fast_path_exact_skip_ is True
+    assert est.blackbox_diagnostics_.get("specialist_skipped_reason") == "fast_path_exact"
+    assert est.best_mse_ < 1e-12
+    assert est.get_formula()
+
+
+def test_exact_fast_path_skip_overrides_evolution_routing(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    formula = "+".join(["x0"] * 12)
+
+    def _fake_fast_path(*args, **kwargs):
+        return {
+            "formula": formula,
+            "mse": 0.0,
+            "operator_hints": {"operators": {"identity"}, "frequencies": []},
+            "details": {"n_nonzero": 12, "y_variance": 1.0},
+            "uncertainty": {"prediction_entropy": 0.0, "prediction_margin": 1.0},
+        }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(run_fast_path=_fake_fast_path),
+    )
+
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = 12.0 * x
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=True,
+        use_universal_proposer=False,
+        enable_specialist_screening_diagnostics=True,
+        enable_specialist_composition_screening=True,
+        enable_residual_stage=True,
+        enable_inception_reuse=True,
+        random_state=0,
+    )
+    monkeypatch.setattr(est, "_run_universal_proposer_dual_path", lambda *args, **kwargs: (None, True))
+
+    def _fail_specialist(*args, **kwargs):
+        raise AssertionError("specialist phases should not run after exact fast-path")
+
+    monkeypatch.setattr(est, "_build_univariate_specialist_candidate_formulas", _fail_specialist)
+    monkeypatch.setattr(est, "_run_specialist_candidate_screening", _fail_specialist)
+    monkeypatch.setattr(est, "_run_residual_boosting", _fail_specialist)
+    monkeypatch.setattr(est, "_run_inception_reuse", _fail_specialist)
+
+    est.fit(X, y)
+
+    assert est.fast_path_exact_skip_ is True
+    assert est.best_mse_ < 1e-12
+    assert set(est.phase_timings_) == {"total_fit"}
+
+
+def test_specialist_screening_skips_residual_when_candidate_is_exact(monkeypatch):
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = np.cos(np.pi * x)
+
+    est = GlassboxRegressor(
+        enable_specialist_screening_diagnostics=True,
+        enable_specialist_composition_screening=True,
+        enable_residual_stage=True,
+        random_state=0,
+    )
+    est.blackbox_diagnostics_ = {}
+
+    def _screening(candidates, X_arg, y_arg, **kwargs):
+        return {"top_candidates": [{"formula": "cos(pi*x0)", "validation_mse": 0.0, "validation_r2": 1.0}]}
+
+    def _compose(*args, **kwargs):
+        raise AssertionError("composition should not run when an exact candidate is already present")
+
+    def _residual(*args, **kwargs):
+        raise AssertionError("residual fit should not run when an exact candidate is already present")
+
+    monkeypatch.setattr(est, "_compute_specialist_screening_diagnostics", _screening)
+    monkeypatch.setattr(est, "_compose_specialist_candidates", _compose)
+    monkeypatch.setattr(est, "_stage_residual_symbolic_fit", _residual)
+
+    candidates = [{"formula": "cos(pi*x0)", "validation_mse": 0.0, "validation_r2": 1.0}]
+    returned = est._run_specialist_candidate_screening(
+        candidates,
+        X,
+        y,
+        {"screening_budget": 8, "seed_budget": 8},
+    )
+
+    assert returned == candidates
+    diag = est.blackbox_diagnostics_["candidate_screening"]
+    assert diag["residual_skipped_reason"] == "existing_exact_candidate"
+    assert diag["best_existing_validation_mse"] == 0.0
+
+
+def test_regressor_formula_eval_uses_signed_fractional_powers():
+    from scripts import benchmark_common as bc
+
+    x = np.linspace(-2.0, 2.0, 41)
+    X = x.reshape(-1, 1)
+    formula = "x**1.5 - 0.25*x"
+
+    est = GlassboxRegressor()
+    reg_pred = est._safe_eval_formula_array(formula, X)
+    bench_pred = bc.evaluate_formula(bc.postprocess_formula(formula), X)
+
+    assert bench_pred is not None
+    np.testing.assert_allclose(reg_pred, bench_pred, rtol=1e-12, atol=1e-12)
 
 
 def test_blackbox_search_plan_expands_uncertain_breadth_and_interaction_depth():
@@ -460,6 +739,41 @@ def test_blackbox_candidate_screening_handles_none_validation_values():
     assert isinstance(hints, dict)
 
 
+def test_univariate_specialist_candidate_pool_preserves_decomposition_seeds(monkeypatch):
+    x = np.linspace(-2.0, 2.0, 80)
+    X = x.reshape(-1, 1)
+    y = np.sin(x) * np.cos(x) + 0.25 * x
+    est = GlassboxRegressor(random_state=68)
+    est._fp_result = {
+        "candidate_formulas": [
+            {
+                "formula": "sin(x)*cos(x) + 0.25*x",
+                "mse": 0.0,
+                "source": "decomposition_probe",
+                "decomposition_probe_type": "multiplicative_pair",
+            }
+        ],
+        "details": {},
+    }
+
+    monkeypatch.setattr(est, "_targeted_specialist_probe_formulas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(est, "_build_blackbox_formula_pool", lambda *args, **kwargs: [])
+    monkeypatch.setattr(est, "_refine_candidate_formulas", lambda candidates, *args, **kwargs: candidates)
+    monkeypatch.setattr(est, "_prune_blackbox_candidate_formulas", lambda candidates, **kwargs: candidates)
+
+    candidates = est._build_univariate_specialist_candidate_formulas(
+        "x",
+        1.0,
+        None,
+        X,
+        y,
+        max_candidates=8,
+    )
+
+    assert any(c.get("source") == "decomposition_probe" for c in candidates)
+    assert any(c.get("formula") == "sin(x)*cos(x) + 0.25*x" for c in candidates)
+
+
 def test_blackbox_evolution_comparison_uses_validation_not_incumbent_train_mse():
     rng = np.random.RandomState(71)
     X = rng.randn(180, 2)
@@ -794,6 +1108,165 @@ def test_blackbox_candidate_screening_exports_interaction_operator_hints(monkeyp
     screening = est.blackbox_diagnostics_.get("candidate_screening", {})
     assert screening.get("candidate_count", 0) > 0
     assert "periodic" in screening.get("interaction_operator_hints", [])
+    specialist = screening.get("specialist_screening", {})
+    assert specialist.get("enabled") is True
+    assert specialist.get("candidate_count", 0) > 0
+    assert specialist.get("segment_count", 0) >= 2
+    assert specialist.get("segment_axis") in {"x0", "radius", "index"}
+    assert specialist.get("top_candidates")
+
+
+def test_blackbox_candidate_screening_exports_specialist_pair_diagnostics(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    called = {"cpp": False}
+
+    class _FakeCore:
+        @staticmethod
+        def run_evolution(**kwargs):
+            called["cpp"] = True
+            return {"best_mse": 10.0, "formula": "0", "nodes": [], "output_weights": []}
+
+        @staticmethod
+        def reduce_formula_noise(formula, X_list, y):
+            return formula
+
+        @staticmethod
+        def simplify_formula(formula, **kwargs):
+            return formula
+
+    def _fake_fast_path(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
+    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+
+    rng = np.random.RandomState(53)
+    x = np.linspace(-3.0, 3.0, 160)
+    X = np.column_stack([x, np.sin(x), np.cos(x)])
+    y = np.where(x < 0.0, x * x, np.sin(2.0 * x))
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=False,
+        use_universal_proposer=False,
+        blackbox_mode=True,
+        blackbox_standardize=False,
+        blackbox_min_features_to_select=2,
+        population_size=10,
+        generations=10,
+        multi_start_runs=1,
+        timeout=20,
+        random_state=53,
+    )
+    est.fit(X, y)
+
+    screening = est.blackbox_diagnostics_.get("candidate_screening", {})
+    specialist = screening.get("specialist_screening", {})
+    assert specialist.get("enabled") is True
+    assert specialist.get("top_pairs")
+    pair = specialist["top_pairs"][0]
+    assert 0.0 <= pair.get("complementarity_score", -1.0) <= 1.0
+    assert "formula_a" in pair and "formula_b" in pair
+    assert "residual_correlation" in pair
+    composition = est.blackbox_diagnostics_.get("specialist_composition_screening", {})
+    assert composition.get("proposal_count", 0) >= 0
+
+
+def test_blackbox_candidate_screening_can_disable_specialist_diagnostics(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    class _FakeCore:
+        @staticmethod
+        def run_evolution(**kwargs):
+            return {"best_mse": 10.0, "formula": "0", "nodes": [], "output_weights": []}
+
+        @staticmethod
+        def reduce_formula_noise(formula, X_list, y):
+            return formula
+
+        @staticmethod
+        def simplify_formula(formula, **kwargs):
+            return formula
+
+    def _fake_fast_path(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
+    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+
+    rng = np.random.RandomState(59)
+    X = rng.randn(150, 3)
+    y = X[:, 0] * np.sin(X[:, 1])
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=False,
+        use_universal_proposer=False,
+        blackbox_mode=True,
+        blackbox_standardize=False,
+        blackbox_min_features_to_select=2,
+        enable_specialist_screening_diagnostics=False,
+        population_size=10,
+        generations=10,
+        multi_start_runs=1,
+        timeout=20,
+        random_state=59,
+    )
+    est.fit(X, y)
+
+    screening = est.blackbox_diagnostics_.get("candidate_screening", {})
+    assert screening.get("candidate_count", 0) > 0
+    assert "specialist_screening" not in screening
+
+
+def test_blackbox_candidate_screening_can_accept_specialist_compositions(monkeypatch):
+    import glassbox.sr.sklearn_wrapper as sw
+
+    class _FakeCore:
+        @staticmethod
+        def run_evolution(**kwargs):
+            return {"best_mse": 10.0, "formula": "0", "nodes": [], "output_weights": []}
+
+        @staticmethod
+        def reduce_formula_noise(formula, X_list, y):
+            return formula
+
+        @staticmethod
+        def simplify_formula(formula, **kwargs):
+            return formula
+
+    def _fake_fast_path(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
+    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+
+    x = np.linspace(-3.0, 3.0, 180)
+    X = np.column_stack([x, np.sin(2.0 * x), np.cos(2.0 * x)])
+    y = np.where(x < 0.0, x * x, np.sin(2.0 * x))
+
+    est = GlassboxRegressor(
+        use_fast_path=True,
+        use_guided_evolution=False,
+        use_universal_proposer=False,
+        blackbox_mode=True,
+        blackbox_standardize=False,
+        blackbox_min_features_to_select=2,
+        population_size=10,
+        generations=10,
+        multi_start_runs=1,
+        timeout=20,
+        random_state=61,
+    )
+    est.fit(X, y)
+
+    composition = est.blackbox_diagnostics_.get("specialist_composition_screening", {})
+    assert composition.get("proposal_count", 0) >= 1
+    assert composition.get("accepted_count", 0) >= 1
 
 
 def test_blackbox_candidate_pool_can_skip_cpp_from_interaction_formula(monkeypatch):
@@ -941,3 +1414,55 @@ def test_constant_refinement_improves_candidate_validation_mse():
     assert refined is not None
     assert refined["validation_mse"] < base_mse
     assert refined["constant_refined"] is True
+
+
+def test_cleanup_guard_rejects_display_mse_regression(monkeypatch):
+    X = np.linspace(-1.0, 1.0, 40).reshape(-1, 1)
+    y = X[:, 0]
+    est = GlassboxRegressor(random_state=61)
+    est.blackbox_diagnostics_ = {}
+
+    monkeypatch.setattr(est, "_reduce_formula_noise", lambda formula, X_in, y_in: "display_bad")
+    monkeypatch.setattr(est, "_simplify_formula", lambda formula: formula)
+    monkeypatch.setattr(
+        est,
+        "_formula_mse",
+        lambda formula, X_in, y_in: {"display_good": 1e-4, "display_bad": 1e-5}.get(formula, float("inf")),
+    )
+    monkeypatch.setattr(
+        est,
+        "_display_formula_mse",
+        lambda formula, X_in, y_in: {"display_good": 1e-4, "display_bad": 1e-1}.get(formula, float("inf")),
+    )
+
+    selected = est._cleanup_formula_with_fidelity_guard("display_good", X, y)
+
+    assert selected == "display_good"
+    guard = est.blackbox_diagnostics_["formula_cleanup_guard"][-1]["steps"][0]
+    assert guard["accepted"] is False
+    assert guard["after_display_mse"] == 1e-1
+
+
+def test_final_formula_selection_prefers_display_score(monkeypatch):
+    X = np.linspace(-1.0, 1.0, 40).reshape(-1, 1)
+    y = X[:, 0]
+    est = GlassboxRegressor(random_state=62)
+
+    monkeypatch.setattr(
+        est,
+        "_formula_mse",
+        lambda formula, X_in, y_in: {"incumbent": 1e-4, "challenger": 1e-6}.get(formula, float("inf")),
+    )
+    monkeypatch.setattr(
+        est,
+        "_display_formula_mse",
+        lambda formula, X_in, y_in: {"incumbent": 1e-4, "challenger": 1e-1}.get(formula, float("inf")),
+    )
+
+    formula, mse, source = est._select_final_formula("incumbent", 1e-4, "challenger", 1e-6, X, y)
+
+    assert formula == "incumbent"
+    assert mse == 1e-4
+    assert source == "incumbent"
+    assert est.final_formula_selection_diagnostics_["selected"] == "incumbent"
+    assert est.final_formula_selection_diagnostics_["challenger_display_mse"] == 1e-1

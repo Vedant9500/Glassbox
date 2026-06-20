@@ -168,3 +168,14 @@ No need for full neural-SR or MCTS unless you want a later phase.
 - **Stochastic GA** without fixed seeds → pass/fail flip on identical targets (Tier 2 vs 4 `x^6+…+x`).
 
 ---
+# Future Optimization Notes
+
+## Current Status (2026-06-03)
+
+This note captures optimization ideas from earlier benchmark observations. Some
+items are now implemented or partially implemented: proposer/fast-path seed
+graphs feed C++ evolution, residual symbolic stages exist behind flags,
+displayed-formula scoring is the benchmark contract, polynomial/exact-match
+fast lanes exist, and C++ island specialization is the guided-evolution default.
+Use `docs/PROJECT_MAP.md` for current architecture and this file for historical
+idea context.

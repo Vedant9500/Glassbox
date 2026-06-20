@@ -6,12 +6,12 @@ Comprehensive evaluation of the symbolic regression pipeline across ~200
 formulas of increasing complexity, organized into 8 difficulty tiers.
 
 Usage:
-  python scripts/benchmark_suite.py                                    # Full suite (fast-path only)
-  python scripts/benchmark_suite.py --tier 1                           # Only tier 1
-    python scripts/benchmark_suite.py --with-evolution                   # Include guided evolution (latest path)
-    python scripts/benchmark_suite.py --evolution-only                   # Guided evolution only (skip fast-path)
-  python scripts/benchmark_suite.py --classifier-model models/v3.pt   # Custom model
-  python scripts/benchmark_suite.py --output-dir results/              # Custom output dir
+  python scripts/benchmark_suite.py                                            # Full suite (fast-path only)
+  python scripts/benchmark_suite.py --tier 1                                   # Only tier 1
+  python scripts/benchmark_suite.py --specialist-regressor --specialist-full   # Use specialist regressor for all tiers with fast-path 
+  python scripts/benchmark_suite.py --evolution-only                           # Guided evolution only (skip fast-path)
+  python scripts/benchmark_suite.py --classifier-model models/v3.pt            # Custom model
+  python scripts/benchmark_suite.py --output-dir results/                      # Custom output dir
 
 Scoring:
     Uses displayed-formula MSE only for scoring; raw MSE is diagnostic.
@@ -25,7 +25,11 @@ import argparse
 import json
 import math
 import os
+import pickle
+import platform
+import random
 import re
+import subprocess
 import sys
 import time
 import warnings
@@ -47,6 +51,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+try:
+    from sympy.utilities.exceptions import SymPyDeprecationWarning
+except Exception:  # pragma: no cover - SymPy warning class may be absent
+    SymPyDeprecationWarning = DeprecationWarning
+
+warnings.filterwarnings("ignore", category=SymPyDeprecationWarning)
 
 # ---------------------------------------------------------------------------
 # Path setup
@@ -449,7 +459,8 @@ def _parse_formula(formula_str: str) -> Callable[[np.ndarray], np.ndarray]:
             "log": sp.log,
             "sqrt": sp.sqrt,
             "pi": sp.pi,
-            "E": sp.E
+            "E": sp.E,
+            "e": sp.E,
         }
         expr = parse_expr(formula, local_dict=local_dict, transformations=transformations, evaluate=False)     
         free_syms = sorted(expr.free_symbols, key=lambda sym: sym.name)
@@ -639,8 +650,9 @@ def _postprocess_formula(formula: str) -> str:
             )
 
         with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=SymPyDeprecationWarning)
             warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"sympy\..*")
-            warnings.filterwarnings("ignore", message=r".*Using non-Expr arguments in Mul.*")
+            warnings.filterwarnings("ignore", message=r"\s*Using non-Expr arguments in Mul.*")
             _, simplified_expr = simplify_onn_formula(
                 normalized,
                 int_tol=evo_int_tol,
@@ -698,6 +710,14 @@ _postprocess_formula = bc.postprocess_formula
 _evaluate_formula_mse = bc.evaluate_formula_mse
 
 
+def _postprocess_formula_for_benchmark(formula: str, x: np.ndarray, y: np.ndarray) -> Tuple[str, Dict[str, Any]]:
+    return bc.postprocess_formula_with_fidelity_guard(
+        formula,
+        np.asarray(x, dtype=np.float64).reshape(-1, 1),
+        y,
+    )
+
+
 def _select_score_mse(mse_display: Optional[float]) -> Optional[float]:
     """Choose MSE for scoring: use displayed-formula MSE only."""
     if mse_display is not None and math.isfinite(mse_display):
@@ -728,6 +748,31 @@ def _mse_divergence_stats(mse_display: Optional[float], mse_raw: Optional[float]
     # Conservative threshold: flag when discrepancy is large enough to affect ranking.
     out["mse_divergence_flag"] = rel_gap > 0.10
     return out
+
+
+def _display_eval_details(formula: str, x: np.ndarray, y: np.ndarray) -> Dict[str, Any]:
+    """Evaluate a displayed formula and return MSE plus parser diagnostics."""
+    X = np.asarray(x, dtype=np.float64).reshape(-1, 1)
+    y_pred, diagnostics = bc.evaluate_formula(formula, X, return_diagnostics=True)
+    return {
+        "mse": _evaluate_formula_mse(formula, x, y),
+        "diagnostics": diagnostics,
+    }
+
+
+def _record_display_eval_failure(
+    result: Dict[str, Any],
+    formula: str,
+    x: np.ndarray,
+    y: np.ndarray,
+) -> None:
+    """Attach display-evaluation failure details without changing scoring policy."""
+    details = _display_eval_details(formula, x, y)
+    result["display_eval_diagnostics"] = details.get("diagnostics")
+    if details.get("mse") is None and formula:
+        result["formula_before_display_error"] = formula
+        if result.get("error") is None:
+            result["error"] = "formula_eval_failed"
 
 
 def score_result(mse: float, formula: str) -> str:
@@ -830,6 +875,8 @@ SCORE_SYMBOLS = {
     "FAIL":   "[FAIL]",
 }
 
+_SCORE_POINTS = {"FAIL": 0, "LOOSE": 1, "APPROX": 2, "EXACT": 3}
+
 
 _PROPOSER_CACHE = {}
 def _get_proposer(path: str, device: str):
@@ -856,6 +903,9 @@ def run_formula(
     evolution_generations: int = 150,
     evolution_population: int = 50,
     trust_proposer_plan: bool = False,
+    exact_match_backend: str = "auto",
+    exact_match_min_gpu_work: int = 250_000,
+    exact_match_max_combos: int = 50_000,
 ) -> Dict[str, Any]:
     """Run fast-path and/or guided evolution on a single formula."""
     x_min, x_max = x_range
@@ -873,9 +923,20 @@ def run_formula(
         "uncertainty": None,
         "residual_diagnostics": None,
         "candidate_formulas": None,
+        "fast_path_candidate_formulas": None,
+        "evolution_seed_candidates": None,
+        "proposer_candidate_formulas": None,
+        "winning_stage": None,
+        "engine_raw_mse": None,
+        "formula_before_postprocess_mse": None,
+        "formula_after_postprocess_mse": None,
+        "score_mse": None,
+        "display_eval_diagnostics": None,
+        "formula_before_display_error": None,
         "mse_divergence_abs": None,
         "mse_divergence_rel": None,
         "mse_divergence_flag": False,
+        "exact_match_diagnostics": None,
     }
 
     try:
@@ -891,11 +952,17 @@ def run_formula(
                 formula = str(int(round(const_val)))
             else:
                 formula = f"{const_val:.6g}"
-            formula = _postprocess_formula(formula)
+            formula, guard = _postprocess_formula_for_benchmark(formula, x_np, y_np)
             result["formula_discovered"] = formula
+            result["postprocess_guard"] = guard
             result["mse_raw"] = 0.0
+            result["engine_raw_mse"] = 0.0
+            result["formula_before_postprocess_mse"] = guard.get("postprocess_raw_mse")
+            result["formula_after_postprocess_mse"] = guard.get("postprocess_processed_mse")
             result["mse_display"] = 0.0
             result["mse"] = 0.0
+            result["score_mse"] = 0.0
+            result["winning_stage"] = "constant_shortcut"
             result["time"] = 0.0
             result["n_terms"] = _count_terms(formula)
             result["uncertainty"] = cfp._prediction_uncertainty_metrics({'identity': 1.0})
@@ -905,6 +972,13 @@ def run_formula(
                 if y_pred is not None
                 else None
             )
+            result["exact_match_diagnostics"] = {
+                    "backend_requested": exact_match_backend,
+                    "fallback_reason": "constant_shortcut",
+                    "max_combos": int(exact_match_max_combos),
+                    "torch_used": False,
+                    "gpu_used": False,
+                }
             result["candidate_formulas"] = [{
                 "formula": formula,
                 "mse": 0.0,
@@ -943,6 +1017,9 @@ def run_formula(
                 exact_match_threads=1,
                 exact_match_enabled=True,
                 exact_match_max_basis=150,
+                exact_match_backend=exact_match_backend,
+                exact_match_min_gpu_work=exact_match_min_gpu_work,
+                exact_match_max_combos=exact_match_max_combos,
                 simplify_formula_output=False,
             )
             elapsed = time.time() - t0
@@ -951,20 +1028,36 @@ def run_formula(
                 result["error"] = "fast_path_not_applicable"
                 result["time"] = elapsed
             else:
-                result["formula_discovered"] = _postprocess_formula(fp_result.get("formula", ""))
+                fp_formula = fp_result.get("formula", "")
+                result["formula_discovered"], result["postprocess_guard"] = _postprocess_formula_for_benchmark(
+                    fp_formula,
+                    x_np,
+                    y_np,
+                )
                 result["mse_raw"] = fp_result.get("mse", float("inf"))
-                result["mse_display"] = _evaluate_formula_mse(result["formula_discovered"], x_np, y_np)
+                result["engine_raw_mse"] = fp_result.get("mse", float("inf"))
+                result["formula_before_postprocess_mse"] = result["postprocess_guard"].get("postprocess_raw_mse")
+                result["formula_after_postprocess_mse"] = result["postprocess_guard"].get("postprocess_processed_mse")
+                display_details = _display_eval_details(result["formula_discovered"], x_np, y_np)
+                result["mse_display"] = display_details["mse"]
+                result["display_eval_diagnostics"] = display_details["diagnostics"]
                 result["mse"] = _select_score_mse(result["mse_display"])
+                result["score_mse"] = result["mse"]
                 result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
                 result["uncertainty"] = fp_result.get("uncertainty")
                 result["candidate_formulas"] = fp_result.get("candidate_formulas")
-                if result["formula_discovered"] and result["mse_display"] is None and result["error"] is None:
-                    result["error"] = "formula_eval_failed"
+                result["fast_path_candidate_formulas"] = fp_result.get("candidate_formulas")
+                result["winning_stage"] = "fast_path"
+                if result["formula_discovered"] and result["mse_display"] is None:
+                    result["formula_before_display_error"] = result["formula_discovered"]
+                    if result["error"] is None:
+                        result["error"] = "formula_eval_failed"
                 result["time"] = elapsed
                 str_term_count = _count_terms(result["formula_discovered"])
                 details = fp_result.get("details", {}) if isinstance(fp_result, dict) else {}
                 structural_terms = details.get("n_nonzero", 0)
                 simplified_terms = details.get("n_nonzero_simplified", 0)
+                result["exact_match_diagnostics"] = details.get("exact_match_diagnostics")
                 result["n_terms"] = max(
                     int(str_term_count),
                     int(structural_terms) if structural_terms is not None else 0,
@@ -1050,6 +1143,7 @@ def run_formula(
                                 if prob > 0.15:
                                     operator_hints["operators"].add(op)
                         proposer_skeletons = payload.get("candidate_skeletons", [])
+                        result["proposer_candidate_formulas"] = list(proposer_skeletons or [])
                         candidate_formulas = []
                         if fp_result and fp_result.get("formula"):
                             candidate_formulas.append({
@@ -1112,8 +1206,36 @@ def run_formula(
                     "from_fast_path": True,
                 }]
 
+            if fp_result:
+                fp_seed_candidates = list(fp_result.get("candidate_formulas") or [])
+                if fp_seed_candidates:
+                    if candidate_formulas is None:
+                        candidate_formulas = []
+                    seen_seed_formulas = {
+                        str(c.get("formula", "")).replace(" ", "")
+                        for c in candidate_formulas
+                        if isinstance(c, dict)
+                    }
+                    for cand in fp_seed_candidates:
+                        if not isinstance(cand, dict):
+                            continue
+                        formula_seed = str(cand.get("formula", "") or "").strip()
+                        if not formula_seed:
+                            continue
+                        seed_key = formula_seed.replace(" ", "")
+                        if seed_key in seen_seed_formulas:
+                            continue
+                        merged = dict(cand)
+                        merged.setdefault("from_fast_path_candidate_pool", True)
+                        candidate_formulas.append(merged)
+                        seen_seed_formulas.add(seed_key)
+            result["evolution_seed_candidates"] = list(candidate_formulas or [])
+
             t1 = time.time()
             try:
+                guided_plan = dict(guided_plan or {})
+                remaining_timeout = max(1, int(float(timeout) - float(t1 - (t0 if "t0" in locals() else t1))))
+                guided_plan.setdefault("timeout_seconds", remaining_timeout)
                 guided_result = run_guided_evolution(
                     x_2d,
                     y_2d,
@@ -1131,9 +1253,15 @@ def run_formula(
                 result["time"] = base_elapsed + guided_elapsed
 
                 if guided_result and guided_result.get("formula"):
-                    guided_formula = _postprocess_formula(guided_result.get("formula", ""))
-                    guided_mse_raw = guided_result.get("mse", float("inf"))
-                    guided_mse_display = _evaluate_formula_mse(guided_formula, x_np, y_np)
+                    guided_raw_formula = guided_result.get("formula", "")
+                    guided_formula, guided_guard = _postprocess_formula_for_benchmark(
+                        guided_raw_formula,
+                        x_np,
+                        y_np,
+                    )
+                    guided_mse_raw = guided_result.get("raw_mse", guided_result.get("mse", float("inf")))
+                    guided_display_details = _display_eval_details(guided_formula, x_np, y_np)
+                    guided_mse_display = guided_display_details["mse"]
                     guided_mse_score = _select_score_mse(guided_mse_display)
                     guided_mse_for_compare = (
                         guided_mse_score if guided_mse_score is not None else float("inf")
@@ -1143,16 +1271,24 @@ def run_formula(
                     if evolution_only or fp_result is None or guided_mse_for_compare < baseline_mse:
                         result["formula_discovered"] = guided_formula
                         result["mse_raw"] = guided_mse_raw
+                        result["engine_raw_mse"] = guided_mse_raw
+                        result["formula_before_postprocess_mse"] = guided_guard.get("postprocess_raw_mse")
+                        result["formula_after_postprocess_mse"] = guided_guard.get("postprocess_processed_mse")
                         result["mse_display"] = guided_mse_display
                         result["mse"] = guided_mse_for_compare
+                        result["score_mse"] = result["mse"]
+                        result["display_eval_diagnostics"] = guided_display_details["diagnostics"]
                         result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
                         result["uncertainty"] = fp_result.get("uncertainty") if fp_result else None
-                        result["candidate_formulas"] = fp_result.get("candidate_formulas") if fp_result else None
+                        result["candidate_formulas"] = result["evolution_seed_candidates"]
+                        result["winning_stage"] = "guided_evolution"
                         if result["formula_discovered"] and result["mse_display"] is None:
+                            result["formula_before_display_error"] = result["formula_discovered"]
                             result["error"] = "formula_eval_failed"
                         else:
                             result["error"] = None
                         result["n_terms"] = _count_terms(guided_formula)
+                        result["postprocess_guard"] = guided_guard
                 elif evolution_only or fp_result is None:
                     result["error"] = "guided_evolution_failed"
             except Exception as guided_err:
@@ -1162,8 +1298,11 @@ def run_formula(
 
         if result["formula_discovered"]:
             if result["mse_display"] is None:
-                result["mse_display"] = _evaluate_formula_mse(result["formula_discovered"], x_np, y_np)
+                display_details = _display_eval_details(result["formula_discovered"], x_np, y_np)
+                result["mse_display"] = display_details["mse"]
+                result["display_eval_diagnostics"] = display_details["diagnostics"]
             result["mse"] = _select_score_mse(result["mse_display"])
+            result["score_mse"] = result["mse"]
             result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
             y_pred = cfp._evaluate_formula_values(result["formula_discovered"], x_np)
             result["residual_diagnostics"] = (
@@ -1171,8 +1310,10 @@ def run_formula(
                 if y_pred is not None
                 else None
             )
-            if result["formula_discovered"] and result["mse_display"] is None and result["error"] is None:
-                result["error"] = "formula_eval_failed"
+            if result["formula_discovered"] and result["mse_display"] is None:
+                result["formula_before_display_error"] = result["formula_discovered"]
+                if result["error"] is None:
+                    result["error"] = "formula_eval_failed"
 
     except Exception as e:
         result["error"] = str(e)
@@ -1180,7 +1321,11 @@ def run_formula(
         result["time"] = 0.0
 
     # Score
-    result["score"] = score_result(result["mse"], result["formula_discovered"])
+    result["score_mse"] = result["mse"]
+    if result.get("error") and "timeout" in str(result.get("error")).lower():
+        result["score"] = "FAIL"
+    else:
+        result["score"] = score_result(result["mse"], result["formula_discovered"])
     return result
 
 
@@ -1191,6 +1336,7 @@ def run_formula_cpp_evolution(
     pop_size: int = 100,
     generations: int = 1000,
     device: Optional[str] = None,
+    timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run pure C++ evolution on a single formula (no classifier fast-path)."""
     import sys
@@ -1209,6 +1355,12 @@ def run_formula_cpp_evolution(
         "error": None,
         "n_terms": 0,
         "residual_diagnostics": None,
+        "engine_raw_mse": None,
+        "formula_before_postprocess_mse": None,
+        "formula_after_postprocess_mse": None,
+        "score_mse": None,
+        "display_eval_diagnostics": None,
+        "formula_before_display_error": None,
         "mse_divergence_abs": None,
         "mse_divergence_rel": None,
         "mse_divergence_flag": False,
@@ -1233,11 +1385,16 @@ def run_formula_cpp_evolution(
                 formula = str(int(round(const_val)))
             else:
                 formula = f"{const_val:.6g}"
-            formula = _postprocess_formula(formula)
+            formula, guard = _postprocess_formula_for_benchmark(formula, x_np, y_np)
             result["formula_discovered"] = formula
+            result["postprocess_guard"] = guard
             result["mse_raw"] = 0.0
+            result["engine_raw_mse"] = 0.0
+            result["formula_before_postprocess_mse"] = guard.get("postprocess_raw_mse")
+            result["formula_after_postprocess_mse"] = guard.get("postprocess_processed_mse")
             result["mse_display"] = 0.0
             result["mse"] = 0.0
+            result["score_mse"] = 0.0
             result["time"] = elapsed
             result["n_terms"] = 1
             result["residual_diagnostics"] = {
@@ -1285,10 +1442,20 @@ def run_formula_cpp_evolution(
         )
         elapsed = time.time() - t0
         
-        result["formula_discovered"] = _postprocess_formula(cpp_result.get("formula", ""))
+        result["formula_discovered"], result["postprocess_guard"] = _postprocess_formula_for_benchmark(
+            cpp_result.get("formula", ""),
+            x_np,
+            y_np,
+        )
         result["mse_raw"] = cpp_result.get("best_mse", float("inf"))
-        result["mse_display"] = _evaluate_formula_mse(result["formula_discovered"], x_np, y_np)
+        result["engine_raw_mse"] = cpp_result.get("best_mse", float("inf"))
+        result["formula_before_postprocess_mse"] = result["postprocess_guard"].get("postprocess_raw_mse")
+        result["formula_after_postprocess_mse"] = result["postprocess_guard"].get("postprocess_processed_mse")
+        display_details = _display_eval_details(result["formula_discovered"], x_np, y_np)
+        result["mse_display"] = display_details["mse"]
+        result["display_eval_diagnostics"] = display_details["diagnostics"]
         result["mse"] = _select_score_mse(result["mse_display"])
+        result["score_mse"] = result["mse"]
         result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
         y_pred = cfp._evaluate_formula_values(result["formula_discovered"], x_np)
         result["residual_diagnostics"] = (
@@ -1296,10 +1463,15 @@ def run_formula_cpp_evolution(
             if y_pred is not None
             else None
         )
-        if result["formula_discovered"] and result["mse_display"] is None and result["error"] is None:
-            result["error"] = "formula_eval_failed"
+        if result["formula_discovered"] and result["mse_display"] is None:
+            result["formula_before_display_error"] = result["formula_discovered"]
+            if result["error"] is None:
+                result["error"] = "formula_eval_failed"
         result["time"] = elapsed
         result["n_terms"] = _count_terms(result["formula_discovered"])
+        if timeout is not None and elapsed > float(timeout):
+            result["error"] = f"timeout_exceeded after {elapsed:.1f}s"
+            result["score"] = "FAIL"
         
     except ImportError as e:
         result["error"] = f"C++ backend not available: {e}"
@@ -1309,8 +1481,299 @@ def run_formula_cpp_evolution(
         import traceback; traceback.print_exc()
         result["time"] = 0.0
     
+    result["score_mse"] = result["mse"]
+    if result.get("error") and "timeout" in str(result.get("error")).lower():
+        result["score"] = "FAIL"
+    else:
+        result["score"] = score_result(result["mse"], result["formula_discovered"])
+    return result
+
+
+def run_formula_specialist_regressor(
+    formula_str: str,
+    x_range: Tuple[float, float],
+    classifier_path: str,
+    proposer_path: Optional[str],
+    n_samples: int = 300,
+    device: Optional[str] = None,
+    timeout: float = 60.0,
+    population_size: int = 50,
+    generations: int = 150,
+    specialist_enabled: bool = True,
+    specialist_diagnostics: bool = True,
+    specialist_composition: bool = True,
+    specialist_residual: bool = False,
+    specialist_vault: bool = True,
+    specialist_inception: bool = False,
+    exact_match_backend: str = "auto",
+    exact_match_min_gpu_work: int = 250_000,
+    exact_match_max_combos: int = 50_000,
+) -> Dict[str, Any]:
+    """Run the sklearn regressor path so specialist composition/boosting is measurable."""
+    x_min, x_max = x_range
+    diagnostics_enabled = bool(specialist_enabled and specialist_diagnostics)
+    composition_enabled = bool(specialist_enabled and specialist_composition and diagnostics_enabled)
+    residual_enabled = bool(specialist_enabled and specialist_residual and composition_enabled)
+    vault_enabled = bool(specialist_enabled and specialist_vault and composition_enabled)
+    inception_enabled = bool(specialist_enabled and specialist_inception)
+    result = {
+        "formula_target": formula_str,
+        "x_range": list(x_range),
+        "formula_discovered": "",
+        "mse": None,
+        "mse_raw": None,
+        "mse_display": None,
+        "time": None,
+        "score": "FAIL",
+        "error": None,
+        "n_terms": 0,
+        "uncertainty": None,
+        "residual_diagnostics": None,
+        "candidate_formulas": None,
+        "engine_raw_mse": None,
+        "formula_before_postprocess_mse": None,
+        "formula_after_postprocess_mse": None,
+        "score_mse": None,
+        "display_eval_diagnostics": None,
+        "formula_before_display_error": None,
+        "mse_divergence_abs": None,
+        "mse_divergence_rel": None,
+        "mse_divergence_flag": False,
+        "exact_match_diagnostics": None,
+        "benchmark_path": "specialist_regressor" if specialist_enabled else "regressor_baseline",
+        "specialist_enabled": bool(specialist_enabled),
+        "specialist_phase_config": {
+            "diagnostics": diagnostics_enabled,
+            "composition": composition_enabled,
+            "residual": residual_enabled,
+            "vault": vault_enabled,
+            "inception": inception_enabled,
+        },
+        "specialist_track": None,
+        "has_composed_seeds": False,
+        "composition_candidates_accepted": False,
+        "composition_candidate_count": 0,
+        "composition_seeded_evolution": False,
+        "composition_won_final_selection": False,
+        "composition_improved_mse": False,
+        "boosting_attempted": False,
+        "boosting_improved": False,
+        "boosting_stage_count": 0,
+        "boosting_diagnostics": None,
+        "phase_timings": None,
+        "formula_eval_count": 0,
+        "formula_eval_cache_hits": 0,
+        "formula_eval_cache_size": 0,
+        "specialist_diagnostics": None,
+        "specialist_composition_screening": None,
+    }
+
+    try:
+        from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
+        x_np, y_np = _generate_data(formula_str, x_min, x_max, n_samples)
+        X = np.asarray(x_np, dtype=np.float64).reshape(-1, 1)
+        y = np.asarray(y_np, dtype=np.float64).reshape(-1)
+
+        y_std = np.std(y)
+        if y_std < 1e-10:
+            const_val = float(np.mean(y))
+            formula = str(int(round(const_val))) if abs(const_val - round(const_val)) < 1e-6 else f"{const_val:.6g}"
+            formula, guard = _postprocess_formula_for_benchmark(formula, x_np, y_np)
+            result["formula_discovered"] = formula
+            result["postprocess_guard"] = guard
+            result["mse_raw"] = 0.0
+            result["engine_raw_mse"] = 0.0
+            result["formula_before_postprocess_mse"] = guard.get("postprocess_raw_mse")
+            result["formula_after_postprocess_mse"] = guard.get("postprocess_processed_mse")
+            result["mse_display"] = 0.0
+            result["mse"] = 0.0
+            result["score_mse"] = 0.0
+            result["time"] = 0.0
+            result["n_terms"] = _count_terms(formula)
+            result["exact_match_diagnostics"] = {
+                "backend_requested": exact_match_backend,
+                "fallback_reason": "constant_shortcut",
+                "max_combos": int(exact_match_max_combos),
+                "torch_used": False,
+                "gpu_used": False,
+            }
+            result["score"] = score_result(0.0, formula)
+            return result
+
+        reg = GlassboxRegressor(
+            population_size=max(20, int(population_size)),
+            generations=max(20, int(generations)),
+            timeout=max(1, int(timeout)),
+            classifier_path=classifier_path,
+            universal_proposer_path=proposer_path or "models/universal_proposer_multi.pt",
+            use_universal_proposer=bool(proposer_path),
+            universal_proposer_shadow_mode=False,
+            universal_proposer_log_routing=False,
+            blackbox_mode=True,
+            blackbox_feature_selection=True,
+            blackbox_standardize=True,
+            enable_specialist_screening_diagnostics=diagnostics_enabled,
+            enable_specialist_composition_screening=composition_enabled,
+            enable_residual_stage=residual_enabled,
+            enable_specialist_vault_memory=vault_enabled,
+            enable_inception_reuse=inception_enabled,
+            use_guided_evolution=True,
+            use_fast_path=True,
+            multi_start_runs=1,
+            device=device,
+            exact_match_backend=exact_match_backend,
+            exact_match_min_gpu_work=exact_match_min_gpu_work,
+            exact_match_max_combos=exact_match_max_combos,
+            random_state=0,
+        )
+
+        t0 = time.time()
+        reg.fit(X, y)
+        elapsed = time.time() - t0
+
+        formula, guard = _postprocess_formula_for_benchmark(reg.get_formula(), x_np, y_np)
+        result["formula_discovered"] = formula
+        result["postprocess_guard"] = guard
+        result["mse_raw"] = _finite_float(getattr(reg, "best_mse_", None), float("inf"))
+        result["engine_raw_mse"] = result["mse_raw"]
+        result["formula_before_postprocess_mse"] = guard.get("postprocess_raw_mse")
+        result["formula_after_postprocess_mse"] = guard.get("postprocess_processed_mse")
+        display_details = _display_eval_details(formula, x_np, y_np)
+        result["mse_display"] = display_details["mse"]
+        result["display_eval_diagnostics"] = display_details["diagnostics"]
+        result["mse"] = _select_score_mse(result["mse_display"])
+        result["score_mse"] = result["mse"]
+        result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
+        result["time"] = elapsed
+        result["n_terms"] = _count_terms(formula)
+
+        y_pred = cfp._evaluate_formula_values(formula, x_np)
+        result["residual_diagnostics"] = (
+            cfp._residual_diagnostics(y_np, y_pred, x_np)
+            if y_pred is not None
+            else None
+        )
+        if formula and result["mse_display"] is None:
+            result["formula_before_display_error"] = formula
+            result["error"] = "formula_eval_failed"
+
+        result.update(bc.specialist_metadata_from_estimator(reg))
+        result["exact_match_diagnostics"] = getattr(reg, "fast_path_exact_match_diagnostics_", None)
+
+    except Exception as e:
+        result["error"] = str(e)
+        traceback.print_exc()
+        result["time"] = 0.0
+
+    result["score_mse"] = result["mse"]
     result["score"] = score_result(result["mse"], result["formula_discovered"])
     return result
+
+
+def _timeout_result(formula_str: str, x_range: Tuple[float, float], elapsed: float, error: str) -> Dict[str, Any]:
+    return {
+        "formula_target": formula_str,
+        "x_range": list(x_range),
+        "formula_discovered": "",
+        "mse": None,
+        "mse_raw": None,
+        "mse_display": None,
+        "time": float(elapsed),
+        "score": "FAIL",
+        "error": error,
+        "n_terms": 0,
+        "score_mse": None,
+        "display_eval_diagnostics": None,
+    }
+
+
+def _benchmark_worker_cli(input_path: str, output_path: str) -> int:
+    try:
+        with open(input_path, "rb") as fh:
+            call_spec = pickle.load(fh)
+        fn = globals()[call_spec["function"]]
+        payload = {"status": "ok", "result": fn(**call_spec["kwargs"])}
+    except Exception as exc:
+        payload = {
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    with open(output_path, "wb") as fh:
+        pickle.dump(payload, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    return 0
+
+
+def run_benchmark_call_with_timeout(
+    function_name: str,
+    kwargs: Dict[str, Any],
+    timeout_seconds: Optional[float],
+) -> Dict[str, Any]:
+    """Run a benchmark formula call in a child process with hard wall-clock timeout."""
+    timeout_seconds = float(timeout_seconds or 0.0)
+    if timeout_seconds <= 0:
+        return globals()[function_name](**kwargs)
+
+    worker_dir = Path("scratch") / "benchmark_workers"
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    unique = f"{os.getpid()}_{time.time_ns()}"
+    input_path = worker_dir / f"{unique}.in.pkl"
+    output_path = worker_dir / f"{unique}.out.pkl"
+    t0 = time.time()
+    with open(input_path, "wb") as fh:
+        pickle.dump({"function": function_name, "kwargs": kwargs}, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    try:
+        cmd = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--_benchmark-worker",
+            str(input_path),
+            str(output_path),
+        ]
+        completed = subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent.parent), timeout=timeout_seconds)
+        elapsed = time.time() - t0
+        if completed.returncode != 0:
+            return _timeout_result(
+                kwargs.get("formula_str", ""),
+                kwargs.get("x_range", (0.0, 0.0)),
+                elapsed,
+                f"worker exited with code {completed.returncode}",
+            )
+        if not output_path.exists():
+            return _timeout_result(
+                kwargs.get("formula_str", ""),
+                kwargs.get("x_range", (0.0, 0.0)),
+                elapsed,
+                "worker produced no result",
+            )
+        with open(output_path, "rb") as fh:
+            payload = pickle.load(fh)
+        if payload.get("status") == "ok":
+            result = payload["result"]
+            elapsed = float(result.get("time") or (time.time() - t0))
+            if elapsed > timeout_seconds:
+                result["error"] = f"timeout_exceeded after {elapsed:.1f}s"
+                result["score"] = "FAIL"
+            return result
+
+        error = payload.get("error", "worker error")
+        return _timeout_result(kwargs.get("formula_str", ""), kwargs.get("x_range", (0.0, 0.0)), elapsed, error)
+    except subprocess.TimeoutExpired:
+        elapsed = time.time() - t0
+        return _timeout_result(
+            kwargs.get("formula_str", ""),
+            kwargs.get("x_range", (0.0, 0.0)),
+            elapsed,
+            f"hard timeout after {elapsed:.1f}s",
+        )
+    finally:
+        for path in (input_path, output_path):
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1372,6 +1835,7 @@ def generate_markdown_report(
     output_path: Path,
     classifier_path: str,
     total_time: float,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Write a detailed Markdown report."""
     lines = []
@@ -1379,6 +1843,12 @@ def generate_markdown_report(
     lines.append(f"**Date**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     lines.append(f"**Classifier**: `{classifier_path}`\n")
     lines.append(f"**Total runtime**: {total_time:.1f}s\n")
+    if metadata:
+        lines.append(f"**Mode**: `{metadata.get('mode', '')}`\n")
+        lines.append(f"**Python ABI**: `{metadata.get('python_abi', '')}`\n")
+        lines.append(f"**C++ core**: `{metadata.get('cpp_core_status', {}).get('status', 'unknown')}`\n")
+        if metadata.get("seed") is not None:
+            lines.append(f"**Seed**: `{metadata.get('seed')}`\n")
 
     # Overall summary table
     lines.append("\n## Summary\n")
@@ -1408,8 +1878,8 @@ def generate_markdown_report(
         tier_name = ALL_TIERS[tier_num][0]
         results = all_results[tier_num]
         lines.append(f"\n## Tier {tier_num}: {tier_name}\n")
-        lines.append("| # | Score | Target | Discovered | MSE(score) | MSE(raw) | MSE(display) | Time | Terms |")
-        lines.append("|---|-------|--------|------------|------------|----------|--------------|------|-------|")
+        lines.append("| # | Score | Target | Discovered | MSE(score) | MSE(raw) | MSE(display) | Drift | Stage | Time | Terms |")
+        lines.append("|---|-------|--------|------------|------------|----------|--------------|-------|-------|------|-------|")
 
         for i, r in enumerate(results, 1):
             sym = SCORE_SYMBOLS.get(r["score"], "?")
@@ -1425,12 +1895,26 @@ def generate_markdown_report(
                 f"{mse_display:.2e}" if mse_display is not None and math.isfinite(mse_display) else "—"
             )
             time_s = f"{r['time']:.2f}s" if r["time"] is not None else "—"
+            drift_rel = r.get("mse_divergence_rel")
+            if drift_rel is not None and math.isfinite(drift_rel):
+                drift_s = f"{drift_rel:.1e}" if r.get("mse_divergence_flag") else ""
+            else:
+                drift_s = ""
+            stage = r.get("winning_stage") or r.get("benchmark_path") or ""
+            if r.get("composition_won_final_selection"):
+                stage = "composition"
+            elif r.get("composition_seeded_evolution") and stage:
+                stage = f"{stage}+comp"
+            elif r.get("composition_seeded_evolution"):
+                stage = "composition_seeded"
+            if len(stage) > 28:
+                stage = stage[:25] + "..."
             n_terms = r.get("n_terms", 0)
             err = r.get("error", "")
             if err:
                 disc = f"ERROR: {err[:40]}"
             lines.append(
-                f"| {i} | {sym} | `{target}` | `{disc}` | {mse_s} | {mse_raw_s} | {mse_display_s} | {time_s} | {n_terms} |"
+                f"| {i} | {sym} | `{target}` | `{disc}` | {mse_s} | {mse_raw_s} | {mse_display_s} | {drift_s} | {stage} | {time_s} | {n_terms} |"
             )
 
     output_path.write_text("\n".join(lines), encoding="utf-8")
@@ -1441,12 +1925,14 @@ def save_json_results(
     output_path: Path,
     classifier_path: str,
     total_time: float,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Save full results to JSON."""
     data = {
         "timestamp": datetime.now().isoformat(),
         "classifier": classifier_path,
         "total_time_seconds": round(total_time, 2),
+        "metadata": metadata or {},
         "tiers": {},
     }
 
@@ -1475,6 +1961,207 @@ def save_json_results(
     output_path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
 
 
+def _cpp_core_status() -> Dict[str, Any]:
+    core, reason = cfp._load_cpp_core()
+    built_extensions: List[str] = []
+    try:
+        cpp_dir = _REPO_ROOT / "glassbox" / "sr" / "cpp"
+        built_extensions = sorted(p.name for p in cpp_dir.glob("_core.*"))
+    except Exception:
+        built_extensions = []
+    return {
+        "status": "available" if core is not None else "unavailable",
+        "reason": reason,
+        "built_extensions": built_extensions,
+    }
+
+
+def _collect_report_diagnostics(all_results: Dict[int, List[Dict]]) -> Dict[str, int]:
+    diagnostics = {
+        "exact_match_combo_cap_count": 0,
+        "bounded_sparse_beam_count": 0,
+        "display_eval_failure_count": 0,
+        "mse_divergence_flag_count": 0,
+        "candidate_governor_count": 0,
+    }
+    for results in all_results.values():
+        for result in results:
+            exact_diag = result.get("exact_match_diagnostics")
+            if isinstance(exact_diag, dict):
+                if exact_diag.get("combo_count", 0) and exact_diag.get("max_combos", 0):
+                    if exact_diag.get("combo_count", 0) > exact_diag.get("max_combos", 0):
+                        diagnostics["exact_match_combo_cap_count"] += 1
+                if str(exact_diag.get("fallback_reason", "")).startswith("bounded_sparse_beam"):
+                    diagnostics["bounded_sparse_beam_count"] += 1
+            if result.get("display_eval_diagnostics") and result.get("mse_display") is None:
+                diagnostics["display_eval_failure_count"] += 1
+            if result.get("mse_divergence_flag"):
+                diagnostics["mse_divergence_flag_count"] += 1
+            details = result.get("details")
+            if isinstance(details, dict) and details.get("candidate_governor"):
+                diagnostics["candidate_governor_count"] += 1
+            for cand in result.get("candidate_formulas") or []:
+                if isinstance(cand, dict) and cand.get("governor"):
+                    diagnostics["candidate_governor_count"] += 1
+                    break
+    return diagnostics
+
+
+def _build_run_metadata(
+    args: argparse.Namespace,
+    *,
+    device: str,
+    mode: str,
+    tiers_to_run: List[int],
+    total_formulas: int,
+    all_results: Optional[Dict[int, List[Dict]]] = None,
+) -> Dict[str, Any]:
+    metadata = {
+        "mode": mode,
+        "device": device,
+        "seed": args.seed,
+        "runs": int(args.runs),
+        "tiers": list(tiers_to_run),
+        "total_formulas": int(total_formulas),
+        "n_samples": int(args.n_samples),
+        "python_version": platform.python_version(),
+        "python_abi": getattr(sys.implementation, "cache_tag", "unknown"),
+        "platform": platform.platform(),
+        "classifier_model": args.classifier_model,
+        "proposer_model": None if args.disable_proposer else args.proposer_model,
+        "exact_match_backend": args.exact_match_backend,
+        "exact_match_min_gpu_work": int(args.exact_match_min_gpu_work),
+        "exact_match_max_combos": int(args.exact_match_max_combos),
+        "cpp_core_status": _cpp_core_status(),
+        "specialist_phase_config": {
+            "specialist_regressor": bool(args.specialist_regressor),
+            "specialist_baseline": bool(args.specialist_baseline),
+            "diagnostics": not bool(args.disable_specialist_diagnostics),
+            "composition": not bool(args.disable_specialist_composition),
+            "residual": bool(args.enable_specialist_residual or args.specialist_full),
+            "vault": not bool(args.disable_specialist_vault),
+            "inception": bool(args.enable_specialist_inception or args.specialist_full),
+        },
+    }
+    if all_results is not None:
+        metadata["report_diagnostics"] = _collect_report_diagnostics(all_results)
+    return metadata
+
+
+def _flatten_json_report_results(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    flattened: Dict[str, Dict[str, Any]] = {}
+    tiers = report.get("tiers", {})
+    if not isinstance(tiers, dict):
+        return flattened
+    for tier_payload in tiers.values():
+        if not isinstance(tier_payload, dict):
+            continue
+        for result in tier_payload.get("results", []) or []:
+            if not isinstance(result, dict):
+                continue
+            key = str(result.get("formula_target") or result.get("human_name") or "").strip()
+            if key:
+                flattened[key] = result
+    return flattened
+
+
+def _flatten_current_results(all_results: Dict[int, List[Dict]]) -> Dict[str, Dict[str, Any]]:
+    flattened: Dict[str, Dict[str, Any]] = {}
+    for results in all_results.values():
+        for result in results:
+            key = str(result.get("formula_target") or result.get("human_name") or "").strip()
+            if key:
+                flattened[key] = result
+    return flattened
+
+
+def compare_benchmark_results(
+    previous_report_path: Path,
+    current_results: Dict[int, List[Dict]],
+) -> Dict[str, Any]:
+    previous_report = json.loads(previous_report_path.read_text(encoding="utf-8"))
+    previous = _flatten_json_report_results(previous_report)
+    current = _flatten_current_results(current_results)
+    transitions: List[Dict[str, Any]] = []
+    summary = {
+        "previous_only": 0,
+        "current_only": 0,
+        "same": 0,
+        "improved": 0,
+        "regressed": 0,
+        "changed": 0,
+    }
+
+    for key, cur in sorted(current.items()):
+        prev = previous.get(key)
+        if prev is None:
+            summary["current_only"] += 1
+            transitions.append({
+                "formula": key,
+                "previous_score": None,
+                "current_score": cur.get("score"),
+                "direction": "new",
+            })
+            continue
+
+        prev_score = str(prev.get("score", "FAIL"))
+        cur_score = str(cur.get("score", "FAIL"))
+        prev_points = _SCORE_POINTS.get(prev_score, 0)
+        cur_points = _SCORE_POINTS.get(cur_score, 0)
+        if cur_points > prev_points:
+            direction = "improved"
+            summary["improved"] += 1
+        elif cur_points < prev_points:
+            direction = "regressed"
+            summary["regressed"] += 1
+        else:
+            direction = "same"
+            summary["same"] += 1
+
+        prev_mse = prev.get("mse")
+        cur_mse = cur.get("mse")
+        prev_formula = prev.get("formula_discovered")
+        cur_formula = cur.get("formula_discovered")
+        mse_changed = False
+        try:
+            if prev_mse is None or cur_mse is None:
+                mse_changed = prev_mse != cur_mse
+            else:
+                mse_changed = not math.isclose(float(prev_mse), float(cur_mse), rel_tol=1e-9, abs_tol=1e-12)
+        except Exception:
+            mse_changed = prev_mse != cur_mse
+        formula_changed = prev_formula != cur_formula
+        if direction != "same" or prev_score != cur_score or mse_changed or formula_changed:
+            summary["changed"] += 1
+        transitions.append({
+            "formula": key,
+            "previous_score": prev_score,
+            "current_score": cur_score,
+            "direction": direction,
+            "previous_mse": prev_mse,
+            "current_mse": cur_mse,
+            "previous_formula": prev_formula,
+            "current_formula": cur_formula,
+            "mse_changed": mse_changed,
+            "formula_changed": formula_changed,
+        })
+
+    for key in sorted(set(previous) - set(current)):
+        summary["previous_only"] += 1
+        transitions.append({
+            "formula": key,
+            "previous_score": previous[key].get("score"),
+            "current_score": None,
+            "direction": "missing",
+        })
+
+    return {
+        "previous_report": str(previous_report_path),
+        "summary": summary,
+        "transitions": transitions,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1490,6 +2177,7 @@ Examples:
   python scripts/benchmark_suite.py --tier 1 --tier 2                  # Tiers 1 & 2
   python scripts/benchmark_suite.py --classifier-model models/v3.pt   # Custom model
   python scripts/benchmark_suite.py --output-dir results/              # Custom output
+  python scripts/benchmark_suite.py --compare-to results/old.json      # Compare reports
         """,
     )
     parser.add_argument(
@@ -1520,6 +2208,38 @@ Examples:
         help="Skip fast-path and run latest guided evolution (beam-search path) for every formula",
     )
     parser.add_argument(
+        "--specialist-regressor", action="store_true",
+        help="Run formulas through GlassboxRegressor so specialist composition/boosting is measured",
+    )
+    parser.add_argument(
+        "--specialist-baseline", action="store_true",
+        help="With --specialist-regressor, disable specialist screening/composition/residual stages for A/B comparison",
+    )
+    parser.add_argument(
+        "--disable-specialist-diagnostics", action="store_true",
+        help="With --specialist-regressor, skip specialist pair/segment diagnostics",
+    )
+    parser.add_argument(
+        "--disable-specialist-composition", action="store_true",
+        help="With --specialist-regressor, keep diagnostics but skip specialist composition proposals",
+    )
+    parser.add_argument(
+        "--enable-specialist-residual", action="store_true",
+        help="With --specialist-regressor, enable the residual symbolic stage for accepted compositions",
+    )
+    parser.add_argument(
+        "--disable-specialist-vault", action="store_true",
+        help="With --specialist-regressor, disable cross-run specialist vault memory",
+    )
+    parser.add_argument(
+        "--enable-specialist-inception", action="store_true",
+        help="With --specialist-regressor, enable inception/subexpression reuse",
+    )
+    parser.add_argument(
+        "--specialist-full", action="store_true",
+        help="With --specialist-regressor, enable all specialist phases including residual and inception",
+    )
+    parser.add_argument(
         "--tier", type=int, action="append", default=None, dest="tiers",
         help="Run only specific tier(s). Can be repeated: --tier 1 --tier 2",
     )
@@ -1536,8 +2256,34 @@ Examples:
         help="Device for classifier inference (default: auto)",
     )
     parser.add_argument(
+        "--exact-match-backend",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "torch_cuda", "torch", "numpy"],
+        help=(
+            "Backend for fast-path exact symbolic matching. In auto mode, CUDA is used "
+            "only when device resolves to cuda and the work threshold is met."
+        ),
+    )
+    parser.add_argument(
+        "--exact-match-min-gpu-work",
+        type=int,
+        default=250_000,
+        help="Minimum estimated exact-match work before auto mode uses CUDA (default: 250000)",
+    )
+    parser.add_argument(
+        "--exact-match-max-combos",
+        type=int,
+        default=50_000,
+        help="Maximum pair/triple exact-match combinations before falling back to sparse search (default: 50000)",
+    )
+    parser.add_argument(
         "--timeout", type=float, default=60.0,
-        help="Timeout per formula in seconds (default: 60)",
+        help="Engine timeout budget per formula in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--hard-timeout", action="store_true",
+        help="Run each formula in a subprocess and enforce --timeout as a hard wall-clock limit",
     )
     parser.add_argument(
         "--quiet", action="store_true",
@@ -1571,16 +2317,74 @@ Examples:
         "--runs", type=int, default=1,
         help="Number of times to run each formula. Returns best result. (default: 1)",
     )
+    parser.add_argument(
+        "--seed", type=int, default=None,
+        help="Set Python, NumPy, and Torch random seeds for repeatable benchmark runs",
+    )
+    parser.add_argument(
+        "--compare-to", type=str, default=None,
+        help="Compare this run against a prior benchmark JSON report",
+    )
     args = parser.parse_args()
 
-    if args.cpp_evolution_only and args.evolution_only:
-        print("Error: --cpp-evolution-only and --evolution-only cannot be used together.")
+    exclusive_modes = sum(bool(v) for v in (args.cpp_evolution_only, args.evolution_only, args.specialist_regressor))
+    if exclusive_modes > 1:
+        print("Error: --cpp-evolution-only, --evolution-only, and --specialist-regressor are mutually exclusive.")
         sys.exit(1)
+    if args.specialist_baseline and not args.specialist_regressor:
+        print("Error: --specialist-baseline requires --specialist-regressor.")
+        sys.exit(1)
+    specialist_phase_flags = (
+        args.disable_specialist_diagnostics,
+        args.disable_specialist_composition,
+        args.enable_specialist_residual,
+        args.disable_specialist_vault,
+        args.enable_specialist_inception,
+        args.specialist_full,
+    )
+    if any(specialist_phase_flags) and not args.specialist_regressor:
+        print("Error: specialist phase flags require --specialist-regressor.")
+        sys.exit(1)
+
+    specialist_diagnostics = not args.disable_specialist_diagnostics
+    specialist_composition = specialist_diagnostics and not args.disable_specialist_composition
+    specialist_residual = bool(args.enable_specialist_residual or args.specialist_full)
+    specialist_vault = not args.disable_specialist_vault
+    specialist_inception = bool(args.enable_specialist_inception or args.specialist_full)
+    if args.specialist_full:
+        specialist_diagnostics = True
+        specialist_composition = True
+        specialist_vault = True
+
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+
+    compare_to_path = Path(args.compare_to) if args.compare_to else None
+    if compare_to_path is not None and not compare_to_path.exists():
+        print(f"Error: --compare-to report does not exist: {compare_to_path}")
+        sys.exit(2)
+
+    # Validate report output before doing expensive formula work.
+    output_dir = Path(args.output_dir)
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        probe_path = output_dir / ".benchmark_write_probe"
+        probe_path.write_text("", encoding="utf-8")
+        probe_path.unlink(missing_ok=True)
+    except Exception as exc:
+        print(f"Error: cannot write benchmark reports to '{output_dir}': {exc}")
+        sys.exit(2)
 
     # Resolve device
     device = args.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
+    args.exact_match_min_gpu_work = max(0, int(args.exact_match_min_gpu_work))
+    args.exact_match_max_combos = max(0, int(args.exact_match_max_combos))
 
     # Determine which tiers to run
     tiers_to_run = args.tiers if args.tiers else list(ALL_TIERS.keys())
@@ -1615,6 +2419,8 @@ Examples:
     print("=" * 90)
     if args.cpp_evolution_only:
         mode_str = "Pure C++ Evolution (No Classifier/Proposer)"
+    elif args.specialist_regressor:
+        mode_str = "GlassboxRegressor Specialist" if not args.specialist_baseline else "GlassboxRegressor Baseline"
     elif args.evolution_only:
         mode_str = "Guided Evolution Only (latest path)"
     else:
@@ -1625,6 +2431,22 @@ Examples:
         print(f"  Generations: {args.generations}")
     elif args.evolution_only:
         print("  Strategy:    guided beam-search evolution")
+    elif args.specialist_regressor:
+        print("  Strategy:    sklearn regressor path")
+        print(f"  Specialist:  {'disabled baseline' if args.specialist_baseline else 'enabled'}")
+        if not args.specialist_baseline:
+            phase_txt = ", ".join(
+                name
+                for name, enabled in (
+                    ("diagnostics", specialist_diagnostics),
+                    ("composition", specialist_composition),
+                    ("residual", specialist_residual),
+                    ("vault", specialist_vault),
+                    ("inception", specialist_inception),
+                )
+                if enabled
+            ) or "none"
+            print(f"  Phases:      {phase_txt}")
     else:
         print(f"  Classifier:  {args.classifier_model}")
         proposer_txt = args.proposer_model if not args.disable_proposer else "DISABLED"
@@ -1633,9 +2455,18 @@ Examples:
             print("  Planner:     universal proposer search plan")
         print("  Strategy:    optimized")
     print(f"  Device:      {device}")
+    if not args.cpp_evolution_only:
+        print(
+            f"  Exact match: {args.exact_match_backend} "
+            f"(min GPU work={args.exact_match_min_gpu_work}, max combos={args.exact_match_max_combos})"
+        )
     print(f"  Tiers:       {tiers_to_run}")
     print(f"  Formulas:    {total_formulas}")
     print(f"  Samples/ea:  {args.n_samples}")
+    if args.seed is not None:
+        print(f"  Seed:        {args.seed}")
+    if compare_to_path is not None:
+        print(f"  Compare to:  {compare_to_path}")
     print("=" * 90)
 
     # Run benchmark
@@ -1663,30 +2494,62 @@ Examples:
             
             for _ in range(args.runs):
                 if args.cpp_evolution_only:
-                    result = run_formula_cpp_evolution(
-                        formula_str,
-                        x_range,
-                        n_samples=args.n_samples,
-                        pop_size=args.pop_size,
-                        generations=args.generations,
-                        device=device,
-                    )
+                    call_name = "run_formula_cpp_evolution"
+                    call_kwargs = {
+                        "formula_str": formula_str,
+                        "x_range": x_range,
+                        "n_samples": args.n_samples,
+                        "pop_size": args.pop_size,
+                        "generations": args.generations,
+                        "device": device,
+                        "timeout": args.timeout,
+                    }
+                elif args.specialist_regressor:
+                    call_name = "run_formula_specialist_regressor"
+                    call_kwargs = {
+                        "formula_str": formula_str,
+                        "x_range": x_range,
+                        "classifier_path": args.classifier_model,
+                        "proposer_path": None if args.disable_proposer else args.proposer_model,
+                        "n_samples": args.n_samples,
+                        "device": device,
+                        "timeout": args.timeout,
+                        "population_size": args.guided_pop_size,
+                        "generations": args.guided_generations,
+                        "specialist_enabled": not args.specialist_baseline,
+                        "specialist_diagnostics": specialist_diagnostics,
+                        "specialist_composition": specialist_composition,
+                        "specialist_residual": specialist_residual,
+                        "specialist_vault": specialist_vault,
+                        "specialist_inception": specialist_inception,
+                        "exact_match_backend": args.exact_match_backend,
+                        "exact_match_min_gpu_work": args.exact_match_min_gpu_work,
+                        "exact_match_max_combos": args.exact_match_max_combos,
+                    }
                 else:
-                    result = run_formula(
-                        formula_str,
-                        x_range,
-                        classifier_path=args.classifier_model,
-                        n_samples=args.n_samples,
-                        device=device,
-                        timeout=args.timeout,
-                        with_evolution=args.with_evolution,
-                        evolution_only=args.evolution_only,
-                        proposer_path=args.proposer_model,
-                        disable_proposer=args.disable_proposer,
-                        evolution_generations=args.guided_generations,
-                        evolution_population=args.guided_pop_size,
-                        trust_proposer_plan=args.trust_proposer_plan,
-                    )
+                    call_name = "run_formula"
+                    call_kwargs = {
+                        "formula_str": formula_str,
+                        "x_range": x_range,
+                        "classifier_path": args.classifier_model,
+                        "n_samples": args.n_samples,
+                        "device": device,
+                        "timeout": args.timeout,
+                        "with_evolution": args.with_evolution,
+                        "evolution_only": args.evolution_only,
+                        "proposer_path": args.proposer_model,
+                        "disable_proposer": args.disable_proposer,
+                        "evolution_generations": args.guided_generations,
+                        "evolution_population": args.guided_pop_size,
+                        "trust_proposer_plan": args.trust_proposer_plan,
+                        "exact_match_backend": args.exact_match_backend,
+                        "exact_match_min_gpu_work": args.exact_match_min_gpu_work,
+                        "exact_match_max_combos": args.exact_match_max_combos,
+                    }
+                if args.hard_timeout:
+                    result = run_benchmark_call_with_timeout(call_name, call_kwargs, args.timeout)
+                else:
+                    result = globals()[call_name](**call_kwargs)
                 
                 # Keep the best result based on displayed MSE (or just any valid MSE if best_result is None)
                 if best_result is None:
@@ -1736,28 +2599,48 @@ Examples:
     print_summary(all_results)
 
     # Save reports
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    metadata = _build_run_metadata(
+        args,
+        device=device,
+        mode=mode_str,
+        tiers_to_run=tiers_to_run,
+        total_formulas=total_formulas,
+        all_results=all_results,
+    )
 
     json_path = output_dir / f"benchmark_{ts}.json"
-    save_json_results(all_results, json_path, args.classifier_model, total_time)
+    save_json_results(all_results, json_path, args.classifier_model, total_time, metadata=metadata)
     print(f"JSON report: {json_path}")
 
     md_path = output_dir / f"benchmark_{ts}.md"
-    generate_markdown_report(all_results, md_path, args.classifier_model, total_time)
+    generate_markdown_report(all_results, md_path, args.classifier_model, total_time, metadata=metadata)
     print(f"Markdown report: {md_path}")
+
+    if compare_to_path is not None:
+        comparison = compare_benchmark_results(compare_to_path, all_results)
+        compare_path = output_dir / f"benchmark_compare_{ts}.json"
+        compare_path.write_text(json.dumps(comparison, indent=2, default=str), encoding="utf-8")
+        summary = comparison["summary"]
+        print(
+            "Comparison: "
+            f"+{summary['improved']} / -{summary['regressed']} / "
+            f"{summary['same']} same / {summary['current_only']} new"
+        )
+        print(f"Comparison report: {compare_path}")
 
     # Also save a "latest" copy for easy access
     json_latest = output_dir / "benchmark_latest.json"
-    save_json_results(all_results, json_latest, args.classifier_model, total_time)
+    save_json_results(all_results, json_latest, args.classifier_model, total_time, metadata=metadata)
 
     md_latest = output_dir / "benchmark_latest.md"
-    generate_markdown_report(all_results, md_latest, args.classifier_model, total_time)
+    generate_markdown_report(all_results, md_latest, args.classifier_model, total_time, metadata=metadata)
     print(f"Latest links: {json_latest}, {md_latest}")
 
     print(f"\nTotal time: {total_time:.1f}s")
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 4 and sys.argv[1] == "--_benchmark-worker":
+        raise SystemExit(_benchmark_worker_cli(sys.argv[2], sys.argv[3]))
     main()
