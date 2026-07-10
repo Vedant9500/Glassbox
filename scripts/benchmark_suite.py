@@ -15,10 +15,13 @@ Usage:
 
 Scoring:
     Uses displayed-formula MSE only for scoring; raw MSE is diagnostic.
-  EXACT   — MSE < 1e-6  AND  ≤ 5 terms
+  EXACT   — MSE < 1e-6 (or noise-aware band under --noise) AND ≤ 10 terms
   APPROX  — MSE < 0.01
   LOOSE   — MSE < 0.1
   FAIL    — MSE ≥ 0.1 or error
+
+  Under --noise, EXACT is a *noisy-fit* band, not structure recovery.
+  Prefer CleanMSE / R2clean / Recov columns (see noise_handling_audit.md).
 """
 
 import argparse
@@ -509,13 +512,60 @@ def _parse_formula(formula_str: str) -> Callable[[np.ndarray], np.ndarray]:
         return fallback_fn
 
 
+# Preset noise levels for --noise flag (RMS as fraction of signal std).
+# Mirrors the Phase 0 tiers in scripts/benchmark_noise.py but kept as simple
+# Gaussian presets so the existing clean benchmark can run under noise without
+# pulling the full protocol.
+def _noise_type_for_preset(preset: str) -> str:
+    cfg = NOISE_PRESETS.get(preset)
+    return (cfg or {}).get("noise_type", "clean") if cfg else "clean"
+
+
+def _noise_level_for_preset(preset: str) -> float:
+    cfg = NOISE_PRESETS.get(preset)
+    return (cfg or {}).get("noise_level", 0.0) if cfg else 0.0
+
+
+NOISE_PRESETS: Dict[str, Optional[Dict[str, Any]]] = {
+    "none": None,
+    "low": {"noise_type": "gaussian", "noise_level": 0.001},
+    "medium": {"noise_type": "gaussian", "noise_level": 0.01},
+    "high": {"noise_type": "gaussian", "noise_level": 0.10},
+    "outliers": {"noise_type": "outliers", "noise_level": 0.03},
+}
+
+
+def _apply_noise_to_y(y: np.ndarray, noise_cfg: Optional[Dict[str, Any]], *, seed: int) -> np.ndarray:
+    """Inject noise into a clean target vector using benchmark_noise generators."""
+    if not noise_cfg:
+        return y
+    try:
+        from scripts import benchmark_noise as bn
+    except Exception:
+        # Fallback: simple additive Gaussian so --noise still works if the
+        # Phase 0 module is unavailable. Match constant-target scale rule.
+        rng = np.random.RandomState(int(seed))
+        arr = np.asarray(y, dtype=np.float64)
+        y_std = float(np.std(arr))
+        y_abs = float(np.mean(np.abs(arr))) if arr.size else 0.0
+        floor = max(1e-12, 1e-6 * max(y_abs, 1.0))
+        if y_std <= floor:
+            scale = y_abs if y_abs > 1e-12 else 1.0
+        else:
+            scale = y_std
+        return arr + rng.normal(0.0, float(noise_cfg.get("noise_level", 0.0)) * scale, size=arr.shape)
+    return bn.apply_noise_tier(y, noise_cfg, seed=int(seed))
+
+
 def _generate_data(
     formula_str: str,
     x_min: float = -5.0,
     x_max: float = 5.0,
     n_samples: int = 300,
+    noise_cfg: Optional[Dict[str, Any]] = None,
+    noise_seed: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Generate clean (x, y) data from a formula string."""
+    """Generate (x, y) data from a formula string, optionally adding noise."""
     fn = _parse_formula(formula_str)
     x = np.linspace(x_min, x_max, n_samples)
     y = fn(x)
@@ -526,6 +576,9 @@ def _generate_data(
         raise ValueError(f"Too few valid points ({mask.sum()}) for '{formula_str}'")
     x = x[mask]
     y = y[mask]
+
+    if noise_cfg:
+        y = _apply_noise_to_y(np.asarray(y, dtype=np.float64), noise_cfg, seed=int(noise_seed))
     return x, y
 
 
@@ -775,12 +828,42 @@ def _record_display_eval_failure(
             result["error"] = "formula_eval_failed"
 
 
+# Noise-aware scoring context: set by main() when --noise is used so that
+# structurally-correct formulas recovered under noise still count as EXACT.
+# Defaults to clean semantics (1e-6 wall) when unset.
+_NOISE_AWARE_EXACT_TOL: float = 1e-6
+
+
+_NOISE_LEVEL: float = 0.0
+
+
+def set_noise_aware_exact_tol(noise_level: float, y_var: float) -> None:
+    """Configure noise-aware EXACT scoring from the injected noise level.
+
+    Stores the noise level; the per-formula loop calls update_noise_aware_y_var
+    with each target's variance so the EXACT threshold scales correctly with
+    signal magnitude. Stays at the clean 1e-6 wall when noise_level == 0.
+    """
+    global _NOISE_AWARE_EXACT_TOL, _NOISE_LEVEL
+    _NOISE_LEVEL = max(0.0, float(noise_level or 0.0))
+    _NOISE_AWARE_EXACT_TOL = max(1e-6, 4.0 * (_NOISE_LEVEL ** 2) * float(y_var)) if _NOISE_LEVEL > 0 else 1e-6
+
+
+def update_noise_aware_y_var(y_var: float) -> None:
+    """Recompute the EXACT threshold for the current target's variance."""
+    global _NOISE_AWARE_EXACT_TOL
+    if _NOISE_LEVEL > 0:
+        _NOISE_AWARE_EXACT_TOL = max(1e-6, 4.0 * (_NOISE_LEVEL ** 2) * float(y_var))
+    else:
+        _NOISE_AWARE_EXACT_TOL = 1e-6
+
+
 def score_result(mse: float, formula: str) -> str:
     """Classify a result as EXACT / APPROX / LOOSE / FAIL."""
     if mse is None or not math.isfinite(mse):
         return "FAIL"
     n_terms = _count_terms(formula)
-    if mse < 1e-6 and n_terms <= 10:
+    if mse < _NOISE_AWARE_EXACT_TOL and n_terms <= 10:
         return "EXACT"
     if mse < 0.01:
         return "APPROX"
@@ -868,6 +951,87 @@ def _guided_evolution_decision(
     return False, "fast_path_confident"
 
 
+
+def _safe_r2_np(y_true, y_pred) -> Optional[float]:
+    """Unweighted R2; None when prediction is invalid."""
+    y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
+    if y_true.shape != y_pred.shape or not np.all(np.isfinite(y_pred)):
+        return None
+    var = float(np.var(y_true))
+    if var < 1e-15:
+        return 1.0 if float(np.mean((y_pred - y_true) ** 2)) < 1e-15 else 0.0
+    return float(1.0 - np.mean((y_pred - y_true) ** 2) / var)
+
+
+def _attach_clean_target_metrics(
+    result: Dict[str, Any],
+    x: np.ndarray,
+    y_clean: np.ndarray,
+    *,
+    exact_tol: float = 1e-6,
+    acceptable_r2: float = 0.99,
+) -> Dict[str, Any]:
+    """Attach clean-target recovery metrics (independent of noisy EXACT band).
+
+    Suite ``score`` / ``mse`` may use noisy labels under ``--noise``. Clean
+    metrics answer: "does the discovered formula recover the true signal?"
+    See ``noise_handling_audit.md``.
+    """
+    formula = str(result.get("formula_discovered") or "").strip()
+    x_arr = np.asarray(x, dtype=np.float64)
+    y_arr = np.asarray(y_clean, dtype=np.float64).reshape(-1)
+
+    mse_clean = None
+    r2_clean = None
+    if formula:
+        mse_clean = _evaluate_formula_mse(formula, x_arr, y_arr)
+        y_pred = cfp._evaluate_formula_values(formula, x_arr)
+        if y_pred is not None:
+            r2_clean = _safe_r2_np(y_arr, y_pred)
+
+    n_terms = int(result.get("n_terms") or _count_terms(formula))
+    recovery_exact = bool(
+        mse_clean is not None
+        and math.isfinite(float(mse_clean))
+        and float(mse_clean) < float(exact_tol)
+        and n_terms <= 10
+    )
+    recovery_acceptable = bool(
+        r2_clean is not None
+        and math.isfinite(float(r2_clean))
+        and float(r2_clean) >= float(acceptable_r2)
+    )
+
+    result["mse_clean"] = (
+        float(mse_clean) if mse_clean is not None and math.isfinite(float(mse_clean)) else None
+    )
+    result["r2_clean"] = (
+        float(r2_clean) if r2_clean is not None and math.isfinite(float(r2_clean)) else None
+    )
+    result["recovery_exact"] = recovery_exact
+    result["recovery_acceptable"] = recovery_acceptable
+    return result
+
+
+def _generate_xy_with_optional_noise(
+    formula_str: str,
+    x_min: float,
+    x_max: float,
+    n_samples: int,
+    noise_cfg: Optional[Dict[str, Any]] = None,
+    noise_seed: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(x, y_fit, y_clean)``. ``y_fit`` equals ``y_clean`` when no noise."""
+    x_np, y_clean = _generate_data(formula_str, x_min, x_max, n_samples)
+    y_clean = np.asarray(y_clean, dtype=np.float64).reshape(-1)
+    if noise_cfg:
+        y_fit = _apply_noise_to_y(y_clean, noise_cfg, seed=int(noise_seed))
+    else:
+        y_fit = y_clean
+    return np.asarray(x_np, dtype=np.float64), np.asarray(y_fit, dtype=np.float64), y_clean
+
+
 SCORE_SYMBOLS = {
     "EXACT":  "[PASS]",
     "APPROX": "[APPROX]",
@@ -906,6 +1070,8 @@ def run_formula(
     exact_match_backend: str = "auto",
     exact_match_min_gpu_work: int = 250_000,
     exact_match_max_combos: int = 50_000,
+    noise_cfg: Optional[Dict[str, Any]] = None,
+    noise_seed: int = 0,
 ) -> Dict[str, Any]:
     """Run fast-path and/or guided evolution on a single formula."""
     x_min, x_max = x_range
@@ -916,6 +1082,10 @@ def run_formula(
         "mse": None,
         "mse_raw": None,
         "mse_display": None,
+        "mse_clean": None,
+        "r2_clean": None,
+        "recovery_exact": False,
+        "recovery_acceptable": False,
         "time": None,
         "score": "FAIL",
         "error": None,
@@ -940,8 +1110,11 @@ def run_formula(
     }
 
     try:
-        # Generate data
-        x_np, y_np = _generate_data(formula_str, x_min, x_max, n_samples)
+        # Generate data (keep clean labels for recovery; fit on optional noise)
+        x_np, y_np, y_clean = _generate_xy_with_optional_noise(
+            formula_str, x_min, x_max, n_samples,
+            noise_cfg=noise_cfg, noise_seed=noise_seed,
+        )
 
         # Early return for constant targets. This avoids evolution-only
         # degenerating to formula "0" on flat signals.
@@ -988,6 +1161,7 @@ def run_formula(
                 "alpha": 0.0,
             }]
             result["score"] = score_result(0.0, formula)
+            _attach_clean_target_metrics(result, x_np, y_clean)
             return result
 
         # Convert to torch
@@ -1021,6 +1195,7 @@ def run_formula(
                 exact_match_min_gpu_work=exact_match_min_gpu_work,
                 exact_match_max_combos=exact_match_max_combos,
                 simplify_formula_output=False,
+                noise_level=(noise_cfg or {}).get("noise_level", 0.0) if noise_cfg else 0.0,
             )
             elapsed = time.time() - t0
 
@@ -1320,12 +1495,14 @@ def run_formula(
         import traceback; traceback.print_exc()
         result["time"] = 0.0
 
-    # Score
+    # Score (noisy-fit band) + clean-target recovery metrics
     result["score_mse"] = result["mse"]
     if result.get("error") and "timeout" in str(result.get("error")).lower():
         result["score"] = "FAIL"
     else:
         result["score"] = score_result(result["mse"], result["formula_discovered"])
+    if "y_clean" in locals():
+        _attach_clean_target_metrics(result, x_np, y_clean)
     return result
 
 
@@ -1337,6 +1514,8 @@ def run_formula_cpp_evolution(
     generations: int = 1000,
     device: Optional[str] = None,
     timeout: Optional[float] = None,
+    noise_cfg: Optional[Dict[str, Any]] = None,
+    noise_seed: int = 0,
 ) -> Dict[str, Any]:
     """Run pure C++ evolution on a single formula (no classifier fast-path)."""
     import sys
@@ -1350,6 +1529,10 @@ def run_formula_cpp_evolution(
         "mse": None,
         "mse_raw": None,
         "mse_display": None,
+        "mse_clean": None,
+        "r2_clean": None,
+        "recovery_exact": False,
+        "recovery_acceptable": False,
         "time": None,
         "score": "FAIL",
         "error": None,
@@ -1373,8 +1556,11 @@ def run_formula_cpp_evolution(
             sys.path.insert(0, str(cpp_dir))
         import _core
         
-        # Generate data
-        x_np, y_np = _generate_data(formula_str, x_min, x_max, n_samples)
+        # Generate data (keep clean labels for recovery; fit on optional noise)
+        x_np, y_np, y_clean = _generate_xy_with_optional_noise(
+            formula_str, x_min, x_max, n_samples,
+            noise_cfg=noise_cfg, noise_seed=noise_seed,
+        )
         
         # Early return for constant signals (evolution can't find pure constants)
         y_std = np.std(y_np)
@@ -1408,6 +1594,7 @@ def run_formula_cpp_evolution(
                 "residual_suspicious": False,
             }
             result["score"] = score_result(0.0, formula)
+            _attach_clean_target_metrics(result, x_np, y_clean)
             return result
         
         X_list = [x_np]
@@ -1486,6 +1673,8 @@ def run_formula_cpp_evolution(
         result["score"] = "FAIL"
     else:
         result["score"] = score_result(result["mse"], result["formula_discovered"])
+    if "y_clean" in locals():
+        _attach_clean_target_metrics(result, x_np, y_clean)
     return result
 
 
@@ -1508,6 +1697,8 @@ def run_formula_specialist_regressor(
     exact_match_backend: str = "auto",
     exact_match_min_gpu_work: int = 250_000,
     exact_match_max_combos: int = 50_000,
+    noise_cfg: Optional[Dict[str, Any]] = None,
+    noise_seed: int = 0,
 ) -> Dict[str, Any]:
     """Run the sklearn regressor path so specialist composition/boosting is measurable."""
     x_min, x_max = x_range
@@ -1523,6 +1714,10 @@ def run_formula_specialist_regressor(
         "mse": None,
         "mse_raw": None,
         "mse_display": None,
+        "mse_clean": None,
+        "r2_clean": None,
+        "recovery_exact": False,
+        "recovery_acceptable": False,
         "time": None,
         "score": "FAIL",
         "error": None,
@@ -1571,7 +1766,10 @@ def run_formula_specialist_regressor(
     try:
         from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
-        x_np, y_np = _generate_data(formula_str, x_min, x_max, n_samples)
+        x_np, y_np, y_clean = _generate_xy_with_optional_noise(
+            formula_str, x_min, x_max, n_samples,
+            noise_cfg=noise_cfg, noise_seed=noise_seed,
+        )
         X = np.asarray(x_np, dtype=np.float64).reshape(-1, 1)
         y = np.asarray(y_np, dtype=np.float64).reshape(-1)
 
@@ -1599,6 +1797,7 @@ def run_formula_specialist_regressor(
                 "gpu_used": False,
             }
             result["score"] = score_result(0.0, formula)
+            _attach_clean_target_metrics(result, x_np, y_clean)
             return result
 
         reg = GlassboxRegressor(
@@ -1668,6 +1867,8 @@ def run_formula_specialist_regressor(
 
     result["score_mse"] = result["mse"]
     result["score"] = score_result(result["mse"], result["formula_discovered"])
+    if "y_clean" in locals():
+        _attach_clean_target_metrics(result, x_np, y_clean)
     return result
 
 
@@ -1845,6 +2046,17 @@ def generate_markdown_report(
     lines.append(f"**Total runtime**: {total_time:.1f}s\n")
     if metadata:
         lines.append(f"**Mode**: `{metadata.get('mode', '')}`\n")
+        noise_meta = metadata.get("noise") or {}
+        if noise_meta and noise_meta.get("preset") not in (None, "none"):
+            lines.append(
+                f"**Noise**: `{noise_meta.get('preset')}` ({noise_meta.get('noise_type')}, "
+                f"level={noise_meta.get('noise_level')}, seed={noise_meta.get('seed')})\n"
+            )
+            lines.append(
+                "**Note**: `Score/EXACT` uses noisy-label display MSE with a noise-aware "
+                "band. Prefer `CleanMSE` / `R2clean` / `Recov` for structure recovery "
+                "(see `noise_handling_audit.md`).\n"
+            )
         lines.append(f"**Python ABI**: `{metadata.get('python_abi', '')}`\n")
         lines.append(f"**C++ core**: `{metadata.get('cpp_core_status', {}).get('status', 'unknown')}`\n")
         if metadata.get("seed") is not None:
@@ -1878,8 +2090,8 @@ def generate_markdown_report(
         tier_name = ALL_TIERS[tier_num][0]
         results = all_results[tier_num]
         lines.append(f"\n## Tier {tier_num}: {tier_name}\n")
-        lines.append("| # | Score | Target | Discovered | MSE(score) | MSE(raw) | MSE(display) | Drift | Stage | Time | Terms |")
-        lines.append("|---|-------|--------|------------|------------|----------|--------------|-------|-------|------|-------|")
+        lines.append("| # | Score | Target | Discovered | MSE(score) | MSE(raw) | MSE(display) | CleanMSE | R2clean | Recov | Drift | Stage | Time | Terms |")
+        lines.append("|---|-------|--------|------------|------------|----------|--------------|----------|---------|-------|-------|-------|------|-------|")
 
         for i, r in enumerate(results, 1):
             sym = SCORE_SYMBOLS.get(r["score"], "?")
@@ -1894,6 +2106,20 @@ def generate_markdown_report(
             mse_display_s = (
                 f"{mse_display:.2e}" if mse_display is not None and math.isfinite(mse_display) else "—"
             )
+            mse_clean = r.get("mse_clean")
+            mse_clean_s = (
+                f"{mse_clean:.2e}" if mse_clean is not None and math.isfinite(mse_clean) else "—"
+            )
+            r2_clean = r.get("r2_clean")
+            r2_clean_s = (
+                f"{r2_clean:.3f}" if r2_clean is not None and math.isfinite(r2_clean) else "—"
+            )
+            if r.get("recovery_exact"):
+                recov_s = "exact"
+            elif r.get("recovery_acceptable"):
+                recov_s = "ok"
+            else:
+                recov_s = "—"
             time_s = f"{r['time']:.2f}s" if r["time"] is not None else "—"
             drift_rel = r.get("mse_divergence_rel")
             if drift_rel is not None and math.isfinite(drift_rel):
@@ -1914,7 +2140,7 @@ def generate_markdown_report(
             if err:
                 disc = f"ERROR: {err[:40]}"
             lines.append(
-                f"| {i} | {sym} | `{target}` | `{disc}` | {mse_s} | {mse_raw_s} | {mse_display_s} | {drift_s} | {stage} | {time_s} | {n_terms} |"
+                f"| {i} | {sym} | `{target}` | `{disc}` | {mse_s} | {mse_raw_s} | {mse_display_s} | {mse_clean_s} | {r2_clean_s} | {recov_s} | {drift_s} | {stage} | {time_s} | {n_terms} |"
             )
 
     output_path.write_text("\n".join(lines), encoding="utf-8")
@@ -2033,6 +2259,12 @@ def _build_run_metadata(
         "exact_match_min_gpu_work": int(args.exact_match_min_gpu_work),
         "exact_match_max_combos": int(args.exact_match_max_combos),
         "cpp_core_status": _cpp_core_status(),
+        "noise": {
+            "preset": getattr(args, "noise", "none"),
+            "noise_type": _noise_type_for_preset(getattr(args, "noise", "none")),
+            "noise_level": _noise_level_for_preset(getattr(args, "noise", "none")),
+            "seed": int(getattr(args, "noise_seed", 0)),
+        },
         "specialist_phase_config": {
             "specialist_regressor": bool(args.specialist_regressor),
             "specialist_baseline": bool(args.specialist_baseline),
@@ -2322,6 +2554,20 @@ Examples:
         help="Set Python, NumPy, and Torch random seeds for repeatable benchmark runs",
     )
     parser.add_argument(
+        "--noise", type=str, default="none",
+        choices=list(NOISE_PRESETS.keys()),
+        help=(
+            "Inject noise into the (otherwise clean) benchmark targets so "
+            "noise-handling can be measured. Presets: none, low (0.1%% RMS), "
+            "medium (1%% RMS), high (10%% RMS), outliers (3%% spikes). "
+            "Default: none (clean benchmark)."
+        ),
+    )
+    parser.add_argument(
+        "--noise-seed", type=int, default=0,
+        help="Seed for --noise injection so runs are reproducible (default: 0).",
+    )
+    parser.add_argument(
         "--compare-to", type=str, default=None,
         help="Compare this run against a prior benchmark JSON report",
     )
@@ -2367,6 +2613,20 @@ Examples:
     if compare_to_path is not None and not compare_to_path.exists():
         print(f"Error: --compare-to report does not exist: {compare_to_path}")
         sys.exit(2)
+
+    # Resolve --noise preset into a concrete noise config (None == clean).
+    noise_cfg = NOISE_PRESETS.get(args.noise)
+    noise_seed = int(args.noise_seed)
+
+    # Configure noise-aware EXACT scoring so structurally-correct formulas
+    # recovered under noise are still classed EXACT (not penalised down to
+    # APPROX by residual noise MSE). Uses a representative y variance; the
+    # fast-path also recomputes per-formula, but the global default keeps
+    # score_result consistent for non-fast-path formulas too.
+    if noise_cfg is not None:
+        set_noise_aware_exact_tol(float(noise_cfg.get("noise_level", 0.0)), 1.0)
+    else:
+        set_noise_aware_exact_tol(0.0, 1.0)
 
     # Validate report output before doing expensive formula work.
     output_dir = Path(args.output_dir)
@@ -2463,6 +2723,12 @@ Examples:
     print(f"  Tiers:       {tiers_to_run}")
     print(f"  Formulas:    {total_formulas}")
     print(f"  Samples/ea:  {args.n_samples}")
+    if noise_cfg is not None:
+        nt = noise_cfg.get("noise_type", "?")
+        nl = noise_cfg.get("noise_level", 0.0)
+        print(f"  Noise:       {args.noise} ({nt}, level={nl}, seed={noise_seed})")
+    else:
+        print(f"  Noise:       none (clean)")
     if args.seed is not None:
         print(f"  Seed:        {args.seed}")
     if compare_to_path is not None:
@@ -2483,6 +2749,16 @@ Examples:
         tier_results = []
         for formula_str, human_name, x_range in formulas:
             formula_idx += 1
+            # Refresh noise-aware EXACT threshold for this target's variance so
+            # structurally-correct formulas under noise are scored EXACT.
+            try:
+                _probe_x, _probe_y = _generate_data(
+                    formula_str, x_range[0], x_range[1], args.n_samples,
+                )
+                update_noise_aware_y_var(float(np.var(_probe_y)) if _probe_y.size else 1.0)
+            except Exception:
+                pass
+
             if not args.quiet:
                 try:
                     print(f"  [{formula_idx}/{total_formulas}] {human_name:<30} ", end="", flush=True)
@@ -2503,6 +2779,8 @@ Examples:
                         "generations": args.generations,
                         "device": device,
                         "timeout": args.timeout,
+                        "noise_cfg": noise_cfg,
+                        "noise_seed": noise_seed,
                     }
                 elif args.specialist_regressor:
                     call_name = "run_formula_specialist_regressor"
@@ -2525,6 +2803,8 @@ Examples:
                         "exact_match_backend": args.exact_match_backend,
                         "exact_match_min_gpu_work": args.exact_match_min_gpu_work,
                         "exact_match_max_combos": args.exact_match_max_combos,
+                        "noise_cfg": noise_cfg,
+                        "noise_seed": noise_seed,
                     }
                 else:
                     call_name = "run_formula"
@@ -2545,6 +2825,8 @@ Examples:
                         "exact_match_backend": args.exact_match_backend,
                         "exact_match_min_gpu_work": args.exact_match_min_gpu_work,
                         "exact_match_max_combos": args.exact_match_max_combos,
+                        "noise_cfg": noise_cfg,
+                        "noise_seed": noise_seed,
                     }
                 if args.hard_timeout:
                     result = run_benchmark_call_with_timeout(call_name, call_kwargs, args.timeout)

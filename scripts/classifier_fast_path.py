@@ -1998,6 +1998,7 @@ def fast_path_regression(
     exact_match_backend: str = "auto",
     exact_match_min_gpu_work: int = DEFAULT_EXACT_MATCH_MIN_GPU_WORK,
     exact_match_max_combos: int = DEFAULT_EXACT_MATCH_MAX_COMBOS,
+    noise_level: float = 0.0,
 ) -> Tuple[str, float, Dict]:
     """
     Directly solve for coefficients using least squares regression.
@@ -2025,6 +2026,12 @@ def fast_path_regression(
     y = y.flatten()
     y_variance = float(np.var(y)) if y.size > 0 else 0.0
     exact_match_diagnostics: Dict[str, Any] = {}
+    # Noise-aware acceptance tolerance for the exact-match reject walls.
+    # Under injected noise the true formula still carries residual MSE ~ noise
+    # variance, so the clean-data 1e-6 wall wrongly rejects structurally-correct
+    # matches. ~2-sigma headroom over noise variance; stays 1e-6 when clean.
+    _nl = max(0.0, float(noise_level))
+    exact_accept_tol = max(1e-6, 4.0 * (_nl ** 2) * y_variance) if _nl > 0 else 1e-6
 
     # ── Out-of-domain holdout: hold back domain-edge points ──
     holdout_mask = None
@@ -2169,7 +2176,7 @@ def fast_path_regression(
             if basis_holdout is not None and y_holdout is not None:
                 holdout_pred = basis_holdout @ coeffs
                 holdout_mse = float(np.mean((y_holdout - holdout_pred) ** 2))
-            if not np.isfinite(full_mse) or full_mse >= 1e-6:
+            if not np.isfinite(full_mse) or full_mse >= exact_accept_tol:
                 exact_match_diagnostics.update({
                     'rejected_reason': 'full_domain_mse_not_exact',
                     'fit_mse': float(mse),
@@ -2194,7 +2201,7 @@ def fast_path_regression(
                     postprocess=True,
                 )
                 display_mse = governed_exact.get('display_mse')
-                if display_mse is None or not np.isfinite(float(display_mse)) or float(display_mse) >= 1e-6:
+                if display_mse is None or not np.isfinite(float(display_mse)) or float(display_mse) >= exact_accept_tol:
                     exact_match_diagnostics.update({
                         'rejected_reason': 'display_mse_not_exact',
                         'fit_mse': float(mse),
@@ -2528,7 +2535,7 @@ def fast_path_regression(
     formula = str(best_candidate.get('display_formula') or best_candidate.get('formula') or _coeffs_to_formula(coeffs))
 
     n_nonzero = int(np.sum(np.abs(coeffs) >= sparsity_threshold))
-    exact_match_flag = mse < 1e-6 and n_nonzero <= 10
+    exact_match_flag = mse < exact_accept_tol and n_nonzero <= 10
 
     candidate_formulas = []
     for cand in top_candidates:
@@ -2972,6 +2979,7 @@ def fast_path_with_refinement(
     exact_match_backend: str = "auto",
     exact_match_min_gpu_work: int = DEFAULT_EXACT_MATCH_MIN_GPU_WORK,
     exact_match_max_combos: int = DEFAULT_EXACT_MATCH_MAX_COMBOS,
+    noise_level: float = 0.0,
 ) -> Tuple[str, float, Dict]:
     """
     Fast-path with optional frequency refinement.
@@ -3014,6 +3022,7 @@ def fast_path_with_refinement(
             universal_basis=use_universal,
             exact_match_threads=exact_match_threads,
             exact_match_enabled=exact_match_enabled,
+            noise_level=noise_level,
             exact_match_max_basis=exact_match_max_basis,
             max_power=max_power,
             device=device,
@@ -3211,6 +3220,7 @@ def run_fast_path(
     exact_match_backend: str = "auto",
     exact_match_min_gpu_work: int = DEFAULT_EXACT_MATCH_MIN_GPU_WORK,
     exact_match_max_combos: int = DEFAULT_EXACT_MATCH_MAX_COMBOS,
+    noise_level: float = 0.0,
 ) -> Optional[Dict]:
     """
     Run the complete fast-path pipeline.
@@ -3371,6 +3381,7 @@ def run_fast_path(
         exact_match_backend=exact_match_backend,
         exact_match_min_gpu_work=exact_match_min_gpu_work,
         exact_match_max_combos=exact_match_max_combos,
+        noise_level=noise_level,
     )
 
     raw_formula = formula

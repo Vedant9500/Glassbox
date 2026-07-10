@@ -590,3 +590,45 @@ def test_blend_priors_with_uniform_respects_trust():
     assert abs(sum(almost_base) - 1.0) < 1e-12
     assert max(abs(v - 0.25) for v in almost_uniform) < 1e-12
     assert max(abs(v - e) for v, e in zip(almost_base, cfp._normalize_priors(base))) < 1e-12
+
+
+def test_attach_clean_target_metrics_flags_wrong_structure():
+    x = np.linspace(-5.0, 5.0, 200)
+    y_clean = -x
+    # Wrong structure that still has low noisy MSE for some noise levels
+    result = {
+        "formula_discovered": "-18*sin(0.05574*x)",
+        "n_terms": 2,
+    }
+    bs._attach_clean_target_metrics(result, x, y_clean)
+    assert result["mse_clean"] is not None
+    assert result["mse_clean"] > 1e-6
+    assert result["recovery_exact"] is False
+
+
+def test_attach_clean_target_metrics_true_formula_recovers():
+    x = np.linspace(-3.0, 3.0, 128)
+    y_clean = 2.0 * x + 1.0
+    result = {
+        "formula_discovered": "2*x + 1",
+        "n_terms": 2,
+    }
+    bs._attach_clean_target_metrics(result, x, y_clean)
+    assert result["mse_clean"] is not None
+    assert result["mse_clean"] < 1e-6
+    assert result["recovery_exact"] is True
+    assert result["r2_clean"] is not None
+    assert result["r2_clean"] > 0.999
+    assert result["recovery_acceptable"] is True
+
+
+def test_generate_xy_with_optional_noise_keeps_clean_copy():
+    x, y_fit, y_clean = bs._generate_xy_with_optional_noise(
+        "2*x", -2.0, 2.0, 64,
+        noise_cfg={"noise_type": "gaussian", "noise_level": 0.1},
+        noise_seed=7,
+    )
+    assert x.shape[0] == 64
+    assert y_fit.shape == y_clean.shape
+    assert not np.allclose(y_fit, y_clean)
+    assert np.allclose(y_clean, 2.0 * x)

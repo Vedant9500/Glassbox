@@ -87,13 +87,60 @@ std::shared_ptr<sr::ParseNode> parse_formula_exact(const std::string& formula) {
     return parser.parse();
 }
 
+// Weighted helpers for Phase 2 candidate scoring (PhySO-style y_weights).
+static Eigen::ArrayXd load_optional_weights(
+    const py::object& weights_obj,
+    int n,
+    const char* name
+) {
+    if (weights_obj.is_none()) {
+        return Eigen::ArrayXd();  // empty => uniform
+    }
+    auto arr = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(weights_obj);
+    if (!arr) {
+        throw std::runtime_error(std::string(name) + " must be convertible to float64 array");
+    }
+    auto buf = arr.request();
+    if (buf.ndim != 1 || static_cast<int>(buf.size) != n) {
+        throw std::runtime_error(
+            std::string(name) + " must be 1D with length matching the corresponding y split"
+        );
+    }
+    Eigen::Map<Eigen::ArrayXd> mapped(static_cast<double*>(buf.ptr), n);
+    Eigen::ArrayXd w = mapped;
+    for (int i = 0; i < n; ++i) {
+        if (!std::isfinite(w(i)) || w(i) < 0.0) {
+            throw std::runtime_error(std::string(name) + " must be finite and non-negative");
+        }
+    }
+    double total = w.sum();
+    if (!(total > 0.0) || !std::isfinite(total)) {
+        throw std::runtime_error(std::string(name) + " must have positive total weight");
+    }
+    return w;
+}
+
+static double weighted_mean(const Eigen::ArrayXd& v, const Eigen::ArrayXd& w, double w_sum) {
+    return (w * v).sum() / w_sum;
+}
+
+static double weighted_mse(const Eigen::ArrayXd& err, const Eigen::ArrayXd& w, double w_sum) {
+    return (w * err.square()).sum() / w_sum;
+}
+
+static double unweighted_mse(const Eigen::ArrayXd& err) {
+    return err.square().mean();
+}
+
 py::list score_formula_candidates_cpp(
     py::list formulas_py,
     py::array_t<double> X_fit_array,
     py::array_t<double> y_fit_array,
     py::array_t<double> X_val_array,
     py::array_t<double> y_val_array,
-    int num_threads = -1
+    int num_threads = -1,
+    py::object fit_weights_obj = py::none(),
+    py::object val_weights_obj = py::none()
 ) {
     auto X_fit_contig = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(X_fit_array);
     auto y_fit_contig = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(y_fit_array);
@@ -118,6 +165,14 @@ py::list score_formula_candidates_cpp(
         throw std::runtime_error("Input shapes are inconsistent");
     }
 
+    // Optional per-point weights (Phase 2). Empty arrays => uniform / legacy path.
+    Eigen::ArrayXd w_fit = load_optional_weights(fit_weights_obj, n_fit, "fit_weights");
+    Eigen::ArrayXd w_val = load_optional_weights(val_weights_obj, n_val, "val_weights");
+    const bool use_fit_w = w_fit.size() == n_fit;
+    const bool use_val_w = w_val.size() == n_val;
+    const double w_fit_sum = use_fit_w ? w_fit.sum() : static_cast<double>(n_fit);
+    const double w_val_sum = use_val_w ? w_val.sum() : static_cast<double>(n_val);
+
     const double* X_fit_ptr = static_cast<double*>(X_fit_buf.ptr);
     const double* X_val_ptr = static_cast<double*>(X_val_buf.ptr);
     Eigen::Map<Eigen::ArrayXd> y_fit(static_cast<double*>(y_fit_buf.ptr), n_fit);
@@ -138,11 +193,21 @@ py::list score_formula_candidates_cpp(
 
     struct CandidateScore {
         bool ok = false;
+        bool weighted = false;
         std::string formula;
         std::string error;
+        // Primary selection metrics (weighted when weights provided, else unweighted).
         double fit_mse = std::numeric_limits<double>::infinity();
         double val_mse = std::numeric_limits<double>::infinity();
         double r2 = -std::numeric_limits<double>::infinity();
+        // Always populate unweighted diagnostics.
+        double unweighted_fit_mse = std::numeric_limits<double>::infinity();
+        double unweighted_val_mse = std::numeric_limits<double>::infinity();
+        double unweighted_r2 = -std::numeric_limits<double>::infinity();
+        // Weighted diagnostics (NaN when no weights).
+        double weighted_fit_mse = std::numeric_limits<double>::quiet_NaN();
+        double weighted_val_mse = std::numeric_limits<double>::quiet_NaN();
+        double weighted_r2 = std::numeric_limits<double>::quiet_NaN();
         double scale = 0.0;
         double bias = 0.0;
     };
@@ -163,6 +228,7 @@ py::list score_formula_candidates_cpp(
         for (int idx = 0; idx < static_cast<int>(formulas.size()); ++idx) {
             CandidateScore score;
             score.formula = formulas[idx];
+            score.weighted = use_fit_w || use_val_w;
             try {
                 auto parsed = parse_formula_exact(score.formula);
                 Eigen::ArrayXd pred_fit = evaluate_parse_node_exact(parsed, X_fit_cols, n_fit);
@@ -193,10 +259,21 @@ py::list score_formula_candidates_cpp(
                     continue;
                 }
 
-                double mean_x = pred_fit.mean();
-                double mean_y = y_fit.mean();
-                double var_x = (pred_fit - mean_x).square().sum();
-                double cov_xy = ((pred_fit - mean_x) * (y_fit - mean_y)).sum();
+                // Affine scale/bias on fit split (weighted least squares when weights given).
+                double mean_x, mean_y, var_x, cov_xy;
+                if (use_fit_w) {
+                    mean_x = weighted_mean(pred_fit, w_fit, w_fit_sum);
+                    mean_y = weighted_mean(y_fit, w_fit, w_fit_sum);
+                    Eigen::ArrayXd dx = pred_fit - mean_x;
+                    Eigen::ArrayXd dy = y_fit - mean_y;
+                    var_x = (w_fit * dx.square()).sum();
+                    cov_xy = (w_fit * dx * dy).sum();
+                } else {
+                    mean_x = pred_fit.mean();
+                    mean_y = y_fit.mean();
+                    var_x = (pred_fit - mean_x).square().sum();
+                    cov_xy = ((pred_fit - mean_x) * (y_fit - mean_y)).sum();
+                }
                 if (var_x > 1e-15) {
                     score.scale = cov_xy / var_x;
                     score.bias = mean_y - score.scale * mean_x;
@@ -207,16 +284,42 @@ py::list score_formula_candidates_cpp(
 
                 Eigen::ArrayXd fit_err = score.scale * pred_fit + score.bias - y_fit;
                 Eigen::ArrayXd val_err = score.scale * pred_val + score.bias - y_val;
-                score.fit_mse = fit_err.square().mean();
-                score.val_mse = val_err.square().mean();
 
-                double mean_y_val = y_val.mean();
-                double var_y_val = (y_val - mean_y_val).square().mean();
-                if (var_y_val < 1e-15) {
-                    score.r2 = score.val_mse < 1e-15 ? 1.0 : 0.0;
-                } else {
-                    score.r2 = 1.0 - score.val_mse / var_y_val;
+                score.unweighted_fit_mse = unweighted_mse(fit_err);
+                score.unweighted_val_mse = unweighted_mse(val_err);
+                {
+                    double mean_y_val_u = y_val.mean();
+                    double var_y_val_u = (y_val - mean_y_val_u).square().mean();
+                    if (var_y_val_u < 1e-15) {
+                        score.unweighted_r2 = score.unweighted_val_mse < 1e-15 ? 1.0 : 0.0;
+                    } else {
+                        score.unweighted_r2 = 1.0 - score.unweighted_val_mse / var_y_val_u;
+                    }
                 }
+
+                if (use_fit_w) {
+                    score.weighted_fit_mse = weighted_mse(fit_err, w_fit, w_fit_sum);
+                }
+                if (use_val_w) {
+                    score.weighted_val_mse = weighted_mse(val_err, w_val, w_val_sum);
+                    double mean_y_val_w = weighted_mean(y_val, w_val, w_val_sum);
+                    double var_y_val_w = (w_val * (y_val - mean_y_val_w).square()).sum() / w_val_sum;
+                    if (var_y_val_w < 1e-15) {
+                        score.weighted_r2 = score.weighted_val_mse < 1e-15 ? 1.0 : 0.0;
+                    } else {
+                        score.weighted_r2 = 1.0 - score.weighted_val_mse / var_y_val_w;
+                    }
+                } else if (use_fit_w) {
+                    // Fit weighted but val unweighted: still expose weighted_fit only.
+                    score.weighted_val_mse = score.unweighted_val_mse;
+                    score.weighted_r2 = score.unweighted_r2;
+                }
+
+                // Primary selection metrics: prefer weighted when available.
+                score.fit_mse = use_fit_w ? score.weighted_fit_mse : score.unweighted_fit_mse;
+                score.val_mse = use_val_w ? score.weighted_val_mse : score.unweighted_val_mse;
+                score.r2 = use_val_w ? score.weighted_r2 : score.unweighted_r2;
+
                 score.ok = std::isfinite(score.fit_mse) && std::isfinite(score.val_mse) && std::isfinite(score.r2);
                 if (!score.ok) score.error = "invalid_score";
             } catch (const std::exception& e) {
@@ -235,11 +338,20 @@ py::list score_formula_candidates_cpp(
         py::dict item;
         item["formula"] = score.formula;
         item["ok"] = score.ok;
+        // Primary (selection) metrics: weighted when weights provided.
         item["fit_mse"] = score.fit_mse;
         item["mse"] = score.val_mse;
         item["validation_mse"] = score.val_mse;
         item["r2"] = score.r2;
         item["validation_r2"] = score.r2;
+        // Explicit dual metrics (Phase 2 contract).
+        item["unweighted_fit_mse"] = score.unweighted_fit_mse;
+        item["unweighted_validation_mse"] = score.unweighted_val_mse;
+        item["unweighted_r2"] = score.unweighted_r2;
+        item["weighted_fit_mse"] = score.weighted_fit_mse;
+        item["weighted_validation_mse"] = score.weighted_val_mse;
+        item["weighted_r2"] = score.weighted_r2;
+        item["weighted"] = score.weighted;
         item["scale"] = score.scale;
         item["bias"] = score.bias;
         item["error"] = score.error;
@@ -816,9 +928,12 @@ std::string reduce_formula_noise_wrapper(
 PYBIND11_MODULE(_core, m) {
     m.doc() = "Fast C++ core for Glassbox Symbolic Regression";
     m.def("score_formula_candidates", &score_formula_candidates_cpp,
-          "Parse and score formulas with affine scaling using OpenMP",
+          "Parse and score formulas with affine scaling using OpenMP. "
+          "Optional fit_weights/val_weights enable Phase 2 weighted affine fit "
+          "and weighted validation metrics (primary mse/r2 become weighted).",
           py::arg("formulas"), py::arg("X_fit"), py::arg("y_fit"),
-          py::arg("X_val"), py::arg("y_val"), py::arg("num_threads")=-1);
+          py::arg("X_val"), py::arg("y_val"), py::arg("num_threads")=-1,
+          py::arg("fit_weights")=py::none(), py::arg("val_weights")=py::none());
     m.def("run_evolution", &run_evolution_cpp, "Runs the evolutionary algorithm natively in C++",
           py::arg("X_list"), py::arg("y"), py::arg("pop_size")=50, py::arg("generations")=1000, 
           py::arg("early_stop_mse")=1e-6, py::arg("seed_omegas")=py::list(),

@@ -58,6 +58,127 @@ def _finite_float(value, default=0.0):
     return out if np.isfinite(out) else float(default)
 
 
+def _validate_sample_weight(sample_weight, n_samples):
+    """Validate and normalise per-point weights (PhySO `y_weights` analogue).
+
+    Returns a float64 array of length ``n_samples`` with non-negative finite
+    entries and mean ~1. ``None`` or empty input resolves to None (uniform).
+    Raises ``ValueError`` for length mismatch, non-finite, or all-zero weights.
+    """
+    if sample_weight is None:
+        return None
+    try:
+        w = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+    except Exception as exc:  # pragma: no cover - defensive
+        raise ValueError("sample_weight must be array-like") from exc
+    if w.shape[0] != n_samples:
+        raise ValueError(
+            f"sample_weight has length {w.shape[0]}, expected {n_samples}"
+        )
+    if not np.all(np.isfinite(w)):
+        raise ValueError("sample_weight must contain only finite values")
+    if np.any(w < 0):
+        raise ValueError("sample_weight must be non-negative")
+    total = float(np.sum(w))
+    if not np.isfinite(total) or total <= 0:
+        raise ValueError("sample_weight must have positive total weight")
+    normalised = w / (total / float(n_samples))
+    return normalised
+
+
+def _weighted_mse(pred, target, sample_weight=None):
+    """Mean squared error, optionally weighted (weights assumed mean-1).
+
+    When ``sample_weight`` is provided it must match ``target`` length and have
+    positive total weight; length/total mismatch raises ``ValueError`` instead
+    of silently falling back to unweighted MSE.
+    """
+    pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+    target = np.asarray(target, dtype=np.float64).reshape(-1)
+    if pred.shape != target.shape:
+        return float("inf")
+    resid = pred - target
+    if not np.all(np.isfinite(resid)):
+        return float("inf")
+    if sample_weight is None:
+        return float(np.mean(resid ** 2))
+    w = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+    if w.shape != target.shape:
+        raise ValueError(
+            f"sample_weight length {w.shape[0]} does not match target length {target.shape[0]}"
+        )
+    total = float(np.sum(w))
+    if not np.isfinite(total) or total <= 0:
+        raise ValueError("sample_weight must have positive total weight")
+    return float(np.sum(w * resid * resid) / total)
+
+
+def _weighted_r2(pred, target, sample_weight=None):
+    """Coefficient of determination, optionally weighted (weighted variance).
+
+    When ``sample_weight`` is provided it must match ``target`` length; mismatch
+    raises ``ValueError`` (no silent unweighted fallback).
+    """
+    pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+    target = np.asarray(target, dtype=np.float64).reshape(-1)
+    if pred.shape != target.shape:
+        return -float("inf")
+    if sample_weight is None:
+        var = float(np.var(target))
+        if var < 1e-15:
+            return 1.0 if float(np.mean((pred - target) ** 2)) < 1e-15 else 0.0
+        return float(1.0 - np.mean((pred - target) ** 2) / var)
+    w = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+    if w.shape != target.shape:
+        raise ValueError(
+            f"sample_weight length {w.shape[0]} does not match target length {target.shape[0]}"
+        )
+    total = float(np.sum(w))
+    if not np.isfinite(total) or total <= 0:
+        raise ValueError("sample_weight must have positive total weight")
+    mean_t = float(np.sum(w * target) / total)
+    var = float(np.sum(w * (target - mean_t) ** 2) / total)
+    if var < 1e-15:
+        return 1.0 if _weighted_mse(pred, target, w) < 1e-15 else 0.0
+    return float(1.0 - _weighted_mse(pred, target, w) / var)
+
+
+def _effective_sample_size(sample_weight):
+    """Kish effective sample size; uniform weights -> n."""
+    if sample_weight is None:
+        return None
+    w = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+    total = float(np.sum(w))
+    if total <= 0:
+        return None
+    return float((total * total) / float(np.sum(w * w)))
+
+
+def _slice_sample_weight(sample_weight, indices=None, n_targets=None):
+    """Slice or validate per-point weights for a subset of rows.
+
+    ``None`` stays ``None``. If ``indices`` is given, returns ``weight[indices]``.
+    If only ``n_targets`` is given, requires ``len(weight) == n_targets``.
+    Raises ``ValueError`` on length mismatches so callers cannot silently
+    ignore weights on holdout/subset scores.
+    """
+    if sample_weight is None:
+        return None
+    w = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+    if indices is not None:
+        idx = np.asarray(indices, dtype=int).reshape(-1)
+        if idx.size and (int(np.min(idx)) < 0 or int(np.max(idx)) >= w.shape[0]):
+            raise ValueError(
+                f"sample_weight index out of range for length {w.shape[0]}"
+            )
+        return w[idx]
+    if n_targets is not None and w.shape[0] != int(n_targets):
+        raise ValueError(
+            f"sample_weight length {w.shape[0]} does not match n_targets {n_targets}"
+        )
+    return w
+
+
 # Path setup
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _SCRIPTS_DIR = _REPO_ROOT / 'scripts'
@@ -681,8 +802,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "constant_refined": True,
         }
 
-    def _score_formula_candidate(self, formula, X_fit, y_fit, X_val, y_val):
-        """Fit affine scaling on training data and score on validation data."""
+    def _score_formula_candidate(
+        self,
+        formula,
+        X_fit,
+        y_fit,
+        X_val,
+        y_val,
+        fit_weights=None,
+        val_weights=None,
+    ):
+        """Fit affine scaling on train and score on validation (Phase 2 weights)."""
         text = str(formula or "").strip()
         if not text:
             return None
@@ -692,8 +822,30 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         except Exception:
             return None
 
+        y_fit = np.asarray(y_fit, dtype=np.float64).reshape(-1)
+        y_val = np.asarray(y_val, dtype=np.float64).reshape(-1)
+        pred_fit = np.asarray(pred_fit, dtype=np.float64).reshape(-1)
+        pred_val = np.asarray(pred_val, dtype=np.float64).reshape(-1)
+        if pred_fit.shape != y_fit.shape or pred_val.shape != y_val.shape:
+            return None
+
+        w_fit = None if fit_weights is None else np.asarray(fit_weights, dtype=np.float64).reshape(-1)
+        w_val = None if val_weights is None else np.asarray(val_weights, dtype=np.float64).reshape(-1)
+        if w_fit is not None and w_fit.shape != y_fit.shape:
+            raise ValueError(
+                f"fit_weights length {w_fit.shape[0]} does not match y_fit length {y_fit.shape[0]}"
+            )
+        if w_val is not None and w_val.shape != y_val.shape:
+            raise ValueError(
+                f"val_weights length {w_val.shape[0]} does not match y_val length {y_val.shape[0]}"
+            )
+
         fit_mask = np.isfinite(pred_fit) & np.isfinite(y_fit)
         val_mask = np.isfinite(pred_val) & np.isfinite(y_val)
+        if w_fit is not None:
+            fit_mask = fit_mask & np.isfinite(w_fit) & (w_fit >= 0)
+        if w_val is not None:
+            val_mask = val_mask & np.isfinite(w_val) & (w_val >= 0)
         if int(fit_mask.sum()) < 8 or int(val_mask.sum()) < 4:
             return None
 
@@ -701,12 +853,24 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         t_fit = y_fit[fit_mask]
         x_val = pred_val[val_mask]
         t_val = y_val[val_mask]
+        wf = None if w_fit is None else w_fit[fit_mask]
+        wv = None if w_val is None else w_val[val_mask]
+        if wf is not None and float(np.sum(wf)) <= 0:
+            return None
+        if wv is not None and float(np.sum(wv)) <= 0:
+            return None
+
         try:
-            coef, _, _, _ = np.linalg.lstsq(
-                np.column_stack([x_fit, np.ones_like(x_fit)]),
-                t_fit,
-                rcond=None,
-            )
+            if wf is None:
+                coef, _, _, _ = np.linalg.lstsq(
+                    np.column_stack([x_fit, np.ones_like(x_fit)]),
+                    t_fit,
+                    rcond=None,
+                )
+            else:
+                sw = np.sqrt(np.maximum(wf, 0.0))
+                A = np.column_stack([x_fit, np.ones_like(x_fit)]) * sw[:, None]
+                coef, _, _, _ = np.linalg.lstsq(A, t_fit * sw, rcond=None)
             scale = float(coef[0])
             bias = float(coef[1])
             fit_pred = scale * x_fit + bias
@@ -714,23 +878,53 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         except Exception:
             return None
 
-        fit_mse = float(np.mean((fit_pred - t_fit) ** 2))
-        val_mse = float(np.mean((val_pred - t_val) ** 2))
-        if not np.isfinite(fit_mse) or not np.isfinite(val_mse):
+        unweighted_fit_mse = float(np.mean((fit_pred - t_fit) ** 2))
+        unweighted_val_mse = float(np.mean((val_pred - t_val) ** 2))
+        if not np.isfinite(unweighted_fit_mse) or not np.isfinite(unweighted_val_mse):
             return None
-
-        val_var = float(np.var(t_val))
-        val_r2 = 1.0 if val_var < 1e-15 and val_mse < 1e-15 else (
-            0.0 if val_var < 1e-15 else 1.0 - val_mse / val_var
+        val_var_u = float(np.var(t_val))
+        unweighted_r2 = (
+            1.0 if val_var_u < 1e-15 and unweighted_val_mse < 1e-15
+            else (0.0 if val_var_u < 1e-15 else 1.0 - unweighted_val_mse / val_var_u)
         )
-        complexity = max(1, text.count("+") + text.count("-") + text.count("*") + text.count("/") + text.count("^") + 1)
 
+        weighted_fit_mse = None
+        weighted_val_mse = None
+        weighted_r2 = None
+        if wf is not None:
+            weighted_fit_mse = float(np.sum(wf * (fit_pred - t_fit) ** 2) / float(np.sum(wf)))
+        if wv is not None:
+            weighted_val_mse = float(np.sum(wv * (val_pred - t_val) ** 2) / float(np.sum(wv)))
+            mean_t = float(np.sum(wv * t_val) / float(np.sum(wv)))
+            val_var_w = float(np.sum(wv * (t_val - mean_t) ** 2) / float(np.sum(wv)))
+            weighted_r2 = (
+                1.0 if val_var_w < 1e-15 and weighted_val_mse < 1e-15
+                else (0.0 if val_var_w < 1e-15 else 1.0 - weighted_val_mse / val_var_w)
+            )
+
+        fit_mse = weighted_fit_mse if weighted_fit_mse is not None else unweighted_fit_mse
+        val_mse = weighted_val_mse if weighted_val_mse is not None else unweighted_val_mse
+        val_r2 = weighted_r2 if weighted_r2 is not None else unweighted_r2
+
+        complexity = max(
+            1,
+            text.count("+") + text.count("-") + text.count("*")
+            + text.count("/") + text.count("^") + 1,
+        )
         refined_formula = text
         if abs(scale - 1.0) > 1e-8 or abs(bias) > 1e-8:
             refined_formula = f"(({scale:.12g})*({text})+({bias:.12g}))"
 
         risk_score = self._formula_risk_score(refined_formula, X_val)
-        generalization_gap = float(max(0.0, val_mse - fit_mse) / max(float(np.var(t_val)), 1e-12))
+        if wv is None:
+            gap_denom = max(float(np.var(t_val)), 1e-12)
+        else:
+            mean_t = float(np.sum(wv * t_val) / float(np.sum(wv)))
+            gap_denom = max(
+                float(np.sum(wv * (t_val - mean_t) ** 2) / float(np.sum(wv))),
+                1e-12,
+            )
+        generalization_gap = float(max(0.0, val_mse - fit_mse) / gap_denom)
 
         return {
             "formula": refined_formula,
@@ -738,6 +932,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "fit_mse": fit_mse,
             "mse": val_mse,
             "r2": float(val_r2),
+            "unweighted_fit_mse": unweighted_fit_mse,
+            "unweighted_validation_mse": unweighted_val_mse,
+            "unweighted_r2": float(unweighted_r2),
+            "weighted_fit_mse": weighted_fit_mse,
+            "weighted_validation_mse": weighted_val_mse,
+            "weighted_r2": None if weighted_r2 is None else float(weighted_r2),
+            "weighted": bool(wf is not None or wv is not None),
             "scale": scale,
             "bias": bias,
             "complexity": complexity,
@@ -1168,8 +1369,28 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.inception_diagnostics_["final_mse"] = float(current_mse)
         return current_formula
 
-    def _formula_mse(self, formula, X, y):
-        """Evaluate a formula directly on data and return MSE, or inf on failure."""
+    def _active_sample_weight(self, n_targets=None, indices=None, sample_weight=None):
+        """Return weights for a scoring call, sliced/validated or ``None``.
+
+        Prefer explicit ``sample_weight``; otherwise use ``sample_weight_`` when
+        provided at fit time. Length mismatches raise ``ValueError``.
+        """
+        if sample_weight is not None:
+            return _slice_sample_weight(sample_weight, indices=indices, n_targets=n_targets)
+        if not getattr(self, "sample_weight_provided_", False):
+            return None
+        stored = getattr(self, "sample_weight_", None)
+        if stored is None:
+            return None
+        return _slice_sample_weight(stored, indices=indices, n_targets=n_targets)
+
+    def _formula_mse(self, formula, X, y, sample_weight=None, sample_weight_indices=None):
+        """Evaluate a formula directly on data and return MSE, or inf on failure.
+
+        When fit-time weights are active, they are applied if lengths match.
+        If ``sample_weight_indices`` is provided, fit-time weights are sliced to
+        those rows (for holdout/subset scoring). Length mismatches raise.
+        """
         text = str(formula or "").strip()
         if not text:
             return float("inf")
@@ -1183,7 +1404,16 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return float("inf")
         if not np.all(np.isfinite(pred)):
             return float("inf")
-        mse = float(np.mean((pred - target) ** 2))
+        w = self._active_sample_weight(
+            n_targets=target.shape[0] if sample_weight_indices is None else None,
+            indices=sample_weight_indices,
+            sample_weight=sample_weight,
+        )
+        if w is not None and w.shape[0] != target.shape[0]:
+            raise ValueError(
+                f"sample_weight length {w.shape[0]} does not match target length {target.shape[0]}"
+            )
+        mse = _weighted_mse(pred, target, w)
         return mse if np.isfinite(mse) else float("inf")
 
     def _display_formula_mse(self, formula, X, y):
@@ -1204,9 +1434,19 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return float("inf")
         return mse if np.isfinite(mse) else float("inf")
 
-    def _final_formula_score(self, formula, X, y):
-        """Return the display-first score plus internal/display diagnostics."""
-        internal_mse = self._formula_mse(formula, X, y)
+    def _final_formula_score(self, formula, X, y, sample_weight=None, sample_weight_indices=None):
+        """Return the display-first score plus internal/display diagnostics.
+
+        Display MSE remains unweighted (benchmark display contract). Internal
+        MSE honours fit-time / explicit weights, optionally sliced by indices.
+        """
+        internal_mse = self._formula_mse(
+            formula,
+            X,
+            y,
+            sample_weight=sample_weight,
+            sample_weight_indices=sample_weight_indices,
+        )
         display_mse = self._display_formula_mse(formula, X, y)
         score = display_mse if np.isfinite(display_mse) else internal_mse
         return score, internal_mse, display_mse
@@ -1349,15 +1589,18 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if split is None:
             return None
 
+        val_idx = split.get("val_idx")
         base_score, base_internal, base_display = self._final_formula_score(
             base_formula,
             split["X_val"],
             split["y_val"],
+            sample_weight_indices=val_idx,
         )
         candidate_score, candidate_internal, candidate_display = self._final_formula_score(
             candidate_formula,
             split["X_val"],
             split["y_val"],
+            sample_weight_indices=val_idx,
         )
         return {
             "base_score": base_score,
@@ -1692,6 +1935,31 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             }
         return global_allowed, multi, binary_allowed, multi_binary
 
+    def _split_sample_weights(self, split, n_total=None):
+        """Slice fit-time sample_weight_ to fit/val indices of a holdout split.
+
+        Returns ``(fit_weights, val_weights)`` or ``(None, None)`` when no
+        fit-time weights were provided. Length mismatches raise.
+        """
+        if not getattr(self, "sample_weight_provided_", False):
+            return None, None
+        w = getattr(self, "sample_weight_", None)
+        if w is None:
+            return None, None
+        w = np.asarray(w, dtype=np.float64).reshape(-1)
+        if n_total is not None and w.shape[0] != int(n_total):
+            raise ValueError(
+                f"sample_weight length {w.shape[0]} does not match n_samples {n_total}"
+            )
+        fit_idx = split.get("fit_idx")
+        val_idx = split.get("val_idx")
+        if fit_idx is None or val_idx is None:
+            return None, None
+        return (
+            w[np.asarray(fit_idx, dtype=int)],
+            w[np.asarray(val_idx, dtype=int)],
+        )
+
     def _refine_candidate_formulas(self, candidate_formulas, X, y, *, max_candidates=12):
         """Refine symbolic candidates with affine scaling and holdout scoring."""
         if not candidate_formulas:
@@ -1716,13 +1984,25 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             try:
                 import _core  # type: ignore
                 if hasattr(_core, "score_formula_candidates"):
-                    scored_cpp = _core.score_formula_candidates(
-                        ordered_formulas,
-                        np.ascontiguousarray(split["X_fit"], dtype=np.float64),
-                        np.ascontiguousarray(split["y_fit"], dtype=np.float64),
-                        np.ascontiguousarray(split["X_val"], dtype=np.float64),
-                        np.ascontiguousarray(split["y_val"], dtype=np.float64),
+                    fit_w, val_w = self._split_sample_weights(
+                        split, n_total=int(np.asarray(y).reshape(-1).shape[0])
                     )
+                    Xf = np.ascontiguousarray(split["X_fit"], dtype=np.float64)
+                    yf = np.ascontiguousarray(split["y_fit"], dtype=np.float64)
+                    Xv = np.ascontiguousarray(split["X_val"], dtype=np.float64)
+                    yv = np.ascontiguousarray(split["y_val"], dtype=np.float64)
+                    fw = None if fit_w is None else np.ascontiguousarray(fit_w, dtype=np.float64)
+                    vw = None if val_w is None else np.ascontiguousarray(val_w, dtype=np.float64)
+                    try:
+                        scored_cpp = _core.score_formula_candidates(
+                            ordered_formulas, Xf, yf, Xv, yv,
+                            fit_weights=fw, val_weights=vw,
+                        )
+                    except TypeError:
+                        # Older extension without weight args.
+                        scored_cpp = _core.score_formula_candidates(
+                            ordered_formulas, Xf, yf, Xv, yv,
+                        )
                     for formula, scored in zip(ordered_formulas, list(scored_cpp)):
                         if isinstance(scored, dict):
                             cpp_scores[re.sub(r"\s+", "", formula.lower())] = dict(scored)
@@ -1773,6 +2053,19 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             "fit_mse": fit_mse,
                             "mse": val_mse,
                             "r2": val_r2,
+                            "unweighted_fit_mse": _finite_float(
+                                cpp_scored.get("unweighted_fit_mse"), fit_mse
+                            ),
+                            "unweighted_validation_mse": _finite_float(
+                                cpp_scored.get("unweighted_validation_mse"), val_mse
+                            ),
+                            "unweighted_r2": _finite_float(
+                                cpp_scored.get("unweighted_r2"), val_r2
+                            ),
+                            "weighted_fit_mse": cpp_scored.get("weighted_fit_mse"),
+                            "weighted_validation_mse": cpp_scored.get("weighted_validation_mse"),
+                            "weighted_r2": cpp_scored.get("weighted_r2"),
+                            "weighted": bool(cpp_scored.get("weighted", False)),
                             "scale": scale,
                             "bias": bias,
                             "complexity": max(1, formula.count("+") + formula.count("-") + formula.count("*") + formula.count("/") + formula.count("^") + 1),
@@ -1780,12 +2073,18 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             "generalization_gap": float(max(0.0, val_mse - fit_mse) / max(float(np.var(split["y_val"])), 1e-12)),
                         }
             if scored is None:
+                if "fit_w" not in locals():
+                    fit_w, val_w = self._split_sample_weights(
+                        split, n_total=int(np.asarray(y).reshape(-1).shape[0])
+                    )
                 scored = self._score_formula_candidate(
                     formula,
                     split["X_fit"],
                     split["y_fit"],
                     split["X_val"],
                     split["y_val"],
+                    fit_weights=fit_w,
+                    val_weights=val_w,
                 )
             if scored is None:
                 continue
@@ -2121,13 +2420,34 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             }
             if CPP_AVAILABLE:
                 try:
-                    scored_cpp = _core.score_formula_candidates(
-                        [str(item.get("formula", "")) for item in formulas],
-                        np.ascontiguousarray(X_arr, dtype=np.float64),
-                        np.ascontiguousarray(y_arr, dtype=np.float64),
-                        np.ascontiguousarray(X_arr, dtype=np.float64),
-                        np.ascontiguousarray(y_arr, dtype=np.float64),
-                    )
+                    probe_w = None
+                    if (
+                        getattr(self, "sample_weight_provided_", False)
+                        and getattr(self, "sample_weight_", None) is not None
+                    ):
+                        probe_w = np.asarray(self.sample_weight_, dtype=np.float64).reshape(-1)
+                        if probe_w.shape[0] != y_arr.shape[0]:
+                            raise ValueError(
+                                f"sample_weight length {probe_w.shape[0]} does not match y length {y_arr.shape[0]}"
+                            )
+                    Xa = np.ascontiguousarray(X_arr, dtype=np.float64)
+                    ya = np.ascontiguousarray(y_arr, dtype=np.float64)
+                    formulas_list = [str(item.get("formula", "")) for item in formulas]
+                    try:
+                        if probe_w is not None:
+                            w_c = np.ascontiguousarray(probe_w, dtype=np.float64)
+                            scored_cpp = _core.score_formula_candidates(
+                                formulas_list, Xa, ya, Xa, ya,
+                                fit_weights=w_c, val_weights=w_c,
+                            )
+                        else:
+                            scored_cpp = _core.score_formula_candidates(
+                                formulas_list, Xa, ya, Xa, ya,
+                            )
+                    except TypeError:
+                        scored_cpp = _core.score_formula_candidates(
+                            formulas_list, Xa, ya, Xa, ya,
+                        )
                     ok_count = 0
                     for item, scored in zip(formulas, list(scored_cpp)):
                         if isinstance(scored, dict) and scored.get("ok"):
@@ -3287,7 +3607,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         except Exception:
             return 1.0
 
-    def _passes_cross_validation_skip_guard(self, formula, X, y):
+    def _passes_cross_validation_skip_guard(self, formula, X, y, sample_weight=None):
         """Return True when fast-path formula is stable enough to skip evolution."""
         diagnostics = {
             'enabled': bool(self.cv_skip_guard_enabled),
@@ -3323,16 +3643,22 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         rng.shuffle(idx)
         folds = [f for f in np.array_split(idx, n_folds) if len(f) > 0]
 
+        try:
+            w_all = self._active_sample_weight(
+                n_targets=n_samples,
+                sample_weight=sample_weight,
+            )
+        except ValueError as exc:
+            diagnostics['passed'] = False
+            diagnostics['reason'] = f'sample_weight_error:{exc}'
+            self.fast_path_cv_guard_ = diagnostics
+            return False
         fold_r2 = []
         for fold_idx in folds:
             y_fold = y[fold_idx]
             pred_fold = y_pred[fold_idx]
-            var_fold = float(np.var(y_fold))
-            if var_fold < 1e-15:
-                r2_fold = 1.0 if float(np.mean((pred_fold - y_fold) ** 2)) < 1e-15 else 0.0
-            else:
-                mse_fold = float(np.mean((pred_fold - y_fold) ** 2))
-                r2_fold = 1.0 - mse_fold / var_fold
+            w_fold = None if w_all is None else w_all[fold_idx]
+            r2_fold = _weighted_r2(pred_fold, y_fold, w_fold)
             if np.isfinite(r2_fold):
                 fold_r2.append(float(r2_fold))
 
@@ -3839,16 +4165,28 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             self._fft_phase_info = None
             return []
 
-    def fit(self, X, y):
+    def fit(self, X, y, sample_weight=None):
         """
         Fit the symbolic regression model using the full Glassbox pipeline:
         1. Fast-path (classifier-guided basis regression)
         2. C++ evolution (if fast-path misses or is approximate)
         3. Formula simplification (float snapping + SymPy)
+
+        Parameters
+        ----------
+        sample_weight : array-like of shape (n_samples,), optional
+            Per-point weights (PhySO ``y_weights`` analogue). Non-negative and
+            finite; normalised to mean 1 internally. ``None`` keeps uniform
+            weights and default behaviour unchanged. Used by the Python-side
+            scoring layers (formula MSE, CV skip guard, final selection) so
+            noisy or low-confidence points can be downweighted. Native C++
+            scoring becomes weight-aware starting in Phase 2.
         """
         import time as _time
 
         X, y = check_X_y(X, y, accept_sparse=False)
+        self.sample_weight_ = _validate_sample_weight(sample_weight, X.shape[0])
+        self.sample_weight_provided_ = self.sample_weight_ is not None
         self.has_composed_seeds_ = False
         self.composition_candidates_accepted_ = False
         self.composition_candidate_count_ = 0
@@ -3942,6 +4280,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         )
         self.blackbox_state_ = blackbox_state
         self.blackbox_diagnostics_ = state_to_dict(blackbox_state)
+        if isinstance(self.blackbox_diagnostics_, dict):
+            if self.sample_weight_provided_ and self.sample_weight_ is not None:
+                self.blackbox_diagnostics_["sample_weight"] = {
+                    "provided": True,
+                    "effective_sample_size": _effective_sample_size(self.sample_weight_),
+                    "min_weight": float(np.min(self.sample_weight_)),
+                    "max_weight": float(np.max(self.sample_weight_)),
+                    "mean_weight": float(np.mean(self.sample_weight_)),
+                }
+            else:
+                self.blackbox_diagnostics_["sample_weight"] = {"provided": False}
         if isinstance(self.blackbox_diagnostics_, dict) and feature_selection_fallback is not None:
             self.blackbox_diagnostics_["feature_selection_fallback"] = feature_selection_fallback
         self.blackbox_search_plan_ = {}
@@ -4123,7 +4472,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             and math.isfinite(best_mse)
             and current_r2 >= self.evolution_skip_r2
         ):
-            fast_path_cv_ok = self._passes_cross_validation_skip_guard(best_formula, X, y)
+            fast_path_cv_ok = self._passes_cross_validation_skip_guard(best_formula, X, y, self.sample_weight_)
         else:
             self.fast_path_cv_guard_ = {
                 'enabled': bool(self.cv_skip_guard_enabled),
