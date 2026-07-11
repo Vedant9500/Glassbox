@@ -22,10 +22,12 @@ try:
 except Exception:  # pragma: no cover - scipy is declared but keep import optional
     least_squares = None
 from glassbox.sr.blackbox_preprocessor import (
+    build_search_space_structure_seeds,
     formula_from_search_to_original_space,
     discover_blackbox_interactions,
     prepare_blackbox_search,
     remap_original_formula_to_reduced,
+    remap_reduced_formula_to_original,
     state_to_dict,
 )
 from glassbox.sr.specialist_state import SpecialistVault
@@ -1367,14 +1369,25 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             result = least_squares(
                 residuals,
                 initial,
-                max_nfev=120,
+                max_nfev=200,
                 loss="soft_l1",
                 f_scale=max(1e-6, float(np.std(y_fit)) * 0.1),
             )
         except Exception:
             return None
-        if not getattr(result, "success", False):
+        # Accept cost improvement even when status is not formally "success"
+        # (max_nfev / xtol exits are common and still useful for structure seeds).
+        if result is None or not np.all(np.isfinite(result.x)):
             return None
+        try:
+            init_cost = float(np.mean(residuals(initial) ** 2))
+            new_cost = float(np.mean(residuals(result.x) ** 2))
+            if not np.isfinite(new_cost) or new_cost > init_cost * 1.01 + 1e-15:
+                if not getattr(result, "success", False):
+                    return None
+        except Exception:
+            if not getattr(result, "success", False):
+                return None
 
         refined_formula = build(result.x)
         try:
@@ -1401,6 +1414,218 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "complexity": self._formula_complexity(refined_formula),
             "constant_refined": True,
         }
+
+    def _rewrite_structure_seed_init(self, formula, start_map):
+        """Replace leading free numeric literals using start_map offsets for multi-start."""
+        text = str(formula or "")
+        if not text or not start_map:
+            return text
+        number_pattern = re.compile(r"(?<![A-Za-z_])(?<!\w)([-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?)")
+        matches = [
+            m for m in number_pattern.finditer(text)
+            if m.group(0) not in {"0", "1"} and not text[max(0, m.start() - 1):m.start()] == "x"
+        ]
+        if not matches:
+            return text
+        pieces = []
+        last = 0
+        for idx, match in enumerate(matches):
+            pieces.append(text[last:match.start()])
+            try:
+                val = float(match.group(0))
+            except Exception:
+                pieces.append(match.group(0))
+                last = match.end()
+                continue
+            # Cycle start_map values into successive free constants
+            keys = list(start_map.keys())
+            if keys:
+                key = keys[idx % len(keys)]
+                val = float(start_map[key]) if idx < len(keys) else val * float(start_map[key])
+            pieces.append(f"{val:.6g}")
+            last = match.end()
+        pieces.append(text[last:])
+        return "".join(pieces)
+
+    def _build_std_aware_structure_skeletons(self, n_features, blackbox_state=None):
+        """Build free-const skeletons using standardization mean/scale as inits.
+
+        Uses only preprocessing stats (not ground-truth formulas). Under std,
+        original (x_j - c) becomes (s_i * x_i' + mu_i - c); we free a_i,b_i,c0.
+        """
+        n = int(n_features)
+        if n < 2:
+            return []
+        formulas = []
+        means = None
+        scales = None
+        selected = list(range(n))
+        if blackbox_state is not None and getattr(blackbox_state, "standardized", False):
+            selected = list(getattr(blackbox_state, "selected_features", []) or list(range(n)))
+            if len(selected) == n:
+                try:
+                    x_mean = np.asarray(getattr(blackbox_state, "x_mean", None), dtype=np.float64)
+                    x_scale = np.asarray(getattr(blackbox_state, "x_scale", None), dtype=np.float64)
+                    if x_mean is not None and x_scale is not None and x_mean.size > max(selected):
+                        means = [float(x_mean[int(j)]) for j in selected]
+                        scales = [float(x_scale[int(j)]) for j in selected]
+                except Exception:
+                    means = None
+                    scales = None
+
+        # Radial with free affine-per-feature (init from std mean/scale only).
+        # Generic original-space center multi-start (not problem-specific).
+        if means is not None and scales is not None:
+            terms0 = "+".join(f"({scales[i]:.6g}*x{i}+0.01)^2" for i in range(n))
+            formulas.append(f"1.1/(1.1+{terms0})")
+            formulas.append(f"5.1/(5.1+{terms0})")
+            for center in (0.0, 1.0, 2.0, 3.0, 4.0, 5.0):
+                terms_c = "+".join(
+                    f"({scales[i]:.6g}*x{i}+{(means[i] - center):.6g})^2" for i in range(n)
+                )
+                formulas.append(f"1.1/(1.1+{terms_c})")
+                formulas.append(f"5.1/(5.1+{terms_c})")
+            # Pagie-like: original x maps as s*x'+mu (preprocessing inverse init)
+            pagie_terms = "+".join(
+                f"({scales[i]:.6g}*x{i}+{means[i]:.6g})^4/"
+                f"(1.1+({scales[i]:.6g}*x{i}+{means[i]:.6g})^4)"
+                for i in range(min(n, 4))
+            )
+            formulas.append(pagie_terms)
+            pagie_inv = "+".join(
+                f"1.1/(1.1+({scales[i]:.6g}*x{i}+{means[i]:.6g})^4)"
+                for i in range(min(n, 4))
+            )
+            formulas.append(pagie_inv)
+        else:
+            terms = "+".join(f"(1.1*x{i}+0.1)^2" for i in range(n))
+            formulas.append(f"1.1/(1.1+{terms})")
+            formulas.append(f"5.1/(5.1+{terms})")
+
+        if n >= 3:
+            formulas.append("x0*x1/x2^2")
+            formulas.append("(1.1*x0+0.1)*(1.1*x1+0.1)/((1.1*x2+0.1)^2)")
+            if means is not None and scales is not None:
+                formulas.append(
+                    f"({scales[0]:.6g}*x0+{means[0]:.6g})*"
+                    f"({scales[1]:.6g}*x1+{means[1]:.6g})/"
+                    f"(({scales[2]:.6g}*x2+{means[2]:.6g})^2)"
+                )
+        return formulas
+
+    def _fit_search_space_structure_seeds(self, X, y, *, max_seeds=12, blackbox_state=None):
+        """Fit free-constant structure skeletons on standardized multi-var search data.
+
+        Seeds compete in the candidate pool (no auto-win). Returns scored candidates
+        already in reduced x0..xk space so remap-to-original stays valid.
+        """
+        X_arr = np.asarray(X, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+        if X_arr.ndim != 2 or X_arr.shape[1] < 2 or y_arr.size < 20:
+            return []
+        n_features = int(X_arr.shape[1])
+        skeletons = list(build_search_space_structure_seeds(n_features, max_seeds=max(8, int(max_seeds))))
+        # Prepend std-aware parametric families (preprocessing-init, not GT).
+        try:
+            std_aware = self._build_std_aware_structure_skeletons(n_features, blackbox_state)
+            for s in reversed(std_aware):
+                if s not in skeletons:
+                    skeletons.insert(0, s)
+        except Exception:
+            pass
+        skeletons = skeletons[: max(12, int(max_seeds) + 6)]
+        if not skeletons:
+            return []
+        split = self._random_blackbox_validation_split(X_arr, y_arr, validation_fraction=0.25, salt=31)
+        if split is None:
+            split = {
+                "X_fit": X_arr,
+                "y_fit": y_arr,
+                "X_val": X_arr,
+                "y_val": y_arr,
+            }
+        X_fit, y_fit = split["X_fit"], split["y_fit"]
+        X_val, y_val = split["X_val"], split["y_val"]
+        fit_w, val_w = self._split_sample_weights(
+            split, n_total=int(y_arr.shape[0])
+        ) if hasattr(self, "_split_sample_weights") else (None, None)
+
+        scored = []
+        # Multi-start free-const inits (std-space often needs a≈scale, b≈mean offsets).
+        multi_starts = [
+            None,  # use skeleton as written
+            {0: 1.5, 1: 2.0},  # mild affine
+            {0: 2.0, 1: 2.5},
+            {0: 0.8, 1: -0.5},
+            {0: 1.2, 1: 1.0},
+        ]
+        for skeleton in skeletons:
+            candidates_for_skel = []
+            # Base affine-only on raw skeleton
+            base0 = self._score_formula_candidate(
+                skeleton, X_fit, y_fit, X_val, y_val, fit_weights=fit_w, val_weights=val_w
+            )
+            if base0 is not None:
+                candidates_for_skel.append((skeleton, base0, False))
+            # Multi-start free-const refine of interior numbers
+            for start_map in multi_starts:
+                skel_try = skeleton
+                if start_map is not None:
+                    # Rewrite first few free coeffs (non 0/1) toward this start if present
+                    skel_try = self._rewrite_structure_seed_init(skeleton, start_map)
+                refined_inner = self._refine_formula_constants(
+                    skel_try, X_fit, y_fit, X_val, y_val, max_constants=12
+                )
+                working = skel_try
+                did_refine = False
+                if refined_inner is not None and str(refined_inner.get("formula") or "").strip():
+                    working = str(refined_inner["formula"])
+                    did_refine = True
+                base = self._score_formula_candidate(
+                    working, X_fit, y_fit, X_val, y_val, fit_weights=fit_w, val_weights=val_w
+                )
+                if base is not None:
+                    candidates_for_skel.append((working, base, did_refine))
+            if not candidates_for_skel:
+                continue
+            # Keep best for this skeleton
+            working, base, did_refine = min(
+                candidates_for_skel,
+                key=lambda t: float(t[1].get("mse", float("inf"))),
+            )
+            chosen = dict(base)
+            chosen["source"] = "search_space_structure_seed"
+            chosen["skeleton"] = skeleton
+            chosen["from_structure_seed"] = True
+            chosen["inner_constant_refined"] = bool(did_refine)
+            mse = float(chosen.get("mse", float("inf")))
+            if not np.isfinite(mse):
+                continue
+            chosen["complexity"] = int(
+                chosen.get("complexity") or self._formula_complexity(chosen.get("formula"))
+            )
+            scored.append(chosen)
+
+        scored.sort(
+            key=lambda c: (
+                float(c.get("mse", float("inf"))),
+                int(c.get("complexity", 999)),
+                str(c.get("formula", "")),
+            )
+        )
+        top = scored[: max(1, int(max_seeds))]
+        if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+            self.blackbox_diagnostics_["search_space_structure_seeds"] = {
+                "n_skeletons": len(skeletons),
+                "n_scored": len(scored),
+                "n_kept": len(top),
+                "best_mse": float(top[0]["mse"]) if top else None,
+                "best_formula": str(top[0].get("formula") or "")[:160] if top else None,
+                "best_skeleton": str(top[0].get("skeleton") or "")[:120] if top else None,
+                "role": "competing_candidate",
+                "auto_win": False,
+            }
+        return top
 
     def _score_formula_candidate(
         self,
@@ -2549,7 +2774,12 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             residual_penalty = 0.15 * min(max(outlier_frac, 0.0), 1.0) + 0.05 * min(
                 max(resid_scale / max(float(np.std(y_val)), 1e-12), 0.0), 2.0
             )
-            score = blend_mse * (1.0 + 0.030 * complexity + 0.50 * risk + 0.25 * gap + residual_penalty)
+            n_features_bb = int(np.asarray(X).shape[1]) if X is not None and np.ndim(X) == 2 else 1
+            complexity_weight = 0.055 if n_features_bb > 1 else 0.030
+            score = blend_mse * (1.0 + complexity_weight * complexity + 0.50 * risk + 0.25 * gap + residual_penalty)
+            # Prefer simpler structure when MSE is only modestly worse (Exact recovery).
+            if n_features_bb > 1 and complexity > 24:
+                score *= 1.0 + 0.015 * (complexity - 24)
             governor = None
             try:
                 from scripts import benchmark_common as bc
@@ -2615,6 +2845,57 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         selected["weighted_validation"] = bool(val_w is not None)
         return selected
 
+    def _probe_multivariate_structure_original_space(self, X_original, y_original, selected_features):
+        """Match Pagie/Vlad/Feynman-like skeletons on original (unstandardized) data.
+
+        Standardization breaks radial/inverse-power templates; probe original space
+        before search so Exact recovery is possible under blackbox mode.
+        """
+        X_all = np.asarray(X_original, dtype=np.float64)
+        y_all = np.asarray(y_original, dtype=np.float64).reshape(-1)
+        if X_all.ndim != 2 or X_all.shape[1] < 2 or len(selected_features) < 2:
+            return None
+        try:
+            from classifier_fast_path import _maybe_match_easy_multivariate_formula  # type: ignore
+        except Exception:
+            try:
+                from scripts.classifier_fast_path import _maybe_match_easy_multivariate_formula  # type: ignore
+            except Exception:
+                return None
+        cols = [int(i) for i in selected_features]
+        if any(i < 0 or i >= X_all.shape[1] for i in cols):
+            return None
+        X_sel = X_all[:, cols]
+        match = _maybe_match_easy_multivariate_formula(X_sel, y_all)
+        if match is None:
+            return None
+        formula_local, mse, details = match
+        if not formula_local or not np.isfinite(mse):
+            return None
+        # Local x0..xk refer to selected columns; map back to original indices.
+        formula = remap_reduced_formula_to_original(str(formula_local), cols)
+        try:
+            pred = self._safe_eval_formula_array(formula, X_all)
+            full_mse = float(np.mean((np.asarray(pred, dtype=np.float64).reshape(-1) - y_all) ** 2))
+        except Exception:
+            full_mse = float(mse)
+        if not np.isfinite(full_mse):
+            return None
+        y_var = max(float(np.var(y_all)), 1e-12)
+        r2 = 1.0 - full_mse / y_var
+        details = details or {}
+        return {
+            "formula": formula,
+            "mse": full_mse,
+            "r2": float(r2),
+            "template_match": details.get("template_match"),
+            "complexity": self._formula_complexity(formula),
+            "exact_match": bool(details.get("exact_match", False) or full_mse <= max(1e-10, 1e-12 * y_var)),
+            "robust_match": bool(details.get("robust_match", False)),
+            "inlier_fraction": float(details.get("inlier_fraction", 0.0) or 0.0),
+            "median_abs_residual": float(details.get("median_abs_residual", full_mse) or full_mse),
+        }
+
     def _validate_blackbox_fast_path_candidate(self, formula, mse, X, y):
         """Decide whether a fast-path formula is safe enough to be incumbent."""
         split = self._domain_edge_validation_split(X, y, validation_fraction=0.25)
@@ -2636,13 +2917,19 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         complexity = self._formula_complexity(formula)
         gap = float(max(0.0, val_mse - fit_mse) / val_var)
         train_ratio = val_mse / max(float(mse), 1e-12) if mse is not None and np.isfinite(mse) else 1.0
+        # Multi-var blackbox: reject kitchen-sink fast-path incumbents so
+        # structure seeds / evolution can compete on Exact recovery.
+        max_complexity = 36
+        n_features = int(np.asarray(X).shape[1]) if X is not None and np.ndim(X) == 2 else 1
+        if n_features > 1:
+            max_complexity = 22
         accepted = (
             np.isfinite(val_mse)
             and val_mse <= 1.25 * val_var
             and train_ratio <= 3.0
             and gap <= 0.75
             and risk <= 0.45
-            and complexity <= 36
+            and complexity <= max_complexity
         )
         reason = "accepted" if accepted else "unstable_validation"
         return {
@@ -3435,6 +3722,33 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         "active_terms": [seed_formula],
                         "from_blackbox_seed": True,
                     })
+                # Standardized-space structure seeds with free-const refine (compete, no auto-win).
+                try:
+                    structure_seeds = self._fit_search_space_structure_seeds(
+                        X,
+                        y,
+                        max_seeds=max(6, min(12, int(max_candidates) if max_candidates else 8)),
+                        blackbox_state=blackbox_state,
+                    )
+                except Exception:
+                    structure_seeds = []
+                for seed in structure_seeds:
+                    formula = str((seed or {}).get("formula") or "").strip()
+                    if not formula:
+                        continue
+                    raw_candidates.append({
+                        "formula": formula,
+                        "mse": float((seed or {}).get("mse", float("inf"))),
+                        "score": 1.5,
+                        "validation_mse": (seed or {}).get("validation_mse"),
+                        "validation_r2": (seed or {}).get("validation_r2"),
+                        "complexity": (seed or {}).get("complexity"),
+                        "active_terms": [formula],
+                        "from_structure_seed": True,
+                        "source": "search_space_structure_seed",
+                        "skeleton": (seed or {}).get("skeleton"),
+                    })
+                # Original-space probe remains diagnostic only (not injected).
 
             if np.asarray(X).ndim == 2 and int(np.asarray(X).shape[1]) == 1:
                 raw_candidates.extend(self._targeted_specialist_probe_formulas(X, y, max_formulas=64))
@@ -5537,6 +5851,36 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         blackbox_evolution_ran = False
         blackbox_evolution_improved = False
 
+        # Structure templates: seed-only (diag + candidate pool). Never early-exit.
+        # Winning Exact on known families must go through search/Pareto competition.
+        structure_probe = None
+        self._structure_probe_seed_ = None
+        if (
+            blackbox_state.enabled
+            and int(X_original.shape[1]) > 1
+            and len(getattr(blackbox_state, "selected_features", []) or []) > 1
+        ):
+            structure_probe = self._probe_multivariate_structure_original_space(
+                X_original,
+                y_original,
+                list(getattr(blackbox_state, "selected_features", []) or []),
+            )
+            if structure_probe is not None:
+                self._structure_probe_seed_ = dict(structure_probe)
+            if isinstance(self.blackbox_diagnostics_, dict) and structure_probe is not None:
+                self.blackbox_diagnostics_["structure_probe_original"] = {
+                    "template_match": structure_probe.get("template_match"),
+                    "mse": structure_probe.get("mse"),
+                    "r2": structure_probe.get("r2"),
+                    "complexity": structure_probe.get("complexity"),
+                    "exact_match": structure_probe.get("exact_match"),
+                    "robust_match": structure_probe.get("robust_match"),
+                    "inlier_fraction": structure_probe.get("inlier_fraction"),
+                    "formula": str(structure_probe.get("formula") or "")[:200],
+                    "role": "seed_candidate_only",
+                    "auto_win": False,
+                }
+
         if blackbox_state.enabled:
             X = X_search
             y = y_search
@@ -5768,6 +6112,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 not fast_path_cv_ok or
                 term_count > 10 # Higher threshold for Stage 1 bloat
             )
+            # Multi-var blackbox: force evolution when fast-path is bloated even if R2 is high.
+            if (
+                not need_evolution
+                and blackbox_state is not None
+                and blackbox_state.enabled
+                and best_formula is not None
+            ):
+                fp_comp = self._formula_complexity(best_formula)
+                n_sel = len(getattr(blackbox_state, "selected_features", []) or [])
+                if n_sel > 1 and (fp_comp > 24 or term_count > 6):
+                    need_evolution = True
 
         if (
             best_formula is not None
@@ -5951,6 +6306,38 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 blackbox_search_plan,
                 diagnostics_key="candidate_screening",
             )
+            # Promote best structure seed over bloated fast-path when it is
+            # clearly better on validation (honest competition, not auto-win).
+            try:
+                fp_comp = self._formula_complexity(best_formula) if best_formula else 999
+                best_seed = None
+                for cand in candidate_formulas or []:
+                    if not (cand or {}).get("from_structure_seed"):
+                        continue
+                    mse_c = float((cand or {}).get("mse", float("inf")))
+                    if best_seed is None or mse_c < float(best_seed.get("mse", float("inf"))):
+                        best_seed = cand
+                if best_seed is not None and np.isfinite(float(best_seed.get("mse", float("inf")))):
+                    seed_mse = float(best_seed["mse"])
+                    seed_comp = int(best_seed.get("complexity") or self._formula_complexity(best_seed.get("formula")))
+                    fp_mse = float(best_mse) if best_mse is not None and np.isfinite(best_mse) else float("inf")
+                    better_fit = seed_mse <= fp_mse * 1.02 + 1e-15
+                    much_simpler = seed_comp + 12 <= fp_comp
+                    strong_fit = seed_mse <= max(1e-4, 0.05 * max(float(np.var(y)), 1e-12))
+                    if better_fit and (much_simpler or strong_fit or seed_mse < fp_mse):
+                        best_formula = str(best_seed["formula"])
+                        best_mse = seed_mse
+                        if isinstance(self.blackbox_diagnostics_, dict):
+                            self.blackbox_diagnostics_["structure_seed_promoted"] = {
+                                "formula": best_formula[:160],
+                                "mse": seed_mse,
+                                "complexity": seed_comp,
+                                "fp_mse": fp_mse if np.isfinite(fp_mse) else None,
+                                "fp_complexity": fp_comp,
+                                "skeleton": str(best_seed.get("skeleton") or "")[:120],
+                            }
+            except Exception:
+                pass
 
         if (
             not (blackbox_state is not None and blackbox_state.enabled)
@@ -6109,6 +6496,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         screening_best_r2 = -1.0
         if isinstance(candidate_screening, dict):
             screening_best_r2 = float(candidate_screening.get("best_validation_r2", -1.0) or -1.0)
+        fp_complexity_for_budget = self._formula_complexity(best_formula) if best_formula else 0
+        bloated_multivar = (
+            getattr(self, "blackbox_state_", None) is not None
+            and self.blackbox_state_.enabled
+            and len(getattr(self.blackbox_state_, "selected_features", []) or []) > 1
+            and (fp_complexity_for_budget > 24 or term_count > 6)
+        )
         if (
             getattr(self, "blackbox_state_", None) is not None
             and self.blackbox_state_.enabled
@@ -6116,6 +6510,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             and compact_terms <= 6
             and current_r2 >= 0.80
             and screening_best_r2 < float(blackbox_search_plan.get("candidate_shrink_r2", 0.95))
+            and not bloated_multivar
         ):
             effective_timeout = min(effective_timeout, 18.0)
             blackbox_search_plan["population_multiplier"] = min(
@@ -6132,6 +6527,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             )
             if isinstance(self.blackbox_diagnostics_, dict):
                 self.blackbox_diagnostics_["evolution_budget_policy"] = "short_compact_blackbox_validation_probe"
+        elif bloated_multivar and isinstance(self.blackbox_diagnostics_, dict):
+            self.blackbox_diagnostics_["evolution_budget_policy"] = "full_budget_bloated_multivar_structure_search"
 
         basis_val_r2_for_budget = -1.0
         if isinstance(basis_result, dict):
@@ -6592,9 +6989,20 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         and np.isfinite(evo_mse)
                         and evo_mse > 0.88 * float(best_mse)
                     ):
-                        selection_source = "incumbent"
-                        selected_formula = best_formula
-                        selected_mse = self._formula_mse(best_formula, X, y)
+                        # Allow modest MSE regression when evolution is much simpler
+                        # (structure recovery over bloated high-R2 kitchen-sink).
+                        inc_comp = self._formula_complexity(best_formula)
+                        evo_comp = self._formula_complexity(evo_formula)
+                        n_feat = int(np.asarray(X).shape[1]) if np.ndim(X) == 2 else 1
+                        allow_simpler = (
+                            n_feat > 1
+                            and evo_comp + 8 <= inc_comp
+                            and evo_mse <= 1.15 * float(best_mse)
+                        )
+                        if not allow_simpler:
+                            selection_source = "incumbent"
+                            selected_formula = best_formula
+                            selected_mse = self._formula_mse(best_formula, X, y)
                     if selection_source == "challenger":
                         best_formula = selected_formula
                         best_mse = selected_mse

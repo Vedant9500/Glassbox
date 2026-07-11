@@ -283,6 +283,15 @@ def test_blackbox_seed_formulas_include_features_and_interactions():
     assert "x3*sin(x7)" in formulas
 
 
+def test_blackbox_seed_formulas_include_structure_recovery_skeletons():
+    formulas = build_blackbox_seed_formulas([0, 1, 2, 3, 4], max_seeds=40)
+    joined = " ".join(formulas)
+
+    assert any("1/(1+x0^(-4))" in f or "1/(1+x0^4)" in f for f in formulas)
+    assert "1/(5+" in joined or "10/(5+" in joined
+    assert any("x0*x1/x2^2" in f or "x0*x1/(x2^2)" in f for f in formulas)
+
+
 def test_interaction_scoring_prefers_holdout_stable_signal():
     rng = np.random.RandomState(9)
     X = rng.randn(220, 3)

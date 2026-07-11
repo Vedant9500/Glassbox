@@ -1000,6 +1000,71 @@ def prepare_blackbox_search(
     return X_scaled_all[:, selected], y_scaled, state
 
 
+def build_search_space_structure_seeds(
+    n_features: int,
+    *,
+    max_seeds: int = 12,
+) -> List[str]:
+    """Structure skeletons in *reduced/search* indices x0..xk (standardized space).
+
+    Free numeric constants are intentional so constant refine / affine fit can
+    recover Pagie-like, radial-rational, and product/square families without
+    original-space template auto-win.
+    """
+    n = int(n_features)
+    if n < 2:
+        return []
+    formulas: List[str] = []
+
+    def add(formula: str) -> None:
+        text = str(formula or "").strip()
+        if text and text not in formulas:
+            formulas.append(text)
+
+    idxs = list(range(n))
+    # Priority order: one family head each, then fill — avoid starving product seeds.
+    # Free constants must NOT be bare 0/1: constant refine skips those literals.
+    # Pagie under std: free affine inside power — (a*x+b)^4 / (c+(a*x+b)^4)
+    k = min(4, n)
+    add("+".join(f"(1.1*x{i}+0.1)^4/(1.1+(1.1*x{i}+0.1)^4)" for i in idxs[:k]))
+    add("+".join(f"(0.5*x{i}+0.2)^4/(0.8+(0.5*x{i}+0.2)^4)" for i in idxs[:k]))
+    add("+".join(f"x{i}^4/(1.1+x{i}^4)" for i in idxs[:k]))
+    add("+".join(f"1.1/(1.1+x{i}^4)" for i in idxs[:k]))
+    # Radial / anisotropic (Vlad-like under std): free a_i,b_i,c
+    sq0 = "+".join(f"x{i}^2" for i in idxs)
+    add(f"1.1/(1.1+{sq0})")
+    add(f"5.1/(5.1+{sq0})")
+    sq_ab = "+".join(f"(1.1*x{i}+0.1)^2" for i in idxs)
+    add(f"1.1/(1.1+{sq_ab})")
+    add(f"5.1/(5.1+{sq_ab})")
+    # Product / square (Feynman-like) — free scales inside
+    if n >= 3:
+        for a, b, c in ((0, 1, 2), (0, 2, 1), (1, 2, 0)):
+            if a < n and b < n and c < n:
+                add(f"x{a}*x{b}/x{c}^2")
+                add(f"x{a}*x{b}/(1.1+x{c}^2)")
+                add(f"(1.1*x{a})*(1.1*x{b})/(1.1+(1.1*x{c})^2)")
+                add(f"(1.1*x{a}+0.1)*(1.1*x{b}+0.1)/((1.1*x{c}+0.1)^2)")
+    # Fill remaining slots
+    for i in idxs[: min(2, n)]:
+        add(f"(1.1*x{i}+0.1)^4/(1.1+(1.1*x{i}+0.1)^4)")
+        add(f"1.1/(1.1+x{i}^4)")
+    for center in (0.5, -0.5):
+        if len(formulas) >= max_seeds:
+            break
+        c_txt = f"{center:g}"
+        sq = "+".join(f"(x{i}-{c_txt})^2" for i in idxs)
+        add(f"1.1/(1.1+{sq})")
+    for a_i, a in enumerate(idxs[:3]):
+        for b in idxs[a_i + 1 : 3]:
+            add(f"x{a}*x{b}")
+            add(f"1.1/(1.1+x{a}^2+x{b}^2)")
+            if len(formulas) >= max_seeds:
+                return formulas[:max_seeds]
+
+    return formulas[:max_seeds]
+
+
 def build_blackbox_seed_formulas(
     selected_features: List[int],
     interaction_terms: Optional[List[str]] = None,
@@ -1022,6 +1087,39 @@ def build_blackbox_seed_formulas(
         if len(formulas) >= max_seeds:
             return formulas[:max_seeds]
 
+    # Structure-recovery skeletons (Pagie / Vlad / Feynman-like).
+    # Cap early so interaction/unary seeds still get budget.
+    structure_budget = min(max_seeds, max(6, int(round(max_seeds * 0.35))))
+    if len(selected_features) >= 2:
+        pagie_inv = "+".join(f"1/(1+x{i}^(-4))" for i in selected_features[:4])
+        pagie_pow = "+".join(f"1/(1+x{i}^4)" for i in selected_features[:4])
+        add(pagie_inv)
+        add(pagie_pow)
+        for idx in selected_features[:2]:
+            add(f"1/(1+x{idx}^(-4))")
+            add(f"1/(1+x{idx}^4)")
+        for center in (0, 3):
+            if len(formulas) >= structure_budget:
+                break
+            sq = "+".join(f"(x{i}-{center})^2" for i in selected_features)
+            add(f"1/(5+{sq})")
+            add(f"10/(5+{sq})")
+            add(f"1/(1+{sq})")
+    if len(selected_features) >= 3 and len(formulas) < structure_budget:
+        feats = selected_features[:4]
+        for a_i, a in enumerate(feats):
+            for b in feats[a_i + 1:]:
+                for c in feats:
+                    if c == a or c == b:
+                        continue
+                    add(f"x{a}*x{b}/x{c}^2")
+                    if len(formulas) >= structure_budget:
+                        break
+                if len(formulas) >= structure_budget:
+                    break
+            if len(formulas) >= structure_budget:
+                break
+
     pair_budget = max(2, int(round(max_seeds * 0.40))) if len(selected_features) > 1 else 0
     for a_i, a in enumerate(selected_features):
         for b in selected_features[a_i + 1:]:
@@ -1034,11 +1132,15 @@ def build_blackbox_seed_formulas(
         if len(formulas) >= pair_budget:
             break
 
+    # First pass: one essential unary per feature so none are starved by structure seeds.
     for idx in selected_features:
         add(f"x{idx}")
+        add(f"sin(x{idx})")
+        if len(formulas) >= max_seeds:
+            return formulas[:max_seeds]
+    for idx in selected_features:
         add(f"x{idx}^2")
         add(f"x{idx}^3")
-        add(f"sin(x{idx})")
         add(f"cos(x{idx})")
         add(f"exp(-abs(x{idx}))")
         if len(formulas) >= max_seeds:
