@@ -169,15 +169,15 @@ changed the final formula.
 Goal: borrow PhySO's strongest structural defence — shrink search
 before noise can create wrong fits.
 
-- [ ] Promote existing C++ `input_units`, `output_units`,
+- [x] Promote existing C++ `input_units`, `output_units`,
       `dim_penalty_weight` into `GlassboxRegressor` public API.
-- [ ] Add unit validation + dimensionless-default examples.
-- [ ] Use units to filter candidate formulas and seed graphs before
+- [x] Add unit validation + dimensionless-default examples.
+- [x] Use units to filter candidate formulas and seed graphs before
       C++ evolution.
-- [ ] Add hard vs soft unit modes: hard reject impossible, soft penalty
+- [x] Add hard vs soft unit modes: hard reject impossible, soft penalty
       for unitless/uncertain.
-- [ ] Do NOT require units for normal ML/tabular use.
-- [ ] Do NOT apply unit penalties when unit can't be inferred safely;
+- [x] Do NOT require units for normal ML/tabular use.
+- [x] Do NOT apply unit penalties when unit can't be inferred safely;
       don't mix incompatible unit-vector lengths.
 
 **Expected outcome & when visible:** On physics-style noisy data, the search space shrinks before noise can drive wrong fits — this is PhySO's single strongest noise defence, so it is high-impact standalone. Users who supply `input_units`/`output_units` get physics-constrained SR where high-MSE-but-physical simple formulas beat low-MSE unphysical overfits. Visible immediately for physics-unit users; no effect for tabular ML users who omit units (back-compat preserved).
@@ -192,21 +192,21 @@ public API can state when Glassbox is physics-constrained.
 
 Goal: prevent post-processing and residual stages from fitting noise.
 
-- [ ] Extend `_cleanup_formula_with_fidelity_guard` and
+- [x] Extend `_cleanup_formula_with_fidelity_guard` and
       `reduce_formula_noise_cpp` with weights + holdout checks.
-- [ ] Replace fixed cleanup slack with noise-aware slack based on
+- [x] Replace fixed cleanup slack with noise-aware slack based on
       residual scale + validation variance.
-- [ ] Strengthen `_select_blackbox_pareto_formula`: weighted validation,
+- [x] Strengthen `_select_blackbox_pareto_formula`: weighted validation,
       edge validation, complexity, risk, generalization gap, robust
       residual diagnostics.
-- [ ] Residual-stage acceptance rule: candidate must improve weighted
+- [x] Residual-stage acceptance rule: candidate must improve weighted
       validation AND not worsen unweighted/edge validation beyond slack.
-- [ ] Track `noise_pruned_terms`, `cleanup_rejected_reason`,
+- [x] Track `noise_pruned_terms`, `cleanup_rejected_reason`,
       `residual_rejected_as_noise`.
-- [ ] Do NOT accept residual additions on training MSE alone.
-- [ ] Do NOT let BIC pruning remove physically required small terms
+- [x] Do NOT accept residual additions on training MSE alone.
+- [x] Do NOT let BIC pruning remove physically required small terms
       without holdout/fidelity guard.
-- [ ] Do NOT use one slack value for clean and 10% noisy data.
+- [x] Do NOT use one slack value for clean and 10% noisy data.
 
 **Expected outcome & when visible:** Final formulas become simpler and less noise-shaped; residual/specialist stages improve true structure instead of memorising residual noise. *Not visible in isolation:* cleanup (`reduce_formula_noise_cpp`) and residual guards only become weight/noise-aware once **Phase 1** (weights exist), **Phase 2** (weighted scoring), and **Phase 3** (weighted evolution) are in place — otherwise there is no weighted signal for the guards to use. The visible win is 'we stop re-introducing noise-shaped terms during cleanup/residual passes', which matters most after Phases 1–3 have already produced a good weighted candidate.
 

@@ -3795,6 +3795,9 @@ def beam_search_evolution(
     loss_mode: str = "mse",
     huber_delta: Optional[float] = None,
     trim_fraction: float = 0.1,
+    input_units: Optional[list] = None,
+    output_units: Optional[list] = None,
+    dim_penalty_weight: float = 0.1,
 ) -> Dict:
     """
     Beam search over diverse C++ evolution configurations.
@@ -4254,6 +4257,12 @@ def beam_search_evolution(
             if huber_delta is not None:
                 evolution_kwargs["huber_delta"] = float(huber_delta)
             evolution_kwargs["trim_fraction"] = float(trim_fraction)
+        # Phase 5: optional dimensional analysis (inactive when input_units empty/None).
+        if input_units:
+            evolution_kwargs["input_units"] = input_units
+            if output_units is not None:
+                evolution_kwargs["output_units"] = output_units
+            evolution_kwargs["dim_penalty_weight"] = float(dim_penalty_weight)
         try:
             result = _core.run_evolution(**evolution_kwargs)
         except TypeError:
@@ -4261,6 +4270,9 @@ def beam_search_evolution(
             evolution_kwargs.pop("loss_mode", None)
             evolution_kwargs.pop("huber_delta", None)
             evolution_kwargs.pop("trim_fraction", None)
+            evolution_kwargs.pop("input_units", None)
+            evolution_kwargs.pop("output_units", None)
+            evolution_kwargs.pop("dim_penalty_weight", None)
             result = _core.run_evolution(**evolution_kwargs)
     except Exception as e:
         print(f"  \u274c Native Island Search failed: {e}")
@@ -4370,6 +4382,9 @@ def run_guided_evolution(
     loss_mode: str = "mse",
     huber_delta: Optional[float] = None,
     trim_fraction: float = 0.1,
+    input_units: Optional[list] = None,
+    output_units: Optional[list] = None,
+    dim_penalty_weight: float = 0.1,
 ) -> Dict:
     """
     Run evolution guided by fast-path operator hints.
@@ -4449,6 +4464,9 @@ def run_guided_evolution(
         loss_mode=loss_mode,
         huber_delta=huber_delta,
         trim_fraction=trim_fraction,
+        input_units=input_units,
+        output_units=output_units,
+        dim_penalty_weight=dim_penalty_weight,
     )
     
     if beam_result is not None and beam_result['mse'] < float('inf'):

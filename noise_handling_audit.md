@@ -195,3 +195,51 @@ Pareto weight threading, full multi-seed baseline run on real estimator,
 - Wiring: sklearn + guided beam pass loss kwargs (TypeError fallback).
 - Tests: `tests/test_robust_loss.py` + C++ parity huber/trimmed smoke.
 - Next: Phase 6 cleanup/residual guards (plan order), then Phase 5 units.
+
+---
+
+## Phase 6 completed (noise-aware cleanup / residual guards)
+
+- C++ `reduce_formula_noise`: optional `y_weights`, `holdout_fraction`,
+  `relative_slack`; weighted WLS+BIC; unweighted holdout fidelity blocks
+  over-pruning small terms.
+- Python cleanup: `_noise_aware_cleanup_slack` (MAD residual scale + val gap)
+  replaces fixed 10% slack; tracks `noise_pruned_terms`,
+  `cleanup_rejected_reason`, per-step reject reasons.
+- Pareto: weighted fit/val/edge when `sample_weight_` present; residual MAD /
+  outlier fraction penalty; dual weighted+unweighted metrics retained.
+- Residual stage + boosting: must improve weighted holdout and not worsen
+  unweighted/edge beyond noise-aware slack; `residual_rejected_as_noise`.
+- Tests: `tests/test_phase6_noise_guards.py`.
+- Next: Phase 5 units API (or Phase 7 calibration).
+
+---
+
+## Phase 5 completed (units / physics priors)
+
+- C++: `run_evolution(..., dim_penalty_weight=0.1)` exposed (was config-only).
+- Public API: `GlassboxRegressor(input_units, output_units, dim_penalty_weight,
+  unit_mode='off'|'soft'|'hard')`. Units optional; tabular default unchanged.
+- Auto `soft` when units supplied with default `unit_mode='off'`.
+- Validation: matching feature count + equal unit-vector lengths; both or none.
+- Python formula unit inference for candidate filter; hard drops unphysical when
+  inference succeeds; soft ranks by penalty; unsafe inference never rejected.
+- Wiring: guided beam + raw C++ evolution get units kwargs; blackbox feature
+  selection remaps unit rows (disables if remap unsafe).
+- Diagnostics: `physics_constrained_`, `blackbox_diagnostics_['physics_units']`,
+  `unit_filter`.
+- Tests: `tests/test_phase5_units.py`.
+- Soft units floor: default `dim_penalty_weight=0.1` → effective 2.0 when units
+  active (hard still floors at 10). Explicit user values >0.1 kept (min 0.5).
+- Next: Phase 7 routing calibration (or Phase 8 release gate).
+
+---
+
+## Phase 4 tightened (IRLS output ridge)
+
+- C++ `solve_output_weights`: 4 IRLS iters for huber / trimmed_mse / student_t
+  (Huber w=min(1,d/|r|), trimmed soft-zeros worst frac, student_t 1/(1+(r/s)^2)).
+- Combines with Phase 3 `y_weights` when both set.
+- Probe (block outliers, seed=11, 50 gens): mse clean≈902, huber≈0.26,
+  trimmed exact `2*x+1`, weights clean≈9.
+- Tests: parity + robust suites green after rebuild.

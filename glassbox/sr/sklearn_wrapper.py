@@ -182,6 +182,16 @@ def _slice_sample_weight(sample_weight, indices=None, n_targets=None):
 # Phase 4: robust search losses (display MSE stays plain unweighted MSE).
 _VALID_LOSS_MODES = ("mse", "huber", "trimmed_mse", "student_t")
 
+# Phase 5: dimensional analysis (optional; omit units for tabular ML).
+_VALID_UNIT_MODES = ("off", "soft", "hard")
+_UNIT_UNARY_DIMLESS = frozenset({
+    "sin", "cos", "tan", "exp", "log", "ln",
+    "asin", "acos", "atan", "sinh", "cosh", "tanh",
+})
+_UNIT_UNARY_PRESERVE = frozenset({"abs", "sign", "neg", "negation"})
+_UNIT_HARD_PENALTY = 1e6
+_UNIT_MATCH_TOL = 1e-6
+
 
 def _validate_loss_mode(loss_mode):
     mode = str(loss_mode or "mse").strip().lower()
@@ -190,6 +200,322 @@ def _validate_loss_mode(loss_mode):
             f"loss_mode must be one of {_VALID_LOSS_MODES}, got {loss_mode!r}"
         )
     return mode
+
+
+def _validate_unit_mode(unit_mode):
+    mode = str(unit_mode or "off").strip().lower()
+    if mode in ("none", "disabled", "false", "0"):
+        mode = "off"
+    if mode not in _VALID_UNIT_MODES:
+        raise ValueError(
+            f"unit_mode must be one of {_VALID_UNIT_MODES}, got {unit_mode!r}"
+        )
+    return mode
+
+
+def _as_unit_vector(vec, *, name="units", n_dims=None):
+    try:
+        arr = np.asarray(vec, dtype=np.float64).reshape(-1)
+    except Exception as exc:
+        raise ValueError(f"{name} must be array-like of floats") from exc
+    if arr.size == 0:
+        raise ValueError(f"{name} must be non-empty")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must contain only finite values")
+    if n_dims is not None and arr.size != int(n_dims):
+        raise ValueError(
+            f"{name} has length {arr.size}, expected {n_dims} dimensional exponents"
+        )
+    return arr.tolist()
+
+
+def _validate_physics_units(input_units, output_units, n_features):
+    """Validate PhySO-style unit exponent vectors.
+
+    ``input_units``: list of length ``n_features``, each a vector of base-dimension
+    exponents (e.g. SI [M, L, T, ...] or custom). ``output_units``: one vector of
+    the same length. Empty/None → inactive (tabular default).
+    """
+    if input_units is None and output_units is None:
+        return None, None
+    if input_units is None or output_units is None:
+        raise ValueError(
+            "input_units and output_units must both be provided, or both omitted"
+        )
+    n_features = int(n_features)
+    if n_features < 1:
+        raise ValueError("n_features must be >= 1 when units are provided")
+
+    try:
+        rows = list(input_units)
+    except TypeError as exc:
+        raise ValueError("input_units must be a sequence of unit vectors") from exc
+    if len(rows) != n_features:
+        raise ValueError(
+            f"input_units has {len(rows)} feature rows, expected {n_features}"
+        )
+    parsed = []
+    n_dims = None
+    for i, row in enumerate(rows):
+        vec = _as_unit_vector(row, name=f"input_units[{i}]", n_dims=n_dims)
+        if n_dims is None:
+            n_dims = len(vec)
+        parsed.append(vec)
+    out = _as_unit_vector(output_units, name="output_units", n_dims=n_dims)
+    # Reject mixing zero-dim with multi-dim inconsistently (already length-checked).
+    return parsed, out
+
+
+def _units_equal(a, b, tol=_UNIT_MATCH_TOL):
+    if a is None or b is None:
+        return False
+    if len(a) != len(b):
+        return False
+    return all(abs(float(x) - float(y)) <= tol for x, y in zip(a, b))
+
+
+def _units_zero(u, tol=_UNIT_MATCH_TOL):
+    return u is not None and all(abs(float(x)) <= tol for x in u)
+
+
+def _units_add(a, b):
+    return [float(x) + float(y) for x, y in zip(a, b)]
+
+
+def _units_sub(a, b):
+    return [float(x) - float(y) for x, y in zip(a, b)]
+
+
+def _units_scale(a, s):
+    return [float(x) * float(s) for x in a]
+
+
+def _infer_formula_units(formula, input_units, output_units=None):
+    """Propagate dimensional exponents for a display formula string.
+
+    Returns dict:
+      units: list[float] | None
+      penalty: float (squared mismatches; higher = more unphysical)
+      ok: bool (safe inference succeeded)
+      reason: str
+    """
+    text = str(formula or "").strip()
+    if not text or not input_units:
+        return {"units": None, "penalty": 0.0, "ok": False, "reason": "no_formula_or_units"}
+
+    n_dims = len(input_units[0])
+    zero = [0.0] * n_dims
+    penalty = [0.0]
+
+    # Tokenize: numbers, names, operators, punctuation.
+    token_re = re.compile(
+        r"\s*("
+        r"[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
+        r"|x\d+"
+        r"|[A-Za-z_][A-Za-z0-9_]*"
+        r"|[\+\-\*/\^]|\*\*"
+        r"|[(),|]"
+        r")"
+    )
+    tokens = []
+    pos = 0
+    s = text.replace("·", "*").replace("−", "-")
+    while pos < len(s):
+        m = token_re.match(s, pos)
+        if not m:
+            return {"units": None, "penalty": 0.0, "ok": False, "reason": "parse_error"}
+        tok = m.group(1)
+        if tok.strip():
+            tokens.append(tok)
+        pos = m.end()
+    if not tokens:
+        return {"units": None, "penalty": 0.0, "ok": False, "reason": "empty_tokens"}
+
+    i = [0]
+
+    def peek():
+        return tokens[i[0]] if i[0] < len(tokens) else None
+
+    def get():
+        tok = peek()
+        i[0] += 1
+        return tok
+
+    def parse_expr():
+        return parse_add()
+
+    def parse_add():
+        left = parse_mul()
+        while peek() in ("+", "-"):
+            op = get()
+            right = parse_mul()
+            if left is None or right is None:
+                left = None
+                continue
+            if not _units_equal(left, right):
+                for d in range(n_dims):
+                    diff = left[d] - right[d]
+                    penalty[0] += diff * diff
+            # Result units: prefer left if mismatch (C++ style)
+            left = list(left)
+        return left
+
+    def parse_mul():
+        left = parse_pow()
+        while peek() in ("*", "/"):
+            op = get()
+            right = parse_pow()
+            if left is None or right is None:
+                left = None
+                continue
+            left = _units_add(left, right) if op == "*" else _units_sub(left, right)
+        return left
+
+    def parse_pow():
+        base = parse_unary()
+        if peek() not in ("^", "**"):
+            return base
+        get()
+        # Constant exponent only (unit-safe scale).
+        sign = 1.0
+        if peek() == "+":
+            get()
+        elif peek() == "-":
+            get()
+            sign = -1.0
+        tok = peek()
+        if tok is None:
+            return None
+        try:
+            float(tok)
+            get()
+            exp_val = sign * float(tok)
+        except Exception:
+            if tok == "(":
+                get()
+                inner = parse_expr()
+                if peek() == ")":
+                    get()
+                if inner is not None and _units_zero(inner):
+                    return list(zero) if base is not None and _units_zero(base) else None
+                return None
+            parse_unary()
+            return None
+        if base is None:
+            return None
+        return _units_scale(base, exp_val)
+
+    def parse_unary():
+        if peek() in ("+", "-"):
+            get()
+            return parse_unary()
+        return parse_primary()
+
+    def parse_primary():
+        tok = peek()
+        if tok is None:
+            return None
+        if tok == "(":
+            get()
+            node = parse_expr()
+            if peek() == ")":
+                get()
+            return node
+        if tok == "|":
+            # abs |expr|
+            get()
+            node = parse_expr()
+            if peek() == "|":
+                get()
+            return node
+        # number
+        try:
+            float(tok)
+            get()
+            return list(zero)
+        except Exception:
+            pass
+        # feature xN
+        m = re.fullmatch(r"x(\d+)", tok)
+        if m:
+            get()
+            idx = int(m.group(1))
+            if 0 <= idx < len(input_units):
+                return list(input_units[idx])
+            return None
+        # function call
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tok) and i[0] + 1 < len(tokens) and tokens[i[0] + 1] == "(":
+            name = get().lower()
+            get()  # (
+            arg = parse_expr()
+            if peek() == ")":
+                get()
+            if name in _UNIT_UNARY_DIMLESS:
+                if arg is not None and not _units_zero(arg):
+                    for d in range(n_dims):
+                        penalty[0] += arg[d] * arg[d]
+                return list(zero)
+            if name in _UNIT_UNARY_PRESERVE:
+                return list(arg) if arg is not None else None
+            if name in ("square",):
+                return _units_scale(arg, 2.0) if arg is not None else None
+            if name in ("sqrt", "sqr"):
+                return _units_scale(arg, 0.5) if arg is not None else None
+            # Unknown function: only safe if arg dimensionless → dimensionless result
+            if arg is not None and _units_zero(arg):
+                return list(zero)
+            return None
+        # bare identifier (pi, e, etc.) → dimensionless
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tok):
+            get()
+            return list(zero)
+        return None
+
+    try:
+        units = parse_expr()
+        if peek() is not None:
+            return {"units": None, "penalty": 0.0, "ok": False, "reason": "trailing_tokens"}
+    except Exception:
+        return {"units": None, "penalty": 0.0, "ok": False, "reason": "exception"}
+
+    if units is None:
+        return {"units": None, "penalty": float(penalty[0]), "ok": False, "reason": "unsafe_inference"}
+
+    if output_units is not None:
+        for d in range(min(n_dims, len(output_units))):
+            diff = units[d] - float(output_units[d])
+            penalty[0] += diff * diff
+
+    return {
+        "units": units,
+        "penalty": float(penalty[0]),
+        "ok": True,
+        "reason": "ok",
+    }
+
+
+def _formula_unit_compatible(formula, input_units, output_units, unit_mode="soft", *, max_penalty=1e-6):
+    """Return (compatible, info) for candidate filtering.
+
+    hard: reject when inference ok and penalty > max_penalty, or when
+    inference fails on clearly structured formulas with trig/exp of dimensioned args
+    that we *did* score. Soft: never reject; only report penalty.
+    off: always compatible.
+    """
+    mode = _validate_unit_mode(unit_mode)
+    if mode == "off" or not input_units:
+        return True, {"penalty": 0.0, "ok": False, "reason": "units_inactive"}
+    info = _infer_formula_units(formula, input_units, output_units)
+    if mode == "soft":
+        return True, info
+    # hard
+    if not info.get("ok"):
+        # Do not reject when units cannot be inferred safely.
+        return True, info
+    pen = float(info.get("penalty") or 0.0)
+    if pen > float(max_penalty):
+        return False, info
+    return True, info
 
 
 def _mad_scale(resid, sample_weight=None):
@@ -321,6 +647,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
     Scikit-learn compatible wrapper for Glassbox Symbolic Regression.
 
     Uses the full pipeline: classifier fast-path → C++ evolution → formula simplification.
+
+    Optional physics units (Phase 5 / PhySO-style):
+      input_units: list of length n_features, each a base-dimension exponent vector
+        e.g. SI-like [M, L, T] → length variable [[0,1,0]], time [[0,0,1]].
+      output_units: one exponent vector for the target (same length as each input row).
+      unit_mode: 'off' (default tabular), 'soft' (penalty/rank), 'hard' (filter).
+      dim_penalty_weight: C++ fitness penalty scale when units active.
+    Omit units for normal ML/tabular use — no dimensional penalties applied.
     """
 
     def __init__(
@@ -387,6 +721,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         loss_mode="mse",
         huber_delta=None,
         trim_fraction=0.1,
+        # Phase 5: optional dimensional analysis (PhySO-style). Omit for tabular ML.
+        input_units=None,
+        output_units=None,
+        dim_penalty_weight=0.1,
+        unit_mode="off",
     ):
         self.population_size = population_size
         self.generations = generations
@@ -395,6 +734,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.loss_mode = _validate_loss_mode(loss_mode)
         self.huber_delta = huber_delta
         self.trim_fraction = float(trim_fraction)
+        self.input_units = input_units
+        self.output_units = output_units
+        self.dim_penalty_weight = float(dim_penalty_weight)
+        self.unit_mode = _validate_unit_mode(unit_mode)
         self.p_min = p_min
         self.p_max = p_max
         self.use_nsga2 = use_nsga2
@@ -454,6 +797,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.exact_match_max_combos = exact_match_max_combos
         self.skip_evolution_if_bloated = skip_evolution_if_bloated
         self.bloat_term_threshold = bloat_term_threshold
+
+        self.input_units_ = None
+        self.output_units_ = None
+        self.units_active_ = False
+        self.physics_constrained_ = False
 
         self._universal_proposer_model = None
         self.specialist_state_ = None
@@ -1520,6 +1868,118 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return None
         return _slice_sample_weight(stored, indices=indices, n_targets=n_targets)
 
+    def _activate_physics_units(self, n_features):
+        """Validate constructor units and set fit-time unit state (Phase 5).
+
+        Units are optional. When omitted or ``unit_mode='off'``, behaviour matches
+        tabular ML (no dimensional penalties). When provided, enables
+        physics-constrained SR via C++ ``dim_penalty_weight`` and candidate filters.
+        """
+        mode = _validate_unit_mode(getattr(self, "unit_mode", "off"))
+        raw_in = getattr(self, "input_units", None)
+        raw_out = getattr(self, "output_units", None)
+        self.input_units_ = None
+        self.output_units_ = None
+        self.units_active_ = False
+        self.physics_constrained_ = False
+        # Auto-enable soft mode when user supplies units but left unit_mode at default off.
+        if mode == "off" and raw_in is None and raw_out is None:
+            return
+        if mode == "off" and (raw_in is not None or raw_out is not None):
+            mode = "soft"
+            self.unit_mode = mode
+        if mode == "off":
+            return
+        parsed_in, parsed_out = _validate_physics_units(raw_in, raw_out, n_features)
+        if not parsed_in:
+            return
+        self.input_units_ = parsed_in
+        self.output_units_ = parsed_out
+        self.units_active_ = True
+        self.physics_constrained_ = True
+
+    def _evolution_units_kwargs(self):
+        """Kwargs for C++ run_evolution dimensional analysis (empty when inactive).
+
+        Soft mode floors a near-default ``dim_penalty_weight`` (0.1) to 2.0 so
+        units actually compete with noisy MSE without requiring users to tune.
+        Explicit user values above the floor are kept. Hard mode floors at 10.
+        """
+        if not getattr(self, "units_active_", False):
+            return {}
+        iu = getattr(self, "input_units_", None)
+        ou = getattr(self, "output_units_", None)
+        if not iu:
+            return {}
+        weight = float(getattr(self, "dim_penalty_weight", 0.1) or 0.0)
+        mode = _validate_unit_mode(getattr(self, "unit_mode", "soft"))
+        if mode == "hard":
+            weight = max(weight, 10.0)
+        else:
+            # Evidence: weight≈1 weak, weight≈10 recovers physical v=L/t; soft floor 2.0.
+            if weight <= 0.1000001:
+                weight = 2.0
+            else:
+                weight = max(weight, 0.5)
+        return {
+            "input_units": [list(row) for row in iu],
+            "output_units": list(ou) if ou is not None else [],
+            "dim_penalty_weight": weight,
+        }
+
+    def _filter_candidates_by_units(self, candidate_formulas, *, max_candidates=None):
+        """Filter/annotate candidates with dimensional compatibility (Phase 5).
+
+        hard mode drops incompatible formulas when units infer successfully.
+        soft mode keeps all but sorts physical formulas first and records penalty.
+        Never applies penalties when inference is unsafe.
+        """
+        if not candidate_formulas:
+            return []
+        if not getattr(self, "units_active_", False):
+            return list(candidate_formulas)
+        iu = getattr(self, "input_units_", None)
+        ou = getattr(self, "output_units_", None)
+        mode = _validate_unit_mode(getattr(self, "unit_mode", "soft"))
+        kept = []
+        rejected = []
+        for cand in candidate_formulas:
+            formula = str((cand or {}).get("formula", "")).strip()
+            if not formula:
+                continue
+            ok, info = _formula_unit_compatible(formula, iu, ou, unit_mode=mode)
+            merged = dict(cand)
+            merged["unit_penalty"] = float(info.get("penalty") or 0.0)
+            merged["unit_ok"] = bool(info.get("ok"))
+            merged["unit_reason"] = info.get("reason")
+            if ok:
+                kept.append(merged)
+            else:
+                rejected.append({
+                    "formula": formula[:160],
+                    "unit_penalty": merged["unit_penalty"],
+                    "reason": info.get("reason"),
+                })
+        if mode == "soft":
+            kept.sort(
+                key=lambda c: (
+                    float(c.get("unit_penalty") or 0.0) if c.get("unit_ok") else 1e3,
+                    _finite_float(c.get("mse"), float("inf")),
+                    _finite_float(c.get("complexity"), float("inf")),
+                )
+            )
+        if max_candidates is not None:
+            kept = kept[: max(1, int(max_candidates))]
+        if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+            self.blackbox_diagnostics_["unit_filter"] = {
+                "mode": mode,
+                "active": True,
+                "kept": len(kept),
+                "rejected": len(rejected),
+                "rejected_examples": rejected[:6],
+            }
+        return kept
+
     def _search_loss_kwargs(self):
         """Kwargs for robust search loss (Phase 4). Display path ignores these."""
         return {
@@ -1596,6 +2056,75 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         score = display_mse if np.isfinite(display_mse) else internal_mse
         return score, internal_mse, display_mse
 
+    def _noise_aware_cleanup_slack(self, formula, X, y, *, relative_slack=None, absolute_slack=None):
+        """Compute cleanup slack from residual scale + validation variance (Phase 6).
+
+        Clean data keeps tight slack; high residual scale / validation gap
+        widens relative slack so BIC pruning can drop noise terms without
+        failing the fidelity guard. Returns ``(rel, abs, diag)``.
+        """
+        base_rel = 0.10 if relative_slack is None else float(relative_slack)
+        base_abs = 1e-9 if absolute_slack is None else float(absolute_slack)
+        diag = {
+            "base_relative_slack": base_rel,
+            "base_absolute_slack": base_abs,
+            "relative_slack": base_rel,
+            "absolute_slack": base_abs,
+        }
+        try:
+            pred = self._safe_eval_formula_array(formula, X)
+            pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+            target = np.asarray(y, dtype=np.float64).reshape(-1)
+            if pred.shape != target.shape or not np.all(np.isfinite(pred)):
+                return base_rel, base_abs, diag
+            resid = pred - target
+            w = self._active_sample_weight(n_targets=target.shape[0])
+            # Near-zero residuals → treat as clean (do not use MAD floor=1.0 as noise).
+            resid_rms = float(np.sqrt(np.mean(resid ** 2))) if resid.size else 0.0
+            if not np.isfinite(resid_rms) or resid_rms < 1e-14:
+                scale = 0.0
+            else:
+                scale = float(_mad_scale(resid, w))
+                # If MAD floor inflated a near-perfect fit, prefer rms.
+                if scale > 10.0 * max(resid_rms, 1e-15) and resid_rms < 1e-6:
+                    scale = resid_rms
+            y_scale = float(np.std(target)) if target.size else 1.0
+            if not np.isfinite(y_scale) or y_scale < 1e-12:
+                y_scale = max(float(np.mean(np.abs(target))), 1e-12)
+            noise_ratio = scale / y_scale if y_scale > 0 else 0.0
+            # Holdout generalization gap (unweighted display contract on val).
+            gap_ratio = 0.0
+            try:
+                split = self._domain_edge_validation_split(X, y, validation_fraction=0.2)
+            except Exception:
+                split = None
+            if split is not None:
+                try:
+                    fit_pred = self._safe_eval_formula_array(formula, split["X_fit"])
+                    val_pred = self._safe_eval_formula_array(formula, split["X_val"])
+                    fit_mse = float(np.mean((fit_pred - split["y_fit"]) ** 2))
+                    val_mse = float(np.mean((val_pred - split["y_val"]) ** 2))
+                    y_var = max(float(np.var(split["y_val"])), 1e-12)
+                    if np.isfinite(fit_mse) and np.isfinite(val_mse):
+                        gap_ratio = float(max(0.0, val_mse - fit_mse) / y_var)
+                except Exception:
+                    gap_ratio = 0.0
+            # Map noise/gap into [0.05, 0.35] relative slack (do not use one value for clean vs 10%).
+            rel = base_rel + 0.20 * min(max(noise_ratio, 0.0), 1.0) + 0.10 * min(max(gap_ratio, 0.0), 1.0)
+            rel = float(min(max(rel, 0.05), 0.35))
+            abs_slack = max(base_abs, 1e-12 * (y_scale ** 2), 1e-6 * (scale ** 2))
+            diag.update({
+                "residual_mad_scale": scale,
+                "y_scale": y_scale,
+                "noise_ratio": float(noise_ratio),
+                "generalization_gap_ratio": float(gap_ratio),
+                "relative_slack": rel,
+                "absolute_slack": float(abs_slack),
+            })
+            return rel, float(abs_slack), diag
+        except Exception:
+            return base_rel, base_abs, diag
+
     def _cleanup_formula_with_fidelity_guard(
         self,
         formula,
@@ -1603,36 +2132,42 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         y,
         *,
         stage="final_cleanup",
-        relative_slack=0.10,
-        absolute_slack=1e-9,
+        relative_slack=None,
+        absolute_slack=None,
     ):
-        """Apply formula cleanup only when direct evaluation preserves fit."""
+        """Apply formula cleanup only when evaluation preserves fit (noise-aware slack)."""
         current = str(formula or "").strip()
         if not current:
             return formula
 
+        rel_slack, abs_slack, slack_diag = self._noise_aware_cleanup_slack(
+            current, X, y, relative_slack=relative_slack, absolute_slack=absolute_slack
+        )
         current_mse = self._formula_mse(current, X, y)
         current_display_mse = self._display_formula_mse(current, X, y)
         diagnostics = []
+        rejected_reasons = []
+        noise_pruned_terms = 0
+        terms_before = max(1, current.count("+") + current.count("-") // 2 + 1)
 
         def _accepts(candidate_mse, candidate_display_mse):
             if not np.isfinite(candidate_mse) and not np.isfinite(candidate_display_mse):
-                return False
+                return False, "non_finite_candidate"
             if np.isfinite(current_mse) and np.isfinite(candidate_mse):
-                internal_allowed = current_mse * (1.0 + max(0.0, float(relative_slack))) + max(0.0, float(absolute_slack))
+                internal_allowed = current_mse * (1.0 + max(0.0, float(rel_slack))) + max(0.0, float(abs_slack))
                 if candidate_mse > internal_allowed:
-                    return False
+                    return False, "internal_mse_regression"
             elif np.isfinite(current_mse):
-                return False
+                return False, "internal_mse_non_finite"
 
             if np.isfinite(current_display_mse) and np.isfinite(candidate_display_mse):
-                display_allowed = current_display_mse * (1.0 + max(0.0, float(relative_slack))) + max(0.0, float(absolute_slack))
+                display_allowed = current_display_mse * (1.0 + max(0.0, float(rel_slack))) + max(0.0, float(abs_slack))
                 if candidate_display_mse > display_allowed:
-                    return False
+                    return False, "display_mse_regression"
             elif np.isfinite(current_display_mse):
-                return False
+                return False, "display_mse_non_finite"
 
-            return True
+            return True, "accepted"
 
         cleanup_steps = (
             ("reduce_formula_noise", lambda text: self._reduce_formula_noise(text, X, y)),
@@ -1648,25 +2183,44 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
             candidate_mse = self._formula_mse(candidate, X, y)
             candidate_display_mse = self._display_formula_mse(candidate, X, y)
-            accepted = _accepts(candidate_mse, candidate_display_mse)
-            diagnostics.append({
+            accepted, reason = _accepts(candidate_mse, candidate_display_mse)
+            step_diag = {
                 "step": step_name,
                 "accepted": bool(accepted),
+                "reason": reason,
                 "before_mse": float(current_mse) if np.isfinite(current_mse) else None,
                 "after_mse": float(candidate_mse) if np.isfinite(candidate_mse) else None,
                 "before_display_mse": float(current_display_mse) if np.isfinite(current_display_mse) else None,
                 "after_display_mse": float(candidate_display_mse) if np.isfinite(candidate_display_mse) else None,
-            })
+                "relative_slack": float(rel_slack),
+                "absolute_slack": float(abs_slack),
+            }
+            diagnostics.append(step_diag)
             if accepted:
+                if step_name == "reduce_formula_noise":
+                    terms_after = max(1, candidate.count("+") + candidate.count("-") // 2 + 1)
+                    noise_pruned_terms += max(0, terms_before - terms_after)
+                    terms_before = terms_after
                 current = candidate
                 current_mse = candidate_mse
                 current_display_mse = candidate_display_mse
+            else:
+                rejected_reasons.append(f"{step_name}:{reason}")
 
-        if diagnostics and isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
-            self.blackbox_diagnostics_.setdefault("formula_cleanup_guard", []).append({
-                "stage": stage,
-                "steps": diagnostics,
-            })
+        if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+            if diagnostics:
+                self.blackbox_diagnostics_.setdefault("formula_cleanup_guard", []).append({
+                    "stage": stage,
+                    "steps": diagnostics,
+                    "noise_aware_slack": slack_diag,
+                    "noise_pruned_terms": int(noise_pruned_terms),
+                    "cleanup_rejected_reason": rejected_reasons[-1] if rejected_reasons else None,
+                })
+            if noise_pruned_terms:
+                prev = int(self.blackbox_diagnostics_.get("noise_pruned_terms", 0) or 0)
+                self.blackbox_diagnostics_["noise_pruned_terms"] = prev + int(noise_pruned_terms)
+            if rejected_reasons:
+                self.blackbox_diagnostics_["cleanup_rejected_reason"] = rejected_reasons[-1]
         return current
 
     def _candidate_pool_has_actionable_fit(self, candidate_formulas, incumbent_mse, search_plan=None):
@@ -1772,7 +2326,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         return "challenger" if choice.get("source") == "challenger" else "incumbent"
 
     def _select_blackbox_pareto_formula(self, candidates, X, y):
-        """Select a validation-stable Pareto winner for blackbox approximation."""
+        """Select a validation-stable Pareto winner (weighted val + residual diagnostics)."""
         if not candidates:
             return None
         random_split = self._random_blackbox_validation_split(X, y, validation_fraction=0.25, salt=17)
@@ -1782,6 +2336,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return None
         y_val = split["y_val"]
         y_var = max(float(np.var(y_val)), 1e-12)
+        fit_w, val_w = self._split_sample_weights(split, n_total=int(np.asarray(y).reshape(-1).shape[0]))
+        edge_w = None
+        if edge_split is not None and edge_split is not split:
+            try:
+                _, edge_w = self._split_sample_weights(
+                    edge_split, n_total=int(np.asarray(y).reshape(-1).shape[0])
+                )
+            except Exception:
+                edge_w = None
         scored = []
         seen = set()
         for candidate in candidates:
@@ -1803,30 +2366,63 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 continue
             if not (np.all(np.isfinite(pred_fit)) and np.all(np.isfinite(pred_val))):
                 continue
-            fit_mse = float(np.mean((pred_fit - split["y_fit"]) ** 2))
-            val_mse = float(np.mean((pred_val - y_val) ** 2))
+            # Unweighted diagnostics always retained for display/bench parity.
+            fit_mse_u = float(np.mean((pred_fit - split["y_fit"]) ** 2))
+            val_mse_u = float(np.mean((pred_val - y_val) ** 2))
+            if not np.isfinite(fit_mse_u) or not np.isfinite(val_mse_u):
+                continue
+            fit_mse = fit_mse_u
+            val_mse = val_mse_u
+            if fit_w is not None:
+                try:
+                    fit_mse = _weighted_mse(pred_fit, split["y_fit"], fit_w)
+                except Exception:
+                    fit_mse = fit_mse_u
+            if val_w is not None:
+                try:
+                    val_mse = _weighted_mse(pred_val, y_val, val_w)
+                except Exception:
+                    val_mse = val_mse_u
             if not np.isfinite(fit_mse) or not np.isfinite(val_mse):
                 continue
             complexity = int((candidate or {}).get("complexity") or self._formula_complexity(formula))
             risk = self._formula_risk_score(formula, split["X_val"])
             gap = float(max(0.0, val_mse - fit_mse) / y_var)
-            val_r2 = 1.0 - val_mse / y_var
+            val_r2 = 1.0 - val_mse_u / y_var
+            # Robust residual diagnostics on validation residuals.
+            resid_val = pred_val - y_val
+            resid_scale = float(_mad_scale(resid_val, val_w))
+            resid_std = float(np.std(resid_val)) if resid_val.size else 0.0
+            outlier_frac = 0.0
+            if resid_scale > 1e-12 and resid_val.size:
+                outlier_frac = float(np.mean(np.abs(resid_val) > 3.0 * resid_scale))
             edge_mse = None
+            edge_mse_u = None
             edge_r2 = None
             if edge_split is not None and edge_split is not split:
                 try:
                     edge_pred = self._safe_eval_formula_array(formula, edge_split["X_val"])
                     edge_pred = np.asarray(edge_pred, dtype=np.float64).reshape(-1)
                     if edge_pred.shape == edge_split["y_val"].shape and np.all(np.isfinite(edge_pred)):
-                        edge_mse = float(np.mean((edge_pred - edge_split["y_val"]) ** 2))
+                        edge_mse_u = float(np.mean((edge_pred - edge_split["y_val"]) ** 2))
+                        edge_mse = edge_mse_u
+                        if edge_w is not None:
+                            try:
+                                edge_mse = _weighted_mse(edge_pred, edge_split["y_val"], edge_w)
+                            except Exception:
+                                edge_mse = edge_mse_u
                         edge_var = max(float(np.var(edge_split["y_val"])), 1e-12)
-                        edge_r2 = 1.0 - edge_mse / edge_var
+                        edge_r2 = 1.0 - edge_mse_u / edge_var
                 except Exception:
                     edge_mse = None
             blend_mse = val_mse
             if edge_mse is not None and np.isfinite(edge_mse):
                 blend_mse = 0.72 * val_mse + 0.28 * edge_mse
-            score = blend_mse * (1.0 + 0.030 * complexity + 0.50 * risk + 0.25 * gap)
+            # Penalize heavy residual tails / outlier memorization.
+            residual_penalty = 0.15 * min(max(outlier_frac, 0.0), 1.0) + 0.05 * min(
+                max(resid_scale / max(float(np.std(y_val)), 1e-12), 0.0), 2.0
+            )
+            score = blend_mse * (1.0 + 0.030 * complexity + 0.50 * risk + 0.25 * gap + residual_penalty)
             governor = None
             try:
                 from scripts import benchmark_common as bc
@@ -1834,9 +2430,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     formula,
                     X,
                     y,
-                    raw_mse=(candidate or {}).get("mse", val_mse),
-                    fit_mse=fit_mse,
-                    holdout_mse=edge_mse,
+                    raw_mse=(candidate or {}).get("mse", val_mse_u),
+                    fit_mse=fit_mse_u,
+                    holdout_mse=edge_mse_u,
                     complexity=complexity,
                     postprocess=False,
                 )
@@ -1847,18 +2443,29 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             except Exception:
                 governor_score = None
                 governor_display = None
+            try:
+                full_mse_u = float(np.mean((self._safe_eval_formula_array(formula, X) - y) ** 2))
+            except Exception:
+                full_mse_u = val_mse_u
             scored.append({
                 "formula": formula,
-                "mse": float(np.mean((self._safe_eval_formula_array(formula, X) - y) ** 2)),
+                "mse": full_mse_u,
                 "validation_mse": val_mse,
+                "validation_mse_unweighted": val_mse_u,
                 "validation_r2": float(val_r2),
                 "edge_validation_mse": edge_mse,
+                "edge_validation_mse_unweighted": edge_mse_u,
                 "edge_validation_r2": edge_r2,
                 "blended_validation_mse": float(blend_mse),
                 "fit_mse": fit_mse,
+                "fit_mse_unweighted": fit_mse_u,
                 "complexity": complexity,
                 "risk_score": risk,
                 "generalization_gap": gap,
+                "residual_mad_scale": resid_scale,
+                "residual_std": resid_std,
+                "residual_outlier_fraction": outlier_frac,
+                "residual_penalty": float(residual_penalty),
                 "pareto_score": float(score),
                 "display_governor_score": governor_score,
                 "display_mse": governor_display,
@@ -1878,6 +2485,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         selected["evaluated_candidates"] = len(scored)
         selected["best_raw_validation_mse"] = best_raw["validation_mse"]
         selected["selected_by"] = "blackbox_validation_pareto"
+        selected["weighted_validation"] = bool(val_w is not None)
         return selected
 
     def _validate_blackbox_fast_path_candidate(self, formula, mse, X, y):
@@ -2315,9 +2923,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if not candidate_formulas:
             return []
 
+        # Phase 5: dimensional filter before diversity prune when units active.
+        candidate_formulas = self._filter_candidates_by_units(candidate_formulas)
+
         ordered = sorted(
             candidate_formulas,
             key=lambda c: (
+                float(c.get("unit_penalty") or 0.0) if c.get("unit_ok") else 0.0,
                 _finite_float(c.get("mse"), float("inf")),
                 -_finite_float(c.get("validation_r2"), -float("inf")),
                 _finite_float(c.get("complexity"), float("inf")),
@@ -3938,18 +4550,28 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
     def _stage_residual_symbolic_fit_impl(self, X, y, base_formula, *, _allow_recursion=False):
         """Implementation for _stage_residual_symbolic_fit with timing wrapper."""
+        self._residual_stage_guard_ = {
+            "enabled": bool(self.enable_residual_stage),
+            "allowed": bool(_allow_recursion),
+            "mode": "bounded_mini_search",
+            "accepted": False,
+        }
         if not self.enable_residual_stage or not _allow_recursion or not base_formula or not self.use_guided_evolution:
+            self._residual_stage_guard_["reason"] = "disabled_or_not_allowed"
             return None
         if X.shape[1] < 1:
+            self._residual_stage_guard_["reason"] = "no_features"
             return None
 
         try:
             y_pred = self._safe_eval_formula_array(base_formula, X)
         except Exception:
+            self._residual_stage_guard_["reason"] = "base_eval_failed"
             return None
 
         residual = np.asarray(y, dtype=np.float64).reshape(-1) - np.asarray(y_pred, dtype=np.float64).reshape(-1)
         if not np.all(np.isfinite(residual)) or float(np.var(residual)) < 1e-12:
+            self._residual_stage_guard_["reason"] = "flat_or_nonfinite_residual"
             return None
 
         candidate_pool = self._build_residual_mini_search_candidates(
@@ -3958,14 +4580,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             base_formula,
             max_candidates=getattr(self, "residual_mini_search_max_candidates", 64),
         )
-        self._residual_stage_guard_ = {
-            "enabled": True,
-            "allowed": bool(_allow_recursion),
-            "mode": "bounded_mini_search",
-            "candidate_count": len(candidate_pool),
-        }
+        self._residual_stage_guard_["candidate_count"] = len(candidate_pool)
         if not candidate_pool:
-            self._residual_stage_guard_["accepted"] = False
             self._residual_stage_guard_["reason"] = "no_candidate_pool"
             return None
 
@@ -3977,67 +4593,153 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             max_candidates=top_k,
         )
         if not refined:
-            self._residual_stage_guard_["accepted"] = False
             self._residual_stage_guard_["reason"] = "no_refined_residual_candidates"
             return None
 
         split = self._domain_edge_validation_split(X, y, validation_fraction=0.2)
         if split is None:
-            self._residual_stage_guard_["accepted"] = False
             self._residual_stage_guard_["reason"] = "no_validation_split"
             return None
+
+        # Phase 6: residual acceptance requires weighted val improvement AND
+        # unweighted/edge val not worse beyond noise-aware slack.
+        n_total = int(np.asarray(y).reshape(-1).shape[0])
+        try:
+            _, val_w = self._split_sample_weights(split, n_total=n_total)
+        except Exception:
+            val_w = None
+        edge_split = None
+        edge_w = None
+        try:
+            edge_split = self._domain_edge_validation_split(X, y, validation_fraction=0.25)
+            if edge_split is not None:
+                _, edge_w = self._split_sample_weights(edge_split, n_total=n_total)
+        except Exception:
+            edge_split = None
+            edge_w = None
 
         try:
             base_pred = self._safe_eval_formula_array(base_formula, split["X_val"])
         except Exception:
+            self._residual_stage_guard_["reason"] = "base_val_eval_failed"
+            return None
+        base_pred = np.asarray(base_pred, dtype=np.float64).reshape(-1)
+        y_val = np.asarray(split["y_val"], dtype=np.float64).reshape(-1)
+
+        base_mse_u = float(np.mean((base_pred - y_val) ** 2))
+        try:
+            base_mse_w = _weighted_mse(base_pred, y_val, val_w) if val_w is not None else base_mse_u
+        except Exception:
+            base_mse_w = base_mse_u
+        if not np.isfinite(base_mse_w):
+            self._residual_stage_guard_["reason"] = "base_mse_nonfinite"
             return None
 
-        base_mse = float(np.mean((base_pred - split["y_val"]) ** 2))
-        if not np.isfinite(base_mse):
-            return None
+        _, abs_slack, slack_diag = self._noise_aware_cleanup_slack(
+            base_formula, split["X_val"], y_val, relative_slack=0.08, absolute_slack=1e-10
+        )
+        rel_slack = float(slack_diag.get("relative_slack", 0.08))
+
+        base_edge_mse_u = None
+        base_edge_pred = None
+        if edge_split is not None:
+            try:
+                base_edge_pred = self._safe_eval_formula_array(base_formula, edge_split["X_val"])
+                base_edge_pred = np.asarray(base_edge_pred, dtype=np.float64).reshape(-1)
+                base_edge_mse_u = float(np.mean((base_edge_pred - edge_split["y_val"]) ** 2))
+            except Exception:
+                base_edge_mse_u = None
+                base_edge_pred = None
 
         best = None
+        reject_noise = 0
         for cand in refined:
             formula = str((cand or {}).get("formula", "")).strip()
             if not formula or formula == "0":
                 continue
             try:
                 res_pred = self._safe_eval_formula_array(formula, split["X_val"])
+                res_pred = np.asarray(res_pred, dtype=np.float64).reshape(-1)
                 combined = base_pred + res_pred
-                combined_mse = float(np.mean((combined - split["y_val"]) ** 2))
+                combined_mse_u = float(np.mean((combined - y_val) ** 2))
+                combined_mse_w = (
+                    _weighted_mse(combined, y_val, val_w) if val_w is not None else combined_mse_u
+                )
             except Exception:
                 continue
-            if not np.isfinite(combined_mse):
+            if not np.isfinite(combined_mse_w) or not np.isfinite(combined_mse_u):
                 continue
-            improvement = base_mse - combined_mse
-            if improvement <= max(1e-10, base_mse * 0.002):
+            # Must improve weighted (or unweighted if no weights) validation.
+            improvement_w = base_mse_w - combined_mse_w
+            if improvement_w <= max(1e-10, base_mse_w * 0.002):
+                reject_noise += 1
                 continue
+            # Must not worsen unweighted validation beyond noise-aware slack.
+            u_allowed = base_mse_u * (1.0 + rel_slack) + abs_slack
+            if combined_mse_u > u_allowed:
+                reject_noise += 1
+                continue
+            # Edge validation guard when available.
+            if base_edge_pred is not None and base_edge_mse_u is not None and np.isfinite(base_edge_mse_u):
+                try:
+                    res_edge = self._safe_eval_formula_array(formula, edge_split["X_val"])
+                    res_edge = np.asarray(res_edge, dtype=np.float64).reshape(-1)
+                    comb_edge = base_edge_pred + res_edge
+                    edge_mse_u = float(np.mean((comb_edge - edge_split["y_val"]) ** 2))
+                    edge_allowed = base_edge_mse_u * (1.0 + rel_slack) + abs_slack
+                    if np.isfinite(edge_mse_u) and edge_mse_u > edge_allowed:
+                        reject_noise += 1
+                        continue
+                    if edge_w is not None:
+                        try:
+                            base_e_w = _weighted_mse(base_edge_pred, edge_split["y_val"], edge_w)
+                            comb_e_w = _weighted_mse(comb_edge, edge_split["y_val"], edge_w)
+                            if comb_e_w > base_e_w * (1.0 + rel_slack) + abs_slack:
+                                reject_noise += 1
+                                continue
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             score = (
-                combined_mse,
+                combined_mse_w,
                 _finite_float((cand or {}).get("risk_score"), 0.0),
                 _finite_float((cand or {}).get("complexity"), float("inf")),
             )
             if best is None or score < best[0]:
-                best = (score, formula, combined_mse, cand)
+                best = (score, formula, combined_mse_w, combined_mse_u, cand)
 
         if best is None:
             self._residual_stage_guard_.update({
                 "accepted": False,
                 "reason": "no_holdout_improvement",
-                "base_mse": float(base_mse),
+                "residual_rejected_as_noise": True,
+                "noise_rejects": int(reject_noise),
+                "base_mse": float(base_mse_w),
+                "base_mse_unweighted": float(base_mse_u) if np.isfinite(base_mse_u) else None,
                 "refined_count": len(refined),
+                "relative_slack": rel_slack,
             })
+            if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+                self.blackbox_diagnostics_["residual_rejected_as_noise"] = True
             return None
 
-        _, formula, combined_mse, cand = best
+        _, formula, combined_mse_w, combined_mse_u, cand = best
         self._residual_stage_guard_.update({
             "accepted": True,
             "formula": formula[:240],
-            "base_mse": float(base_mse),
-            "combined_mse": float(combined_mse),
+            "base_mse": float(base_mse_w),
+            "base_mse_unweighted": float(base_mse_u) if np.isfinite(base_mse_u) else None,
+            "combined_mse": float(combined_mse_w),
+            "combined_mse_unweighted": float(combined_mse_u),
             "validation_r2": cand.get("validation_r2"),
             "refined_count": len(refined),
+            "noise_rejects": int(reject_noise),
+            "relative_slack": rel_slack,
+            "weighted_validation": bool(val_w is not None),
         })
+        if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+            self.blackbox_diagnostics_["residual_rejected_as_noise"] = False
         return formula
 
     def _build_residual_mini_search_candidates(self, X, residual, base_formula, *, max_candidates=64):
@@ -4192,6 +4894,18 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         X_fit, X_holdout = X[:-holdout_n], X[-holdout_n:]
         y_fit, y_holdout = y[:-holdout_n], y[-holdout_n:]
         del X_fit, y_fit
+        # Phase 6: optional holdout weights; never accept residual on train MSE alone.
+        holdout_w = None
+        try:
+            holdout_w = self._active_sample_weight(
+                indices=np.arange(X.shape[0] - holdout_n, X.shape[0], dtype=int)
+            )
+        except Exception:
+            holdout_w = None
+        _, boost_abs_slack, boost_slack_diag = self._noise_aware_cleanup_slack(
+            base_formula, X_holdout, y_holdout, relative_slack=0.05, absolute_slack=1e-10
+        )
+        boost_rel_slack = float(boost_slack_diag.get("relative_slack", 0.05))
 
         for stage in range(max_boosting_stages):
             try:
@@ -4200,7 +4914,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             except Exception:
                 break
 
-            current_holdout_mse = float(np.mean((pred_holdout - y_holdout)**2))
+            current_holdout_mse_u = float(np.mean((pred_holdout - y_holdout)**2))
+            try:
+                current_holdout_mse = (
+                    _weighted_mse(pred_holdout, y_holdout, holdout_w)
+                    if holdout_w is not None else current_holdout_mse_u
+                )
+            except Exception:
+                current_holdout_mse = current_holdout_mse_u
             current_holdout_r2 = local_r2(y_holdout, pred_holdout)
             if self.boosting_diagnostics_.get("initial_holdout_r2") is None:
                 self.boosting_diagnostics_["initial_holdout_r2"] = float(current_holdout_r2)
@@ -4219,6 +4940,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 self.timeout = orig_timeout
 
             if not h_k or h_k == "0":
+                if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+                    guard = getattr(self, "_residual_stage_guard_", {}) or {}
+                    if guard.get("residual_rejected_as_noise") or guard.get("reason") == "no_holdout_improvement":
+                        self.blackbox_diagnostics_["residual_rejected_as_noise"] = True
                 break
 
             best_eta = None
@@ -4234,15 +4959,28 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 combined_formula = f"({current_formula}) + (({eta:.6g}) * ({h_k}))"
                 try:
                     combined_pred = pred_holdout + eta * h_pred_holdout
-                    mse = float(np.mean((combined_pred - y_holdout)**2))
-                    if mse < best_holdout_mse:
-                        best_holdout_mse = mse
-                        best_eta = eta
-                        best_combined_formula = combined_formula
+                    mse_w = (
+                        _weighted_mse(combined_pred, y_holdout, holdout_w)
+                        if holdout_w is not None
+                        else float(np.mean((combined_pred - y_holdout) ** 2))
+                    )
+                    mse_u = float(np.mean((combined_pred - y_holdout) ** 2))
+                    # Weighted must improve; unweighted must not regress beyond slack.
+                    if mse_w >= best_holdout_mse:
+                        continue
+                    u_allowed = current_holdout_mse_u * (1.0 + boost_rel_slack) + boost_abs_slack
+                    if mse_u > u_allowed:
+                        continue
+                    best_holdout_mse = mse_w
+                    best_eta = eta
+                    best_combined_formula = combined_formula
                 except Exception:
                     continue
 
             if best_eta is None:
+                if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+                    self.blackbox_diagnostics_["residual_rejected_as_noise"] = True
+                self.boosting_diagnostics_["last_reject_reason"] = "holdout_slack"
                 break
 
             try:
@@ -4253,6 +4991,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
             r2_improvement = best_holdout_r2 - current_holdout_r2
             if r2_improvement < 0.005:
+                if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+                    self.blackbox_diagnostics_["residual_rejected_as_noise"] = True
+                self.boosting_diagnostics_["last_reject_reason"] = "insufficient_r2_gain"
                 break
 
             refined_list = self._refine_candidate_formulas(
@@ -4348,6 +5089,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.specialist_vault_ = SpecialistVault(max_entries=int(getattr(self, "specialist_vault_size", 8) or 0))
         self.n_features_in_ = X.shape[1]
         self.original_n_features_in_ = X.shape[1]
+        self._activate_physics_units(self.n_features_in_)
         fit_start = _time.time()
 
         if self.random_state is not None:
@@ -4454,11 +5196,39 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             X = X_search
             y = y_search
             self.n_features_in_ = X.shape[1]
+            # Phase 5: remap unit vectors to selected feature subset.
+            if getattr(self, "units_active_", False) and getattr(self, "input_units_", None):
+                selected = list(getattr(blackbox_state, "selected_features", []) or [])
+                full_units = list(self.input_units_)
+                if selected and all(0 <= int(i) < len(full_units) for i in selected):
+                    self.input_units_ = [list(full_units[int(i)]) for i in selected]
+                else:
+                    # Cannot safely remap — disable units rather than mix lengths.
+                    self.input_units_ = None
+                    self.output_units_ = None
+                    self.units_active_ = False
+                    self.physics_constrained_ = False
             if self.universal_proposer_log_routing:
                 print(
                     "  [Blackbox] selected features "
                     f"{blackbox_state.selected_features} / {self.original_n_features_in_}"
                 )
+
+        if isinstance(self.blackbox_diagnostics_, dict):
+            self.blackbox_diagnostics_["physics_units"] = {
+                "active": bool(getattr(self, "units_active_", False)),
+                "physics_constrained": bool(getattr(self, "physics_constrained_", False)),
+                "unit_mode": _validate_unit_mode(getattr(self, "unit_mode", "off")),
+                "dim_penalty_weight": float(getattr(self, "dim_penalty_weight", 0.1) or 0.0),
+                "n_features_units": (
+                    len(self.input_units_) if getattr(self, "input_units_", None) else 0
+                ),
+                "n_dims": (
+                    len(self.input_units_[0])
+                    if getattr(self, "input_units_", None)
+                    else 0
+                ),
+            }
 
         detected_omegas = self._detect_frequencies(X, y)
 
@@ -5154,6 +5924,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 guided_kw["trim_fraction"] = float(
                                     getattr(self, "trim_fraction", 0.1) or 0.1
                                 )
+                            guided_kw.update(self._evolution_units_kwargs())
                             try:
                                 guided_result = run_guided_evolution(
                                     x_t, y_t, hints, **guided_kw
@@ -5163,6 +5934,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 guided_kw.pop("loss_mode", None)
                                 guided_kw.pop("huber_delta", None)
                                 guided_kw.pop("trim_fraction", None)
+                                guided_kw.pop("input_units", None)
+                                guided_kw.pop("output_units", None)
+                                guided_kw.pop("dim_penalty_weight", None)
                                 guided_result = run_guided_evolution(
                                     x_t, y_t, hints, **guided_kw
                                 )
@@ -5373,6 +6147,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 evo_kwargs["trim_fraction"] = float(
                                     getattr(self, "trim_fraction", 0.1) or 0.1
                                 )
+                            evo_kwargs.update(self._evolution_units_kwargs())
                             try:
                                 result = _core.run_evolution(**evo_kwargs)
                             except TypeError:
@@ -5380,6 +6155,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 evo_kwargs.pop("loss_mode", None)
                                 evo_kwargs.pop("huber_delta", None)
                                 evo_kwargs.pop("trim_fraction", None)
+                                evo_kwargs.pop("input_units", None)
+                                evo_kwargs.pop("output_units", None)
+                                evo_kwargs.pop("dim_penalty_weight", None)
                                 result = _core.run_evolution(**evo_kwargs)
 
                             raw_mse = result.get('best_mse', float('inf'))
@@ -5767,13 +6545,33 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         return self.formula_
 
     def _reduce_formula_noise(self, formula_str, X, y):
-        """Greedy backward elimination of terms to reduce noise from L1 regularization."""
+        """Greedy backward elimination with optional weights + holdout fidelity (Phase 6)."""
         if not formula_str or formula_str == "0":
             return formula_str
-            
+
         try:
             from glassbox.sr.cpp import _core
-            X_list = [X[:, j] for j in range(self.n_features_in_)]
-            return _core.reduce_formula_noise(formula_str, X_list, y)
+            n_feat = int(getattr(self, "n_features_in_", X.shape[1]))
+            X_list = [X[:, j] for j in range(n_feat)]
+            w = self._active_sample_weight(n_targets=int(np.asarray(y).reshape(-1).shape[0]))
+            # Noise-aware holdout slack for C++ fidelity guard.
+            _, _, slack_diag = self._noise_aware_cleanup_slack(formula_str, X, y)
+            rel = float(slack_diag.get("relative_slack", 0.10))
+            kwargs = {
+                "holdout_fraction": 0.2,
+                "relative_slack": rel,
+            }
+            if w is not None:
+                kwargs["y_weights"] = np.asarray(w, dtype=np.float64)
+            try:
+                return _core.reduce_formula_noise(formula_str, X_list, y, **kwargs)
+            except TypeError:
+                # Older extension without Phase 6 kwargs.
+                if w is not None:
+                    try:
+                        return _core.reduce_formula_noise(formula_str, X_list, y, w)
+                    except TypeError:
+                        pass
+                return _core.reduce_formula_noise(formula_str, X_list, y)
         except Exception:
             return formula_str

@@ -384,9 +384,10 @@ py::dict run_evolution_cpp(
     int num_islands = 1,
     int migration_interval = 25,
     int migration_size = 2,
-    // P7: Dimensional Analysis
+    // P7: Dimensional Analysis (Phase 5 public API)
     py::list input_units = py::list(),
     py::list output_units = py::list(),
+    double dim_penalty_weight = 0.1,
     double arithmetic_temperature = 5.0,
     std::string trace_path = "",
     bool trace_include_formulas = false,
@@ -602,6 +603,7 @@ py::dict run_evolution_cpp(
     config.migration_size = migration_size;
     config.input_units = cpp_input_units;
     config.output_units = cpp_output_units;
+    config.dim_penalty_weight = std::max(0.0, dim_penalty_weight);
     config.enable_trace = !trace_path.empty();
     config.trace_path = trace_path;
     config.trace_include_formulas = trace_include_formulas;
@@ -931,11 +933,14 @@ std::string snap_formula_floats_wrapper(std::string formula_str, int n_features 
     return sr::get_formula_string(graph, n_features);
 }
 
-// Wrapper for reduce_formula_noise_cpp
+// Wrapper for reduce_formula_noise_cpp (Phase 6: optional y_weights + holdout fidelity).
 std::string reduce_formula_noise_wrapper(
     std::string formula_str,
     py::list X_list,
-    py::array_t<double> y_array
+    py::array_t<double> y_array,
+    py::object y_weights = py::none(),
+    double holdout_fraction = 0.0,
+    double relative_slack = 0.10
 ) {
     std::vector<Eigen::ArrayXd> X;
     for (auto item : X_list) {
@@ -955,8 +960,27 @@ std::string reduce_formula_noise_wrapper(
     auto y_buf = y_contig.request();
     double* y_ptr = static_cast<double*>(y_buf.ptr);
     Eigen::Map<Eigen::ArrayXd> y(y_ptr, y_buf.size);
+
+    const Eigen::ArrayXd* w_ptr = nullptr;
+    Eigen::ArrayXd w_owned;
+    if (!y_weights.is_none()) {
+        auto w_arr = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(y_weights);
+        if (!w_arr) {
+            throw std::runtime_error("y_weights must be convertible to a contiguous float64 array");
+        }
+        auto w_buf = w_arr.request();
+        if (w_buf.size != y_buf.size) {
+            throw std::runtime_error(
+                "y_weights length does not match y length for reduce_formula_noise"
+            );
+        }
+        w_owned = Eigen::Map<Eigen::ArrayXd>(static_cast<double*>(w_buf.ptr), w_buf.size);
+        w_ptr = &w_owned;
+    }
     
-    return sr::reduce_formula_noise_cpp(formula_str, X, y);
+    return sr::reduce_formula_noise_cpp(
+        formula_str, X, y, w_ptr, holdout_fraction, relative_slack
+    );
 }
 
 PYBIND11_MODULE(_core, m) {
@@ -984,6 +1008,7 @@ PYBIND11_MODULE(_core, m) {
           py::arg("migration_size")=2,
           py::arg("input_units")=py::list(),
           py::arg("output_units")=py::list(),
+          py::arg("dim_penalty_weight")=0.1,
           py::arg("arithmetic_temperature")=5.0,
           py::arg("trace_path")="",
           py::arg("trace_include_formulas")=false,
@@ -1031,8 +1056,18 @@ PYBIND11_MODULE(_core, m) {
     m.def("snap_formula_floats", &snap_formula_floats_wrapper, "Snaps display floats in a formula string",
           py::arg("formula_str"), py::arg("n_features")=1);
     m.def("snap_formula_floats_cpp", &snap_formula_floats_wrapper, "Alias for snap_formula_floats");
-    m.def("reduce_formula_noise", &reduce_formula_noise_wrapper, "Greedy backward elimination of terms to reduce noise",
-          py::arg("formula_str"), py::arg("X_list"), py::arg("y"));
-    m.def("reduce_formula_noise_cpp", &reduce_formula_noise_wrapper, "Alias for reduce_formula_noise");
+    m.def("reduce_formula_noise", &reduce_formula_noise_wrapper,
+          "Greedy backward elimination of terms to reduce noise. "
+          "Optional y_weights enable weighted BIC; holdout_fraction>0 adds "
+          "unweighted holdout fidelity guard against over-pruning.",
+          py::arg("formula_str"), py::arg("X_list"), py::arg("y"),
+          py::arg("y_weights") = py::none(),
+          py::arg("holdout_fraction") = 0.0,
+          py::arg("relative_slack") = 0.10);
+    m.def("reduce_formula_noise_cpp", &reduce_formula_noise_wrapper, "Alias for reduce_formula_noise",
+          py::arg("formula_str"), py::arg("X_list"), py::arg("y"),
+          py::arg("y_weights") = py::none(),
+          py::arg("holdout_fraction") = 0.0,
+          py::arg("relative_slack") = 0.10);
 }
 

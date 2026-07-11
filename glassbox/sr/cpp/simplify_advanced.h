@@ -436,10 +436,16 @@ inline std::string simplify_formula_cpp(
     return get_formula_string(graph, n_features);
 }
 
+// Phase 6: optional y_weights for BIC term pruning (uniform when empty/null-length).
+// holdout_fraction in [0, 0.45]: if >0 and N large enough, reject term drops that
+// worsen unweighted holdout MSE beyond relative_slack (noise-aware fidelity guard).
 inline std::string reduce_formula_noise_cpp(
     const std::string& formula_str,
     const std::vector<Eigen::ArrayXd>& X,
-    const Eigen::ArrayXd& y
+    const Eigen::ArrayXd& y,
+    const Eigen::ArrayXd* y_weights = nullptr,
+    double holdout_fraction = 0.0,
+    double relative_slack = 0.10
 ) {
     if (formula_str.empty() || formula_str == "0") return formula_str;
 
@@ -454,10 +460,29 @@ inline std::string reduce_formula_noise_cpp(
     }
 
     int K = candidate_nodes.size();
-    int N = y.size();
+    int N = static_cast<int>(y.size());
     if (K <= 1 || K > 20 || N == 0) {
         simplify_ast_advanced(graph);
         return get_formula_string(graph, X.size());
+    }
+
+    // Validate optional weights (must match N if provided and non-empty).
+    Eigen::ArrayXd w = Eigen::ArrayXd::Ones(N);
+    bool use_weights = false;
+    if (y_weights != nullptr && y_weights->size() == N) {
+        double wsum = 0.0;
+        bool ok = true;
+        for (int i = 0; i < N; ++i) {
+            double wi = (*y_weights)(i);
+            if (!std::isfinite(wi) || wi < 0.0) { ok = false; break; }
+            w(i) = wi;
+            wsum += wi;
+        }
+        if (ok && wsum > 0.0) {
+            // Normalize to mean ~1 so BIC scale stays comparable.
+            w *= (static_cast<double>(N) / wsum);
+            use_weights = true;
+        }
     }
 
     Eigen::MatrixXd Z(N, K);
@@ -476,28 +501,109 @@ inline std::string reduce_formula_noise_cpp(
     Eigen::VectorXd y_vec = (y - graph.output_bias).matrix();
     std::vector<bool> current_mask(K, true);
 
+    // Optional holdout indices for fidelity guard (last floor(frac*N) rows).
+    int n_hold = 0;
+    double frac = holdout_fraction;
+    if (frac < 0.0) frac = 0.0;
+    if (frac > 0.45) frac = 0.45;
+    if (frac > 0.0 && N >= 20) {
+        n_hold = static_cast<int>(std::floor(frac * N));
+        if (n_hold < 4) n_hold = 0;
+        if (n_hold >= N - 4) n_hold = 0;
+    }
+    const int n_fit = N - n_hold;
+    const double slack = std::max(0.0, relative_slack);
+
+    auto solve_weighted = [&](const Eigen::MatrixXd& Z_sub, const Eigen::VectorXd& y_sub,
+                              const Eigen::ArrayXd& w_sub, Eigen::VectorXd& coefs) {
+        const int n = static_cast<int>(Z_sub.rows());
+        const int k = static_cast<int>(Z_sub.cols());
+        if (!use_weights) {
+            coefs = Z_sub.colPivHouseholderQr().solve(y_sub);
+            return;
+        }
+        // Weighted least squares via sqrt(w) row scaling.
+        Eigen::MatrixXd Zw(n, k);
+        Eigen::VectorXd yw(n);
+        for (int i = 0; i < n; ++i) {
+            double s = std::sqrt(std::max(w_sub(i), 0.0));
+            Zw.row(i) = Z_sub.row(i) * s;
+            yw(i) = y_sub(i) * s;
+        }
+        coefs = Zw.colPivHouseholderQr().solve(yw);
+    };
+
     auto get_bic = [&](const std::vector<bool>& mask, Eigen::VectorXd& coefs) -> double {
         int k = 0;
         for (bool m : mask) if (m) k++;
         if (k == 0) return 1e15;
 
-        Eigen::MatrixXd Z_sub(N, k);
+        // Fit on fit-slice only when holdout is active.
+        Eigen::MatrixXd Z_fit(n_fit, k);
+        Eigen::VectorXd y_fit(n_fit);
+        Eigen::ArrayXd w_fit(n_fit);
         int col_idx = 0;
         for (int j = 0; j < K; ++j) {
             if (mask[j]) {
-                Z_sub.col(col_idx++) = Z.col(j);
+                Z_fit.col(col_idx) = Z.block(0, j, n_fit, 1);
+                ++col_idx;
             }
         }
+        y_fit = y_vec.head(n_fit);
+        w_fit = w.head(n_fit);
 
-        coefs = Z_sub.colPivHouseholderQr().solve(y_vec);
-        double mse = (Z_sub * coefs - y_vec).squaredNorm() / N;
+        solve_weighted(Z_fit, y_fit, w_fit, coefs);
+
+        // Weighted MSE on fit rows for BIC.
+        double wsum = 0.0;
+        double sse = 0.0;
+        for (int i = 0; i < n_fit; ++i) {
+            double pred = 0.0;
+            int c = 0;
+            for (int j = 0; j < K; ++j) {
+                if (mask[j]) pred += Z(i, j) * coefs(c++);
+            }
+            double r = pred - y_vec(i);
+            double wi = use_weights ? w(i) : 1.0;
+            sse += wi * r * r;
+            wsum += wi;
+        }
+        double mse = sse / std::max(wsum, 1e-15);
         if (mse < 1e-15) mse = 1e-15;
 
-        return N * std::log(mse) + k * std::log(N);
+        // Effective N for BIC: Kish ESS when weighted, else n_fit.
+        double n_eff = static_cast<double>(n_fit);
+        if (use_weights) {
+            double s1 = 0.0, s2 = 0.0;
+            for (int i = 0; i < n_fit; ++i) {
+                s1 += w(i);
+                s2 += w(i) * w(i);
+            }
+            if (s2 > 0.0) n_eff = (s1 * s1) / s2;
+            n_eff = std::max(n_eff, 2.0);
+        }
+        return n_eff * std::log(mse) + k * std::log(n_eff);
+    };
+
+    auto holdout_mse = [&](const std::vector<bool>& mask, const Eigen::VectorXd& coefs) -> double {
+        if (n_hold <= 0) return 0.0;
+        double sse = 0.0;
+        for (int i = n_fit; i < N; ++i) {
+            double pred = 0.0;
+            int c = 0;
+            for (int j = 0; j < K; ++j) {
+                if (mask[j]) pred += Z(i, j) * coefs(c++);
+            }
+            double r = pred - y_vec(i);
+            sse += r * r;
+        }
+        return sse / static_cast<double>(n_hold);
     };
 
     Eigen::VectorXd best_coef;
     double best_bic = get_bic(current_mask, best_coef);
+    double base_hold = holdout_mse(current_mask, best_coef);
+    int initial_active = K;
 
     while (true) {
         int num_active = 0;
@@ -515,11 +621,20 @@ inline std::string reduce_formula_noise_cpp(
 
                 Eigen::VectorXd coefs;
                 double bic = get_bic(test_mask, coefs);
-                if (bic < best_drop_bic) {
-                    best_drop_bic = bic;
-                    best_drop_idx = j;
-                    best_drop_coef = coefs;
+                if (bic >= best_drop_bic) continue;
+
+                // Holdout fidelity: do not drop terms that blow up unweighted holdout.
+                if (n_hold > 0) {
+                    double h = holdout_mse(test_mask, coefs);
+                    double allowed = base_hold * (1.0 + slack) + 1e-12;
+                    if (std::isfinite(base_hold) && std::isfinite(h) && h > allowed) {
+                        continue;
+                    }
                 }
+
+                best_drop_bic = bic;
+                best_drop_idx = j;
+                best_drop_coef = coefs;
             }
         }
 
@@ -527,6 +642,10 @@ inline std::string reduce_formula_noise_cpp(
             current_mask[best_drop_idx] = false;
             best_bic = best_drop_bic;
             best_coef = best_drop_coef;
+            // Refresh base holdout after accepted drop (allow gradual simplification).
+            if (n_hold > 0) {
+                base_hold = holdout_mse(current_mask, best_coef);
+            }
         } else {
             break;
         }
@@ -534,6 +653,7 @@ inline std::string reduce_formula_noise_cpp(
 
     std::fill(graph.output_weights.begin(), graph.output_weights.end(), 0.0);
     int coef_idx = 0;
+    int final_active = 0;
     for (int j = 0; j < K; ++j) {
         if (current_mask[j]) {
             int idx = candidate_nodes[j];
@@ -543,9 +663,12 @@ inline std::string reduce_formula_noise_cpp(
                     graph.output_weights.resize(idx + 1, 0.0);
                 }
                 graph.output_weights[idx] = c;
+                ++final_active;
             }
         }
     }
+    (void)initial_active;
+    (void)final_active;
 
     simplify_ast_advanced(graph);
     return get_formula_string(graph, X.size());

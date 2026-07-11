@@ -1961,6 +1961,8 @@ private:
     // Replaces bare SVD with (A^T W A + λI)^{-1} A^T W b to prevent
     // multicollinearity from producing massive cancelling coefficients.
     // When y_weights_ are set, W is diag(weights); otherwise W = I.
+    // Phase 4 tighten: Huber / trimmed / student_t use a few IRLS iterations
+    // so linear output coeffs are fit under the same robust objective as fitness.
     // Returns true if solve succeeded.
     bool solve_output_weights(IndividualGraph& ind, const std::vector<Eigen::ArrayXd>& cache) {
         int n_samples = static_cast<int>(y_.size());
@@ -1980,24 +1982,101 @@ private:
         
         Eigen::VectorXd b = y_.matrix();
         Eigen::VectorXd w;
-        
-        try {
-            // Ridge regression: w = (A^T W A + λI)^{-1} A^T W b
-            double lambda = 1e-4;
-            Eigen::MatrixXd AtWA;
-            Eigen::VectorXd AtWb;
-            if (has_y_weights_ && y_weights_.size() == n_samples) {
-                Eigen::MatrixXd WA = y_weights_.matrix().asDiagonal() * A;
-                AtWA = A.transpose() * WA;
-                AtWb = A.transpose() * (y_weights_ * y_).matrix();
-            } else {
-                AtWA = A.transpose() * A;
-                AtWb = A.transpose() * b;
+
+        // Base sample weights (Phase 3) or uniform.
+        Eigen::ArrayXd base_w = Eigen::ArrayXd::Ones(n_samples);
+        if (has_y_weights_ && y_weights_.size() == n_samples) {
+            base_w = y_weights_;
+        }
+
+        const bool robust =
+            config_.loss_mode == LossMode::Huber
+            || config_.loss_mode == LossMode::TrimmedMse
+            || config_.loss_mode == LossMode::StudentT;
+        const int irls_iters = robust ? 4 : 1;
+        const double lambda = 1e-4;
+
+        auto ridge_solve = [&](const Eigen::ArrayXd& ww, Eigen::VectorXd& w_out) -> bool {
+            try {
+                double wsum = ww.sum();
+                if (!(wsum > 0.0) || !std::isfinite(wsum)) return false;
+                Eigen::MatrixXd WA = ww.matrix().asDiagonal() * A;
+                Eigen::MatrixXd AtWA = A.transpose() * WA;
+                Eigen::VectorXd AtWb = A.transpose() * (ww * y_).matrix();
+                AtWA.diagonal() += Eigen::VectorXd::Constant(num_features + 1, lambda);
+                w_out = AtWA.ldlt().solve(AtWb);
+                return w_out.allFinite();
+            } catch (...) {
+                return false;
             }
-            AtWA.diagonal() += Eigen::VectorXd::Constant(num_features + 1, lambda);
-            w = AtWA.ldlt().solve(AtWb);
-        } catch (...) {
+        };
+
+        auto pred_from_w = [&](const Eigen::VectorXd& coef) -> Eigen::ArrayXd {
+            Eigen::ArrayXd pred = Eigen::ArrayXd::Constant(n_samples, coef(num_features));
+            for (int f = 0; f < num_features; ++f) {
+                pred += coef(f) * A.col(f).array();
+            }
+            return pred;
+        };
+
+        auto irls_weights = [&](const Eigen::ArrayXd& resid) -> Eigen::ArrayXd {
+            Eigen::ArrayXd rw = Eigen::ArrayXd::Ones(n_samples);
+            if (config_.loss_mode == LossMode::Huber) {
+                double d = config_.huber_delta;
+                if (!(d > 0.0) || !std::isfinite(d)) d = mad_scale(resid);
+                d = std::max(d, 1e-12);
+                for (int i = 0; i < n_samples; ++i) {
+                    double a = std::abs(resid(i));
+                    // Standard Huber IRLS: w = 1 if |r|<=d else d/|r|
+                    rw(i) = (a <= d || a < 1e-15) ? 1.0 : (d / a);
+                }
+            } else if (config_.loss_mode == LossMode::TrimmedMse) {
+                Eigen::ArrayXd sq = resid.square();
+                double frac = std::clamp(config_.trim_fraction, 0.0, 0.45);
+                int drop = static_cast<int>(std::llround(n_samples * frac));
+                drop = std::clamp(drop, 0, std::max(0, n_samples - 1));
+                if (drop > 0) {
+                    std::vector<int> order(static_cast<size_t>(n_samples));
+                    for (int i = 0; i < n_samples; ++i) order[static_cast<size_t>(i)] = i;
+                    std::partial_sort(
+                        order.begin(),
+                        order.begin() + drop,
+                        order.end(),
+                        [&](int a, int b) { return sq(a) > sq(b); }
+                    );
+                    for (int k = 0; k < drop; ++k) {
+                        rw(order[static_cast<size_t>(k)]) = 1e-6; // soft zero (keep matrix invertible)
+                    }
+                }
+            } else if (config_.loss_mode == LossMode::StudentT) {
+                double s = config_.huber_delta;
+                if (!(s > 0.0) || !std::isfinite(s)) s = mad_scale(resid);
+                s = std::max(s, 1e-12);
+                // IRLS for log(1+(r/s)^2): weight ∝ 1 / (1 + (r/s)^2)
+                for (int i = 0; i < n_samples; ++i) {
+                    double z = resid(i) / s;
+                    rw(i) = 1.0 / (1.0 + z * z);
+                }
+            }
+            return rw;
+        };
+
+        Eigen::ArrayXd cur_w = base_w;
+        if (!ridge_solve(cur_w, w)) {
             return false;
+        }
+
+        for (int it = 1; it < irls_iters; ++it) {
+            Eigen::ArrayXd resid = pred_from_w(w) - y_;
+            if (!resid.isFinite().all()) break;
+            Eigen::ArrayXd rw = irls_weights(resid);
+            cur_w = base_w * rw;
+            // Renormalize mean ~1 for numerical stability with ridge scale.
+            double mean_w = cur_w.mean();
+            if (mean_w > 0.0 && std::isfinite(mean_w)) cur_w /= mean_w;
+            Eigen::VectorXd w_next;
+            if (!ridge_solve(cur_w, w_next)) break;
+            w = w_next;
         }
         
         // Coefficient pruning: zero out weak weights
