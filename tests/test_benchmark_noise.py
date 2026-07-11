@@ -79,6 +79,10 @@ def test_required_columns_present():
     assert "clean_test_mse" in bn.REQUIRED_COLUMNS
     assert "clean_test_r2" in bn.REQUIRED_COLUMNS
     assert "acceptable_clean" in bn.REQUIRED_COLUMNS
+    assert "blackbox_enabled" in bn.REQUIRED_COLUMNS
+    assert "n_features" in bn.REQUIRED_COLUMNS
+    assert "noise_band" in bn.REQUIRED_COLUMNS
+    assert "selected_features" in bn.REQUIRED_COLUMNS
 
 
 def test_assert_row_contract_passes_for_well_formed_row():
@@ -243,6 +247,37 @@ def test_select_problems_default_set():
     problems = bn._select_problems()
     assert len(problems) == len(bn.DEFAULT_BASELINE_PROBLEMS)
     assert problems[0][0] == bn.DEFAULT_BASELINE_PROBLEMS[0]
+
+
+def test_select_blackbox_problems_are_multivariate():
+    problems = bn._select_problems(bn.DEFAULT_BLACKBOX_PROBLEMS)
+    assert len(problems) == len(bn.DEFAULT_BLACKBOX_PROBLEMS)
+    for name, _fn, n_features, _ranges, _formula in problems:
+        assert int(n_features) > 1, name
+    # At least one problem can exercise top-k ranking under default min_features=5.
+    assert any(int(p[2]) >= 5 for p in problems)
+
+
+def test_blackbox_diag_fields_from_estimator_attrs():
+    class _E:
+        blackbox_diagnostics_ = {
+            "enabled": True,
+            "reason": "selected_top_features",
+            "selected_features": [0, 2],
+            "n_selected_features": 2,
+            "feature_selection_uncertain": False,
+            "ranking_sample_weight_mode": "provided",
+            "runtime_noise": {"noise_band": "low"},
+        }
+        blackbox_search_plan_ = {"noise_band": "low", "noise_pressure": 0.4}
+
+    fields = bn._blackbox_diag_fields(_E(), n_features=5)
+    assert fields["blackbox_enabled"] is True
+    assert fields["n_features"] == 5
+    assert fields["selected_features"] == [0, 2]
+    assert fields["noise_band"] == "low"
+    assert fields["noise_pressure"] == pytest.approx(0.4)
+    assert fields["ranking_sample_weight_mode"] == "provided"
 
 
 def test_main_smoke_writes_protocol_artifacts(tmp_path, monkeypatch):

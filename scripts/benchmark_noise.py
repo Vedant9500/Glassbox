@@ -290,6 +290,50 @@ def _sample_weight_mode(estimator: Any) -> str:
     return "none"
 
 
+def _blackbox_diag_fields(estimator: Any, n_features: int) -> Dict[str, Any]:
+    """Extract blackbox / noise-routing fields for protocol rows (Phase A)."""
+    diag = getattr(estimator, "blackbox_diagnostics_", None)
+    if not isinstance(diag, dict):
+        diag = {}
+    selected = diag.get("selected_features")
+    if not isinstance(selected, list):
+        selected = []
+    runtime = diag.get("runtime_noise") if isinstance(diag.get("runtime_noise"), dict) else {}
+    plan = getattr(estimator, "blackbox_search_plan_", None)
+    if not isinstance(plan, dict):
+        plan = diag.get("search_plan") if isinstance(diag.get("search_plan"), dict) else {}
+    noise_band = runtime.get("noise_band") or plan.get("noise_band")
+    noise_pressure = plan.get("noise_pressure")
+    if noise_pressure is None and isinstance(plan.get("noise_routing"), dict):
+        noise_pressure = plan.get("noise_routing", {}).get("noise_pressure")
+    enabled = bool(diag.get("enabled")) if "enabled" in diag else bool(selected) and int(n_features) > 1
+    return {
+        "n_features": int(n_features),
+        "blackbox_enabled": enabled,
+        "blackbox_reason": str(diag.get("reason") or ("unknown" if enabled else "disabled_or_low_dimensional")),
+        "selected_features": [int(i) for i in selected],
+        "n_selected_features": int(diag.get("n_selected_features") or len(selected)),
+        "feature_selection_uncertain": bool(diag.get("feature_selection_uncertain", False)),
+        "ranking_sample_weight_mode": str(diag.get("ranking_sample_weight_mode") or "none"),
+        "noise_band": str(noise_band) if noise_band is not None else None,
+        "noise_pressure": _to_json_float(noise_pressure),
+    }
+
+
+def _empty_blackbox_fields(n_features: int = 0) -> Dict[str, Any]:
+    return {
+        "n_features": int(n_features),
+        "blackbox_enabled": False,
+        "blackbox_reason": "unavailable",
+        "selected_features": [],
+        "n_selected_features": 0,
+        "feature_selection_uncertain": False,
+        "ranking_sample_weight_mode": "none",
+        "noise_band": None,
+        "noise_pressure": None,
+    }
+
+
 def _false_confidence(
     *, train_r2: Optional[float], test_r2: Optional[float], threshold: float = 0.95
 ) -> Optional[bool]:
@@ -379,7 +423,7 @@ def _run_single(
         problem, n_samples=n_samples, seed=seed
     )
     if X_clean is None:
-        return {
+        out = {
             "noise_type": tier.get("noise_type"),
             "noise_level": tier.get("noise_level"),
             "sample_weight_mode": "none",
@@ -401,6 +445,8 @@ def _run_single(
             "true_formula": true_formula,
             "error": "bad_data",
         }
+        out.update(_empty_blackbox_fields(int(n_features)))
+        return out
 
     # Deterministic subsample + ordered train/test split (shared helper).
     # Noise is applied after the split so train/test share one noise draw on
@@ -429,7 +475,7 @@ def _run_single(
         est.fit(X_train, y_train)
         formula = bc.postprocess_formula(str(est.get_formula()))
     except Exception as exc:  # pragma: no cover - benchmark robustness
-        return {
+        out = {
             "noise_type": tier.get("noise_type"),
             "noise_level": tier.get("noise_level"),
             "sample_weight_mode": "none",
@@ -451,6 +497,8 @@ def _run_single(
             "true_formula": true_formula,
             "error": str(exc)[:200],
         }
+        out.update(_empty_blackbox_fields(int(n_features)))
+        return out
 
     # Predictions / metrics.
     try:
@@ -500,7 +548,7 @@ def _run_single(
         and float(clean_test_r2) >= float(acceptable_r2)
     )
 
-    return {
+    row = {
         "noise_type": tier.get("noise_type"),
         "noise_level": tier.get("noise_level"),
         "sample_weight_mode": _sample_weight_mode(est),
@@ -524,6 +572,8 @@ def _run_single(
         "true_formula": true_formula,
         "error": None,
     }
+    row.update(_blackbox_diag_fields(est, int(n_features)))
+    return row
 
 
 
@@ -567,6 +617,16 @@ REQUIRED_COLUMNS = (
     "seed_graphs_used",
     "exact_match",
     "acceptable_clean",
+    # Phase A blackbox × noise measurement columns
+    "n_features",
+    "blackbox_enabled",
+    "blackbox_reason",
+    "selected_features",
+    "n_selected_features",
+    "feature_selection_uncertain",
+    "ranking_sample_weight_mode",
+    "noise_band",
+    "noise_pressure",
 )
 
 
@@ -728,6 +788,15 @@ DEFAULT_BASELINE_PROBLEMS = (
     "Feynman-I.6.20a",
 )
 
+# Multi-feature problems that exercise the real blackbox path (n_features > 1).
+# Vladislavleva-4 (5-D) is required for top-k ranking under default
+# blackbox_min_features_to_select=5; Pagie/Feynman exercise blackbox-on keep-all.
+DEFAULT_BLACKBOX_PROBLEMS = (
+    "Pagie-1",
+    "Feynman-I.9.18",
+    "Vladislavleva-4",
+)
+
 
 def _select_problems(names: Optional[Sequence[str]] = None):
     """Pick ground-truth problems by name (default: easy multi-tier baseline set).
@@ -754,6 +823,22 @@ def _select_problems(names: Optional[Sequence[str]] = None):
     return problems
 
 
+# Named ablations for release-gate comparisons (Phase 8).
+# Each mutates GlassboxRegressor kwargs; budgets must stay comparable.
+ABLATION_PRESETS: Dict[str, Dict[str, Any]] = {
+    "full": {},
+    "no_weights": {"_force_no_sample_weight": True},
+    "no_robust_loss": {"loss_mode": "mse"},
+    "no_units": {"input_units": None, "output_units": None, "unit_mode": "off"},
+    "no_cv_guard": {"cv_skip_guard_enabled": False},
+    "no_uncertainty_routing": {"adaptive_compute_budget": False},
+    "no_noise_pruning": {
+        # Disable residual stage + fidelity-sensitive residual boosting.
+        "enable_residual_stage": False,
+    },
+}
+
+
 def _default_estimator_factory(
     *,
     generations: int = 40,
@@ -761,6 +846,9 @@ def _default_estimator_factory(
     timeout: float = 45.0,
     multi_start_runs: int = 1,
     allow_stub: bool = False,
+    ablation: str = "full",
+    extra_params: Optional[Dict[str, Any]] = None,
+    blackbox_protocol: bool = False,
 ):
     try:
         from glassbox.sr.sklearn_wrapper import GlassboxRegressor
@@ -769,9 +857,19 @@ def _default_estimator_factory(
             raise
         GlassboxRegressor = None  # type: ignore
 
+    ablation_key = str(ablation or "full").strip().lower()
+    if ablation_key not in ABLATION_PRESETS:
+        raise ValueError(
+            f"unknown ablation {ablation!r}; choose from {sorted(ABLATION_PRESETS)}"
+        )
+    ablation_params = dict(ABLATION_PRESETS[ablation_key])
+    force_no_sw = bool(ablation_params.pop("_force_no_sample_weight", False))
+    if extra_params:
+        ablation_params.update(extra_params)
+
     if GlassboxRegressor is not None:
         def factory():
-            return GlassboxRegressor(
+            kwargs = dict(
                 random_state=0,
                 generations=int(generations),
                 population_size=int(population_size),
@@ -780,7 +878,24 @@ def _default_estimator_factory(
                 use_fast_path=True,
                 use_guided_evolution=True,
                 blackbox_mode=True,
+                blackbox_feature_selection=True,
             )
+            if blackbox_protocol:
+                # Ensure multi-var problems can actually drop features in ranking.
+                kwargs.setdefault("blackbox_min_features_to_select", 2)
+                kwargs.setdefault("blackbox_max_features", 4)
+                kwargs.setdefault("blackbox_standardize", True)
+            kwargs.update(ablation_params)
+            est = GlassboxRegressor(**kwargs)
+            if force_no_sw:
+                # Wrap fit so protocol cannot inject sample_weight later.
+                _orig_fit = est.fit
+
+                def _fit_no_weight(X, y, sample_weight=None):
+                    return _orig_fit(X, y, sample_weight=None)
+
+                est.fit = _fit_no_weight  # type: ignore[method-assign]
+            return est
         return factory
 
     # Minimal mean predictor for tooling smoke when Glassbox/torch is absent.
@@ -860,16 +975,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="Tiny run: 2 problems, clean+gaussian_10pct, 1 seed, small budget",
     )
+    parser.add_argument(
+        "--blackbox",
+        action="store_true",
+        help=(
+            "Multi-feature blackbox × noise protocol: use DEFAULT_BLACKBOX_PROBLEMS "
+            "and lower min_features_to_select so ranking can drop features"
+        ),
+    )
+    parser.add_argument(
+        "--ablation",
+        type=str,
+        default="full",
+        help=(
+            "Estimator ablation preset for release-gate comparisons: "
+            + ", ".join(sorted(ABLATION_PRESETS))
+        ),
+    )
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
-    if args.smoke:
+    if args.smoke and args.blackbox:
+        problem_names = list(DEFAULT_BLACKBOX_PROBLEMS[:2])
+        seeds = [11]
+        tier_names = ["clean", "gaussian_10pct", "outliers_3pct"]
+        generations, pop, timeout, n_samples = 15, 30, 25.0, 120
+    elif args.smoke:
         problem_names = list(DEFAULT_BASELINE_PROBLEMS[:2])
         seeds = [11]
         tier_names = ["clean", "gaussian_10pct"]
         generations, pop, timeout, n_samples = 15, 30, 20.0, 120
     else:
-        problem_names = [p.strip() for p in args.problems.split(",") if p.strip()]
+        if args.blackbox and args.problems == ",".join(DEFAULT_BASELINE_PROBLEMS):
+            problem_names = list(DEFAULT_BLACKBOX_PROBLEMS)
+        else:
+            problem_names = [p.strip() for p in args.problems.split(",") if p.strip()]
         seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
         if args.tiers.strip().lower() == "all":
             tier_names = [t["name"] for t in NOISE_TIERS]
@@ -888,12 +1028,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tiers.append(tier_by_name[name])
 
     problems = _select_problems(problem_names)
-    factory = _default_estimator_factory(
-        generations=generations,
-        population_size=pop,
-        timeout=timeout,
-        allow_stub=bool(args.smoke),
-    )
+    try:
+        factory = _default_estimator_factory(
+            generations=generations,
+            population_size=pop,
+            timeout=timeout,
+            allow_stub=bool(args.smoke),
+            ablation=str(args.ablation),
+            blackbox_protocol=bool(args.blackbox),
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
 
     if not args.quiet:
         print(
@@ -903,6 +1048,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(f"Problems: {', '.join(p[0] for p in problems)}")
         print(f"Tiers:    {', '.join(t['name'] for t in tiers)}")
         print(f"Seeds:    {seeds}")
+        print(f"Ablation: {args.ablation}")
+        print(
+            f"Budget:   generations={generations} population={pop} "
+            f"timeout={timeout}s (report budgets when comparing methods)"
+        )
 
     rows = run_noise_protocol(
         factory,
@@ -912,7 +1062,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         n_samples=n_samples,
         verbose=not args.quiet,
     )
+    # Annotate every row with ablation + budget for release-gate audits.
+    for row in rows:
+        row["ablation"] = str(args.ablation)
+        row["budget_generations"] = int(generations)
+        row["budget_population"] = int(pop)
+        row["budget_timeout"] = float(timeout)
+        # Failed seeds stay visible (error field already set in _run_single).
+        if row.get("error"):
+            row["failed_seed"] = True
     summary = summarize_noise_protocol(rows)
+    summary["ablation"] = str(args.ablation)
+    summary["budget"] = {
+        "generations": int(generations),
+        "population_size": int(pop),
+        "timeout": float(timeout),
+        "n_samples": int(n_samples),
+        "seeds": list(seeds),
+    }
+    failed = [r for r in rows if r.get("error")]
+    summary["failed_seeds"] = [
+        {"problem": r.get("problem"), "tier": r.get("tier"), "seed": r.get("seed"), "error": r.get("error")}
+        for r in failed
+    ]
+    summary["n_failed_seeds"] = len(failed)
     out_dir = Path(args.output_dir)
     paths = write_report(rows, summary, out_dir)
 

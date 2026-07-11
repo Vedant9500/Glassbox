@@ -8,6 +8,7 @@ space before symbolic evolution.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -52,11 +53,68 @@ def _safe_std(values: np.ndarray) -> np.ndarray:
     return scale
 
 
-def _corr_score(x: np.ndarray, y: np.ndarray) -> float:
+def _as_sample_weight(sample_weight, n: int) -> Optional[np.ndarray]:
+    """Validate optional per-point weights; return length-n array or None."""
+    if sample_weight is None:
+        return None
     try:
-        if np.std(x) < 1e-12 or np.std(y) < 1e-12:
+        w = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+    except Exception:
+        return None
+    if w.shape[0] != int(n) or not np.all(np.isfinite(w)) or np.any(w < 0.0):
+        return None
+    if float(np.sum(w)) <= 1e-15:
+        return None
+    return w
+
+
+def _weighted_mean(values: np.ndarray, weights: Optional[np.ndarray] = None) -> float:
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        return 0.0
+    if weights is None:
+        return float(np.mean(values))
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    total = float(np.sum(w))
+    if total <= 1e-15:
+        return float(np.mean(values))
+    return float(np.dot(w, values) / total)
+
+
+def _weighted_var(values: np.ndarray, weights: Optional[np.ndarray] = None) -> float:
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if values.size == 0:
+        return 0.0
+    mu = _weighted_mean(values, weights)
+    centered = values - mu
+    if weights is None:
+        return float(np.mean(centered * centered))
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    total = float(np.sum(w))
+    if total <= 1e-15:
+        return float(np.mean(centered * centered))
+    return float(np.dot(w, centered * centered) / total)
+
+
+def _corr_score(x: np.ndarray, y: np.ndarray, sample_weight: Optional[np.ndarray] = None) -> float:
+    try:
+        x = np.asarray(x, dtype=np.float64).reshape(-1)
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
+        w = _as_sample_weight(sample_weight, x.shape[0])
+        if w is None:
+            if np.std(x) < 1e-12 or np.std(y) < 1e-12:
+                return 0.0
+            corr = np.corrcoef(x, y)[0, 1]
+            return float(abs(corr)) if np.isfinite(corr) else 0.0
+        mx = _weighted_mean(x, w)
+        my = _weighted_mean(y, w)
+        xc = x - mx
+        yc = y - my
+        denom = math.sqrt(max(_weighted_var(x, w), 0.0) * max(_weighted_var(y, w), 0.0))
+        if denom < 1e-15:
             return 0.0
-        corr = np.corrcoef(x, y)[0, 1]
+        num = float(np.dot(w, xc * yc) / float(np.sum(w)))
+        corr = num / denom
         return float(abs(corr)) if np.isfinite(corr) else 0.0
     except Exception:
         return 0.0
@@ -69,15 +127,38 @@ def _rankdata(values: np.ndarray) -> np.ndarray:
     return ranks
 
 
-def _univariate_poly_score(x: np.ndarray, y: np.ndarray) -> float:
+def _weighted_lstsq(design: np.ndarray, target: np.ndarray, sample_weight: Optional[np.ndarray] = None):
+    design = np.asarray(design, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64).reshape(-1)
+    w = _as_sample_weight(sample_weight, target.shape[0])
+    if w is None:
+        coef, _, _, _ = np.linalg.lstsq(design, target, rcond=None)
+        return coef
+    sw = np.sqrt(np.maximum(w, 0.0))
+    coef, _, _, _ = np.linalg.lstsq(design * sw[:, None], target * sw, rcond=None)
+    return coef
+
+
+def _univariate_poly_score(
+    x: np.ndarray,
+    y: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
+) -> float:
     """Return validation-free relative R2 from a small univariate polynomial probe."""
     try:
-        y_var = max(float(np.var(y)), 1e-12)
+        x = np.asarray(x, dtype=np.float64).reshape(-1)
+        y = np.asarray(y, dtype=np.float64).reshape(-1)
+        w = _as_sample_weight(sample_weight, x.shape[0])
+        y_var = max(_weighted_var(y, w), 1e-12)
         cols = [x, x * x, x * x * x, np.ones_like(x)]
         design = np.column_stack(cols)
-        coef, _, _, _ = np.linalg.lstsq(design, y, rcond=None)
+        coef = _weighted_lstsq(design, y, w)
         pred = design @ coef
-        mse = float(np.mean((pred - y) ** 2))
+        resid = pred - y
+        if w is None:
+            mse = float(np.mean(resid * resid))
+        else:
+            mse = float(np.dot(w, resid * resid) / float(np.sum(w)))
         if not np.isfinite(mse):
             return 0.0
         return float(np.clip(1.0 - mse / y_var, 0.0, 1.0))
@@ -91,19 +172,24 @@ def _univariate_holdout_poly_score(
     *,
     validation_fraction: float = 0.25,
     random_state: int = 0,
+    sample_weight: Optional[np.ndarray] = None,
 ) -> float:
     """Return holdout R2 from a small univariate polynomial probe."""
     x = np.asarray(x, dtype=np.float64).reshape(-1)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
+    w_all = _as_sample_weight(sample_weight, x.shape[0])
     mask = np.isfinite(x) & np.isfinite(y)
+    if w_all is not None:
+        mask = mask & np.isfinite(w_all)
     if int(mask.sum()) < 12:
         return 0.0
 
     x = x[mask]
     y = y[mask]
+    w = w_all[mask] if w_all is not None else None
     n = int(x.shape[0])
     if n < 24:
-        return _univariate_poly_score(x, y)
+        return _univariate_poly_score(x, y, w)
 
     rng = np.random.RandomState(int(random_state))
     indices = np.arange(n)
@@ -121,13 +207,19 @@ def _univariate_holdout_poly_score(
     y_train = y[train_idx]
     x_val = x[val_idx]
     y_val = y[val_idx]
+    w_train = w[train_idx] if w is not None else None
+    w_val = w[val_idx] if w is not None else None
     try:
         design_train = np.column_stack([x_train, x_train * x_train, x_train * x_train * x_train, np.ones_like(x_train)])
         design_val = np.column_stack([x_val, x_val * x_val, x_val * x_val * x_val, np.ones_like(x_val)])
-        coef, _, _, _ = np.linalg.lstsq(design_train, y_train, rcond=None)
+        coef = _weighted_lstsq(design_train, y_train, w_train)
         pred_val = design_val @ coef
-        val_var = max(float(np.var(y_val)), 1e-12)
-        mse = float(np.mean((pred_val - y_val) ** 2))
+        resid = pred_val - y_val
+        val_var = max(_weighted_var(y_val, w_val), 1e-12)
+        if w_val is None:
+            mse = float(np.mean(resid * resid))
+        else:
+            mse = float(np.dot(w_val, resid * resid) / float(np.sum(w_val)))
         if not np.isfinite(mse):
             return 0.0
         return float(np.clip(1.0 - mse / val_var, 0.0, 1.0))
@@ -141,27 +233,33 @@ def _affine_relative_score(
     *,
     validation_fraction: float = 0.25,
     random_state: int = 0,
+    sample_weight: Optional[np.ndarray] = None,
 ) -> tuple[float, float]:
     """Return holdout-aware and train relative R2 for a 1D candidate signal."""
     values = np.asarray(values, dtype=np.float64).reshape(-1)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
+    w_all = _as_sample_weight(sample_weight, values.shape[0])
     mask = np.isfinite(values) & np.isfinite(y)
+    if w_all is not None:
+        mask = mask & np.isfinite(w_all)
     if int(mask.sum()) < 12:
         return 0.0, 0.0
 
     x = values[mask]
     target = y[mask]
+    w = w_all[mask] if w_all is not None else None
     n = int(x.shape[0])
     if n < 24:
         try:
-            coef, _, _, _ = np.linalg.lstsq(
-                np.column_stack([x, np.ones_like(x)]),
-                target,
-                rcond=None,
-            )
-            pred = coef[0] * x + coef[1]
-            mse = float(np.mean((pred - target) ** 2))
-            y_var = max(float(np.var(target)), 1e-12)
+            design = np.column_stack([x, np.ones_like(x)])
+            coef = _weighted_lstsq(design, target, w)
+            pred = design @ coef
+            resid = pred - target
+            y_var = max(_weighted_var(target, w), 1e-12)
+            if w is None:
+                mse = float(np.mean(resid * resid))
+            else:
+                mse = float(np.dot(w, resid * resid) / float(np.sum(w)))
             rel = float(np.clip(1.0 - mse / y_var, 0.0, 1.0))
             return rel, rel
         except Exception:
@@ -183,18 +281,25 @@ def _affine_relative_score(
     y_train = target[train_idx]
     x_val = x[val_idx]
     y_val = target[val_idx]
+    w_train = w[train_idx] if w is not None else None
+    w_val = w[val_idx] if w is not None else None
     try:
-        coef, _, _, _ = np.linalg.lstsq(
-            np.column_stack([x_train, np.ones_like(x_train)]),
-            y_train,
-            rcond=None,
-        )
+        design_train = np.column_stack([x_train, np.ones_like(x_train)])
+        coef = _weighted_lstsq(design_train, y_train, w_train)
         train_pred = coef[0] * x_train + coef[1]
         val_pred = coef[0] * x_val + coef[1]
-        train_var = max(float(np.var(y_train)), 1e-12)
-        val_var = max(float(np.var(y_val)), 1e-12)
-        train_rel = float(np.clip(1.0 - float(np.mean((train_pred - y_train) ** 2)) / train_var, 0.0, 1.0))
-        val_rel = float(np.clip(1.0 - float(np.mean((val_pred - y_val) ** 2)) / val_var, 0.0, 1.0))
+        train_var = max(_weighted_var(y_train, w_train), 1e-12)
+        val_var = max(_weighted_var(y_val, w_val), 1e-12)
+        if w_train is None:
+            train_mse = float(np.mean((train_pred - y_train) ** 2))
+        else:
+            train_mse = float(np.dot(w_train, (train_pred - y_train) ** 2) / float(np.sum(w_train)))
+        if w_val is None:
+            val_mse = float(np.mean((val_pred - y_val) ** 2))
+        else:
+            val_mse = float(np.dot(w_val, (val_pred - y_val) ** 2) / float(np.sum(w_val)))
+        train_rel = float(np.clip(1.0 - train_mse / train_var, 0.0, 1.0))
+        val_rel = float(np.clip(1.0 - val_mse / val_var, 0.0, 1.0))
         return val_rel, train_rel
     except Exception:
         return 0.0, 0.0
@@ -219,52 +324,76 @@ def _normalize_score_dict(scores: Dict[int, float]) -> Dict[int, float]:
     }
 
 
-def _cheap_feature_scores(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
+def _cheap_feature_scores(
+    X: np.ndarray,
+    y: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
+) -> Dict[int, float]:
     """Rank features using deterministic univariate signals only."""
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
+    w_all = _as_sample_weight(sample_weight, y.shape[0])
     scores: Dict[int, float] = {}
 
     y_rank = _rankdata(y)
     for j in range(X.shape[1]):
         col = X[:, j]
         finite = np.isfinite(col) & np.isfinite(y)
+        if w_all is not None:
+            finite = finite & np.isfinite(w_all) & (w_all > 0.0)
         if int(finite.sum()) < 8:
             scores[j] = 0.0
             continue
         xj = col[finite]
         yj = y[finite]
-        pearson = _corr_score(xj, yj)
-        spearman = _corr_score(_rankdata(xj), y_rank[finite])
-        poly = _univariate_poly_score(xj, yj)
+        wj = w_all[finite] if w_all is not None else None
+        pearson = _corr_score(xj, yj, wj)
+        spearman = _corr_score(_rankdata(xj), y_rank[finite], wj)
+        poly = _univariate_poly_score(xj, yj, wj)
         holdout_poly = _univariate_holdout_poly_score(
             xj,
             yj,
             random_state=97 * (j + 1),
+            sample_weight=wj,
         )
         scores[j] = float(0.20 * pearson + 0.15 * spearman + 0.25 * poly + 0.40 * holdout_poly)
     return scores
 
 
-def _mutual_information_scores(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
+def _mutual_information_scores(
+    X: np.ndarray,
+    y: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
+) -> Dict[int, float]:
     if mutual_info_regression is None:
         return {}
     try:
-        scores = mutual_info_regression(
-            np.asarray(X, dtype=np.float64),
-            np.asarray(y, dtype=np.float64).reshape(-1),
-            random_state=0,
-        )
+        X_arr = np.asarray(X, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+        w = _as_sample_weight(sample_weight, y_arr.shape[0])
+        # sklearn MI has no sample_weight; approximate by weighted resampling.
+        if w is not None and X_arr.ndim == 2 and X_arr.shape[0] == y_arr.shape[0]:
+            rng = np.random.RandomState(0)
+            p = w / float(np.sum(w))
+            idx = rng.choice(y_arr.shape[0], size=int(y_arr.shape[0]), replace=True, p=p)
+            X_arr = X_arr[idx]
+            y_arr = y_arr[idx]
+        scores = mutual_info_regression(X_arr, y_arr, random_state=0)
         return _normalize_score_dict({j: float(scores[j]) for j in range(len(scores))})
     except Exception:
         return {}
 
 
-def _sparse_linear_scores(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
+def _sparse_linear_scores(
+    X: np.ndarray,
+    y: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
+) -> Dict[int, float]:
     if LassoCV is None or ElasticNetCV is None:
         return {}
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
+    w = _as_sample_weight(sample_weight, y.shape[0])
     if X.ndim != 2 or X.shape[1] == 0 or X.shape[0] < max(24, X.shape[1] + 4):
         return {}
 
@@ -276,7 +405,10 @@ def _sparse_linear_scores(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
             max_iter=5000,
             alphas=32,
         )
-        lasso.fit(X, y)
+        if w is None:
+            lasso.fit(X, y)
+        else:
+            lasso.fit(X, y, sample_weight=w)
         score_pool.append(np.abs(np.asarray(lasso.coef_, dtype=np.float64)))
     except Exception:
         pass
@@ -288,7 +420,10 @@ def _sparse_linear_scores(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
             alphas=24,
             l1_ratio=(0.2, 0.5, 0.8, 0.95, 1.0),
         )
-        enet.fit(X, y)
+        if w is None:
+            enet.fit(X, y)
+        else:
+            enet.fit(X, y, sample_weight=w)
         score_pool.append(np.abs(np.asarray(enet.coef_, dtype=np.float64)))
     except Exception:
         pass
@@ -299,11 +434,16 @@ def _sparse_linear_scores(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
     return _normalize_score_dict({j: float(mean_scores[j]) for j in range(mean_scores.shape[0])})
 
 
-def _tree_importance_scores(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
+def _tree_importance_scores(
+    X: np.ndarray,
+    y: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
+) -> Dict[int, float]:
     if ExtraTreesRegressor is None:
         return {}
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
+    w = _as_sample_weight(sample_weight, y.shape[0])
     if X.ndim != 2 or X.shape[1] == 0 or X.shape[0] < 24:
         return {}
     try:
@@ -314,7 +454,10 @@ def _tree_importance_scores(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
             random_state=0,
             n_jobs=1,
         )
-        model.fit(X, y)
+        if w is None:
+            model.fit(X, y)
+        else:
+            model.fit(X, y, sample_weight=w)
         importances = np.asarray(model.feature_importances_, dtype=np.float64)
         return _normalize_score_dict({j: float(importances[j]) for j in range(importances.shape[0])})
     except Exception:
@@ -358,13 +501,18 @@ def _ranker_disagreement(
     return float(np.clip(np.mean(spreads) * 2.0, 0.0, 1.0))
 
 
-def compute_blackbox_feature_ranking(X: np.ndarray, y: np.ndarray) -> Dict[str, Any]:
+def compute_blackbox_feature_ranking(
+    X: np.ndarray,
+    y: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
     """Rank features with deterministic and optional model-based votes."""
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
+    w_all = _as_sample_weight(sample_weight, y.shape[0])
     n_features = int(X.shape[1]) if X.ndim == 2 else 0
     if n_features <= 0:
-        return {"feature_scores": {}, "ranker_votes": {}}
+        return {"feature_scores": {}, "ranker_votes": {}, "sample_weight_mode": "none"}
 
     pearson_scores: Dict[int, float] = {}
     spearman_scores: Dict[int, float] = {}
@@ -375,6 +523,8 @@ def compute_blackbox_feature_ranking(X: np.ndarray, y: np.ndarray) -> Dict[str, 
     for j in range(n_features):
         col = X[:, j]
         finite = np.isfinite(col) & np.isfinite(y)
+        if w_all is not None:
+            finite = finite & np.isfinite(w_all) & (w_all > 0.0)
         if int(finite.sum()) < 8:
             pearson_scores[j] = 0.0
             spearman_scores[j] = 0.0
@@ -383,13 +533,15 @@ def compute_blackbox_feature_ranking(X: np.ndarray, y: np.ndarray) -> Dict[str, 
             continue
         xj = col[finite]
         yj = y[finite]
-        pearson_scores[j] = _corr_score(xj, yj)
-        spearman_scores[j] = _corr_score(_rankdata(xj), y_rank[finite])
-        poly_scores[j] = _univariate_poly_score(xj, yj)
+        wj = w_all[finite] if w_all is not None else None
+        pearson_scores[j] = _corr_score(xj, yj, wj)
+        spearman_scores[j] = _corr_score(_rankdata(xj), y_rank[finite], wj)
+        poly_scores[j] = _univariate_poly_score(xj, yj, wj)
         holdout_poly_scores[j] = _univariate_holdout_poly_score(
             xj,
             yj,
             random_state=97 * (j + 1),
+            sample_weight=wj,
         )
 
     ranker_votes: Dict[str, Dict[int, float]] = {
@@ -399,15 +551,15 @@ def compute_blackbox_feature_ranking(X: np.ndarray, y: np.ndarray) -> Dict[str, 
         "holdout_poly": _normalize_score_dict(holdout_poly_scores),
     }
 
-    mi_scores = _mutual_information_scores(X, y)
+    mi_scores = _mutual_information_scores(X, y, w_all)
     if mi_scores:
         ranker_votes["mutual_information"] = mi_scores
 
-    sparse_scores = _sparse_linear_scores(X, y)
+    sparse_scores = _sparse_linear_scores(X, y, w_all)
     if sparse_scores:
         ranker_votes["sparse_linear"] = sparse_scores
 
-    tree_scores = _tree_importance_scores(X, y)
+    tree_scores = _tree_importance_scores(X, y, w_all)
     if tree_scores:
         ranker_votes["tree"] = tree_scores
 
@@ -436,12 +588,17 @@ def compute_blackbox_feature_ranking(X: np.ndarray, y: np.ndarray) -> Dict[str, 
     return {
         "feature_scores": feature_scores,
         "ranker_votes": ranker_votes,
+        "sample_weight_mode": "provided" if w_all is not None else "none",
     }
 
 
-def rank_blackbox_features(X: np.ndarray, y: np.ndarray) -> Dict[int, float]:
+def rank_blackbox_features(
+    X: np.ndarray,
+    y: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
+) -> Dict[int, float]:
     """Backwards-compatible feature score helper."""
-    return compute_blackbox_feature_ranking(X, y)["feature_scores"]
+    return compute_blackbox_feature_ranking(X, y, sample_weight=sample_weight)["feature_scores"]
 
 
 def discover_blackbox_interactions(
@@ -450,10 +607,12 @@ def discover_blackbox_interactions(
     selected_features: Optional[List[int]] = None,
     max_pairs: int = 6,
     validation_fraction: float = 0.25,
+    sample_weight: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Score a small set of pairwise interaction candidates."""
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
+    w_all = _as_sample_weight(sample_weight, y.shape[0])
     if X.ndim != 2 or X.shape[1] < 2:
         return {"interaction_pairs": [], "interaction_terms": [], "interaction_scores": {}}
 
@@ -462,7 +621,7 @@ def discover_blackbox_interactions(
     if len(cols) < 2:
         return {"interaction_pairs": [], "interaction_terms": [], "interaction_scores": {}}
 
-    base_scores = _cheap_feature_scores(X, y)
+    base_scores = _cheap_feature_scores(X, y, w_all)
     candidate_rows: List[Tuple[float, Tuple[int, int], str, np.ndarray]] = []
 
     def _interaction_family(term: str) -> str:
@@ -505,12 +664,15 @@ def discover_blackbox_interactions(
             xi = X[:, a]
             xj = X[:, b]
             mask = np.isfinite(xi) & np.isfinite(xj) & np.isfinite(y)
+            if w_all is not None:
+                mask = mask & np.isfinite(w_all) & (w_all > 0.0)
             if int(mask.sum()) < 12:
                 continue
 
             xi = xi[mask]
             xj = xj[mask]
             yj = y[mask]
+            wj = w_all[mask] if w_all is not None else None
 
             candidates = {
                 f"x{la}*x{lb}": xi * xj,
@@ -540,6 +702,7 @@ def discover_blackbox_interactions(
                         yj,
                         validation_fraction=validation_fraction,
                         random_state=31 * (a + 1) + 17 * (b + 1),
+                        sample_weight=wj,
                     )
                     score = (
                         0.75 * val_rel
@@ -601,6 +764,7 @@ def prepare_blackbox_search(
     standardize: bool = True,
     min_features_to_select: int = 5,
     interaction_search: bool = True,
+    sample_weight: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray, BlackboxState]:
     """Return reduced/standardized search data and remapping metadata."""
     X = np.asarray(X, dtype=np.float64)
@@ -656,6 +820,8 @@ def prepare_blackbox_search(
 
     X_scaled_all = (X_clean - x_mean) / x_scale if standardize else X_clean.copy()
     y_scaled = (y_clean - y_mean) / y_scale if standardize else y_clean.copy()
+    w_all = _as_sample_weight(sample_weight, y_clean.shape[0])
+    ranking_weight_mode = "provided" if w_all is not None else "none"
     if n_features < int(min_features_to_select):
         selected = sorted(usable)
         feature_scores = {idx: 0.0 for idx in usable}
@@ -663,8 +829,11 @@ def prepare_blackbox_search(
         dropped = [j for j in range(n_features) if j not in selected]
         reason = "retained_all_features_small_problem"
     else:
-        cheap_scores = _cheap_feature_scores(X_scaled_all[:, usable], y_scaled)
-        ranking = compute_blackbox_feature_ranking(X_scaled_all[:, usable], y_scaled)
+        cheap_scores = _cheap_feature_scores(X_scaled_all[:, usable], y_scaled, w_all)
+        ranking = compute_blackbox_feature_ranking(
+            X_scaled_all[:, usable], y_scaled, sample_weight=w_all
+        )
+        ranking_weight_mode = str(ranking.get("sample_weight_mode") or ranking_weight_mode)
         feature_scores = {
             usable[j]: score
             for j, score in (ranking.get("feature_scores") or {}).items()
@@ -679,34 +848,116 @@ def prepare_blackbox_search(
 
         k = int(max(1, min(max_features, len(usable))))
         ranked_usable = sorted(usable, key=lambda idx: feature_scores.get(idx, 0.0), reverse=True)
-        selected = ranked_usable[:k]
-        top_score = float(feature_scores.get(selected[0], 0.0)) if selected else 0.0
-        kth_score = float(feature_scores.get(selected[-1], 0.0)) if selected else 0.0
-        next_score = float(feature_scores.get(ranked_usable[k], 0.0)) if k < len(ranked_usable) else 0.0
-        top_cheap_score = max((float(v) for v in cheap_scores.values()), default=0.0)
-        score_gap = kth_score - next_score
-        disagreement = _ranker_disagreement(ranker_votes, ranked_usable)
-        uncertain = (
-            len(usable) <= max(5, k + 2)
-            and (
-                top_cheap_score <= 0.12
-                or (
-                    next_score > 0.0
-                    and score_gap < max(0.04, 0.12 * max(top_score, 1e-12))
-                )
-                or (
-                    top_cheap_score <= 0.20
-                    and score_gap < max(0.08, 0.20 * max(top_score, 1e-12))
-                    and disagreement >= 0.35
+        # No need to drop when everything fits in the budget.
+        if len(usable) <= k:
+            selected = list(usable)
+            reason = "retained_all_features_within_budget"
+            top_score = float(feature_scores.get(ranked_usable[0], 0.0)) if ranked_usable else 0.0
+            kth_score = float(feature_scores.get(ranked_usable[-1], 0.0)) if ranked_usable else 0.0
+            next_score = 0.0
+            top_cheap_score = max((float(v) for v in cheap_scores.values()), default=0.0)
+            score_gap = top_score
+            disagreement = _ranker_disagreement(ranker_votes, ranked_usable)
+        else:
+            selected = list(ranked_usable[:k])
+            top_score = float(feature_scores.get(selected[0], 0.0)) if selected else 0.0
+            orig_kth = float(feature_scores.get(selected[-1], 0.0)) if selected else 0.0
+            # Near-tie plateau: keep *strong* features scored almost as high as
+            # the k-th cut. Fixed threshold (no cascade). Require min score so
+            # a weak k-th cut does not pull in the entire noise floor.
+            plateau_tol = max(0.02, 0.08 * max(abs(top_score), 1e-12))
+            min_meaningful = max(0.12, 0.35 * max(abs(top_score), 1e-12))
+            extend_i = k
+            max_extra = max(1, min(2, len(usable) - k))
+            while extend_i < len(ranked_usable) and (extend_i - k) < max_extra:
+                s_next = float(feature_scores.get(ranked_usable[extend_i], 0.0))
+                if s_next < min_meaningful:
+                    break
+                abs_gap = orig_kth - s_next
+                rel_gap = abs_gap / max(abs(orig_kth), 1e-12) if abs(orig_kth) > 1e-12 else abs_gap
+                if s_next >= orig_kth - plateau_tol or rel_gap <= 0.10:
+                    selected.append(ranked_usable[extend_i])
+                    extend_i += 1
+                    continue
+                break
+            # Drop weak fillers already inside the top-k cut when a clear
+            # score cliff exists after the strong head (informative ranking).
+            strong = [
+                idx for idx in selected
+                if float(feature_scores.get(idx, 0.0)) >= min_meaningful
+            ]
+            if len(strong) >= 2 and len(strong) < len(selected):
+                head_min = min(float(feature_scores.get(idx, 0.0)) for idx in strong)
+                weak = [
+                    idx for idx in selected
+                    if float(feature_scores.get(idx, 0.0)) < min_meaningful
+                ]
+                if weak and head_min >= 2.5 * max(
+                    float(feature_scores.get(weak[0], 0.0)), 1e-12
+                ):
+                    selected = strong
+                    extend_i = k  # treat as non-extended for reason labeling
+            kth_score = float(feature_scores.get(selected[-1], 0.0)) if selected else 0.0
+            # Recompute next after possible head trim.
+            ranked_sel = sorted(
+                selected, key=lambda idx: feature_scores.get(idx, 0.0), reverse=True
+            )
+            tail_rank = 0
+            for pos, idx in enumerate(ranked_usable):
+                if idx in selected:
+                    tail_rank = pos
+            next_score = (
+                float(feature_scores.get(ranked_usable[tail_rank + 1], 0.0))
+                if tail_rank + 1 < len(ranked_usable)
+                else 0.0
+            )
+            top_cheap_score = max((float(v) for v in cheap_scores.values()), default=0.0)
+            score_gap = kth_score - next_score
+            disagreement = _ranker_disagreement(ranker_votes, ranked_usable)
+            score_values = np.asarray(
+                [float(feature_scores.get(idx, 0.0)) for idx in usable],
+                dtype=np.float64,
+            )
+            score_max = float(np.max(score_values)) if score_values.size else 0.0
+            score_min = float(np.min(score_values)) if score_values.size else 0.0
+            # Symmetric multi-var (e.g. Vladislavleva-4): every coord has
+            # comparable *and informative* score — keep all rather than drop
+            # one weak sample draw. Pure-noise rankings have low cheap scores.
+            near_plateau = (
+                len(usable) <= 6
+                and score_max >= 0.25
+                and top_cheap_score >= 0.18
+                and score_min >= 0.35 * score_max
+            )
+            near_boundary_tie = (
+                next_score >= min_meaningful
+                and score_gap < max(0.03, 0.10 * max(abs(top_score), 1e-12))
+            )
+            weak_signal = top_cheap_score <= 0.12 or score_max <= 0.15
+            uncertain = near_plateau or (
+                len(usable) <= max(5, k + 2)
+                and (
+                    weak_signal
+                    or (near_boundary_tie and disagreement >= 0.35)
+                    or (
+                        top_cheap_score <= 0.20
+                        and score_gap < max(0.08, 0.20 * max(abs(top_score), 1e-12))
+                        and disagreement >= 0.35
+                    )
                 )
             )
-        )
-        if uncertain:
-            selected = list(usable)
-            reason = "retained_all_features_uncertain_selection"
-        else:
-            reason = "selected_top_features"
-        selected = sorted(selected)
+            if uncertain:
+                selected = list(usable)
+                reason = (
+                    "retained_all_features_score_plateau"
+                    if near_plateau
+                    else "retained_all_features_uncertain_selection"
+                )
+            elif len(selected) > k:
+                reason = "selected_top_features_plateau_extended"
+            else:
+                reason = "selected_top_features"
+        selected = sorted(set(int(i) for i in selected))
         dropped = [j for j in range(n_features) if j not in selected]
 
     if interaction_search:
@@ -714,6 +965,7 @@ def prepare_blackbox_search(
             X_scaled_all[:, selected],
             y_scaled,
             selected_features=selected,
+            sample_weight=w_all,
         )
     else:
         interaction_state = {
@@ -737,9 +989,14 @@ def prepare_blackbox_search(
         interaction_pairs=list(interaction_state["interaction_pairs"]),
         interaction_terms=list(interaction_state["interaction_terms"]),
         interaction_scores=dict(interaction_state["interaction_scores"]),
-        feature_selection_uncertain=(reason == "retained_all_features_uncertain_selection"),
+        feature_selection_uncertain=reason in (
+            "retained_all_features_uncertain_selection",
+            "retained_all_features_score_plateau",
+        ),
         candidate_seed_formulas=build_blackbox_seed_formulas(selected, interaction_state["interaction_terms"]),
     )
+    # Attach ranking weight mode for diagnostics (not a dataclass field).
+    state.ranking_sample_weight_mode = ranking_weight_mode  # type: ignore[attr-defined]
     return X_scaled_all[:, selected], y_scaled, state
 
 
@@ -879,4 +1136,9 @@ def state_to_dict(state: Optional[BlackboxState]) -> Dict[str, Any]:
         "interaction_scores": dict(state.interaction_scores),
         "feature_selection_uncertain": bool(state.feature_selection_uncertain),
         "candidate_seed_formulas": list(state.candidate_seed_formulas),
+        "ranking_sample_weight_mode": str(
+            getattr(state, "ranking_sample_weight_mode", "none") or "none"
+        ),
+        "n_selected_features": int(len(state.selected_features)),
+        "n_dropped_features": int(len(state.dropped_features)),
     }

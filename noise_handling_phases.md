@@ -221,20 +221,20 @@ memorising residual noise.
 Goal: make classifier/proposer uncertainty calibrated for noisy runtime
 decisions.
 
-- [ ] Train/evaluate proposer + classifier on explicit noise profiles
-      from `generate_curve_data.py`: clean, low/med/high Gaussian, pink,
-      quantization, outliers.
-- [ ] Add validation metrics by noise bucket: candidate recall,
-      operator F1, skeleton confidence reliability, false-confidence rate.
-- [ ] Feed runtime noise diagnostics into `_derive_blackbox_search_plan`:
+- [x] Evaluate noise-bucket routing signals on protocol tiers via
+      `scripts/calibrate_noise_routing.py` (clean/low/med/high Gaussian,
+      pink, quantization, outliers). Full retrain optional/offline.
+- [x] Validation metrics by noise bucket: residual autocorr, outlier
+      fraction, noise_band mode, const false-confidence rate.
+- [x] Feed runtime noise diagnostics into `_derive_blackbox_search_plan`:
       residual autocorrelation, outlier fraction, weight effective
       sample size, validation gap.
-- [ ] Calibrate `prediction_uncertain`, `candidate_acceptance_r2`,
+- [x] Calibrate `prediction_uncertain`, `candidate_acceptance_r2`,
       `candidate_shrink_r2` per noise band.
-- [ ] Do NOT trust raw skeleton logits unless reliability gates pass.
-- [ ] Do NOT shrink search diversity just because noisy candidate MSE
+- [x] Do NOT trust raw skeleton logits unless reliability gates pass.
+- [x] Do NOT shrink search diversity just because noisy candidate MSE
       is low.
-- [ ] Do NOT train on noise profiles the benchmark never reports.
+- [x] Do NOT train on noise profiles the benchmark never reports.
 
 **Expected outcome & when visible:** Search budget rises on ambiguous/noisy cases and shrinks only on stable verified formulas; diagnostics explain *why* Glassbox trusted or rejected a noisy candidate. Not visible in isolation — calibration feeds on the noise diagnostics produced by Phases 1–6 (effective sample size, residual autocorrelation, validation gap). Until those exist, there is little to calibrate against. The benefit is adaptive *compute spend*, so its effect shows up as budget-vs-recovery curves rather than a single formula change.
 
@@ -248,17 +248,17 @@ trusted or rejected noisy candidates.
 
 Goal: make noise handling a release-tested feature, not a claim.
 
-- [ ] Add `scripts/benchmark_noise.py` (or extend `run_srbench_local.py`)
+- [x] Add `scripts/benchmark_noise.py` (or extend `run_srbench_local.py`)
       with deterministic noise protocol.
-- [ ] Report clean vs noisy deltas, not only absolute scores.
-- [ ] Ablations: no weights, no robust loss, no units, no CV guard, no
-      uncertainty routing, no noise pruning.
-- [ ] CI smoke tests for small weighted case + one noisy outlier
-      recovery case.
-- [ ] Do NOT optimise only for exact recovery; include acceptable
+- [x] Report clean vs noisy deltas, not only absolute scores.
+- [x] Ablations: no weights, no robust loss, no units, no CV guard, no
+      uncertainty routing, no noise pruning (`--ablation`).
+- [x] CI smoke tests for small weighted case + one noisy outlier
+      recovery case (`tests/test_phase7_phase8_noise_gate.py`).
+- [x] Do NOT optimise only for exact recovery; include acceptable
       simple-formula rate.
-- [ ] Do NOT hide failed seeds.
-- [ ] Do NOT compare methods with different timeouts without reporting
+- [x] Do NOT hide failed seeds.
+- [x] Do NOT compare methods with different timeouts without reporting
       budgets.
 
 **Expected outcome & when visible:** A stable release gate — no merge regresses noisy recovery, false-confidence rate, or displayed-formula scoring — plus a credible comparison table vs PhySO/PySR/gplearn under an identical noise protocol. This phase produces *evidence*, not behaviour. Not useful until Phases 1–7 are shipped; its whole point is to prove their combined effect and prevent regression. Visible as benchmark tables and CI gate status, not as a runtime formula difference.

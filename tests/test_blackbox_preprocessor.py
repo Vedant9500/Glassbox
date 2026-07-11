@@ -164,6 +164,7 @@ def test_compute_blackbox_feature_ranking_exposes_ranker_votes():
     assert "feature_scores" in ranking
     assert "ranker_votes" in ranking
     assert ranking["ranker_votes"]
+    assert ranking.get("sample_weight_mode") == "none"
     assert "holdout_poly" in ranking["ranker_votes"]
     top_features = sorted(
         ranking["feature_scores"],
@@ -172,6 +173,77 @@ def test_compute_blackbox_feature_ranking_exposes_ranker_votes():
     )[:3]
     assert 1 in top_features
     assert 4 in top_features
+
+
+def test_symmetric_multivariate_keeps_all_features_on_plateau():
+    """Vladislavleva-like: equal coordinate roles must not drop one clean feature."""
+    rng = np.random.RandomState(11)
+    n = 300
+    X = rng.uniform(0.05, 6.05, size=(n, 5))
+    y = 10.0 / (5.0 + np.sum((X - 3.0) ** 2, axis=1))
+
+    _, _, state = prepare_blackbox_search(
+        X,
+        y,
+        enabled=True,
+        max_features=4,
+        standardize=True,
+        min_features_to_select=2,
+        interaction_search=False,
+    )
+
+    assert state.enabled is True
+    # All five coords contribute symmetrically — keep all (plateau / within budget).
+    assert set(state.selected_features) == {0, 1, 2, 3, 4}, (
+        f"selected={state.selected_features} reason={state.reason}"
+    )
+    assert state.feature_selection_uncertain or state.reason in (
+        "retained_all_features_score_plateau",
+        "retained_all_features_uncertain_selection",
+        "retained_all_features_within_budget",
+        "selected_top_features_plateau_extended",
+    )
+
+
+def test_weighted_ranking_prefers_true_features_under_outliers():
+    """Downweighting outlier rows should keep true signal features in the top-k."""
+    rng = np.random.RandomState(0)
+    n = 240
+    X = rng.randn(n, 8)
+    y = 3.0 * X[:, 2] - 2.0 * X[:, 5] ** 2
+    # Contiguous block outliers that correlate a decoy feature with y.
+    y_noisy = y.copy()
+    y_noisy[0:40] = 50.0 + 8.0 * X[0:40, 7]
+    w = np.ones(n, dtype=np.float64)
+    w[0:40] = 0.01
+
+    _, _, state_unw = prepare_blackbox_search(
+        X,
+        y_noisy,
+        enabled=True,
+        max_features=3,
+        standardize=False,
+        min_features_to_select=2,
+        interaction_search=False,
+    )
+    _, _, state_w = prepare_blackbox_search(
+        X,
+        y_noisy,
+        enabled=True,
+        max_features=3,
+        standardize=False,
+        min_features_to_select=2,
+        interaction_search=False,
+        sample_weight=w,
+    )
+
+    assert state_w.ranking_sample_weight_mode == "provided"
+    # Weighted ranking should recover both true features more often than unweighted.
+    true = {2, 5}
+    hit_w = len(true.intersection(state_w.selected_features))
+    hit_u = len(true.intersection(state_unw.selected_features))
+    assert hit_w >= hit_u
+    assert 2 in state_w.selected_features or 5 in state_w.selected_features
 
 
 def test_uncertain_feature_selection_retains_small_candidate_set():

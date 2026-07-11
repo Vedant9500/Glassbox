@@ -243,3 +243,24 @@ Pareto weight threading, full multi-seed baseline run on real estimator,
 - Probe (block outliers, seed=11, 50 gens): mse clean≈902, huber≈0.26,
   trimmed exact `2*x+1`, weights clean≈9.
 - Tests: parity + robust suites green after rebuild.
+
+---
+
+## Phase 7 completed (routing calibration)
+
+- Runtime diagnostics: residual lag-1 autocorr, outlier fraction (3×MAD),
+  validation gap, Kish ESS ratio → `noise_band` clean|low|medium|high.
+- `_derive_blackbox_search_plan` takes `noise_diagnostics`; calibrates
+  `candidate_acceptance_r2` / `candidate_shrink_r2` / entropy floor;
+  expands breadth/depth under residual noise; does not shrink diversity
+  when noisy candidate R² looks high on medium/high bands.
+- Adaptive timeout scales with noise band.
+- Report helper: `scripts/calibrate_noise_routing.py` (protocol tiers only).
+
+## Phase 8 completed (release gate)
+
+- `benchmark_noise.py --ablation {full,no_weights,no_robust_loss,no_units,
+  no_cv_guard,no_uncertainty_routing,no_noise_pruning}`; budget fields on
+  every row; failed seeds retained in summary.
+- CI smokes: weighted outlier recovery + trimmed robust recovery in
+  `tests/test_phase7_phase8_noise_gate.py`.

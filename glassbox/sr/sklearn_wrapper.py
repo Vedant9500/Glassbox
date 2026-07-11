@@ -154,6 +154,106 @@ def _effective_sample_size(sample_weight):
     return float((total * total) / float(np.sum(w * w)))
 
 
+def _residual_lag1_autocorr(resid):
+    """Lag-1 residual autocorrelation in [-1, 1]; 0 if undefined."""
+    r = np.asarray(resid, dtype=np.float64).reshape(-1)
+    r = r[np.isfinite(r)]
+    if r.size < 8:
+        return 0.0
+    r = r - float(np.mean(r))
+    den = float(np.dot(r, r))
+    if den < 1e-15:
+        return 0.0
+    num = float(np.dot(r[:-1], r[1:]))
+    ac = num / den
+    if not np.isfinite(ac):
+        return 0.0
+    return float(np.clip(ac, -1.0, 1.0))
+
+
+def _estimate_outlier_fraction(resid, sample_weight=None):
+    """Fraction of points beyond 3 * MAD scale (robust outlier rate)."""
+    r = np.asarray(resid, dtype=np.float64).reshape(-1)
+    if r.size == 0 or not np.any(np.isfinite(r)):
+        return 0.0
+    scale = float(_mad_scale(r, sample_weight))
+    if not np.isfinite(scale) or scale < 1e-12:
+        return 0.0
+    return float(np.mean(np.abs(r[np.isfinite(r)]) > 3.0 * scale))
+
+
+def _noise_band_from_diagnostics(diag):
+    """Map runtime noise diagnostics to a coarse band used for threshold calibration.
+
+    Bands align with protocol tiers conceptually: clean / low / medium / high.
+    Not a claim about training-label noise — only residual/weight geometry at fit time.
+    """
+    if not isinstance(diag, dict):
+        return "clean"
+    outlier = float(diag.get("outlier_fraction") or 0.0)
+    gap = float(diag.get("validation_gap") or 0.0)
+    ac = abs(float(diag.get("residual_autocorr") or 0.0))
+    ess_ratio = diag.get("ess_ratio")
+    ess_ratio = float(ess_ratio) if ess_ratio is not None and np.isfinite(float(ess_ratio)) else 1.0
+    score = (
+        1.2 * min(max(outlier, 0.0), 1.0)
+        + 0.8 * min(max(gap, 0.0), 1.0)
+        + 0.4 * min(max(ac, 0.0), 1.0)
+        + 0.6 * min(max(1.0 - ess_ratio, 0.0), 1.0)
+    )
+    if score < 0.15:
+        return "clean"
+    if score < 0.40:
+        return "low"
+    if score < 0.75:
+        return "medium"
+    return "high"
+
+
+# Calibrated acceptance/shrink floors by residual noise band (Phase 7).
+# High noise: do NOT shrink diversity just because noisy candidate MSE is low —
+# require stronger clean-holdout evidence before accepting / shrinking search.
+_NOISE_BAND_THRESHOLDS = {
+    "clean": {"prediction_uncertain_entropy": 0.85, "candidate_acceptance_r2": 0.985, "candidate_shrink_r2": 0.95},
+    "low": {"prediction_uncertain_entropy": 0.80, "candidate_acceptance_r2": 0.975, "candidate_shrink_r2": 0.93},
+    "medium": {"prediction_uncertain_entropy": 0.72, "candidate_acceptance_r2": 0.96, "candidate_shrink_r2": 0.90},
+    "high": {"prediction_uncertain_entropy": 0.65, "candidate_acceptance_r2": 0.94, "candidate_shrink_r2": 0.86},
+}
+
+
+def _soft_mad_sample_weights(values, *, floor: float = 0.05, cap: float = 1.0):
+    """Huber-like soft weights from MAD of ``values`` (target or residual).
+
+    Points beyond ~2.5 MAD get weight decaying as 2.5*scale/|r|, floored at
+    ``floor``. Returns None when scale is undefined (no downweighting signal).
+    """
+    r = np.asarray(values, dtype=np.float64).reshape(-1)
+    if r.size < 8 or not np.any(np.isfinite(r)):
+        return None
+    finite = np.isfinite(r)
+    r_f = r[finite]
+    med = float(np.median(r_f))
+    centered = r_f - med
+    mad = float(np.median(np.abs(centered)))
+    scale = 1.4826 * mad if mad > 1e-15 else float(np.std(centered))
+    if not np.isfinite(scale) or scale < 1e-12:
+        return None
+    thr = 2.5 * scale
+    w = np.ones(r.shape[0], dtype=np.float64)
+    abs_c = np.abs(r - med)
+    heavy = finite & (abs_c > thr)
+    if not np.any(heavy):
+        # Still return uniform-ish weights only when some mass is heavy-tailed.
+        out_frac = float(np.mean(np.abs(centered) > 3.0 * scale))
+        if out_frac < 0.02:
+            return None
+    w[heavy] = np.clip(thr / np.maximum(abs_c[heavy], 1e-12), float(floor), float(cap))
+    mean_w = float(np.mean(w[finite]))
+    if mean_w > 1e-12:
+        w = w / mean_w
+    return w
+
+
 def _slice_sample_weight(sample_weight, indices=None, n_targets=None):
     """Slice or validate per-point weights for a subset of rows.
 
@@ -700,6 +800,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         blackbox_standardize=True,
         blackbox_interaction_search=True,
         blackbox_min_features_to_select=5,
+        # Phase C: gated noise-robust blackbox search (auto|True|False).
+        # auto = soft residual/y weights + optional huber when blackbox is noisy
+        # or selection-uncertain; never overrides user-provided sample_weight.
+        blackbox_noise_robust="auto",
         enable_specialist_screening_diagnostics=True,
         enable_specialist_composition_screening=True,
         enable_residual_stage=True,
@@ -779,6 +883,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.blackbox_standardize = blackbox_standardize
         self.blackbox_interaction_search = blackbox_interaction_search
         self.blackbox_min_features_to_select = blackbox_min_features_to_select
+        mode = blackbox_noise_robust
+        if isinstance(mode, bool):
+            self.blackbox_noise_robust = mode
+        else:
+            text = str(mode or "auto").strip().lower()
+            if text in ("1", "true", "yes", "on"):
+                self.blackbox_noise_robust = True
+            elif text in ("0", "false", "no", "off"):
+                self.blackbox_noise_robust = False
+            else:
+                self.blackbox_noise_robust = "auto"
         self.enable_specialist_screening_diagnostics = enable_specialist_screening_diagnostics
         self.enable_specialist_composition_screening = enable_specialist_composition_screening
         self.enable_residual_stage = enable_residual_stage
@@ -893,6 +1008,18 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             elif uncertain_flag:
                 # Uncertain → give more time, but cap the escalation
                 score *= 1.2
+
+        # Phase 7: residual/weight noise pressure expands budget; never shrink on
+        # high residual noise just because current R² looks fine on noisy labels.
+        noise_diag = getattr(self, "_runtime_noise_diagnostics_", None)
+        if isinstance(noise_diag, dict):
+            band = str(noise_diag.get("noise_band") or "clean")
+            if band == "high":
+                score *= 1.35
+            elif band == "medium":
+                score *= 1.15
+            elif band == "low":
+                score *= 1.05
 
         # ── Proposer-specific budget scaling ──
         # If we have skeletons, we expect faster convergence.
@@ -3936,6 +4063,71 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "source": "engineered_basis",
         }
 
+    def _compute_runtime_noise_diagnostics(self, X=None, y=None, formula=None):
+        """Residual / weight diagnostics for noise-aware routing (Phase 7).
+
+        Uses incumbent formula residuals when available; otherwise target-only
+        proxies (weight ESS). Safe when inference fails — returns zeros.
+        """
+        diag = {
+            "residual_autocorr": 0.0,
+            "outlier_fraction": 0.0,
+            "validation_gap": 0.0,
+            "ess_ratio": 1.0,
+            "effective_sample_size": None,
+            "noise_band": "clean",
+            "n_samples": 0,
+        }
+        try:
+            n = 0
+            if y is not None:
+                n = int(np.asarray(y).reshape(-1).shape[0])
+            elif X is not None:
+                n = int(np.asarray(X).shape[0])
+            diag["n_samples"] = n
+            w = self._active_sample_weight(n_targets=n if n > 0 else None)
+            ess = _effective_sample_size(w) if w is not None else (float(n) if n else None)
+            diag["effective_sample_size"] = ess
+            if ess is not None and n > 0:
+                diag["ess_ratio"] = float(np.clip(ess / float(n), 0.0, 1.0))
+
+            text = str(formula or getattr(self, "formula_", "") or "").strip()
+            if X is not None and y is not None and text:
+                X_arr = np.asarray(X, dtype=np.float64)
+                y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+                try:
+                    pred = self._safe_eval_formula_array(text, X_arr)
+                    pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+                except Exception:
+                    pred = None
+                if pred is not None and pred.shape == y_arr.shape and np.all(np.isfinite(pred)):
+                    resid = pred - y_arr
+                    diag["residual_autocorr"] = _residual_lag1_autocorr(resid)
+                    diag["outlier_fraction"] = _estimate_outlier_fraction(resid, w)
+                    # Holdout generalization gap (unweighted display contract).
+                    try:
+                        split = self._domain_edge_validation_split(X_arr, y_arr, validation_fraction=0.2)
+                    except Exception:
+                        split = None
+                    if split is not None:
+                        try:
+                            p_fit = self._safe_eval_formula_array(text, split["X_fit"])
+                            p_val = self._safe_eval_formula_array(text, split["X_val"])
+                            fit_mse = float(np.mean((p_fit - split["y_fit"]) ** 2))
+                            val_mse = float(np.mean((p_val - split["y_val"]) ** 2))
+                            y_var = max(float(np.var(split["y_val"])), 1e-12)
+                            if np.isfinite(fit_mse) and np.isfinite(val_mse):
+                                diag["validation_gap"] = float(max(0.0, val_mse - fit_mse) / y_var)
+                        except Exception:
+                            pass
+            diag["noise_band"] = _noise_band_from_diagnostics(diag)
+        except Exception:
+            diag["noise_band"] = "clean"
+        self._runtime_noise_diagnostics_ = diag
+        if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+            self.blackbox_diagnostics_["runtime_noise"] = dict(diag)
+        return diag
+
     def _derive_blackbox_search_plan(
         self,
         blackbox_state,
@@ -3944,8 +4136,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         proposer_uncertainty=None,
         proposer_plan=None,
         candidate_screening=None,
+        noise_diagnostics=None,
     ):
-        """Heuristically scale breadth/depth for multivariate blackbox search."""
+        """Heuristically scale breadth/depth; calibrate thresholds by noise band."""
+        noise_diag = noise_diagnostics if isinstance(noise_diagnostics, dict) else (
+            getattr(self, "_runtime_noise_diagnostics_", None) or {}
+        )
+        noise_band = str(noise_diag.get("noise_band") or _noise_band_from_diagnostics(noise_diag) or "clean")
+        band_thr = dict(_NOISE_BAND_THRESHOLDS.get(noise_band, _NOISE_BAND_THRESHOLDS["clean"]))
         base_plan = {
             "uncertainty_score": 0.0,
             "selection_uncertainty": 0.0,
@@ -3959,12 +4157,20 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "seed_budget": 8,
             "screening_budget": 8,
             "basis_max_terms": 4,
-            "candidate_acceptance_r2": 0.985,
-            "candidate_shrink_r2": 0.95,
+            "candidate_acceptance_r2": band_thr["candidate_acceptance_r2"],
+            "candidate_shrink_r2": band_thr["candidate_shrink_r2"],
             "acceptable_complexity": 15,
             "early_stop_max_nodes": 50,
             "timeout_multiplier": 1.0,
             "focus": "balanced",
+            "noise_band": noise_band,
+            "prediction_uncertain_entropy": band_thr["prediction_uncertain_entropy"],
+            "noise_routing": {
+                "residual_autocorr": float(noise_diag.get("residual_autocorr") or 0.0),
+                "outlier_fraction": float(noise_diag.get("outlier_fraction") or 0.0),
+                "validation_gap": float(noise_diag.get("validation_gap") or 0.0),
+                "ess_ratio": float(noise_diag.get("ess_ratio") if noise_diag.get("ess_ratio") is not None else 1.0),
+            },
             "allowed_unary_ops": [],
             "multi_allowed_unary_ops": [],
             "binary_op_priors": [],
@@ -3973,6 +4179,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "multi_allowed_binary_ops": [],
         }
         if blackbox_state is None or not getattr(blackbox_state, "enabled", False):
+            # Still apply noise-band calibration for univariate / non-blackbox plans.
             return base_plan
 
         selected = list(getattr(blackbox_state, "selected_features", []) or [])
@@ -4042,46 +4249,82 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         elif proposer_uncertainty is not None:
             proposer_unc = float(np.clip(float(proposer_uncertainty), 0.0, 1.0))
 
+        # Phase 7: residual / weight geometry — expand budget on noisy residuals.
+        outlier_frac = float(np.clip(float(noise_diag.get("outlier_fraction") or 0.0), 0.0, 1.0))
+        val_gap = float(np.clip(float(noise_diag.get("validation_gap") or 0.0), 0.0, 1.0))
+        resid_ac = float(np.clip(abs(float(noise_diag.get("residual_autocorr") or 0.0)), 0.0, 1.0))
+        ess_ratio = noise_diag.get("ess_ratio")
+        ess_ratio = float(ess_ratio) if ess_ratio is not None and np.isfinite(float(ess_ratio)) else 1.0
+        ess_ratio = float(np.clip(ess_ratio, 0.0, 1.0))
+        noise_pressure = float(np.clip(
+            0.40 * outlier_frac + 0.30 * val_gap + 0.15 * resid_ac + 0.15 * (1.0 - ess_ratio),
+            0.0,
+            1.0,
+        ))
+
         uncertainty_score = float(np.clip(
-            0.36 * selection_uncertainty
-            + 0.22 * interaction_pressure
-            + 0.18 * fast_uncertainty
-            + 0.12 * proposer_unc
-            + 0.12 * (1.0 - candidate_strength),
+            0.28 * selection_uncertainty
+            + 0.18 * interaction_pressure
+            + 0.14 * fast_uncertainty
+            + 0.10 * proposer_unc
+            + 0.10 * (1.0 - candidate_strength)
+            + 0.20 * noise_pressure,
             0.0,
             1.0,
         ))
 
         breadth_multiplier = float(np.clip(
             1.0
-            + 0.95 * selection_uncertainty
-            + 0.25 * fast_uncertainty
-            + 0.18 * (1.0 - interaction_pressure)
-            + 0.20 * (1.0 - candidate_strength),
+            + 0.85 * selection_uncertainty
+            + 0.22 * fast_uncertainty
+            + 0.15 * (1.0 - interaction_pressure)
+            + 0.15 * (1.0 - candidate_strength)
+            + 0.45 * noise_pressure,
             0.75,
             3.5,
         ))
         depth_multiplier = float(np.clip(
             1.0
-            + 0.70 * interaction_pressure
-            + 0.25 * proposer_unc
-            + 0.20 * feature_span_pressure
-            + 0.20 * candidate_diversity
-            - 0.35 * candidate_strength,
+            + 0.60 * interaction_pressure
+            + 0.22 * proposer_unc
+            + 0.18 * feature_span_pressure
+            + 0.18 * candidate_diversity
+            + 0.35 * noise_pressure
+            - 0.25 * candidate_strength,
             0.75,
             4.0,
         ))
-        if uncertainty_score < 0.3:
+        # Do NOT shrink search just because noisy candidate MSE/R2 looks good under noise.
+        if noise_band in ("medium", "high") and candidate_strength >= 0.90:
+            depth_multiplier = max(depth_multiplier, 1.15)
+            breadth_multiplier = max(breadth_multiplier, 1.10)
+        if uncertainty_score < 0.3 and noise_band == "clean":
             breadth_multiplier *= 0.85
             depth_multiplier *= 0.9
-        elif uncertainty_score > 0.7:
-            breadth_multiplier *= 1.05
-            depth_multiplier *= 1.05
+        elif uncertainty_score > 0.7 or noise_band == "high":
+            breadth_multiplier *= 1.08
+            depth_multiplier *= 1.08
 
+        # Phase C: when blackbox is noisy and/or selection-uncertain, do not
+        # over-clamp Track-1 budget (literature: best-case recovery needs room).
+        hard_blackbox_caps = True
+        relax_blackbox_caps = (
+            getattr(blackbox_state, "enabled", False)
+            and (
+                noise_band in ("medium", "high")
+                or selection_uncertainty >= 0.70
+                or noise_pressure >= 0.35
+            )
+        )
         if getattr(blackbox_state, "enabled", False):
             # For blackbox Track 1, spend uncertainty budget on screening first.
-            breadth_multiplier = min(breadth_multiplier, 2.25)
-            depth_multiplier = min(depth_multiplier, 2.5)
+            if relax_blackbox_caps:
+                breadth_multiplier = min(breadth_multiplier, 2.75)
+                depth_multiplier = min(depth_multiplier, 3.0)
+                hard_blackbox_caps = False
+            else:
+                breadth_multiplier = min(breadth_multiplier, 2.25)
+                depth_multiplier = min(depth_multiplier, 2.5)
 
         generation_multiplier = float(np.clip(depth_multiplier, 0.75, 4.0))
         population_multiplier = float(np.clip(breadth_multiplier, 0.75, 3.5))
@@ -4100,23 +4343,37 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             2,
             8,
         ))
+        # Calibrate accept/shrink per noise band; interaction still softens slightly.
+        band_accept = float(band_thr["candidate_acceptance_r2"])
+        band_shrink = float(band_thr["candidate_shrink_r2"])
         candidate_acceptance_r2 = float(np.clip(
-            0.985 - 0.03 * interaction_pressure - 0.01 * candidate_diversity,
-            0.93,
+            band_accept - 0.02 * interaction_pressure - 0.01 * candidate_diversity,
+            0.90,
             0.985,
         ))
         candidate_shrink_r2 = float(np.clip(
-            candidate_acceptance_r2 - 0.04,
-            0.88,
+            min(band_shrink, candidate_acceptance_r2 - 0.03),
+            0.84,
             0.96,
         ))
+        # High residual noise: raise bar to accept / shrink (avoid false confidence).
+        if noise_band == "high":
+            candidate_acceptance_r2 = max(candidate_acceptance_r2, 0.94)
+            candidate_shrink_r2 = min(candidate_shrink_r2, candidate_acceptance_r2 - 0.05)
 
         if getattr(blackbox_state, "enabled", False):
-            generation_multiplier = float(np.clip(generation_multiplier, 0.75, 2.0))
-            population_multiplier = float(np.clip(population_multiplier, 0.80, 1.85))
-            seed_budget = int(np.clip(seed_budget, 6, 14))
-            screening_budget = int(np.clip(screening_budget, 8, 24))
-            basis_max_terms = int(np.clip(basis_max_terms, 3, 6))
+            if hard_blackbox_caps:
+                generation_multiplier = float(np.clip(generation_multiplier, 0.75, 2.0))
+                population_multiplier = float(np.clip(population_multiplier, 0.80, 1.85))
+                seed_budget = int(np.clip(seed_budget, 6, 14))
+                screening_budget = int(np.clip(screening_budget, 8, 24))
+                basis_max_terms = int(np.clip(basis_max_terms, 3, 6))
+            else:
+                generation_multiplier = float(np.clip(generation_multiplier, 0.75, 2.75))
+                population_multiplier = float(np.clip(population_multiplier, 0.80, 2.25))
+                seed_budget = int(np.clip(seed_budget, 6, 18))
+                screening_budget = int(np.clip(screening_budget, 8, 28))
+                basis_max_terms = int(np.clip(basis_max_terms, 3, 7))
 
         acceptable_complexity = int(np.clip(
             round(15 + 5 * uncertainty_score + 3 * interaction_pressure + 2 * feature_span_pressure + 2 * candidate_diversity),
@@ -4135,9 +4392,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         ))
 
         if getattr(blackbox_state, "enabled", False):
-            acceptable_complexity = int(np.clip(acceptable_complexity, 10, 32))
-            early_stop_max_nodes = int(np.clip(early_stop_max_nodes, 16, 64))
-            timeout_multiplier = float(np.clip(timeout_multiplier, 0.75, 1.0))
+            if hard_blackbox_caps:
+                acceptable_complexity = int(np.clip(acceptable_complexity, 10, 32))
+                early_stop_max_nodes = int(np.clip(early_stop_max_nodes, 16, 64))
+                timeout_multiplier = float(np.clip(timeout_multiplier, 0.75, 1.0))
+            else:
+                acceptable_complexity = int(np.clip(acceptable_complexity, 10, 48))
+                early_stop_max_nodes = int(np.clip(early_stop_max_nodes, 16, 80))
+                timeout_multiplier = float(np.clip(timeout_multiplier, 0.75, 1.45))
 
         focus = "balanced"
         if candidate_strength >= candidate_acceptance_r2:
@@ -4162,6 +4424,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "interaction_pressure": interaction_pressure,
             "candidate_strength": candidate_strength,
             "candidate_diversity": candidate_diversity,
+            "noise_pressure": noise_pressure,
+            "noise_band": noise_band,
+            "prediction_uncertain_entropy": band_thr["prediction_uncertain_entropy"],
+            "noise_routing": {
+                "residual_autocorr": resid_ac,
+                "outlier_fraction": outlier_frac,
+                "validation_gap": val_gap,
+                "ess_ratio": ess_ratio,
+            },
             "breadth_multiplier": breadth_multiplier,
             "depth_multiplier": depth_multiplier,
             "generation_multiplier": generation_multiplier,
@@ -5116,7 +5387,73 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             standardize=bool(self.blackbox_standardize),
             min_features_to_select=int(self.blackbox_min_features_to_select),
             interaction_search=bool(self.blackbox_interaction_search),
+            sample_weight=self.sample_weight_ if self.sample_weight_provided_ else None,
         )
+        # Phase C: gated soft MAD weights for blackbox multi-feature when user
+        # did not supply weights. May re-run ranking with weights so selection
+        # sees the same objective as evolution.
+        self._blackbox_noise_robust_applied_ = {
+            "active": False,
+            "mode": getattr(self, "blackbox_noise_robust", "auto"),
+            "reason": "not_applied",
+        }
+        robust_mode = getattr(self, "blackbox_noise_robust", "auto")
+        want_robust = robust_mode is True or (
+            robust_mode == "auto"
+            and blackbox_enabled
+            and getattr(blackbox_state, "enabled", False)
+            and int(X.shape[1]) > 1
+            and not self.sample_weight_provided_
+        )
+        if want_robust:
+            soft_w = _soft_mad_sample_weights(y)
+            selection_uncertain = bool(getattr(blackbox_state, "feature_selection_uncertain", False))
+            out_frac = _estimate_outlier_fraction(y - float(np.median(np.asarray(y, dtype=np.float64).reshape(-1))))
+            activate = soft_w is not None and (
+                robust_mode is True
+                or selection_uncertain
+                or out_frac >= 0.02
+                or str(getattr(blackbox_state, "reason", "")).startswith("retained_all_features")
+            )
+            if activate and soft_w is not None:
+                self.sample_weight_ = _validate_sample_weight(soft_w, X.shape[0])
+                self.sample_weight_provided_ = self.sample_weight_ is not None
+                # Prefer huber search loss when we auto-soft-weight blackbox noise
+                # but only if user left default mse.
+                loss_switched = False
+                if str(getattr(self, "loss_mode", "mse") or "mse") == "mse":
+                    self.loss_mode = "huber"
+                    loss_switched = True
+                X_search, y_search, blackbox_state = prepare_blackbox_search(
+                    X,
+                    y,
+                    enabled=blackbox_enabled,
+                    max_features=int(self.blackbox_max_features),
+                    standardize=bool(self.blackbox_standardize),
+                    min_features_to_select=int(self.blackbox_min_features_to_select),
+                    interaction_search=bool(self.blackbox_interaction_search),
+                    sample_weight=self.sample_weight_,
+                )
+                self._blackbox_noise_robust_applied_ = {
+                    "active": True,
+                    "mode": robust_mode,
+                    "reason": "soft_mad_weights",
+                    "outlier_fraction_target": float(out_frac),
+                    "selection_uncertain": selection_uncertain,
+                    "loss_mode_switched_to_huber": loss_switched,
+                    "ess_ratio": (
+                        float(_effective_sample_size(self.sample_weight_) / max(float(X.shape[0]), 1.0))
+                        if self.sample_weight_ is not None
+                        else None
+                    ),
+                }
+            else:
+                self._blackbox_noise_robust_applied_ = {
+                    "active": False,
+                    "mode": robust_mode,
+                    "reason": "no_heavy_tail_signal",
+                    "outlier_fraction_target": float(out_frac),
+                }
         feature_selection_fallback = None
         if (
             blackbox_enabled
@@ -5175,6 +5512,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     "min_weight": float(np.min(self.sample_weight_)),
                     "max_weight": float(np.max(self.sample_weight_)),
                     "mean_weight": float(np.mean(self.sample_weight_)),
+                    "source": (
+                        "auto_soft_mad"
+                        if (getattr(self, "_blackbox_noise_robust_applied_", {}) or {}).get("active")
+                        else "user"
+                    ),
                 }
             else:
                 self.blackbox_diagnostics_["sample_weight"] = {"provided": False}
@@ -5185,6 +5527,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 "applied_to": "search_scoring_and_evolution",
                 "display_mse_unweighted": True,
             }
+            self.blackbox_diagnostics_["blackbox_noise_robust"] = dict(
+                getattr(self, "_blackbox_noise_robust_applied_", {}) or {}
+            )
         if isinstance(self.blackbox_diagnostics_, dict) and feature_selection_fallback is not None:
             self.blackbox_diagnostics_["feature_selection_fallback"] = feature_selection_fallback
         self.blackbox_search_plan_ = {}
@@ -5497,16 +5842,37 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         proposer_plan = proposer_payload.get("search_plan", {})
         if not isinstance(proposer_plan, dict):
             proposer_plan = {}
+        # Phase 7: residual/weight diagnostics before routing so plan thresholds adapt.
+        noise_diag = self._compute_runtime_noise_diagnostics(
+            X, y, formula=best_formula
+        )
+        # Calibrate prediction_uncertain flag using noise-band entropy floor.
+        if isinstance(_fp_uncertainty, dict):
+            band = str(noise_diag.get("noise_band") or "clean")
+            thr = float(_NOISE_BAND_THRESHOLDS.get(band, _NOISE_BAND_THRESHOLDS["clean"])[
+                "prediction_uncertain_entropy"
+            ])
+            ent = _fp_uncertainty.get("prediction_entropy")
+            try:
+                ent_f = float(ent) if ent is not None else None
+            except Exception:
+                ent_f = None
+            if ent_f is not None and np.isfinite(ent_f) and ent_f >= thr:
+                _fp_uncertainty = dict(_fp_uncertainty)
+                _fp_uncertainty["prediction_uncertain"] = True
+                _fp_uncertainty["prediction_uncertain_reason"] = f"noise_band_{band}_entropy"
         blackbox_search_plan = self._derive_blackbox_search_plan(
             getattr(self, "blackbox_state_", None),
             fast_path_uncertainty=_fp_uncertainty,
             proposer_uncertainty=proposer_payload.get("sequence_uncertainty", {}),
             proposer_plan=proposer_plan,
             candidate_screening=candidate_screening,
+            noise_diagnostics=noise_diag,
         )
         self.blackbox_search_plan_ = blackbox_search_plan
         if isinstance(self.blackbox_diagnostics_, dict):
             self.blackbox_diagnostics_["search_plan"] = blackbox_search_plan
+            self.blackbox_diagnostics_["runtime_noise"] = dict(noise_diag)
 
         candidate_formulas = None
         if blackbox_state is not None and blackbox_state.enabled:
@@ -6332,6 +6698,28 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     best_formula,
                     self.blackbox_state_,
                 )
+                # Phase C: re-score remapped formula on original-space holdout
+                # so scaled-space false confidence cannot lock the winner.
+                try:
+                    holdout_n = int(max(8, round(len(y_original) * 0.20)))
+                    holdout_n = min(holdout_n, max(0, len(y_original) - 16))
+                    if holdout_n >= 8:
+                        X_val = X_original[-holdout_n:]
+                        y_val = np.asarray(y_original[-holdout_n:], dtype=np.float64).reshape(-1)
+                        pred_val = self._safe_eval_formula_array(best_formula, X_val)
+                        holdout_mse = float(np.mean((np.asarray(pred_val, dtype=np.float64).reshape(-1) - y_val) ** 2))
+                        y_var_h = max(float(np.var(y_val)), 1e-12)
+                        holdout_r2 = float(1.0 - holdout_mse / y_var_h) if np.isfinite(holdout_mse) else None
+                        if isinstance(self.blackbox_diagnostics_, dict):
+                            self.blackbox_diagnostics_["original_space_holdout"] = {
+                                "n": int(holdout_n),
+                                "mse": holdout_mse if np.isfinite(holdout_mse) else None,
+                                "r2": holdout_r2,
+                            }
+                        if np.isfinite(holdout_mse):
+                            best_mse = holdout_mse
+                except Exception:
+                    pass
                 original_linear = getattr(self, "_blackbox_original_linear_fallback", None)
                 if isinstance(original_linear, dict) and original_linear.get("formula"):
                     holdout_n = int(max(8, round(len(y_original) * 0.25)))
