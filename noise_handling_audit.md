@@ -165,3 +165,33 @@ Pareto weight threading, full multi-seed baseline run on real estimator,
   specialist probe paths pass weights.
 - Extension rebuilt: `glassbox/sr/cpp/_core.cpython-314-x86_64-linux-gnu.so`.
 - Next: Phase 3 weighted native evolution.
+
+---
+
+## Phase 3 completed (weighted native evolution)
+
+- C++ `run_evolution(..., y_weights=None)`: weights stored on `EvolutionEngine`,
+  threaded to island workers.
+- `evaluate_fitness_with_penalty`: `raw_mse` unweighted; `weighted_mse` +
+  fitness/early-stop use weighted objective when weights present.
+- Weighted ridge in `solve_output_weights` and `DifferentialGramian`; residual
+  MSE helpers used for Adam/LM/snap/cleanup accept paths.
+- Result dict: `best_mse` (unweighted, back-compat), `best_weighted_mse`,
+  `weighted` flag; Pareto entries expose `weighted_mse`.
+- Python: `GlassboxRegressor` fit-time `sample_weight_` → guided + raw C++
+  evolution; `beam_search_evolution` / `run_guided_evolution` accept `y_weights`.
+- Tests: `glassbox/sr/test_cpp_parity.py` weighted uniform / outlier / bad length.
+- Next: Phase 6 cleanup/residual guards (or Phase 4 robust loss per order).
+
+---
+
+## Phase 4 completed (robust loss modes)
+
+- Python: `_robust_loss` / `_mad_scale` with modes `mse|huber|trimmed_mse|student_t`.
+- `GlassboxRegressor(loss_mode=..., huber_delta=..., trim_fraction=...)` default `mse`.
+- Search paths: `_formula_mse`, `_score_formula_candidate` use robust loss; display MSE plain.
+- C++: `run_evolution(..., loss_mode, huber_delta, trim_fraction)`; residual path applies
+  Huber / trimmed / student-t; `raw_mse` still plain MSE; `search_loss` = objective.
+- Wiring: sklearn + guided beam pass loss kwargs (TypeError fallback).
+- Tests: `tests/test_robust_loss.py` + C++ parity huber/trimmed smoke.
+- Next: Phase 6 cleanup/residual guards (plan order), then Phase 5 units.

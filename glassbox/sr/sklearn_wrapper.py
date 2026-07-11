@@ -179,6 +179,125 @@ def _slice_sample_weight(sample_weight, indices=None, n_targets=None):
     return w
 
 
+# Phase 4: robust search losses (display MSE stays plain unweighted MSE).
+_VALID_LOSS_MODES = ("mse", "huber", "trimmed_mse", "student_t")
+
+
+def _validate_loss_mode(loss_mode):
+    mode = str(loss_mode or "mse").strip().lower()
+    if mode not in _VALID_LOSS_MODES:
+        raise ValueError(
+            f"loss_mode must be one of {_VALID_LOSS_MODES}, got {loss_mode!r}"
+        )
+    return mode
+
+
+def _mad_scale(resid, sample_weight=None):
+    """Robust residual scale via MAD (≈ σ for Gaussian). Floor avoids zero delta."""
+    r = np.asarray(resid, dtype=np.float64).reshape(-1)
+    if r.size == 0 or not np.any(np.isfinite(r)):
+        return 1.0
+    r = r[np.isfinite(r)]
+    if sample_weight is not None:
+        w = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+        if w.shape == r.shape and float(np.sum(w)) > 0:
+            # Weighted median via sort + cumulative weights
+            order = np.argsort(r)
+            rs, ws = r[order], w[order]
+            c = np.cumsum(ws)
+            mid = 0.5 * float(c[-1])
+            med = float(rs[int(np.searchsorted(c, mid))])
+            abs_dev = np.abs(rs - med)
+            order2 = np.argsort(abs_dev)
+            c2 = np.cumsum(ws[order2])
+            mad = float(abs_dev[order2][int(np.searchsorted(c2, mid))])
+        else:
+            med = float(np.median(r))
+            mad = float(np.median(np.abs(r - med)))
+    else:
+        med = float(np.median(r))
+        mad = float(np.median(np.abs(r - med)))
+    scale = 1.4826 * mad
+    if not np.isfinite(scale) or scale < 1e-12:
+        # Fall back to std / absolute level
+        s = float(np.std(r))
+        if np.isfinite(s) and s > 1e-12:
+            return s
+        a = float(np.mean(np.abs(r)))
+        return a if a > 1e-12 else 1.0
+    return scale
+
+
+def _robust_loss(pred, target, loss_mode="mse", sample_weight=None, *, delta=None, trim_fraction=0.1):
+    """Search-objective loss; MSE when mode is mse. Not for display metrics.
+
+    Modes:
+      - mse: weighted/unweighted mean squared residual
+      - huber: smooth L1 outside ``delta`` (default = MAD scale)
+      - trimmed_mse: drop largest ``trim_fraction`` of squared residuals
+      - student_t: log(1 + (r/s)^2) with s = MAD scale (heavy-tail)
+    """
+    mode = _validate_loss_mode(loss_mode)
+    pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+    target = np.asarray(target, dtype=np.float64).reshape(-1)
+    if pred.shape != target.shape:
+        return float("inf")
+    resid = pred - target
+    if not np.all(np.isfinite(resid)):
+        return float("inf")
+    w = None
+    if sample_weight is not None:
+        w = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+        if w.shape != target.shape:
+            raise ValueError(
+                f"sample_weight length {w.shape[0]} does not match target length {target.shape[0]}"
+            )
+        total = float(np.sum(w))
+        if not np.isfinite(total) or total <= 0:
+            raise ValueError("sample_weight must have positive total weight")
+    if mode == "mse":
+        return _weighted_mse(pred, target, w)
+
+    abs_r = np.abs(resid)
+    if mode == "huber":
+        scale = float(delta) if delta is not None and float(delta) > 0 else _mad_scale(resid, w)
+        # Standard Huber: 0.5 r^2 if |r|<=d else d*(|r|-0.5 d)
+        d = max(float(scale), 1e-12)
+        quad = 0.5 * resid * resid
+        lin = d * (abs_r - 0.5 * d)
+        loss = np.where(abs_r <= d, quad, lin)
+        if w is None:
+            return float(np.mean(loss))
+        return float(np.sum(w * loss) / float(np.sum(w)))
+
+    if mode == "trimmed_mse":
+        sq = resid * resid
+        frac = float(trim_fraction)
+        frac = min(max(frac, 0.0), 0.45)
+        n = int(sq.size)
+        keep = max(1, int(round(n * (1.0 - frac))))
+        if w is None:
+            order = np.argsort(sq)
+            return float(np.mean(sq[order[:keep]]))
+        # Soft trim: zero the largest residuals by weight mass
+        order = np.argsort(sq)
+        kept_idx = order[:keep]
+        ww = w[kept_idx]
+        total = float(np.sum(ww))
+        if total <= 0:
+            return float("inf")
+        return float(np.sum(ww * sq[kept_idx]) / total)
+
+    # student_t
+    s = float(delta) if delta is not None and float(delta) > 0 else _mad_scale(resid, w)
+    s = max(s, 1e-12)
+    z2 = (resid / s) ** 2
+    loss = np.log1p(z2)
+    if w is None:
+        return float(np.mean(loss))
+    return float(np.sum(w * loss) / float(np.sum(w)))
+
+
 # Path setup
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _SCRIPTS_DIR = _REPO_ROOT / 'scripts'
@@ -265,11 +384,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         exact_match_max_combos=50_000,
         skip_evolution_if_bloated=False,
         bloat_term_threshold=20,
+        loss_mode="mse",
+        huber_delta=None,
+        trim_fraction=0.1,
     ):
         self.population_size = population_size
         self.generations = generations
         self.early_stop_mse = early_stop_mse
         self.random_state = random_state
+        self.loss_mode = _validate_loss_mode(loss_mode)
+        self.huber_delta = huber_delta
+        self.trim_fraction = float(trim_fraction)
         self.p_min = p_min
         self.p_max = p_max
         self.use_nsga2 = use_nsga2
@@ -902,8 +1027,16 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 else (0.0 if val_var_w < 1e-15 else 1.0 - weighted_val_mse / val_var_w)
             )
 
-        fit_mse = weighted_fit_mse if weighted_fit_mse is not None else unweighted_fit_mse
-        val_mse = weighted_val_mse if weighted_val_mse is not None else unweighted_val_mse
+        # Search objective may use robust loss (Phase 4); keep plain MSE diagnostics.
+        loss_kw = self._search_loss_kwargs()
+        search_fit = _robust_loss(fit_pred, t_fit, sample_weight=wf, **loss_kw)
+        search_val = _robust_loss(val_pred, t_val, sample_weight=wv, **loss_kw)
+        if not np.isfinite(search_fit) or not np.isfinite(search_val):
+            return None
+
+        fit_mse = float(search_fit)
+        val_mse = float(search_val)
+        # R² stays unweighted/weighted MSE-based for interpretability
         val_r2 = weighted_r2 if weighted_r2 is not None else unweighted_r2
 
         complexity = max(
@@ -939,6 +1072,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "weighted_validation_mse": weighted_val_mse,
             "weighted_r2": None if weighted_r2 is None else float(weighted_r2),
             "weighted": bool(wf is not None or wv is not None),
+            "loss_mode": str(loss_kw.get("loss_mode", "mse")),
+            "search_fit_loss": fit_mse,
+            "search_validation_loss": val_mse,
             "scale": scale,
             "bias": bias,
             "complexity": complexity,
@@ -1384,9 +1520,18 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return None
         return _slice_sample_weight(stored, indices=indices, n_targets=n_targets)
 
-    def _formula_mse(self, formula, X, y, sample_weight=None, sample_weight_indices=None):
-        """Evaluate a formula directly on data and return MSE, or inf on failure.
+    def _search_loss_kwargs(self):
+        """Kwargs for robust search loss (Phase 4). Display path ignores these."""
+        return {
+            "loss_mode": getattr(self, "loss_mode", "mse") or "mse",
+            "delta": getattr(self, "huber_delta", None),
+            "trim_fraction": float(getattr(self, "trim_fraction", 0.1) or 0.1),
+        }
 
+    def _formula_mse(self, formula, X, y, sample_weight=None, sample_weight_indices=None):
+        """Evaluate a formula for *search* scoring (robust loss when configured).
+
+        Display / benchmark metrics use ``_display_formula_mse`` (plain MSE).
         When fit-time weights are active, they are applied if lengths match.
         If ``sample_weight_indices`` is provided, fit-time weights are sliced to
         those rows (for holdout/subset scoring). Length mismatches raise.
@@ -1413,8 +1558,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             raise ValueError(
                 f"sample_weight length {w.shape[0]} does not match target length {target.shape[0]}"
             )
-        mse = _weighted_mse(pred, target, w)
-        return mse if np.isfinite(mse) else float("inf")
+        loss = _robust_loss(pred, target, sample_weight=w, **self._search_loss_kwargs())
+        return loss if np.isfinite(loss) else float("inf")
 
     def _display_formula_mse(self, formula, X, y):
         """Evaluate a formula with the shared benchmark/display evaluator."""
@@ -4291,6 +4436,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 }
             else:
                 self.blackbox_diagnostics_["sample_weight"] = {"provided": False}
+            self.blackbox_diagnostics_["loss_mode"] = {
+                "mode": str(getattr(self, "loss_mode", "mse") or "mse"),
+                "huber_delta": getattr(self, "huber_delta", None),
+                "trim_fraction": float(getattr(self, "trim_fraction", 0.1) or 0.1),
+                "applied_to": "search_scoring_and_evolution",
+                "display_mse_unweighted": True,
+            }
         if isinstance(self.blackbox_diagnostics_, dict) and feature_selection_fallback is not None:
             self.blackbox_diagnostics_["feature_selection_fallback"] = feature_selection_fallback
         self.blackbox_search_plan_ = {}
@@ -4979,15 +5131,41 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 int(guided_search_plan.get("timeout_seconds", guided_remaining) or guided_remaining),
                                 guided_remaining,
                             )
-                            guided_result = run_guided_evolution(
-                                x_t, y_t, hints,
+                            guided_kw = dict(
                                 generations=guided_generations,
                                 population_size=guided_population,
                                 device=self.device or "cpu",
                                 candidate_formulas=candidate_formulas,
-                                confidence=confidence,  # New parameter
+                                confidence=confidence,
                                 search_plan=guided_search_plan,
                             )
+                            if (
+                                getattr(self, "sample_weight_provided_", False)
+                                and getattr(self, "sample_weight_", None) is not None
+                            ):
+                                guided_kw["y_weights"] = np.ascontiguousarray(
+                                    self.sample_weight_, dtype=np.float64
+                                )
+                            mode = str(getattr(self, "loss_mode", "mse") or "mse")
+                            if mode != "mse":
+                                guided_kw["loss_mode"] = mode
+                                if getattr(self, "huber_delta", None) is not None:
+                                    guided_kw["huber_delta"] = float(self.huber_delta)
+                                guided_kw["trim_fraction"] = float(
+                                    getattr(self, "trim_fraction", 0.1) or 0.1
+                                )
+                            try:
+                                guided_result = run_guided_evolution(
+                                    x_t, y_t, hints, **guided_kw
+                                )
+                            except TypeError:
+                                guided_kw.pop("y_weights", None)
+                                guided_kw.pop("loss_mode", None)
+                                guided_kw.pop("huber_delta", None)
+                                guided_kw.pop("trim_fraction", None)
+                                guided_result = run_guided_evolution(
+                                    x_t, y_t, hints, **guided_kw
+                                )
 
                             if guided_result and guided_result.get('formula'):
                                 evo_formula = guided_result['formula']
@@ -5129,7 +5307,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 except Exception:
                                     seed_graphs_py = []
 
-                            result = _core.run_evolution(
+                            evo_kwargs = dict(
                                 X_list=X_list,
                                 y=y_arr,
                                 pop_size=_clamp_int(
@@ -5178,6 +5356,31 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 multi_allowed_binary_ops=blackbox_search_plan.get("multi_allowed_binary_ops", []),
                                 seed_graphs_py=seed_graphs_py,
                             )
+                            if (
+                                getattr(self, "sample_weight_provided_", False)
+                                and getattr(self, "sample_weight_", None) is not None
+                            ):
+                                evo_w = np.ascontiguousarray(
+                                    self.sample_weight_, dtype=np.float64
+                                )
+                                if evo_w.shape[0] == y_arr.shape[0]:
+                                    evo_kwargs["y_weights"] = evo_w
+                            mode = str(getattr(self, "loss_mode", "mse") or "mse")
+                            if mode != "mse":
+                                evo_kwargs["loss_mode"] = mode
+                                if getattr(self, "huber_delta", None) is not None:
+                                    evo_kwargs["huber_delta"] = float(self.huber_delta)
+                                evo_kwargs["trim_fraction"] = float(
+                                    getattr(self, "trim_fraction", 0.1) or 0.1
+                                )
+                            try:
+                                result = _core.run_evolution(**evo_kwargs)
+                            except TypeError:
+                                evo_kwargs.pop("y_weights", None)
+                                evo_kwargs.pop("loss_mode", None)
+                                evo_kwargs.pop("huber_delta", None)
+                                evo_kwargs.pop("trim_fraction", None)
+                                result = _core.run_evolution(**evo_kwargs)
 
                             raw_mse = result.get('best_mse', float('inf'))
                             raw_formula = result.get('formula', '')

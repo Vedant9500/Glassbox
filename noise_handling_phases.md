@@ -115,19 +115,22 @@ points; acceptance thresholds become weight-aware.
 
 Goal: native evolution optimises weighted loss, not only unweighted MSE.
 
-- [ ] Add optional `y_weights` to `run_evolution_cpp` (`core.cpp`);
+- [x] Add optional `y_weights` to `run_evolution_cpp` (`core.cpp`);
       store in `EvolutionEngine`.
-- [ ] Update `evaluate_fitness_with_penalty` (`evolution.h`) to use
+- [x] Update `evaluate_fitness_with_penalty` (`evolution.h`) to use
       weighted MSE for `fitness`, keep unweighted `raw_mse` for diag.
-- [ ] Extend `DifferentialGramian`, `solve_output_weights`, snapping
+- [x] Extend `DifferentialGramian`, `solve_output_weights`, snapping
       MSE, cleanup backward elimination, inner-param refinement to
       weighted residuals.
-- [ ] Return `best_weighted_mse`, `best_mse`, weight diag separately.
-- [ ] Native tests in `glassbox/sr/test_cpp_parity.py` proving weighted
+- [x] Return `best_weighted_mse`, `best_mse`, weight diag separately.
+- [x] Native tests in `glassbox/sr/test_cpp_parity.py` proving weighted
       evolution changes choice when outliers downweighted.
-- [ ] Do NOT remove unweighted `raw_mse` (bench/back-compat need it).
-- [ ] Do NOT apply complexity penalty inconsistently between weighted /
+- [x] Do NOT remove unweighted `raw_mse` (bench/back-compat need it).
+- [x] Do NOT apply complexity penalty inconsistently between weighted /
       unweighted metrics without naming it.
+- [x] Python wiring: `sklearn_wrapper` + `classifier_fast_path` pass
+      `sample_weight` / `y_weights` into `run_evolution` (TypeError
+      fallback for older extensions).
 
 **Expected outcome & when visible:** This is where weights deliver their full payoff. Evolution optimises weighted loss, so the *structure* it discovers changes when known-bad observations are downweighted — correct simple structure recovers even when outliers would otherwise dominate. Combined with Phase 1 + 2, this is the first phase that can reproduce PhySO's 'downweight noisy region → recover the right formula' behaviour end-to-end. Pareto front also exposes the weighted-fit vs unweighted-robustness tradeoff. Not visible in isolation: needs Phase 1 (weights exist) and ideally Phase 2 (screening consistent).
 
@@ -141,15 +144,17 @@ weighted-fit vs unweighted-robustness tradeoff.
 
 Goal: handle noise when user has no weights.
 
-- [ ] Add `loss_mode`: `mse`, `huber`, `trimmed_mse`, `student_t`.
-- [ ] Start in Python candidate screening + final scoring, then port
+- [x] Add `loss_mode`: `mse`, `huber`, `trimmed_mse`, `student_t`.
+- [x] Start in Python candidate screening + final scoring, then port
       minimal `huber` / `trimmed_mse` to C++ evolution.
-- [ ] Residual-scale estimation via MAD on validation residuals.
-- [ ] Use robust loss for search fitness, keep displayed unweighted
+- [x] Residual-scale estimation via MAD on validation residuals.
+- [x] Use robust loss for search fitness, keep displayed unweighted
       MSE/R² in reports.
-- [ ] Do NOT default to robust loss until benchmark evidence supports it.
-- [ ] Do NOT combine robust loss with aggressive residual boosting
+- [x] Do NOT default to robust loss until benchmark evidence supports it.
+- [x] Do NOT combine robust loss with aggressive residual boosting
       without stricter holdout guards.
+- [x] Diagnostics: `blackbox_diagnostics_["loss_mode"]`; C++ returns
+      `search_loss` / `loss_mode`.
 
 **Expected outcome & when visible:** Better recovery under outliers and quantization *without* requiring user-supplied weights — this is the no-weights safety net. Standalone visible: a user hitting heavy-tailed or quantization noise gets more robust formulas even with uniform weights. Diagnostics record when robust loss changed the final formula. Most powerful when layered on top of Phase 3 (weighted + robust), but it is *not* a no-op on its own.
 

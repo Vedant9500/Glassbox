@@ -28,6 +28,14 @@
 
 namespace sr {
 
+// Phase 4 robust search losses (display / best_mse stay plain MSE).
+enum class LossMode {
+    Mse = 0,
+    Huber = 1,
+    TrimmedMse = 2,
+    StudentT = 3,
+};
+
 // Configuration for evolution
 struct EvolutionConfig {
     int pop_size = 50;
@@ -42,6 +50,11 @@ struct EvolutionConfig {
     double p_min = -2.0, p_max = 3.0;
     double omega_min = -8.0, omega_max = 8.0;
     int max_nodes = 24;  // Hard structural bloat cap for mutation/crossover
+
+    // Phase 4: search fitness loss (default mse = legacy behaviour)
+    LossMode loss_mode = LossMode::Mse;
+    double huber_delta = -1.0;      // <=0 => MAD scale from residuals
+    double trim_fraction = 0.1;     // fraction of largest residuals dropped
     
     bool use_early_stop = true;
     double early_stop_mse = 1e-6;
@@ -122,9 +135,12 @@ struct EvolutionConfig {
 class DifferentialGramian {
 private:
     Eigen::MatrixXd A_; // Full design matrix: n_samples x (n_features + 1)
-    Eigen::MatrixXd G_; // A^T A : size (F+1) x (F+1)
-    Eigen::VectorXd c_; // A^T y : size (F+1)
+    Eigen::MatrixXd G_; // A^T W A : size (F+1) x (F+1)
+    Eigen::VectorXd c_; // A^T W y : size (F+1)
     Eigen::ArrayXd y_;  // Target vector reference
+    Eigen::ArrayXd w_;  // Optional per-point weights (empty => uniform)
+    double w_sum_ = 0.0;
+    bool use_weights_ = false;
     int n_samples_ = 0;
     int n_features_ = 0;
 
@@ -137,19 +153,42 @@ public:
     int n_features() const { return n_features_; }
     int n_samples() const { return n_samples_; }
 
-    void initialize(const std::vector<Eigen::ArrayXd>& cache, const Eigen::ArrayXd& y) {
+    void initialize(
+        const std::vector<Eigen::ArrayXd>& cache,
+        const Eigen::ArrayXd& y,
+        const Eigen::ArrayXd& sample_weights = Eigen::ArrayXd()
+    ) {
         n_features_ = static_cast<int>(cache.size());
         n_samples_ = static_cast<int>(y.size());
         y_ = y;
-        
+        use_weights_ = (sample_weights.size() == n_samples_ && n_samples_ > 0);
+        if (use_weights_) {
+            w_ = sample_weights;
+            w_sum_ = w_.sum();
+            if (!(w_sum_ > 0.0) || !std::isfinite(w_sum_)) {
+                use_weights_ = false;
+                w_ = Eigen::ArrayXd();
+                w_sum_ = static_cast<double>(n_samples_);
+            }
+        } else {
+            w_ = Eigen::ArrayXd();
+            w_sum_ = static_cast<double>(n_samples_);
+        }
+
         A_.resize(n_samples_, n_features_ + 1);
         for (int i = 0; i < n_features_; ++i) {
             A_.col(i) = cache[i].matrix();
         }
         A_.col(n_features_).setOnes(); // Bias column
-        
-        G_ = A_.transpose() * A_;
-        c_ = A_.transpose() * y.matrix();
+
+        if (use_weights_) {
+            Eigen::MatrixXd WA = w_.matrix().asDiagonal() * A_;
+            G_ = A_.transpose() * WA;
+            c_ = A_.transpose() * (w_ * y_).matrix();
+        } else {
+            G_ = A_.transpose() * A_;
+            c_ = A_.transpose() * y.matrix();
+        }
         llt_valid_ = false;
     }
 
@@ -163,14 +202,19 @@ public:
             // 1. Update Design Matrix
             A_.col(idx) = new_cache[idx].matrix();
             
-            // 2. Update Gramian Row and Column (A_idx^T * A)
-            // This is O(N*S) but uses BLAS-optimized matrix-vector multiplication
-            Eigen::VectorXd new_row = A_.col(idx).transpose() * A_;
-            G_.row(idx) = new_row;
-            G_.col(idx) = new_row;
-            
-            // 3. Update RHS: c_i = A_i^T * y
-            c_(idx) = A_.col(idx).dot(y_.matrix());
+            // 2. Update Gramian Row and Column
+            if (use_weights_) {
+                Eigen::VectorXd wA = (w_ * A_.col(idx).array()).matrix();
+                Eigen::VectorXd new_row = A_.transpose() * wA;
+                G_.row(idx) = new_row;
+                G_.col(idx) = new_row;
+                c_(idx) = (w_ * A_.col(idx).array() * y_).sum();
+            } else {
+                Eigen::VectorXd new_row = A_.col(idx).transpose() * A_;
+                G_.row(idx) = new_row;
+                G_.col(idx) = new_row;
+                c_(idx) = A_.col(idx).dot(y_.matrix());
+            }
         }
     }
 
@@ -183,7 +227,8 @@ public:
         return w_out.allFinite();
     }
 
-    // Compute MSE directly from weights and a cache (avoids full graph re-eval)
+    // Compute MSE directly from weights and a cache (avoids full graph re-eval).
+    // When sample weights are set, returns weighted MSE used for selection.
     double compute_mse(const Eigen::VectorXd& w, const std::vector<Eigen::ArrayXd>& cache) const {
         Eigen::ArrayXd pred = Eigen::ArrayXd::Constant(n_samples_, w(n_features_)); // bias
         for (int f = 0; f < n_features_; ++f) {
@@ -191,7 +236,10 @@ public:
                 pred += w(f) * cache[f];
             }
         }
-        double mse = (pred - y_).square().mean();
+        Eigen::ArrayXd err2 = (pred - y_).square();
+        double mse = use_weights_
+            ? (w_ * err2).sum() / w_sum_
+            : err2.mean();
         return std::isfinite(mse) ? mse : std::numeric_limits<double>::infinity();
     }
 };
@@ -202,11 +250,13 @@ public:
                     const std::vector<Eigen::ArrayXd>& X, 
                     const Eigen::ArrayXd& y,
                     const std::vector<double>& seed_omegas = {},
-                    const std::vector<IndividualGraph>& seed_graphs = {})
+                    const std::vector<IndividualGraph>& seed_graphs = {},
+                    const Eigen::ArrayXd& y_weights = Eigen::ArrayXd())
                 : config_(config), X_(X), y_(y), seed_omegas_(seed_omegas), seed_graphs_(seed_graphs),
                     rng_(config.random_seed >= 0
                             ? static_cast<unsigned int>(config.random_seed)
                             : std::random_device{}()) {
+    set_y_weights(y_weights);
     sanitize_config();
 
         if (config_.enable_trace && !config_.trace_path.empty()) {
@@ -359,7 +409,7 @@ public:
 
             update_discovery_metrics(gen, start_time);
 
-            if (config_.use_early_stop && best_overall_.raw_mse < config_.early_stop_mse && best_overall_.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
+            if (config_.use_early_stop && objective_mse(best_overall_) < config_.early_stop_mse && best_overall_.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
                 trace_event("run.early_stop", gen);
                 break; // Exact algebraic match found that is simple
             }
@@ -566,8 +616,11 @@ public:
                 current_seed_omegas = config_.multi_seed_omegas[i];
             }
             
-            // Pass seed_graphs_ to all islands (they'll use max a fraction of pop so it's fine)
-            islands.emplace_back(current_island_cfg, X_, y_, current_seed_omegas, seed_graphs_);
+            // Pass seed_graphs_ + y_weights_ to all islands
+            islands.emplace_back(
+                current_island_cfg, X_, y_, current_seed_omegas, seed_graphs_,
+                has_y_weights_ ? y_weights_ : Eigen::ArrayXd()
+            );
         }
 
         // Initialize all islands. This includes constant refinement and can be
@@ -644,7 +697,7 @@ public:
             bool should_stop = false;
             for (auto& island : islands) {
                 auto best = island.get_best();
-                if (best.raw_mse < config_.early_stop_mse && best.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
+                if (objective_mse(best) < config_.early_stop_mse && best.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
                     should_stop = true;
                 }
                 if (best.fitness < best_overall_.fitness) {
@@ -682,6 +735,9 @@ private:
     EvolutionConfig config_;
     std::vector<Eigen::ArrayXd> X_;
     Eigen::ArrayXd y_;
+    Eigen::ArrayXd y_weights_; // empty => uniform; else length == y_.size()
+    bool has_y_weights_ = false;
+    double y_weight_sum_ = 0.0;
     std::vector<double> seed_omegas_;
     std::vector<IndividualGraph> seed_graphs_;
     
@@ -703,6 +759,136 @@ private:
     double first_acceptable_time_sec_ = -1.0;
     int last_island_outer_threads_ = 1;
     int last_island_inner_threads_ = 1;
+
+    void set_y_weights(const Eigen::ArrayXd& y_weights) {
+        has_y_weights_ = false;
+        y_weights_ = Eigen::ArrayXd();
+        y_weight_sum_ = static_cast<double>(y_.size());
+        if (y_weights.size() == 0) return;
+        if (y_weights.size() != y_.size()) {
+            throw std::runtime_error("y_weights must be 1D with length matching y");
+        }
+        for (int i = 0; i < static_cast<int>(y_weights.size()); ++i) {
+            if (!std::isfinite(y_weights(i)) || y_weights(i) < 0.0) {
+                throw std::runtime_error("y_weights must be finite and non-negative");
+            }
+        }
+        double total = y_weights.sum();
+        if (!(total > 0.0) || !std::isfinite(total)) {
+            throw std::runtime_error("y_weights must have positive total weight");
+        }
+        y_weights_ = y_weights;
+        y_weight_sum_ = total;
+        has_y_weights_ = true;
+    }
+
+    // Objective used for selection/fitness/early-stop (weighted and/or robust).
+    double objective_mse(const IndividualGraph& ind) const {
+        // weighted_mse holds the search objective after evaluate_fitness_with_penalty
+        // (plain weighted MSE, huber, trimmed, or student_t). Fall back to raw_mse
+        // only if it was never evaluated.
+        if (std::isfinite(ind.weighted_mse) && ind.weighted_mse < 1e90) {
+            return ind.weighted_mse;
+        }
+        return ind.raw_mse;
+    }
+
+    double mad_scale(const Eigen::ArrayXd& resid) const {
+        const int n = static_cast<int>(resid.size());
+        if (n <= 0) return 1.0;
+        std::vector<double> vals;
+        vals.reserve(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            if (std::isfinite(resid(i))) vals.push_back(resid(i));
+        }
+        if (vals.empty()) return 1.0;
+        std::sort(vals.begin(), vals.end());
+        double med = vals[vals.size() / 2];
+        for (double& v : vals) v = std::abs(v - med);
+        std::sort(vals.begin(), vals.end());
+        double mad = vals[vals.size() / 2];
+        double scale = 1.4826 * mad;
+        if (!std::isfinite(scale) || scale < 1e-12) {
+            double acc = 0.0;
+            int c = 0;
+            for (int i = 0; i < n; ++i) {
+                if (std::isfinite(resid(i))) {
+                    acc += resid(i) * resid(i);
+                    ++c;
+                }
+            }
+            if (c > 0) {
+                scale = std::sqrt(acc / static_cast<double>(c));
+            }
+            if (!std::isfinite(scale) || scale < 1e-12) scale = 1.0;
+        }
+        return scale;
+    }
+
+    double residual_mse(const Eigen::ArrayXd& pred, const Eigen::ArrayXd& y) const {
+        Eigen::ArrayXd resid = pred - y;
+        const int n = static_cast<int>(resid.size());
+        if (n <= 0) return std::numeric_limits<double>::infinity();
+
+        // Plain (optionally weighted) MSE path — also used for diagnostics.
+        auto weighted_mean_of = [&](const Eigen::ArrayXd& vals) -> double {
+            if (has_y_weights_ && y_weights_.size() == vals.size()) {
+                return (y_weights_ * vals).sum() / y_weight_sum_;
+            }
+            return vals.mean();
+        };
+
+        if (config_.loss_mode == LossMode::Mse) {
+            return weighted_mean_of(resid.square());
+        }
+
+        if (config_.loss_mode == LossMode::Huber) {
+            double d = config_.huber_delta;
+            if (!(d > 0.0) || !std::isfinite(d)) d = mad_scale(resid);
+            d = std::max(d, 1e-12);
+            Eigen::ArrayXd loss(n);
+            for (int i = 0; i < n; ++i) {
+                double a = std::abs(resid(i));
+                if (a <= d) loss(i) = 0.5 * resid(i) * resid(i);
+                else loss(i) = d * (a - 0.5 * d);
+            }
+            return weighted_mean_of(loss);
+        }
+
+        if (config_.loss_mode == LossMode::TrimmedMse) {
+            Eigen::ArrayXd sq = resid.square();
+            double frac = std::clamp(config_.trim_fraction, 0.0, 0.45);
+            int keep = std::max(1, static_cast<int>(std::llround(n * (1.0 - frac))));
+            std::vector<int> order(static_cast<size_t>(n));
+            for (int i = 0; i < n; ++i) order[static_cast<size_t>(i)] = i;
+            std::partial_sort(order.begin(), order.begin() + keep, order.end(),
+                [&](int a, int b) { return sq(a) < sq(b); });
+            if (has_y_weights_ && y_weights_.size() == n) {
+                double num = 0.0, den = 0.0;
+                for (int k = 0; k < keep; ++k) {
+                    int i = order[static_cast<size_t>(k)];
+                    num += y_weights_(i) * sq(i);
+                    den += y_weights_(i);
+                }
+                return (den > 0.0) ? (num / den) : std::numeric_limits<double>::infinity();
+            }
+            double acc = 0.0;
+            for (int k = 0; k < keep; ++k) acc += sq(order[static_cast<size_t>(k)]);
+            return acc / static_cast<double>(keep);
+        }
+
+        // Student-t style heavy-tail loss: log(1 + (r/s)^2)
+        double s = config_.huber_delta;
+        if (!(s > 0.0) || !std::isfinite(s)) s = mad_scale(resid);
+        s = std::max(s, 1e-12);
+        Eigen::ArrayXd loss = (resid / s).square().log1p();
+        return weighted_mean_of(loss);
+    }
+
+    double residual_mse_unweighted(const Eigen::ArrayXd& pred, const Eigen::ArrayXd& y) const {
+        // Always plain MSE for raw_mse diagnostics / back-compat.
+        return (pred - y).square().mean();
+    }
 
     static void normalize_prior_vector(std::vector<double>& priors) {
         double sum = 0.0;
@@ -773,9 +959,9 @@ private:
     double run_wall_time_sec_ = 0.0;
 
     void update_discovery_metrics(int generation, const std::chrono::steady_clock::time_point& start_time) {
-        const bool is_exact = (best_overall_.raw_mse < config_.early_stop_mse && best_overall_.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes));
+        const bool is_exact = (objective_mse(best_overall_) < config_.early_stop_mse && best_overall_.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes));
         const bool is_acceptable =
-            (best_overall_.raw_mse < config_.acceptable_mse &&
+            (objective_mse(best_overall_) < config_.acceptable_mse &&
              static_cast<int>(best_overall_.nodes.size()) <= config_.acceptable_complexity);
 
         if (is_exact && first_exact_generation_ < 0) {
@@ -1179,7 +1365,10 @@ private:
         }
     }
     
-    // Evaluate fitness including complexity and soft rounding penalty
+    // Evaluate fitness including complexity and soft rounding penalty.
+    // raw_mse: always plain unweighted MSE (diagnostics / back-compat).
+    // weighted_mse: search objective (weights and/or robust loss from residual_mse).
+    // fitness: search objective * complexity penalty.
     double evaluate_fitness_with_penalty(IndividualGraph& graph, const std::vector<Eigen::ArrayXd>& X, const Eigen::ArrayXd& y, int num_samples, SubtreeCache* tc = nullptr) {
         Eigen::ArrayXd pred;
         if (tc != nullptr) {
@@ -1188,8 +1377,12 @@ private:
         } else {
             pred = evaluate_graph_simple(graph, X, num_samples);
         }
-        double mse = (pred - y).square().mean();
-        graph.raw_mse = mse;
+        const double unweighted_mse = residual_mse_unweighted(pred, y);
+        const double search_obj = residual_mse(pred, y);
+        graph.raw_mse = unweighted_mse;
+        graph.weighted_mse = search_obj;
+        // Selection always uses search objective (weights + robust loss when set).
+        const double mse = search_obj;
         
         double penalty = 0.0;
         if (config_.round_penalty_weight > 0) {
@@ -1765,8 +1958,9 @@ private:
     }
     
     // ── Ridge Regression solver for output weights ──────────────────────
-    // Replaces bare SVD with (A^T*A + λI)^{-1} A^T b to prevent
+    // Replaces bare SVD with (A^T W A + λI)^{-1} A^T W b to prevent
     // multicollinearity from producing massive cancelling coefficients.
+    // When y_weights_ are set, W is diag(weights); otherwise W = I.
     // Returns true if solve succeeded.
     bool solve_output_weights(IndividualGraph& ind, const std::vector<Eigen::ArrayXd>& cache) {
         int n_samples = static_cast<int>(y_.size());
@@ -1788,11 +1982,20 @@ private:
         Eigen::VectorXd w;
         
         try {
-            // Ridge regression: w = (A^T A + λI)^{-1} A^T b
+            // Ridge regression: w = (A^T W A + λI)^{-1} A^T W b
             double lambda = 1e-4;
-            Eigen::MatrixXd AtA = A.transpose() * A;
-            AtA.diagonal() += Eigen::VectorXd::Constant(num_features + 1, lambda);
-            w = AtA.ldlt().solve(A.transpose() * b);
+            Eigen::MatrixXd AtWA;
+            Eigen::VectorXd AtWb;
+            if (has_y_weights_ && y_weights_.size() == n_samples) {
+                Eigen::MatrixXd WA = y_weights_.matrix().asDiagonal() * A;
+                AtWA = A.transpose() * WA;
+                AtWb = A.transpose() * (y_weights_ * y_).matrix();
+            } else {
+                AtWA = A.transpose() * A;
+                AtWb = A.transpose() * b;
+            }
+            AtWA.diagonal() += Eigen::VectorXd::Constant(num_features + 1, lambda);
+            w = AtWA.ldlt().solve(AtWb);
         } catch (...) {
             return false;
         }
@@ -1866,7 +2069,7 @@ private:
         int n_params = static_cast<int>(active_unary.size()) * 3; // {p, omega, phi} — NOT amplitude (redundant with SVD output_weight)
         std::vector<double> m(n_params, 0.0), v(n_params, 0.0);
         
-        double best_mse = ind.raw_mse;
+        double best_mse = objective_mse(ind);
         IndividualGraph best_snapshot = ind; // Keep best seen
         int global_step = 0;
         
@@ -1886,11 +2089,11 @@ private:
                         
                         *params[pi] = original + epsilon;
                         Eigen::ArrayXd pred_plus = evaluate_graph_simple(ind, X_, n_samples);
-                        double mse_plus = (pred_plus - y_).square().mean();
+                        double mse_plus = residual_mse(pred_plus, y_);
                         
                         *params[pi] = original - epsilon;
                         Eigen::ArrayXd pred_minus = evaluate_graph_simple(ind, X_, n_samples);
-                        double mse_minus = (pred_minus - y_).square().mean();
+                        double mse_minus = residual_mse(pred_minus, y_);
                         
                         *params[pi] = original;
                         
@@ -1936,17 +2139,17 @@ private:
             
             // Evaluate and track best
             evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
-            if (ind.raw_mse < best_mse) {
-                best_mse = ind.raw_mse;
+            if (objective_mse(ind) < best_mse) {
+                best_mse = objective_mse(ind);
                 best_snapshot = ind;
             }
             
             // Early exit if already excellent
-            if (ind.raw_mse < 1e-10) break;
+            if (objective_mse(ind) < 1e-10) break;
         }
         
         // Restore best seen (in case later rounds degraded)
-        if (best_snapshot.raw_mse < ind.raw_mse) {
+        if (objective_mse(best_snapshot) < objective_mse(ind)) {
             ind = best_snapshot;
         }
     }
@@ -2004,7 +2207,7 @@ private:
             }
 
             Eigen::ArrayXd residual = pred - y_;
-            double mse = residual.square().mean();
+            double mse = residual_mse(pred, y_);
             if (!std::isfinite(mse)) return std::numeric_limits<double>::infinity();
 
             if (residual_out != nullptr) {
@@ -2031,7 +2234,7 @@ private:
             evaluate_graph(base_graph, X_, n_samples, base_cache);
             
             DifferentialGramian dg;
-            dg.initialize(base_cache, y_);
+            dg.initialize(base_cache, y_, has_y_weights_ ? y_weights_ : Eigen::ArrayXd());
             
             Eigen::VectorXd r;
             double base_mse = evaluate_residual(base_graph, &r);
@@ -2315,7 +2518,7 @@ private:
         }
         
         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
-        double baseline_mse = ind.raw_mse;
+        double baseline_mse = objective_mse(ind);
         
         // ── Step 5: Iterative Backward Elimination ──
         // Greedily remove least-important node, re-solve Ridge, repeat
@@ -2349,9 +2552,9 @@ private:
             evaluate_fitness_with_penalty(candidate, X_, y_, n_samples);
             
             // Accept if MSE is still acceptable (within 5% of baseline)
-            if (candidate.raw_mse < baseline_mse * 1.05 + 1e-8) {
+            if (objective_mse(candidate) < baseline_mse * 1.05 + 1e-8) {
                 ind = candidate;
-                baseline_mse = ind.raw_mse;
+                baseline_mse = objective_mse(ind);
             } else {
                 break; // Can't remove any more without hurting accuracy
             }
@@ -2362,14 +2565,14 @@ private:
         // This converts 0.9997*sin(2.998*x + 0.0012) → sin(3*x).
         {
             evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
-            double snap_baseline_mse = ind.raw_mse;
+            double snap_baseline_mse = objective_mse(ind);
 
             // Finding 3: Initialize base cache and Gramian for batch snapping
             int n_feat = static_cast<int>(ind.nodes.size());
             std::vector<Eigen::ArrayXd> base_cache;
             evaluate_graph(ind, X_, n_samples, base_cache);
             DifferentialGramian dg;
-            dg.initialize(base_cache, y_);
+            dg.initialize(base_cache, y_, has_y_weights_ ? y_weights_ : Eigen::ArrayXd());
             double ridge_lambda = 1e-8; // Low lambda for precision during snapping
 
             auto compute_mse_from_trial = [&](const Eigen::VectorXd& w, 
@@ -2382,7 +2585,7 @@ private:
                         pred += w(f) * cache[f];
                     }
                 }
-                double mse = (pred - y_).square().mean();
+                double mse = residual_mse(pred, y_);
                 return std::isfinite(mse) ? mse : std::numeric_limits<double>::infinity();
             };
 
@@ -2492,7 +2695,7 @@ private:
                             ind.output_bias = w_final(n_feat);
                         }
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
-                        snap_baseline_mse = ind.raw_mse;
+                        snap_baseline_mse = objective_mse(ind);
                     }
                 }
                 
@@ -2567,7 +2770,7 @@ private:
                             ind.output_bias = w_final(n_feat);
                         }
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
-                        snap_baseline_mse = ind.raw_mse;
+                        snap_baseline_mse = objective_mse(ind);
                     }
                     
                     // Try snapping phi
@@ -2615,7 +2818,7 @@ private:
                             ind.output_bias = w_final(n_feat);
                         }
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
-                        snap_baseline_mse = ind.raw_mse;
+                        snap_baseline_mse = objective_mse(ind);
                     }
                 }
             }
@@ -2703,7 +2906,7 @@ private:
                             ind.output_bias = w_final(n_feat);
                         }
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
-                        snap_baseline_mse = ind.raw_mse;
+                        snap_baseline_mse = objective_mse(ind);
                     }
                 
                 // Snap phi for Exp
@@ -2754,7 +2957,7 @@ private:
                             ind.output_bias = w_final(n_feat);
                         }
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
-                        snap_baseline_mse = ind.raw_mse;
+                        snap_baseline_mse = objective_mse(ind);
                     }
             }
             
@@ -2806,7 +3009,7 @@ private:
             
             // Re-evaluate after trig simplification
             evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
-            snap_baseline_mse = ind.raw_mse;
+            snap_baseline_mse = objective_mse(ind);
 
             // 6a.6 Arithmetic gate snapping
             // If an arithmetic blend is already close to a discrete operator,
@@ -2853,11 +3056,11 @@ private:
                     solve_output_weights(ind, trial_cache);
                     evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
 
-                    if (snap_accepts(snap_baseline_mse, ind.raw_mse, candidate.tier) &&
-                        ind.raw_mse < best_snap_mse) {
+                    if (snap_accepts(snap_baseline_mse, objective_mse(ind), candidate.tier) &&
+                        objective_mse(ind) < best_snap_mse) {
                         best_beta = candidate.beta;
                         best_gamma = candidate.gamma;
-                        best_snap_mse = ind.raw_mse;
+                        best_snap_mse = objective_mse(ind);
                     }
                 }
 
@@ -2868,7 +3071,7 @@ private:
                     evaluate_graph(ind, X_, n_samples, updated_cache);
                     solve_output_weights(ind, updated_cache);
                     evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
-                    snap_baseline_mse = ind.raw_mse;
+                    snap_baseline_mse = objective_mse(ind);
                 } else {
                     node.beta = original_beta;
                     node.gamma = original_gamma;
@@ -2893,7 +3096,7 @@ private:
                         pred += graph.output_weights[f] * cache[f];
                     }
                 }
-                double mse = (pred - y_).square().mean();
+                double mse = residual_mse(pred, y_);
                 return std::isfinite(mse) ? mse : std::numeric_limits<double>::infinity();
             };
 
@@ -2935,7 +3138,7 @@ private:
                     if (best_snap_w != w) {
                         ind.output_weights[i] = best_snap_w;
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples); // Update fitness/raw_mse
-                        snap_baseline_mse = ind.raw_mse;
+                        snap_baseline_mse = objective_mse(ind);
                     }
                 }
             }

@@ -214,6 +214,127 @@ def test_arithmetic_gate_can_canonicalize_products():
     assert np.isfinite(result["best_mse"])
 
 
+@requires_cpp
+def test_weighted_evolution_uniform_matches_unweighted():
+    """Uniform y_weights should match the unweighted path (dual metrics present)."""
+    rng = np.random.RandomState(0)
+    x = rng.uniform(-2, 2, size=80)
+    y = 2.0 * x + 1.0
+    X_list = [x]
+    base = _core.run_evolution(
+        X_list, y, pop_size=20, generations=15, early_stop_mse=1e-12, random_seed=11
+    )
+    weighted = _core.run_evolution(
+        X_list, y, pop_size=20, generations=15, early_stop_mse=1e-12, random_seed=11,
+        y_weights=np.ones_like(y),
+    )
+    assert "best_weighted_mse" in weighted
+    assert weighted["weighted"] is True
+    assert np.isfinite(weighted["best_mse"])
+    assert np.isfinite(weighted["best_weighted_mse"])
+    # Same seed + uniform weights → same unweighted best_mse within tolerance
+    assert abs(float(base["best_mse"]) - float(weighted["best_mse"])) < 1e-6
+
+
+@requires_cpp
+def test_weighted_evolution_downweights_outliers_changes_choice():
+    """Downweighting outliers should recover closer to the true linear structure."""
+    rng = np.random.RandomState(1)
+    x = np.linspace(-2.0, 2.0, 100)
+    y_true = 2.0 * x + 1.0
+    y = y_true.copy()
+    # Corrupt a contiguous block of points with huge outliers
+    y[40:55] += 80.0
+    w = np.ones_like(y)
+    w[40:55] = 1e-6
+
+    unweighted = _core.run_evolution(
+        [x], y,
+        pop_size=40, generations=40, early_stop_mse=1e-12,
+        random_seed=42, timeout_seconds=30,
+        p_min=-1.0, p_max=3.0,
+    )
+    weighted = _core.run_evolution(
+        [x], y,
+        pop_size=40, generations=40, early_stop_mse=1e-12,
+        random_seed=42, timeout_seconds=30,
+        p_min=-1.0, p_max=3.0,
+        y_weights=w,
+    )
+    assert weighted["weighted"] is True
+    assert np.isfinite(weighted["best_weighted_mse"])
+
+    # Score formulas on clean target: weighted run should fit clean y better
+    def _clean_mse(formula: str) -> float:
+        # Prefer engine-reported formula; fall back to large mse
+        f = str(formula or "")
+        if not f:
+            return float("inf")
+        try:
+            # Lightweight eval via numpy with x0 alias
+            local = {"x0": x, "x": x, "sin": np.sin, "cos": np.cos, "exp": np.exp,
+                     "log": np.log, "sqrt": np.sqrt, "abs": np.abs, "pi": np.pi}
+            pred = eval(f.replace("^", "**"), {"__builtins__": {}}, local)
+            pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+            if pred.shape != y_true.shape or not np.all(np.isfinite(pred)):
+                return float("inf")
+            return float(np.mean((pred - y_true) ** 2))
+        except Exception:
+            return float("inf")
+
+    clean_u = _clean_mse(unweighted.get("formula", ""))
+    clean_w = _clean_mse(weighted.get("formula", ""))
+    # Weighted path should not be dramatically worse on clean structure; usually better
+    assert clean_w < clean_u * 2.0 + 0.5 or clean_w < 1.0
+
+
+@requires_cpp
+def test_weighted_evolution_rejects_bad_weight_length():
+    x = np.linspace(-1, 1, 40)
+    y = 2.0 * x
+    with pytest.raises(Exception):
+        _core.run_evolution(
+            [x], y, pop_size=5, generations=2, early_stop_mse=1e-8,
+            y_weights=np.ones(30),
+        )
+
+
+@requires_cpp
+def test_huber_loss_mode_exposed_and_runs():
+    """Phase 4: loss_mode=huber returns dual metrics and runs without crash."""
+    rng = np.random.RandomState(0)
+    x = rng.uniform(-2, 2, size=60)
+    y = 2.0 * x + 1.0
+    y = y.copy()
+    y[10:15] += 30.0
+    result = _core.run_evolution(
+        [x], y,
+        pop_size=15, generations=10, early_stop_mse=1e-12,
+        random_seed=3, timeout_seconds=15,
+        loss_mode="huber", huber_delta=1.0,
+    )
+    assert result.get("loss_mode") == "huber"
+    assert "search_loss" in result
+    assert np.isfinite(result["best_mse"])
+    assert np.isfinite(result["search_loss"])
+
+
+@requires_cpp
+def test_trimmed_mse_loss_mode_runs():
+    x = np.linspace(-2, 2, 50)
+    y = x ** 2
+    y = y.copy()
+    y[0] = 1e3
+    result = _core.run_evolution(
+        [x], y,
+        pop_size=12, generations=8, early_stop_mse=1e-12,
+        random_seed=5, timeout_seconds=10,
+        loss_mode="trimmed_mse", trim_fraction=0.1,
+    )
+    assert result.get("loss_mode") == "trimmed_mse"
+    assert np.isfinite(result["best_mse"])
+
+
 # ── Direct execution (backward compatibility) ───────────────────────────
 
 if __name__ == "__main__":

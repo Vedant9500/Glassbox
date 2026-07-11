@@ -3791,6 +3791,10 @@ def beam_search_evolution(
     candidate_formulas: Optional[List[Dict]] = None,
     confidence: float = 0.5, # New parameter
     search_plan: Optional[Dict[str, Any]] = None,
+    y_weights: Optional[np.ndarray] = None,
+    loss_mode: str = "mse",
+    huber_delta: Optional[float] = None,
+    trim_fraction: float = 0.1,
 ) -> Dict:
     """
     Beam search over diverse C++ evolution configurations.
@@ -4240,7 +4244,24 @@ def beam_search_evolution(
         }
         if timeout_seconds is not None:
             evolution_kwargs["timeout_seconds"] = timeout_seconds
-        result = _core.run_evolution(**evolution_kwargs)
+        if y_weights is not None:
+            w = np.ascontiguousarray(np.asarray(y_weights, dtype=np.float64).reshape(-1))
+            if w.shape[0] == y_np.shape[0]:
+                evolution_kwargs["y_weights"] = w
+        mode = str(loss_mode or "mse").strip().lower()
+        if mode != "mse":
+            evolution_kwargs["loss_mode"] = mode
+            if huber_delta is not None:
+                evolution_kwargs["huber_delta"] = float(huber_delta)
+            evolution_kwargs["trim_fraction"] = float(trim_fraction)
+        try:
+            result = _core.run_evolution(**evolution_kwargs)
+        except TypeError:
+            evolution_kwargs.pop("y_weights", None)
+            evolution_kwargs.pop("loss_mode", None)
+            evolution_kwargs.pop("huber_delta", None)
+            evolution_kwargs.pop("trim_fraction", None)
+            result = _core.run_evolution(**evolution_kwargs)
     except Exception as e:
         print(f"  \u274c Native Island Search failed: {e}")
         return None
@@ -4345,6 +4366,10 @@ def run_guided_evolution(
     candidate_formulas: Optional[List[Dict]] = None,
     confidence: float = 0.5,
     search_plan: Optional[Dict[str, Any]] = None,
+    y_weights: Optional[np.ndarray] = None,
+    loss_mode: str = "mse",
+    huber_delta: Optional[float] = None,
+    trim_fraction: float = 0.1,
 ) -> Dict:
     """
     Run evolution guided by fast-path operator hints.
@@ -4420,6 +4445,10 @@ def run_guided_evolution(
         candidate_formulas=candidate_formulas,
         confidence=confidence,
         search_plan=search_plan,
+        y_weights=y_weights,
+        loss_mode=loss_mode,
+        huber_delta=huber_delta,
+        trim_fraction=trim_fraction,
     )
     
     if beam_result is not None and beam_result['mse'] < float('inf'):

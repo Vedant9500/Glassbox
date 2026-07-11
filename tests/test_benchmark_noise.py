@@ -170,7 +170,9 @@ def test_summary_delta_table_keys():
     assert len(deltas) == 1  # noisy tier vs clean
     assert deltas[0]["tier"] == "gaussian_10pct"
     md = bn.to_markdown(summary)
-    assert "R2(med)" in md
+    assert "R2noisy" in md
+    assert "R2clean" in md
+    assert "CleanMSE" in md
 
 
 def test_write_report_creates_files(tmp_path):

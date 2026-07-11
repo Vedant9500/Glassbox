@@ -13,6 +13,8 @@
 #include <omp.h>
 #include <iostream>
 #include <limits>
+#include <cctype>
+#include <string>
 
 namespace py = pybind11;
 
@@ -409,7 +411,11 @@ py::dict run_evolution_cpp(
     py::list multi_binary_op_priors = py::list(),
     py::list multi_allowed_binary_ops = py::list(),
     py::list multi_seed_omegas = py::list(),
-    py::list seed_graphs_py = py::list()
+    py::list seed_graphs_py = py::list(),
+    py::object y_weights_obj = py::none(),
+    std::string loss_mode = "mse",
+    double huber_delta = -1.0,
+    double trim_fraction = 0.1
 ) {
     // 1. Convert Python/Numpy inputs to C++/Eigen
     std::vector<Eigen::ArrayXd> X;
@@ -430,6 +436,11 @@ py::dict run_evolution_cpp(
     auto y_buf = y_contig.request();
     double* y_ptr = static_cast<double*>(y_buf.ptr);
     Eigen::Map<Eigen::ArrayXd> y(y_ptr, y_buf.size);
+
+    // Optional per-point weights (Phase 3). Empty => uniform / legacy path.
+    Eigen::ArrayXd y_weights = load_optional_weights(
+        y_weights_obj, static_cast<int>(y_buf.size), "y_weights"
+    );
     
     // Parse seed omegas
     std::vector<double> cpp_seed_omegas;
@@ -609,6 +620,21 @@ py::dict run_evolution_cpp(
     config.acceptable_complexity = acceptable_complexity;
     config.early_stop_max_nodes = early_stop_max_nodes;
 
+    // Phase 4: robust search loss (default mse preserves legacy behaviour).
+    {
+        std::string mode = loss_mode;
+        for (char& c : mode) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (mode == "huber") config.loss_mode = sr::LossMode::Huber;
+        else if (mode == "trimmed_mse" || mode == "trimmed") config.loss_mode = sr::LossMode::TrimmedMse;
+        else if (mode == "student_t" || mode == "student-t" || mode == "studentt") {
+            config.loss_mode = sr::LossMode::StudentT;
+        } else {
+            config.loss_mode = sr::LossMode::Mse;
+        }
+        config.huber_delta = huber_delta;
+        config.trim_fraction = trim_fraction;
+    }
+
     // Sync evaluator temperature so arithmetic blend sharpness is tunable from Python.
     sr::set_arithmetic_temperature(arithmetic_temperature);
 
@@ -622,7 +648,9 @@ py::dict run_evolution_cpp(
     if (num_islands > 1) std::cout << " (Island Model: " << num_islands << " islands)";
     std::cout << std::endl;
     
-    sr::EvolutionEngine engine(config, X, y, cpp_seed_omegas, cpp_seed_graphs);
+    sr::EvolutionEngine engine(
+        config, X, y, cpp_seed_omegas, cpp_seed_graphs, y_weights
+    );
     
     // 3. Run evolution loop natively in C++
     {
@@ -643,7 +671,12 @@ py::dict run_evolution_cpp(
     auto best = engine.get_best();
     
     py::dict result;
+    // best_mse remains unweighted for back-compat / benchmarks.
     result["best_mse"] = best.raw_mse;
+    result["best_weighted_mse"] = best.weighted_mse;
+    result["weighted"] = (y_weights.size() == static_cast<int>(y_buf.size));
+    result["loss_mode"] = loss_mode;
+    result["search_loss"] = best.weighted_mse;
     result["penalized_fitness"] = best.fitness;
     result["time_to_first_exact_sec"] = engine.get_first_exact_time_sec();
     result["generation_to_first_exact"] = engine.get_first_exact_generation();
@@ -702,6 +735,7 @@ py::dict run_evolution_cpp(
             sr::simplify_ast(ind);
             py::dict pdict;
             pdict["mse"] = ind.raw_mse;
+            pdict["weighted_mse"] = ind.weighted_mse;
             pdict["complexity"] = ind.active_complexity();
             pdict["raw_nodes"] = ind.complexity();
             pdict["formula"] = sr::get_formula_string(ind, static_cast<int>(X.size()));
@@ -973,7 +1007,11 @@ PYBIND11_MODULE(_core, m) {
           py::arg("multi_binary_op_priors")=py::list(),
           py::arg("multi_allowed_binary_ops")=py::list(),
           py::arg("multi_seed_omegas")=py::list(),
-          py::arg("seed_graphs_py")=py::list());
+          py::arg("seed_graphs_py")=py::list(),
+          py::arg("y_weights")=py::none(),
+          py::arg("loss_mode")="mse",
+          py::arg("huber_delta")=-1.0,
+          py::arg("trim_fraction")=0.1);
 
     m.def("refine_frequencies", &refine_frequencies_wrapper, "Refines frequencies via Eigen varpro");
     m.def("refine_powers", &refine_powers_model_wrapper, "Refines powers via Eigen varpro");
