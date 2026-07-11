@@ -94,3 +94,57 @@ def test_structure_probe_is_seed_only_not_auto_win():
     ss = diag.get("search_space_structure_seeds") or {}
     assert ss.get("auto_win") is False
     assert int(ss.get("n_scored") or 0) >= 1
+
+
+def test_original_space_free_const_exact_under_outliers():
+    """IRLS free-const + polish recovers Exact clean structure under 3% spikes."""
+    from glassbox.sr.sklearn_wrapper import (
+        GlassboxRegressor,
+        _soft_mad_sample_weights,
+        _validate_sample_weight,
+    )
+
+    def _with_outliers(y_clean, seed=11, frac=0.03):
+        rng = np.random.RandomState(seed)
+        y = np.asarray(y_clean, dtype=np.float64).copy()
+        n_out = max(1, int(round(frac * len(y))))
+        idx = rng.choice(len(y), size=n_out, replace=False)
+        y[idx] += rng.normal(0.0, 3.0 * (float(np.std(y_clean)) + 1e-12), size=n_out)
+        return y
+
+    def _recover(X, y_clean):
+        y = _with_outliers(y_clean)
+        est = GlassboxRegressor(blackbox_mode=True, timeout=5, random_state=11)
+        est.blackbox_diagnostics_ = {}
+        w = _soft_mad_sample_weights(y)
+        est.sample_weight_ = _validate_sample_weight(w, len(y))
+        est.sample_weight_provided_ = True
+
+        class _S:
+            pass
+
+        state = _S()
+        state.selected_features = list(range(X.shape[1]))
+        state.enabled = True
+        state.standardized = False
+        winner = est._fit_original_space_structure_winner(X, y, state)
+        assert winner is not None and winner.get("formula")
+        formula, _ = est._polish_original_space_structure_formula(winner["formula"], X, y)
+        pred = est._safe_eval_formula_array(formula, X)
+        return float(np.mean((np.asarray(pred) - y_clean) ** 2)), formula
+
+    rng = np.random.RandomState(11)
+    Xv = rng.uniform(0.05, 6.05, size=(400, 5))
+    yv = 10.0 / (5.0 + np.sum((Xv - 3.0) ** 2, axis=1))
+    mse_v, _ = _recover(Xv, yv)
+    assert mse_v < 1e-6
+
+    Xp = rng.uniform(0.1, 5.0, size=(220, 2))
+    yp = 1.0 / (1.0 + Xp[:, 0] ** (-4)) + 1.0 / (1.0 + Xp[:, 1] ** (-4))
+    mse_p, _ = _recover(Xp, yp)
+    assert mse_p < 1e-6
+
+    Xf = rng.uniform(0.1, 5.0, size=(220, 3))
+    yf = Xf[:, 0] * Xf[:, 1] / (4.0 * np.pi * Xf[:, 2] ** 2)
+    mse_f, _ = _recover(Xf, yf)
+    assert mse_f < 1e-6

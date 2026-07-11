@@ -8,9 +8,11 @@ Uses the FULL Glassbox pipeline:
 """
 
 import sys
+import os
 import re
 import math
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -1316,18 +1318,100 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "source": "original_linear_ridge",
         }
 
-    def _refine_formula_constants(self, formula, X_fit, y_fit, X_val, y_val, *, max_constants=8):
-        """Optimize numeric constants inside a candidate structure with least squares."""
+    def _soft_residual_weights(self, resid, *, floor=0.05, cap=1.0, sample_weight=None):
+        """Huber-like soft weights from residual MAD; optional multiply by sample_weight."""
+        r = np.asarray(resid, dtype=np.float64).reshape(-1)
+        if r.size < 4 or not np.any(np.isfinite(r)):
+            return None
+        finite = np.isfinite(r)
+        r_f = r[finite]
+        med = float(np.median(r_f))
+        mad = float(np.median(np.abs(r_f - med))) + 1e-12
+        scale = 1.4826 * mad
+        if not np.isfinite(scale) or scale < 1e-12:
+            scale = float(np.std(r_f)) + 1e-12
+        thr = 2.5 * scale
+        w = np.ones(r.shape[0], dtype=np.float64)
+        abs_c = np.abs(r - med)
+        heavy = finite & (abs_c > thr)
+        if np.any(heavy):
+            w[heavy] = np.clip(thr / np.maximum(abs_c[heavy], 1e-12), float(floor), float(cap))
+        if sample_weight is not None:
+            sw = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+            if sw.shape == w.shape:
+                w = w * np.clip(sw, 0.0, None)
+        total = float(np.sum(w[finite]))
+        if total <= 0:
+            return None
+        mean_w = total / max(float(np.sum(finite)), 1.0)
+        if mean_w > 1e-12:
+            w = w / mean_w
+        return w
+
+    def _inlier_mse(self, pred, target, sample_weight=None, *, inlier_frac=0.90):
+        """MSE on soft inliers (lowest abs residual mass) for Exact-friendly selection."""
+        p = np.asarray(pred, dtype=np.float64).reshape(-1)
+        t = np.asarray(target, dtype=np.float64).reshape(-1)
+        if p.shape != t.shape or p.size < 4:
+            return float("inf")
+        resid = p - t
+        if not np.all(np.isfinite(resid)):
+            return float("inf")
+        abs_r = np.abs(resid)
+        n = int(abs_r.size)
+        keep = max(4, int(round(n * float(inlier_frac))))
+        keep = min(keep, n)
+        order = np.argsort(abs_r)
+        idx = order[:keep]
+        if sample_weight is not None:
+            w = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+            if w.shape == t.shape:
+                ww = w[idx]
+                total = float(np.sum(ww))
+                if total > 0:
+                    return float(np.sum(ww * resid[idx] ** 2) / total)
+        return float(np.mean(resid[idx] ** 2))
+
+    def _refine_formula_constants(
+        self,
+        formula,
+        X_fit,
+        y_fit,
+        X_val,
+        y_val,
+        *,
+        max_constants=8,
+        sample_weight=None,
+        fit_weights=None,
+        robust=True,
+        irls_iters=3,
+    ):
+        """Optimize numeric constants inside a candidate structure with least squares.
+
+        Under outliers, soft MAD / IRLS residual weights keep free-const recovery
+        from drifting so near-integer snap can hit Exact on clean labels.
+        """
         if least_squares is None:
             return None
         text = str(formula or "").strip()
         if not text:
             return None
         number_pattern = re.compile(r"(?<![A-Za-z_])(?<!\w)([-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?)")
-        matches = [
-            m for m in number_pattern.finditer(text)
-            if m.group(0) not in {"0", "1"} and not text[max(0, m.start() - 1):m.start()] == "x"
-        ]
+        matches = []
+        for m in number_pattern.finditer(text):
+            raw = m.group(0)
+            if raw in {"0", "1"}:
+                continue
+            # Do not free feature indices (x0) or pure integer exponents (x^2, x^4).
+            if m.start() > 0 and text[m.start() - 1] == "x":
+                continue
+            if m.start() > 0 and text[m.start() - 1] == "^":
+                try:
+                    if float(raw).is_integer() and abs(float(raw)) <= 8:
+                        continue
+                except Exception:
+                    pass
+            matches.append(m)
         if not matches or len(matches) > int(max_constants):
             return None
 
@@ -1348,13 +1432,26 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if not np.all(np.isfinite(initial)):
             return None
 
+        y_fit = np.asarray(y_fit, dtype=np.float64).reshape(-1)
+        y_val = np.asarray(y_val, dtype=np.float64).reshape(-1)
+        base_w = fit_weights if fit_weights is not None else sample_weight
+        if base_w is not None:
+            base_w = np.asarray(base_w, dtype=np.float64).reshape(-1)
+            if base_w.shape != y_fit.shape:
+                base_w = None
+        if base_w is None and robust:
+            # Target MAD soft weights catch label spikes before residual IRLS.
+            base_w = _soft_mad_sample_weights(y_fit)
+        if base_w is None:
+            base_w = np.ones(y_fit.shape[0], dtype=np.float64)
+
         def build(params):
             out = template
             for idx, value in enumerate(params):
                 out = out.replace(f"__c{idx}", f"({float(value):.12g})")
             return out
 
-        def residuals(params):
+        def raw_residuals(params):
             candidate = build(params)
             try:
                 pred = self._safe_eval_formula_array(candidate, X_fit)
@@ -1365,31 +1462,84 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 return np.full_like(y_fit, 1e6, dtype=np.float64)
             return np.clip(pred - y_fit, -1e6, 1e6)
 
-        try:
-            result = least_squares(
-                residuals,
-                initial,
-                max_nfev=200,
-                loss="soft_l1",
-                f_scale=max(1e-6, float(np.std(y_fit)) * 0.1),
+        def weighted_cost(params, w):
+            r = raw_residuals(params)
+            ww = np.asarray(w, dtype=np.float64).reshape(-1)
+            total = float(np.sum(ww))
+            if total <= 0:
+                return float(np.mean(r ** 2))
+            return float(np.sum(ww * r ** 2) / total)
+
+        best_params = None
+        best_cost = float("inf")
+        w_cur = np.asarray(base_w, dtype=np.float64).reshape(-1)
+        n_irls = max(1, int(irls_iters) if robust else 1)
+        f_scale = max(1e-6, float(np.std(y_fit)) * (0.05 if robust else 0.1))
+        max_nfev = 400 if robust else 200
+        x0 = initial.copy()
+
+        for _irls in range(n_irls):
+            sw = np.sqrt(np.clip(w_cur, 1e-8, None))
+
+            def residuals(params, _sw=sw):
+                return raw_residuals(params) * _sw
+
+            try:
+                result = least_squares(
+                    residuals,
+                    x0,
+                    max_nfev=max_nfev,
+                    loss="soft_l1",
+                    f_scale=f_scale,
+                )
+            except Exception:
+                result = None
+            if result is None or not np.all(np.isfinite(result.x)):
+                continue
+            cost = weighted_cost(result.x, w_cur)
+            init_cost = weighted_cost(x0, w_cur)
+            accept = np.isfinite(cost) and (
+                cost <= init_cost * 1.02 + 1e-15 or getattr(result, "success", False)
             )
-        except Exception:
-            return None
-        # Accept cost improvement even when status is not formally "success"
-        # (max_nfev / xtol exits are common and still useful for structure seeds).
-        if result is None or not np.all(np.isfinite(result.x)):
-            return None
-        try:
-            init_cost = float(np.mean(residuals(initial) ** 2))
-            new_cost = float(np.mean(residuals(result.x) ** 2))
-            if not np.isfinite(new_cost) or new_cost > init_cost * 1.01 + 1e-15:
+            if not accept:
+                continue
+            if cost < best_cost:
+                best_cost = cost
+                best_params = np.asarray(result.x, dtype=np.float64).copy()
+            x0 = np.asarray(result.x, dtype=np.float64)
+            # Residual IRLS reweight for next pass
+            if robust and _irls + 1 < n_irls:
+                r_next = raw_residuals(x0)
+                w_soft = self._soft_residual_weights(r_next, sample_weight=base_w)
+                if w_soft is not None:
+                    w_cur = w_soft
+
+        if best_params is None:
+            # Fallback: single unweighted soft_l1 (legacy path)
+            try:
+                result = least_squares(
+                    raw_residuals,
+                    initial,
+                    max_nfev=200,
+                    loss="soft_l1",
+                    f_scale=max(1e-6, float(np.std(y_fit)) * 0.1),
+                )
+            except Exception:
+                return None
+            if result is None or not np.all(np.isfinite(result.x)):
+                return None
+            try:
+                init_cost = float(np.mean(raw_residuals(initial) ** 2))
+                new_cost = float(np.mean(raw_residuals(result.x) ** 2))
+                if not np.isfinite(new_cost) or new_cost > init_cost * 1.01 + 1e-15:
+                    if not getattr(result, "success", False):
+                        return None
+            except Exception:
                 if not getattr(result, "success", False):
                     return None
-        except Exception:
-            if not getattr(result, "success", False):
-                return None
+            best_params = np.asarray(result.x, dtype=np.float64)
 
-        refined_formula = build(result.x)
+        refined_formula = build(best_params)
         try:
             pred_fit = self._safe_eval_formula_array(refined_formula, X_fit)
             pred_val = self._safe_eval_formula_array(refined_formula, X_val)
@@ -1401,6 +1551,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         val_mse = float(np.mean((pred_val - y_val) ** 2))
         if not np.isfinite(fit_mse) or not np.isfinite(val_mse):
             return None
+        inlier_fit = self._inlier_mse(pred_fit, y_fit, base_w)
+        inlier_val = self._inlier_mse(pred_val, y_val)
         val_var = float(np.var(y_val))
         val_r2 = 1.0 if val_var < 1e-15 and val_mse < 1e-15 else (
             0.0 if val_var < 1e-15 else 1.0 - val_mse / val_var
@@ -1411,9 +1563,662 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "mse": val_mse,
             "validation_mse": val_mse,
             "validation_r2": float(val_r2),
+            "inlier_fit_mse": float(inlier_fit) if np.isfinite(inlier_fit) else None,
+            "inlier_val_mse": float(inlier_val) if np.isfinite(inlier_val) else None,
             "complexity": self._formula_complexity(refined_formula),
             "constant_refined": True,
+            "robust_refined": bool(robust),
         }
+
+    def _snap_near_integer_constants(self, formula, *, atol=1e-4, max_abs=100):
+        """Snap free numeric literals near integers (Exact recovery hygiene)."""
+        text = str(formula or "")
+        if not text:
+            return text
+        number_pattern = re.compile(r"(?<![A-Za-z_])(?<!\w)([-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?)")
+
+        def repl(match):
+            raw = match.group(0)
+            # Don't rewrite feature indices like x0
+            if match.start() > 0 and text[match.start() - 1] == "x":
+                return raw
+            try:
+                val = float(raw)
+            except Exception:
+                return raw
+            if abs(val) > float(max_abs):
+                return raw
+            nearest = round(val)
+            if abs(val - nearest) <= float(atol):
+                return str(int(nearest))
+            return raw
+
+        return number_pattern.sub(repl, text)
+
+    def _parse_outer_affine(self, formula):
+        """Parse ((s)*(inner)+(b)) allowing extra paren nesting. Returns (s, inner, b) or None."""
+        text = str(formula or "").strip().replace(" ", "")
+        if not text:
+            return None
+        # Peel one layer of wrapping parens if whole expression is parenthesized
+        while text.startswith("(") and text.endswith(")"):
+            depth = 0
+            balanced = True
+            for i, ch in enumerate(text):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0 and i != len(text) - 1:
+                        balanced = False
+                        break
+            if balanced and depth == 0 and len(text) > 2:
+                text = text[1:-1]
+            else:
+                break
+        # Match s * (inner) + b  or  (s)*(inner)+(b)
+        m = re.match(
+            r"^\(?([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\)?\*\((.+)\)\+?\(?([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\)?$",
+            text,
+        )
+        if not m:
+            return None
+        try:
+            return float(m.group(1)), m.group(2), float(m.group(3))
+        except Exception:
+            return None
+
+    def _strip_near_identity_affine(self, formula, *, scale_tol=0.05, bias_tol=0.05):
+        """Unwrap ((s)*(inner)+(b)) when s≈1 and b≈0 for Exact-friendly display."""
+        text = str(formula or "").strip()
+        if not text:
+            return text
+        for _ in range(4):
+            parsed = self._parse_outer_affine(text)
+            if parsed is None:
+                break
+            scale, inner, bias = parsed
+            if abs(scale - 1.0) <= float(scale_tol) and abs(bias) <= float(bias_tol):
+                text = inner.strip()
+                continue
+            break
+        return text
+
+    def _fold_outer_affine_into_leading_const(self, formula):
+        """((s)*((c)*expr)+(b)) → (s*c)*expr when b≈0 for cleaner Exact snap."""
+        text = str(formula or "").strip()
+        if not text:
+            return formula
+        parsed = self._parse_outer_affine(text)
+        if parsed is None:
+            return formula
+        scale, inner, bias = parsed
+        # Peel leading constant from inner: (c)*rest or c*rest
+        inner_c = inner.strip().replace(" ", "")
+        while inner_c.startswith("(") and inner_c.endswith(")"):
+            depth = 0
+            ok = True
+            for i, ch in enumerate(inner_c):
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                    if depth == 0 and i != len(inner_c) - 1:
+                        ok = False
+                        break
+            if ok and depth == 0 and len(inner_c) > 2:
+                inner_c = inner_c[1:-1]
+            else:
+                break
+        m = re.match(
+            r"^\(?([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\)?\*(.+)$",
+            inner_c,
+        )
+        if not m:
+            return formula
+        try:
+            c0 = float(m.group(1))
+            rest = m.group(2)
+            folded = scale * c0
+            if abs(bias) <= 1e-6:
+                return f"({folded:.12g})*{rest}"
+            return f"(({folded:.12g})*({rest})+({bias:.12g}))"
+        except Exception:
+            return formula
+
+    def _drop_tiny_outer_bias(self, formula, *, bias_tol=0.05):
+        """(c)*expr + b → (c)*expr when |b| is small (Exact under spikes)."""
+        text = str(formula or "").strip()
+        parsed = self._parse_outer_affine(text)
+        if parsed is None:
+            return formula
+        scale, inner, bias = parsed
+        if abs(bias) <= float(bias_tol) and abs(scale) > 1e-15:
+            # If scale is already the leading const and inner is product-like
+            return f"({scale:.12g})*{inner}"
+        return formula
+
+    def _robust_scale_only_refit(self, formula, X, y, *, sample_weight=None, iters=5):
+        """Refit leading scale of (c)*expr via L1/median-ratio IRLS (Exact under spikes).
+
+        Soft-Huber on residuals alone under-pulls product ratios when spikes are
+        large; median(y/base) + L1 IRLS recovers the clean constant.
+        """
+        text = str(formula or "").strip().replace(" ", "")
+        if not text:
+            return formula, None
+        # Match (c)*rest  or  c*rest  (no outer bias)
+        m = re.match(
+            r"^\(?([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\)?\*(.+)$",
+            text,
+        )
+        if not m:
+            parsed = self._parse_outer_affine(formula)
+            if parsed is None:
+                return formula, None
+            scale0, inner, bias = parsed
+            if abs(bias) > 0.05:
+                return formula, None
+            rest = inner
+            c0 = scale0
+        else:
+            try:
+                c0 = float(m.group(1))
+                rest = m.group(2)
+            except Exception:
+                return formula, None
+        try:
+            base = self._safe_eval_formula_array(rest, X)
+            base = np.asarray(base, dtype=np.float64).reshape(-1)
+            y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+            if base.shape != y_arr.shape or not np.all(np.isfinite(base)):
+                return formula, None
+        except Exception:
+            return formula, None
+        mask = np.isfinite(base) & np.isfinite(y_arr) & (np.abs(base) > 1e-12)
+        if int(np.sum(mask)) < 8:
+            return formula, None
+        ratios = y_arr[mask] / base[mask]
+        c_med = float(np.median(ratios))
+        # Trimmed mean of ratios (drop 5% tails)
+        order = np.argsort(ratios)
+        n_r = int(order.size)
+        lo = max(0, int(0.05 * n_r))
+        hi = max(lo + 1, int(0.95 * n_r))
+        c_trim = float(np.mean(ratios[order[lo:hi]]))
+        c = float(c0)
+        # Prefer median / trim start when they disagree with OLS-like c0
+        for c_start in (c_med, c_trim, c):
+            if np.isfinite(c_start):
+                c = c_start
+                break
+        for _ in range(max(2, int(iters))):
+            resid = y_arr - c * base
+            # L1 IRLS: w ~ 1/|r|; floor to avoid inf
+            ww = 1.0 / np.maximum(np.abs(resid), 1e-8)
+            ww = np.clip(ww, 0.01, 100.0)
+            if sample_weight is not None:
+                sw = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+                if sw.shape == ww.shape:
+                    ww = ww * np.clip(sw, 0.0, None)
+            ww = ww * mask.astype(np.float64)
+            den = float(np.sum(ww * base * base))
+            if abs(den) < 1e-18:
+                break
+            c = float(np.sum(ww * y_arr * base) / den)
+        # Collapse leading (a)*(b)*rest → (a*b)*rest for cleaner formulas
+        rest_c = str(rest).replace(" ", "")
+        m2 = re.match(
+            r"^\(?([-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?)\)?\*(.+)$",
+            rest_c,
+        )
+        if m2:
+            try:
+                # base was eval of rest which already embeds m2.group(1); keep c, rewrite rest
+                c_inner = float(m2.group(1))
+                if abs(c_inner) > 1e-15:
+                    # Re-express: c * (c_inner * core) == (c) * rest already correct numerically
+                    # Prefer single leading constant times core structure
+                    core = m2.group(2)
+                    c_combined = c * c_inner
+                    new_f = f"({c_combined:.12g})*{core}"
+                    pred = c * base  # still valid
+                    mse = float(np.mean((pred - y_arr) ** 2))
+                    inlier = self._inlier_mse(pred, y_arr)
+                    return new_f, {"mse": mse, "inlier_mse": inlier, "scale": c_combined}
+            except Exception:
+                pass
+        new_f = f"({c:.12g})*{rest}"
+        try:
+            pred = c * base
+            mse = float(np.mean((pred - y_arr) ** 2))
+            inlier = self._inlier_mse(pred, y_arr)
+        except Exception:
+            return new_f, None
+        return new_f, {"mse": mse, "inlier_mse": inlier, "scale": c}
+
+    def _fit_original_space_structure_winner(self, X_original, y_original, blackbox_state):
+        """Fit free-const structure families on original (unstandardized) selected cols.
+
+        Returns best formula already in original feature indices, or None.
+        Competing candidate only — no auto-win.
+        """
+        X_all = np.asarray(X_original, dtype=np.float64)
+        y_all = np.asarray(y_original, dtype=np.float64).reshape(-1)
+        if X_all.ndim != 2 or y_all.size < 20:
+            return None
+        selected = list(getattr(blackbox_state, "selected_features", []) or list(range(X_all.shape[1])))
+        if len(selected) < 2:
+            return None
+        if any(int(i) < 0 or int(i) >= X_all.shape[1] for i in selected):
+            return None
+        X_sel = X_all[:, [int(i) for i in selected]]
+        # Skeletons in reduced indices on original-scale data
+        skeletons = list(build_search_space_structure_seeds(X_sel.shape[1], max_seeds=16))
+        # Prefer free-const affine forms on original scale
+        n = X_sel.shape[1]
+        radial = []
+        # Radial / Vlad-like: free center + numerator/denom (Exact under outliers via IRLS)
+        for center in (3.0, 2.0, 1.0, 4.0, 0.0):
+            # Non-integer seeds so free-const refine can move them
+            c_seed = f"{center + 0.1:.1f}" if abs(center) > 1e-12 else "0.1"
+            sq_c = "+".join(f"(x{i}-{c_seed})^2" for i in range(n))
+            radial.extend(
+                [
+                    f"10.1/(5.1+{sq_c})",
+                    f"5.1/(5.1+{sq_c})",
+                    f"1.1/(1.1+{sq_c})",
+                ]
+            )
+        sq = "+".join(f"(1.1*x{i}+0.1)^2" for i in range(n))
+        radial.extend(
+            [
+                f"10.1/(5.1+{sq})",
+                f"5.1/(5.1+{sq})",
+                f"1.1/(1.1+{sq})",
+            ]
+        )
+        pagie = [
+            "+".join(f"x{i}^4/(1.1+x{i}^4)" for i in range(min(n, 4))),
+            "+".join(f"1.1/(1.1+x{i}^4)" for i in range(min(n, 4))),
+            "+".join(f"(1.1*x{i}+0.1)^4/(1.1+(1.1*x{i}+0.1)^4)" for i in range(min(n, 4))),
+        ]
+        product = []
+        if n >= 3:
+            # 1/(4*pi) ≈ 0.079577; free-const seeds near physics product-ratio
+            product = [
+                "0.079577*x0*x1/x2^2",
+                "0.0796*x0*x1/x2^2",
+                "0.08*x0*x1/x2^2",
+                "0.1*x0*x1/x2^2",
+                "x0*x1/x2^2",
+                "(1.1*x0+0.1)*(1.1*x1+0.1)/((1.1*x2+0.1)^2)",
+            ]
+        # Priority: product / radial / pagie / generic seeds
+        skeletons = product + radial + pagie + skeletons
+        # Dedup
+        seen = set()
+        uniq = []
+        for s in skeletons:
+            if s not in seen:
+                seen.add(s)
+                uniq.append(s)
+        # Cap: product-first for n>=3 so physics ratio wins before heavy radial bank
+        skeletons = uniq[:20 if n < 3 else 16]
+
+        n_pts = int(y_all.shape[0])
+        n_val = max(8, int(round(0.25 * n_pts)))
+        n_val = min(n_val, n_pts - 12)
+        idx = np.arange(n_pts)
+        rng = np.random.RandomState(43)
+        rng.shuffle(idx)
+        val_idx, fit_idx = idx[:n_val], idx[n_val:]
+        X_fit, y_fit = X_sel[fit_idx], y_all[fit_idx]
+        X_val, y_val = X_sel[val_idx], y_all[val_idx]
+        # Fit-time soft weights on original y (label spikes)
+        fit_w = None
+        try:
+            stored = self._active_sample_weight(n_targets=n_pts)
+            if stored is not None:
+                fit_w = np.asarray(stored, dtype=np.float64).reshape(-1)[fit_idx]
+        except Exception:
+            fit_w = None
+        if fit_w is None:
+            fit_w = _soft_mad_sample_weights(y_fit)
+
+        def _eval_one_skeleton(skel):
+            working = skel
+            refined = self._refine_formula_constants(
+                skel,
+                X_fit,
+                y_fit,
+                X_val,
+                y_val,
+                max_constants=14,
+                fit_weights=fit_w,
+                robust=True,
+                irls_iters=2,
+            )
+            if refined is not None and str(refined.get("formula") or "").strip():
+                working = str(refined["formula"])
+            # Prefer free-const structure without outer affine (Exact path).
+            # Affine outer fit drifts constants under spikes and blocks integer snap.
+            candidates = [working]
+            scored = self._score_formula_candidate(
+                working, X_fit, y_fit, X_val, y_val, fit_weights=fit_w
+            )
+            if scored is not None and str(scored.get("formula") or "").strip():
+                candidates.append(str(scored["formula"]))
+            best_item = None
+            for formula_red in candidates:
+                formula_orig = remap_reduced_formula_to_original(formula_red, selected)
+                try:
+                    pred = self._safe_eval_formula_array(formula_orig, X_all)
+                    pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+                    mse = float(np.mean((pred - y_all) ** 2))
+                    inlier = self._inlier_mse(pred, y_all)
+                except Exception:
+                    continue
+                if not np.isfinite(mse):
+                    continue
+                # Scale-only IRLS on product-like free-const forms
+                try:
+                    scale_f, scale_info = self._robust_scale_only_refit(
+                        formula_orig, X_all, y_all, sample_weight=None, iters=5
+                    )
+                    if scale_f and scale_info is not None:
+                        inlier_sc = float(scale_info.get("inlier_mse", float("inf")))
+                        if np.isfinite(inlier_sc) and inlier_sc <= max(inlier * 1.05, 1e-12):
+                            formula_orig = scale_f
+                            mse = float(scale_info.get("mse", mse))
+                            inlier = inlier_sc
+                except Exception:
+                    pass
+                snapped = self._snap_near_integer_constants(formula_orig, atol=1e-3)
+                try:
+                    pred_s = self._safe_eval_formula_array(snapped, X_all)
+                    pred_s = np.asarray(pred_s, dtype=np.float64).reshape(-1)
+                    mse_s = float(np.mean((pred_s - y_all) ** 2))
+                    inlier_s = self._inlier_mse(pred_s, y_all)
+                    if np.isfinite(inlier_s) and (
+                        inlier_s <= inlier * 1.10 + 1e-15
+                        or (np.isfinite(mse_s) and mse_s <= mse * 1.05 + 1e-12)
+                    ):
+                        formula_orig, mse, inlier = snapped, mse_s, inlier_s
+                except Exception:
+                    pass
+                if np.isfinite(inlier) and inlier < 1e-6:
+                    stripped = self._strip_near_identity_affine(formula_orig)
+                    if stripped and stripped != formula_orig:
+                        try:
+                            pred_t = self._safe_eval_formula_array(stripped, X_all)
+                            pred_t = np.asarray(pred_t, dtype=np.float64).reshape(-1)
+                            inlier_t = self._inlier_mse(pred_t, y_all)
+                            mse_t = float(np.mean((pred_t - y_all) ** 2))
+                            if np.isfinite(inlier_t) and inlier_t <= max(inlier * 1.2, 1e-10):
+                                formula_orig, mse, inlier = stripped, mse_t, inlier_t
+                        except Exception:
+                            pass
+                item = {
+                    "formula": formula_orig,
+                    "mse": mse,
+                    "inlier_mse": float(inlier) if np.isfinite(inlier) else mse,
+                    "complexity": self._formula_complexity(formula_orig),
+                    "skeleton": skel,
+                }
+                if best_item is None or (
+                    float(item["inlier_mse"]),
+                    float(item["mse"]),
+                    int(item["complexity"]),
+                ) < (
+                    float(best_item["inlier_mse"]),
+                    float(best_item["mse"]),
+                    int(best_item["complexity"]),
+                ):
+                    best_item = item
+            return best_item
+
+        # Product skeletons first (small, Exact-friendly); early-exit before radial bank.
+        best = None
+        priority = [s for s in skeletons if "x0*x1" in s or "x0*x1/" in s or "*x1/" in s]
+        rest = [s for s in skeletons if s not in priority]
+        ordered = priority + rest
+
+        def _consider(item):
+            nonlocal best
+            if item is None:
+                return
+            if best is None:
+                best = item
+                return
+            key = (
+                float(item["inlier_mse"]),
+                float(item["mse"]),
+                int(item["complexity"]),
+            )
+            best_key = (
+                float(best.get("inlier_mse", best["mse"])),
+                float(best["mse"]),
+                int(best["complexity"]),
+            )
+            if key < best_key:
+                best = item
+
+        # Sequential on priority (usually 1–6) for fast Exact hit
+        for skel in priority:
+            _consider(_eval_one_skeleton(skel))
+            if best is not None and float(best.get("inlier_mse", 1.0)) < 1e-8:
+                return best
+
+        # Thread-parallel free-const fits for remaining (scipy releases GIL).
+        if rest and not (best is not None and float(best.get("inlier_mse", 1.0)) < 1e-6):
+            n_workers = min(8, max(1, len(rest)), max(1, (os.cpu_count() or 4)))
+            try:
+                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    futures = [pool.submit(_eval_one_skeleton, sk) for sk in rest]
+                    for fut in as_completed(futures):
+                        try:
+                            _consider(fut.result())
+                        except Exception:
+                            pass
+                        if best is not None and float(best.get("inlier_mse", 1.0)) < 1e-8:
+                            break
+            except Exception:
+                for skel in rest:
+                    _consider(_eval_one_skeleton(skel))
+                    if best is not None and float(best.get("inlier_mse", 1.0)) < 1e-8:
+                        break
+        return best
+
+    def _polish_original_space_structure_formula(self, formula, X_original, y_original):
+        """Re-fit free constants after std→original remap; snap near-integers.
+
+        Soft_l1 free-const refine resists outliers. Returns (formula, mse).
+        """
+        text = str(formula or "").strip()
+        X_arr = np.asarray(X_original, dtype=np.float64)
+        y_arr = np.asarray(y_original, dtype=np.float64).reshape(-1)
+        if not text or X_arr.ndim != 2 or y_arr.size < 16:
+            return formula, self._formula_mse(text, X_arr, y_arr) if text else float("inf")
+
+        def full_mse(f):
+            try:
+                pred = self._safe_eval_formula_array(f, X_arr)
+                return float(np.mean((np.asarray(pred, dtype=np.float64).reshape(-1) - y_arr) ** 2))
+            except Exception:
+                return float("inf")
+
+        base_mse = full_mse(text)
+        best_f, best_m = text, base_mse
+        try:
+            pred0 = self._safe_eval_formula_array(text, X_arr)
+            best_inlier = self._inlier_mse(pred0, y_arr)
+        except Exception:
+            best_inlier = base_mse
+
+        # Holdout split for free-const refine
+        n = int(y_arr.shape[0])
+        n_val = max(8, int(round(0.25 * n)))
+        n_val = min(n_val, n - 12)
+        idx = np.arange(n)
+        rng = np.random.RandomState(41)
+        rng.shuffle(idx)
+        val_idx = idx[:n_val]
+        fit_idx = idx[n_val:]
+        X_fit, y_fit = X_arr[fit_idx], y_arr[fit_idx]
+        X_val, y_val = X_arr[val_idx], y_arr[val_idx]
+        fit_w = None
+        try:
+            stored = self._active_sample_weight(n_targets=n)
+            if stored is not None:
+                fit_w = np.asarray(stored, dtype=np.float64).reshape(-1)[fit_idx]
+        except Exception:
+            fit_w = None
+        if fit_w is None:
+            fit_w = _soft_mad_sample_weights(y_fit)
+
+        # Prefer collapsing outer affine before any re-refine (avoids product drift).
+        folded = self._fold_outer_affine_into_leading_const(best_f)
+        for cand in (folded, self._strip_near_identity_affine(folded, scale_tol=0.12, bias_tol=0.12)):
+            if not cand or cand == best_f:
+                continue
+            try:
+                pred_c = self._safe_eval_formula_array(cand, X_arr)
+                inlier_c = self._inlier_mse(pred_c, y_arr)
+                mse_c = full_mse(cand)
+                if np.isfinite(inlier_c) and inlier_c <= max(best_inlier * 1.30, 1e-9):
+                    best_f, best_m, best_inlier = cand, mse_c, inlier_c
+            except Exception:
+                pass
+
+        # Drop tiny bias: (c)*expr + eps → (c)*expr when inliers hold
+        no_bias = self._drop_tiny_outer_bias(best_f)
+        if no_bias and no_bias != best_f:
+            try:
+                pred_nb = self._safe_eval_formula_array(no_bias, X_arr)
+                inlier_nb = self._inlier_mse(pred_nb, y_arr)
+                mse_nb = full_mse(no_bias)
+                if np.isfinite(inlier_nb) and inlier_nb <= max(best_inlier * 1.25, 1e-9):
+                    best_f, best_m, best_inlier = no_bias, mse_nb, inlier_nb
+            except Exception:
+                pass
+
+        # Scale-only IRLS on (c)*structure — recovers Exact under 3% spikes
+        try:
+            full_w = None
+            try:
+                full_w = self._active_sample_weight(n_targets=n)
+            except Exception:
+                full_w = None
+            if full_w is None:
+                full_w = _soft_mad_sample_weights(y_arr)
+            scale_f, scale_info = self._robust_scale_only_refit(
+                best_f, X_arr, y_arr, sample_weight=full_w, iters=6
+            )
+            if scale_f and scale_info is not None:
+                inlier_sc = float(scale_info.get("inlier_mse", float("inf")))
+                mse_sc = float(scale_info.get("mse", float("inf")))
+                if np.isfinite(inlier_sc) and inlier_sc <= max(best_inlier * 1.05, 1e-12):
+                    best_f, best_m, best_inlier = scale_f, mse_sc, inlier_sc
+        except Exception:
+            pass
+
+        # Only full free-const re-refine when inliers are still weak
+        if not (np.isfinite(best_inlier) and best_inlier < 1e-4):
+            refined = self._refine_formula_constants(
+                best_f,
+                X_fit,
+                y_fit,
+                X_val,
+                y_val,
+                max_constants=16,
+                fit_weights=fit_w,
+                robust=True,
+                irls_iters=2,
+            )
+            if refined is not None and str(refined.get("formula") or "").strip():
+                cand = str(refined["formula"])
+                mse_c = full_mse(cand)
+                try:
+                    pred_c = self._safe_eval_formula_array(cand, X_arr)
+                    inlier_c = self._inlier_mse(pred_c, y_arr)
+                except Exception:
+                    inlier_c = mse_c
+                if np.isfinite(inlier_c) and inlier_c < best_inlier * 0.90:
+                    best_f, best_m, best_inlier = cand, mse_c, inlier_c
+
+        # Snap near-integers if inlier fidelity holds (Exact under spikes)
+        for atol in (5e-4, 1e-3, 2e-3, 5e-3):
+            snapped = self._snap_near_integer_constants(best_f, atol=atol)
+            if not snapped or snapped == best_f:
+                continue
+            mse_s = full_mse(snapped)
+            try:
+                pred_s = self._safe_eval_formula_array(snapped, X_arr)
+                inlier_s = self._inlier_mse(pred_s, y_arr)
+            except Exception:
+                inlier_s = mse_s
+            if np.isfinite(inlier_s) and inlier_s <= best_inlier * 1.15 + 1e-15:
+                best_f, best_m, best_inlier = snapped, mse_s, inlier_s
+                break
+
+        # Affine outer polish only when inliers are not already near-exact
+        # (outer affine destroys integer snap needed for Exact under spikes).
+        if float(best_inlier) >= 1e-7:
+            try:
+                pred = self._safe_eval_formula_array(best_f, X_arr)
+                pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+                if pred.shape == y_arr.shape and np.all(np.isfinite(pred)):
+                    A = np.column_stack([pred, np.ones_like(pred)])
+                    resid0 = y_arr - pred
+                    w = self._soft_residual_weights(resid0)
+                    if w is None:
+                        mad = float(np.median(np.abs(resid0 - np.median(resid0)))) + 1e-12
+                        w = 1.0 / (1.0 + (np.abs(resid0) / (3.0 * mad)) ** 2)
+                        w = np.clip(w, 0.05, 1.0)
+                    sw = np.sqrt(np.clip(w, 1e-8, None))
+                    coef, _, _, _ = np.linalg.lstsq(A * sw[:, None], y_arr * sw, rcond=None)
+                    scale, bias = float(coef[0]), float(coef[1])
+                    if abs(scale - 1.0) < 0.08 and abs(bias) < 0.08 * (float(np.std(y_arr)) + 1e-12):
+                        if abs(scale - 1.0) > 1e-8 or abs(bias) > 1e-8:
+                            affine = f"(({scale:.12g})*({best_f})+({bias:.12g}))"
+                            mse_a = full_mse(affine)
+                            try:
+                                pred_a = self._safe_eval_formula_array(affine, X_arr)
+                                inlier_a = self._inlier_mse(pred_a, y_arr)
+                            except Exception:
+                                inlier_a = mse_a
+                            if np.isfinite(inlier_a) and inlier_a < best_inlier * 0.99:
+                                best_f, best_m, best_inlier = affine, mse_a, inlier_a
+            except Exception:
+                pass
+
+        # Final aggressive near-integer snap when inliers are excellent (Exact hygiene).
+        snap_atols = (5e-4, 1e-3, 2e-3, 5e-3, 1e-2) if float(best_inlier) < 1e-5 else (5e-4, 1e-3, 2e-3)
+        for atol in snap_atols:
+            snapped = self._snap_near_integer_constants(best_f, atol=atol)
+            if not snapped or snapped == best_f:
+                continue
+            mse_s = full_mse(snapped)
+            try:
+                pred_s = self._safe_eval_formula_array(snapped, X_arr)
+                inlier_s = self._inlier_mse(pred_s, y_arr)
+            except Exception:
+                continue
+            # Under spikes, full MSE is dominated by outliers — trust inliers.
+            if np.isfinite(inlier_s) and inlier_s <= max(best_inlier * 1.25, 1e-10) + 1e-15:
+                best_f, best_m, best_inlier = snapped, mse_s, inlier_s
+                break
+
+        if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+            self.blackbox_diagnostics_["original_space_polish"] = {
+                "base_mse": float(base_mse) if np.isfinite(base_mse) else None,
+                "polished_mse": float(best_m) if np.isfinite(best_m) else None,
+                "inlier_mse": float(best_inlier) if np.isfinite(best_inlier) else None,
+                "improved": bool(np.isfinite(best_m) and np.isfinite(base_mse) and best_m < base_mse),
+                "formula": str(best_f)[:160],
+            }
+        return best_f, best_m
 
     def _rewrite_structure_seed_init(self, formula, start_map):
         """Replace leading free numeric literals using start_map offsets for multi-start."""
@@ -1556,25 +2361,34 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             None,  # use skeleton as written
             {0: 1.5, 1: 2.0},  # mild affine
             {0: 2.0, 1: 2.5},
-            {0: 0.8, 1: -0.5},
-            {0: 1.2, 1: 1.0},
+            {0: 1.0, 1: 3.0},  # Vlad-like center bias
+            {0: 10.0, 1: 5.0},
         ]
-        for skeleton in skeletons:
+        # Soft weights on fit labels if not already provided (outlier spikes).
+        if fit_w is None:
+            fit_w = _soft_mad_sample_weights(y_fit)
+
+        def _fit_one_skeleton(skeleton):
             candidates_for_skel = []
-            # Base affine-only on raw skeleton
             base0 = self._score_formula_candidate(
                 skeleton, X_fit, y_fit, X_val, y_val, fit_weights=fit_w, val_weights=val_w
             )
             if base0 is not None:
                 candidates_for_skel.append((skeleton, base0, False))
-            # Multi-start free-const refine of interior numbers
             for start_map in multi_starts:
                 skel_try = skeleton
                 if start_map is not None:
-                    # Rewrite first few free coeffs (non 0/1) toward this start if present
                     skel_try = self._rewrite_structure_seed_init(skeleton, start_map)
                 refined_inner = self._refine_formula_constants(
-                    skel_try, X_fit, y_fit, X_val, y_val, max_constants=12
+                    skel_try,
+                    X_fit,
+                    y_fit,
+                    X_val,
+                    y_val,
+                    max_constants=12,
+                    fit_weights=fit_w,
+                    robust=True,
+                    irls_iters=2,
                 )
                 working = skel_try
                 did_refine = False
@@ -1585,14 +2399,22 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     working, X_fit, y_fit, X_val, y_val, fit_weights=fit_w, val_weights=val_w
                 )
                 if base is not None:
+                    if refined_inner is not None and refined_inner.get("inlier_val_mse") is not None:
+                        base = dict(base)
+                        base["inlier_mse"] = refined_inner.get("inlier_val_mse")
                     candidates_for_skel.append((working, base, did_refine))
             if not candidates_for_skel:
-                continue
-            # Keep best for this skeleton
-            working, base, did_refine = min(
-                candidates_for_skel,
-                key=lambda t: float(t[1].get("mse", float("inf"))),
-            )
+                return None
+
+            def _skel_key(t):
+                b = t[1] or {}
+                return (
+                    float(b.get("inlier_mse", b.get("mse", float("inf")))),
+                    float(b.get("mse", float("inf"))),
+                    int(b.get("complexity", 999)),
+                )
+
+            working, base, did_refine = min(candidates_for_skel, key=_skel_key)
             chosen = dict(base)
             chosen["source"] = "search_space_structure_seed"
             chosen["skeleton"] = skeleton
@@ -1600,14 +2422,32 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             chosen["inner_constant_refined"] = bool(did_refine)
             mse = float(chosen.get("mse", float("inf")))
             if not np.isfinite(mse):
-                continue
+                return None
             chosen["complexity"] = int(
                 chosen.get("complexity") or self._formula_complexity(chosen.get("formula"))
             )
-            scored.append(chosen)
+            return chosen
+
+        n_workers = min(8, max(1, len(skeletons)), max(1, (os.cpu_count() or 4)))
+        try:
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = [pool.submit(_fit_one_skeleton, sk) for sk in skeletons]
+                for fut in as_completed(futures):
+                    try:
+                        chosen = fut.result()
+                    except Exception:
+                        chosen = None
+                    if chosen is not None:
+                        scored.append(chosen)
+        except Exception:
+            for skeleton in skeletons:
+                chosen = _fit_one_skeleton(skeleton)
+                if chosen is not None:
+                    scored.append(chosen)
 
         scored.sort(
             key=lambda c: (
+                float(c.get("inlier_mse", c.get("mse", float("inf")))),
                 float(c.get("mse", float("inf"))),
                 int(c.get("complexity", 999)),
                 str(c.get("formula", "")),
@@ -1622,6 +2462,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 "best_mse": float(top[0]["mse"]) if top else None,
                 "best_formula": str(top[0].get("formula") or "")[:160] if top else None,
                 "best_skeleton": str(top[0].get("skeleton") or "")[:120] if top else None,
+                "n_workers": int(n_workers),
                 "role": "competing_candidate",
                 "auto_win": False,
             }
@@ -2780,6 +3621,12 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             # Prefer simpler structure when MSE is only modestly worse (Exact recovery).
             if n_features_bb > 1 and complexity > 24:
                 score *= 1.0 + 0.015 * (complexity - 24)
+            # Mild preference for free-const structure seeds over kitchen-sink when close.
+            if n_features_bb > 1 and (
+                (candidate or {}).get("from_structure_seed")
+                or str((candidate or {}).get("source", "")).startswith("structure_seed")
+            ):
+                score *= 0.92
             governor = None
             try:
                 from scripts import benchmark_common as bc
@@ -6308,6 +7155,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             )
             # Promote best structure seed over bloated fast-path when it is
             # clearly better on validation (honest competition, not auto-win).
+            self._promoted_structure_seed_ = None
             try:
                 fp_comp = self._formula_complexity(best_formula) if best_formula else 999
                 best_seed = None
@@ -6327,6 +7175,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     if better_fit and (much_simpler or strong_fit or seed_mse < fp_mse):
                         best_formula = str(best_seed["formula"])
                         best_mse = seed_mse
+                        self._promoted_structure_seed_ = {
+                            "formula": best_formula,
+                            "mse": seed_mse,
+                            "complexity": seed_comp,
+                            "skeleton": str(best_seed.get("skeleton") or ""),
+                            "from_structure_seed": True,
+                        }
                         if isinstance(self.blackbox_diagnostics_, dict):
                             self.blackbox_diagnostics_["structure_seed_promoted"] = {
                                 "formula": best_formula[:160],
@@ -7066,6 +7921,25 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         "complexity": self._formula_complexity(self.evolution_candidate_formula_),
                         "source": "evolution",
                     })
+                # Keep promoted structure seed in final Pareto so kitchen-sink cannot bury it.
+                promoted = getattr(self, "_promoted_structure_seed_", None)
+                if isinstance(promoted, dict) and promoted.get("formula"):
+                    pareto_candidates.append({
+                        "formula": promoted["formula"],
+                        "mse": promoted.get("mse", float("inf")),
+                        "complexity": promoted.get("complexity", self._formula_complexity(promoted["formula"])),
+                        "source": "structure_seed",
+                        "from_structure_seed": True,
+                    })
+                for cand in candidate_formulas or []:
+                    if (cand or {}).get("from_structure_seed") and (cand or {}).get("formula"):
+                        pareto_candidates.append({
+                            "formula": cand["formula"],
+                            "mse": cand.get("mse", float("inf")),
+                            "complexity": cand.get("complexity", self._formula_complexity(cand.get("formula"))),
+                            "source": "structure_seed_pool",
+                            "from_structure_seed": True,
+                        })
                 for idx, front_item in enumerate(getattr(self, "pareto_front_", []) or []):
                     if not isinstance(front_item, dict):
                         continue
@@ -7082,6 +7956,33 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     })
                 pareto_choice = self._select_blackbox_pareto_formula(pareto_candidates, X, y)
                 if pareto_choice is not None:
+                    # Prefer structure seed when it is nearly as good and much simpler.
+                    seed_cands = [
+                        c for c in pareto_candidates
+                        if (c or {}).get("from_structure_seed") or str((c or {}).get("source", "")).startswith("structure_seed")
+                    ]
+                    if seed_cands and pareto_choice is not None:
+                        best_seed_c = min(
+                            seed_cands,
+                            key=lambda c: (
+                                float(c.get("mse", float("inf"))),
+                                int(c.get("complexity") or 999),
+                            ),
+                        )
+                        try:
+                            choice_mse = float(pareto_choice.get("mse", float("inf")))
+                            seed_mse_f = float(best_seed_c.get("mse", float("inf")))
+                            choice_comp = int(pareto_choice.get("complexity") or self._formula_complexity(pareto_choice.get("formula")))
+                            seed_comp_f = int(best_seed_c.get("complexity") or self._formula_complexity(best_seed_c.get("formula")))
+                            if (
+                                np.isfinite(seed_mse_f)
+                                and seed_mse_f <= choice_mse * 1.15 + 1e-15
+                                and seed_comp_f + 8 <= choice_comp
+                            ):
+                                pareto_choice = dict(best_seed_c)
+                                pareto_choice["source"] = "structure_seed_prefer_simple"
+                        except Exception:
+                            pass
                     best_formula = pareto_choice["formula"]
                     best_mse = pareto_choice["mse"]
                     if isinstance(self.blackbox_diagnostics_, dict):
@@ -7102,10 +8003,81 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 stage="final_fit",
             )
             if getattr(self, "blackbox_state_", None) is not None and self.blackbox_state_.enabled:
-                best_formula = formula_from_search_to_original_space(
+                remapped = formula_from_search_to_original_space(
                     best_formula,
                     self.blackbox_state_,
                 )
+                best_formula = remapped
+                # Re-fit free constants in original space (std remap inflates constants;
+                # soft_l1 helps under outliers). Then snap near-integers for Exact.
+                try:
+                    best_formula, best_mse = self._polish_original_space_structure_formula(
+                        best_formula,
+                        X_original,
+                        y_original,
+                    )
+                except Exception:
+                    pass
+                # Always compete original-space free-const family fit on multi-var
+                # blackbox (IRLS under spikes). No auto-win — only if better inliers.
+                try:
+                    n_sel = len(getattr(self.blackbox_state_, "selected_features", []) or [])
+                    if n_sel >= 2:
+                        orig_seed = self._fit_original_space_structure_winner(
+                            X_original,
+                            y_original,
+                            self.blackbox_state_,
+                        )
+                        if orig_seed is not None:
+                            o_f = str(orig_seed.get("formula") or "")
+                            o_m = float(orig_seed.get("mse", float("inf")))
+                            o_in = float(orig_seed.get("inlier_mse", o_m))
+                            # Polish the original-space family with IRLS + integer snap
+                            try:
+                                o_f2, o_m2 = self._polish_original_space_structure_formula(
+                                    o_f, X_original, y_original
+                                )
+                                if o_f2:
+                                    o_f = o_f2
+                                    o_m = float(o_m2) if np.isfinite(o_m2) else o_m
+                                    try:
+                                        o_pred = self._safe_eval_formula_array(o_f, X_original)
+                                        o_in = self._inlier_mse(o_pred, y_original)
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            cur_m = self._formula_mse(best_formula, X_original, y_original)
+                            try:
+                                cur_pred = self._safe_eval_formula_array(best_formula, X_original)
+                                cur_in = self._inlier_mse(cur_pred, y_original)
+                            except Exception:
+                                cur_in = cur_m
+                            if o_f and np.isfinite(o_m) and (
+                                o_in < cur_in * 0.98
+                                or o_m < cur_m * 0.98
+                                or (
+                                    o_in <= max(cur_in * 1.05, 1e-8)
+                                    and self._formula_complexity(o_f) + 8
+                                    <= self._formula_complexity(best_formula)
+                                )
+                                or (
+                                    np.isfinite(o_in)
+                                    and o_in < 1e-6
+                                    and (not np.isfinite(cur_in) or cur_in > 1e-6)
+                                )
+                            ):
+                                best_formula, best_mse = o_f, o_m
+                                if isinstance(self.blackbox_diagnostics_, dict):
+                                    self.blackbox_diagnostics_["original_space_structure_winner"] = {
+                                        "formula": o_f[:160],
+                                        "mse": o_m,
+                                        "inlier_mse": o_in if np.isfinite(o_in) else None,
+                                        "complexity": self._formula_complexity(o_f),
+                                        "replaced_remapped": True,
+                                    }
+                except Exception:
+                    pass
                 # Phase C: re-score remapped formula on original-space holdout
                 # so scaled-space false confidence cannot lock the winner.
                 try:

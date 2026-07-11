@@ -207,8 +207,7 @@ python -c "import json; from pathlib import Path; rows=json.loads(Path('results/
 
 ## One-line status
 
-**Blackbox × noise measurable; ranking + Phase C on. Honest path: search-space
-structure seeds with free-const refine (no Exact auto-win). Clean seed=11:
-Vlad/Feynman Exact=1; Pagie near-Exact (CleanMSE~6e-6, Accept=1, Exact=0).
-Outliers still hard on Exact; R2clean/Accept improved. Results:
-`results/noise_protocol_blackbox_p0_seeds2/`.**
+**Honest multi-var structure path: search-space seeds + original-space free-const
+polish (no template auto-win). Clean seed=11 Exact=1 on Vlad/Pagie/Feynman.
+Outliers: Accept=1 + high R2clean, Exact still 0. Results:
+`results/noise_protocol_blackbox_p0_polish2/`.**
