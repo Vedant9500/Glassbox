@@ -264,3 +264,70 @@ Pareto weight threading, full multi-seed baseline run on real estimator,
   every row; failed seeds retained in summary.
 - CI smokes: weighted outlier recovery + trimmed robust recovery in
   `tests/test_phase7_phase8_noise_gate.py`.
+
+---
+
+## Blackbox × noise (Phases A–C + Phase E)
+
+### What landed
+
+| Layer | Status | Evidence |
+|-------|--------|----------|
+| Multi-var protocol (`--blackbox`) | Done | `DEFAULT_BLACKBOX_PROBLEMS` (Pagie-1, Feynman-I.9.18, Vladislavleva-4); row fields `blackbox_enabled`, `selected_features`, `noise_band`, … |
+| Weighted ranking | Done | `prepare_blackbox_search(..., sample_weight=)`; `test_weighted_ranking_prefers_true_features_under_outliers` |
+| Soft MAD + plan caps | Done | `blackbox_noise_robust=auto`; timeout multiplier can exceed 1.0 under blackbox noise pressure |
+| Structure seeds + free-const | Done | Clean Exact=1 (seed 11) on Vlad/Pagie/Feynman in `results/noise_protocol_blackbox_p0_polish2/` |
+| Phase E CI smoke | Done | `test_phase_e_blackbox_outliers_ci_smoke` — multi-feature × outliers, `blackbox_enabled=True`, feature drop possible |
+| Phase E ablation table | Done | `build_ablation_table` / `--ablation-table`; release presets `full,no_weights,no_robust_loss` |
+| Phase E+ Exact under outliers (unit) | Done | Original-space free-const + IRLS + known-const snap; Vlad/Pagie/Feynman clean_mse ≪ 1e-6 (`test_blackbox_structure_recovery`) |
+| Phase E+ noise_band sensitivity | Done | residual RMS + signal-scale outlier fraction; gaussian_10pct→low, outliers_3pct→medium |
+| Phase E+ multi-seed publish table | Done | `build_publish_table` / `--publish-table` / `--publish-seeds` (Exact matrix for release freeze) |
+
+### Linux `_core` rebuild (2026-07-14)
+
+- Extension rebuilt in place: `glassbox/sr/cpp/_core.cpython-314-x86_64-linux-gnu.so`
+- Weighted evolution + Huber/trimmed + units + weighted `reduce_formula_noise` are **runtime-real** on Linux, not source-only.
+- Phase suites: 118 passed (protocol, weights, candidate scoring, parity, robust, units, guards, release gate, blackbox preprocessor, structure recovery).
+
+### Literature do / avoid (blackbox × noise)
+
+| Do | Avoid |
+|----|--------|
+| Measure **clean recovery** (`R2clean` / Accept / Exact) on multi-var GT + noise | Treating Track-1 noisy-label R² as structure recovery |
+| Weight-aware ranking + search under outliers | Defaulting all Track 1 to `loss_mode=huber` |
+| Uncertain selection → keep more features; soft plan expand under noise | Aggressive post-hoc feature bans after full search |
+| Units only when real physics units exist | Faking units on unitless PMLB tables |
+| Ablation tables with **identical budgets** | Comparing methods with hidden timeout/pop differences |
+| Report failed seeds + ablation deltas vs `full` | Hiding failed seeds or claiming EXACT from noisy fit alone |
+| Constant-aware recovery (IRLS / free-const polish) | Denoiser / dual-encoder contrastive as first lever |
+
+### Still open (post Phase E+)
+
+- **Budgeted multi-seed protocol freeze** (tooling ready; numbers not yet locked):
+  `--blackbox --publish-table --publish-seeds --tiers clean,outliers_3pct`
+- End-to-end protocol Exact under outliers can still lag unit Exact when search
+  budget loses the original-space structure compete (complexity bloat path).
+- Optional Phase D: Track-1 dump of `runtime_noise` + `search_plan`; train-only
+  noise labeled noisy-label R².
+- `y_uncertainty` API (Phase 1 leftover); display/Pareto stay unweighted by design.
+
+### Phase E / E+ how-to
+
+```text
+# CI smoke (unit)
+python -m pytest tests/test_phase7_phase8_noise_gate.py::test_phase_e_blackbox_outliers_ci_smoke -q
+
+# Structure Exact + noise_band + publish helpers
+python -m pytest tests/test_blackbox_structure_recovery.py tests/test_phase7_phase8_noise_gate.py tests/test_benchmark_noise.py -q
+
+# Multi-var ablation table for release notes (identical budgets)
+python scripts/benchmark_noise.py --blackbox --ablation-table \
+  --ablations full,no_weights,no_robust_loss \
+  --seeds 11 --tiers clean,outliers_3pct \
+  --output-dir results/noise_protocol_blackbox_ablation
+
+# Multi-seed publish freeze (budgeted)
+python scripts/benchmark_noise.py --blackbox --publish-table --publish-seeds \
+  --tiers clean,outliers_3pct \
+  --output-dir results/noise_protocol_publish
+```

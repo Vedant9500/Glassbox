@@ -186,24 +186,90 @@ def _estimate_outlier_fraction(resid, sample_weight=None):
     return float(np.mean(np.abs(r[np.isfinite(r)]) > 3.0 * scale))
 
 
+def _signal_scale_outlier_fraction(resid, y=None, *, k: float = 2.5):
+    """Fraction of residuals larger than ``k`` × robust signal scale.
+
+    Complements MAD-relative outlier fraction: sparse protocol spikes (3%) can
+    inflate residual std/MAD so MAD-relative rate under-counts; signal-scale
+    rate still fires when spikes are large vs y.
+    """
+    r = np.asarray(resid, dtype=np.float64).reshape(-1)
+    if r.size == 0 or not np.any(np.isfinite(r)):
+        return 0.0
+    finite = np.isfinite(r)
+    r_f = r[finite]
+    if y is not None:
+        y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+        if y_arr.shape == r.shape:
+            y_f = y_arr[finite]
+            y_med = float(np.median(y_f))
+            y_mad = float(np.median(np.abs(y_f - y_med)))
+            scale = 1.4826 * y_mad if y_mad > 1e-12 else float(np.std(y_f))
+        else:
+            scale = float(np.std(r_f))
+    else:
+        scale = float(np.std(r_f))
+    if not np.isfinite(scale) or scale < 1e-12:
+        return 0.0
+    return float(np.mean(np.abs(r_f) > float(k) * scale))
+
+
+def _residual_rms_ratio(resid, y):
+    """RMS(residual) / max(std(y), eps), clipped to [0, 1].
+
+    Captures white-noise *amplitude* that pure geometry (autocorr / MAD rate)
+    misses. Used for noise_band sensitivity on gaussian_10pct tiers.
+    """
+    r = np.asarray(resid, dtype=np.float64).reshape(-1)
+    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+    if r.size == 0 or y_arr.size == 0 or r.shape != y_arr.shape:
+        return 0.0
+    finite = np.isfinite(r) & np.isfinite(y_arr)
+    if not np.any(finite):
+        return 0.0
+    r_f = r[finite]
+    y_f = y_arr[finite]
+    y_std = float(np.std(y_f))
+    if not np.isfinite(y_std) or y_std < 1e-12:
+        y_std = float(np.mean(np.abs(y_f - np.median(y_f))))
+    if not np.isfinite(y_std) or y_std < 1e-12:
+        return 0.0
+    rms = float(np.sqrt(np.mean(r_f ** 2)))
+    if not np.isfinite(rms):
+        return 0.0
+    return float(np.clip(rms / y_std, 0.0, 1.0))
+
+
 def _noise_band_from_diagnostics(diag):
     """Map runtime noise diagnostics to a coarse band used for threshold calibration.
 
     Bands align with protocol tiers conceptually: clean / low / medium / high.
     Not a claim about training-label noise — only residual/weight geometry at fit time.
+
+    Phase E+: residual RMS ratio + signal-scale outlier fraction so white Gaussian
+    and sparse protocol spikes no longer collapse to ``clean``.
     """
     if not isinstance(diag, dict):
         return "clean"
     outlier = float(diag.get("outlier_fraction") or 0.0)
+    signal_out = float(diag.get("signal_outlier_fraction") or 0.0)
+    # Prefer the stronger of MAD-relative vs signal-scale spike rates.
+    outlier_eff = max(outlier, signal_out)
     gap = float(diag.get("validation_gap") or 0.0)
     ac = abs(float(diag.get("residual_autocorr") or 0.0))
     ess_ratio = diag.get("ess_ratio")
     ess_ratio = float(ess_ratio) if ess_ratio is not None and np.isfinite(float(ess_ratio)) else 1.0
+    rms_ratio = float(diag.get("residual_rms_ratio") or 0.0)
+    if not np.isfinite(rms_ratio):
+        rms_ratio = 0.0
+    rms_ratio = float(np.clip(rms_ratio, 0.0, 1.0))
     score = (
-        1.2 * min(max(outlier, 0.0), 1.0)
+        1.2 * min(max(outlier_eff, 0.0), 1.0)
         + 0.8 * min(max(gap, 0.0), 1.0)
         + 0.4 * min(max(ac, 0.0), 1.0)
         + 0.6 * min(max(1.0 - ess_ratio, 0.0), 1.0)
+        # White-noise amplitude channel (gaussian_10pct ≈ 0.1 → +0.15).
+        + 1.5 * rms_ratio
     )
     if score < 0.15:
         return "clean"
@@ -1595,6 +1661,130 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         return number_pattern.sub(repl, text)
 
+    # Known algebraic / physics constants tried when free-const inliers are excellent.
+    # Score on inliers only — never force if structure fit degrades.
+    _KNOWN_STRUCTURE_CONSTANTS = (
+        1.0 / (4.0 * np.pi),   # ≈ 0.079577… Coulomb / Feynman-I.9.18
+        1.0 / (2.0 * np.pi),   # ≈ 0.159155…
+        1.0 / np.pi,           # ≈ 0.318310…
+        np.pi,
+        2.0 * np.pi,
+        4.0 * np.pi,
+        np.e,
+        1.0 / np.e,
+        np.sqrt(2.0),
+        np.sqrt(3.0),
+        0.5,
+        2.0,
+        5.0,
+        10.0,
+    )
+
+    def _snap_known_structure_constants(self, formula, *, atol=0.01, max_abs=100):
+        """Snap free literals toward a small bank of algebraic/physics constants.
+
+        Used after excellent inlier MSE under spikes so e.g. 0.07855 → 1/(4π)
+        without template auto-win. Pure hygiene; caller must re-score inliers.
+        """
+        text = str(formula or "")
+        if not text:
+            return text
+        number_pattern = re.compile(r"(?<![A-Za-z_])(?<!\w)([-+]?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?)")
+        bank = [float(c) for c in self._KNOWN_STRUCTURE_CONSTANTS if np.isfinite(float(c))]
+
+        def repl(match):
+            raw = match.group(0)
+            if match.start() > 0 and text[match.start() - 1] == "x":
+                return raw
+            # Leave pure integer exponents (x^2, x^4).
+            if match.start() > 0 and text[match.start() - 1] == "^":
+                return raw
+            try:
+                val = float(raw)
+            except Exception:
+                return raw
+            if abs(val) > float(max_abs) or abs(val) < 1e-15:
+                return raw
+            # Prefer integer snap when already near int (handled elsewhere);
+            # here only non-integer free consts toward known bank.
+            nearest_int = round(val)
+            if abs(val - nearest_int) <= 1e-9:
+                return raw
+            best_c = None
+            best_d = float("inf")
+            for c in bank:
+                # Relative + absolute tolerance so 0.07855 hits 0.079577.
+                d = abs(val - c)
+                rel = d / max(abs(c), abs(val), 1e-12)
+                if d <= float(atol) or rel <= 0.03:
+                    if d < best_d:
+                        best_d = d
+                        best_c = c
+            if best_c is None:
+                return raw
+            # Emit compact decimal (keep enough digits for 1/(4π)).
+            return f"{best_c:.12g}"
+
+        return number_pattern.sub(repl, text)
+
+    def _aggressive_exact_snap(self, formula, X, y, *, inlier_gate=1e-4):
+        """When inliers are excellent, push free constants to integers / known bank.
+
+        Returns (formula, full_mse, inlier_mse). Prefer inlier fidelity over full
+        noisy MSE so spike-dominated labels cannot block Exact clean recovery.
+        """
+        text = str(formula or "").strip()
+        X_arr = np.asarray(X, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+        if not text or X_arr.ndim != 2 or y_arr.size < 8:
+            return text, float("inf"), float("inf")
+
+        def _score(f):
+            try:
+                pred = self._safe_eval_formula_array(f, X_arr)
+                pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+                mse = float(np.mean((pred - y_arr) ** 2))
+                inlier = self._inlier_mse(pred, y_arr)
+                return mse, inlier
+            except Exception:
+                return float("inf"), float("inf")
+
+        best_f = text
+        best_m, best_in = _score(text)
+        if not (np.isfinite(best_in) and best_in <= float(inlier_gate)):
+            return best_f, best_m, best_in
+
+        # Wider integer atols when inliers already tiny (centers 3.058→3, 5.1→5).
+        int_atols = (5e-3, 1e-2, 2e-2, 5e-2, 8e-2) if best_in < 1e-5 else (5e-3, 1e-2, 2e-2)
+        for atol in int_atols:
+            snapped = self._snap_near_integer_constants(best_f, atol=atol)
+            if not snapped or snapped == best_f:
+                continue
+            mse_s, in_s = _score(snapped)
+            if np.isfinite(in_s) and in_s <= max(best_in * 1.5, 1e-10) + 1e-15:
+                best_f, best_m, best_in = snapped, mse_s, in_s
+
+        # Known-constant bank (physics product ratio, π, e, …).
+        for atol in (0.005, 0.01, 0.02):
+            snapped = self._snap_known_structure_constants(best_f, atol=atol)
+            if not snapped or snapped == best_f:
+                continue
+            mse_s, in_s = _score(snapped)
+            if np.isfinite(in_s) and in_s <= max(best_in * 1.5, 1e-10) + 1e-15:
+                best_f, best_m, best_in = snapped, mse_s, in_s
+                break
+
+        # Second integer pass after known-const (can unlock 10.0 / 5.0).
+        for atol in (1e-2, 5e-2):
+            snapped = self._snap_near_integer_constants(best_f, atol=atol)
+            if not snapped or snapped == best_f:
+                continue
+            mse_s, in_s = _score(snapped)
+            if np.isfinite(in_s) and in_s <= max(best_in * 1.5, 1e-10) + 1e-15:
+                best_f, best_m, best_in = snapped, mse_s, in_s
+
+        return best_f, best_m, best_in
+
     def _parse_outer_affine(self, formula):
         """Parse ((s)*(inner)+(b)) allowing extra paren nesting. Returns (s, inner, b) or None."""
         text = str(formula or "").strip().replace(" ", "")
@@ -1947,6 +2137,16 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         formula_orig, mse, inlier = snapped, mse_s, inlier_s
                 except Exception:
                     pass
+                # Aggressive Exact snap when free-const inliers already excellent.
+                if np.isfinite(inlier) and inlier < 1e-3:
+                    try:
+                        a_f, a_m, a_in = self._aggressive_exact_snap(
+                            formula_orig, X_all, y_all, inlier_gate=1e-3
+                        )
+                        if a_f and np.isfinite(a_in) and a_in <= max(inlier * 1.5, 1e-10):
+                            formula_orig, mse, inlier = a_f, a_m, a_in
+                    except Exception:
+                        pass
                 if np.isfinite(inlier) and inlier < 1e-6:
                     stripped = self._strip_near_identity_affine(formula_orig)
                     if stripped and stripped != formula_orig:
@@ -2194,7 +2394,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 pass
 
         # Final aggressive near-integer snap when inliers are excellent (Exact hygiene).
-        snap_atols = (5e-4, 1e-3, 2e-3, 5e-3, 1e-2) if float(best_inlier) < 1e-5 else (5e-4, 1e-3, 2e-3)
+        snap_atols = (5e-4, 1e-3, 2e-3, 5e-3, 1e-2, 2e-2, 5e-2) if float(best_inlier) < 1e-5 else (5e-4, 1e-3, 2e-3, 5e-3)
         for atol in snap_atols:
             snapped = self._snap_near_integer_constants(best_f, atol=atol)
             if not snapped or snapped == best_f:
@@ -2206,9 +2406,25 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             except Exception:
                 continue
             # Under spikes, full MSE is dominated by outliers — trust inliers.
-            if np.isfinite(inlier_s) and inlier_s <= max(best_inlier * 1.25, 1e-10) + 1e-15:
+            if np.isfinite(inlier_s) and inlier_s <= max(best_inlier * 1.35, 1e-10) + 1e-15:
                 best_f, best_m, best_inlier = snapped, mse_s, inlier_s
-                break
+                # keep widening while improving; don't break early
+
+        # Known-constant + wider integer bank when inliers already excellent.
+        # Closes Exact under outliers for product (1/4π) and radial (centers→3).
+        if np.isfinite(best_inlier) and best_inlier < 1e-3:
+            try:
+                snapped_f, snapped_m, snapped_in = self._aggressive_exact_snap(
+                    best_f, X_arr, y_arr, inlier_gate=1e-3
+                )
+                if (
+                    snapped_f
+                    and np.isfinite(snapped_in)
+                    and snapped_in <= max(best_inlier * 1.5, 1e-10) + 1e-15
+                ):
+                    best_f, best_m, best_inlier = snapped_f, snapped_m, snapped_in
+            except Exception:
+                pass
 
         if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
             self.blackbox_diagnostics_["original_space_polish"] = {
@@ -5229,10 +5445,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         Uses incumbent formula residuals when available; otherwise target-only
         proxies (weight ESS). Safe when inference fails — returns zeros.
+
+        Phase E+: also residual RMS / signal-scale outlier rate so white and
+        sparse-spike tiers do not under-detect as ``clean``.
         """
         diag = {
             "residual_autocorr": 0.0,
             "outlier_fraction": 0.0,
+            "signal_outlier_fraction": 0.0,
+            "residual_rms_ratio": 0.0,
             "validation_gap": 0.0,
             "ess_ratio": 1.0,
             "effective_sample_size": None,
@@ -5265,6 +5486,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     resid = pred - y_arr
                     diag["residual_autocorr"] = _residual_lag1_autocorr(resid)
                     diag["outlier_fraction"] = _estimate_outlier_fraction(resid, w)
+                    diag["signal_outlier_fraction"] = _signal_scale_outlier_fraction(
+                        resid, y_arr, k=2.5
+                    )
+                    diag["residual_rms_ratio"] = _residual_rms_ratio(resid, y_arr)
                     # Holdout generalization gap (unweighted display contract).
                     try:
                         split = self._domain_edge_validation_split(X_arr, y_arr, validation_fraction=0.2)
@@ -5329,6 +5554,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "noise_routing": {
                 "residual_autocorr": float(noise_diag.get("residual_autocorr") or 0.0),
                 "outlier_fraction": float(noise_diag.get("outlier_fraction") or 0.0),
+                "signal_outlier_fraction": float(noise_diag.get("signal_outlier_fraction") or 0.0),
+                "residual_rms_ratio": float(noise_diag.get("residual_rms_ratio") or 0.0),
                 "validation_gap": float(noise_diag.get("validation_gap") or 0.0),
                 "ess_ratio": float(noise_diag.get("ess_ratio") if noise_diag.get("ess_ratio") is not None else 1.0),
             },
@@ -5410,15 +5637,23 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         elif proposer_uncertainty is not None:
             proposer_unc = float(np.clip(float(proposer_uncertainty), 0.0, 1.0))
 
-        # Phase 7: residual / weight geometry — expand budget on noisy residuals.
+        # Phase 7 / E+: residual geometry + amplitude — expand budget on noise.
         outlier_frac = float(np.clip(float(noise_diag.get("outlier_fraction") or 0.0), 0.0, 1.0))
+        signal_out = float(np.clip(float(noise_diag.get("signal_outlier_fraction") or 0.0), 0.0, 1.0))
+        outlier_eff = max(outlier_frac, signal_out)
         val_gap = float(np.clip(float(noise_diag.get("validation_gap") or 0.0), 0.0, 1.0))
         resid_ac = float(np.clip(abs(float(noise_diag.get("residual_autocorr") or 0.0)), 0.0, 1.0))
         ess_ratio = noise_diag.get("ess_ratio")
         ess_ratio = float(ess_ratio) if ess_ratio is not None and np.isfinite(float(ess_ratio)) else 1.0
         ess_ratio = float(np.clip(ess_ratio, 0.0, 1.0))
+        rms_ratio = float(np.clip(float(noise_diag.get("residual_rms_ratio") or 0.0), 0.0, 1.0))
+        # Weights sum to 1.0; residual RMS catches white noise amplitude.
         noise_pressure = float(np.clip(
-            0.40 * outlier_frac + 0.30 * val_gap + 0.15 * resid_ac + 0.15 * (1.0 - ess_ratio),
+            0.30 * outlier_eff
+            + 0.20 * val_gap
+            + 0.10 * resid_ac
+            + 0.10 * (1.0 - ess_ratio)
+            + 0.30 * rms_ratio,
             0.0,
             1.0,
         ))
@@ -5459,22 +5694,30 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if noise_band in ("medium", "high") and candidate_strength >= 0.90:
             depth_multiplier = max(depth_multiplier, 1.15)
             breadth_multiplier = max(breadth_multiplier, 1.10)
-        if uncertainty_score < 0.3 and noise_band == "clean":
+        # Soft clean-shrink: only when residual amplitude AND pressure are tiny.
+        # Prevents under-expansion when band lags but RMS/spikes are real.
+        if (
+            uncertainty_score < 0.3
+            and noise_band == "clean"
+            and noise_pressure < 0.05
+            and rms_ratio < 0.03
+        ):
             breadth_multiplier *= 0.85
             depth_multiplier *= 0.9
-        elif uncertainty_score > 0.7 or noise_band == "high":
+        elif uncertainty_score > 0.7 or noise_band == "high" or noise_pressure >= 0.25:
             breadth_multiplier *= 1.08
             depth_multiplier *= 1.08
 
-        # Phase C: when blackbox is noisy and/or selection-uncertain, do not
+        # Phase C / E+: when blackbox is noisy and/or selection-uncertain, do not
         # over-clamp Track-1 budget (literature: best-case recovery needs room).
         hard_blackbox_caps = True
         relax_blackbox_caps = (
             getattr(blackbox_state, "enabled", False)
             and (
-                noise_band in ("medium", "high")
+                noise_band in ("medium", "high", "low")
                 or selection_uncertainty >= 0.70
-                or noise_pressure >= 0.35
+                or noise_pressure >= 0.15
+                or rms_ratio >= 0.08
             )
         )
         if getattr(blackbox_state, "enabled", False):
@@ -8053,20 +8296,37 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 cur_in = self._inlier_mse(cur_pred, y_original)
                             except Exception:
                                 cur_in = cur_m
-                            if o_f and np.isfinite(o_m) and (
-                                o_in < cur_in * 0.98
-                                or o_m < cur_m * 0.98
-                                or (
+                            # Prefer excellent-inlier structure over noisy full-MSE winners.
+                            # Protocol Exact cares about clean algebraic form; spike-dominated
+                            # full MSE must not block near-Exact free-const families.
+                            prefer_structure = False
+                            if o_f and np.isfinite(o_in):
+                                if o_in < 1e-6 and (not np.isfinite(cur_in) or cur_in > 1e-6):
+                                    prefer_structure = True
+                                elif o_in < 1e-8 and (
+                                    not np.isfinite(cur_in) or cur_in > o_in * 10.0
+                                ):
+                                    prefer_structure = True
+                                elif o_in < cur_in * 0.98:
+                                    prefer_structure = True
+                                elif np.isfinite(o_m) and o_m < cur_m * 0.98:
+                                    prefer_structure = True
+                                elif (
                                     o_in <= max(cur_in * 1.05, 1e-8)
                                     and self._formula_complexity(o_f) + 8
                                     <= self._formula_complexity(best_formula)
-                                )
-                                or (
+                                ):
+                                    prefer_structure = True
+                                elif (
                                     np.isfinite(o_in)
-                                    and o_in < 1e-6
-                                    and (not np.isfinite(cur_in) or cur_in > 1e-6)
-                                )
-                            ):
+                                    and o_in < 1e-5
+                                    and np.isfinite(cur_in)
+                                    and cur_in > 1e-4
+                                    and self._formula_complexity(o_f)
+                                    <= self._formula_complexity(best_formula) + 12
+                                ):
+                                    prefer_structure = True
+                            if prefer_structure:
                                 best_formula, best_mse = o_f, o_m
                                 if isinstance(self.blackbox_diagnostics_, dict):
                                     self.blackbox_diagnostics_["original_space_structure_winner"] = {

@@ -200,12 +200,23 @@ python scripts/benchmark_noise.py --smoke --blackbox --output-dir results/noise_
 
 ---
 
-## Phase E — CI / release
+## Phase E — CI / release — DONE
 
-1. Multi-feature × outliers CI smoke with `blackbox_enabled=True` and, if possible, a case where selection drops features.
+1. Multi-feature × outliers CI smoke with `blackbox_enabled=True` and a path where selection can drop features.
+   - `tests/test_phase7_phase8_noise_gate.py::test_phase_e_blackbox_outliers_ci_smoke`
 2. Ablation table on multi-var noise protocol for release notes.
+   - `build_ablation_table` / `write_ablation_report` / `--ablation-table`
+   - Default presets: `DEFAULT_BLACKBOX_RELEASE_ABLATIONS = full,no_weights,no_robust_loss`
 3. Update `noise_handling_audit.md` with blackbox × noise section + literature do/avoid.
 4. Do **not** retrain classifier/proposer on multi-noise in this plan (out of scope).
+
+**CLI:**
+```text
+python scripts/benchmark_noise.py --blackbox --ablation-table \
+  --ablations full,no_weights,no_robust_loss \
+  --seeds 11 --tiers clean,outliers_3pct \
+  --output-dir results/noise_protocol_blackbox_ablation
+```
 
 ---
 

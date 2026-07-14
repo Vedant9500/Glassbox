@@ -765,6 +765,418 @@ def write_report(rows, summary, output_dir) -> Dict[str, Path]:
     return {"rows": rows_path, "summary": summary_path, "markdown": md_path}
 
 
+# ---------------------------------------------------------------------------
+# Phase E — multi-var ablation table (release notes)
+# ---------------------------------------------------------------------------
+# Default ablations for blackbox × noise release comparisons. Keep budgets
+# identical across these; only estimator knobs change.
+DEFAULT_BLACKBOX_RELEASE_ABLATIONS: Tuple[str, ...] = (
+    "full",
+    "no_weights",
+    "no_robust_loss",
+)
+
+
+def build_ablation_table(
+    rows_by_ablation: Dict[str, Sequence[Dict[str, Any]]],
+    *,
+    baseline: str = "full",
+) -> Dict[str, Any]:
+    """Compare multi-var noise protocol ablations for release notes.
+
+    ``rows_by_ablation`` maps ablation name -> protocol rows (same problems /
+    tiers / seeds / budgets). Metrics are clean-recovery first (R2clean /
+    Accept / Exact), never noisy-label R² alone.
+    """
+    if not rows_by_ablation:
+        raise ValueError("rows_by_ablation is empty")
+    if baseline not in rows_by_ablation:
+        raise ValueError(
+            f"baseline ablation {baseline!r} missing; have {sorted(rows_by_ablation)}"
+        )
+
+    summaries: Dict[str, Dict[str, Any]] = {}
+    for name, rows in rows_by_ablation.items():
+        summary = summarize_noise_protocol(rows)
+        summary["ablation"] = str(name)
+        summaries[str(name)] = summary
+
+    # Per (problem, tier, ablation) cell table with delta vs baseline.
+    baseline_cells = {
+        (c["problem"], c["tier"]): c for c in summaries[baseline]["cells"]
+    }
+    comparison_rows: List[Dict[str, Any]] = []
+    for name, summary in summaries.items():
+        for cell in summary["cells"]:
+            key = (cell["problem"], cell["tier"])
+            base = baseline_cells.get(key)
+            row = {
+                "ablation": name,
+                "problem": cell["problem"],
+                "tier": cell["tier"],
+                "n_runs": cell["n_runs"],
+                "median_clean_test_r2": cell.get("median_clean_test_r2"),
+                "acceptable_clean_rate": cell.get("acceptable_clean_rate"),
+                "exact_match_rate": cell.get("exact_match_rate"),
+                "median_test_r2": cell.get("median_test_r2"),
+                "median_formula_complexity": cell.get("median_formula_complexity"),
+                "false_confidence_rate": cell.get("false_confidence_rate"),
+                "is_baseline": name == baseline,
+            }
+            if base is not None and name != baseline:
+                for metric in (
+                    "median_clean_test_r2",
+                    "acceptable_clean_rate",
+                    "exact_match_rate",
+                    "median_test_r2",
+                    "median_formula_complexity",
+                ):
+                    cur = cell.get(metric)
+                    ref = base.get(metric)
+                    if cur is not None and ref is not None:
+                        row[f"delta_{metric}_vs_{baseline}"] = float(cur) - float(ref)
+                    else:
+                        row[f"delta_{metric}_vs_{baseline}"] = None
+            comparison_rows.append(row)
+
+    # Aggregate headline: mean Accept/R2clean on non-clean tiers per ablation.
+    headlines: List[Dict[str, Any]] = []
+    for name, summary in summaries.items():
+        noisy_cells = [c for c in summary["cells"] if c.get("tier") != "clean"]
+        if not noisy_cells:
+            noisy_cells = list(summary["cells"])
+        def _mean_key(cells, key):
+            vals = [float(c[key]) for c in cells if c.get(key) is not None]
+            return float(np.mean(vals)) if vals else None
+
+        headlines.append({
+            "ablation": name,
+            "n_cells": len(summary["cells"]),
+            "mean_clean_test_r2_noisy_tiers": _mean_key(
+                noisy_cells, "median_clean_test_r2"
+            ),
+            "mean_acceptable_clean_rate_noisy_tiers": _mean_key(
+                noisy_cells, "acceptable_clean_rate"
+            ),
+            "mean_exact_match_rate_noisy_tiers": _mean_key(
+                noisy_cells, "exact_match_rate"
+            ),
+            "mean_formula_complexity_noisy_tiers": _mean_key(
+                noisy_cells, "median_formula_complexity"
+            ),
+            "is_baseline": name == baseline,
+        })
+
+    # Ensure baseline is first, then attach deltas.
+    headlines.sort(key=lambda h: (0 if h["ablation"] == baseline else 1, h["ablation"]))
+    base_head = next(h for h in headlines if h["ablation"] == baseline)
+    for head in headlines:
+        if head["ablation"] == baseline:
+            continue
+        for metric in (
+            "mean_clean_test_r2_noisy_tiers",
+            "mean_acceptable_clean_rate_noisy_tiers",
+            "mean_exact_match_rate_noisy_tiers",
+            "mean_formula_complexity_noisy_tiers",
+        ):
+            cur = head.get(metric)
+            ref = base_head.get(metric)
+            if cur is not None and ref is not None:
+                head[f"delta_{metric}_vs_{baseline}"] = float(cur) - float(ref)
+            else:
+                head[f"delta_{metric}_vs_{baseline}"] = None
+
+    return {
+        "baseline": baseline,
+        "ablations": list(summaries.keys()),
+        "summaries": summaries,
+        "comparison_rows": comparison_rows,
+        "headlines": headlines,
+        "n_ablations": len(summaries),
+    }
+
+
+def ablation_table_to_markdown(table: Dict[str, Any]) -> str:
+    """Render Phase E multi-var ablation headlines + per-cell deltas as Markdown."""
+    baseline = table.get("baseline", "full")
+    lines = [
+        "# Blackbox × Noise — Ablation Table (Phase E)",
+        "",
+        f"Baseline ablation: `{baseline}`",
+        "",
+        "## Headline (noisy tiers, clean recovery)",
+        "",
+        "| Ablation | R2clean | Accept | Exact | Complexity | ΔR2clean | ΔAccept |",
+        "|---|---:|---:|---:|---:|---:|---:|",
+    ]
+
+    def fmt(v, prec=4):
+        return "-" if v is None else f"{float(v):.{prec}g}"
+
+    for h in table.get("headlines", []):
+        d_r2 = h.get(f"delta_mean_clean_test_r2_noisy_tiers_vs_{baseline}")
+        d_acc = h.get(f"delta_mean_acceptable_clean_rate_noisy_tiers_vs_{baseline}")
+        lines.append(
+            f"| {h['ablation']} | {fmt(h.get('mean_clean_test_r2_noisy_tiers'))} | "
+            f"{fmt(h.get('mean_acceptable_clean_rate_noisy_tiers'), 2)} | "
+            f"{fmt(h.get('mean_exact_match_rate_noisy_tiers'), 2)} | "
+            f"{fmt(h.get('mean_formula_complexity_noisy_tiers'), 3)} | "
+            f"{fmt(d_r2)} | {fmt(d_acc, 2)} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Per problem × tier",
+            "",
+            "| Ablation | Problem | Tier | R2clean | Accept | Exact | Complexity |",
+            "|---|---|---|---:|---:|---:|---:|",
+        ]
+    )
+    for row in table.get("comparison_rows", []):
+        lines.append(
+            f"| {row['ablation']} | {row['problem']} | {row['tier']} | "
+            f"{fmt(row.get('median_clean_test_r2'))} | "
+            f"{fmt(row.get('acceptable_clean_rate'), 2)} | "
+            f"{fmt(row.get('exact_match_rate'), 2)} | "
+            f"{fmt(row.get('median_formula_complexity'), 3)} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_ablation_report(
+    table: Dict[str, Any], output_dir
+) -> Dict[str, Path]:
+    """Write multi-var ablation JSON + Markdown for release notes."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "noise_protocol_ablation_table.json"
+    md_path = output_dir / "noise_protocol_ablation_table.md"
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(table, f, indent=2, default=_json_default)
+    with md_path.open("w", encoding="utf-8") as f:
+        f.write(ablation_table_to_markdown(table))
+    return {"ablation_json": json_path, "ablation_markdown": md_path}
+
+
+# ---------------------------------------------------------------------------
+# Phase E+ — multi-seed publishable tables (release freeze)
+# ---------------------------------------------------------------------------
+# Default seed set for publishable multi-var blackbox × noise claims.
+# Seed 11 is the locked single-seed lock; 7/23/42 expand variance coverage.
+DEFAULT_PUBLISH_SEEDS: Tuple[int, ...] = (11, 7, 23, 42)
+DEFAULT_PUBLISH_TIERS: Tuple[str, ...] = ("clean", "outliers_3pct")
+
+
+def build_publish_table(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    seeds: Optional[Sequence[int]] = None,
+    min_seeds: int = 2,
+) -> Dict[str, Any]:
+    """Build a multi-seed publishable recovery table from protocol rows.
+
+    Clean-recovery first: Exact / Accept / R2clean rates with per-seed
+    visibility. Suitable for release notes — never use noisy-label R² alone.
+    """
+    assert_row_contract(rows)
+    seed_list = [int(s) for s in (seeds if seeds is not None else sorted({
+        int(r["seed"]) for r in rows if r.get("seed") is not None
+    }))]
+    if not seed_list:
+        seed_list = list(DEFAULT_PUBLISH_SEEDS)
+
+    summary = summarize_noise_protocol(rows)
+    by_key: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for row in rows:
+        by_key.setdefault((row["problem"], row["tier"]), []).append(row)
+
+    cells: List[Dict[str, Any]] = []
+    for (problem, tier), runs in sorted(by_key.items()):
+        seed_exact = {}
+        seed_accept = {}
+        seed_r2clean = {}
+        seed_formula = {}
+        for r in runs:
+            s = int(r["seed"])
+            seed_exact[s] = bool(r.get("exact_match"))
+            seed_accept[s] = bool(r.get("acceptable_clean"))
+            if r.get("clean_test_r2") is not None:
+                seed_r2clean[s] = float(r["clean_test_r2"])
+            if r.get("formula") is not None:
+                seed_formula[s] = str(r.get("formula") or "")[:120]
+        n_seeds = len({int(r["seed"]) for r in runs})
+        clean_r2s = [
+            float(r["clean_test_r2"])
+            for r in runs
+            if r.get("clean_test_r2") is not None
+        ]
+        cells.append({
+            "problem": problem,
+            "tier": tier,
+            "n_runs": len(runs),
+            "n_seeds": n_seeds,
+            "seeds": sorted({int(r["seed"]) for r in runs}),
+            "exact_match_rate": float(np.mean([1.0 if r.get("exact_match") else 0.0 for r in runs])),
+            "acceptable_clean_rate": float(
+                np.mean([1.0 if r.get("acceptable_clean") else 0.0 for r in runs])
+            ),
+            "median_clean_test_r2": float(np.median(clean_r2s)) if clean_r2s else None,
+            "mean_clean_test_r2": float(np.mean(clean_r2s)) if clean_r2s else None,
+            "seed_exact": seed_exact,
+            "seed_accept": seed_accept,
+            "seed_r2clean": seed_r2clean,
+            "seed_formula": seed_formula,
+            "median_formula_complexity": _median_key(runs, "formula_complexity"),
+            "median_clean_full_mse": _median_key(runs, "clean_full_mse"),
+            "publishable_seed_coverage": bool(n_seeds >= int(min_seeds)),
+        })
+
+    # Headline: clean tiers vs outlier tiers across all multi-var problems.
+    clean_cells = [c for c in cells if c["tier"] == "clean"]
+    outlier_cells = [c for c in cells if "outlier" in str(c["tier"]).lower()]
+    if not outlier_cells:
+        outlier_cells = [c for c in cells if c["tier"] != "clean"]
+
+    def _mean_cells(cs, key):
+        vals = [float(c[key]) for c in cs if c.get(key) is not None]
+        return float(np.mean(vals)) if vals else None
+
+    headlines = {
+        "clean": {
+            "n_cells": len(clean_cells),
+            "mean_exact_match_rate": _mean_cells(clean_cells, "exact_match_rate"),
+            "mean_acceptable_clean_rate": _mean_cells(clean_cells, "acceptable_clean_rate"),
+            "mean_median_clean_test_r2": _mean_cells(clean_cells, "median_clean_test_r2"),
+        },
+        "outliers": {
+            "n_cells": len(outlier_cells),
+            "mean_exact_match_rate": _mean_cells(outlier_cells, "exact_match_rate"),
+            "mean_acceptable_clean_rate": _mean_cells(outlier_cells, "acceptable_clean_rate"),
+            "mean_median_clean_test_r2": _mean_cells(outlier_cells, "median_clean_test_r2"),
+        },
+    }
+
+    n_seed_obs = max((c["n_seeds"] for c in cells), default=0)
+    return {
+        "seeds": seed_list,
+        "min_seeds": int(min_seeds),
+        "n_rows": len(rows),
+        "n_cells": len(cells),
+        "seed_coverage_ok": bool(n_seed_obs >= int(min_seeds)),
+        "cells": cells,
+        "headlines": headlines,
+        "summary": summary,
+        "contract": {
+            "exact_definition": "clean_full_mse < 1e-6",
+            "acceptable_definition": "clean_test_r2 >= 0.9",
+            "metrics_are_clean_recovery": True,
+            "do_not_use_suite_noisy_exact": True,
+        },
+    }
+
+
+def publish_table_to_markdown(table: Dict[str, Any]) -> str:
+    """Render multi-seed publishable recovery table as Markdown for release notes."""
+    seeds = table.get("seeds") or []
+    lines = [
+        "# Blackbox × Noise — Multi-Seed Publish Table (Phase E+)",
+        "",
+        f"Seeds: `{', '.join(str(s) for s in seeds)}`",
+        f"Seed coverage OK (≥{table.get('min_seeds', 2)}): "
+        f"**{bool(table.get('seed_coverage_ok'))}**",
+        "",
+        "## Headline",
+        "",
+        "| Bucket | Exact | Accept | R2clean |",
+        "|---|---:|---:|---:|",
+    ]
+
+    def fmt(v, prec=4):
+        return "-" if v is None else f"{float(v):.{prec}g}"
+
+    for bucket in ("clean", "outliers"):
+        h = (table.get("headlines") or {}).get(bucket) or {}
+        lines.append(
+            f"| {bucket} | {fmt(h.get('mean_exact_match_rate'), 2)} | "
+            f"{fmt(h.get('mean_acceptable_clean_rate'), 2)} | "
+            f"{fmt(h.get('mean_median_clean_test_r2'))} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Per problem × tier (multi-seed rates)",
+            "",
+            "| Problem | Tier | n_seeds | Exact | Accept | R2clean | CleanFullMSE | Complexity |",
+            "|---|---|---:|---:|---:|---:|---:|---:|",
+        ]
+    )
+    for cell in table.get("cells", []):
+        lines.append(
+            f"| {cell['problem']} | {cell['tier']} | {cell['n_seeds']} | "
+            f"{fmt(cell.get('exact_match_rate'), 2)} | "
+            f"{fmt(cell.get('acceptable_clean_rate'), 2)} | "
+            f"{fmt(cell.get('median_clean_test_r2'))} | "
+            f"{fmt(cell.get('median_clean_full_mse'))} | "
+            f"{fmt(cell.get('median_formula_complexity'), 3)} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Per-seed Exact matrix",
+            "",
+        ]
+    )
+    # Build seed columns from observed seeds in cells
+    obs_seeds = sorted({
+        int(s)
+        for cell in table.get("cells", [])
+        for s in (cell.get("seeds") or [])
+    })
+    if obs_seeds:
+        header = "| Problem | Tier | " + " | ".join(f"s{s}" for s in obs_seeds) + " |"
+        sep = "|---|---|" + "|".join(["---:" for _ in obs_seeds]) + "|"
+        lines.append(header)
+        lines.append(sep)
+        for cell in table.get("cells", []):
+            seed_exact = cell.get("seed_exact") or {}
+            bits = []
+            for s in obs_seeds:
+                v = seed_exact.get(s)
+                if v is None:
+                    bits.append("-")
+                else:
+                    bits.append("1" if v else "0")
+            lines.append(
+                f"| {cell['problem']} | {cell['tier']} | " + " | ".join(bits) + " |"
+            )
+    lines.append("")
+    lines.append(
+        "_Contract: Exact = clean_full_mse < 1e-6; Accept = clean_test_r2 ≥ 0.9. "
+        "Do not cite suite noisy EXACT% as structure recovery._"
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_publish_report(
+    table: Dict[str, Any], output_dir
+) -> Dict[str, Path]:
+    """Write multi-seed publish JSON + Markdown for release freeze."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "noise_protocol_publish_table.json"
+    md_path = output_dir / "noise_protocol_publish_table.md"
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(table, f, indent=2, default=_json_default)
+    with md_path.open("w", encoding="utf-8") as f:
+        f.write(publish_table_to_markdown(table))
+    return {"publish_json": json_path, "publish_markdown": md_path}
+
+
 def _json_default(obj):
     if isinstance(obj, (np.integer,)):
         return int(obj)
@@ -990,6 +1402,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help=(
             "Estimator ablation preset for release-gate comparisons: "
             + ", ".join(sorted(ABLATION_PRESETS))
+            + ". Use --ablation-table to run several and emit a comparison."
+        ),
+    )
+    parser.add_argument(
+        "--ablation-table",
+        action="store_true",
+        help=(
+            "Phase E: run DEFAULT_BLACKBOX_RELEASE_ABLATIONS (or --ablations) "
+            "with identical budgets and write multi-var ablation table for "
+            "release notes. Implies multi-feature blackbox protocol defaults "
+            "when --blackbox is also set (recommended)."
+        ),
+    )
+    parser.add_argument(
+        "--ablations",
+        type=str,
+        default=",".join(DEFAULT_BLACKBOX_RELEASE_ABLATIONS),
+        help=(
+            "Comma-separated ablation presets for --ablation-table "
+            f"(default: {','.join(DEFAULT_BLACKBOX_RELEASE_ABLATIONS)})"
+        ),
+    )
+    parser.add_argument(
+        "--publish-table",
+        action="store_true",
+        help=(
+            "Phase E+: emit multi-seed publishable recovery table "
+            "(Exact/Accept/R2clean + per-seed Exact matrix) for release freeze. "
+            "Recommended with --blackbox --seeds 11,7,23,42 --tiers clean,outliers_3pct."
+        ),
+    )
+    parser.add_argument(
+        "--publish-seeds",
+        action="store_true",
+        help=(
+            "Use DEFAULT_PUBLISH_SEEDS "
+            f"({','.join(str(s) for s in DEFAULT_PUBLISH_SEEDS)}) "
+            "unless --seeds is explicitly set for a non-default list."
         ),
     )
     parser.add_argument("--quiet", action="store_true")
@@ -1010,15 +1460,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             problem_names = list(DEFAULT_BLACKBOX_PROBLEMS)
         else:
             problem_names = [p.strip() for p in args.problems.split(",") if p.strip()]
-        seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
+        if args.publish_seeds and args.seeds == "11,23,47,89,137":
+            seeds = list(DEFAULT_PUBLISH_SEEDS)
+        else:
+            seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
         if args.tiers.strip().lower() == "all":
-            tier_names = [t["name"] for t in NOISE_TIERS]
+            # Publish-table freeze focuses on clean + outliers by default.
+            if args.publish_table or args.publish_seeds:
+                tier_names = list(DEFAULT_PUBLISH_TIERS)
+            else:
+                tier_names = [t["name"] for t in NOISE_TIERS]
         else:
             tier_names = [t.strip() for t in args.tiers.split(",") if t.strip()]
         generations = int(args.generations)
         pop = int(args.population_size)
         timeout = float(args.timeout)
         n_samples = int(args.n_samples)
+
+    # Phase E ablation-table defaults: multi-var + outliers, modest budget.
+    if args.ablation_table and not args.smoke:
+        if args.blackbox and args.problems == ",".join(DEFAULT_BASELINE_PROBLEMS):
+            problem_names = list(DEFAULT_BLACKBOX_PROBLEMS)
+        if args.tiers.strip().lower() == "all" and not args.smoke:
+            # Keep release ablation tables focused (not full tier matrix).
+            tier_names = ["clean", "outliers_3pct", "gaussian_10pct"]
 
     tier_by_name = {t["name"]: t for t in NOISE_TIERS}
     tiers = []
@@ -1028,6 +1493,140 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         tiers.append(tier_by_name[name])
 
     problems = _select_problems(problem_names)
+
+    def _annotate_rows(rows, ablation_name: str) -> List[Dict[str, Any]]:
+        annotated = []
+        for row in rows:
+            r = dict(row)
+            r["ablation"] = str(ablation_name)
+            r["budget_generations"] = int(generations)
+            r["budget_population"] = int(pop)
+            r["budget_timeout"] = float(timeout)
+            if r.get("error"):
+                r["failed_seed"] = True
+            annotated.append(r)
+        return annotated
+
+    def _budget_dict() -> Dict[str, Any]:
+        return {
+            "generations": int(generations),
+            "population_size": int(pop),
+            "timeout": float(timeout),
+            "n_samples": int(n_samples),
+            "seeds": list(seeds),
+        }
+
+    out_dir = Path(args.output_dir)
+
+    # ------------------------------------------------------------------
+    # Phase E: multi-ablation comparison table
+    # ------------------------------------------------------------------
+    if args.ablation_table:
+        ablation_names = [
+            a.strip().lower() for a in str(args.ablations).split(",") if a.strip()
+        ]
+        if not ablation_names:
+            raise SystemExit("--ablations resolved to empty list")
+        unknown = [a for a in ablation_names if a not in ABLATION_PRESETS]
+        if unknown:
+            raise SystemExit(
+                f"unknown ablation(s) {unknown}; choose from {sorted(ABLATION_PRESETS)}"
+            )
+        if "full" not in ablation_names:
+            # Always include baseline for deltas.
+            ablation_names = ["full"] + ablation_names
+
+        if not args.quiet:
+            print(
+                f"Ablation table: {len(ablation_names)} ablations × "
+                f"{len(problems)} problems × {len(tiers)} tiers × "
+                f"{len(seeds)} seeds  (n_samples={n_samples})"
+            )
+            print(f"Ablations: {', '.join(ablation_names)}")
+            print(f"Problems:  {', '.join(p[0] for p in problems)}")
+            print(f"Tiers:     {', '.join(t['name'] for t in tiers)}")
+            print(f"Seeds:     {seeds}")
+            print(
+                f"Budget:    generations={generations} population={pop} "
+                f"timeout={timeout}s"
+            )
+            print(f"Blackbox protocol: {bool(args.blackbox)}")
+
+        rows_by_ablation: Dict[str, List[Dict[str, Any]]] = {}
+        all_rows: List[Dict[str, Any]] = []
+        for abl in ablation_names:
+            try:
+                factory = _default_estimator_factory(
+                    generations=generations,
+                    population_size=pop,
+                    timeout=timeout,
+                    allow_stub=bool(args.smoke),
+                    ablation=abl,
+                    blackbox_protocol=bool(args.blackbox),
+                )
+            except ValueError as exc:
+                raise SystemExit(str(exc)) from exc
+            if not args.quiet:
+                print(f"\n--- ablation={abl} ---")
+            rows = run_noise_protocol(
+                factory,
+                problems,
+                tiers=tiers,
+                seeds=seeds,
+                n_samples=n_samples,
+                verbose=not args.quiet,
+            )
+            rows = _annotate_rows(rows, abl)
+            rows_by_ablation[abl] = rows
+            all_rows.extend(rows)
+
+        table = build_ablation_table(rows_by_ablation, baseline="full")
+        table["budget"] = _budget_dict()
+        table["blackbox_protocol"] = bool(args.blackbox)
+        table["problems"] = [p[0] for p in problems]
+        table["tiers"] = [t["name"] for t in tiers]
+
+        # Primary protocol report uses full ablation rows.
+        full_rows = rows_by_ablation.get("full", all_rows)
+        summary = summarize_noise_protocol(full_rows)
+        summary["ablation"] = "full"
+        summary["budget"] = _budget_dict()
+        summary["ablation_table"] = True
+        failed = [r for r in all_rows if r.get("error")]
+        summary["failed_seeds"] = [
+            {
+                "problem": r.get("problem"),
+                "tier": r.get("tier"),
+                "seed": r.get("seed"),
+                "ablation": r.get("ablation"),
+                "error": r.get("error"),
+            }
+            for r in failed
+        ]
+        summary["n_failed_seeds"] = len(failed)
+
+        paths = write_report(all_rows, summary, out_dir)
+        abl_paths = write_ablation_report(table, out_dir)
+        paths.update(abl_paths)
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stamped = out_dir / f"noise_protocol_ablation_{stamp}"
+        stamped.mkdir(parents=True, exist_ok=True)
+        for key, src in paths.items():
+            dest = stamped / Path(src).name
+            dest.write_bytes(Path(src).read_bytes())
+
+        if not args.quiet:
+            print("\nWrote:")
+            for key, p in paths.items():
+                print(f"  {key}: {p}")
+            print(f"  stamped: {stamped}")
+            print("\n" + ablation_table_to_markdown(table))
+        return 0
+
+    # ------------------------------------------------------------------
+    # Single-ablation protocol (default)
+    # ------------------------------------------------------------------
     try:
         factory = _default_estimator_factory(
             generations=generations,
@@ -1062,39 +1661,39 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         n_samples=n_samples,
         verbose=not args.quiet,
     )
-    # Annotate every row with ablation + budget for release-gate audits.
-    for row in rows:
-        row["ablation"] = str(args.ablation)
-        row["budget_generations"] = int(generations)
-        row["budget_population"] = int(pop)
-        row["budget_timeout"] = float(timeout)
-        # Failed seeds stay visible (error field already set in _run_single).
-        if row.get("error"):
-            row["failed_seed"] = True
+    rows = _annotate_rows(rows, str(args.ablation))
     summary = summarize_noise_protocol(rows)
     summary["ablation"] = str(args.ablation)
-    summary["budget"] = {
-        "generations": int(generations),
-        "population_size": int(pop),
-        "timeout": float(timeout),
-        "n_samples": int(n_samples),
-        "seeds": list(seeds),
-    }
+    summary["budget"] = _budget_dict()
     failed = [r for r in rows if r.get("error")]
     summary["failed_seeds"] = [
         {"problem": r.get("problem"), "tier": r.get("tier"), "seed": r.get("seed"), "error": r.get("error")}
         for r in failed
     ]
     summary["n_failed_seeds"] = len(failed)
-    out_dir = Path(args.output_dir)
     paths = write_report(rows, summary, out_dir)
+
+    # Phase E+: multi-seed publish table (Exact/Accept matrix for release freeze).
+    if args.publish_table or (args.blackbox and len(seeds) >= 2):
+        pub = build_publish_table(rows, seeds=seeds)
+        pub["budget"] = _budget_dict()
+        pub["blackbox_protocol"] = bool(args.blackbox)
+        pub["problems"] = [p[0] for p in problems]
+        pub["tiers"] = [t["name"] for t in tiers]
+        pub["ablation"] = str(args.ablation)
+        pub_paths = write_publish_report(pub, out_dir)
+        paths.update(pub_paths)
+        summary["publish_table"] = True
+        summary["seed_coverage_ok"] = bool(pub.get("seed_coverage_ok"))
+        if not args.quiet:
+            print("\n" + publish_table_to_markdown(pub))
 
     # Also stamp a dated copy for baseline freeze.
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     stamped = out_dir / f"noise_protocol_{stamp}"
     stamped.mkdir(parents=True, exist_ok=True)
     for key, src in paths.items():
-        dest = stamped / src.name
+        dest = stamped / Path(src).name
         dest.write_bytes(Path(src).read_bytes())
 
     if not args.quiet:

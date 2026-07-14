@@ -258,6 +258,95 @@ def test_select_blackbox_problems_are_multivariate():
     assert any(int(p[2]) >= 5 for p in problems)
 
 
+def test_build_ablation_table_release_keys(tmp_path):
+    """Phase E: ablation table compares full vs no_weights on multi-var rows."""
+    def _mk(problem, tier, ablation, clean_r2, accept):
+        row = {c: None for c in bn.REQUIRED_COLUMNS}
+        row.update({
+            "problem": problem,
+            "tier": tier,
+            "seed": 11,
+            "test_r2": clean_r2,
+            "clean_test_r2": clean_r2,
+            "exact_match": clean_r2 > 0.99,
+            "acceptable_clean": accept,
+            "false_confidence": False,
+            "raw_mse": 0.2,
+            "display_mse": 0.2,
+            "clean_test_mse": max(0.0, 1.0 - clean_r2),
+            "formula_complexity": 10 if ablation == "full" else 30,
+            "error": None,
+            "ablation": ablation,
+            "blackbox_enabled": True,
+            "n_features": 5,
+        })
+        return row
+
+    rows_by = {
+        "full": [
+            _mk("Pagie-1", "clean", "full", 1.0, True),
+            _mk("Pagie-1", "outliers_3pct", "full", 0.92, True),
+        ],
+        "no_weights": [
+            _mk("Pagie-1", "clean", "no_weights", 1.0, True),
+            _mk("Pagie-1", "outliers_3pct", "no_weights", 0.55, False),
+        ],
+    }
+    table = bn.build_ablation_table(rows_by, baseline="full")
+    assert "full" in table["ablations"]
+    assert "no_weights" in table["ablations"]
+    md = bn.ablation_table_to_markdown(table)
+    assert "Phase E" in md or "Ablation Table" in md
+    paths = bn.write_ablation_report(table, tmp_path)
+    assert paths["ablation_json"].exists()
+    assert paths["ablation_markdown"].exists()
+    assert set(bn.DEFAULT_BLACKBOX_RELEASE_ABLATIONS) <= set(bn.ABLATION_PRESETS)
+
+
+def test_build_publish_table_multi_seed(tmp_path):
+    """Phase E+: multi-seed publish table exposes Exact matrix + coverage."""
+    def _mk(problem, tier, seed, exact, accept, r2=1.0):
+        row = {c: None for c in bn.REQUIRED_COLUMNS}
+        row.update({
+            "problem": problem,
+            "tier": tier,
+            "seed": seed,
+            "test_r2": r2,
+            "clean_test_r2": r2,
+            "clean_full_mse": 1e-9 if exact else 0.05,
+            "exact_match": exact,
+            "acceptable_clean": accept,
+            "false_confidence": False,
+            "raw_mse": 0.1,
+            "display_mse": 0.1,
+            "clean_test_mse": max(0.0, 1.0 - r2),
+            "formula_complexity": 12,
+            "formula": "10/(5+(x0-3)^2+(x1-3)^2)",
+            "error": None,
+            "blackbox_enabled": True,
+            "n_features": 5,
+        })
+        return row
+
+    rows = []
+    for seed in (11, 7, 23):
+        rows.append(_mk("Vladislavleva-4", "clean", seed, True, True, 1.0))
+        rows.append(_mk("Vladislavleva-4", "outliers_3pct", seed, seed != 7, True, 0.99))
+        rows.append(_mk("Pagie-1", "clean", seed, True, True, 1.0))
+        rows.append(_mk("Pagie-1", "outliers_3pct", seed, False, True, 0.95))
+
+    table = bn.build_publish_table(rows, seeds=(11, 7, 23), min_seeds=2)
+    assert table["seed_coverage_ok"] is True
+    assert table["n_cells"] == 4
+    md = bn.publish_table_to_markdown(table)
+    assert "Multi-Seed Publish Table" in md
+    assert "Per-seed Exact matrix" in md
+    paths = bn.write_publish_report(table, tmp_path)
+    assert paths["publish_json"].exists()
+    assert paths["publish_markdown"].exists()
+    assert bn.DEFAULT_PUBLISH_SEEDS[0] == 11
+
+
 def test_blackbox_diag_fields_from_estimator_attrs():
     class _E:
         blackbox_diagnostics_ = {

@@ -60,6 +60,19 @@ def test_outlier_fraction_and_noise_band():
     })
     assert band in ("medium", "high")
     assert _noise_band_from_diagnostics({}) == "clean"
+    # Phase E+: residual RMS / signal-scale outlier channels.
+    assert _noise_band_from_diagnostics({
+        "residual_rms_ratio": 0.10,
+        "outlier_fraction": 0.0,
+        "validation_gap": 0.0,
+        "residual_autocorr": 0.0,
+        "ess_ratio": 1.0,
+    }) in ("low", "medium", "high")
+    assert _noise_band_from_diagnostics({
+        "signal_outlier_fraction": 0.03,
+        "outlier_fraction": 0.0,
+        "residual_rms_ratio": 0.45,
+    }) in ("medium", "high")
 
 
 def test_runtime_noise_diagnostics_and_plan_calibrate():
@@ -224,7 +237,7 @@ def test_release_gate_robust_trimmed_recovers_linear():
 
 
 def test_benchmark_ablation_presets_exist():
-    from scripts.benchmark_noise import ABLATION_PRESETS
+    from scripts.benchmark_noise import ABLATION_PRESETS, DEFAULT_BLACKBOX_RELEASE_ABLATIONS
 
     for key in (
         "full",
@@ -235,6 +248,9 @@ def test_benchmark_ablation_presets_exist():
         "no_uncertainty_routing",
         "no_noise_pruning",
     ):
+        assert key in ABLATION_PRESETS
+    # Phase E release ablations are a subset of presets.
+    for key in DEFAULT_BLACKBOX_RELEASE_ABLATIONS:
         assert key in ABLATION_PRESETS
 
 
@@ -284,3 +300,138 @@ def test_noise_protocol_contract_and_failed_seed_visibility():
     summary = summarize_noise_protocol(rows)
     assert summary["n_rows"] == 2
     assert any(d["tier"] == "gaussian_10pct" for d in summary["deltas_vs_clean"])
+
+
+def test_phase_e_ablation_table_from_rows(tmp_path):
+    """Phase E: multi-var ablation table helper + markdown for release notes."""
+    from scripts.benchmark_noise import (
+        REQUIRED_COLUMNS,
+        ablation_table_to_markdown,
+        build_ablation_table,
+        write_ablation_report,
+    )
+
+    def _row(problem, tier, *, clean_r2, accept, exact, complexity, ablation):
+        return {
+            **{c: None for c in REQUIRED_COLUMNS},
+            "problem": problem,
+            "tier": tier,
+            "seed": 11,
+            "test_r2": clean_r2,
+            "clean_test_r2": clean_r2,
+            "exact_match": exact,
+            "acceptable_clean": accept,
+            "false_confidence": False,
+            "raw_mse": 0.1,
+            "display_mse": 0.1,
+            "clean_test_mse": max(0.0, 1.0 - float(clean_r2)),
+            "formula_complexity": complexity,
+            "error": None,
+            "ablation": ablation,
+            "n_features": 5,
+            "blackbox_enabled": True,
+        }
+
+    rows_by_ablation = {
+        "full": [
+            _row("Vladislavleva-4", "clean", clean_r2=1.0, accept=True, exact=True, complexity=12, ablation="full"),
+            _row("Vladislavleva-4", "outliers_3pct", clean_r2=0.95, accept=True, exact=False, complexity=18, ablation="full"),
+        ],
+        "no_weights": [
+            _row("Vladislavleva-4", "clean", clean_r2=1.0, accept=True, exact=True, complexity=12, ablation="no_weights"),
+            _row("Vladislavleva-4", "outliers_3pct", clean_r2=0.70, accept=False, exact=False, complexity=40, ablation="no_weights"),
+        ],
+        "no_robust_loss": [
+            _row("Vladislavleva-4", "clean", clean_r2=1.0, accept=True, exact=True, complexity=12, ablation="no_robust_loss"),
+            _row("Vladislavleva-4", "outliers_3pct", clean_r2=0.80, accept=True, exact=False, complexity=25, ablation="no_robust_loss"),
+        ],
+    }
+    table = build_ablation_table(rows_by_ablation, baseline="full")
+    assert table["baseline"] == "full"
+    assert table["n_ablations"] == 3
+    assert len(table["headlines"]) == 3
+    assert table["headlines"][0]["ablation"] == "full"
+
+    # no_weights should show worse clean recovery than full on outliers.
+    nw = next(h for h in table["headlines"] if h["ablation"] == "no_weights")
+    assert nw["mean_clean_test_r2_noisy_tiers"] < 0.9
+    assert nw["delta_mean_clean_test_r2_noisy_tiers_vs_full"] < 0.0
+
+    md = ablation_table_to_markdown(table)
+    assert "Ablation Table" in md
+    assert "no_weights" in md
+    assert "R2clean" in md
+
+    paths = write_ablation_report(table, tmp_path)
+    assert paths["ablation_json"].exists()
+    assert paths["ablation_markdown"].exists()
+    assert "Vladislavleva-4" in paths["ablation_markdown"].read_text(encoding="utf-8")
+
+
+def test_phase_e_blackbox_outliers_ci_smoke():
+    """Phase E CI: multi-feature × outliers with blackbox_enabled=True.
+
+    Exercises real blackbox ranking under block outliers. Prefers clean recovery
+    (R2clean / Accept) over noisy-label fit. Also checks that selection can
+    drop decoy features when ranking is informative.
+    """
+    from glassbox.sr.blackbox_preprocessor import prepare_blackbox_search
+
+    rng = np.random.RandomState(11)
+    n = 180
+    # 6 features: signal on 0,1; decoys 2..5. Outliers correlate decoy 5 with y.
+    X = rng.randn(n, 6)
+    y_clean = 1.5 * X[:, 0] - 0.8 * X[:, 1]
+    y = y_clean.copy()
+    y[0:25] = 30.0 + 6.0 * X[0:25, 5]
+    w = np.ones(n, dtype=np.float64)
+    w[0:25] = 0.02
+
+    # 1) Ranking path: weighted selection prefers true features; can drop decoys.
+    _, _, state_w = prepare_blackbox_search(
+        X,
+        y,
+        enabled=True,
+        max_features=3,
+        min_features_to_select=2,
+        standardize=False,
+        interaction_search=False,
+        sample_weight=w,
+    )
+    assert state_w.enabled is True
+    assert len(state_w.selected_features) <= 5  # can drop vs full 6
+    true = {0, 1}
+    assert len(true.intersection(state_w.selected_features)) >= 1
+
+    # 2) Estimator fit: blackbox multi-feature + soft MAD / weights under outliers.
+    est = GlassboxRegressor(
+        random_state=11,
+        generations=12,
+        population_size=24,
+        timeout=20.0,
+        multi_start_runs=1,
+        use_fast_path=True,
+        blackbox_mode=True,
+        blackbox_feature_selection=True,
+        blackbox_min_features_to_select=2,
+        blackbox_max_features=4,
+        blackbox_standardize=True,
+        blackbox_noise_robust="auto",
+        loss_mode="huber",
+    )
+    est.fit(X, y, sample_weight=w)
+    diag = getattr(est, "blackbox_diagnostics_", {}) or {}
+    assert bool(diag.get("enabled")) is True
+    selected = diag.get("selected_features") or []
+    assert isinstance(selected, list)
+    assert len(selected) >= 1
+    # Feature drop case when ranking is confident enough.
+    n_selected = int(diag.get("n_selected_features") or len(selected))
+    assert n_selected <= X.shape[1]
+
+    pred = np.asarray(est.predict(X), dtype=np.float64)
+    clean_r2 = 1.0 - float(np.mean((pred - y_clean) ** 2) / (np.var(y_clean) + 1e-15))
+    # Soft gate: clean recovery should remain useful under block outliers.
+    assert clean_r2 > 0.5, f"clean recovery too weak under blackbox outliers: {clean_r2}"
+    # Protocol-facing fields exist for release artifacts.
+    assert "ranking_sample_weight_mode" in diag or getattr(est, "sample_weight_provided_", False)

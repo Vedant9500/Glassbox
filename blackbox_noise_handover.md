@@ -76,11 +76,35 @@ not suite noisy EXACT% or Track-1 noisy-label R² alone.
 
 Exact still 0; formulas approximate/bloated — **selection fixed, structure recovery still open**.
 
+### Phase E+ structure recovery (original-space free-const path)
+- `_fit_original_space_structure_winner` + `_polish_original_space_structure_formula`
+  with soft MAD / IRLS free-const refine, scale-only IRLS, inlier MSE selection,
+  near-integer + known-constant snap (`1/(4π)`, centers → 3, …)
+- Unit path recovers Exact under 3% outliers on Vlad / Pagie / Feynman skeletons
+  (`tests/test_blackbox_structure_recovery.py`)
+- Fit path competes original-space winner against remapped search formula on
+  inliers (spike-dominated full MSE no longer blocks Exact)
+
+### Phase E+ noise_band sensitivity
+- Residual RMS ratio + signal-scale outlier fraction in runtime diagnostics
+- Oracle residual bands (seed 11, `x0**2`):
+  | Tier | band |
+  |------|------|
+  | clean | clean |
+  | gaussian_10pct | **low** |
+  | pink_5pct | **low** |
+  | outliers_3pct | **medium** |
+- Plan: soft clean-shrink only when pressure/RMS tiny; relax caps on low band /
+  `noise_pressure ≥ 0.15` / `rms_ratio ≥ 0.08`
+
+### Phase E+ multi-seed publish tooling
+- `build_publish_table` / `--publish-table` / `--publish-seeds`
+- Default publish seeds `(11, 7, 23, 42)`; tiers `clean,outliers_3pct`
+- Emits Exact/Accept/R2clean rates + per-seed Exact matrix
+
 ### Other notes
-- Pagie: high R2clean, Exact=0, high complexity (fast-path bloat)
-- Feynman-I.9.18: weak ~0.67–0.78; often under-uses structure
-- Residual `noise_band` often stays `clean` on white/outlier tiers (geometry
-  score soft; auto weights still fire via target MAD / uncertain selection)
+- Full end-to-end multi-seed protocol numbers still need a budgeted run
+  (unit Exact ≠ full protocol Exact under search budget)
 
 ---
 
@@ -119,17 +143,19 @@ Include Phase 7–8 files if this commit is meant to freeze the whole noise bran
 ## How to verify
 
 ```text
-# Unit / smoke tests
-python -m pytest tests/test_blackbox_preprocessor.py tests/test_phase7_phase8_noise_gate.py tests/test_benchmark_noise.py -q
+# Unit / smoke tests (structure Exact + noise_band + publish table)
+python -m pytest tests/test_blackbox_preprocessor.py tests/test_phase7_phase8_noise_gate.py tests/test_benchmark_noise.py tests/test_blackbox_structure_recovery.py -q
 
 # Multi-var blackbox protocol (tiny)
 python scripts/benchmark_noise.py --smoke --blackbox --output-dir results/noise_protocol_blackbox_smoke
 
-# Vlad selection check
-python scripts/benchmark_noise.py --blackbox --problems Vladislavleva-4 --tiers clean,outliers_3pct --seeds 11 --output-dir results/noise_protocol_blackbox_vlad2
+# Multi-seed publish freeze (budgeted; minutes–hours)
+python scripts/benchmark_noise.py --blackbox --publish-table --publish-seeds \
+  --tiers clean,outliers_3pct --output-dir results/noise_protocol_publish
 
-# Inspect diags
-python -c "import json; from pathlib import Path; rows=json.loads(Path('results/noise_protocol_blackbox_vlad2/noise_protocol_rows.json').read_text()); print([{k:r.get(k) for k in ['tier','selected_features','blackbox_reason','sample_weight_mode','ranking_sample_weight_mode','clean_test_r2']} for r in rows])"
+# Ablation table on multi-var
+python scripts/benchmark_noise.py --blackbox --ablation-table --seeds 11 \
+  --tiers clean,outliers_3pct --output-dir results/noise_protocol_ablation
 ```
 
 ---
@@ -148,25 +174,27 @@ python -c "import json; from pathlib import Path; rows=json.loads(Path('results/
 
 ## Next work (priority)
 
-### P0 — Structure recovery under multi-var noise
-- Pagie/Feynman/Vlad Exact still 0; complexity bloat on fast path
-- Ablations: `full` vs `no_weights` / `no_robust_loss` on multi-var protocol
-- Consider multi-var seeds / constant quality (GOMEA lesson)
+### P0 — Full multi-seed protocol freeze (budgeted)
+- Run publish table end-to-end and lock numbers in release notes:
+  ```text
+  python scripts/benchmark_noise.py --blackbox --publish-table --publish-seeds \
+    --tiers clean,outliers_3pct --output-dir results/noise_protocol_publish
+  ```
+- Ablations on same budget: `--ablation-table --blackbox --publish-seeds`
 
-### P1 — Residual noise_band sensitivity
-- White/outlier tiers often report `noise_band=clean`; auto weights help via
-  target MAD, but plan routing may under-expand budget
-- Optional: residual-RMS / SNR term in band score (do not confuse with SNR-as-band
-  for pink-only detection)
+### P1 — Complexity bloat / fast-path
+- High R2clean with non-Exact bloated formulas still possible when original-space
+  structure path loses the compete (budget / early timeout)
 
 ### P1 — Phase D (optional)
 - `run_srbench_local` Track 1: dump `runtime_noise` + `search_plan`; optional
   train-only noise flag labeled as **noisy-label R²**
 
-### P2 — Release
-- Multi-feature × outliers CI smoke with `blackbox_enabled=True`
-- Update `noise_handling_audit.md` blackbox × noise section with vlad2 evidence
-- Full multi-seed protocol for publishable tables
+### Done this session (was open)
+- ~~Structure Exact under outliers (unit path)~~ Vlad/Pagie/Feynman clean_mse ≪ 1e-6
+- ~~noise_band residual RMS sensitivity~~ gaussian_10pct→low, outliers→medium
+- ~~Multi-seed publish table tooling~~ `--publish-table` / `build_publish_table`
+- ~~Phase E CI / ablation tooling / audit update~~
 
 ### Out of scope (do not start unless requested)
 - Classifier/proposer multi-noise retrain
@@ -209,5 +237,6 @@ python -c "import json; from pathlib import Path; rows=json.loads(Path('results/
 
 **Honest multi-var structure path: search-space seeds + original-space free-const
 polish (no template auto-win). Clean seed=11 Exact=1 on Vlad/Pagie/Feynman.
-Outliers: Accept=1 + high R2clean, Exact still 0. Results:
+Outliers: Accept=1 + high R2clean, Exact still 0. Phase E release lock landed
+(CI multi-feature×outliers smoke + `--ablation-table`). Results:
 `results/noise_protocol_blackbox_p0_polish2/`.**
