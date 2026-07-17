@@ -304,3 +304,77 @@ def test_auto_residual_soft_weights_helper_matrix():
     assert float(np.min(soft)) < float(np.max(soft))
     assert out >= 0.01
 
+
+def test_auto_weight_final_guard_rejects_bloated_formula():
+    """Guardrail: bloated bad formula fails unweighted checks under auto soft-weights."""
+    import numpy as np
+    from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
+    x = np.linspace(-2.0, 2.0, 120).reshape(-1, 1)
+    y = (x[:, 0] ** 3 + x[:, 0] ** 2 + x[:, 0]).copy()
+    y[40:48] += 8.0 * np.std(y)
+
+    est = GlassboxRegressor(blackbox_noise_robust="auto", random_state=0)
+    # Simulate auto soft-weight state without full fit.
+    est.n_features_in_ = 1
+    est._blackbox_noise_robust_applied_ = {
+        "active": True,
+        "mode": "auto",
+        "reason": "soft_mad_weights",
+        "path": "1d_sr",
+    }
+    est.blackbox_diagnostics_ = {
+        "sample_weight": {"provided": True, "source": "auto_soft_mad"},
+    }
+    est.sample_weight_provided_ = True
+    est.sample_weight_ = np.ones(len(y))
+    est._auto_weight_fallback_candidates_ = [
+        {"formula": "x**3 + x**2 + x", "complexity": 7, "source": "seed"},
+    ]
+
+    bloated = (
+        "0.2*sin(12*x) + 0.3*cos(9*x) + 0.1*exp(0.2*x) + 0.05*x**5 "
+        "+ 0.04*x**4 + 0.03*sin(3*x)*cos(5*x) + 0.02*x**2*sin(x) "
+        "+ 0.01*cos(x)**2 + 0.5*x + 0.1"
+    )
+    # Ensure complexity exceeds cap
+    assert est._formula_complexity(bloated) > 22
+
+    guarded = est._apply_auto_weight_final_guard(bloated, x, y, stage="unit_test")
+    assert guarded != bloated
+    assert est._formula_complexity(guarded) <= 22 or guarded == "x**3 + x**2 + x"
+    diag = est.blackbox_diagnostics_.get("auto_weight_final_guard") or {}
+    assert diag.get("active") is True
+    assert diag.get("primary_ok") is False
+    assert "complexity_cap" in (diag.get("primary_reasons") or []) or not diag.get("primary_ok")
+
+
+def test_auto_weight_guard_inactive_without_auto_weights():
+    """Guard must not rewrite formulas when auto soft-weights are off."""
+    import numpy as np
+    from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
+    x = np.linspace(-1, 1, 40).reshape(-1, 1)
+    y = 2 * x[:, 0] + 1
+    est = GlassboxRegressor(blackbox_noise_robust=False, random_state=0)
+    est.n_features_in_ = 1
+    est._blackbox_noise_robust_applied_ = {"active": False, "reason": "not_applied"}
+    est.blackbox_diagnostics_ = {"sample_weight": {"provided": False}}
+    formula = "2*x + 1 + 0.01*sin(x)"
+    out = est._apply_auto_weight_final_guard(formula, x, y)
+    assert out == formula
+
+
+def test_evaluate_auto_weight_guard_ok_on_true_structure():
+    import numpy as np
+    from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
+    x = np.linspace(-2, 2, 80).reshape(-1, 1)
+    y = x[:, 0] ** 2
+    est = GlassboxRegressor()
+    est.n_features_in_ = 1
+    m = est._evaluate_auto_weight_guard("x**2", x, y)
+    assert m["ok"] is True
+    assert m["complexity"] <= 22
+    assert m["full_r2"] > 0.99
+

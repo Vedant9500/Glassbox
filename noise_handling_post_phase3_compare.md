@@ -108,3 +108,21 @@ This matches the plan: Phase 3 is necessary plumbing + partial outlier help; **P
 ## 7. One-line summary
 
 **Phase 3 is live and safe on clean data; outliers get auto weights and a few Exact/complexity wins (Keijzer-4, Nguyen-5), but overall Exact is flat, pink/10% Gaussian barely change, and Nguyen-1 outliers show a must-fix Accept/complexity regression before claiming victory.**
+
+---
+
+## 8. Guardrail (implemented after this compare)
+
+Auto-weight final guard in `GlassboxRegressor` (2026-07-17):
+
+- Active only when `_blackbox_noise_robust_applied_.active` and source is not user weights.
+- Rejects / replaces winners that fail **unweighted** checks:
+  - complexity cap (1D: 22)
+  - full R² ≥ 0.50
+  - holdout R² ≥ 0.40
+  - train−holdout gap ≤ 0.45
+- Prefers simpler tracked fallbacks / cleaned formula / evolution candidate.
+- Residual boosting also blocked when candidate fails the same checks.
+- Diagnostics: `blackbox_diagnostics_["auto_weight_final_guard"]`.
+
+Re-run protocol after this change before claiming Nguyen-1 Accept fix.

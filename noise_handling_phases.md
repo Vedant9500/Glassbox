@@ -11,8 +11,9 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
 ## Current focus
 
 - **Phase 0 freeze done** (2026-07-17). See `noise_handling_baseline_findings.md`.
-- **Phase 3 done in code** (native weighted evolution + 1D auto residual soft-weights → `y_weights`).
-- **Next measure:** re-run protocol to `results/noise_protocol_post_phase3/` vs freeze; if outliers Exact still weak → Phase 4/6.
+- **Phase 3 done** + post measure in `noise_handling_post_phase3_compare.md`.
+- **Guardrail done:** auto-weight final guard (complexity / unweighted holdout R²) for Nguyen-1-style blow-ups.
+- **Next:** re-measure outliers focus; then Phase 6/4 if Exact still weak.
 - Do not optimize suite noisy EXACT%; use Exact + Complexity + R2clean vs freeze.
 
 

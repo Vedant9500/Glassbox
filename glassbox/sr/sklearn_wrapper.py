@@ -3781,7 +3781,231 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "n_val": int(len(split["y_val"])),
         }
 
+    def _auto_noise_guard_active(self) -> bool:
+        """True when Phase-3 auto residual soft-weights were applied (not user weights)."""
+        applied = getattr(self, "_blackbox_noise_robust_applied_", None) or {}
+        if not isinstance(applied, dict) or not applied.get("active"):
+            return False
+        diag = getattr(self, "blackbox_diagnostics_", None) or {}
+        sw = diag.get("sample_weight") if isinstance(diag, dict) else None
+        if isinstance(sw, dict) and str(sw.get("source") or "") == "user":
+            return False
+        # Explicit auto path, or soft_mad without user source.
+        if str(applied.get("reason") or "") == "soft_mad_weights":
+            return True
+        return str(sw.get("source") if isinstance(sw, dict) else "") == "auto_soft_mad"
+
+    def _unweighted_r2_from_mse(self, mse, y) -> float:
+        target = np.asarray(y, dtype=np.float64).reshape(-1)
+        if target.size == 0:
+            return float("nan")
+        y_var = float(np.var(target))
+        try:
+            mse_f = float(mse)
+        except Exception:
+            return float("nan")
+        if not np.isfinite(mse_f):
+            return float("nan")
+        if y_var < 1e-15:
+            return 1.0 if mse_f < 1e-15 else 0.0
+        return float(1.0 - mse_f / y_var)
+
+    def _auto_weight_guard_limits(self, X) -> dict:
+        n_feat = int(np.asarray(X).shape[1]) if np.ndim(X) == 2 else 1
+        # 1D SR: aggressive cap — Nguyen-1 disaster was complexity 61.
+        if n_feat <= 1:
+            max_complexity = 22
+        elif n_feat <= 4:
+            max_complexity = 30
+        else:
+            max_complexity = 40
+        return {
+            "max_complexity": int(max_complexity),
+            "min_full_r2": 0.50,
+            "min_holdout_r2": 0.40,
+            "max_gap": 0.45,  # train_r2 - holdout_r2
+        }
+
+    def _evaluate_auto_weight_guard(self, formula, X, y, *, limits=None) -> dict:
+        """Unweighted safety metrics for a candidate under auto soft-weights."""
+        text = str(formula or "").strip()
+        limits = dict(limits or self._auto_weight_guard_limits(X))
+        out = {
+            "formula": text,
+            "ok": False,
+            "reasons": [],
+            "complexity": int(self._formula_complexity(text)) if text else 0,
+            "full_mse": float("inf"),
+            "full_r2": float("nan"),
+            "holdout_mse": float("inf"),
+            "holdout_r2": float("nan"),
+            "train_r2": float("nan"),
+            "gap": float("nan"),
+            "limits": limits,
+        }
+        if not text:
+            out["reasons"].append("empty_formula")
+            return out
+
+        full_mse = self._display_formula_mse(text, X, y)
+        out["full_mse"] = float(full_mse) if np.isfinite(full_mse) else float("inf")
+        out["full_r2"] = self._unweighted_r2_from_mse(full_mse, y)
+
+        # Deterministic edge holdout, unweighted (do not use sample_weight).
+        try:
+            split = self._domain_edge_validation_split(X, y, validation_fraction=0.25)
+        except Exception:
+            split = None
+        if split is not None:
+            try:
+                train_mse = self._display_formula_mse(text, split["X_fit"], split["y_fit"])
+                hold_mse = self._display_formula_mse(text, split["X_val"], split["y_val"])
+                out["train_r2"] = self._unweighted_r2_from_mse(train_mse, split["y_fit"])
+                out["holdout_mse"] = float(hold_mse) if np.isfinite(hold_mse) else float("inf")
+                out["holdout_r2"] = self._unweighted_r2_from_mse(hold_mse, split["y_val"])
+                if np.isfinite(out["train_r2"]) and np.isfinite(out["holdout_r2"]):
+                    out["gap"] = float(out["train_r2"] - out["holdout_r2"])
+            except Exception:
+                pass
+
+        reasons = []
+        if out["complexity"] > int(limits["max_complexity"]):
+            reasons.append("complexity_cap")
+        if not np.isfinite(out["full_r2"]) or out["full_r2"] < float(limits["min_full_r2"]):
+            reasons.append("full_r2")
+        if np.isfinite(out["holdout_r2"]) and out["holdout_r2"] < float(limits["min_holdout_r2"]):
+            reasons.append("holdout_r2")
+        if np.isfinite(out["gap"]) and out["gap"] > float(limits["max_gap"]):
+            reasons.append("generalization_gap")
+        out["reasons"] = reasons
+        out["ok"] = len(reasons) == 0
+        return out
+
+    def _register_auto_weight_fallback_candidate(self, formula, X=None, y=None, *, source="track"):
+        """Remember simple formulas seen during fit for auto-weight final rescue."""
+        text = str(formula or "").strip()
+        if not text:
+            return
+        if not hasattr(self, "_auto_weight_fallback_candidates_") or self._auto_weight_fallback_candidates_ is None:
+            self._auto_weight_fallback_candidates_ = []
+        pool = self._auto_weight_fallback_candidates_
+        # de-dupe
+        for item in pool:
+            if str(item.get("formula") or "") == text:
+                return
+        cx = int(self._formula_complexity(text))
+        entry = {"formula": text, "complexity": cx, "source": str(source)}
+        if X is not None and y is not None:
+            try:
+                entry["full_mse"] = float(self._display_formula_mse(text, X, y))
+            except Exception:
+                pass
+        pool.append(entry)
+        # keep a small pool of simplest candidates
+        pool.sort(key=lambda c: (int(c.get("complexity") or 999), float(c.get("full_mse") or 1e300)))
+        del pool[12:]
+
+    def _apply_auto_weight_final_guard(self, formula, X, y, *, stage="final_fit"):
+        """Block bloated / unweighted-catastrophic formulas when auto soft-weights ran.
+
+        Uses unweighted display MSE/R² and holdout gap (clean y is unavailable at fit).
+        Prefer a simpler tracked fallback when the winner fails the guard.
+        """
+        text = str(formula or "").strip()
+        if not text or not self._auto_noise_guard_active():
+            return text or formula
+
+        limits = self._auto_weight_guard_limits(X)
+        primary = self._evaluate_auto_weight_guard(text, X, y, limits=limits)
+        pool = [{"formula": text, "source": "primary", "metrics": primary}]
+
+        for item in list(getattr(self, "_auto_weight_fallback_candidates_", None) or []):
+            f = str(item.get("formula") or "").strip()
+            if not f or f == text:
+                continue
+            pool.append({
+                "formula": f,
+                "source": str(item.get("source") or "fallback"),
+                "metrics": self._evaluate_auto_weight_guard(f, X, y, limits=limits),
+            })
+
+        evo = str(getattr(self, "evolution_candidate_formula_", "") or "").strip()
+        if evo and evo != text:
+            pool.append({
+                "formula": evo,
+                "source": "evolution_candidate",
+                "metrics": self._evaluate_auto_weight_guard(evo, X, y, limits=limits),
+            })
+
+        # Always consider a cleaned primary (may drop noise terms).
+        try:
+            cleaned = str(self._cleanup_formula_with_fidelity_guard(
+                text, X, y, stage="auto_weight_guard_cleanup"
+            ) or "").strip()
+        except Exception:
+            cleaned = ""
+        if cleaned and cleaned != text:
+            pool.append({
+                "formula": cleaned,
+                "source": "cleaned_primary",
+                "metrics": self._evaluate_auto_weight_guard(cleaned, X, y, limits=limits),
+            })
+
+        def _rank_key(entry):
+            m = entry["metrics"]
+            ok = 0 if m.get("ok") else 1
+            # Prefer finite holdout mse, then full mse, then complexity.
+            h = m.get("holdout_mse")
+            fmse = m.get("full_mse")
+            h = float(h) if h is not None and np.isfinite(h) else 1e300
+            fmse = float(fmse) if fmse is not None and np.isfinite(fmse) else 1e300
+            cx = int(m.get("complexity") or 999)
+            # Soft preference: even among failing, lower complexity + better holdout.
+            hard_fail = 0
+            reasons = set(m.get("reasons") or [])
+            if "full_r2" in reasons or "holdout_r2" in reasons:
+                hard_fail = 1
+            return (ok, hard_fail, h, fmse, cx)
+
+        pool_unique = []
+        seen = set()
+        for entry in pool:
+            f = entry["formula"]
+            if f in seen:
+                continue
+            seen.add(f)
+            pool_unique.append(entry)
+        pool_unique.sort(key=_rank_key)
+        chosen = pool_unique[0]
+        chosen_metrics = chosen["metrics"]
+        replaced = chosen["formula"] != text or not primary.get("ok")
+
+        diag = {
+            "active": True,
+            "stage": stage,
+            "primary_ok": bool(primary.get("ok")),
+            "primary_reasons": list(primary.get("reasons") or []),
+            "primary_complexity": primary.get("complexity"),
+            "primary_full_r2": primary.get("full_r2"),
+            "primary_holdout_r2": primary.get("holdout_r2"),
+            "selected_formula": chosen["formula"][:200],
+            "selected_source": chosen.get("source"),
+            "selected_ok": bool(chosen_metrics.get("ok")),
+            "selected_reasons": list(chosen_metrics.get("reasons") or []),
+            "selected_complexity": chosen_metrics.get("complexity"),
+            "selected_full_r2": chosen_metrics.get("full_r2"),
+            "selected_holdout_r2": chosen_metrics.get("holdout_r2"),
+            "replaced": bool(chosen["formula"] != text),
+            "pool_size": len(pool_unique),
+            "limits": limits,
+        }
+        if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+            self.blackbox_diagnostics_["auto_weight_final_guard"] = diag
+        self._auto_weight_final_guard_ = diag
+        return chosen["formula"]
+
     def _compare_blackbox_formulas(self, incumbent_formula, challenger_formula, X, y):
+
         """Compare two formulas on validation, not just in-sample fit."""
         candidates = []
         if incumbent_formula:
@@ -6859,6 +7083,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         # auto mode to 1D SR so native evolution receives y_weights under outliers
         # (noise protocol baseline is almost entirely single-feature).
         # May re-run ranking with weights so selection matches evolution objective.
+        self._auto_weight_fallback_candidates_ = []
+        self._auto_weight_final_guard_ = None
         self._blackbox_noise_robust_applied_ = {
             "active": False,
             "mode": getattr(self, "blackbox_noise_robust", "auto"),
@@ -7140,6 +7366,12 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         and self.blackbox_state_.enabled
                     ) else X
                     eval_y = y_original if eval_X is X_original else y
+                    self._register_auto_weight_fallback_candidate(
+                        final_formula, eval_X, eval_y, source="fast_path"
+                    )
+                    final_formula = self._apply_auto_weight_final_guard(
+                        final_formula, eval_X, eval_y, stage="fast_path_exact"
+                    )
                     pred = self._safe_eval_formula_array(final_formula, eval_X)
                     final_mse = float(np.mean((pred - np.asarray(eval_y, dtype=np.float64).reshape(-1)) ** 2))
                 except Exception:
@@ -8195,12 +8427,27 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             selected_formula = best_formula
                             selected_mse = self._formula_mse(best_formula, X, y)
                     if selection_source == "challenger":
-                        best_formula = selected_formula
-                        best_mse = selected_mse
-                        blackbox_evolution_improved = bool(
-                            getattr(self, "blackbox_state_", None) is not None
-                            and self.blackbox_state_.enabled
-                        ) or blackbox_evolution_improved
+                        # Auto-weight guard: do not promote bloated evolution winners
+                        # that fail unweighted full/holdout R² (Nguyen-1 outliers).
+                        if self._auto_noise_guard_active():
+                            g = self._evaluate_auto_weight_guard(selected_formula, X, y)
+                            if not g.get("ok"):
+                                selection_source = "incumbent"
+                                selected_formula = best_formula
+                                selected_mse = self._formula_mse(best_formula, X, y) if best_formula else selected_mse
+                                if isinstance(self.blackbox_diagnostics_, dict):
+                                    self.blackbox_diagnostics_["evolution_auto_weight_guard"] = g
+                            else:
+                                self._register_auto_weight_fallback_candidate(
+                                    selected_formula, X, y, source="evolution_ok"
+                                )
+                        if selection_source == "challenger":
+                            best_formula = selected_formula
+                            best_mse = selected_mse
+                            blackbox_evolution_improved = bool(
+                                getattr(self, "blackbox_state_", None) is not None
+                                and self.blackbox_state_.enabled
+                            ) or blackbox_evolution_improved
                     if isinstance(self.blackbox_diagnostics_, dict):
                         self.blackbox_diagnostics_["evolution_selection"] = {
                             "incumbent_formula": best_formula if selection_source != "challenger" else None,
@@ -8573,8 +8820,18 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         and np.isfinite(holdout_candidate)
                         and holdout_candidate <= holdout_allowed
                     )
+                if residual_accepted and self._auto_noise_guard_active():
+                    # Residual stages often re-bloat under auto weights (Nguyen-1).
+                    g = self._evaluate_auto_weight_guard(residual_candidate, residual_X, residual_y)
+                    if not g.get("ok"):
+                        residual_accepted = False
+                        if isinstance(self.blackbox_diagnostics_, dict):
+                            self.blackbox_diagnostics_["residual_auto_weight_guard"] = g
                 if residual_accepted:
                     best_formula = residual_candidate
+                    self._register_auto_weight_fallback_candidate(
+                        residual_candidate, residual_X, residual_y, source="residual"
+                    )
                 if isinstance(self.blackbox_diagnostics_, dict):
                     self.blackbox_diagnostics_["residual_boosting_final_guard"] = {
                         "accepted": bool(residual_accepted),
@@ -8640,6 +8897,49 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 self.n_features_in_ = prior_n_features
             else:
                 self.n_features_in_ = X_original.shape[1]
+
+        # Phase 3 guardrail: auto soft-weights must not promote bloated formulas
+        # that look good under weighted/Huber search but fail unweighted holdout.
+        try:
+            if best_formula:
+                self._register_auto_weight_fallback_candidate(
+                    best_formula, X_original, y_original, source="pre_guard_best"
+                )
+            evo_cand = getattr(self, "evolution_candidate_formula_", None)
+            if evo_cand:
+                self._register_auto_weight_fallback_candidate(
+                    evo_cand, X_original, y_original, source="evolution"
+                )
+            guarded = self._apply_auto_weight_final_guard(
+                best_formula,
+                X_original if (
+                    getattr(self, "blackbox_state_", None) is not None
+                    and getattr(self.blackbox_state_, "enabled", False)
+                ) else X,
+                y_original if (
+                    getattr(self, "blackbox_state_", None) is not None
+                    and getattr(self.blackbox_state_, "enabled", False)
+                ) else y,
+                stage="final_fit",
+            )
+            if guarded and str(guarded) != str(best_formula or ""):
+                best_formula = guarded
+                try:
+                    eval_X = X_original if (
+                        getattr(self, "blackbox_state_", None) is not None
+                        and getattr(self.blackbox_state_, "enabled", False)
+                    ) else X
+                    eval_y = y_original if eval_X is X_original else y
+                    pred = self._safe_eval_formula_array(best_formula, eval_X)
+                    best_mse = float(np.mean((pred - np.asarray(eval_y, dtype=np.float64).reshape(-1)) ** 2))
+                except Exception:
+                    pass
+        except Exception as _guard_exc:
+            if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+                self.blackbox_diagnostics_["auto_weight_final_guard"] = {
+                    "active": True,
+                    "error": str(_guard_exc)[:200],
+                }
 
         self.formula_ = best_formula or "0"
         self.best_mse_ = best_mse
