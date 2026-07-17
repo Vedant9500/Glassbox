@@ -26,9 +26,15 @@ against the JSON / Markdown tables emitted here.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
+import os
+import sys
+import time
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import get_context
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -281,12 +287,26 @@ def _complexity(formula: str) -> int:
 
 
 def _sample_weight_mode(estimator: Any) -> str:
-    """Record which weight mode the fit used. Phase 1 wiring point."""
+    """Record which weight mode the fit used (user / auto soft-MAD / none)."""
     diag = getattr(estimator, "blackbox_diagnostics_", None)
     if isinstance(diag, dict):
         sw = diag.get("sample_weight")
         if isinstance(sw, dict) and sw.get("provided"):
+            src = str(sw.get("source") or "user")
+            if src == "auto_soft_mad":
+                return "auto_soft_mad"
             return "provided"
+        robust = diag.get("blackbox_noise_robust")
+        if isinstance(robust, dict) and robust.get("active"):
+            return "auto_soft_mad"
+    # Fallback: fitted attribute without diagnostics
+    if getattr(estimator, "sample_weight_provided_", False) and getattr(
+        estimator, "sample_weight_", None
+    ) is not None:
+        applied = getattr(estimator, "_blackbox_noise_robust_applied_", None) or {}
+        if isinstance(applied, dict) and applied.get("active"):
+            return "auto_soft_mad"
+        return "provided"
     return "none"
 
 
@@ -358,6 +378,250 @@ def _seed_graphs_used(estimator: Any) -> int:
 # ---------------------------------------------------------------------------
 # Protocol runner
 # ---------------------------------------------------------------------------
+def default_parallel_config(
+    n_jobs: Optional[int] = None,
+    omp_num_threads: Optional[int] = None,
+    *,
+    cpu_count: Optional[int] = None,
+) -> Tuple[int, int]:
+    """Choose outer workers × per-worker OpenMP threads for protocol cells.
+
+    Goal: ``workers * OMP_NUM_THREADS ≈ logical CPUs`` without massive
+    oversubscription. On an 8c/16t laptop (e.g. Ryzen 7 7840HS) the default is
+    ``4 workers × 4 OMP``.
+
+    ``n_jobs <= 0`` or ``None`` means auto. ``omp_num_threads <= 0`` or ``None``
+    means derive from remaining CPU budget.
+    """
+    cpus = int(cpu_count if cpu_count is not None else (os.cpu_count() or 4))
+    cpus = max(1, cpus)
+    if n_jobs is None or int(n_jobs) <= 0:
+        # Prefer a few fat outer jobs over many tiny ones.
+        if cpus >= 16:
+            jobs = 4
+        elif cpus >= 8:
+            jobs = 4
+        elif cpus >= 4:
+            jobs = 2
+        else:
+            jobs = 1
+    else:
+        jobs = max(1, int(n_jobs))
+    jobs = min(jobs, cpus)
+
+    if omp_num_threads is None or int(omp_num_threads) <= 0:
+        omp = max(1, cpus // jobs)
+        # SR OpenMP rarely needs more than 8 threads per fit.
+        omp = min(8, omp)
+    else:
+        omp = max(1, int(omp_num_threads))
+    return int(jobs), int(omp)
+
+
+def _set_worker_thread_env(omp_num_threads: int) -> None:
+    """Pin BLAS/OpenMP threads for a protocol worker process."""
+    n = str(max(1, int(omp_num_threads)))
+    for key in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+    ):
+        os.environ[key] = n
+
+
+@contextlib.contextmanager
+def _silence_stdio(enabled: bool = True):
+    """Suppress fit-time print spam (proposer/evolution banners) from workers."""
+    if not enabled:
+        yield
+        return
+    with open(os.devnull, "w") as devnull:
+        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                yield
+
+
+def _cell_status(row: Dict[str, Any], *, acceptable_r2: float) -> str:
+    if row.get("error"):
+        return "ERR"
+    if row.get("exact_match"):
+        return "OK"
+    clean_r2 = row.get("clean_test_r2")
+    if clean_r2 is None:
+        clean_r2 = row.get("test_r2")
+    try:
+        clean_r2_f = float(clean_r2) if clean_r2 is not None else float("nan")
+    except (TypeError, ValueError):
+        clean_r2_f = float("nan")
+    if math.isfinite(clean_r2_f) and clean_r2_f > float(acceptable_r2):
+        return "MID"
+    return "LOW"
+
+
+def _format_eta(seconds: float) -> str:
+    if not math.isfinite(seconds) or seconds < 0:
+        return "--:--"
+    seconds = int(round(seconds))
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h:d}h{m:02d}m"
+    return f"{m:02d}m{s:02d}s"
+
+
+class _ProtocolDashboard:
+    """Single-pane progress view: current cell + overall completion."""
+
+    def __init__(self, total: int, *, enabled: bool = True, detail: bool = False):
+        self.total = max(0, int(total))
+        self.enabled = bool(enabled)
+        self.detail = bool(detail)
+        self.done = 0
+        self.ok = 0
+        self.mid = 0
+        self.low = 0
+        self.err = 0
+        self.started = time.time()
+        self.current: Optional[str] = None
+        self.last_line: Optional[str] = None
+        self._use_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
+        if self.enabled and self.total > 0:
+            self._render(prefix="START")
+
+    def _bar(self, width: int = 24) -> str:
+        if self.total <= 0:
+            return "[" + ("-" * width) + "]"
+        frac = min(1.0, self.done / float(self.total))
+        filled = int(round(frac * width))
+        return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
+
+    def _render(self, *, prefix: str = "RUN", last: Optional[str] = None) -> None:
+        if not self.enabled:
+            return
+        elapsed = time.time() - self.started
+        rate = (self.done / elapsed) if elapsed > 0 and self.done else 0.0
+        remaining = (self.total - self.done) / rate if rate > 0 else float("nan")
+        pct = (100.0 * self.done / self.total) if self.total else 100.0
+        current = self.current or "-"
+        line = (
+            f"{prefix} {self._bar()} {self.done}/{self.total} ({pct:5.1f}%)  "
+            f"ETA {_format_eta(remaining)}  elapsed {_format_eta(elapsed)}  "
+            f"OK={self.ok} MID={self.mid} LOW={self.low} ERR={self.err}"
+        )
+        task = f"  current: {current}"
+        if last:
+            task = f"  last: {last} | current: {current}"
+
+        if self.detail:
+            print(line)
+            print(task)
+            return
+
+        # Compact: overwrite a 2-line dashboard on TTYs; else one line per update.
+        if self._use_tty and self.last_line is not None:
+            # Move up 2 lines and clear them.
+            sys.stdout.write("[2A[2K[1B[2K[1A")
+        print(line)
+        print(task)
+        sys.stdout.flush()
+        self.last_line = line
+
+    def start_cell(self, problem: Any, tier: Any, seed: Any) -> None:
+        self.current = f"{problem} / {tier} / seed={seed}"
+        # On a TTY, refresh so the user sees the cell that just started.
+        # When redirected to a log file, only emit on finish_cell to avoid spam.
+        if self._use_tty or self.detail:
+            self._render(prefix="RUN ")
+
+    def finish_cell(
+        self,
+        row: Dict[str, Any],
+        *,
+        acceptable_r2: float,
+        next_cell: Optional[str] = None,
+    ) -> None:
+        status = _cell_status(row, acceptable_r2=acceptable_r2)
+        if status == "OK":
+            self.ok += 1
+        elif status == "MID":
+            self.mid += 1
+        elif status == "ERR":
+            self.err += 1
+        else:
+            self.low += 1
+        self.done += 1
+        last = (
+            f"{row.get('problem')}/{row.get('tier')}/s{row.get('seed')} → {status}"
+        )
+        if next_cell is not None:
+            self.current = next_cell
+        elif self.done >= self.total:
+            self.current = "done"
+        self._render(prefix="DONE" if self.done >= self.total else "RUN ", last=last)
+        if self.detail:
+            print(_format_protocol_progress(row, acceptable_r2=acceptable_r2))
+
+    def note_parallel_start(self, n_jobs: int, omp: int) -> None:
+        if not self.enabled:
+            return
+        print(
+            f"  parallel: {self.total} cells on {n_jobs} workers "
+            f"(OMP_NUM_THREADS={omp} per worker)"
+        )
+        self._render(prefix="RUN ")
+
+
+def _format_protocol_progress(row: Dict[str, Any], *, acceptable_r2: float) -> str:
+    ok = "OK" if row.get("exact_match") else (
+        "MID" if (row.get("test_r2") or 0.0) > acceptable_r2 else "LOW"
+    )
+    return (
+        f"  {str(row.get('problem')):24s} {str(row.get('tier')):18s} "
+        f"seed={int(row.get('seed') or 0):4d} "
+        f"R2_test={row.get('test_r2')}  exact={row.get('exact_match')}  {ok}"
+    )
+
+
+def _run_protocol_job(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Spawn-safe worker: rebuild estimator + problem, run one protocol cell.
+
+    Problem tuples contain lambdas (not picklable), so jobs pass problem names
+    and re-resolve via ``_select_problems`` inside the child process.
+    """
+    omp = payload.get("omp_num_threads")
+    if omp is not None:
+        _set_worker_thread_env(int(omp))
+
+    factory_kwargs = dict(payload.get("factory_kwargs") or {})
+    factory = _default_estimator_factory(**factory_kwargs)
+    problem_name = str(payload["problem_name"])
+    problem = _select_problems([problem_name])[0]
+    tier = dict(payload["tier"])
+    seed = int(payload["seed"])
+    n_samples = int(payload.get("n_samples", 300))
+    train_fraction = float(payload.get("train_fraction", 0.8))
+    acceptable_r2 = float(payload.get("acceptable_r2", 0.9))
+    silence_fit = bool(payload.get("silence_fit", True))
+
+    with _silence_stdio(enabled=silence_fit):
+        row = _run_single(
+            factory,
+            problem,
+            tier,
+            seed,
+            n_samples=n_samples,
+            train_fraction=train_fraction,
+            acceptable_r2=acceptable_r2,
+        )
+    row["problem"] = problem_name
+    row["tier"] = str(tier.get("name"))
+    row["seed"] = seed
+    return row
+
+
 def run_noise_protocol(
     estimator_factory,
     problems: Sequence[Tuple],
@@ -367,44 +631,131 @@ def run_noise_protocol(
     n_samples: int = 300,
     train_fraction: float = 0.8,
     verbose: bool = True,
+    detail: bool = False,
+    silence_fit: bool = True,
     acceptable_r2: float = 0.9,
+    n_jobs: int = 1,
+    omp_num_threads: Optional[int] = None,
+    factory_kwargs: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Run problem x tier x seed sweep and collect Phase 0 report rows.
 
     ``estimator_factory`` is a zero-arg callable returning a fresh unfitted
     estimator (so each run is independent). ``problems`` follow the
     ``GROUND_TRUTH_PROBLEMS`` tuple shape used by ``run_srbench_local``.
+
+    Progress
+    --------
+    By default (``verbose=True``) a compact dashboard shows:
+    overall completion bar, ETA, OK/MID/LOW/ERR counts, and the current cell.
+    Pass ``detail=True`` for the older one-line-per-cell log.
+    Fit-time Glassbox prints are silenced when ``silence_fit=True``.
+
+    Parallelism
+    -----------
+    ``n_jobs > 1`` runs independent cells in a process pool (spawn). This needs
+    ``factory_kwargs`` so workers can rebuild the estimator without pickling a
+    nested factory / problem lambdas. When ``factory_kwargs`` is omitted,
+    falls back to sequential execution with a warning.
     """
     tiers = list(tiers) if tiers is not None else list(NOISE_TIERS)
-    seeds = list(seeds) if seeds is not None else [11, 23, 47, 89, 137]
-    rows: List[Dict[str, Any]] = []
+    seeds = [int(s) for s in (list(seeds) if seeds is not None else [11, 23, 47, 89, 137])]
+    jobs, omp = default_parallel_config(n_jobs=n_jobs, omp_num_threads=omp_num_threads)
 
+    use_pool = jobs > 1 and factory_kwargs is not None
+    if jobs > 1 and factory_kwargs is None:
+        warnings.warn(
+            "run_noise_protocol(n_jobs>1) requires factory_kwargs for process-pool "
+            "workers; falling back to sequential execution.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        jobs = 1
+
+    total_cells = len(problems) * len(tiers) * len(seeds)
+    dash = _ProtocolDashboard(total_cells, enabled=bool(verbose), detail=bool(detail))
+
+    if not use_pool:
+        if omp_num_threads is not None and int(omp_num_threads) > 0:
+            _set_worker_thread_env(int(omp_num_threads))
+        rows: List[Dict[str, Any]] = []
+        for problem in problems:
+            name = problem[0]
+            for tier in tiers:
+                tier_name = str(tier["name"])
+                for seed in seeds:
+                    dash.start_cell(name, tier_name, int(seed))
+                    with _silence_stdio(enabled=bool(silence_fit)):
+                        row = _run_single(
+                            estimator_factory,
+                            problem,
+                            tier,
+                            int(seed),
+                            n_samples=n_samples,
+                            train_fraction=train_fraction,
+                            acceptable_r2=acceptable_r2,
+                        )
+                    row["problem"] = name
+                    row["tier"] = tier_name
+                    row["seed"] = int(seed)
+                    rows.append(row)
+                    dash.finish_cell(row, acceptable_r2=acceptable_r2)
+        return rows
+
+    # Process-pool path: one independent cell per job.
+    payloads: List[Dict[str, Any]] = []
     for problem in problems:
-        name = problem[0]
+        name = str(problem[0])
         for tier in tiers:
-            tier_name = str(tier["name"])
             for seed in seeds:
-                row = _run_single(
-                    estimator_factory,
-                    problem,
-                    tier,
-                    int(seed),
-                    n_samples=n_samples,
-                    train_fraction=train_fraction,
-                    acceptable_r2=acceptable_r2,
+                payloads.append(
+                    {
+                        "problem_name": name,
+                        "tier": dict(tier),
+                        "seed": int(seed),
+                        "n_samples": int(n_samples),
+                        "train_fraction": float(train_fraction),
+                        "acceptable_r2": float(acceptable_r2),
+                        "factory_kwargs": dict(factory_kwargs or {}),
+                        "omp_num_threads": int(omp),
+                        "silence_fit": bool(silence_fit),
+                    }
                 )
-                row["problem"] = name
-                row["tier"] = tier_name
-                row["seed"] = int(seed)
-                rows.append(row)
-                if verbose:
-                    ok = "OK" if row.get("exact_match") else (
-                        "MID" if (row.get("test_r2") or 0.0) > acceptable_r2 else "LOW"
-                    )
-                    print(
-                        f"  {name:24s} {tier_name:18s} seed={seed:4d} "
-                        f"R2_test={row.get('test_r2')}  exact={row.get('exact_match')}  {ok}"
-                    )
+
+    dash.note_parallel_start(int(jobs), int(omp))
+
+    rows_out: List[Optional[Dict[str, Any]]] = [None] * len(payloads)
+    # Track in-flight labels for the dashboard (best-effort).
+    pending_labels = {
+        i: f"{p['problem_name']} / {p['tier'].get('name')} / seed={p['seed']}"
+        for i, p in enumerate(payloads)
+    }
+    if pending_labels:
+        dash.current = f"queued {len(pending_labels)} cells"
+        dash._render(prefix="RUN ")
+
+    ctx = get_context("spawn")
+    with ProcessPoolExecutor(max_workers=int(jobs), mp_context=ctx) as pool:
+        future_map = {
+            pool.submit(_run_protocol_job, payload): idx
+            for idx, payload in enumerate(payloads)
+        }
+        inflight = {future_map[f]: f for f in future_map}
+        for fut in as_completed(future_map):
+            idx = future_map[fut]
+            row = fut.result()
+            rows_out[idx] = row
+            pending_labels.pop(idx, None)
+            next_label = None
+            if pending_labels:
+                # show one remaining / still-pending cell as "current"
+                next_label = next(iter(pending_labels.values()))
+                if len(pending_labels) > 1:
+                    next_label = f"{next_label} (+{len(pending_labels)-1} pending)"
+            dash.finish_cell(row, acceptable_r2=acceptable_r2, next_cell=next_label)
+
+    rows = [r for r in rows_out if r is not None]
+    # Stable report order: problem → tier → seed (payload order).
     return rows
 
 
@@ -1239,7 +1590,12 @@ def _select_problems(names: Optional[Sequence[str]] = None):
 # Each mutates GlassboxRegressor kwargs; budgets must stay comparable.
 ABLATION_PRESETS: Dict[str, Dict[str, Any]] = {
     "full": {},
-    "no_weights": {"_force_no_sample_weight": True},
+    # Disable user weights AND auto soft-MAD / robust path so evolution stays unweighted.
+    "no_weights": {
+        "_force_no_sample_weight": True,
+        "blackbox_noise_robust": False,
+        "loss_mode": "mse",
+    },
     "no_robust_loss": {"loss_mode": "mse"},
     "no_units": {"input_units": None, "output_units": None, "unit_mode": "off"},
     "no_cv_guard": {"cv_skip_guard_enabled": False},
@@ -1291,6 +1647,8 @@ def _default_estimator_factory(
                 use_guided_evolution=True,
                 blackbox_mode=True,
                 blackbox_feature_selection=True,
+                # Protocol dashboard owns the console; keep fit internals quiet.
+                universal_proposer_log_routing=False,
             )
             if blackbox_protocol:
                 # Ensure multi-var problems can actually drop features in ranking.
@@ -1442,8 +1800,45 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "unless --seeds is explicitly set for a non-default list."
         ),
     )
-    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--jobs",
+        type=int,
+        default=0,
+        help=(
+            "Parallel process-pool workers for independent protocol cells "
+            "(problem×tier×seed). 0/negative = auto from CPU count "
+            "(default on 16-thread CPUs: 4). Use 1 for sequential."
+        ),
+    )
+    parser.add_argument(
+        "--omp-num-threads",
+        type=int,
+        default=0,
+        help=(
+            "OpenMP/BLAS threads per worker. 0/negative = auto "
+            "(≈ cpu_count / jobs, capped at 8). Recommended with --jobs 4: 4."
+        ),
+    )
+    parser.add_argument("--quiet", action="store_true", help="No progress output")
+    parser.add_argument(
+        "--detail",
+        action="store_true",
+        help="Print one result line per cell (old verbose log) instead of compact dashboard",
+    )
+    parser.add_argument(
+        "--show-fit-logs",
+        action="store_true",
+        help="Do not silence Glassbox fit-time prints (debug only; very noisy)",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
+
+    n_jobs, omp_threads = default_parallel_config(
+        n_jobs=int(args.jobs),
+        omp_num_threads=int(args.omp_num_threads),
+    )
+    # Sequential path still benefits from an explicit OMP pin.
+    if n_jobs <= 1:
+        _set_worker_thread_env(int(omp_threads))
 
     if args.smoke and args.blackbox:
         problem_names = list(DEFAULT_BLACKBOX_PROBLEMS[:2])
@@ -1514,6 +1909,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "timeout": float(timeout),
             "n_samples": int(n_samples),
             "seeds": list(seeds),
+            "n_jobs": int(n_jobs),
+            "omp_num_threads": int(omp_threads),
+        }
+
+    def _factory_kwargs(ablation_name: str) -> Dict[str, Any]:
+        return {
+            "generations": int(generations),
+            "population_size": int(pop),
+            "timeout": float(timeout),
+            "allow_stub": bool(args.smoke),
+            "ablation": str(ablation_name),
+            "blackbox_protocol": bool(args.blackbox),
         }
 
     out_dir = Path(args.output_dir)
@@ -1550,20 +1957,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 f"Budget:    generations={generations} population={pop} "
                 f"timeout={timeout}s"
             )
+            print(
+                f"Parallel:  jobs={n_jobs}  omp_num_threads={omp_threads} "
+                f"(workers × OMP ≈ {n_jobs * omp_threads})"
+            )
             print(f"Blackbox protocol: {bool(args.blackbox)}")
 
         rows_by_ablation: Dict[str, List[Dict[str, Any]]] = {}
         all_rows: List[Dict[str, Any]] = []
         for abl in ablation_names:
             try:
-                factory = _default_estimator_factory(
-                    generations=generations,
-                    population_size=pop,
-                    timeout=timeout,
-                    allow_stub=bool(args.smoke),
-                    ablation=abl,
-                    blackbox_protocol=bool(args.blackbox),
-                )
+                factory = _default_estimator_factory(**_factory_kwargs(abl))
             except ValueError as exc:
                 raise SystemExit(str(exc)) from exc
             if not args.quiet:
@@ -1575,6 +1979,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 seeds=seeds,
                 n_samples=n_samples,
                 verbose=not args.quiet,
+                detail=bool(args.detail),
+                silence_fit=not bool(args.show_fit_logs),
+                n_jobs=n_jobs,
+                omp_num_threads=omp_threads,
+                factory_kwargs=_factory_kwargs(abl),
             )
             rows = _annotate_rows(rows, abl)
             rows_by_ablation[abl] = rows
@@ -1628,14 +2037,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Single-ablation protocol (default)
     # ------------------------------------------------------------------
     try:
-        factory = _default_estimator_factory(
-            generations=generations,
-            population_size=pop,
-            timeout=timeout,
-            allow_stub=bool(args.smoke),
-            ablation=str(args.ablation),
-            blackbox_protocol=bool(args.blackbox),
-        )
+        factory = _default_estimator_factory(**_factory_kwargs(str(args.ablation)))
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
 
@@ -1652,6 +2054,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"Budget:   generations={generations} population={pop} "
             f"timeout={timeout}s (report budgets when comparing methods)"
         )
+        print(
+            f"Parallel: jobs={n_jobs}  omp_num_threads={omp_threads} "
+            f"(workers × OMP ≈ {n_jobs * omp_threads})"
+        )
 
     rows = run_noise_protocol(
         factory,
@@ -1660,6 +2066,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         seeds=seeds,
         n_samples=n_samples,
         verbose=not args.quiet,
+        detail=bool(args.detail),
+        silence_fit=not bool(args.show_fit_logs),
+        n_jobs=n_jobs,
+        omp_num_threads=omp_threads,
+        factory_kwargs=_factory_kwargs(str(args.ablation)),
     )
     rows = _annotate_rows(rows, str(args.ablation))
     summary = summarize_noise_protocol(rows)

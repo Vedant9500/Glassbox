@@ -249,6 +249,66 @@ def test_select_problems_default_set():
     assert problems[0][0] == bn.DEFAULT_BASELINE_PROBLEMS[0]
 
 
+def test_default_parallel_config_ryzen_class():
+    # 8c/16t class laptop: prefer 4 workers × 4 OMP.
+    jobs, omp = bn.default_parallel_config(n_jobs=0, omp_num_threads=0, cpu_count=16)
+    assert jobs == 4
+    assert omp == 4
+    jobs2, omp2 = bn.default_parallel_config(n_jobs=6, omp_num_threads=0, cpu_count=16)
+    assert jobs2 == 6
+    assert omp2 == 2
+    jobs3, omp3 = bn.default_parallel_config(n_jobs=1, omp_num_threads=8, cpu_count=16)
+    assert jobs3 == 1
+    assert omp3 == 8
+
+
+def test_protocol_parallel_jobs_match_sequential_order():
+    """Process-pool path keeps payload order and emits contract rows."""
+    factory_kwargs = {
+        "generations": 5,
+        "population_size": 10,
+        "timeout": 5.0,
+        "allow_stub": True,
+        "ablation": "full",
+        "blackbox_protocol": False,
+    }
+    factory = bn._default_estimator_factory(**factory_kwargs)
+    problems = bn._select_problems(["Poly-x2"])
+    tiers = [bn.NOISE_TIERS[0], bn.NOISE_TIERS[3]]  # clean + gaussian_10pct
+    seeds = [11, 23]
+
+    seq = bn.run_noise_protocol(
+        factory,
+        problems,
+        tiers=tiers,
+        seeds=seeds,
+        n_samples=40,
+        verbose=False,
+        n_jobs=1,
+        factory_kwargs=factory_kwargs,
+    )
+    par = bn.run_noise_protocol(
+        factory,
+        problems,
+        tiers=tiers,
+        seeds=seeds,
+        n_samples=40,
+        verbose=False,
+        n_jobs=2,
+        omp_num_threads=1,
+        factory_kwargs=factory_kwargs,
+    )
+    assert len(par) == len(seq) == 4
+    bn.assert_row_contract(par)
+    assert [(r["problem"], r["tier"], r["seed"]) for r in par] == [
+        (r["problem"], r["tier"], r["seed"]) for r in seq
+    ]
+    # Stub mean-fit should be deterministic across process boundary.
+    assert [r.get("discovered_formula") for r in par] == [
+        r.get("discovered_formula") for r in seq
+    ]
+
+
 def test_select_blackbox_problems_are_multivariate():
     problems = bn._select_problems(bn.DEFAULT_BLACKBOX_PROBLEMS)
     assert len(problems) == len(bn.DEFAULT_BLACKBOX_PROBLEMS)

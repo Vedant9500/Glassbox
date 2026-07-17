@@ -213,3 +213,94 @@ def test_formula_mse_uses_sliced_weights_on_holdout_like_subset():
     from glassbox.sr.sklearn_wrapper import _weighted_mse, _slice_sample_weight
     direct = _weighted_mse(np.zeros(10), y[30:], _slice_sample_weight(est.sample_weight_, indices=np.arange(30, 40)))
     assert pytest.approx(holdout, rel=1e-9) == direct
+
+
+def test_auto_soft_weights_activate_on_1d_outliers():
+    """Phase 3: 1D SR should auto soft-weight outliers so evolution gets y_weights."""
+    import numpy as np
+    from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
+    rng = np.random.RandomState(0)
+    x = np.linspace(-2.0, 2.0, 120).reshape(-1, 1)
+    y = (2.0 * x[:, 0] + 1.0).copy()
+    y[50:58] += 40.0  # block outliers
+
+    est = GlassboxRegressor(
+        generations=2,
+        population_size=8,
+        timeout=5,
+        multi_start_runs=1,
+        use_fast_path=False,
+        use_guided_evolution=False,
+        blackbox_mode=False,
+        blackbox_noise_robust="auto",
+        random_state=0,
+    )
+    # Fit may still run some pipeline; even if evolution is skipped, soft weights
+    # are applied at the start of fit before search.
+    try:
+        est.fit(x, y)
+    except Exception:
+        # Extremely short budgets can fail mid-search; weights are set early.
+        pass
+
+    applied = getattr(est, "_blackbox_noise_robust_applied_", {}) or {}
+    assert applied.get("active") is True, applied
+    assert applied.get("path") == "1d_sr", applied
+    assert est.sample_weight_provided_ is True
+    assert est.sample_weight_ is not None
+    assert float(np.min(est.sample_weight_)) < float(np.max(est.sample_weight_))
+    diag = getattr(est, "blackbox_diagnostics_", {}) or {}
+    sw = diag.get("sample_weight") or {}
+    assert sw.get("provided") is True
+    assert sw.get("source") == "auto_soft_mad"
+
+
+def test_auto_soft_weights_skip_clean_1d():
+    """Clean 1D targets should not invent soft weights (preserve Phase 0 clean Exact)."""
+    import numpy as np
+    from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
+    for y_fn, label in (
+        (lambda x: 2.0 * x + 1.0, "linear"),
+        (lambda x: x ** 2, "poly_x2"),
+        (lambda x: x ** 3 + x ** 2 + x, "nguyen1"),
+    ):
+        x = np.linspace(-2.0, 2.0, 100).reshape(-1, 1)
+        y = y_fn(x[:, 0])
+        est = GlassboxRegressor(
+            generations=1,
+            population_size=4,
+            timeout=3,
+            multi_start_runs=1,
+            use_fast_path=False,
+            use_guided_evolution=False,
+            blackbox_mode=False,
+            blackbox_noise_robust="auto",
+            random_state=0,
+        )
+        try:
+            est.fit(x, y)
+        except Exception:
+            pass
+        applied = getattr(est, "_blackbox_noise_robust_applied_", {}) or {}
+        assert applied.get("active") is not True, (label, applied)
+        assert not getattr(est, "sample_weight_provided_", False) or est.sample_weight_ is None
+
+
+def test_auto_residual_soft_weights_helper_matrix():
+    """Residual soft weights: clean families off; block outliers on."""
+    import numpy as np
+    from glassbox.sr.sklearn_wrapper import _auto_residual_soft_weights
+
+    x = np.linspace(-2.0, 2.0, 200)
+    soft, out = _auto_residual_soft_weights(x.reshape(-1, 1), x ** 2)
+    assert soft is None
+
+    y = (2.0 * x + 1.0).copy()
+    y[40:50] += 30.0
+    soft, out = _auto_residual_soft_weights(x.reshape(-1, 1), y)
+    assert soft is not None
+    assert float(np.min(soft)) < float(np.max(soft))
+    assert out >= 0.01
+

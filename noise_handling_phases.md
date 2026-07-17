@@ -3,9 +3,18 @@
 Multi-phase plan to close the noise-handling gap with PhySO.
 Source of truth for the *what* and *why* lives in `physo_noise_handling.md`.
 Measurement-bug audit (2026-07-10): `noise_handling_audit.md`.
+Baseline freeze findings (2026-07-17): `noise_handling_baseline_findings.md`.
 This file tracks **status** so we don't lose the thread between phases.
 
 Legend: `[ ]` not started · `[~]` in progress · `[x]` done
+
+## Current focus
+
+- **Phase 0 freeze done** (2026-07-17). See `noise_handling_baseline_findings.md`.
+- **Phase 3 done in code** (native weighted evolution + 1D auto residual soft-weights → `y_weights`).
+- **Next measure:** re-run protocol to `results/noise_protocol_post_phase3/` vs freeze; if outliers Exact still weak → Phase 4/6.
+- Do not optimize suite noisy EXACT%; use Exact + Complexity + R2clean vs freeze.
+
 
 ---
 
@@ -29,11 +38,13 @@ Key files: `glassbox/sr/cpp/evolution.h`, `glassbox/sr/cpp/core.cpp`,
 - [x] Build fixed noisy suites: clean, 0.1%, 1%, 10% RMS Gaussian,
       pink, quantization, sparse outliers.
 - [x] Protocol CLI: `python scripts/benchmark_noise.py` (+ `--smoke`).
-- [~] Run ≥5 seeds/tier on noisy Feynman + easy synthetic **via**
-      `scripts/benchmark_noise.py` and store `noise_protocol_*.json`
-      (CLI ready; full baseline still needs a torch-enabled run).
-      Suite `--noise high` probes under `results/before_noise/` remain
-      noisy-fit EXACT only — prefer CleanMSE/Recov / protocol clean columns.
+- [x] Run ≥5 seeds/tier on noisy Feynman + easy synthetic **via**
+      `scripts/benchmark_noise.py` and store `noise_protocol_*.json`.
+      Freeze: `results/noise_protocol_baseline/noise_protocol_20260717_143607`
+      (210 cells, 0 failures). Findings + fix list:
+      `noise_handling_baseline_findings.md`. Suite `--noise high` under
+      `results/before_noise/` remains noisy-fit EXACT only — prefer
+      CleanMSE/Recov / protocol clean columns.
 - [x] Constant-target noise uses amplitude fallback (not free under noise).
 - [x] Capture native trace stats via existing `trace_path` in `core.cpp`.
 - [x] Do NOT tune thresholds on a single run; keep displayed MSE primary.
@@ -137,6 +148,18 @@ Goal: native evolution optimises weighted loss, not only unweighted MSE.
 **Outcome**: evolution recovers correct simple structure when known-bad
 observations would otherwise dominate; Pareto front exposes
 weighted-fit vs unweighted-robustness tradeoff.
+
+**Outcome (2026-07-17 closeout):**
+- C++ `run_evolution(..., y_weights=...)` + weighted fitness/ridge already present
+  (verified: weighted recovery of `2*x+1` under block outliers).
+- Python already passed `sample_weight_` into evolution / guided path.
+- **Gap closed:** auto soft-weights now apply on **1D SR** (not only multi-feature
+  blackbox), using residual MAD (linear/quad/cubic probes) so clean polynomials
+  stay unweighted.
+- Protocol reports `sample_weight_mode=auto_soft_mad` when active; `no_weights`
+  ablation forces `blackbox_noise_robust=False`.
+- Tests: `tests/test_sample_weight_contract.py` (1D auto on/off) +
+  `glassbox/sr/test_cpp_parity.py` weighted evolution.
 
 ---
 

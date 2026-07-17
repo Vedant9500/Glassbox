@@ -324,6 +324,67 @@ def _soft_mad_sample_weights(values, *, floor: float = 0.05, cap: float = 1.0):
     return w
 
 
+def _auto_residual_soft_weights(X, y, *, floor: float = 0.05, cap: float = 1.0):
+    """Soft MAD weights from residuals of a cheap structure fit (Phase 3 1D path).
+
+    Raw-target soft weights fire on clean nonlinear y (e.g. polynomials) because
+    the *level* distribution is heavy-tailed even when residuals are clean.
+
+    Fit residual probes (linear, quadratic/cubic for 1D, median) and keep the
+    residual with the smallest MAD scale, then soft-weight *that* residual only.
+    Returns ``(weights_or_None, outlier_fraction)``.
+    """
+    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+    n = int(y_arr.shape[0])
+    if n < 8 or not np.any(np.isfinite(y_arr)):
+        return None, 0.0
+    X_arr = np.asarray(X, dtype=np.float64)
+    if X_arr.ndim == 1:
+        X_arr = X_arr.reshape(-1, 1)
+    if X_arr.shape[0] != n:
+        r = y_arr - float(np.median(y_arr[np.isfinite(y_arr)]))
+        soft = _soft_mad_sample_weights(r, floor=floor, cap=cap)
+        return soft, float(_estimate_outlier_fraction(r))
+
+    def _resid_scale(r):
+        r = np.asarray(r, dtype=np.float64).reshape(-1)
+        rf = r[np.isfinite(r)]
+        if rf.size < 4:
+            return float("inf")
+        mad = float(np.median(np.abs(rf - np.median(rf))))
+        if mad > 1e-15:
+            return 1.4826 * mad
+        s = float(np.std(rf))
+        return s if np.isfinite(s) and s > 0.0 else 0.0
+
+    residuals = []
+    try:
+        x0 = X_arr[:, 0]
+        A = np.column_stack([x0, np.ones(n, dtype=np.float64)])
+        coef, _, _, _ = np.linalg.lstsq(A, y_arr, rcond=None)
+        residuals.append(y_arr - A @ coef)
+        if X_arr.shape[1] == 1:
+            A2 = np.column_stack([x0 ** 2, x0, np.ones(n, dtype=np.float64)])
+            coef2, _, _, _ = np.linalg.lstsq(A2, y_arr, rcond=None)
+            residuals.append(y_arr - A2 @ coef2)
+            A3 = np.column_stack(
+                [x0 ** 3, x0 ** 2, x0, np.ones(n, dtype=np.float64)]
+            )
+            coef3, _, _, _ = np.linalg.lstsq(A3, y_arr, rcond=None)
+            residuals.append(y_arr - A3 @ coef3)
+    except Exception:
+        pass
+    y_med = float(np.median(y_arr[np.isfinite(y_arr)]))
+    residuals.append(y_arr - y_med)
+
+    if not residuals:
+        return None, 0.0
+    best_r = min(residuals, key=_resid_scale)
+    out_frac = float(_estimate_outlier_fraction(best_r))
+    soft = _soft_mad_sample_weights(best_r, floor=floor, cap=cap)
+    return soft, out_frac
+
+
 def _slice_sample_weight(sample_weight, indices=None, n_targets=None):
     """Slice or validate per-point weights for a subset of rows.
 
@@ -6793,31 +6854,57 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             interaction_search=bool(self.blackbox_interaction_search),
             sample_weight=self.sample_weight_ if self.sample_weight_provided_ else None,
         )
-        # Phase C: gated soft MAD weights for blackbox multi-feature when user
-        # did not supply weights. May re-run ranking with weights so selection
-        # sees the same objective as evolution.
+        # Phase C / Phase 3: gated soft MAD weights when user did not supply
+        # sample_weight. Originally multi-feature blackbox only; Phase 3 extends
+        # auto mode to 1D SR so native evolution receives y_weights under outliers
+        # (noise protocol baseline is almost entirely single-feature).
+        # May re-run ranking with weights so selection matches evolution objective.
         self._blackbox_noise_robust_applied_ = {
             "active": False,
             "mode": getattr(self, "blackbox_noise_robust", "auto"),
             "reason": "not_applied",
         }
         robust_mode = getattr(self, "blackbox_noise_robust", "auto")
-        want_robust = robust_mode is True or (
-            robust_mode == "auto"
-            and blackbox_enabled
+        multi_feature_blackbox = (
+            blackbox_enabled
             and getattr(blackbox_state, "enabled", False)
             and int(X.shape[1]) > 1
-            and not self.sample_weight_provided_
+        )
+        single_feature_sr = int(X.shape[1]) == 1
+        want_robust = (
+            not self.sample_weight_provided_
+            and (
+                robust_mode is True
+                or (
+                    robust_mode == "auto"
+                    and (multi_feature_blackbox or single_feature_sr)
+                )
+            )
         )
         if want_robust:
-            soft_w = _soft_mad_sample_weights(y)
+            # Residual-based soft weights (avoids false positives on clean polynomials).
+            soft_w, out_frac = _auto_residual_soft_weights(X, y)
             selection_uncertain = bool(getattr(blackbox_state, "feature_selection_uncertain", False))
-            out_frac = _estimate_outlier_fraction(y - float(np.median(np.asarray(y, dtype=np.float64).reshape(-1))))
+            # Activation: need a soft-weight signal plus evidence of heavy tails.
+            # 1D SR uses a slightly lower out_frac floor (sparse 3% outliers often
+            # land near ~1–2% on residual MAD estimates). Clean polynomials that
+            # only trigger weak soft weights (out_frac ~0) stay unweighted.
+            out_frac_floor = 0.01 if single_feature_sr else 0.02
+            low_weight_mass = 0.0
+            if soft_w is not None:
+                sw = np.asarray(soft_w, dtype=np.float64).reshape(-1)
+                mean_w = float(np.mean(sw)) if sw.size else 1.0
+                if mean_w > 1e-12:
+                    low_weight_mass = float(np.mean(sw < 0.85 * mean_w))
             activate = soft_w is not None and (
                 robust_mode is True
                 or selection_uncertain
-                or out_frac >= 0.02
-                or str(getattr(blackbox_state, "reason", "")).startswith("retained_all_features")
+                or out_frac >= out_frac_floor
+                or low_weight_mass >= 0.02
+                or (
+                    multi_feature_blackbox
+                    and str(getattr(blackbox_state, "reason", "")).startswith("retained_all_features")
+                )
             )
             if activate and soft_w is not None:
                 self.sample_weight_ = _validate_sample_weight(soft_w, X.shape[0])
@@ -6842,6 +6929,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     "active": True,
                     "mode": robust_mode,
                     "reason": "soft_mad_weights",
+                    "path": (
+                        "1d_sr"
+                        if single_feature_sr
+                        else ("multi_feature_blackbox" if multi_feature_blackbox else "forced")
+                    ),
                     "outlier_fraction_target": float(out_frac),
                     "selection_uncertain": selection_uncertain,
                     "loss_mode_switched_to_huber": loss_switched,
@@ -6850,6 +6942,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         if self.sample_weight_ is not None
                         else None
                     ),
+                    "weights_to_evolution": True,
                 }
             else:
                 self._blackbox_noise_robust_applied_ = {
