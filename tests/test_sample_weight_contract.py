@@ -378,3 +378,67 @@ def test_evaluate_auto_weight_guard_ok_on_true_structure():
     assert m["complexity"] <= 22
     assert m["full_r2"] > 0.99
 
+
+def test_phase6_parsimony_prefers_simpler_similar_r2():
+    """Phase 6: under auto soft-MAD, prefer simpler formula with similar unweighted fit."""
+    import numpy as np
+    from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
+    x = np.linspace(-2.0, 2.0, 100).reshape(-1, 1)
+    y = (x[:, 0] ** 2).copy()
+    y[45:50] += 6.0  # mild outliers so residual path could activate
+
+    est = GlassboxRegressor(blackbox_noise_robust="auto", random_state=0)
+    est.n_features_in_ = 1
+    est._blackbox_noise_robust_applied_ = {
+        "active": True,
+        "mode": "auto",
+        "reason": "soft_mad_weights",
+        "path": "1d_sr",
+    }
+    est.blackbox_diagnostics_ = {"sample_weight": {"provided": True, "source": "auto_soft_mad"}}
+    est.sample_weight_provided_ = True
+    est.sample_weight_ = np.ones(len(y))
+    simple = "x**2"
+    bloated = "x**2 + 0.0001*sin(12*x) + 0.0001*cos(9*x) + 0.0001*sin(3*x)"
+    est._auto_weight_fallback_candidates_ = [
+        {"formula": simple, "complexity": 3, "source": "seed"},
+    ]
+    # Force metrics path: bloated nearly as good but more complex
+    out = est._phase6_noise_parsimony_pass(bloated, x, y, stage="unit")
+    assert est._formula_complexity(out) <= est._formula_complexity(bloated)
+    # Should prefer simple when available and acceptable
+    assert est._formula_complexity(out) <= 8
+    diag = est.blackbox_diagnostics_.get("phase6_noise_parsimony") or {}
+    assert diag.get("active") is True
+
+
+def test_residual_skipped_when_auto_weight_1d_already_good():
+    """Phase 6: residual boosting skipped under auto weights when 1D fit is already excellent."""
+    import numpy as np
+    from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
+    x = np.linspace(-2.0, 2.0, 80).reshape(-1, 1)
+    y = 2.0 * x[:, 0] + 1.0
+    est = GlassboxRegressor(
+        enable_residual_stage=True,
+        use_guided_evolution=True,
+        blackbox_noise_robust="auto",
+        random_state=0,
+    )
+    est.n_features_in_ = 1
+    est._blackbox_noise_robust_applied_ = {
+        "active": True,
+        "mode": "auto",
+        "reason": "soft_mad_weights",
+        "path": "1d_sr",
+    }
+    est.blackbox_diagnostics_ = {"sample_weight": {"provided": True, "source": "auto_soft_mad"}}
+    out = est._run_residual_boosting_impl(x, y, "2*x + 1")
+    assert out == "2*x + 1"
+    assert (est.boosting_diagnostics_ or {}).get("skip_reason") in (
+        "auto_weight_1d_already_good",
+        "auto_weight_1d_complexity",
+        "auto_weight_at_complexity_cap",
+    ) or (est.blackbox_diagnostics_ or {}).get("residual_skipped_phase6")
+

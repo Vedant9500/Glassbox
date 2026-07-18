@@ -3905,6 +3905,145 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         pool.sort(key=lambda c: (int(c.get("complexity") or 999), float(c.get("full_mse") or 1e300)))
         del pool[12:]
 
+    def _phase6_noise_parsimony_pass(self, formula, X, y, *, stage="phase6_parsimony"):
+        """Phase 6 tighten: under auto soft-MAD, prefer simpler formulas with similar unweighted fit.
+
+        Aggressive reduce/simplify with wider fidelity slack, then keep the simplest
+        candidate whose unweighted holdout R² stays within a small gap of the primary.
+        """
+        text = str(formula or "").strip()
+        if not text or not self._auto_noise_guard_active():
+            return text or formula
+
+        primary_m = self._evaluate_auto_weight_guard(text, X, y)
+        primary_h = primary_m.get("holdout_r2")
+        primary_f = primary_m.get("full_r2")
+        primary_cx = int(primary_m.get("complexity") or self._formula_complexity(text))
+        # Need a finite primary metric; low R² on noisy labels is OK for parsimony.
+        if not np.isfinite(primary_f):
+            return text
+
+        candidates = [{"formula": text, "source": "primary", "metrics": primary_m}]
+
+        # Wider cleanup slack under noise so BIC/reduce can drop junk terms.
+        try:
+            cleaned = str(
+                self._cleanup_formula_with_fidelity_guard(
+                    text,
+                    X,
+                    y,
+                    stage=stage + "_cleanup",
+                    relative_slack=0.25,
+                    absolute_slack=1e-8,
+                )
+                or ""
+            ).strip()
+        except Exception:
+            cleaned = ""
+        if cleaned and cleaned != text:
+            candidates.append({
+                "formula": cleaned,
+                "source": "aggressive_cleanup",
+                "metrics": self._evaluate_auto_weight_guard(cleaned, X, y),
+            })
+            self._register_auto_weight_fallback_candidate(
+                cleaned, X, y, source="phase6_cleanup"
+            )
+
+        # Second reduce-only pass with noise-aware (already uses weights).
+        try:
+            reduced = str(self._reduce_formula_noise(text, X, y) or "").strip()
+        except Exception:
+            reduced = ""
+        if reduced and reduced not in {text, cleaned}:
+            candidates.append({
+                "formula": reduced,
+                "source": "reduce_only",
+                "metrics": self._evaluate_auto_weight_guard(reduced, X, y),
+            })
+            self._register_auto_weight_fallback_candidate(
+                reduced, X, y, source="phase6_reduce"
+            )
+
+        # Also consider tracked simpler fallbacks.
+        for item in list(getattr(self, "_auto_weight_fallback_candidates_", None) or []):
+            f = str(item.get("formula") or "").strip()
+            if not f:
+                continue
+            candidates.append({
+                "formula": f,
+                "source": str(item.get("source") or "fallback"),
+                "metrics": self._evaluate_auto_weight_guard(f, X, y),
+            })
+
+        # Keep candidates that do not tank unweighted recovery vs primary.
+        # Use *relative* thresholds so noisy-label R² can be moderate while still
+        # preferring simpler structure (outliers make absolute R² on y_noisy low).
+        def _acceptable(m):
+            if not m:
+                return False
+            fr = m.get("full_r2")
+            hr = m.get("holdout_r2")
+            if not np.isfinite(fr):
+                return False
+            # Relative to primary full R² (allow tiny regression for simplicity).
+            if np.isfinite(primary_f):
+                if fr < float(primary_f) - 0.05 and fr < 0.98:
+                    return False
+            else:
+                if fr < 0.5:
+                    return False
+            if np.isfinite(primary_h) and np.isfinite(hr):
+                if hr < float(primary_h) - 0.05 and hr < 0.98:
+                    return False
+            # Prefer not to promote clearly worse complexity unless R² is much better.
+            cx = int(m.get("complexity") or 999)
+            if cx > primary_cx + 2:
+                return False
+            return True
+
+        pool = []
+        seen = set()
+        for c in candidates:
+            f = c["formula"]
+            if f in seen:
+                continue
+            seen.add(f)
+            if _acceptable(c["metrics"]):
+                pool.append(c)
+        if not pool:
+            pool = [candidates[0]]
+
+        def _rank(c):
+            m = c["metrics"]
+            cx = int(m.get("complexity") or 999)
+            # Prefer lower complexity, then better holdout, then better full R2.
+            hr = m.get("holdout_r2")
+            fr = m.get("full_r2")
+            hr_key = -float(hr) if hr is not None and np.isfinite(hr) else 0.0
+            fr_key = -float(fr) if fr is not None and np.isfinite(fr) else 0.0
+            return (cx, hr_key, fr_key)
+
+        pool.sort(key=_rank)
+        chosen = pool[0]
+        diag = {
+            "active": True,
+            "stage": stage,
+            "primary_complexity": primary_cx,
+            "primary_full_r2": primary_f,
+            "primary_holdout_r2": primary_h,
+            "selected_formula": str(chosen["formula"])[:200],
+            "selected_source": chosen.get("source"),
+            "selected_complexity": chosen["metrics"].get("complexity"),
+            "selected_full_r2": chosen["metrics"].get("full_r2"),
+            "selected_holdout_r2": chosen["metrics"].get("holdout_r2"),
+            "replaced": str(chosen["formula"]) != text,
+            "pool_size": len(pool),
+        }
+        if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+            self.blackbox_diagnostics_["phase6_noise_parsimony"] = diag
+        return chosen["formula"]
+
     def _apply_auto_weight_final_guard(self, formula, X, y, *, stage="final_fit"):
         """Block bloated / unweighted-catastrophic formulas when auto soft-weights ran.
 
@@ -6822,6 +6961,51 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if not self.enable_residual_stage or not base_formula or not self.use_guided_evolution:
             return base_formula
 
+        # Phase 6 tighten: residual stages often re-bloat under auto soft-MAD
+        # (Nguyen-1 outliers). Skip when 1D and base already fits holdout well,
+        # or when formula is already at/over the auto-weight complexity cap.
+        if self._auto_noise_guard_active():
+            n_feat = int(np.asarray(X).shape[1]) if np.ndim(X) == 2 else 1
+            base_cx = int(self._formula_complexity(base_formula))
+            limits = self._auto_weight_guard_limits(X)
+            max_cx = int(limits.get("max_complexity", 22))
+            try:
+                pred0 = self._safe_eval_formula_array(base_formula, X)
+                y0 = np.asarray(y, dtype=np.float64).reshape(-1)
+                p0 = np.asarray(pred0, dtype=np.float64).reshape(-1)
+                yvar = float(np.var(y0))
+                base_r2_full = (
+                    1.0
+                    if yvar < 1e-15 and float(np.mean((y0 - p0) ** 2)) < 1e-15
+                    else (1.0 - float(np.mean((y0 - p0) ** 2)) / max(yvar, 1e-15))
+                )
+            except Exception:
+                base_r2_full = float("nan")
+            skip_residual = False
+            skip_reason = None
+            if n_feat <= 1 and base_cx >= max(12, max_cx - 6):
+                skip_residual = True
+                skip_reason = "auto_weight_1d_complexity"
+            elif n_feat <= 1 and np.isfinite(base_r2_full) and base_r2_full >= 0.995:
+                skip_residual = True
+                skip_reason = "auto_weight_1d_already_good"
+            elif base_cx >= max_cx:
+                skip_residual = True
+                skip_reason = "auto_weight_at_complexity_cap"
+            if skip_residual:
+                self.boosting_diagnostics_["skipped"] = True
+                self.boosting_diagnostics_["skip_reason"] = skip_reason
+                self.boosting_diagnostics_["base_r2"] = (
+                    float(base_r2_full) if np.isfinite(base_r2_full) else None
+                )
+                if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+                    self.blackbox_diagnostics_["residual_skipped_phase6"] = {
+                        "reason": skip_reason,
+                        "base_complexity": base_cx,
+                        "base_r2": float(base_r2_full) if np.isfinite(base_r2_full) else None,
+                    }
+                return base_formula
+
         def local_r2(y_true, y_pred):
             y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
             y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
@@ -8579,11 +8763,16 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             "evaluated_candidates": pareto_choice.get("evaluated_candidates"),
                             "best_raw_validation_mse": pareto_choice.get("best_raw_validation_mse"),
                         }
+            _cleanup_kw = {"stage": "final_fit"}
+            if self._auto_noise_guard_active():
+                # Phase 6: allow more term dropping when auto soft-MAD is active.
+                _cleanup_kw["relative_slack"] = 0.22
+                _cleanup_kw["absolute_slack"] = 1e-8
             best_formula = self._cleanup_formula_with_fidelity_guard(
                 best_formula,
                 X,
                 y,
-                stage="final_fit",
+                **_cleanup_kw,
             )
             if getattr(self, "blackbox_state_", None) is not None and self.blackbox_state_.enabled:
                 remapped = formula_from_search_to_original_space(
@@ -8898,17 +9087,26 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             else:
                 self.n_features_in_ = X_original.shape[1]
 
-        # Phase 3 guardrail: auto soft-weights must not promote bloated formulas
-        # that look good under weighted/Huber search but fail unweighted holdout.
+        # Phase 6 tighten + Phase 3 guardrail: parsimony under auto soft-MAD,
+        # then block bloated unweighted-catastrophic winners.
         try:
+            eval_X_final = X_original if (
+                getattr(self, "blackbox_state_", None) is not None
+                and getattr(self.blackbox_state_, "enabled", False)
+            ) else X
+            eval_y_final = y_original if eval_X_final is X_original else y
             if best_formula:
                 self._register_auto_weight_fallback_candidate(
-                    best_formula, X_original, y_original, source="pre_guard_best"
+                    best_formula, eval_X_final, eval_y_final, source="pre_guard_best"
                 )
             evo_cand = getattr(self, "evolution_candidate_formula_", None)
             if evo_cand:
                 self._register_auto_weight_fallback_candidate(
-                    evo_cand, X_original, y_original, source="evolution"
+                    evo_cand, eval_X_final, eval_y_final, source="evolution"
+                )
+            if best_formula and self._auto_noise_guard_active():
+                best_formula = self._phase6_noise_parsimony_pass(
+                    best_formula, eval_X_final, eval_y_final, stage="final_fit"
                 )
             guarded = self._apply_auto_weight_final_guard(
                 best_formula,
@@ -8978,6 +9176,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             # Noise-aware holdout slack for C++ fidelity guard.
             _, _, slack_diag = self._noise_aware_cleanup_slack(formula_str, X, y)
             rel = float(slack_diag.get("relative_slack", 0.10))
+            # Phase 6 tighten: under auto soft-MAD allow more aggressive BIC pruning.
+            if self._auto_noise_guard_active():
+                rel = max(rel, 0.22)
             kwargs = {
                 "holdout_fraction": 0.2,
                 "relative_slack": rel,

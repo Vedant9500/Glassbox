@@ -126,3 +126,16 @@ Auto-weight final guard in `GlassboxRegressor` (2026-07-17):
 - Diagnostics: `blackbox_diagnostics_["auto_weight_final_guard"]`.
 
 Re-run protocol after this change before claiming Nguyen-1 Accept fix.
+
+---
+
+## 9. Phase 6 tighten (after guard)
+
+Implemented after post-guard focus run:
+
+1. **Parsimony pass** (`_phase6_noise_parsimony_pass`) when auto soft-MAD active:
+   aggressive cleanup/reduce + prefer simpler fallback with similar unweighted R².
+2. **Residual skip** on 1D auto-weight when base R² already high or complexity high.
+3. Wider cleanup / C++ reduce slack under auto soft-MAD.
+
+Re-measure: `results/noise_protocol_post_phase6/` (same focus matrix as post_guard).

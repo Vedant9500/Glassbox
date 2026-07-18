@@ -45,6 +45,7 @@ coverage.xml
 .pytest_cache/
 cover/
 scratch/
+test_frontend/
 
 # Jupyter Notebook
 .ipynb_checkpoints
