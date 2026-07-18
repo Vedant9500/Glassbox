@@ -485,7 +485,11 @@ def test_phase4_diffuse_noise_enables_huber():
     applied = getattr(est, "_blackbox_noise_robust_applied_", {}) or {}
     assert applied.get("active") is True, applied
     assert applied.get("reason") in ("diffuse_noise_huber", "soft_mad_weights"), applied
-    assert str(est.loss_mode) == "huber"
+    # Search used huber; public hyperparameter must remain user default after fit.
+    assert applied.get("loss_mode_switched_to_huber") is True or str(
+        ((est.blackbox_diagnostics_ or {}).get("loss_mode") or {}).get("mode")
+    ) == "huber"
+    assert str(est.loss_mode) == "mse"
 
 
 def test_phase4_clean_stays_mse():
@@ -542,3 +546,49 @@ def test_phase4_user_loss_mode_not_overridden():
         pass
     assert str(est.loss_mode) == "trimmed_mse"
 
+
+
+def test_auto_huber_does_not_stick_loss_mode_across_fits():
+    """Phase 4 auto Huber must not permanently mutate public loss_mode (sklearn reuse)."""
+    import numpy as np
+    from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
+    rng = np.random.RandomState(0)
+    x = np.linspace(-2.0, 2.0, 100).reshape(-1, 1)
+    y_clean = x[:, 0] ** 2
+    y_noisy = y_clean + rng.normal(0, 0.1 * np.std(y_clean), size=len(x))
+
+    est = GlassboxRegressor(
+        generations=1,
+        population_size=4,
+        timeout=3,
+        multi_start_runs=1,
+        use_fast_path=False,
+        use_guided_evolution=False,
+        blackbox_mode=False,
+        blackbox_noise_robust="auto",
+        loss_mode="mse",
+        random_state=0,
+    )
+    try:
+        est.fit(x, y_noisy)
+    except Exception:
+        pass
+    applied = getattr(est, "_blackbox_noise_robust_applied_", {}) or {}
+    # After fit, public hyperparameter must remain mse even if auto used huber.
+    assert str(est.loss_mode) == "mse", est.loss_mode
+    assert str(est.get_params().get("loss_mode")) == "mse"
+    # Diagnostics should still record that search used huber when activated.
+    if applied.get("reason") == "diffuse_noise_huber":
+        lm = (est.blackbox_diagnostics_ or {}).get("loss_mode") or {}
+        assert str(lm.get("mode") or "") == "huber" or applied.get("loss_mode_switched_to_huber")
+
+    try:
+        est.fit(x, y_clean)
+    except Exception:
+        pass
+    # Second fit on clean data must treat user mode as mse again.
+    assert str(getattr(est, "_user_loss_mode_", "mse")) == "mse"
+    applied2 = getattr(est, "_blackbox_noise_robust_applied_", {}) or {}
+    assert applied2.get("reason") != "diffuse_noise_huber" or not applied2.get("active")
+    assert str(est.loss_mode) == "mse"

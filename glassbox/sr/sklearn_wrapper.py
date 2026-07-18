@@ -3848,7 +3848,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "n_val": int(len(split["y_val"])),
         }
 
+    def _restore_user_loss_mode_if_auto_switched(self) -> None:
+        """Restore constructor/user loss_mode after Phase 3/4 auto Huber switch."""
+        if not getattr(self, "_loss_mode_auto_switched_", False):
+            return
+        prev = getattr(self, "_user_loss_mode_", None)
+        if prev is not None:
+            self.loss_mode = prev
+        self._loss_mode_auto_switched_ = False
+
     def _auto_noise_guard_active(self) -> bool:
+
         """True when Phase-3 auto residual soft-weights were applied (not user weights)."""
         applied = getattr(self, "_blackbox_noise_robust_applied_", None) or {}
         if not isinstance(applied, dict) or not applied.get("active"):
@@ -7286,7 +7296,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.sample_weight_provided_ = self.sample_weight_ is not None
         # Preserve user-requested loss mode so Phase 3/4 auto paths only switch
         # when the caller left the default ``mse``.
+        # Undo sticky auto-switch from a previous fit (do not mutate public
+        # loss_mode permanently — sklearn reuse / get_params must stay clean).
+        if getattr(self, "_loss_mode_auto_switched_", False):
+            prev = getattr(self, "_user_loss_mode_", None)
+            if prev is not None:
+                self.loss_mode = prev
+            self._loss_mode_auto_switched_ = False
         self._user_loss_mode_ = str(getattr(self, "loss_mode", "mse") or "mse")
+        self._loss_mode_auto_switched_ = False
         self.has_composed_seeds_ = False
         self.composition_candidates_accepted_ = False
         self.composition_candidate_count_ = 0
@@ -7394,6 +7412,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 loss_switched = False
                 if str(getattr(self, "loss_mode", "mse") or "mse") == "mse":
                     self.loss_mode = "huber"
+                    self._loss_mode_auto_switched_ = True
                     loss_switched = True
                 X_search, y_search, blackbox_state = prepare_blackbox_search(
                     X,
@@ -7445,6 +7464,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         robust_mode == "auto" and noise_ratio >= 0.02
                     ):
                         self.loss_mode = "huber"
+                        self._loss_mode_auto_switched_ = True
                         self._blackbox_noise_robust_applied_ = {
                             "active": True,
                             "mode": robust_mode,
@@ -7476,6 +7496,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 noise_ratio, res_out_frac = _estimate_diffuse_noise_ratio(X, y)
                 if noise_ratio >= 0.02 or robust_mode is True:
                     self.loss_mode = "huber"
+                    self._loss_mode_auto_switched_ = True
                     self._blackbox_noise_robust_applied_ = {
                         "active": True,
                         "mode": robust_mode,
@@ -7690,6 +7711,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             self.best_mse_ = final_mse
             if skip_reason and isinstance(self.blackbox_diagnostics_, dict):
                 self.blackbox_diagnostics_["specialist_skipped_reason"] = skip_reason
+            self._restore_user_loss_mode_if_auto_switched()
             self._add_phase_time("total_fit", _time.time() - fit_start)
             return self
 
@@ -9267,6 +9289,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         self.formula_ = best_formula or "0"
         self.best_mse_ = best_mse
+        self._restore_user_loss_mode_if_auto_switched()
         self._add_phase_time("total_fit", _time.time() - fit_start)
         return self
 
