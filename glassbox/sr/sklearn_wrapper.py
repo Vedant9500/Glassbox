@@ -385,6 +385,73 @@ def _auto_residual_soft_weights(X, y, *, floor: float = 0.05, cap: float = 1.0):
     return soft, out_frac
 
 
+def _estimate_diffuse_noise_ratio(X, y):
+    """Cheap residual noise ratio for Phase 4 (diffuse noise without sparse outliers).
+
+    Fits the best of {median, linear, quadratic, cubic (1D)} and returns
+    ``mad(residual) / scale(y)``. Clean structured targets → ~0; 10% RMS Gaussian
+    / pink-style residual noise stays elevated even when soft-MAD weights do not
+    fire (isotropic noise has no heavy-tail mass to downweight).
+    """
+    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+    n = int(y_arr.shape[0])
+    if n < 8 or not np.any(np.isfinite(y_arr)):
+        return 0.0, 0.0
+    X_arr = np.asarray(X, dtype=np.float64)
+    if X_arr.ndim == 1:
+        X_arr = X_arr.reshape(-1, 1)
+    finite = np.isfinite(y_arr)
+    y_f = y_arr[finite]
+    y_scale = float(np.std(y_f)) if y_f.size else 0.0
+    if not np.isfinite(y_scale) or y_scale < 1e-12:
+        y_scale = max(float(np.mean(np.abs(y_f))) if y_f.size else 1.0, 1e-12)
+
+    def _resid_scale(r):
+        r = np.asarray(r, dtype=np.float64).reshape(-1)
+        rf = r[np.isfinite(r)]
+        if rf.size < 4:
+            return float("inf")
+        mad = float(np.median(np.abs(rf - np.median(rf))))
+        if mad > 1e-15:
+            return 1.4826 * mad
+        s = float(np.std(rf))
+        return s if np.isfinite(s) else float("inf")
+
+    residuals = []
+    y_med = float(np.median(y_f)) if y_f.size else 0.0
+    residuals.append(y_arr - y_med)
+    if X_arr.shape[0] == n:
+        try:
+            x0 = X_arr[:, 0]
+            A = np.column_stack([x0, np.ones(n, dtype=np.float64)])
+            coef, _, _, _ = np.linalg.lstsq(A, y_arr, rcond=None)
+            residuals.append(y_arr - A @ coef)
+            if X_arr.shape[1] == 1:
+                A2 = np.column_stack([x0 ** 2, x0, np.ones(n, dtype=np.float64)])
+                coef2, _, _, _ = np.linalg.lstsq(A2, y_arr, rcond=None)
+                residuals.append(y_arr - A2 @ coef2)
+                A3 = np.column_stack(
+                    [x0 ** 3, x0 ** 2, x0, np.ones(n, dtype=np.float64)]
+                )
+                coef3, _, _, _ = np.linalg.lstsq(A3, y_arr, rcond=None)
+                residuals.append(y_arr - A3 @ coef3)
+        except Exception:
+            pass
+    best_r = min(residuals, key=_resid_scale)
+    scale = _resid_scale(best_r)
+    best_r = np.asarray(best_r, dtype=np.float64).reshape(-1)
+    rf = best_r[np.isfinite(best_r)]
+    rms = float(np.sqrt(np.mean(rf ** 2))) if rf.size else 0.0
+    # Prefer the larger of MAD-scale and RMS so smooth pink-like residuals still register.
+    if np.isfinite(rms):
+        scale = max(scale if np.isfinite(scale) else 0.0, rms)
+    if not np.isfinite(scale):
+        return 0.0, float(_estimate_outlier_fraction(best_r))
+    ratio = float(scale / y_scale) if y_scale > 0 else 0.0
+    out_frac = float(_estimate_outlier_fraction(best_r))
+    return ratio, out_frac
+
+
 def _slice_sample_weight(sample_weight, indices=None, n_targets=None):
     """Slice or validate per-point weights for a subset of rows.
 
@@ -7217,6 +7284,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         X, y = check_X_y(X, y, accept_sparse=False)
         self.sample_weight_ = _validate_sample_weight(sample_weight, X.shape[0])
         self.sample_weight_provided_ = self.sample_weight_ is not None
+        # Preserve user-requested loss mode so Phase 3/4 auto paths only switch
+        # when the caller left the default ``mse``.
+        self._user_loss_mode_ = str(getattr(self, "loss_mode", "mse") or "mse")
         self.has_composed_seeds_ = False
         self.composition_candidates_accepted_ = False
         self.composition_candidate_count_ = 0
@@ -7361,6 +7431,62 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     "reason": "no_heavy_tail_signal",
                     "outlier_fraction_target": float(out_frac),
                 }
+                # Phase 4: diffuse noise (pink / ~10% Gaussian) often has NO heavy-tail
+                # mass for soft-MAD weights. Enable Huber search loss without weights
+                # when residual scale vs y is elevated after a cheap structure fit.
+                if (
+                    str(getattr(self, "_user_loss_mode_", "mse") or "mse") == "mse"
+                    and str(getattr(self, "loss_mode", "mse") or "mse") == "mse"
+                ):
+                    noise_ratio, res_out_frac = _estimate_diffuse_noise_ratio(X, y)
+                    # ~10% RMS residual noise → ratio ~0.1; clean structured → ~0.
+                    # Floor ~0.025 catches ~5% pink / 10% Gaussian residual ratios; clean/1% stay off.
+                    if robust_mode is True or (
+                        robust_mode == "auto" and noise_ratio >= 0.02
+                    ):
+                        self.loss_mode = "huber"
+                        self._blackbox_noise_robust_applied_ = {
+                            "active": True,
+                            "mode": robust_mode,
+                            "reason": "diffuse_noise_huber",
+                            "path": (
+                                "1d_sr"
+                                if single_feature_sr
+                                else (
+                                    "multi_feature_blackbox"
+                                    if multi_feature_blackbox
+                                    else "forced"
+                                )
+                            ),
+                            "outlier_fraction_target": float(res_out_frac),
+                            "diffuse_noise_ratio": float(noise_ratio),
+                            "loss_mode_switched_to_huber": True,
+                            "weights_to_evolution": False,
+                            "sample_weight_mode": "none",
+                        }
+        elif (
+            not self.sample_weight_provided_
+            and robust_mode is not False
+            and str(getattr(self, "_user_loss_mode_", getattr(self, "loss_mode", "mse")) or "mse")
+            == "mse"
+            and str(getattr(self, "loss_mode", "mse") or "mse") == "mse"
+        ):
+            # want_robust was false (e.g. unusual shape) but still allow forced True.
+            if robust_mode is True:
+                noise_ratio, res_out_frac = _estimate_diffuse_noise_ratio(X, y)
+                if noise_ratio >= 0.02 or robust_mode is True:
+                    self.loss_mode = "huber"
+                    self._blackbox_noise_robust_applied_ = {
+                        "active": True,
+                        "mode": robust_mode,
+                        "reason": "diffuse_noise_huber",
+                        "path": "forced",
+                        "outlier_fraction_target": float(res_out_frac),
+                        "diffuse_noise_ratio": float(noise_ratio),
+                        "loss_mode_switched_to_huber": True,
+                        "weights_to_evolution": False,
+                        "sample_weight_mode": "none",
+                    }
         feature_selection_fallback = None
         if (
             blackbox_enabled

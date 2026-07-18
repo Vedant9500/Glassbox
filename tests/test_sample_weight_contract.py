@@ -442,3 +442,103 @@ def test_residual_skipped_when_auto_weight_1d_already_good():
         "auto_weight_at_complexity_cap",
     ) or (est.blackbox_diagnostics_ or {}).get("residual_skipped_phase6")
 
+
+def test_estimate_diffuse_noise_ratio_clean_vs_noisy():
+    import numpy as np
+    from glassbox.sr.sklearn_wrapper import _estimate_diffuse_noise_ratio
+
+    rng = np.random.RandomState(0)
+    x = np.linspace(-2.0, 2.0, 200).reshape(-1, 1)
+    r_clean, _ = _estimate_diffuse_noise_ratio(x, x[:, 0] ** 2)
+    r_noisy, _ = _estimate_diffuse_noise_ratio(
+        x, x[:, 0] ** 2 + rng.normal(0, 0.1 * np.std(x[:, 0] ** 2), size=len(x))
+    )
+    assert r_clean < 0.01
+    assert r_noisy >= 0.05
+
+
+def test_phase4_diffuse_noise_enables_huber():
+    """Phase 4: 10% Gaussian (no sparse outliers) switches search loss to huber."""
+    import numpy as np
+    from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
+    rng = np.random.RandomState(0)
+    x = np.linspace(-2.0, 2.0, 120).reshape(-1, 1)
+    y = x[:, 0] ** 2 + rng.normal(0, 0.1 * np.std(x[:, 0] ** 2), size=len(x))
+
+    est = GlassboxRegressor(
+        generations=1,
+        population_size=4,
+        timeout=3,
+        multi_start_runs=1,
+        use_fast_path=False,
+        use_guided_evolution=False,
+        blackbox_mode=False,
+        blackbox_noise_robust="auto",
+        loss_mode="mse",
+        random_state=0,
+    )
+    try:
+        est.fit(x, y)
+    except Exception:
+        pass
+    applied = getattr(est, "_blackbox_noise_robust_applied_", {}) or {}
+    assert applied.get("active") is True, applied
+    assert applied.get("reason") in ("diffuse_noise_huber", "soft_mad_weights"), applied
+    assert str(est.loss_mode) == "huber"
+
+
+def test_phase4_clean_stays_mse():
+    import numpy as np
+    from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
+    x = np.linspace(-2.0, 2.0, 80).reshape(-1, 1)
+    y = x[:, 0] ** 2
+    est = GlassboxRegressor(
+        generations=1,
+        population_size=4,
+        timeout=3,
+        multi_start_runs=1,
+        use_fast_path=False,
+        use_guided_evolution=False,
+        blackbox_mode=False,
+        blackbox_noise_robust="auto",
+        loss_mode="mse",
+        random_state=0,
+    )
+    try:
+        est.fit(x, y)
+    except Exception:
+        pass
+    applied = getattr(est, "_blackbox_noise_robust_applied_", {}) or {}
+    assert applied.get("active") is not True or applied.get("reason") != "diffuse_noise_huber"
+    # Clean should keep mse unless something else forced robust
+    if not applied.get("active"):
+        assert str(est.loss_mode) == "mse"
+
+
+def test_phase4_user_loss_mode_not_overridden():
+    import numpy as np
+    from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
+    rng = np.random.RandomState(0)
+    x = np.linspace(-2.0, 2.0, 100).reshape(-1, 1)
+    y = x[:, 0] ** 2 + rng.normal(0, 0.1 * np.std(x[:, 0] ** 2), size=len(x))
+    est = GlassboxRegressor(
+        generations=1,
+        population_size=4,
+        timeout=3,
+        multi_start_runs=1,
+        use_fast_path=False,
+        use_guided_evolution=False,
+        blackbox_mode=False,
+        blackbox_noise_robust="auto",
+        loss_mode="trimmed_mse",
+        random_state=0,
+    )
+    try:
+        est.fit(x, y)
+    except Exception:
+        pass
+    assert str(est.loss_mode) == "trimmed_mse"
+

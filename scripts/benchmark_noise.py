@@ -287,7 +287,7 @@ def _complexity(formula: str) -> int:
 
 
 def _sample_weight_mode(estimator: Any) -> str:
-    """Record which weight mode the fit used (user / auto soft-MAD / none)."""
+    """Record weight/robust mode used at fit (user / auto soft-MAD / huber-only / none)."""
     diag = getattr(estimator, "blackbox_diagnostics_", None)
     if isinstance(diag, dict):
         sw = diag.get("sample_weight")
@@ -298,14 +298,25 @@ def _sample_weight_mode(estimator: Any) -> str:
             return "provided"
         robust = diag.get("blackbox_noise_robust")
         if isinstance(robust, dict) and robust.get("active"):
+            reason = str(robust.get("reason") or "")
+            if reason == "diffuse_noise_huber":
+                return "auto_huber"
+            if reason == "soft_mad_weights":
+                return "auto_soft_mad"
             return "auto_soft_mad"
-    # Fallback: fitted attribute without diagnostics
+        loss = diag.get("loss_mode")
+        if isinstance(loss, dict) and str(loss.get("mode") or "mse") != "mse":
+            return f"loss_{loss.get('mode')}"
+    applied = getattr(estimator, "_blackbox_noise_robust_applied_", None) or {}
+    if isinstance(applied, dict) and applied.get("active"):
+        if str(applied.get("reason") or "") == "diffuse_noise_huber":
+            return "auto_huber"
+        if getattr(estimator, "sample_weight_provided_", False):
+            return "auto_soft_mad"
+        return "auto_huber"
     if getattr(estimator, "sample_weight_provided_", False) and getattr(
         estimator, "sample_weight_", None
     ) is not None:
-        applied = getattr(estimator, "_blackbox_noise_robust_applied_", None) or {}
-        if isinstance(applied, dict) and applied.get("active"):
-            return "auto_soft_mad"
         return "provided"
     return "none"
 

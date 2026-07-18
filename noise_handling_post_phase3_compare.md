@@ -139,3 +139,14 @@ Implemented after post-guard focus run:
 3. Wider cleanup / C++ reduce slack under auto soft-MAD.
 
 Re-measure: `results/noise_protocol_post_phase6/` (same focus matrix as post_guard).
+
+---
+
+## 10. Phase 4 tighten (diffuse noise Huber)
+
+Gap: pink / gaussian_10pct almost never got `auto_soft_mad` (isotropic noise).
+
+**Fix:** `_estimate_diffuse_noise_ratio` + auto `loss_mode=huber` when ratio ≥ 0.02
+and soft-MAD weights did not activate. Reports as `sample_weight_mode=auto_huber`.
+
+Re-measure: `results/noise_protocol_post_phase4/` (full or focus including pink).

@@ -13,8 +13,9 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` done
 - **Phase 0 freeze done** (2026-07-17). See `noise_handling_baseline_findings.md`.
 - **Phase 3 done** + post measure in `noise_handling_post_phase3_compare.md`.
 - **Guardrail done:** auto-weight final guard (complexity / unweighted holdout R²).
-- **Phase 6 tighten done:** parsimony under auto soft-MAD + skip residual when 1D already good/bloated.
-- **Next:** re-measure focus protocol (`post_phase6`); Phase 4 if pink/10% Gaussian still weak.
+- **Phase 6 tighten done:** parsimony under auto soft-MAD + residual skip when 1D already good.
+- **Phase 4 tighten done:** auto Huber for diffuse noise (pink/10% Gaussian) without soft weights.
+- **Next:** re-measure protocol (`post_phase4`) vs freeze/guard; Exact on pink/10% + clean safety.
 - Do not optimize suite noisy EXACT%; use Exact + Complexity + R2clean vs freeze.
 
 
