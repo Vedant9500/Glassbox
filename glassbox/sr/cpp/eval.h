@@ -564,7 +564,8 @@ inline std::string format_node_to_string(
                     };
                     append_term(w[0], "(" + l_str + " + " + r_str + ")");
                     append_term(w[1], "(" + l_str + " * " + r_str + ")");
-                    append_term(w[2], "(" + l_str + " / " + r_str + ")");
+                    // Match eval soft-div: x / sqrt(1 + y^2), not true x/y (S5-4).
+                    append_term(w[2], "(" + l_str + " / sqrt(1.0 + (" + r_str + ")^2))");
                     append_term(w[3], "(" + l_str + " - " + r_str + ")");
                     if (first) return "(" + l_str + " + " + r_str + ")";
                     blend += ")";
@@ -572,9 +573,28 @@ inline std::string format_node_to_string(
                     break;
                 }
                 case BinaryOp::Division:
-                    return "(" + l_str + " / " + r_str + ")";
-                case BinaryOp::Aggregation:
-                    return "(" + l_str + " + " + r_str + ")/2"; // Simplified aggregation display
+                    // Match protected Division eval: x * sign(y) / (|y| + eps) (S5-4).
+                    return "((" + l_str + ") * sign(" + r_str + ") / (abs(" + r_str + ") + 1e-6))";
+                case BinaryOp::Aggregation: {
+                    // Softmax-weighted mean of children (eval.h). Print forms that
+                    // Python display eval can execute with abs/exp only (S5-4).
+                    double tau = stabilized_tau(node.tau);
+                    if (std::abs(tau) >= 10.0) {
+                        return "((" + l_str + " + " + r_str + ")/2)";
+                    }
+                    // max(l,r) = 0.5*(l+r+abs(l-r)); min uses minus abs.
+                    std::string max_lr = "(0.5*((" + l_str + ")+(" + r_str + ")+abs((" + l_str + ")-(" + r_str + "))))";
+                    if (std::abs(tau) <= 1e-2) {
+                        if (tau >= 0.0) return max_lr;
+                        return "(0.5*((" + l_str + ")+(" + r_str + ")-abs((" + l_str + ")-(" + r_str + "))))";
+                    }
+                    char tbuf[64];
+                    snprintf(tbuf, sizeof(tbuf), "%.6g", tau);
+                    std::string t_str(tbuf);
+                    std::string el = "exp(((" + l_str + ")-(" + max_lr + "))/" + t_str + ")";
+                    std::string er = "exp(((" + r_str + ")-(" + max_lr + "))/" + t_str + ")";
+                    return "(((" + l_str + ")*(" + el + ")+(" + r_str + ")*(" + er + "))/((" + el + ")+(" + er + ")))";
+                }
             }
             break;
         }
@@ -582,8 +602,22 @@ inline std::string format_node_to_string(
     return "?";
 }
 
+// Prefer explicit n_inputs, but never collapse multi-feature graphs to bare "x".
+inline int effective_n_inputs(const IndividualGraph& graph, int n_inputs) {
+    int max_f = -1;
+    for (const auto& n : graph.nodes) {
+        if (n.type == NodeType::Input) {
+            max_f = std::max(max_f, n.feature_idx);
+        }
+    }
+    int inferred = max_f + 1;
+    if (inferred <= 1) return std::max(1, n_inputs);
+    return std::max(std::max(1, n_inputs), inferred);
+}
+
 // Convert entire graph to formula string
 inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs) {
+    n_inputs = effective_n_inputs(graph, n_inputs);
     char buf[256];
     if (graph.nodes.empty()) {
         if (std::abs(graph.output_bias) <= 1e-4) return "0";

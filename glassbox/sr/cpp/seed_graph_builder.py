@@ -432,7 +432,47 @@ class _GraphBuilder:
                         left_child=base_idx,
                     )
                 )
-            return None
+            # Variable exponent → sign(base) * exp(exp * log(|base|)) (S5-3).
+            exp_idx = self.build(exp)
+            if exp_idx is None:
+                return None
+            log_idx = self._append(
+                _default_node(type=TYPE_UNARY, unary_op=UNARY_LOG, left_child=base_idx)
+            )
+            mul_idx = self._append(
+                _default_node(
+                    type=TYPE_BINARY,
+                    binary_op=BINARY_ARITHMETIC,
+                    beta=2.0,
+                    gamma=1.0,
+                    left_child=exp_idx,
+                    right_child=log_idx,
+                )
+            )
+            mag_idx = self._append(
+                _default_node(type=TYPE_UNARY, unary_op=UNARY_EXP, omega=1.0, phi=0.0, left_child=mul_idx)
+            )
+            abs_idx = self._append(
+                _default_node(type=TYPE_UNARY, unary_op=UNARY_ABS, left_child=base_idx)
+            )
+            sign_idx = self._append(
+                _default_node(
+                    type=TYPE_BINARY,
+                    binary_op=BINARY_DIVISION,
+                    left_child=base_idx,
+                    right_child=abs_idx,
+                )
+            )
+            return self._append(
+                _default_node(
+                    type=TYPE_BINARY,
+                    binary_op=BINARY_ARITHMETIC,
+                    beta=2.0,
+                    gamma=1.0,
+                    left_child=sign_idx,
+                    right_child=mag_idx,
+                )
+            )
 
         if getattr(expr, "func", None) == sp.sin:
             (arg,) = expr.args

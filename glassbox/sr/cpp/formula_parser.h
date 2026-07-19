@@ -405,17 +405,186 @@ struct GraphCompiler {
     std::unordered_map<uint64_t, int> node_index_cache;
     int n_inputs = 1;
 
+    // Constant-fold parse subtrees (e.g. 1/2, 2+3) so power exponents become
+    // unary Power/IntPow instead of being discarded (S5-3).
+    bool try_const_value(const std::shared_ptr<ParseNode>& pnode, double& out) const {
+        if (!pnode) return false;
+        switch (pnode->type) {
+            case ParseNodeType::Constant:
+                out = pnode->value;
+                return std::isfinite(out);
+            case ParseNodeType::Add:
+            case ParseNodeType::Sub:
+            case ParseNodeType::Mul:
+            case ParseNodeType::Div:
+            case ParseNodeType::Pow: {
+                double a = 0.0, b = 0.0;
+                if (!try_const_value(pnode->left, a) || !try_const_value(pnode->right, b)) return false;
+                if (pnode->type == ParseNodeType::Add) out = a + b;
+                else if (pnode->type == ParseNodeType::Sub) out = a - b;
+                else if (pnode->type == ParseNodeType::Mul) out = a * b;
+                else if (pnode->type == ParseNodeType::Div) {
+                    if (std::abs(b) < 1e-15) return false;
+                    out = a / b;
+                } else {  // Pow
+                    out = std::pow(a, b);
+                }
+                return std::isfinite(out);
+            }
+            case ParseNodeType::Abs: {
+                double a = 0.0;
+                if (!try_const_value(pnode->left, a)) return false;
+                out = std::abs(a);
+                return std::isfinite(out);
+            }
+            case ParseNodeType::Sqrt: {
+                double a = 0.0;
+                if (!try_const_value(pnode->left, a) || a < 0.0) return false;
+                out = std::sqrt(a);
+                return std::isfinite(out);
+            }
+            case ParseNodeType::Log: {
+                double a = 0.0;
+                if (!try_const_value(pnode->left, a)) return false;
+                out = std::log(std::abs(a) + 1e-300);
+                return std::isfinite(out);
+            }
+            case ParseNodeType::Exp: {
+                double a = 0.0;
+                if (!try_const_value(pnode->left, a)) return false;
+                out = std::exp(a);
+                return std::isfinite(out);
+            }
+            case ParseNodeType::Sin: {
+                double a = 0.0;
+                if (!try_const_value(pnode->left, a)) return false;
+                out = std::sin(a);
+                return std::isfinite(out);
+            }
+            case ParseNodeType::Cos: {
+                double a = 0.0;
+                if (!try_const_value(pnode->left, a)) return false;
+                out = std::cos(a);
+                return std::isfinite(out);
+            }
+            default:
+                return false;
+        }
+    }
+
+    int intern_node(OpNode node) {
+        int temp_idx = static_cast<int>(graph.nodes.size());
+        graph.nodes.push_back(node);
+        node_hashes.push_back(0);
+        uint64_t hash = compute_node_hash(graph, temp_idx, node_hashes);
+        node_hashes[temp_idx] = hash;
+
+        auto it = node_index_cache.find(hash);
+        if (it != node_index_cache.end()) {
+            graph.nodes.pop_back();
+            node_hashes.pop_back();
+            return it->second;
+        }
+
+        node_index_cache[hash] = temp_idx;
+        return temp_idx;
+    }
+
+    int append_const(double value) {
+        OpNode node;
+        node.type = NodeType::Constant;
+        node.value = value;
+        return intern_node(node);
+    }
+
+    int append_unary_power(int base_idx, double p_val) {
+        OpNode node;
+        node.type = NodeType::Unary;
+        node.left_child = base_idx;
+        node.right_child = -1;
+        double p_round = std::round(p_val);
+        if (std::abs(p_val - p_round) < 1e-9 && p_round >= 2.0 && p_round <= 6.0) {
+            node.unary_op = UnaryOp::IntPow;
+            node.p = p_round;
+        } else {
+            node.unary_op = UnaryOp::Power;
+            node.p = p_val;
+        }
+        return intern_node(node);
+    }
+
+    // Variable exponent: sign(base) * exp(exp * log(|base|)), matching Unary Power domain.
+    int append_variable_power(int base_idx, int exp_idx) {
+        // log(|base|) — Log already applies abs inside eval.
+        OpNode log_n;
+        log_n.type = NodeType::Unary;
+        log_n.unary_op = UnaryOp::Log;
+        log_n.left_child = base_idx;
+        int log_idx = intern_node(log_n);
+
+        // exp * log(|base|)
+        OpNode mul_n;
+        mul_n.type = NodeType::Binary;
+        mul_n.binary_op = BinaryOp::Arithmetic;
+        mul_n.beta = 2.0;
+        mul_n.gamma = 1.0;
+        mul_n.left_child = exp_idx;
+        mul_n.right_child = log_idx;
+        int mul_idx = intern_node(mul_n);
+
+        // exp(exp * log(|base|)) = |base|^exp
+        OpNode exp_n;
+        exp_n.type = NodeType::Unary;
+        exp_n.unary_op = UnaryOp::Exp;
+        exp_n.omega = 1.0;
+        exp_n.phi = 0.0;
+        exp_n.left_child = mul_idx;
+        int mag_idx = intern_node(exp_n);
+
+        // abs(base)
+        OpNode abs_n;
+        abs_n.type = NodeType::Unary;
+        abs_n.unary_op = UnaryOp::Abs;
+        abs_n.left_child = base_idx;
+        int abs_idx = intern_node(abs_n);
+
+        // sign(base) ≈ base / abs(base) via protected Division
+        OpNode div_n;
+        div_n.type = NodeType::Binary;
+        div_n.binary_op = BinaryOp::Division;
+        div_n.left_child = base_idx;
+        div_n.right_child = abs_idx;
+        int sign_idx = intern_node(div_n);
+
+        // sign(base) * |base|^exp
+        OpNode out_n;
+        out_n.type = NodeType::Binary;
+        out_n.binary_op = BinaryOp::Arithmetic;
+        out_n.beta = 2.0;
+        out_n.gamma = 1.0;
+        out_n.left_child = sign_idx;
+        out_n.right_child = mag_idx;
+        return intern_node(out_n);
+    }
+
     int compile_node(const std::shared_ptr<ParseNode>& pnode) {
         if (!pnode) return -1;
 
-        int left_idx = -1;
-        int right_idx = -1;
+        // Power: constant exponent (including folded 1/2) or variable rewrite (S5-3).
         if (pnode->type == ParseNodeType::Pow) {
-            left_idx = compile_node(pnode->left);
-        } else {
-            left_idx = compile_node(pnode->left);
-            right_idx = compile_node(pnode->right);
+            int base_idx = compile_node(pnode->left);
+            if (base_idx < 0) return append_const(0.0);
+            double p_val = 0.0;
+            if (pnode->right && try_const_value(pnode->right, p_val)) {
+                return append_unary_power(base_idx, p_val);
+            }
+            int exp_idx = compile_node(pnode->right);
+            if (exp_idx < 0) return append_unary_power(base_idx, 1.0);
+            return append_variable_power(base_idx, exp_idx);
         }
+
+        int left_idx = compile_node(pnode->left);
+        int right_idx = compile_node(pnode->right);
 
         OpNode node;
         node.left_child = left_idx;
@@ -489,49 +658,13 @@ struct GraphCompiler {
                 node.binary_op = BinaryOp::Division;
                 break;
             case ParseNodeType::Pow:
-                if (left_idx < 0) {
-                    node.type = NodeType::Constant;
-                    node.value = 0.0;
-                    break;
-                }
-                if (pnode->right && pnode->right->type == ParseNodeType::Constant) {
-                    double p_val = pnode->right->value;
-                    double p_round = std::round(p_val);
-                    if (std::abs(p_val - p_round) < 1e-9 && p_round >= 2.0 && p_round <= 6.0) {
-                        node.type = NodeType::Unary;
-                        node.unary_op = UnaryOp::IntPow;
-                        node.p = p_round;
-                        node.right_child = -1;
-                    } else {
-                        node.type = NodeType::Unary;
-                        node.unary_op = UnaryOp::Power;
-                        node.p = p_val;
-                        node.right_child = -1;
-                    }
-                } else {
-                    node.type = NodeType::Unary;
-                    node.unary_op = UnaryOp::Power;
-                    node.p = 1.0;
-                    node.right_child = -1;
-                }
+                // Handled above.
+                node.type = NodeType::Constant;
+                node.value = 0.0;
                 break;
         }
 
-        int temp_idx = static_cast<int>(graph.nodes.size());
-        graph.nodes.push_back(node);
-        node_hashes.push_back(0);
-        uint64_t hash = compute_node_hash(graph, temp_idx, node_hashes);
-        node_hashes[temp_idx] = hash;
-
-        auto it = node_index_cache.find(hash);
-        if (it != node_index_cache.end()) {
-            graph.nodes.pop_back();
-            node_hashes.pop_back();
-            return it->second;
-        }
-
-        node_index_cache[hash] = temp_idx;
-        return temp_idx;
+        return intern_node(node);
     }
 };
 

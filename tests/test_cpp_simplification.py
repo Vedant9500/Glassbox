@@ -102,3 +102,55 @@ def test_cpp_abs_scores_against_absolute_target():
     assert score["ok"] is True
     assert score["mse"] < 1e-12
     assert abs(score["scale"] - 1.0) < 1e-6
+
+
+@requires_cpp
+def test_cpp_variable_power_and_printer_fidelity():
+    # Constant-folded fractional exponent (1/2) becomes Unary Power p=0.5.
+    g = _core.formula_to_seed_graph_cpp("x0^(1/2)")
+    assert g["nodes"][-1]["unary_op"] == 1  # Power
+    assert abs(g["nodes"][-1]["p"] - 0.5) < 1e-12
+
+    # Variable exponent is not identity; multi-feature names preserved.
+    g2 = _core.formula_to_seed_graph_cpp("x0^x1")
+    assert len(g2["nodes"]) >= 4
+    s = _core.simplify_formula_cpp("x0^x1")
+    assert "x0" in s and "x1" in s
+    assert "exp" in s and "log" in s
+
+    x0 = np.linspace(0.2, 2.0, 60)
+    x1 = np.linspace(0.5, 1.5, 60)
+    X = np.column_stack([x0, x1])
+    y = np.sign(x0) * np.abs(x0) ** x1
+    score = dict(_core.score_formula_candidates(
+        ["x0^x1"],
+        np.ascontiguousarray(X, dtype=np.float64),
+        np.ascontiguousarray(y, dtype=np.float64),
+        np.ascontiguousarray(X, dtype=np.float64),
+        np.ascontiguousarray(y, dtype=np.float64),
+    )[0])
+    assert score["ok"] is True
+    assert score["mse"] < 1e-10
+
+
+@requires_cpp
+def test_cpp_protected_division_print_matches_eval():
+    # Printer must not collapse x0/x1 to bare x/x, and must use protected form.
+    out = _core.simplify_formula_cpp("x0/x1")
+    assert "x0" in out and "x1" in out
+    assert "abs" in out and "sign" in out
+    x0 = np.linspace(-2.0, 2.0, 80)
+    x0[np.abs(x0) < 0.05] = 0.05
+    x1 = np.linspace(0.5, 1.5, 80)
+    X = np.column_stack([x0, x1])
+    # Graph Division semantics ≈ x0/x1 away from zero.
+    y = x0 / x1
+    score = dict(_core.score_formula_candidates(
+        ["x0/x1"],
+        np.ascontiguousarray(X, dtype=np.float64),
+        np.ascontiguousarray(y, dtype=np.float64),
+        np.ascontiguousarray(X, dtype=np.float64),
+        np.ascontiguousarray(y, dtype=np.float64),
+    )[0])
+    assert score["ok"] is True
+    assert score["mse"] < 1e-8

@@ -452,8 +452,8 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 |----|----------|------|---------|------------------|--------|
 | **S5-1** | **P0** | correctness | **`abs(x)` graph-compiles to identity.** `ParseNodeType::Abs` → `UnaryOp::Power` with `p=1.0`. Power eval is sign-preserving `sign(x)*\|x\|^p`, so p=1 is **x**, not \|x\|. `simplify_formula_cpp("abs(x)")` → `"x"`; seed graph from abs is wrong for evolution. Exact scorer path still evaluates true abs → dual-path split (S5-2). | `formula_parser.h` Abs case (~460–465); Power eval `eval.h` 183–190; verified: simplify abs → x; score(`abs`) MSE=0 vs \|y\| while simplified string MSE≈0.34 | fixed |
 | **S5-2** | **P0** | correctness / contract | **Two incompatible evaluators for the same formula strings.** `score_formula_candidates` uses exact parse-tree math (true `/`, true `abs`, variable exponents, unprotected div). Evolution/search + `formula_to_graph`/`get_formula_string` use soft Arithmetic (soft-div `x/sqrt(1+y²)`), soft Division, Power domains, etc. Candidate ranking can prefer formulas whose **search graph** cannot represent / will not match scored MSE after seed compile. | `core.cpp` 21–90, 235–237 vs `eval.h` 214–226 + `formula_to_graph` | fixed |
-| **S5-3** | **P0** | correctness | **Variable-exponent powers silently become `x^1`.** Non-constant RHS of `Pow` compiles to `UnaryOp::Power` with **`p=1.0`** (RHS discarded). `x0^x1` seed graph is identity-like; simplify → `x`. Exact scorer supports `base**exp` per-sample. Seeds/priors with `x_i^{x_j}` are corrupted. | `formula_parser.h` Pow else-branch (~515–520); verified seed `x0^x1` → p=1 | open |
-| **S5-4** | **P0** | silent wrong display | **Printer ↔ evaluator mismatch for soft ops.** (1) Non-discrete Arithmetic blend: eval uses soft-div `x/sqrt(1+y²)` but blend printer emits true `(l / r)`. (2) Hard `BinaryOp::Division` prints `(l / r)` but eval is `x/(\|y\|+ε)*sign(y)`. (3) `Aggregation` always prints `(l+r)/2` but eval is soft-max / soft-mean via `tau`. Displayed evolution formulas can disagree with search fitness and with Python/`_display_formula_mse` string eval. | `eval.h` 214–234, 536–571; Aggregation display ~570 | open |
+| **S5-3** | **P0** | correctness | **Variable-exponent powers silently become `x^1`.** Non-constant RHS of `Pow` compiles to `UnaryOp::Power` with **`p=1.0`** (RHS discarded). `x0^x1` seed graph is identity-like; simplify → `x`. Exact scorer supports `base**exp` per-sample. Seeds/priors with `x_i^{x_j}` are corrupted. | `formula_parser.h` Pow else-branch (~515–520); verified seed `x0^x1` → p=1 | fixed |
+| **S5-4** | **P0** | silent wrong display | **Printer ↔ evaluator mismatch for soft ops.** (1) Non-discrete Arithmetic blend: eval uses soft-div `x/sqrt(1+y²)` but blend printer emits true `(l / r)`. (2) Hard `BinaryOp::Division` prints `(l / r)` but eval is `x/(\|y\|+ε)*sign(y)`. (3) `Aggregation` always prints `(l+r)/2` but eval is soft-max / soft-mean via `tau`. Displayed evolution formulas can disagree with search fitness and with Python/`_display_formula_mse` string eval. | `eval.h` 214–234, 536–571; Aggregation display ~570 | fixed |
 | **S5-5** | **P1** | correctness | **Subtree cache hash quantizes params to 2 decimals.** `quantize(v, decimals=2)` + SharedCache reuse means e.g. ω=1.004 and 1.006 share a cached ArrayXd → **wrong node values** during pop eval when hashes collide. Also used for simplify CSE / trig identities / mul→square via equal hashes — near-equal different subtrees can be treated identical. | `ast.h` 137–144, 160–176; SharedCache path `eval.h` 141–147, 249–252; simplify_advanced hash merges | open |
 | **S5-6** | **P1** | silent incomplete formula | **Output-weight thresholds disagree.** Eval includes \|w\|>**1e-6**; `get_formula_string` / `active_complexity` use **1e-4**; compact/simplify often **1e-8**. Terms with 1e-6 < \|w\| ≤ 1e-4 affect predictions/fitness but are **omitted from formula string** returned to Python. | `eval.h` 262; `get_formula_string` ~604; `ast.h` active_complexity 82; `simplify.h` compact 1e-8 | open |
 | **S5-7** | **P1** | correctness | **`exp(log(·))` simplify → identity, not abs.** Graph Log is `log(\|x\|+ε)`; identity folds Exp∘Log to Power p=1 (identity) or redirects Log∘Exp to child. For signed inputs, true composition is \|x\| (approx), not x. Same root cause as Abs mapping (S5-1). | `simplify_advanced.h` 149–160; verified `exp(log(x))` → `x` | fixed (via Abs) |
@@ -655,8 +655,8 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 
 ---
 
-| O12 | S5 | Fix Abs→Power(p=1); map abs to true abs (new op or even power pattern); fix variable Pow compile | Stops abs/seed/simplify destruction | **partial** (Abs done; variable Pow still open = S5-3) |
-| O13 | S5 | Align printer with eval (soft-div string, aggregation, hard-div); discretize before export | Formula strings match search fitness | open |
+| O12 | S5 | Fix Abs→Power(p=1); map abs to true abs (new op or even power pattern); fix variable Pow compile | Stops abs/seed/simplify destruction | done |
+| O13 | S5 | Align printer with eval (soft-div string, aggregation, hard-div); discretize before export | Formula strings match search fitness | done |
 | O14 | S5 | Raise structural hash quantize decimals or include full-bit params for SharedCache | Stop silent wrong cached evals | open |
 | O15 | S5 | Unify output-weight cutoffs (display ≥ eval threshold or refit-then-print) | No silent dropped terms | open |
 | O16 | S5 | `get_child` by const ref / Map; avoid ArrayXd copies in eval hot path | Large wall-time win on pop eval | open |
@@ -674,6 +674,7 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 | 2026-07-19 | S4 | C++ evolution audit; **E1–E10** (E1 island clone under fixed seed = P0; E2 robust early-stop); section marked done |
 | 2026-07-19 | S5 | C++ eval/AST/refine/simplify/parser audit; **S5-1..S5-16** (P0: abs→identity, dual evaluators, variable pow drop, printer/eval mismatch); section marked done; fixes not applied |
 | 2026-07-19 | S5 | **S5-1/S5-2 fixed**: `UnaryOp::Abs`; scorer uses `formula_to_graph`+`evaluate_graph` (OOB feature check, sharp soft-arith temp); tests updated |
+| 2026-07-19 | S5 | **S5-3/S5-4 fixed**: variable powers via const-fold + exp/log rewrite; printer matches soft-div/protected-div/aggregation; multi-feature print auto-detect |
 
 ---
 
@@ -702,7 +703,7 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 1. **N2** diffuse Huber FP on clean sin/exp
 2. **E1** per-island RNG seed offset (default 8 islands currently clone)
 3. **E2 / N5** early-stop on raw MSE not robust objective
-4. **S5-3 / S5-4** variable pow drop, printer/eval mismatch (**S5-1/S5-2 fixed**)
+4. **S5-5 / S5-6** hash quantize + weight threshold display gaps (**S5-1..S5-4 fixed**)
 5. **S1-1 / S1-2 / S1-3** public API P0s
 6. **S5-5 / S5-6** hash quantize + weight threshold display gaps
 7. **E3** seed capacity under islands
