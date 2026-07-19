@@ -39,6 +39,7 @@ UNARY_POWER = 1
 UNARY_INTPOW = 2
 UNARY_EXP = 3
 UNARY_LOG = 4
+UNARY_ABS = 5
 
 BINARY_ARITHMETIC = 0
 BINARY_DIVISION = 1
@@ -521,8 +522,7 @@ class _GraphBuilder:
             return self._append(
                 _default_node(
                     type=TYPE_UNARY,
-                    unary_op=UNARY_POWER,
-                    p=1.0,
+                    unary_op=UNARY_ABS,
                     left_child=inner,
                 )
             )

@@ -75,3 +75,30 @@ def test_cpp_noise_reduction():
 def test_cpp_periodic_display_canonicalization():
     assert _core.simplify_formula_cpp("sin(pi*x)").replace(" ", "") == "sin(pi*x)"
     assert _core.simplify_formula_cpp("cos(pi*x)").replace(" ", "") == "cos(pi*x)"
+
+
+@requires_cpp
+def test_cpp_abs_is_not_identity():
+    assert _core.simplify_formula_cpp("abs(x)") == "abs(x)"
+    assert "abs" in _core.simplify_formula_cpp("1+abs(x)")
+    g = _core.formula_to_seed_graph_cpp("abs(x)")
+    # UnaryOp::Abs == 5
+    assert g["nodes"][-1]["unary_op"] == 5
+    assert g["nodes"][-1]["type"] == 2
+
+
+@requires_cpp
+def test_cpp_abs_scores_against_absolute_target():
+    x = np.linspace(-2.0, 2.0, 101)
+    X = x.reshape(-1, 1)
+    y = np.abs(x)
+    score = dict(_core.score_formula_candidates(
+        ["abs(x0)"],
+        np.ascontiguousarray(X, dtype=np.float64),
+        np.ascontiguousarray(y, dtype=np.float64),
+        np.ascontiguousarray(X, dtype=np.float64),
+        np.ascontiguousarray(y, dtype=np.float64),
+    )[0])
+    assert score["ok"] is True
+    assert score["mse"] < 1e-12
+    assert abs(score["scale"] - 1.0) < 1e-6

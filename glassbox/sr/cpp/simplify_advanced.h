@@ -109,6 +109,7 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
                 case UnaryOp::IntPow: res = std::pow(v, std::clamp(static_cast<int>(std::round(node.p)), 2, 6)); break;
                 case UnaryOp::Exp: res = std::exp(node.omega * v + node.phi); break;
                 case UnaryOp::Log: res = std::log(std::abs(v) + 1e-6); break;
+                case UnaryOp::Abs: res = std::abs(v); break;
             }
             node.type = NodeType::Constant;
             node.value = snap_val(res, int_tol, zero_tol);
@@ -148,8 +149,7 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
                 node.value = snap_val(std::exp(node.phi), int_tol, zero_tol);
             } else if (child.type == NodeType::Unary && child.unary_op == UnaryOp::Log && std::abs(node.omega - 1.0) < 1e-4 && std::abs(node.phi) < 1e-4) {
                 // exp(log(|y|)) = |y|
-                node.unary_op = UnaryOp::Power;
-                node.p = 1.0;
+                node.unary_op = UnaryOp::Abs;
                 node.left_child = child.left_child;
             }
         } else if (node.unary_op == UnaryOp::Log) {
@@ -159,6 +159,11 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
             } else if (child.type == NodeType::Unary && child.unary_op == UnaryOp::Exp && std::abs(child.omega - 1.0) < 1e-4 && std::abs(child.phi) < 1e-4) {
                 // log(exp(y)) = y
                 redirect[i] = child.left_child;
+            }
+        } else if (node.unary_op == UnaryOp::Abs) {
+            // abs(abs(y)) = abs(y); abs of non-negative-ish Power even integer may stay
+            if (child.type == NodeType::Unary && child.unary_op == UnaryOp::Abs) {
+                redirect[i] = node.left_child;
             }
         }
         

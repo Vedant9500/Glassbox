@@ -35,6 +35,7 @@ class CppGraphModule(nn.Module):
     UNARY_INTPOW = 2
     UNARY_EXP = 3
     UNARY_LOG = 4
+    UNARY_ABS = 5
     
     BINARY_ARITHMETIC = 0
     BINARY_DIVISION = 1
@@ -141,6 +142,8 @@ class CppGraphModule(nn.Module):
                     out = torch.exp(torch.clamp(omega * child + phi, -20.0, 20.0))
                 elif unary_op == self.UNARY_LOG:
                     out = torch.log(torch.abs(child) + eps)
+                elif unary_op == self.UNARY_ABS:
+                    out = torch.abs(child)
                 else:
                     out = child
             

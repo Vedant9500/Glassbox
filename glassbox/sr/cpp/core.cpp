@@ -226,15 +226,26 @@ py::list score_formula_candidates_cpp(
 
     {
         py::gil_scoped_release release;
+        // Near-discrete soft arithmetic for ranking (set once outside OMP; E10).
+        const double prev_temp = sr::get_arithmetic_temperature();
+        sr::set_arithmetic_temperature(100.0);
         #pragma omp parallel for schedule(dynamic)
         for (int idx = 0; idx < static_cast<int>(formulas.size()); ++idx) {
             CandidateScore score;
             score.formula = formulas[idx];
             score.weighted = use_fit_w || use_val_w;
             try {
-                auto parsed = parse_formula_exact(score.formula);
-                Eigen::ArrayXd pred_fit = evaluate_parse_node_exact(parsed, X_fit_cols, n_fit);
-                Eigen::ArrayXd pred_val = evaluate_parse_node_exact(parsed, X_val_cols, n_val);
+                // Graph path matches evolution/search representation (S5-2).
+                sr::IndividualGraph graph = sr::formula_to_graph(score.formula);
+                for (const auto& node : graph.nodes) {
+                    if (node.type == sr::NodeType::Input) {
+                        if (node.feature_idx < 0 || node.feature_idx >= p_fit) {
+                            throw std::runtime_error("feature_index_out_of_range");
+                        }
+                    }
+                }
+                Eigen::ArrayXd pred_fit = sr::evaluate_graph(graph, X_fit_cols, n_fit);
+                Eigen::ArrayXd pred_val = sr::evaluate_graph(graph, X_val_cols, n_val);
                 if (pred_fit.size() != n_fit || pred_val.size() != n_val) {
                     score.error = "shape_mismatch";
                     scores[idx] = score;
@@ -331,6 +342,7 @@ py::list score_formula_candidates_cpp(
             }
             scores[idx] = score;
         }
+        sr::set_arithmetic_temperature(prev_temp);
     }
 
     if (num_threads > 0) omp_set_num_threads(previous_omp_threads);

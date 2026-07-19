@@ -23,7 +23,8 @@ enum class UnaryOp {
     Power,
     IntPow,
     Exp,
-    Log
+    Log,
+    Abs
 };
 
 enum class BinaryOp {
@@ -109,9 +110,10 @@ struct IndividualGraph {
                     break;
                 case NodeType::Unary:
                     if (node.unary_op == UnaryOp::IntPow) total += 2;
+                    else if (node.unary_op == UnaryOp::Abs) total += 2;
                     else if (node.unary_op == UnaryOp::Power) total += 3;
                     else if (node.unary_op == UnaryOp::Periodic) total += 3;
-                    else total += 4;
+                    else total += 4;  // Exp, Log
                     break;
                 case NodeType::Binary:
                     if (node.binary_op == BinaryOp::Arithmetic) total += 2;

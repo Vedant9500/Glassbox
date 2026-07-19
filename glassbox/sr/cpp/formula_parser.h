@@ -459,8 +459,7 @@ struct GraphCompiler {
                 break;
             case ParseNodeType::Abs:
                 node.type = NodeType::Unary;
-                node.unary_op = UnaryOp::Power;
-                node.p = 1.0;
+                node.unary_op = UnaryOp::Abs;
                 break;
             case ParseNodeType::Sqrt:
                 node.type = NodeType::Unary;

@@ -269,7 +269,9 @@ public:
 
         // Normalize op_priors if provided
         if (!config_.op_priors.empty()) {
-            // Backward compatibility: old priors had 4 slots [Periodic, Power, Exp, Log].
+            // Backward compatibility:
+            //   4 slots [Periodic, Power, Exp, Log] -> 5 (+IntPow split)
+            //   5 slots [Periodic, Power, IntPow, Exp, Log] -> 6 (+Abs=0 by default)
             if (config_.op_priors.size() == 4) {
                 std::vector<double> expanded(5, 0.0);
                 expanded[0] = config_.op_priors[0];               // Periodic
@@ -278,6 +280,10 @@ public:
                 expanded[3] = config_.op_priors[2];               // Exp
                 expanded[4] = config_.op_priors[3];               // Log
                 config_.op_priors = expanded;
+            }
+            if (config_.op_priors.size() == 5) {
+                // Append Abs prior (0): seeds/simplify can still introduce Abs.
+                config_.op_priors.push_back(0.0);
             }
             normalize_prior_vector(config_.op_priors);
             op_cdf_ = build_cdf(config_.op_priors);
@@ -290,7 +296,7 @@ public:
 
         allowed_unary_ops_ = sanitize_allowed_ops<UnaryOp>(
             config_.allowed_unary_ops,
-            static_cast<int>(UnaryOp::Log)
+            static_cast<int>(UnaryOp::Abs)
         );
         allowed_binary_ops_ = sanitize_allowed_ops<BinaryOp>(
             config_.allowed_binary_ops,
@@ -1071,7 +1077,7 @@ private:
                     if (r <= op_cdf_[i] && unary_op_allowed(op)) return op;
                 }
             }
-            for (int op = 0; op <= static_cast<int>(UnaryOp::Log); ++op) {
+            for (int op = 0; op <= static_cast<int>(UnaryOp::Abs); ++op) {
                 if (unary_op_allowed(static_cast<UnaryOp>(op))) {
                     return static_cast<UnaryOp>(op);
                 }
@@ -1146,6 +1152,9 @@ private:
             return false;
         }
         if (op == UnaryOp::Exp && (child_op == UnaryOp::Exp || child_op == UnaryOp::Log)) {
+            return false;
+        }
+        if (op == UnaryOp::Abs && child_op == UnaryOp::Abs) {
             return false;
         }
         if ((op == UnaryOp::Power || op == UnaryOp::IntPow) &&
@@ -3587,6 +3596,9 @@ private:
                         }
                         for (int d = 0; d < n_dims; ++d)
                             node_units[i][d] = child_u[d] * exp_val;
+                    } else if (node.unary_op == UnaryOp::Abs) {
+                        // abs(x) preserves units of x
+                        node_units[i] = child_u;
                     } else {
                         // sin, exp, log: argument must be dimensionless
                         // Result is dimensionless too
@@ -3627,7 +3639,7 @@ private:
         double penalty = 0.0;
         for (int i = 0; i < n_nodes; ++i) {
             const auto& node = graph.nodes[i];
-            if (node.type == NodeType::Unary && node.unary_op != UnaryOp::Power && node.unary_op != UnaryOp::IntPow) {
+            if (node.type == NodeType::Unary && node.unary_op != UnaryOp::Power && node.unary_op != UnaryOp::IntPow && node.unary_op != UnaryOp::Abs) {
                 // sin/exp/log argument must be dimensionless
                 if (node.left_child >= 0 && node.left_child < n_nodes) {
                     for (int d = 0; d < n_dims; ++d)

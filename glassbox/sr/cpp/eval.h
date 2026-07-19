@@ -203,6 +203,10 @@ inline Eigen::ArrayXd evaluate_graph_impl(
                         val = (x.abs() + 1e-6).log().max(-1e6).min(1e6);
                         break;
                     }
+                    case UnaryOp::Abs: {
+                        val = x.abs();
+                        break;
+                    }
                 }
                 break;
             }
@@ -527,6 +531,8 @@ inline std::string format_node_to_string(
                 }
                 case UnaryOp::Log:
                     return "log(|" + child_str + "|)";
+                case UnaryOp::Abs:
+                    return "abs(" + child_str + ")";
             }
             break;
         }

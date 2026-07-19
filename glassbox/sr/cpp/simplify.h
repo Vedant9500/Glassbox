@@ -111,6 +111,7 @@ inline void simplify_node(IndividualGraph& graph, int node_idx) {
                 case UnaryOp::IntPow: res = std::pow(v, std::clamp(static_cast<int>(std::round(node.p)), 2, 6)); break;
                 case UnaryOp::Exp: res = std::exp(node.omega * v + node.phi); break;
                 case UnaryOp::Log: res = std::log(std::abs(v) + 1e-6); break;
+                case UnaryOp::Abs: res = std::abs(v); break;
             }
             node.type = NodeType::Constant;
             node.value = res;
