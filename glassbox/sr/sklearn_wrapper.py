@@ -386,12 +386,13 @@ def _auto_residual_soft_weights(X, y, *, floor: float = 0.05, cap: float = 1.0):
 
 
 def _estimate_diffuse_noise_ratio(X, y):
-    """Cheap residual noise ratio for Phase 4 (diffuse noise without sparse outliers).
+    """Cheap residual noise ratio for diffuse noise without sparse outliers.
 
-    Fits the best of {median, linear, quadratic, cubic (1D)} and returns
-    ``mad(residual) / scale(y)``. Clean structured targets → ~0; 10% RMS Gaussian
-    / pink-style residual noise stays elevated even when soft-MAD weights do not
-    fire (isotropic noise has no heavy-tail mass to downweight).
+    Fits the best residual among simple structure probes (poly, trig, exp,
+    rational, multi-linear) and returns ``scale(residual) / scale(y)``.
+
+    Clean structured non-polynomials (sin/exp/rational) must not look like
+    heavy noise — poly-only probes false-positive auto-Huber (N2).
     """
     y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
     n = int(y_arr.shape[0])
@@ -401,6 +402,8 @@ def _estimate_diffuse_noise_ratio(X, y):
     if X_arr.ndim == 1:
         X_arr = X_arr.reshape(-1, 1)
     finite = np.isfinite(y_arr)
+    if X_arr.shape[0] == n:
+        finite = finite & np.all(np.isfinite(X_arr), axis=1)
     y_f = y_arr[finite]
     y_scale = float(np.std(y_f)) if y_f.size else 0.0
     if not np.isfinite(y_scale) or y_scale < 1e-12:
@@ -417,26 +420,52 @@ def _estimate_diffuse_noise_ratio(X, y):
         s = float(np.std(rf))
         return s if np.isfinite(s) else float("inf")
 
+    def _append_lstsq(residuals, cols, y_use):
+        try:
+            A = np.column_stack([np.asarray(c, dtype=np.float64).reshape(-1) for c in cols])
+            if A.shape[0] != y_use.shape[0] or A.shape[0] < A.shape[1] + 2:
+                return
+            if not np.all(np.isfinite(A)):
+                return
+            coef, _, _, _ = np.linalg.lstsq(A, y_use, rcond=None)
+            pred = A @ coef
+            residuals.append(y_use - pred)
+        except Exception:
+            return
+
     residuals = []
     y_med = float(np.median(y_f)) if y_f.size else 0.0
     residuals.append(y_arr - y_med)
-    if X_arr.shape[0] == n:
-        try:
-            x0 = X_arr[:, 0]
-            A = np.column_stack([x0, np.ones(n, dtype=np.float64)])
-            coef, _, _, _ = np.linalg.lstsq(A, y_arr, rcond=None)
-            residuals.append(y_arr - A @ coef)
-            if X_arr.shape[1] == 1:
-                A2 = np.column_stack([x0 ** 2, x0, np.ones(n, dtype=np.float64)])
-                coef2, _, _, _ = np.linalg.lstsq(A2, y_arr, rcond=None)
-                residuals.append(y_arr - A2 @ coef2)
-                A3 = np.column_stack(
-                    [x0 ** 3, x0 ** 2, x0, np.ones(n, dtype=np.float64)]
-                )
-                coef3, _, _, _ = np.linalg.lstsq(A3, y_arr, rcond=None)
-                residuals.append(y_arr - A3 @ coef3)
-        except Exception:
-            pass
+
+    if X_arr.shape[0] == n and int(np.sum(finite)) >= 8:
+        y_use = y_arr[finite]
+        X_use = X_arr[finite]
+        x0 = X_use[:, 0]
+        ones = np.ones(x0.shape[0], dtype=np.float64)
+        # Polynomial family
+        _append_lstsq(residuals, [ones, x0], y_use)
+        _append_lstsq(residuals, [ones, x0, x0 ** 2], y_use)
+        _append_lstsq(residuals, [ones, x0, x0 ** 2, x0 ** 3], y_use)
+        # Trig family (clean sin/cos must not trigger diffuse Huber)
+        _append_lstsq(residuals, [ones, np.sin(x0), np.cos(x0)], y_use)
+        _append_lstsq(residuals, [ones, np.sin(2.0 * x0), np.cos(2.0 * x0)], y_use)
+        _append_lstsq(
+            residuals,
+            [ones, np.sin(2.0 * np.pi * x0), np.cos(2.0 * np.pi * x0)],
+            y_use,
+        )
+        # Exp / Gaussian bump / rational
+        x_clip = np.clip(x0, -20.0, 20.0)
+        _append_lstsq(residuals, [ones, np.exp(x_clip)], y_use)
+        _append_lstsq(residuals, [ones, np.exp(-x0 ** 2)], y_use)
+        _append_lstsq(residuals, [ones, 1.0 / (1.0 + x0 ** 2)], y_use)
+        # Multi-feature linear probe
+        if X_use.shape[1] > 1:
+            cols = [ones] + [X_use[:, j] for j in range(X_use.shape[1])]
+            _append_lstsq(residuals, cols, y_use)
+
+    if not residuals:
+        return 0.0, 0.0
     best_r = min(residuals, key=_resid_scale)
     scale = _resid_scale(best_r)
     best_r = np.asarray(best_r, dtype=np.float64).reshape(-1)
@@ -447,9 +476,12 @@ def _estimate_diffuse_noise_ratio(X, y):
         scale = max(scale if np.isfinite(scale) else 0.0, rms)
     if not np.isfinite(scale):
         return 0.0, float(_estimate_outlier_fraction(best_r))
-    ratio = float(scale / y_scale) if y_scale > 0 else 0.0
-    out_frac = float(_estimate_outlier_fraction(best_r))
-    return ratio, out_frac
+    ratio = float(scale / y_scale)
+    if not np.isfinite(ratio):
+        ratio = 0.0
+    return max(0.0, ratio), float(_estimate_outlier_fraction(best_r))
+
+
 
 
 def _slice_sample_weight(sample_weight, indices=None, n_targets=None):
@@ -7319,6 +7351,21 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.fast_path_exact_match_diagnostics_ = {}
         self.specialist_track_ = "incumbent path"
         self.specialist_vault_ = SpecialistVault(max_entries=int(getattr(self, "specialist_vault_size", 8) or 0))
+        # Clear cross-fit sticky state so prior problem winners cannot leak (S1-3).
+        for _attr in (
+            "formula_",
+            "best_mse_",
+            "evolution_candidate_formula_",
+            "evolution_candidate_mse_",
+            "pareto_front_",
+            "nodes_",
+            "output_weights_",
+            "output_bias_",
+            "blackbox_state_",
+            "blackbox_diagnostics_",
+        ):
+            if hasattr(self, _attr):
+                delattr(self, _attr)
         self.n_features_in_ = X.shape[1]
         self.original_n_features_in_ = X.shape[1]
         self._activate_physics_units(self.n_features_in_)
@@ -8375,16 +8422,28 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
                         # Check if any proposer skeleton is ALREADY a very good fit
                         # to avoid launching evolution if we just need minor constant refinement.
+                        best_cand = None
                         best_cand_mse = float('inf')
                         for cand in (candidate_formulas or []):
-                            if cand.get('mse', float('inf')) < best_cand_mse:
-                                best_cand_mse = cand['mse']
+                            mse_c = cand.get('mse', float('inf'))
+                            try:
+                                mse_c = float(mse_c)
+                            except (TypeError, ValueError):
+                                mse_c = float('inf')
+                            if mse_c < best_cand_mse:
+                                best_cand_mse = mse_c
+                                best_cand = cand
                         
                         # Short-circuit: if a proposer skeleton is already better than fast-path 
                         # and very good, we can skip full evolution and just use it.
-                        if best_cand_mse < 1e-6 and best_cand_mse < (best_mse or float('inf')):
+                        # Must keep the argmin formula, not candidate_formulas[0] (S1-2).
+                        if (
+                            best_cand is not None
+                            and best_cand_mse < 1e-6
+                            and best_cand_mse < (best_mse or float('inf'))
+                        ):
                             print(f"  [Proposer] Rapid hit (MSE={best_cand_mse:.2e}), using skeleton directly.")
-                            best_formula = candidate_formulas[0]['formula']
+                            best_formula = best_cand.get('formula') or best_cand.get('base_formula')
                             best_mse = best_cand_mse
                             blackbox_candidate_accepted = bool(
                                 getattr(self, "blackbox_state_", None) is not None
@@ -9298,7 +9357,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         Predict using the discovered symbolic formula.
         Handles edge cases (log of zero, sqrt of negative) gracefully.
         """
-        check_is_fitted(self)
+        # Require a real fitted formula — many __init__ attrs end with '_' so bare
+        # check_is_fitted(self) is a false positive (S1-1).
+        check_is_fitted(self, attributes=["formula_"])
         X = check_array(X)
 
         try:
@@ -9309,7 +9370,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
     def get_formula(self):
         """Returns the discovered formula string."""
-        check_is_fitted(self)
+        check_is_fitted(self, attributes=["formula_"])
         return self.formula_
 
     def _reduce_formula_noise(self, formula_str, X, y):

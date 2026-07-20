@@ -415,7 +415,7 @@ public:
 
             update_discovery_metrics(gen, start_time);
 
-            if (config_.use_early_stop && objective_mse(best_overall_) < config_.early_stop_mse && best_overall_.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
+            if (config_.use_early_stop && early_stop_metric(best_overall_) < config_.early_stop_mse && best_overall_.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
                 trace_event("run.early_stop", gen);
                 break; // Exact algebraic match found that is simple
             }
@@ -621,10 +621,39 @@ public:
             if (i < config_.multi_seed_omegas.size() && !config_.multi_seed_omegas[i].empty()) {
                 current_seed_omegas = config_.multi_seed_omegas[i];
             }
+
+            // Distinct RNG stream per island under a fixed parent seed (E1).
+            // Without this, all islands clone the same trajectories.
+            if (config_.random_seed >= 0) {
+                // Large coprime-ish stride keeps streams far apart.
+                long long offset = static_cast<long long>(i) * 1000003LL;
+                long long seed = static_cast<long long>(config_.random_seed) + offset + static_cast<long long>(i);
+                // Keep in unsigned 32-bit range for mt19937.
+                current_island_cfg.random_seed = static_cast<int>(
+                    static_cast<unsigned int>(seed & 0xffffffffLL)
+                );
+            } else {
+                current_island_cfg.random_seed = -1;
+            }
+
+            // Optional light sharding of seed graphs across islands to increase diversity.
+            std::vector<IndividualGraph> island_seeds = seed_graphs_;
+            if (seed_graphs_.size() > 1 && config_.num_islands > 1) {
+                island_seeds.clear();
+                for (size_t s = 0; s < seed_graphs_.size(); ++s) {
+                    if (static_cast<int>(s % static_cast<size_t>(config_.num_islands)) == i) {
+                        island_seeds.push_back(seed_graphs_[s]);
+                    }
+                }
+                // Ensure every island gets at least one seed when possible.
+                if (island_seeds.empty()) {
+                    island_seeds.push_back(seed_graphs_[static_cast<size_t>(i % static_cast<int>(seed_graphs_.size()))]);
+                }
+            }
             
             // Pass seed_graphs_ + y_weights_ to all islands
             islands.emplace_back(
-                current_island_cfg, X_, y_, current_seed_omegas, seed_graphs_,
+                current_island_cfg, X_, y_, current_seed_omegas, island_seeds,
                 has_y_weights_ ? y_weights_ : Eigen::ArrayXd()
             );
         }
@@ -703,7 +732,7 @@ public:
             bool should_stop = false;
             for (auto& island : islands) {
                 auto best = island.get_best();
-                if (objective_mse(best) < config_.early_stop_mse && best.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
+                if (early_stop_metric(best) < config_.early_stop_mse && best.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
                     should_stop = true;
                 }
                 if (best.fitness < best_overall_.fitness) {
@@ -788,7 +817,7 @@ private:
         has_y_weights_ = true;
     }
 
-    // Objective used for selection/fitness/early-stop (weighted and/or robust).
+    // Objective used for selection/fitness (weighted and/or robust).
     double objective_mse(const IndividualGraph& ind) const {
         // weighted_mse holds the search objective after evaluate_fitness_with_penalty
         // (plain weighted MSE, huber, trimmed, or student_t). Fall back to raw_mse
@@ -797,6 +826,15 @@ private:
             return ind.weighted_mse;
         }
         return ind.raw_mse;
+    }
+
+    // Early-stop / "exact" claims must use unweighted raw MSE so robust search
+    // losses cannot declare success while true MSE is still large (E2/N5).
+    double early_stop_metric(const IndividualGraph& ind) const {
+        if (std::isfinite(ind.raw_mse) && ind.raw_mse < 1e90) {
+            return ind.raw_mse;
+        }
+        return objective_mse(ind);
     }
 
     double mad_scale(const Eigen::ArrayXd& resid) const {
@@ -965,9 +1003,10 @@ private:
     double run_wall_time_sec_ = 0.0;
 
     void update_discovery_metrics(int generation, const std::chrono::steady_clock::time_point& start_time) {
-        const bool is_exact = (objective_mse(best_overall_) < config_.early_stop_mse && best_overall_.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes));
+        const bool is_exact = (early_stop_metric(best_overall_) < config_.early_stop_mse && best_overall_.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes));
+        // Acceptable band also uses raw MSE so robust objectives do not over-claim.
         const bool is_acceptable =
-            (objective_mse(best_overall_) < config_.acceptable_mse &&
+            (early_stop_metric(best_overall_) < config_.acceptable_mse &&
              static_cast<int>(best_overall_.nodes.size()) <= config_.acceptable_complexity);
 
         if (is_exact && first_exact_generation_ < 0) {
