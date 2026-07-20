@@ -325,14 +325,17 @@ def _soft_mad_sample_weights(values, *, floor: float = 0.05, cap: float = 1.0):
 
 
 def _auto_residual_soft_weights(X, y, *, floor: float = 0.05, cap: float = 1.0):
-    """Soft MAD weights from residuals of a cheap structure fit (Phase 3 1D path).
+    """Soft MAD weights from residuals of a cheap structure fit.
 
     Raw-target soft weights fire on clean nonlinear y (e.g. polynomials) because
     the *level* distribution is heavy-tailed even when residuals are clean.
 
-    Fit residual probes (linear, quadratic/cubic for 1D, median) and keep the
-    residual with the smallest MAD scale, then soft-weight *that* residual only.
-    Returns ``(weights_or_None, outlier_fraction)``.
+    Fit residual probes (multi-linear for multi-feature, poly for 1D, median) and
+    keep the residual with the smallest MAD scale, then soft-weight *that*
+    residual only. Returns ``(weights_or_None, outlier_fraction)``.
+
+    N3: multi-feature probes use all columns (not x0-only) so clean multi-linear
+    targets do not look like heavy-tail residual noise.
     """
     y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
     n = int(y_arr.shape[0])
@@ -359,19 +362,28 @@ def _auto_residual_soft_weights(X, y, *, floor: float = 0.05, cap: float = 1.0):
 
     residuals = []
     try:
-        x0 = X_arr[:, 0]
-        A = np.column_stack([x0, np.ones(n, dtype=np.float64)])
-        coef, _, _, _ = np.linalg.lstsq(A, y_arr, rcond=None)
-        residuals.append(y_arr - A @ coef)
-        if X_arr.shape[1] == 1:
-            A2 = np.column_stack([x0 ** 2, x0, np.ones(n, dtype=np.float64)])
+        n_features = int(X_arr.shape[1])
+        ones = np.ones(n, dtype=np.float64)
+        if n_features >= 1:
+            # Multi-linear residual probe across all features (N3).
+            A_lin = np.column_stack([X_arr, ones])
+            if A_lin.shape[0] >= A_lin.shape[1] + 2 and np.all(np.isfinite(A_lin)):
+                coef, _, _, _ = np.linalg.lstsq(A_lin, y_arr, rcond=None)
+                residuals.append(y_arr - A_lin @ coef)
+        if n_features == 1:
+            x0 = X_arr[:, 0]
+            A2 = np.column_stack([x0 ** 2, x0, ones])
             coef2, _, _, _ = np.linalg.lstsq(A2, y_arr, rcond=None)
             residuals.append(y_arr - A2 @ coef2)
-            A3 = np.column_stack(
-                [x0 ** 3, x0 ** 2, x0, np.ones(n, dtype=np.float64)]
-            )
+            A3 = np.column_stack([x0 ** 3, x0 ** 2, x0, ones])
             coef3, _, _, _ = np.linalg.lstsq(A3, y_arr, rcond=None)
             residuals.append(y_arr - A3 @ coef3)
+        elif n_features > 1 and n_features <= 8 and n >= (2 * n_features + 4):
+            # Light multi-quadratic probe (diagonal squares) for mild curvature.
+            A_q = np.column_stack([X_arr, X_arr ** 2, ones])
+            if np.all(np.isfinite(A_q)):
+                coef_q, _, _, _ = np.linalg.lstsq(A_q, y_arr, rcond=None)
+                residuals.append(y_arr - A_q @ coef_q)
     except Exception:
         pass
     y_med = float(np.median(y_arr[np.isfinite(y_arr)]))
@@ -3560,7 +3572,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
     def _formula_mse(self, formula, X, y, sample_weight=None, sample_weight_indices=None):
         """Evaluate a formula for *search* scoring (robust loss when configured).
 
-        Display / benchmark metrics use ``_display_formula_mse`` (plain MSE).
+        Metric contract (S1-6 / N6):
+        - **Search objective** (this method): may use sample weights + robust
+          ``loss_mode`` (Huber/trimmed/student_t). Used for evolution selection,
+          residual/inception search, and cleanup search steps.
+        - **Display / protocol** (``_display_formula_mse``): always plain
+          unweighted MSE on finite predictions. Used for acceptance that must
+          match benchmarks and public ``best_mse_`` reporting.
+
         When fit-time weights are active, they are applied if lengths match.
         If ``sample_weight_indices`` is provided, fit-time weights are sliced to
         those rows (for holdout/subset scoring). Length mismatches raise.
@@ -3590,29 +3609,55 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         loss = _robust_loss(pred, target, sample_weight=w, **self._search_loss_kwargs())
         return loss if np.isfinite(loss) else float("inf")
 
-    def _display_formula_mse(self, formula, X, y):
-        """Evaluate a formula with the shared benchmark/display evaluator."""
+    def _plain_unweighted_mse(self, formula, X, y):
+        """Local plain unweighted MSE (display/protocol path; no scripts import)."""
         text = str(formula or "").strip()
         if not text:
             return float("inf")
         try:
-            from scripts import benchmark_common as bc
-            mse = bc.evaluate_formula_mse_on_X(text, X, y)
+            pred = self._safe_eval_formula_array(text, X)
         except Exception:
             return float("inf")
-        if mse is None:
+        pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+        target = np.asarray(y, dtype=np.float64).reshape(-1)
+        if pred.shape != target.shape:
             return float("inf")
-        try:
-            mse = float(mse)
-        except Exception:
+        mask = np.isfinite(pred) & np.isfinite(target)
+        if int(np.sum(mask)) < 1:
             return float("inf")
+        mse = float(np.mean((pred[mask] - target[mask]) ** 2))
         return mse if np.isfinite(mse) else float("inf")
 
-    def _final_formula_score(self, formula, X, y, sample_weight=None, sample_weight_indices=None):
-        """Return the display-first score plus internal/display diagnostics.
+    def _display_formula_mse(self, formula, X, y):
+        """Always plain unweighted MSE for display/benchmark protocol (N6/S1-12).
 
-        Display MSE remains unweighted (benchmark display contract). Internal
-        MSE honours fit-time / explicit weights, optionally sliced by indices.
+        Prefer the local evaluator so orchestration does not depend on
+        ``scripts.benchmark_common`` being importable. Optional scripts path is
+        tried only as a parity cross-check and never overrides a finite local
+        value; on scripts failure we keep the local plain MSE (never fall back
+        to weighted/robust search loss).
+        """
+        local_mse = self._plain_unweighted_mse(formula, X, y)
+        # Optional parity with external benchmark helper when available.
+        try:
+            from scripts import benchmark_common as bc
+            mse = bc.evaluate_formula_mse_on_X(str(formula or "").strip(), X, y)
+            if mse is not None:
+                mse_f = float(mse)
+                if np.isfinite(mse_f):
+                    # Prefer local when both finite (same contract); keep local.
+                    return local_mse if np.isfinite(local_mse) else mse_f
+        except Exception:
+            pass
+        return local_mse
+
+    def _final_formula_score(self, formula, X, y, sample_weight=None, sample_weight_indices=None):
+        """Return display-first score plus internal/display diagnostics (S1-6).
+
+        Primary ``score`` is always unweighted display MSE when finite. Never
+        fall back to weighted/robust ``_formula_mse`` for the primary score —
+        that silently breaks the display protocol under auto soft-MAD/Huber (N6).
+        Internal MSE remains available for search diagnostics.
         """
         internal_mse = self._formula_mse(
             formula,
@@ -3622,7 +3667,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             sample_weight_indices=sample_weight_indices,
         )
         display_mse = self._display_formula_mse(formula, X, y)
-        score = display_mse if np.isfinite(display_mse) else internal_mse
+        # Display-first; if display fails, recompute plain unweighted (same contract).
+        if np.isfinite(display_mse):
+            score = display_mse
+        else:
+            score = self._plain_unweighted_mse(formula, X, y)
         return score, internal_mse, display_mse
 
     def _noise_aware_cleanup_slack(self, formula, X, y, *, relative_slack=None, absolute_slack=None):
@@ -3891,7 +3940,12 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
     def _auto_noise_guard_active(self) -> bool:
 
-        """True when Phase-3 auto residual soft-weights were applied (not user weights)."""
+        """True when auto noise robustness is active (not user-provided weights).
+
+        Covers soft-MAD weights *and* pure diffuse Huber (N4). Guards use
+        unweighted holdout/complexity checks so search under robust loss does
+        not accept bloated formulas that look good only under Huber/weights.
+        """
         applied = getattr(self, "_blackbox_noise_robust_applied_", None) or {}
         if not isinstance(applied, dict) or not applied.get("active"):
             return False
@@ -3899,8 +3953,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         sw = diag.get("sample_weight") if isinstance(diag, dict) else None
         if isinstance(sw, dict) and str(sw.get("source") or "") == "user":
             return False
-        # Explicit auto path, or soft_mad without user source.
-        if str(applied.get("reason") or "") == "soft_mad_weights":
+        reason = str(applied.get("reason") or "")
+        # Explicit auto paths: soft-MAD and diffuse Huber without weights.
+        if reason in ("soft_mad_weights", "diffuse_noise_huber"):
+            return True
+        if bool(applied.get("loss_mode_switched_to_huber")):
             return True
         return str(sw.get("source") if isinstance(sw, dict) else "") == "auto_soft_mad"
 
@@ -6573,7 +6630,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return 1.0
 
     def _passes_cross_validation_skip_guard(self, formula, X, y, sample_weight=None):
-        """Return True when fast-path formula is stable enough to skip evolution."""
+        """Return True when fast-path formula is stable enough to skip evolution.
+
+        Metric contract (S1-6): fold scores use *weight-aware* R² on fixed
+        predictions (not refit) for search-stability under active sample weights.
+        This is intentionally not the unweighted display protocol metric; display
+        acceptance still goes through ``_display_formula_mse`` / raw MSE elsewhere.
+        """
         diagnostics = {
             'enabled': bool(self.cv_skip_guard_enabled),
             'fold_r2': [],
@@ -7441,15 +7504,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 mean_w = float(np.mean(sw)) if sw.size else 1.0
                 if mean_w > 1e-12:
                     low_weight_mass = float(np.mean(sw < 0.85 * mean_w))
+            # N3: do NOT force-activate on bare retained_all_features* blackbox
+            # reasons. Clean multi-feature small problems often keep all columns
+            # with near-uniform soft weights; require heavy-tail evidence
+            # (out_frac / low_weight_mass / selection_uncertain / forced True).
             activate = soft_w is not None and (
                 robust_mode is True
                 or selection_uncertain
                 or out_frac >= out_frac_floor
                 or low_weight_mass >= 0.02
-                or (
-                    multi_feature_blackbox
-                    and str(getattr(blackbox_state, "reason", "")).startswith("retained_all_features")
-                )
             )
             if activate and soft_w is not None:
                 self.sample_weight_ = _validate_sample_weight(soft_w, X.shape[0])

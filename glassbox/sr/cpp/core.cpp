@@ -15,6 +15,7 @@
 #include <limits>
 #include <cctype>
 #include <string>
+#include <stdexcept>
 
 namespace py = pybind11;
 
@@ -831,11 +832,12 @@ py::dict refine_periodic_rational_wrapper(py::array_t<double> x_arr, py::array_t
     return out;
 }
 
-// Wrapper for iterative_elastic_net
+// Wrapper for iterative_elastic_net (optional sample_weight / y_weights for S5-9)
 py::tuple iterative_elastic_net_wrapper(py::array_t<double> X_arr, py::array_t<double> y_arr, 
                                         double l1_weight, double l2_weight, 
                                         int n_starts=3, int n_iterations=3, 
-                                        double prune_threshold=0.05, int max_iter=1000) {
+                                        double prune_threshold=0.05, int max_iter=1000,
+                                        py::object sample_weight = py::none()) {
     auto X_buf = X_arr.request();
     auto y_buf = y_arr.request();
     
@@ -846,7 +848,17 @@ py::tuple iterative_elastic_net_wrapper(py::array_t<double> X_arr, py::array_t<d
         static_cast<double*>(X_buf.ptr), n, p);
     Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
 
-    auto res = sr::iterative_elastic_net(X, y, l1_weight, l2_weight, n_starts, n_iterations, prune_threshold, max_iter);
+    Eigen::VectorXd sw;
+    if (!sample_weight.is_none()) {
+        py::array_t<double> w_arr = py::cast<py::array_t<double>>(sample_weight);
+        auto w_buf = w_arr.request();
+        if (static_cast<int>(w_buf.size) != static_cast<int>(y_buf.size)) {
+            throw std::invalid_argument("sample_weight length must match y");
+        }
+        sw = Eigen::Map<Eigen::VectorXd>(static_cast<double*>(w_buf.ptr), w_buf.size);
+    }
+
+    auto res = sr::iterative_elastic_net(X, y, l1_weight, l2_weight, n_starts, n_iterations, prune_threshold, max_iter, sw);
     
     py::list w_out;
     for (int i = 0; i < res.weights.size(); ++i) {
@@ -856,18 +868,28 @@ py::tuple iterative_elastic_net_wrapper(py::array_t<double> X_arr, py::array_t<d
     return py::make_tuple(w_out, res.mse);
 }
 
-// Wrapper for lasso_coordinate_descent
+// Wrapper for lasso_coordinate_descent (optional sample_weight via sqrt scaling)
 py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::array_t<double> y_arr, 
-                                          double alpha, int max_iter=1000, double tol=1e-4) {
+                                          double alpha, int max_iter=1000, double tol=1e-4,
+                                          py::object sample_weight = py::none()) {
     auto X_buf = X_arr.request();
     auto y_buf = y_arr.request();
     
     int n = X_buf.shape[0];
     int p = X_buf.shape[1];
     
-    Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> X(
+    Eigen::MatrixXd X = Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(
         static_cast<double*>(X_buf.ptr), n, p);
-    Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
+    Eigen::VectorXd y = Eigen::Map<Eigen::VectorXd>(static_cast<double*>(y_buf.ptr), y_buf.size);
+    if (!sample_weight.is_none()) {
+        py::array_t<double> w_arr = py::cast<py::array_t<double>>(sample_weight);
+        auto w_buf = w_arr.request();
+        if (static_cast<int>(w_buf.size) != n) {
+            throw std::invalid_argument("sample_weight length must match y");
+        }
+        Eigen::VectorXd sw = Eigen::Map<Eigen::VectorXd>(static_cast<double*>(w_buf.ptr), w_buf.size);
+        sr::apply_sqrt_sample_weights(X, y, sw);
+    }
 
     auto res = sr::elastic_net_cd_cpp(X, y, alpha, 0.0, max_iter, tol);
     
@@ -1053,8 +1075,17 @@ PYBIND11_MODULE(_core, m) {
     m.def("refine_frequencies", &refine_frequencies_wrapper, "Refines frequencies via Eigen varpro");
     m.def("refine_powers", &refine_powers_model_wrapper, "Refines powers via Eigen varpro");
     m.def("refine_periodic_rational", &refine_periodic_rational_wrapper, "Refines periodic rational params via Eigen varpro");
-    m.def("iterative_elastic_net", &iterative_elastic_net_wrapper, "Iterative Elastic Net for regularized pruning");
-    m.def("lasso_coordinate_descent", &lasso_coordinate_descent_wrapper, "LASSO regression using coordinate descent");
+    m.def("iterative_elastic_net", &iterative_elastic_net_wrapper,
+          "Iterative Elastic Net for regularized pruning",
+          py::arg("X"), py::arg("y"), py::arg("l1_weight"), py::arg("l2_weight"),
+          py::arg("n_starts") = 3, py::arg("n_iterations") = 3,
+          py::arg("prune_threshold") = 0.05, py::arg("max_iter") = 1000,
+          py::arg("sample_weight") = py::none());
+    m.def("lasso_coordinate_descent", &lasso_coordinate_descent_wrapper,
+          "LASSO regression using coordinate descent",
+          py::arg("X"), py::arg("y"), py::arg("alpha"),
+          py::arg("max_iter") = 1000, py::arg("tol") = 1e-4,
+          py::arg("sample_weight") = py::none());
     m.def("simplify_formula", &simplify_formula_wrapper, "Simplifies a math formula string natively in C++",
           py::arg("formula_str"), py::arg("int_tol")=1e-5, py::arg("zero_tol")=1e-8, py::arg("max_passes")=6,
           py::arg("use_nsimplify")=true, py::arg("use_identities")=true, py::arg("approximate_trig")=false,

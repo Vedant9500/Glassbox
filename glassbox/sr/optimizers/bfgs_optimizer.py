@@ -379,6 +379,7 @@ def fit_coefficients_bfgs(
     l2_weight: float = 0.001,
     prune_threshold: float = 0.05,
     verbose: bool = False,
+    sample_weight=None,
 ) -> Tuple[torch.Tensor, float, str]:
     """
     Fit coefficients using BFGS (high-level API).
@@ -394,6 +395,7 @@ def fit_coefficients_bfgs(
         l2_weight: L2 regularization weight
         prune_threshold: Pruning threshold for iterative method
         verbose: Print progress
+        sample_weight: Optional per-sample weights (S5-9 weighted elastic net)
 
     Returns:
         (weights, mse, formula_string)
@@ -415,13 +417,25 @@ def fit_coefficients_bfgs(
                 except ImportError:
                     raise ImportError("C++ core not found")
 
-            weights_out, mse = _core.iterative_elastic_net(
-                X.detach().cpu().numpy().astype(np.float64),
-                y.detach().cpu().numpy().astype(np.float64),
-                l1_weight, l2_weight,
-                n_starts, n_iterations,
-                prune_threshold, 1000
-            )
+            sw = None
+            if sample_weight is not None:
+                sw = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+            if sw is not None:
+                weights_out, mse = _core.iterative_elastic_net(
+                    X.detach().cpu().numpy().astype(np.float64),
+                    y.detach().cpu().numpy().astype(np.float64),
+                    l1_weight, l2_weight,
+                    n_starts, n_iterations,
+                    prune_threshold, 1000, sw,
+                )
+            else:
+                weights_out, mse = _core.iterative_elastic_net(
+                    X.detach().cpu().numpy().astype(np.float64),
+                    y.detach().cpu().numpy().astype(np.float64),
+                    l1_weight, l2_weight,
+                    n_starts, n_iterations,
+                    prune_threshold, 1000
+                )
             weights = torch.tensor(weights_out, dtype=X.dtype, device=X.device)
             active_indices = [i for i, w in enumerate(weights_out) if abs(w) > 0]
             if verbose:

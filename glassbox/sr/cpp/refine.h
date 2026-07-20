@@ -9,6 +9,26 @@
 
 namespace sr {
 
+
+// Apply sqrt(sample weights) row scaling for weighted least squares.
+// Empty / wrong-size sw is a no-op. Non-positive weights clamp to 0.
+inline void apply_sqrt_sample_weights(Eigen::MatrixXd& X, Eigen::VectorXd& y,
+                                      const Eigen::VectorXd& sw) {
+    if (sw.size() != y.size() || sw.size() == 0) return;
+    const int n = static_cast<int>(y.size());
+    for (int i = 0; i < n; ++i) {
+        double w = sw(i);
+        if (!std::isfinite(w) || w <= 0.0) {
+            X.row(i).setZero();
+            y(i) = 0.0;
+            continue;
+        }
+        double s = std::sqrt(w);
+        X.row(i) *= s;
+        y(i) *= s;
+    }
+}
+
 struct ElasticNetResult {
     Eigen::VectorXd weights;
     double mse;
@@ -90,12 +110,19 @@ inline ElasticNetResult multi_start_elastic_net(const Eigen::MatrixXd& X, const 
     return best_res;
 }
 
+// Optional sample_weight: when non-empty and length matches y, run weighted LS
+// via sqrt(w) row scaling (S5-9). Empty VectorXd keeps legacy unweighted path.
 inline ElasticNetResult iterative_elastic_net(const Eigen::MatrixXd& X, const Eigen::VectorXd& y,
                                               double l1_weight, double l2_weight, 
                                               int n_starts=3, int n_iterations=3, 
                                               double prune_threshold=0.05,
-                                              int max_iter=1000) {
-    int p = X.cols();
+                                              int max_iter=1000,
+                                              const Eigen::VectorXd& sample_weight = Eigen::VectorXd()) {
+    Eigen::MatrixXd X_work = X;
+    Eigen::VectorXd y_work = y;
+    apply_sqrt_sample_weights(X_work, y_work, sample_weight);
+
+    int p = X_work.cols();
     std::vector<bool> active_mask(p, true);
     
     ElasticNetResult best_res;
@@ -107,17 +134,17 @@ inline ElasticNetResult iterative_elastic_net(const Eigen::MatrixXd& X, const Ei
         for (bool a : active_mask) if (a) num_active++;
         if (num_active == 0) break;
         
-        Eigen::MatrixXd X_active(X.rows(), num_active);
+        Eigen::MatrixXd X_active(X_work.rows(), num_active);
         std::vector<int> active_indices;
         int col_idx = 0;
         for (int j = 0; j < p; ++j) {
             if (active_mask[j]) {
-                X_active.col(col_idx++) = X.col(j);
+                X_active.col(col_idx++) = X_work.col(j);
                 active_indices.push_back(j);
             }
         }
         
-        auto res = multi_start_elastic_net(X_active, y, l1_weight, l2_weight, n_starts, 0.1, max_iter);
+        auto res = multi_start_elastic_net(X_active, y_work, l1_weight, l2_weight, n_starts, 0.1, max_iter);
         
         Eigen::VectorXd full_weights = Eigen::VectorXd::Zero(p);
         for (int j = 0; j < num_active; ++j) {

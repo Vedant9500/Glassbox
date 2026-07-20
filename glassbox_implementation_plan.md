@@ -26,10 +26,15 @@
 | **S5-3** | Variable/folded powers compile (const-fold + exp/log rewrite) |
 | **S5-4** | Printer matches soft-div / protected-div / aggregation; multi-feature names |
 | **S5-7** | `exp(log(·))` → `abs` (via Abs) |
+| **N3** | Soft-MAD: no `retained_all_features` force; multi-linear residual probes |
+| **N4** | Auto noise guards active for `diffuse_noise_huber` |
+| **N6 / S1-12 / O8** | Local unweighted `_display_formula_mse`; no robust primary fallback |
+| **S1-6** | Search vs display metric contract documented; display-first scores |
+| **S5-9 (partial)** | Weighted iterative elastic net (`sample_weight` / sqrt-w) |
 | **O12, O13** | Abs + printer backlog items |
 
 ### Still open (this plan)
-- **P0 open:** N2, E1, E2/N5, S1-1, S1-2, S1-3  
+- **P0 open:** none (Phase 0 shipped)  
 - **P1 open:** ~30 items across S1/S2/S4/S5  
 - **P2 open:** remaining polish  
 - **Unaudited:** S3, S6–S10 may add findings — schedule after Phase 0–2 or in parallel with Phase 6
@@ -70,15 +75,17 @@ Phase 7  API polish & cleanup (P2)
 
 ## Phase 1 — Noise & metric contracts
 
+**Status:** done (2026-07-20) — N3/N4/N6/S1-6/S1-12 fixed; S5-9 elastic-net weighted (freq/power refiners still unweighted).
+
 **Goal:** Auto noise path is conservative; search may weight/Huber; **display/protocol always plain unweighted MSE**.
 
 | # | ID | Work | Notes |
 |---|-----|------|-------|
-| 1.1 | **N3** | Soft-MAD: remove or gate `retained_all_features` force; multi-column residual probes | Avoid soft+Huber on clean multi-feature |
-| 1.2 | **N4** | Activate phase-3/6 unweighted guards for `diffuse_noise_huber` as well as soft-MAD | N2 residual risk if auto-Huber still fires |
-| 1.3 | **N6** / **S1-12** / **O8** | Local unweighted `_display_formula_mse` — no `scripts.benchmark_common` import fallback to robust | Hard display/search separation |
-| 1.4 | **S1-6** | Document and audit decision gates: which use weighted vs unweighted; align skip/accept thresholds | Overlaps S3 |
-| 1.5 | **S5-9** | Weight-aware specialist `refine.h` **or** route specialists through evolution residual | Elastic net / freq / power refiners unweighted today |
+| 1.1 | **N3** | Soft-MAD: remove or gate `retained_all_features` force; multi-column residual probes | **done** — multi-linear probes; no retained_all force |
+| 1.2 | **N4** | Activate phase-3/6 unweighted guards for `diffuse_noise_huber` as well as soft-MAD | **done** |
+| 1.3 | **N6** / **S1-12** / **O8** | Local unweighted `_display_formula_mse` — no `scripts.benchmark_common` import fallback to robust | **done** |
+| 1.4 | **S1-6** | Document and audit decision gates: which use weighted vs unweighted; align skip/accept thresholds | **done** (docs + display-first score; S3 may deepen) |
+| 1.5 | **S5-9** | Weight-aware specialist `refine.h` **or** route specialists through evolution residual | **partial** — elastic net weighted; freq/power still open |
 | 1.6 | **S5-10** | Document dual clamp domains; optionally soft-protect exact scorer if any remaining exact path | Graph path is primary for ranking (S5-2 done) |
 
 **Also close:** O7 (soft-MAD multi-col), O8 (local display MSE).
@@ -242,11 +249,11 @@ S3 audit ──► deep scoring/guard redesign (S1-5/6)
 - [x] E2/N5 early-stop on raw_mse
 
 ### Phase 1
-- [ ] N3 soft-MAD retained_all force
-- [ ] N4 guards under diffuse Huber
-- [ ] N6/O8 local display MSE
-- [ ] S1-6 gate metric audit
-- [ ] S5-9 refine.h weights
+- [x] N3 soft-MAD retained_all force
+- [x] N4 guards under diffuse Huber
+- [x] N6/O8 local display MSE
+- [x] S1-6 gate metric audit
+- [x] S5-9 refine.h weights (elastic net; freq/power still open)
 
 ### Phase 2
 - [ ] E3 seed capacity
