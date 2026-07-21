@@ -129,8 +129,13 @@ inline Eigen::ArrayXd evaluate_graph_impl(
 
     thread_local Eigen::ArrayXXd arena;
     if constexpr (Policy == EvalPolicy::Simple) {
-        if (arena.rows() != num_samples || arena.cols() < static_cast<int>(graph.nodes.size())) {
-            arena.resize(num_samples, std::max(static_cast<int>(graph.nodes.size()), 64));
+        const int n_nodes = static_cast<int>(graph.nodes.size());
+        const int need_cols = std::max(n_nodes, 64);
+        // S5-11: grow as needed; shrink when sample count drops a lot (avoid sticky huge arena).
+        if (arena.rows() != num_samples || arena.cols() < need_cols) {
+            arena.resize(num_samples, need_cols);
+        } else if (arena.rows() > 0 && num_samples > 0 && arena.rows() > num_samples * 4) {
+            arena.resize(num_samples, arena.cols());
         }
     }
 
@@ -143,14 +148,25 @@ inline Eigen::ArrayXd evaluate_graph_impl(
                 needs_eval = true;
             } else {
                 const auto& n = graph.nodes[i];
-                if (n.type == NodeType::Unary && changed[n.left_child]) {
+                // S5-15: bounds-check child indices before indexing changed[].
+                const int n_nodes_i = static_cast<int>(graph.nodes.size());
+                if (n.type == NodeType::Unary
+                    && n.left_child >= 0 && n.left_child < n_nodes_i
+                    && changed[static_cast<size_t>(n.left_child)]) {
                     needs_eval = true;
                     changed[i] = true;
-                    changed_indices_out->push_back(static_cast<int>(i));
-                } else if (n.type == NodeType::Binary && (changed[n.left_child] || changed[n.right_child])) {
-                    needs_eval = true;
-                    changed[i] = true;
-                    changed_indices_out->push_back(static_cast<int>(i));
+                    if (changed_indices_out) changed_indices_out->push_back(static_cast<int>(i));
+                } else if (n.type == NodeType::Binary) {
+                    bool ch = false;
+                    if (n.left_child >= 0 && n.left_child < n_nodes_i
+                        && changed[static_cast<size_t>(n.left_child)]) ch = true;
+                    if (n.right_child >= 0 && n.right_child < n_nodes_i
+                        && changed[static_cast<size_t>(n.right_child)]) ch = true;
+                    if (ch) {
+                        needs_eval = true;
+                        changed[i] = true;
+                        if (changed_indices_out) changed_indices_out->push_back(static_cast<int>(i));
+                    }
                 }
             }
             if (!needs_eval) continue;
@@ -174,9 +190,14 @@ inline Eigen::ArrayXd evaluate_graph_impl(
             val = Eigen::ArrayXd::Zero(num_samples);
         }
         
-        auto get_child = [&](int idx) -> Eigen::ArrayXd {
-            if constexpr (Policy == EvalPolicy::Simple) return arena.col(idx);
-            else return (*cache_out)[idx];
+        // S5-11: do not force ArrayXd return type (that copied every child).
+        // Simple path: arena column expression; cache paths: const ArrayXd&.
+        auto get_child = [&](int idx) -> decltype(auto) {
+            if constexpr (Policy == EvalPolicy::Simple) {
+                return arena.col(idx);
+            } else {
+                return (*cache_out)[static_cast<size_t>(idx)];
+            }
         };
 
         switch (node.type) {
@@ -281,7 +302,7 @@ inline Eigen::ArrayXd evaluate_graph_impl(
     
     Eigen::ArrayXd final_output = Eigen::ArrayXd::Constant(num_samples, graph.output_bias);
     for (size_t i = 0; i < graph.output_weights.size() && i < graph.nodes.size(); ++i) {
-        if (std::abs(graph.output_weights[i]) > 1e-6) {
+        if (std::abs(graph.output_weights[i]) > kOutputWeightActive) {
             if constexpr (Policy == EvalPolicy::Simple) {
                 final_output += graph.output_weights[i] * arena.col(i);
             } else {
@@ -653,7 +674,8 @@ inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs
     
     for (size_t i = 0; i < graph.output_weights.size() && i < graph.nodes.size(); ++i) {
         double w = graph.output_weights[i];
-        if (std::abs(w) > 1e-4) {
+        // S5-6: match eval activity threshold (was 1e-4 → silent dropped terms).
+        if (std::abs(w) > kOutputWeightActive) {
             std::string sub_formula = format_node_to_string(graph, static_cast<int>(i), n_inputs);
             
             if (!first) {

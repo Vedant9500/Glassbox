@@ -1580,7 +1580,8 @@ private:
         // graph length. This keeps dead columns cheap to prune while making
         // risky active operators pay their way.
         int active_complexity = graph.active_complexity();
-        int inactive_nodes = std::max(0, static_cast<int>(graph.nodes.size()) - active_complexity);
+        // S5-13: inactive count must use node count, not weighted complexity units.
+        int inactive_nodes = std::max(0, static_cast<int>(graph.nodes.size()) - graph.active_node_count());
         
         // Scale-invariant parsimony: a graph must improve MSE by roughly 1.2%
         // per active complexity unit to justify added structure.
@@ -2276,18 +2277,49 @@ private:
     // Alternates between: (1) Adam steps on {p, omega, phi},
     // then (2) SVD refit of output weights. This ensures linear weights
     // stay in sync with the refined inner parameters.
+
+    // S5-8: unaries that participate in any active output basis (including nested
+    // ancestors), not only those with nonzero *output* weight.
+    std::vector<int> collect_active_unary_indices(const IndividualGraph& ind) const {
+        std::vector<int> out;
+        if (ind.nodes.empty()) return out;
+        const int n = static_cast<int>(ind.nodes.size());
+        std::vector<char> reachable(static_cast<size_t>(n), 0);
+        std::vector<int> stack;
+        stack.reserve(static_cast<size_t>(n));
+        for (int i = 0; i < n && i < static_cast<int>(ind.output_weights.size()); ++i) {
+            if (std::abs(ind.output_weights[static_cast<size_t>(i)]) > kOutputWeightActive) {
+                stack.push_back(i);
+            }
+        }
+        while (!stack.empty()) {
+            int idx = stack.back();
+            stack.pop_back();
+            if (idx < 0 || idx >= n || reachable[static_cast<size_t>(idx)]) continue;
+            reachable[static_cast<size_t>(idx)] = 1;
+            const auto& node = ind.nodes[static_cast<size_t>(idx)];
+            if ((node.type == NodeType::Unary || node.type == NodeType::Binary) && node.left_child >= 0) {
+                stack.push_back(node.left_child);
+            }
+            if (node.type == NodeType::Binary && node.right_child >= 0) {
+                stack.push_back(node.right_child);
+            }
+        }
+        for (int i = 0; i < n; ++i) {
+            if (!reachable[static_cast<size_t>(i)]) continue;
+            if (ind.nodes[static_cast<size_t>(i)].type == NodeType::Unary) {
+                out.push_back(i);
+            }
+        }
+        return out;
+    }
+
     void refine_inner_params_adam(IndividualGraph& ind) {
         if (ind.nodes.empty()) return;
         int n_samples = static_cast<int>(y_.size());
         
-        // Collect indices of active unary nodes (non-zero output weight)
-        std::vector<int> active_unary;
-        for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
-            if (ind.nodes[i].type == NodeType::Unary && 
-                std::abs(ind.output_weights[i]) > 1e-4) {
-                active_unary.push_back(i);
-            }
-        }
+        // Collect unaries in active output subtrees (S5-8 nested refine).
+        std::vector<int> active_unary = collect_active_unary_indices(ind);
         if (active_unary.empty()) return;
         
         // Adam hyperparameters
@@ -2393,13 +2425,7 @@ private:
         const int n_samples = static_cast<int>(y_.size());
         if (n_samples <= 0) return false;
 
-        std::vector<int> active_unary;
-        for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
-            if (ind.nodes[i].type == NodeType::Unary &&
-                std::abs(ind.output_weights[i]) > 1e-4) {
-                active_unary.push_back(i);
-            }
-        }
+        std::vector<int> active_unary = collect_active_unary_indices(ind);
         if (active_unary.empty()) return false;
 
         const int n_params = static_cast<int>(active_unary.size()) * 3;
@@ -2863,6 +2889,16 @@ private:
             };
             
             // 6a. Inner parameter snapping (p, omega, phi)
+            // S5-8: allow nested unaries under active outputs, not only direct basis terms.
+            std::vector<char> snap_active_unary(static_cast<size_t>(ind.nodes.size()), 0);
+            {
+                auto idxs = collect_active_unary_indices(ind);
+                for (int ui : idxs) {
+                    if (ui >= 0 && ui < static_cast<int>(ind.nodes.size())) {
+                        snap_active_unary[static_cast<size_t>(ui)] = 1;
+                    }
+                }
+            }
             const double snap_candidates_p[] = {-2, -1.5, -1, -0.5, 0, 0.25, 1.0/3.0, 0.5, 2.0/3.0, 0.75, 1, 1.5, 2, 2.5, 3, 4, 5};
             const int n_snap_p = sizeof(snap_candidates_p) / sizeof(snap_candidates_p[0]);
             
@@ -2874,8 +2910,7 @@ private:
             
             for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
                 if (ind.nodes[i].type != NodeType::Unary) continue;
-                if (i >= static_cast<int>(ind.output_weights.size())) continue;
-                if (std::abs(ind.output_weights[i]) < 1e-6) continue; // Skip dead nodes
+                if (i < 0 || i >= static_cast<int>(snap_active_unary.size()) || !snap_active_unary[static_cast<size_t>(i)]) continue; // S5-8 nested-active
                 
                 auto& node = ind.nodes[i];
                 
@@ -3059,8 +3094,7 @@ private:
             for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
                 if (ind.nodes[i].type != NodeType::Unary) continue;
                 if (ind.nodes[i].unary_op != UnaryOp::Exp) continue;
-                if (i >= static_cast<int>(ind.output_weights.size())) continue;
-                if (std::abs(ind.output_weights[i]) < 1e-6) continue;
+                if (i < 0 || i >= static_cast<int>(snap_active_unary.size()) || !snap_active_unary[static_cast<size_t>(i)]) continue;
                 
                 auto& node = ind.nodes[i];
                 
@@ -3198,8 +3232,7 @@ private:
             for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
                 if (ind.nodes[i].type != NodeType::Unary) continue;
                 if (ind.nodes[i].unary_op != UnaryOp::Periodic) continue;
-                if (i >= static_cast<int>(ind.output_weights.size())) continue;
-                if (std::abs(ind.output_weights[i]) < 1e-6) continue;
+                if (i < 0 || i >= static_cast<int>(snap_active_unary.size()) || !snap_active_unary[static_cast<size_t>(i)]) continue;
                 
                 auto& node = ind.nodes[i];
                 double w = ind.output_weights[i];
@@ -3248,8 +3281,7 @@ private:
             for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
                 if (ind.nodes[i].type != NodeType::Binary) continue;
                 if (ind.nodes[i].binary_op != BinaryOp::Arithmetic) continue;
-                if (i >= static_cast<int>(ind.output_weights.size())) continue;
-                if (std::abs(ind.output_weights[i]) < 1e-6) continue;
+                if (i < 0 || i >= static_cast<int>(snap_active_unary.size()) || !snap_active_unary[static_cast<size_t>(i)]) continue;
 
                 auto& node = ind.nodes[i];
                 const double original_beta = node.beta;

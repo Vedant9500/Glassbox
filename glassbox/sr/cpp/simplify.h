@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ast.h"
+#include "eval.h"
 #include <cmath>
 #include <vector>
 #include <iostream>
@@ -21,7 +22,7 @@ inline void compact_graph(IndividualGraph& graph) {
     // Mark used nodes from output weights
     std::vector<bool> used(graph.nodes.size(), false);
     for (size_t i = 0; i < graph.output_weights.size() && i < graph.nodes.size(); ++i) {
-        if (std::abs(graph.output_weights[i]) > 1e-8) {
+        if (std::abs(graph.output_weights[i]) > kOutputWeightDead) {
             used[i] = true;
         }
     }
@@ -52,7 +53,7 @@ inline void compact_graph(IndividualGraph& graph) {
             new_nodes.push_back(n);
             
             // Map weights
-            if (i < graph.output_weights.size() && std::abs(graph.output_weights[i]) > 1e-8) {
+            if (i < graph.output_weights.size() && std::abs(graph.output_weights[i]) > kOutputWeightDead) {
                 // Ensure new_weights is large enough
                 while (new_weights.size() <= new_indices[i]) {
                     new_weights.push_back(0.0);
@@ -76,7 +77,7 @@ inline void simplify_ast(IndividualGraph& graph) {
     
     // Output layer simplification: Fold constants into bias
     for (size_t i = 0; i < graph.output_weights.size() && i < graph.nodes.size(); ++i) {
-        if (std::abs(graph.output_weights[i]) > 1e-8) {
+        if (std::abs(graph.output_weights[i]) > kOutputWeightDead) {
             if (graph.nodes[i].type == NodeType::Constant) {
                 graph.output_bias += graph.output_weights[i] * graph.nodes[i].value;
                 graph.output_weights[i] = 0.0;
@@ -128,8 +129,8 @@ inline void simplify_node(IndividualGraph& graph, int node_idx) {
             double res = 0.0;
             
             if (node.binary_op == BinaryOp::Arithmetic) {
-                // Determine dominant op from softmax weights
-                double t = 5.0; // Assume default temp
+                // S5-12: use live arithmetic temperature (was hardcoded 5.0).
+                double t = get_arithmetic_temperature();
                 double d_add = (node.beta - 1.0) * (node.beta - 1.0) + (node.gamma - 1.0) * (node.gamma - 1.0);
                 double d_mul = (node.beta - 2.0) * (node.beta - 2.0) + (node.gamma - 1.0) * (node.gamma - 1.0);
                 double d_div = (node.beta - 2.0) * (node.beta - 2.0) + (node.gamma + 1.0) * (node.gamma + 1.0);
@@ -147,6 +148,14 @@ inline void simplify_node(IndividualGraph& graph, int node_idx) {
                 else res = l / std::sqrt(1.0 + r*r);
             } else if (node.binary_op == BinaryOp::Division) {
                 res = (l / (std::abs(r) + 1e-6)) * ((r >= 0) ? 1.0 : -1.0);
+            } else if (node.binary_op == BinaryOp::Aggregation) {
+                // Soft-mean / soft-max fold at tau (S5-12).
+                double tau = stabilized_tau(node.tau);
+                double max_val = std::max(l, r);
+                double ex = std::exp((l - max_val) / tau);
+                double ey = std::exp((r - max_val) / tau);
+                double den = ex + ey;
+                res = (den > 0.0) ? (l * ex + r * ey) / den : 0.5 * (l + r);
             }
             
             node.type = NodeType::Constant;

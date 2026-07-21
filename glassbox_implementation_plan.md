@@ -118,16 +118,18 @@ Phase 7  API polish & cleanup (P2)
 
 ## Phase 3 — Graph / eval / refine harden (remaining S5)
 
+**Status:** done (2026-07-20) — S5-5/6/8/11/12/13/15 fixed; S5-14/S5-16 left open/P2.
+
 **Goal:** Eval cache correctness; formula export completeness; refine reaches nested params.
 
-| # | ID | Work |
-|---|-----|------|
-| 3.1 | **S5-5** / **O14** | Structural hash: more decimals or full bits for SharedCache key; keep coarse quantize only for CSE if desired |
-| 3.2 | **S5-6** / **O15** | Unify output-weight cutoffs (eval vs `get_formula_string` vs compact) — no silent dropped terms |
-| 3.3 | **S5-8** | Inner refine/snap: include nested unaries that are ancestors of active outputs, not only nonzero output-weight nodes |
-| 3.4 | **S5-11** / **O16** | `get_child` by const ref / Map — hot-path copy removal |
-| 3.5 | **S5-12** | `simplify.h` use `get_arithmetic_temperature()`; fold Aggregation constants |
-| 3.6 | **S5-13–S5-16** | P2: inactive_nodes units; partial-eval bounds; legacy `evaluate_fitness`; dual cache cleanup |
+| # | ID | Work | Status |
+|---|-----|------|--------|
+| 3.1 | **S5-5** / **O14** | Structural hash: more decimals or full bits for SharedCache key; keep coarse quantize only for CSE if desired | **done** — default 8 decimals |
+| 3.2 | **S5-6** / **O15** | Unify output-weight cutoffs (eval vs `get_formula_string` vs compact) — no silent dropped terms | **done** — `kOutputWeightActive=1e-6` |
+| 3.3 | **S5-8** | Inner refine/snap: include nested unaries that are ancestors of active outputs, not only nonzero output-weight nodes | **done** |
+| 3.4 | **S5-11** / **O16** | `get_child` by const ref / Map — hot-path copy removal | **done** — `decltype(auto)` |
+| 3.5 | **S5-12** | `simplify.h` use `get_arithmetic_temperature()`; fold Aggregation constants | **done** |
+| 3.6 | **S5-13–S5-16** | P2: inactive_nodes units; partial-eval bounds; legacy `evaluate_fitness`; dual cache cleanup | **partial** — S5-13/15 done; S5-14/16 open |
 
 **Done in this area:** S5-1..S5-4, S5-7.
 
@@ -268,12 +270,12 @@ S3 audit ──► deep scoring/guard redesign (S1-5/6)
 - [x] E4/E10 soft arith / global temp
 
 ### Phase 3
-- [ ] S5-5 hash quantize
-- [ ] S5-6 weight cutoffs
-- [ ] S5-8 nested refine
-- [ ] S5-11 get_child copies
-- [ ] S5-12 simplify temp
-- [ ] S5-13..16 P2
+- [x] S5-5 hash quantize
+- [x] S5-6 weight cutoffs
+- [x] S5-8 nested refine
+- [x] S5-11 get_child copies
+- [x] S5-12 simplify temp
+- [x] S5-13/15; S5-14/16 still open
 
 ### Phase 4
 - [ ] S1-4 n_features_in_
