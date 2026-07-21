@@ -122,6 +122,17 @@ struct EvolutionConfig {
     // Reproducibility
     int random_seed = -1; // <0 => nondeterministic random_device
 
+    // Soft-arithmetic blend sharpness (synced to eval.h during fitness eval).
+    // Higher => closer to discrete +/×/÷/− (E4 / E10).
+    double arithmetic_temperature = 5.0;
+
+    // Parallel pop evaluation thread budget. 0 => auto (max threads, or 1 if nested).
+    int eval_num_threads = 0;
+
+    // Seed injection cap fraction of population (E3). Historical default was 0.25.
+    // Islands use small island_size; higher fraction avoids seed starvation.
+    double seed_fraction = 0.5;
+
     // Phase 0 evaluation hooks
     double acceptable_mse = 1e-3;
     int acceptable_complexity = 20;
@@ -370,20 +381,20 @@ public:
                 }
                 // NSGA-II selection from combined pool
                 population_ = nsga2_select(combined, config_.pop_size);
-                // Track best (min MSE from front)
+                // Track best (fitness primary, raw_mse secondary)
                 for (auto& ind : population_) {
-                    if (ind.fitness < best_overall_.fitness) best_overall_ = ind;
+                    consider_champion(ind);
                 }
             } else {
-                // Standard single-objective sort
+                // Standard single-objective sort (raw_mse tie-break)
                 std::sort(population_.begin(), population_.end(), 
                           [](const IndividualGraph& a, const IndividualGraph& b) {
-                              return a.fitness < b.fitness;
+                              return is_better_champion(a, b);
                           });
                 
-                // Track best
-                if (population_[0].fitness < best_overall_.fitness) {
-                    best_overall_ = population_[0];
+                // Track best (fitness primary, raw_mse secondary)
+                if (!population_.empty()) {
+                    consider_champion(population_[0]);
                 }
             }
             
@@ -511,16 +522,26 @@ public:
             trace_event("generation.post_reproduce", gen);
         }
         
-        // Post-evolution cleanup: deduplicate + prune the best graph
+        // Post-evolution cleanup: deduplicate + prune; then export may prefer raw champion.
         cleanup_graph(best_overall_);
+        if (!best_raw_overall_.nodes.empty()) {
+            cleanup_graph(best_raw_overall_);
+        }
+        // Re-evaluate export choice after cleanup (raw_mse may change).
+        // consider_champion is non-const; re-pick via select after cleanup.
         update_discovery_metrics(config_.generations, start_time);
         run_wall_time_sec_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
         trace_event("run.end", -1);
     }
     
     IndividualGraph get_best() const {
-        return best_overall_;
+        return select_export_champion();
     }
+
+    void set_eval_num_threads(int n) { config_.eval_num_threads = std::max(0, n); }
+    void set_arithmetic_temperature_config(double t) { config_.arithmetic_temperature = t; }
+    int max_seed_capacity_public() const { return max_seed_capacity(); }
+
 
     int get_first_exact_generation() const { return first_exact_generation_; }
     double get_first_exact_time_sec() const { return first_exact_time_sec_; }
@@ -661,17 +682,25 @@ public:
         // Initialize all islands. This includes constant refinement and can be
         // expensive, so run islands concurrently and keep inner OpenMP regions
         // small to avoid oversubscription.
+        // E7: do NOT call omp_set_num_threads inside parallel regions (process-wide
+        // race). Budget inner eval via config.eval_num_threads + num_threads clause.
         int requested_threads = std::max(1, omp_get_max_threads());
-        int previous_nested = omp_get_nested();
         int outer_threads = std::min(config_.num_islands, requested_threads);
         int inner_threads = std::max(1, requested_threads / std::max(1, outer_threads));
         last_island_outer_threads_ = outer_threads;
         last_island_inner_threads_ = inner_threads;
-        omp_set_nested(1);
+        for (auto& island : islands) {
+            island.set_eval_num_threads(inner_threads);
+            island.set_arithmetic_temperature_config(config_.arithmetic_temperature);
+        }
+#if defined(_OPENMP)
+        // Prefer active levels over deprecated omp_set_nested when available.
+        int previous_max_active_levels = omp_get_max_active_levels();
+        omp_set_max_active_levels(2);
+#endif
         std::atomic<bool> init_timed_out(false);
         #pragma omp parallel for schedule(dynamic) num_threads(outer_threads)
         for (int i = 0; i < static_cast<int>(islands.size()); ++i) {
-            omp_set_num_threads(inner_threads);
             auto& island = islands[i];
             island.initialize_population();
             for (auto& ind : island.population_) {
@@ -685,7 +714,6 @@ public:
                 island.evaluate_population();
             }
         }
-        omp_set_num_threads(requested_threads);
 
         // Run generations with periodic migration
         for (int gen = 0; gen < config_.generations; ++gen) {
@@ -694,13 +722,11 @@ public:
             }
 
             // Evolve islands independently in parallel. Each island uses a
-            // bounded inner OpenMP team for population evaluation.
+            // bounded inner OpenMP team for population evaluation (eval_num_threads).
             #pragma omp parallel for schedule(dynamic) num_threads(outer_threads)
             for (int i = 0; i < static_cast<int>(islands.size()); ++i) {
-                omp_set_num_threads(inner_threads);
                 islands[i].evolve_one_generation(gen);
             }
-            omp_set_num_threads(requested_threads);
 
             // Migration: ring topology (island i → island i+1)
             if (gen > 0 && gen % config_.migration_interval == 0) {
@@ -709,16 +735,16 @@ public:
                     auto& src = islands[i].population_;
                     auto& dst = islands[next].population_;
 
-                    // Sort source by fitness to get top elites
+                    // Sort source by fitness (raw_mse tie-break) to get top elites
                     std::sort(src.begin(), src.end(),
                               [](const IndividualGraph& a, const IndividualGraph& b) {
-                                  return a.fitness < b.fitness;
+                                  return is_better_champion(a, b);
                               });
 
                     // Replace worst in destination with source elites
                     std::sort(dst.begin(), dst.end(),
                               [](const IndividualGraph& a, const IndividualGraph& b) {
-                                  return a.fitness < b.fitness;
+                                  return is_better_champion(a, b);
                               });
 
                     int n_migrate = std::min(config_.migration_size, (int)src.size() / 2);
@@ -735,22 +761,20 @@ public:
                 if (early_stop_metric(best) < config_.early_stop_mse && best.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
                     should_stop = true;
                 }
-                if (best.fitness < best_overall_.fitness) {
-                    best_overall_ = best;
-                }
+                consider_champion(best);
             }
             update_discovery_metrics(gen, start_time);
 
             if (config_.use_early_stop && should_stop) break;
         }
-        omp_set_nested(previous_nested);
+#if defined(_OPENMP)
+        omp_set_max_active_levels(previous_max_active_levels);
+#endif
 
         // Collect the best overall across all islands and run cleanup
         for (auto& island : islands) {
             auto best = island.get_best();
-            if (best.fitness < best_overall_.fitness) {
-                best_overall_ = best;
-            }
+            consider_champion(best);
         }
 
         // Merge all island populations for Pareto front (if NSGA-II)
@@ -762,6 +786,9 @@ public:
         }
 
         cleanup_graph(best_overall_);
+        if (!best_raw_overall_.nodes.empty()) {
+            cleanup_graph(best_raw_overall_);
+        }
         update_discovery_metrics(config_.generations, start_time);
         run_wall_time_sec_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
     }
@@ -778,6 +805,7 @@ private:
     
     std::vector<IndividualGraph> population_;
     IndividualGraph best_overall_;
+    IndividualGraph best_raw_overall_; // dual archive by raw_mse (E5)
     SubtreeCache gen_cache_; // Per-generation subtree cache
     std::vector<double> op_cdf_; // CDF for prior-weighted op sampling
     std::vector<double> binary_op_cdf_; // CDF for prior-weighted binary-op sampling
@@ -990,12 +1018,10 @@ private:
         if (population_.empty()) return 0;
         std::uniform_int_distribution<int> dist(0, static_cast<int>(population_.size()) - 1);
         int best_idx = dist(rng_);
-        double best_fitness = population_[best_idx].fitness;
         for (int i = 1; i < k; ++i) {
             int idx = dist(rng_);
-            if (population_[idx].fitness < best_fitness) {
+            if (is_better_champion(population_[idx], population_[best_idx])) {
                 best_idx = idx;
-                best_fitness = population_[idx].fitness;
             }
         }
         return best_idx;
@@ -1335,15 +1361,91 @@ private:
         return ind;
     }
 
+    // E3: seed capacity — allow up to seed_fraction of pop (default 50%),
+    // and on tiny island pops keep almost all slots for seeds while leaving
+    // at least one random individual when pop > 1.
+    int max_seed_capacity() const {
+        const int pop = std::max(1, config_.pop_size);
+        const int n_seeds = static_cast<int>(seed_graphs_.size());
+        if (n_seeds <= 0) return 0;
+        double frac = config_.seed_fraction;
+        if (!(frac > 0.0) || !std::isfinite(frac)) frac = 0.5;
+        frac = std::clamp(frac, 0.1, 0.9);
+        int by_frac = std::max(1, static_cast<int>(std::ceil(frac * static_cast<double>(pop))));
+        int cap;
+        if (pop <= 12) {
+            // Small island/pop: avoid historical pop/4 starvation (e.g. 12→3).
+            cap = std::max(by_frac, pop - 1);
+        } else {
+            cap = by_frac;
+        }
+        cap = std::min(cap, pop);
+        return std::min(cap, n_seeds);
+    }
+
+    // E5/E7(tracker): champion compare — lower penalized fitness wins; on near-ties
+    // prefer better unweighted raw_mse (export/protocol accuracy).
+    static bool is_better_champion(const IndividualGraph& cand, const IndividualGraph& best) {
+        constexpr double kFitEps = 1e-12;
+        if (!std::isfinite(cand.fitness)) return false;
+        if (!std::isfinite(best.fitness)) return true;
+        if (cand.fitness < best.fitness - kFitEps) return true;
+        if (cand.fitness > best.fitness + kFitEps) return false;
+        // Fitness tie (or numerically equal): prefer raw_mse, then fewer nodes.
+        if (std::isfinite(cand.raw_mse) && std::isfinite(best.raw_mse)) {
+            if (cand.raw_mse < best.raw_mse - kFitEps) return true;
+            if (cand.raw_mse > best.raw_mse + kFitEps) return false;
+        }
+        return cand.nodes.size() < best.nodes.size();
+    }
+
+    void consider_champion(const IndividualGraph& cand) {
+        if (cand.nodes.empty()) return;
+        if (best_overall_.nodes.empty() || is_better_champion(cand, best_overall_)) {
+            best_overall_ = cand;
+        }
+        // Dual archive: best plain MSE regardless of complexity penalty (export aid).
+        if (best_raw_overall_.nodes.empty()
+            || (std::isfinite(cand.raw_mse)
+                && (!std::isfinite(best_raw_overall_.raw_mse)
+                    || cand.raw_mse < best_raw_overall_.raw_mse))) {
+            best_raw_overall_ = cand;
+        }
+    }
+
+    // Prefer fitness champion; if dual raw archive is much better on raw_mse and
+    // not much worse on fitness, export the raw champion (protocol accuracy).
+    IndividualGraph select_export_champion() const {
+        if (best_raw_overall_.nodes.empty()) return best_overall_;
+        if (best_overall_.nodes.empty()) return best_raw_overall_;
+        constexpr double kFitSlack = 0.05; // 5% fitness slack
+        const double fit_lim = best_overall_.fitness * (1.0 + kFitSlack) + 1e-12;
+        if (std::isfinite(best_raw_overall_.fitness)
+            && best_raw_overall_.fitness <= fit_lim
+            && std::isfinite(best_raw_overall_.raw_mse)
+            && std::isfinite(best_overall_.raw_mse)
+            && best_raw_overall_.raw_mse < best_overall_.raw_mse - 1e-15) {
+            return best_raw_overall_;
+        }
+        return best_overall_;
+    }
+
     void initialize_population() {
         population_.resize(config_.pop_size);
         int n_inputs = static_cast<int>(X_.size());
         
         int seeded = 0;
-        // Seed first N individuals from proposer skeletons
-        int max_seed = std::min((int)seed_graphs_.size(), config_.pop_size / 4);
+        // E3: seed first max_seed graphs (capacity raised vs historical pop/4).
+        int max_seed = max_seed_capacity();
+        // Light shuffle of seed order under RNG so unused tails rotate across runs
+        // when seeds > capacity (single-pop). Islands already shard seed lists.
+        std::vector<int> seed_order(static_cast<size_t>(seed_graphs_.size()));
+        for (int i = 0; i < static_cast<int>(seed_graphs_.size()); ++i) seed_order[static_cast<size_t>(i)] = i;
+        if (seed_order.size() > 1) {
+            std::shuffle(seed_order.begin(), seed_order.end(), rng_);
+        }
         for (int i = 0; i < max_seed; ++i) {
-            population_[i] = seed_graphs_[i];
+            population_[i] = seed_graphs_[static_cast<size_t>(seed_order[static_cast<size_t>(i)])];
             seeded++;
         }
         
@@ -1359,7 +1461,7 @@ private:
         
         executor.evaluate_population(population_, [&](IndividualGraph& ind, SubtreeCache& tc) {
             evaluate_fitness_with_penalty(ind, X_, y_, samples, &tc);
-        });
+        }, config_.eval_num_threads);
 
         // Pull the global merged cache out of executor
         gen_cache_ = executor.get_gen_cache();
@@ -1418,6 +1520,8 @@ private:
     // weighted_mse: search objective (weights and/or robust loss from residual_mse).
     // fitness: search objective * complexity penalty.
     double evaluate_fitness_with_penalty(IndividualGraph& graph, const std::vector<Eigen::ArrayXd>& X, const Eigen::ArrayXd& y, int num_samples, SubtreeCache* tc = nullptr) {
+        // Keep worker threads aligned with this engine's soft-arith temperature (E10).
+        set_arithmetic_temperature(config_.arithmetic_temperature);
         Eigen::ArrayXd pred;
         if (tc != nullptr) {
             std::vector<Eigen::ArrayXd> cache_out;
@@ -3530,9 +3634,7 @@ private:
 
             population_ = nsga2_select(combined, config_.pop_size);
             for (const auto& ind : population_) {
-                if (ind.fitness < best_overall_.fitness) {
-                    best_overall_ = ind;
-                }
+                consider_champion(ind);
             }
             if (gen % 10 == 9) {
                 for (int i = 0; i < std::min(5, config_.elite_size) && i < static_cast<int>(population_.size()); ++i) {
@@ -3547,9 +3649,7 @@ private:
                       return a.fitness < b.fitness;
                   });
 
-        if (population_[0].fitness < best_overall_.fitness) {
-            best_overall_ = population_[0];
-        }
+        if (!population_.empty()) { consider_champion(population_[0]); }
 
         // Create next generation (same logic as run() loop body)
         std::vector<IndividualGraph> next_gen;

@@ -18,6 +18,13 @@
 
 namespace sr {
 
+// E4 note: soft Arithmetic is a continuous relaxation during search (kitchen-sink
+// outer linear combo of node outputs + soft op blend). Higher temperature sharpens
+// toward discrete +/×/÷/−. Final cleanup snaps near-discrete gates (see evolution).
+//
+// E10: temperature is process-global for OpenMP worker visibility (thread_local
+// would desync workers from the controlling engine). Use ScopedArithmeticTemperature
+// RAII at API boundaries, and re-apply engine config temperature on fitness eval.
 inline double& arithmetic_temperature_ref() {
     static double t = 5.0;
     return t;
@@ -31,6 +38,17 @@ inline void set_arithmetic_temperature(double t) {
 inline double get_arithmetic_temperature() {
     return arithmetic_temperature_ref();
 }
+
+// RAII restore for concurrent / nested API entry points (score + run_evolution).
+struct ScopedArithmeticTemperature {
+    double prev_;
+    explicit ScopedArithmeticTemperature(double t) : prev_(get_arithmetic_temperature()) {
+        set_arithmetic_temperature(t);
+    }
+    ~ScopedArithmeticTemperature() { set_arithmetic_temperature(prev_); }
+    ScopedArithmeticTemperature(const ScopedArithmeticTemperature&) = delete;
+    ScopedArithmeticTemperature& operator=(const ScopedArithmeticTemperature&) = delete;
+};
 
 inline double stabilized_tau(double tau) {
     constexpr double kMinAbsTau = 1e-3;

@@ -228,8 +228,7 @@ py::list score_formula_candidates_cpp(
     {
         py::gil_scoped_release release;
         // Near-discrete soft arithmetic for ranking (set once outside OMP; E10).
-        const double prev_temp = sr::get_arithmetic_temperature();
-        sr::set_arithmetic_temperature(100.0);
+        sr::ScopedArithmeticTemperature _scoped_temp(100.0);
         #pragma omp parallel for schedule(dynamic)
         for (int idx = 0; idx < static_cast<int>(formulas.size()); ++idx) {
             CandidateScore score;
@@ -343,7 +342,6 @@ py::list score_formula_candidates_cpp(
             }
             scores[idx] = score;
         }
-        sr::set_arithmetic_temperature(prev_temp);
     }
 
     if (num_threads > 0) omp_set_num_threads(previous_omp_threads);
@@ -634,6 +632,8 @@ py::dict run_evolution_cpp(
     config.acceptable_mse = acceptable_mse;
     config.acceptable_complexity = acceptable_complexity;
     config.early_stop_max_nodes = early_stop_max_nodes;
+    config.arithmetic_temperature = arithmetic_temperature;
+    // Default seed fraction 0.5 (E3); leave eval_num_threads=0 for auto.
 
     // Phase 4: robust search loss (default mse preserves legacy behaviour).
     {
@@ -651,7 +651,8 @@ py::dict run_evolution_cpp(
     }
 
     // Sync evaluator temperature so arithmetic blend sharpness is tunable from Python.
-    sr::set_arithmetic_temperature(arithmetic_temperature);
+    // RAII restores prior process temperature after this call (E10).
+    sr::ScopedArithmeticTemperature _scoped_run_temp(arithmetic_temperature);
 
     int previous_omp_threads = omp_get_max_threads();
     if (num_threads > 0) {

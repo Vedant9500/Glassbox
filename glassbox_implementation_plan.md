@@ -31,6 +31,10 @@
 | **N6 / S1-12 / O8** | Local unweighted `_display_formula_mse`; no robust primary fallback |
 | **S1-6** | Search vs display metric contract documented; display-first scores |
 | **S5-9 (partial)** | Weighted iterative elastic net (`sample_weight` / sqrt-w) |
+| **E3 / O11** | Seed capacity `seed_fraction=0.5` (tiny-pop almost-all) |
+| **E5 / E7** | raw_mse champion tie-break + dual archive; safer island OMP |
+| **E10** | ScopedArithmeticTemperature; config temp on fitness eval |
+| **E4 (partial)** | Soft-arith kitchen-sink documented |
 | **O12, O13** | Abs + printer backlog items |
 
 ### Still open (this plan)
@@ -96,15 +100,17 @@ Phase 7  API polish & cleanup (P2)
 
 ## Phase 2 — Evolution search reliability
 
+**Status:** done (2026-07-20) — E3 seed capacity; E5/E7 champion raw_mse + OMP nesting; E10 scoped temp; E4 documented (snap already in cleanup).
+
 **Goal:** Seeds and selection reflect diversity and raw accuracy under islands.
 
-| # | ID | Work |
-|---|-----|------|
-| 2.1 | **E3** / **O11** | Raise seed capacity under islands (not `pop/4` global starvation) |
-| 2.2 | **E5** | Selection/tie-break prefer better **raw_mse** when fitness equal / for export |
-| 2.3 | **E7** | Review OMP nested / `omp_set_num_threads` inside parallel islands (E7) |
-| 2.4 | **E4** | Kitchen-sink + soft arithmetic bias — document; optional discrete commit temperature schedule before export (ties S3) |
-| 2.5 | **E10** | `arithmetic_temperature` process-global race — thread/local or scoped restore (scorer already sets high temp carefully) |
+| # | ID | Work | Status |
+|---|-----|------|--------|
+| 2.1 | **E3** / **O11** | Raise seed capacity under islands (not `pop/4` global starvation) | **done** — seed_fraction=0.5; tiny-pop almost-all |
+| 2.2 | **E5** | Selection/tie-break prefer better **raw_mse** when fitness equal / for export | **done** — dual archive + export slack |
+| 2.3 | **E7** | Review OMP nested / `omp_set_num_threads` inside parallel islands (E7) | **done** — eval_num_threads; max_active_levels |
+| 2.4 | **E4** | Kitchen-sink + soft arithmetic bias — document; optional discrete commit temperature schedule before export (ties S3) | **partial** — documented; cleanup snap remains |
+| 2.5 | **E10** | `arithmetic_temperature` process-global race — thread/local or scoped restore (scorer already sets high temp carefully) | **done** — ScopedArithmeticTemperature + per-eval reapply |
 
 **Defer heavy:** **E6** full pop re-eval (Phase 5 performance).
 
@@ -256,10 +262,10 @@ S3 audit ──► deep scoring/guard redesign (S1-5/6)
 - [x] S5-9 refine.h weights (elastic net; freq/power still open)
 
 ### Phase 2
-- [ ] E3 seed capacity
-- [ ] E5 raw_mse selection
-- [ ] E7 OMP nesting
-- [ ] E4/E10 soft arith / global temp
+- [x] E3 seed capacity
+- [x] E5 raw_mse selection
+- [x] E7 OMP nesting
+- [x] E4/E10 soft arith / global temp
 
 ### Phase 3
 - [ ] S5-5 hash quantize

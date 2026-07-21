@@ -364,14 +364,14 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 |----|----------|------|---------|----------|--------|
 | E1 | **P0** | bug / waste | **Island model with fixed `random_seed` clones islands.** `run_islands` builds each `EvolutionEngine` with the **same** `config.random_seed` and full `seed_graphs_` — no per-island seed offset. With empty `multi_*_priors` (default sklearn path, `num_islands=8`), islands run identical trajectories until migration, and identical migrants keep them clones. Fixed-seed multi-island is deterministic but **does not diversify**; pays ~N× eval cost for ~1× search. Verified: multi-island det with seed=99; no per-island seed mutation in ctor loop ~619–624. | `run_islands` 579–624; wrapper default `num_islands=8` + `random_seed=run_seed` | fixed |
 | E2 | **P0** | correctness (S2 N5) | **Early-stop / “exact” metrics use robust `objective_mse`, not raw MSE.** `objective_mse` returns `weighted_mse` (Huber/trimmed/student_t/weights). Early-stop, `is_exact`, `is_acceptable` all gate on that + node count. Under auto-Huber (incl. N2 false positives), search can stop as “exact” while `raw_mse` remains large. Python reads `best_mse=raw_mse` (good for report) but evolution already halted/mutated under robust objective. Complexity penalty also relaxes when `mse < 1e-6` on **search** mse (~1437–1439). | early_stop ~412,700; `update_discovery_metrics` 961–965; `objective_mse` 785–793; core.cpp best_mse=raw 676–678 | fixed |
-| E3 | **P1** | seed capacity | **Seeds capped at `pop_size/4` and only first N graphs.** `max_seed = min(seed_graphs.size(), pop_size/4)` (~1296). Islands use **island** pop (`pop/num_islands`), so with 8 islands and pop=100, island_size=12 → **only 3 seeds** per island despite up to 24 built in Python. Remaining seeds discarded; no rotation/shuffle of seed list. Oversized seeds skipped in core.cpp (OK, tested). | `initialize_population` 1290–1306; island_size 582–583 | open |
-| E4 | **P1** | representation bias | **Kitchen-sink additive basis.** Outer linear combo of **all** node outputs encourages many weak terms; active_complexity only counts \|w\|>1e-4. Soft Arithmetic Binary is continuous mixture (eval.h temperature), so structure is not discrete during search — favors flexible fits over sparse algebraic form. Max nodes hard-capped at 24 (mutate/macro/crossover) — good anti-bloat, but soft blend + multi-term sum still bloats **formula strings** after simplify. | `eval.h` 260–266; `active_complexity` ast.h 140–176; max_nodes 52, macro 1556 | open |
-| E5 | **P1** | concurrency | **`omp_set_num_threads` inside parallel island regions.** Outer `#pragma omp parallel for` then each thread calls `omp_set_num_threads(inner_threads)` (~646–647, 665–666). Global OpenMP max-threads is process-wide → race / oversubscription risk with nested OMP + concurrent Python multi_start. `omp_set_nested(1)` enabled. Pop eval uses thread-local SubtreeCache merge (sound). | `run_islands` 629–669; `execution.h` 32–54 | open |
+| E3 | **P1** | seed capacity | **Seeds capped at `pop_size/4` and only first N graphs.** `max_seed = min(seed_graphs.size(), pop_size/4)` (~1296). Islands use **island** pop (`pop/num_islands`), so with 8 islands and pop=100, island_size=12 → **only 3 seeds** per island despite up to 24 built in Python. Remaining seeds discarded; no rotation/shuffle of seed list. Oversized seeds skipped in core.cpp (OK, tested). | `initialize_population` 1290–1306; island_size 582–583 | fixed |
+| E4 | **P1** | representation bias | **Kitchen-sink additive basis.** Outer linear combo of **all** node outputs encourages many weak terms; active_complexity only counts \|w\|>1e-4. Soft Arithmetic Binary is continuous mixture (eval.h temperature), so structure is not discrete during search — favors flexible fits over sparse algebraic form. Max nodes hard-capped at 24 (mutate/macro/crossover) — good anti-bloat, but soft blend + multi-term sum still bloats **formula strings** after simplify. | `eval.h` 260–266; `active_complexity` ast.h 140–176; max_nodes 52, macro 1556 | partial |
+| E5 | **P1** | concurrency | **`omp_set_num_threads` inside parallel island regions.** Outer `#pragma omp parallel for` then each thread calls `omp_set_num_threads(inner_threads)` (~646–647, 665–666). Global OpenMP max-threads is process-wide → race / oversubscription risk with nested OMP + concurrent Python multi_start. `omp_set_nested(1)` enabled. Pop eval uses thread-local SubtreeCache merge (sound). | `run_islands` 629–669; `execution.h` 32–54 | fixed |
 | E6 | **P1** | inefficiency | **Full re-evaluation of population every generation** including elites already scored; children evaluated at birth then again next gen. `refine_constants` re-eval + IRLS; Adam/LM finite-diff costs many graph evals per elite (every 10 gens × top 5). Island clones (E1) multiply all of this × num_islands. | `run` 323, 458–466; `refine_inner_params_adam` 2118–2230 | open |
-| E7 | **P1** | selection / noise | **`best_overall_` tracked by penalized `fitness`, not raw_mse.** Under weights/Huber, a simpler high-raw-MSE model can win fitness vs a better unweighted structure (or vice versa depending on penalty). Post-run `cleanup_graph` re-optimizes; still no dual “best raw” archive. | track best ~378–380, 703–704 | open |
+| E7 | **P1** | selection / noise | **`best_overall_` tracked by penalized `fitness`, not raw_mse.** Under weights/Huber, a simpler high-raw-MSE model can win fitness vs a better unweighted structure (or vice versa depending on penalty). Post-run `cleanup_graph` re-optimizes; still no dual “best raw” archive. | track best ~378–380, 703–704 | fixed |
 | E8 | **P2** | mutation / bloat under noise | Macro wrap/multiply/divide add nodes (15% offspring + explorers); max_nodes=24 hard stop. Under noisy labels, search_obj can improve by adding weak basis nodes; parsimony is multiplicative 1.2% per active complexity unit — may be weak when robust loss compresses outliers. Nest macro can create f(g(x)) compositions. | macro_mutate 1550–1705; complexity_penalty 1430–1446 | open |
 | E9 | **P2** | API / config | **`elite_size` not exposed in `run_evolution` bindings** — always config default 10; islands set `elite_size = max(2, 10/num_islands)`. Parent sampling for macro/crossover is **elite-only** (`parent_dist(0, elite_size-1)`), tournament only for mutation/explorers — strong elitism, less diversity. | core.cpp pop_size only; run 432–436 | open |
-| E10 | **P2** | global state | **`arithmetic_temperature` is process-global** (`eval.h` static). Concurrent `run_evolution` calls with different temperatures race. Islands share same temperature (OK). | `set_arithmetic_temperature` eval.h 21–28; core.cpp sync | open |
+| E10 | **P2** | global state | **`arithmetic_temperature` is process-global** (`eval.h` static). Concurrent `run_evolution` calls with different temperatures race. Islands share same temperature (OK). | `set_arithmetic_temperature` eval.h 21–28; core.cpp sync | fixed |
 
 ### What is solid (checked OK)
 
@@ -651,7 +651,7 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 | O8 | S2 | Local unweighted display MSE (no `scripts` import) | Hard display/search separation | done |
 | O9 | S4 | Offset island RNG seeds; shard seed_graphs across islands | True island diversity; stop N× clone work | done |
 | O10 | S4 | Early-stop / exact on raw_mse (search still uses robust obj) | Correct Exact under noise/Huber | done |
-| O11 | S4 | Raise seed cap; skip re-eval of clean elites | Better seed use + wall-time | open |
+| O11 | S4 | Raise seed cap; skip re-eval of clean elites | Better seed use + wall-time | done |
 
 ---
 
@@ -677,6 +677,7 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 | 2026-07-19 | S5 | **S5-3/S5-4 fixed**: variable powers via const-fold + exp/log rewrite; printer matches soft-div/protected-div/aggregation; multi-feature print auto-detect |
 | 2026-07-20 | Phase0 | **P0 fixes:** S1-1 NotFittedError on formula_; S1-2 rapid-hit argmin; S1-3 sticky fit clear; N2 structure-aware diffuse ratio; E1 island seed offsets; E2/N5 early-stop on raw_mse; tests/test_phase0_correctness.py |
 | 2026-07-20 | Phase1 | **N3/N4/N6/S1-6/S1-12/S5-9(partial) fixed**: drop retained_all soft force + multi-linear residual probes; auto guards for diffuse Huber; local unweighted display MSE (no robust fallback); search vs display metric contract docs; weighted iterative elastic net via sqrt(w); `tests/test_phase1_noise_metrics.py` |
+| 2026-07-20 | Phase2 | **E3/E5(OMP)/E7(raw champion)/E10/E4(partial)**: seed capacity seed_fraction=0.5 (tiny-pop almost-all); raw_mse tie-break + dual best_raw archive/export; no omp_set_num_threads inside island parallel (eval_num_threads + max_active_levels); ScopedArithmeticTemperature + per-eval config temp; kitchen-sink/soft-arith documented; `tests/test_phase2_evolution_reliability.py` |
 
 ---
 
@@ -702,9 +703,9 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 **S1 + S2 + S4 + S5 done.** Recommended next: **S6** (bindings/seeds), then **S3** guards/scoring, then S7+.
 
 **Priority fix queue (cross-cutting):**
-1. **Phase 1 done** (N3/N4/N6/S1-6/S1-12; S5-9 elastic-net weighted). Next: Phase 2 evolution reliability or audit S6
+1. **Phase 1–2 done**. Next: Phase 3 graph/eval harden or audit S6
 2. **S5-5 / S5-6** hash quantize + weight threshold display gaps
-3. **E3** seed capacity under islands
+3. **E3** seed capacity under islands (**fixed** Phase 2)
 4. **N6/O8** local display MSE
 5. **S1-4** n_features_in_ under blackbox
-6. Phase 1 complete — continue Phase 2 or audit S6
+6. Phase 2 complete — continue Phase 3 or audit S6
