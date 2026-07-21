@@ -414,8 +414,9 @@ def test_blackbox_search_plan_expands_uncertain_breadth_and_interaction_depth():
     assert plan["acceptable_complexity"] > 15
     assert plan["early_stop_max_nodes"] > 50
     assert plan["timeout_multiplier"] <= 1.45
-    assert plan["population_multiplier"] <= 2.0
-    assert plan["generation_multiplier"] <= 2.25
+    # Selection-uncertain blackbox relaxes hard caps (up to 2.25 / 2.75).
+    assert plan["population_multiplier"] <= 2.25
+    assert plan["generation_multiplier"] <= 2.75
 
 
 def test_blackbox_search_plan_prefers_screening_when_candidates_are_strong():
@@ -451,8 +452,9 @@ def test_blackbox_search_plan_prefers_screening_when_candidates_are_strong():
     assert plan["screening_budget"] >= plan["seed_budget"]
     assert plan["basis_max_terms"] >= 3
     assert plan["focus"] in {"screening", "screen_accept", "balanced"}
-    assert plan["population_multiplier"] <= 1.85
-    assert plan["generation_multiplier"] <= 2.0
+    # With uncertain feature selection, plan may use relaxed blackbox caps.
+    assert plan["population_multiplier"] <= 2.25
+    assert plan["generation_multiplier"] <= 2.75
     assert plan["candidate_acceptance_r2"] <= 0.985
     assert plan["candidate_shrink_r2"] < plan["candidate_acceptance_r2"]
 
@@ -529,6 +531,12 @@ def test_multivariate_blackbox_cpp_seeds_use_reduced_indices(monkeypatch):
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
     monkeypatch.setattr(sw, "_core", _FakeCore)
     monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+    # Keep evolution path live so seed_graphs / search-plan kwargs are exercised.
+    monkeypatch.setattr(
+        sw.GlassboxRegressor,
+        "_fit_blackbox_engineered_basis_model",
+        lambda self, *args, **kwargs: None,
+    )
 
     rng = np.random.RandomState(8)
     X = rng.randn(80, 5)
@@ -1027,6 +1035,11 @@ def test_blackbox_cpp_receives_binary_priors(monkeypatch):
     monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
     monkeypatch.setattr(sw.GlassboxRegressor, "_refine_candidate_formulas", lambda self, *args, **kwargs: [])
     monkeypatch.setattr(sw.GlassboxRegressor, "_fit_blackbox_basis_model", lambda self, *args, **kwargs: None)
+    monkeypatch.setattr(
+        sw.GlassboxRegressor,
+        "_fit_blackbox_engineered_basis_model",
+        lambda self, *args, **kwargs: None,
+    )
 
     rng = np.random.RandomState(89)
     X = rng.randn(140, 3)
@@ -1427,12 +1440,12 @@ def test_cleanup_guard_rejects_display_mse_regression(monkeypatch):
     monkeypatch.setattr(
         est,
         "_formula_mse",
-        lambda formula, X_in, y_in: {"display_good": 1e-4, "display_bad": 1e-5}.get(formula, float("inf")),
+        lambda formula, X_in, y_in, **kwargs: {"display_good": 1e-4, "display_bad": 1e-5}.get(formula, float("inf")),
     )
     monkeypatch.setattr(
         est,
         "_display_formula_mse",
-        lambda formula, X_in, y_in: {"display_good": 1e-4, "display_bad": 1e-1}.get(formula, float("inf")),
+        lambda formula, X_in, y_in, **kwargs: {"display_good": 1e-4, "display_bad": 1e-1}.get(formula, float("inf")),
     )
 
     selected = est._cleanup_formula_with_fidelity_guard("display_good", X, y)
@@ -1451,12 +1464,12 @@ def test_final_formula_selection_prefers_display_score(monkeypatch):
     monkeypatch.setattr(
         est,
         "_formula_mse",
-        lambda formula, X_in, y_in: {"incumbent": 1e-4, "challenger": 1e-6}.get(formula, float("inf")),
+        lambda formula, X_in, y_in, **kwargs: {"incumbent": 1e-4, "challenger": 1e-6}.get(formula, float("inf")),
     )
     monkeypatch.setattr(
         est,
         "_display_formula_mse",
-        lambda formula, X_in, y_in: {"incumbent": 1e-4, "challenger": 1e-1}.get(formula, float("inf")),
+        lambda formula, X_in, y_in, **kwargs: {"incumbent": 1e-4, "challenger": 1e-1}.get(formula, float("inf")),
     )
 
     formula, mse, source = est._select_final_formula("incumbent", 1e-4, "challenger", 1e-6, X, y)

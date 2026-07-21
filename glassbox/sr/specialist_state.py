@@ -1166,7 +1166,9 @@ def propose_specialist_compositions(
                 complexity_limit = max(30, 4.0 * simpler_comp)
             elif operator in {"damped_product", "affine"}:
                 complexity_limit = max(20, 3.0 * simpler_comp)
-            if total_comp > complexity_limit:
+            # Pure add/mul of already-screened specialists must remain expressible;
+            # later acceptance still filters on val R2 / risk / gap.
+            if operator not in {"add", "mul"} and total_comp > complexity_limit:
                 continue
 
             candidate_templates.append((operator, formula, mse_val, total_comp))

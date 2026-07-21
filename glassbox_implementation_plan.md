@@ -137,6 +137,8 @@ Phase 7  API polish & cleanup (P2)
 
 ## Phase 4 — Orchestration quality & sklearn contract (S1 P1)
 
+**Status:** done (2026-07-21)
+
 **Goal:** Predict/metadata honest; selection less optimistic; safer parallelism.
 
 | # | ID | Work |
@@ -278,11 +280,11 @@ S3 audit ──► deep scoring/guard redesign (S1-5/6)
 - [x] S5-13/15; S5-14/16 still open
 
 ### Phase 4
-- [ ] S1-4 n_features_in_
-- [ ] S1-5 true holdouts
-- [ ] S1-8 thread-safe cache / RNG
-- [ ] S1-10 CV guard honesty
-- [ ] S1-13 residual flag naming
+- [x] S1-4 n_features_in_
+- [x] S1-5 true holdouts
+- [x] S1-8 thread-safe cache / RNG
+- [x] S1-10 CV guard honesty
+- [x] S1-13 residual flag naming
 
 ### Phase 5
 - [ ] S1-9 / O1 defaults
