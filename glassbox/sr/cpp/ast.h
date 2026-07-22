@@ -81,6 +81,9 @@ struct IndividualGraph {
     double fitness = 1e9; // Penalized fitness (uses weighted MSE when weights set)
     double raw_mse = 1e9; // Unweighted mathematical MSE (diagnostics / back-compat)
     double weighted_mse = 1e9; // Weighted MSE when y_weights provided; else == raw_mse
+    // E6: when true, evaluate_population may skip re-scoring this individual
+    // (elites / children already scored at birth remain valid until mutated).
+    bool fitness_valid = false;
 
     // NSGA-II fields (P5)
     int pareto_rank = 0;           // Non-domination rank (0 = Pareto front)

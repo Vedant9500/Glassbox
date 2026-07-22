@@ -1459,7 +1459,10 @@ private:
         int samples = static_cast<int>(y_.size());
         ParallelExecutionEngine executor(X_, y_);
         
+        // E6: skip re-eval of individuals already scored (elites carried over,
+        // children scored at birth). Mutate/crossover clear fitness_valid.
         executor.evaluate_population(population_, [&](IndividualGraph& ind, SubtreeCache& tc) {
+            if (ind.fitness_valid) return;
             evaluate_fitness_with_penalty(ind, X_, y_, samples, &tc);
         }, config_.eval_num_threads);
 
@@ -1620,11 +1623,13 @@ private:
             graph.fitness += config_.dim_penalty_weight * dimensional_penalty(graph);
         }
 
+        graph.fitness_valid = true;  // E6
         return graph.fitness;
     }
     
     IndividualGraph mutate_lamarckian(IndividualGraph parent, double structural_rate) {
         IndividualGraph child = parent;
+        child.fitness_valid = false;  // E6: structure/params may change
         
         std::uniform_real_distribution<double> runif(0.0, 1.0);
         std::normal_distribution<double> rnorm(0.0, 0.5); 
@@ -1702,6 +1707,7 @@ private:
     //   - Nest:     f(x), g(x) → f(g(x))
     IndividualGraph macro_mutate(const IndividualGraph& parent) {
         IndividualGraph child = parent;
+        child.fitness_valid = false;  // E6
         std::uniform_real_distribution<double> runif(0.0, 1.0);
         
         int n = static_cast<int>(child.nodes.size());
@@ -1968,6 +1974,8 @@ private:
 
         child.fitness = 1e9; // Mark for re-evaluation
         child.raw_mse = 1e9;
+        child.weighted_mse = 1e9;
+        child.fitness_valid = false;  // E6
         last_crossover_valid_ = true;
         return child;
     }

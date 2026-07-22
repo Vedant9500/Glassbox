@@ -1023,7 +1023,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         max_power=6,
         timeout=120,
         evolution_skip_r2=0.999,
-        multi_start_runs=3,
+        multi_start_runs=1,  # S1-9/O1: default single start; escalate only if poor
+        multi_start_auto_escalate=True,
+        multi_start_escalate_max=3,
         adaptive_compute_budget=True,
         min_compute_budget=10,
         max_compute_budget=300,
@@ -1103,6 +1105,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.timeout = timeout
         self.evolution_skip_r2 = evolution_skip_r2
         self.multi_start_runs = multi_start_runs
+        self.multi_start_auto_escalate = multi_start_auto_escalate
+        self.multi_start_escalate_max = multi_start_escalate_max
         self.adaptive_compute_budget = adaptive_compute_budget
         self.min_compute_budget = min_compute_budget
         self.max_compute_budget = max_compute_budget
@@ -7622,16 +7626,32 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     self.loss_mode = "huber"
                     self._loss_mode_auto_switched_ = True
                     loss_switched = True
-                X_search, y_search, blackbox_state = prepare_blackbox_search(
-                    X,
-                    y,
-                    enabled=blackbox_enabled,
-                    max_features=int(self.blackbox_max_features),
-                    standardize=bool(self.blackbox_standardize),
-                    min_features_to_select=int(self.blackbox_min_features_to_select),
-                    interaction_search=bool(self.blackbox_interaction_search),
-                    sample_weight=self.sample_weight_,
+                # S1-7/O2: skip full second prepare when selection is stable under
+                # mild soft weights (no uncertain ranking / heavy low-weight mass).
+                # Evolution still receives sample_weight_; only feature re-ranking is skipped.
+                # Skip when blackbox ranking is off (1D / disabled) — second
+                # prepare is pure cleanup. When ranking is on, skip only if
+                # selection looks stable under mild soft weights.
+                skip_rerank = (not blackbox_enabled) or (
+                    not selection_uncertain
+                    and float(out_frac) < 0.08
+                    and float(low_weight_mass) < 0.08
+                    and not bool(getattr(blackbox_state, "feature_selection_uncertain", False))
                 )
+                if skip_rerank:
+                    blackbox_prep_reused = True
+                else:
+                    blackbox_prep_reused = False
+                    X_search, y_search, blackbox_state = prepare_blackbox_search(
+                        X,
+                        y,
+                        enabled=blackbox_enabled,
+                        max_features=int(self.blackbox_max_features),
+                        standardize=bool(self.blackbox_standardize),
+                        min_features_to_select=int(self.blackbox_min_features_to_select),
+                        interaction_search=bool(self.blackbox_interaction_search),
+                        sample_weight=self.sample_weight_,
+                    )
                 self._blackbox_noise_robust_applied_ = {
                     "active": True,
                     "mode": robust_mode,
@@ -7644,6 +7664,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     "outlier_fraction_target": float(out_frac),
                     "selection_uncertain": selection_uncertain,
                     "loss_mode_switched_to_huber": loss_switched,
+                    "skipped_blackbox_rerank": bool(blackbox_prep_reused),
                     "ess_ratio": (
                         float(_effective_sample_size(self.sample_weight_) / max(float(X.shape[0]), 1.0))
                         if self.sample_weight_ is not None
@@ -7978,13 +7999,31 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     if isinstance(self.blackbox_diagnostics_, dict):
                         self.blackbox_diagnostics_["fast_path_exact_match"] = self.fast_path_exact_match_diagnostics_
                     already_compact = bool(fp_details.get("compact_multivariate_basis", False))
+                    # S1-7/O3: skip second fast-path when first result is already
+                    # compact or high-confidence (exact/low uncertainty).
+                    fp_mse0 = float(fp_result.get("mse", float("inf")) or float("inf"))
+                    fp_uncertain = bool(
+                        isinstance(fp_uncertainty, dict)
+                        and fp_uncertainty.get("prediction_uncertain", False)
+                    )
+                    fp_high_confidence = (
+                        already_compact
+                        or (np.isfinite(fp_mse0) and fp_mse0 <= float(self.early_stop_mse) * 10.0)
+                        or (
+                            isinstance(fp_uncertainty, dict)
+                            and not fp_uncertain
+                            and float(fp_uncertainty.get("prediction_margin") or 0.0) >= 0.25
+                            and float(fp_uncertainty.get("prediction_entropy") or 1.0) <= 0.45
+                        )
+                    )
                     if (
                         blackbox_state.enabled
-                        and not already_compact
+                        and not fp_high_confidence
                         and not self._should_use_universal_fast_path(blackbox_state, fp_uncertainty)
                     ):
                         if isinstance(self.blackbox_diagnostics_, dict):
                             self.blackbox_diagnostics_["fast_path_auto_expand"] = False
+                            self.blackbox_diagnostics_["fast_path_second_pass"] = "ran"
                         fp_result = run_fast_path(
                             x_t, y_t,
                             classifier_path=classifier_path,
@@ -8008,6 +8047,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 self.blackbox_diagnostics_["fast_path_exact_match"] = self.fast_path_exact_match_diagnostics_
                     elif isinstance(self.blackbox_diagnostics_, dict) and blackbox_state.enabled:
                         self.blackbox_diagnostics_["fast_path_auto_expand"] = not already_compact
+                        self.blackbox_diagnostics_["fast_path_second_pass"] = (
+                            "skipped_high_confidence" if fp_high_confidence else "skipped_other"
+                        )
                     best_formula = fp_result['formula']
                     best_mse = fp_result.get('mse', float('inf'))
                     operator_hints = fp_result.get('operator_hints') or {}
@@ -8786,7 +8828,23 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 else:
                                     need_evolution = False
 
-                        n_runs = max(1, int(self.multi_start_runs))
+                        # S1-9/O1: default multi_start_runs=1; auto-escalate only when
+                        # quality remains poor after the first start (and budget remains).
+                        planned_runs = max(1, int(self.multi_start_runs))
+                        auto_escalate = bool(
+                            getattr(self, "multi_start_auto_escalate", True)
+                        ) and planned_runs == 1
+                        escalate_cap = max(
+                            1, int(getattr(self, "multi_start_escalate_max", 3) or 3)
+                        )
+                        max_runs = escalate_cap if auto_escalate else planned_runs
+                        multi_start_diag = {
+                            "planned_runs": planned_runs,
+                            "auto_escalate": bool(auto_escalate),
+                            "escalate_cap": int(escalate_cap),
+                            "runs_executed": 0,
+                            "escalated": False,
+                        }
                         best_cpp_result = None
 
                         # Combine operator priors from proposer to pass natively to C++
@@ -8811,9 +8869,37 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         except Exception:
                             build_seed_graphs_from_candidates_fn = None
 
-                        for run_idx in range(n_runs):
+                        # S1-9: shrink island count on easy/high-R2 problems.
+                        eff_islands = max(1, int(self.num_islands))
+                        try:
+                            if float(current_r2) >= 0.995 and int(term_count) <= 5:
+                                eff_islands = min(eff_islands, 2)
+                            elif float(current_r2) >= 0.98 and int(term_count) <= 8:
+                                eff_islands = min(eff_islands, 4)
+                        except Exception:
+                            pass
+                        multi_start_diag["effective_num_islands"] = int(eff_islands)
+
+                        for run_idx in range(max_runs):
                             if not need_evolution:
                                 break
+                            if run_idx > 0 and auto_escalate:
+                                y_var = max(float(np.var(y_arr)), 1e-12)
+                                best_so_far = min(
+                                    float(evo_mse) if np.isfinite(evo_mse) else float("inf"),
+                                    float(best_mse) if np.isfinite(best_mse) else float("inf"),
+                                )
+                                r2_so_far = (
+                                    1.0 - best_so_far / y_var
+                                    if np.isfinite(best_so_far)
+                                    else -1.0
+                                )
+                                if (
+                                    best_so_far <= float(self.early_stop_mse)
+                                    or r2_so_far >= float(self.evolution_skip_r2)
+                                ):
+                                    break
+                                multi_start_diag["escalated"] = True
                             blackbox_evolution_ran = bool(
                                 getattr(self, "blackbox_state_", None) is not None
                                 and self.blackbox_state_.enabled
@@ -8823,7 +8909,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 break
 
                             # Split remaining budget across yet-to-run starts.
-                            runs_left = max(1, n_runs - run_idx)
+                            runs_left = max(1, max_runs - run_idx)
+                            # When auto-escalate is on, do not reserve for unused starts.
+                            if auto_escalate and not multi_start_diag.get("escalated"):
+                                runs_left = 1
                             run_timeout = max(1, int(remaining / runs_left))
 
                             run_seed = -1
@@ -8888,7 +8977,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 p_min=_clamp_float(proposer_plan.get("p_min"), self.p_min, -8.0, 3.0),
                                 p_max=_clamp_float(proposer_plan.get("p_max"), self.p_max, 1.0, 10.0),
                                 use_nsga2=self.use_nsga2,
-                                num_islands=self.num_islands,
+                                num_islands=eff_islands,
                                 migration_interval=self.migration_interval,
                                 migration_size=self.migration_size,
                                 arithmetic_temperature=self.arithmetic_temperature,
@@ -8958,8 +9047,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 evo_mse = raw_mse
                                 best_cpp_result = result
 
+                            multi_start_diag["runs_executed"] = int(run_idx + 1)
+
                             if raw_mse <= self.early_stop_mse:
                                 break
+
+                        if isinstance(self.blackbox_diagnostics_, dict):
+                            self.blackbox_diagnostics_["multi_start"] = dict(multi_start_diag)
+                        self.multi_start_diagnostics_ = dict(multi_start_diag)
 
                         if best_cpp_result is not None:
                             # Store best C++ result for inspection
@@ -9205,11 +9300,32 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 try:
                     n_sel = len(getattr(self.blackbox_state_, "selected_features", []) or [])
                     if n_sel >= 2:
-                        orig_seed = self._fit_original_space_structure_winner(
-                            X_original,
-                            y_original,
-                            self.blackbox_state_,
-                        )
+                        # S1-7: reuse early structure probe when already exact/high-R2
+                        # instead of re-running the free-const family bank.
+                        orig_seed = None
+                        probe = getattr(self, "_structure_probe_seed_", None)
+                        if isinstance(probe, dict) and probe.get("formula"):
+                            p_r2 = float(probe.get("r2", -1.0) or -1.0)
+                            p_exact = bool(probe.get("exact_match", False))
+                            if p_exact or p_r2 >= 0.999:
+                                orig_seed = {
+                                    "formula": str(probe.get("formula")),
+                                    "mse": float(probe.get("mse", float("inf"))),
+                                    "inlier_mse": float(
+                                        probe.get("mse", float("inf"))
+                                    ),
+                                    "from_structure_probe": True,
+                                }
+                                if isinstance(self.blackbox_diagnostics_, dict):
+                                    self.blackbox_diagnostics_["structure_probe_reused"] = True
+                        if orig_seed is None:
+                            orig_seed = self._fit_original_space_structure_winner(
+                                X_original,
+                                y_original,
+                                self.blackbox_state_,
+                            )
+                            if isinstance(self.blackbox_diagnostics_, dict):
+                                self.blackbox_diagnostics_["structure_probe_reused"] = False
                         if orig_seed is not None:
                             o_f = str(orig_seed.get("formula") or "")
                             o_m = float(orig_seed.get("mse", float("inf")))

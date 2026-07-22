@@ -36,12 +36,13 @@
 | **E10** | ScopedArithmeticTemperature; config temp on fitness eval |
 | **E4 (partial)** | Soft-arith kitchen-sink documented |
 | **O12, O13** | Abs + printer backlog items |
+| **S1-9 / S1-7 / E6 (Phase 5)** | multi_start=1+escalate; blackbox/fast-path/structure dedup; fitness_valid elite skip (2026-07-22) |
 
 ### Still open (this plan)
 - **P0 open:** none (Phase 0 shipped)  
-- **P1 open:** ~30 items across S1/S2/S4/S5  
+- **P1 open:** residual after Phase 5 (S1-7 residual formula re-score polish optional)  
 - **P2 open:** remaining polish  
-- **Unaudited:** S3, S6–S10 may add findings — schedule after Phase 0–2 or in parallel with Phase 6
+- **Unaudited:** S3, S6–S10 — Phase 6
 
 ### Recommended implementation order
 ```
@@ -155,15 +156,17 @@ Phase 7  API polish & cleanup (P2)
 
 ## Phase 5 — Performance & defaults
 
+**Status:** done (2026-07-22) — S1-9 defaults+escalate; S1-7 O2/O3 dedup; E6 elite skip; S5-11 already done in Phase 3.
+
 **Goal:** Cut wall time without regressing recovery quality.
 
-| # | ID | Work |
-|---|-----|------|
-| 5.1 | **S1-9** / **O1** | Defaults: `multi_start_runs=1` escalate; revisit islands/timeout for easy problems |
-| 5.2 | **S1-7** / **O2,O3** | Dedup blackbox prep / second fast-path / repeated structure probes |
-| 5.3 | **E6** / **O11** | Skip re-eval of clean elites; cache generation partial |
-| 5.4 | **S5-11** | (if not done in 3.4) eval copy elimination |
-| 5.5 | **E1** residual | Island clone already fixed in P0 — measure island diversity ROI |
+| # | ID | Work | Status |
+|---|-----|------|--------|
+| 5.1 | **S1-9** / **O1** | Defaults: `multi_start_runs=1` escalate; revisit islands/timeout for easy problems | **done** — default 1; auto-escalate to 3 when R² poor; shrink islands on easy R² |
+| 5.2 | **S1-7** / **O2,O3** | Dedup blackbox prep / second fast-path / repeated structure probes | **done** — skip soft-weight re-rank when stable; skip 2nd fast-path on high confidence; reuse exact structure probe |
+| 5.3 | **E6** / **O11** | Skip re-eval of clean elites; cache generation partial | **done** — `fitness_valid` dirty bit; mutate/crossover clear; pop eval skips |
+| 5.4 | **S5-11** | (if not done in 3.4) eval copy elimination | **done** in Phase 3 |
+| 5.5 | **E1** residual | Island clone already fixed in P0 — measure island diversity ROI | **n/a** — fixed in P0; optional bench only |
 
 ---
 
@@ -287,9 +290,9 @@ S3 audit ──► deep scoring/guard redesign (S1-5/6)
 - [x] S1-13 residual flag naming
 
 ### Phase 5
-- [ ] S1-9 / O1 defaults
-- [ ] S1-7 / O2–O3 double work
-- [ ] E6 elite re-eval skip
+- [x] S1-9 / O1 defaults
+- [x] S1-7 / O2–O3 double work
+- [x] E6 elite re-eval skip
 
 ### Phase 6–7
 - [ ] Audit S6, S3, S7–S10
