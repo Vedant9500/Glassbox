@@ -186,6 +186,47 @@ inline Eigen::VectorXd solve_linear(const Eigen::MatrixXd& X, const Eigen::Vecto
     return X.colPivHouseholderQr().solve(y);
 }
 
+// S5-9: weighted least squares via sqrt(w) row scaling (same pattern as elastic net).
+inline Eigen::VectorXd solve_linear_weighted(
+    const Eigen::MatrixXd& X,
+    const Eigen::VectorXd& y,
+    const Eigen::VectorXd& sample_weight
+) {
+    if (sample_weight.size() != y.size() || sample_weight.size() == 0) {
+        return solve_linear(X, y);
+    }
+    Eigen::MatrixXd Xs = X;
+    Eigen::VectorXd ys = y;
+    apply_sqrt_sample_weights(Xs, ys, sample_weight);
+    return solve_linear(Xs, ys);
+}
+
+// Weighted MSE: sum(w r^2)/sum(w). Empty weights => plain mean square error.
+inline double residual_mse_weighted(
+    const Eigen::VectorXd& pred,
+    const Eigen::VectorXd& y,
+    const Eigen::VectorXd& sample_weight
+) {
+    const int n = static_cast<int>(y.size());
+    if (n <= 0) return 0.0;
+    Eigen::ArrayXd r2 = (pred - y).array().square();
+    if (sample_weight.size() != y.size() || sample_weight.size() == 0) {
+        return r2.mean();
+    }
+    double num = 0.0;
+    double den = 0.0;
+    for (int i = 0; i < n; ++i) {
+        double w = sample_weight(i);
+        if (!std::isfinite(w) || w <= 0.0) continue;
+        num += w * r2(i);
+        den += w;
+    }
+    if (!(den > 0.0) || !std::isfinite(den)) {
+        return r2.mean();
+    }
+    return num / den;
+}
+
 // Frequency refinement: c0 + c1*x + c2*x^2 + sum_i [a_i*sin(omega_i*x) + b_i*cos(omega_i*x)]
 // We want to optimize omegas.
 struct FreqResult {
@@ -193,10 +234,16 @@ struct FreqResult {
     double mse;
 };
 
-inline FreqResult refine_frequencies_cpp(const Eigen::VectorXd& x, const Eigen::VectorXd& y, 
-                                         std::vector<double> initial_omegas, int steps = 100, double lr = 0.1) {
-    int n = x.size();
-    int k = initial_omegas.size();
+inline FreqResult refine_frequencies_cpp(
+    const Eigen::VectorXd& x,
+    const Eigen::VectorXd& y,
+    std::vector<double> initial_omegas,
+    int steps = 100,
+    double lr = 0.1,
+    const Eigen::VectorXd& sample_weight = Eigen::VectorXd()
+) {
+    int n = static_cast<int>(x.size());
+    int k = static_cast<int>(initial_omegas.size());
     std::vector<double> omegas = initial_omegas;
     
     double best_mse = 1e9;
@@ -215,11 +262,10 @@ inline FreqResult refine_frequencies_cpp(const Eigen::VectorXd& x, const Eigen::
             X.col(4 + 2*i) = (omegas[i] * x.array()).cos().matrix();
         }
         
-        // Solve for linear parameters
-        Eigen::VectorXd coeffs = solve_linear(X, y);
+        // S5-9: WLS linear coeffs + weighted MSE objective when sample_weight set.
+        Eigen::VectorXd coeffs = solve_linear_weighted(X, y, sample_weight);
         Eigen::VectorXd pred = X * coeffs;
-        Eigen::VectorXd res = pred - y;
-        double mse = res.squaredNorm() / n;
+        double mse = residual_mse_weighted(pred, y, sample_weight);
         
         if (mse < best_mse) {
             best_mse = mse;
@@ -235,15 +281,15 @@ inline FreqResult refine_frequencies_cpp(const Eigen::VectorXd& x, const Eigen::
             omegas[i] += eps;
             X.col(3 + 2*i) = (omegas[i] * x.array()).sin().matrix();
             X.col(4 + 2*i) = (omegas[i] * x.array()).cos().matrix();
-            Eigen::VectorXd c_fwd = solve_linear(X, y);
-            double mse_fwd = (X * c_fwd - y).squaredNorm() / n;
+            Eigen::VectorXd c_fwd = solve_linear_weighted(X, y, sample_weight);
+            double mse_fwd = residual_mse_weighted(X * c_fwd, y, sample_weight);
             
             // Backward step
             omegas[i] -= 2*eps;
             X.col(3 + 2*i) = (omegas[i] * x.array()).sin().matrix();
             X.col(4 + 2*i) = (omegas[i] * x.array()).cos().matrix();
-            Eigen::VectorXd c_bwd = solve_linear(X, y);
-            double mse_bwd = (X * c_bwd - y).squaredNorm() / n;
+            Eigen::VectorXd c_bwd = solve_linear_weighted(X, y, sample_weight);
+            double mse_bwd = residual_mse_weighted(X * c_bwd, y, sample_weight);
             
             // Restore
             omegas[i] += eps;
@@ -284,12 +330,18 @@ inline Eigen::VectorXd safe_power(const Eigen::VectorXd& x, double p) {
     }
 }
 
-inline PowerResult refine_powers_model_cpp(const Eigen::VectorXd& x_valid, const Eigen::VectorXd& y_valid,
-                                      std::vector<double> powers, const std::vector<double>& omegas,
-                                      int steps = 200, double lr = 0.05) {
-    int n = x_valid.size();
-    int num_p = powers.size();
-    int num_w = omegas.size();
+inline PowerResult refine_powers_model_cpp(
+    const Eigen::VectorXd& x_valid,
+    const Eigen::VectorXd& y_valid,
+    std::vector<double> powers,
+    const std::vector<double>& omegas,
+    int steps = 200,
+    double lr = 0.05,
+    const Eigen::VectorXd& sample_weight = Eigen::VectorXd()
+) {
+    int n = static_cast<int>(x_valid.size());
+    int num_p = static_cast<int>(powers.size());
+    int num_w = static_cast<int>(omegas.size());
     int num_features = 2 + num_p + 2 * num_w; // 1, x, p_i, sin(w_i), cos(w_i)
     
     double best_mse = 1e9;
@@ -308,9 +360,9 @@ inline PowerResult refine_powers_model_cpp(const Eigen::VectorXd& x_valid, const
             X.col(2 + num_p + 2*i + 1) = (omegas[i] * x_valid.array()).cos().matrix();
         }
         
-        Eigen::VectorXd c = solve_linear(X, y_valid);
+        Eigen::VectorXd c = solve_linear_weighted(X, y_valid, sample_weight);
         Eigen::VectorXd pred = X * c;
-        double mse = (pred - y_valid).squaredNorm() / n;
+        double mse = residual_mse_weighted(pred, y_valid, sample_weight);
         
         if (mse < best_mse) {
             best_mse = mse;
@@ -324,13 +376,13 @@ inline PowerResult refine_powers_model_cpp(const Eigen::VectorXd& x_valid, const
         for (int i = 0; i < num_p; ++i) {
             powers[i] += eps;
             X.col(2 + i) = safe_power(x_valid, powers[i]);
-            Eigen::VectorXd c_fwd = solve_linear(X, y_valid);
-            double mse_fwd = (X * c_fwd - y_valid).squaredNorm() / n;
+            Eigen::VectorXd c_fwd = solve_linear_weighted(X, y_valid, sample_weight);
+            double mse_fwd = residual_mse_weighted(X * c_fwd, y_valid, sample_weight);
             
             powers[i] -= 2*eps;
             X.col(2 + i) = safe_power(x_valid, powers[i]);
-            Eigen::VectorXd c_bwd = solve_linear(X, y_valid);
-            double mse_bwd = (X * c_bwd - y_valid).squaredNorm() / n;
+            Eigen::VectorXd c_bwd = solve_linear_weighted(X, y_valid, sample_weight);
+            double mse_bwd = residual_mse_weighted(X * c_bwd, y_valid, sample_weight);
             
             powers[i] += eps;
             X.col(2 + i) = safe_power(x_valid, powers[i]);
@@ -370,9 +422,16 @@ struct PeriodicRationalResult {
     double mse;
 };
 
-inline PeriodicRationalResult refine_periodic_rational_cpp(const Eigen::VectorXd& x, const Eigen::VectorXd& y,
-                                                           double omega0, double c0, int steps = 200, double lr = 0.05) {
-    int n = x.size();
+inline PeriodicRationalResult refine_periodic_rational_cpp(
+    const Eigen::VectorXd& x,
+    const Eigen::VectorXd& y,
+    double omega0,
+    double c0,
+    int steps = 200,
+    double lr = 0.05,
+    const Eigen::VectorXd& sample_weight = Eigen::VectorXd()
+) {
+    int n = static_cast<int>(x.size());
     double omega = omega0;
     double c_val = std::max(c0, 1e-6); // enforce positivity
     
@@ -388,9 +447,9 @@ inline PeriodicRationalResult refine_periodic_rational_cpp(const Eigen::VectorXd
         X.col(2) = x;
         X.col(3) = Eigen::VectorXd::Ones(n);
         
-        Eigen::VectorXd coef = solve_linear(X, y);
+        Eigen::VectorXd coef = solve_linear_weighted(X, y, sample_weight);
         Eigen::VectorXd pred = X * coef;
-        double mse = (pred - y).squaredNorm() / n;
+        double mse = residual_mse_weighted(pred, y, sample_weight);
         
         if (mse < best_mse) {
             best_mse = mse;
@@ -411,12 +470,12 @@ inline PeriodicRationalResult refine_periodic_rational_cpp(const Eigen::VectorXd
             Eigen::MatrixXd X_f = X;
             X_f.col(0) = ((omega+eps) * x.array()).sin() / denom.array();
             X_f.col(1) = ((omega+eps) * x.array()).cos() / denom.array();
-            double m_f = (X_f * solve_linear(X_f, y) - y).squaredNorm() / n;
+            double m_f = residual_mse_weighted(X_f * solve_linear_weighted(X_f, y, sample_weight), y, sample_weight);
             
             Eigen::MatrixXd X_b = X;
             X_b.col(0) = ((omega-eps) * x.array()).sin() / denom.array();
             X_b.col(1) = ((omega-eps) * x.array()).cos() / denom.array();
-            double m_b = (X_b * solve_linear(X_b, y) - y).squaredNorm() / n;
+            double m_b = residual_mse_weighted(X_b * solve_linear_weighted(X_b, y, sample_weight), y, sample_weight);
             
             o_fwd = m_f; o_bwd = m_b;
         }
@@ -429,13 +488,13 @@ inline PeriodicRationalResult refine_periodic_rational_cpp(const Eigen::VectorXd
             Eigen::VectorXd d_f = x.array().square() + (c_val + eps);
             X_f.col(0) = (omega * x.array()).sin() / d_f.array();
             X_f.col(1) = (omega * x.array()).cos() / d_f.array();
-            double m_f = (X_f * solve_linear(X_f, y) - y).squaredNorm() / n;
+            double m_f = residual_mse_weighted(X_f * solve_linear_weighted(X_f, y, sample_weight), y, sample_weight);
             
             Eigen::MatrixXd X_b = X;
             Eigen::VectorXd d_b = x.array().square() + (c_val - eps);
             X_b.col(0) = (omega * x.array()).sin() / d_b.array();
             X_b.col(1) = (omega * x.array()).cos() / d_b.array();
-            double m_b = (X_b * solve_linear(X_b, y) - y).squaredNorm() / n;
+            double m_b = residual_mse_weighted(X_b * solve_linear_weighted(X_b, y, sample_weight), y, sample_weight);
             
             c_fwd = m_f; c_bwd = m_b;
         }

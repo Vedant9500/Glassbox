@@ -2767,11 +2767,13 @@ def refine_frequencies(
     n_steps: int = 100,
     lr: float = 0.1,
     device: Optional[str] = None,
+    sample_weight: Optional[np.ndarray] = None,
 ) -> Tuple[List[float], float]:
     """
     Refine frequency parameters using gradient descent.
     
     This handles cases like ω=3.2 where FFT might detect 3.13.
+    Optional sample_weight enables WLS / weighted MSE (S5-9).
     """
     _core, reason = _load_cpp_core()
     if _core is None or not hasattr(_core, "refine_frequencies"):
@@ -2779,6 +2781,9 @@ def refine_frequencies(
     
     x_np = np.asarray(x, dtype=np.float64).flatten()
     y_np = np.asarray(y, dtype=np.float64).flatten()
+    if sample_weight is not None:
+        sw = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+        return _core.refine_frequencies(x_np, y_np, initial_omegas, n_steps, lr, sw)
     return _core.refine_frequencies(x_np, y_np, initial_omegas, n_steps, lr)
 
 

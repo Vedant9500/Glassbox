@@ -80,7 +80,7 @@ Phase 7  API polish & cleanup (P2)
 
 ## Phase 1 — Noise & metric contracts
 
-**Status:** done (2026-07-20) — N3/N4/N6/S1-6/S1-12 fixed; S5-9 elastic-net weighted (freq/power refiners still unweighted).
+**Status:** done (2026-07-20) — N3/N4/N6/S1-6/S1-12 fixed; S5-9 fully weighted (elastic net + freq/power/periodic); S5-10 protected exact eval.
 
 **Goal:** Auto noise path is conservative; search may weight/Huber; **display/protocol always plain unweighted MSE**.
 
@@ -90,8 +90,8 @@ Phase 7  API polish & cleanup (P2)
 | 1.2 | **N4** | Activate phase-3/6 unweighted guards for `diffuse_noise_huber` as well as soft-MAD | **done** |
 | 1.3 | **N6** / **S1-12** / **O8** | Local unweighted `_display_formula_mse` — no `scripts.benchmark_common` import fallback to robust | **done** |
 | 1.4 | **S1-6** | Document and audit decision gates: which use weighted vs unweighted; align skip/accept thresholds | **done** (docs + display-first score; S3 may deepen) |
-| 1.5 | **S5-9** | Weight-aware specialist `refine.h` **or** route specialists through evolution residual | **partial** — elastic net weighted; freq/power still open |
-| 1.6 | **S5-10** | Document dual clamp domains; optionally soft-protect exact scorer if any remaining exact path | Graph path is primary for ranking (S5-2 done) |
+| 1.5 | **S5-9** | Weight-aware specialist `refine.h` **or** route specialists through evolution residual | **done** — elastic net + freq/power/periodic_rational WLS |
+| 1.6 | **S5-10** | Document dual clamp domains; optionally soft-protect exact scorer if any remaining exact path | **done** — protected exact Div/pow; dual-domain note on Exp |
 
 **Also close:** O7 (soft-MAD multi-col), O8 (local display MSE).
 
@@ -284,7 +284,7 @@ S3 audit ──► deep scoring/guard redesign (S1-5/6)
 - [x] N4 guards under diffuse Huber
 - [x] N6/O8 local display MSE
 - [x] S1-6 gate metric audit
-- [x] S5-9 refine.h weights (elastic net; freq/power still open)
+- [x] S5-9 refine.h weights (elastic net + freq/power/periodic WLS)
 
 ### Phase 2
 - [x] E3 seed capacity

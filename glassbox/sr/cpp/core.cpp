@@ -41,9 +41,13 @@ Eigen::ArrayXd evaluate_parse_node_exact(
         case sr::ParseNodeType::Mul:
             return evaluate_parse_node_exact(node->left, X, num_samples) * evaluate_parse_node_exact(node->right, X, num_samples);
         case sr::ParseNodeType::Div: {
+            // S5-10: protected division (match graph Division spirit).
+            // Bare left/right produced Inf/NaN near zeros and desynced ranking
+            // from soft search eval. Keep a small ε so normal denominators stay exact.
             Eigen::ArrayXd left = evaluate_parse_node_exact(node->left, X, num_samples);
             Eigen::ArrayXd right = evaluate_parse_node_exact(node->right, X, num_samples);
-            return left / right;
+            constexpr double kDivEps = 1e-12;
+            return left * right.sign() / (right.abs() + kDivEps);
         }
         case sr::ParseNodeType::Pow: {
             Eigen::ArrayXd base = evaluate_parse_node_exact(node->left, X, num_samples);
@@ -56,14 +60,19 @@ Eigen::ArrayXd evaluate_parse_node_exact(
                 if (std::abs(p - p_round) < 1e-10) {
                     out = base.pow(static_cast<int>(p_round));
                 } else {
-                    if ((base < 0.0).any()) {
-                        throw std::runtime_error("power_domain_error");
-                    }
-                    out = base.pow(p);
+                    // Non-integer constant power: abs-base to stay real-valued (S5-10 domain).
+                    out = base.sign() * (base.abs() + 1e-300).pow(p);
                 }
             } else {
+                // Variable exponent: protected real power (sign * |base|^exp).
                 for (int i = 0; i < num_samples; ++i) {
-                    out(i) = std::pow(base(i), exp_arr(i));
+                    double b = base(i);
+                    double p = exp_arr(i);
+                    if (!std::isfinite(b) || !std::isfinite(p)) {
+                        out(i) = std::numeric_limits<double>::quiet_NaN();
+                        continue;
+                    }
+                    out(i) = std::copysign(std::pow(std::abs(b) + 1e-300, p), b);
                 }
             }
             return out;
@@ -73,6 +82,9 @@ Eigen::ArrayXd evaluate_parse_node_exact(
         case sr::ParseNodeType::Cos:
             return evaluate_parse_node_exact(node->left, X, num_samples).cos();
         case sr::ParseNodeType::Exp:
+            // S5-10 dual-domain note: exact path clamps the *argument* to ±500;
+            // graph eval clamps the *output* of exp to ±1e6. Prefer graph scorer
+            // for ranking (S5-2); this path remains for display/exact diagnostics.
             return evaluate_parse_node_exact(node->left, X, num_samples).min(500.0).max(-500.0).exp();
         case sr::ParseNodeType::Log:
             return (evaluate_parse_node_exact(node->left, X, num_samples).abs() + 1e-300).log();
@@ -89,6 +101,33 @@ std::shared_ptr<sr::ParseNode> parse_formula_exact(const std::string& formula) {
     auto tokens = sr::tokenize(norm);
     sr::Parser parser(tokens);
     return parser.parse();
+}
+
+
+// Optional 1D sample_weight for specialist refiners (S5-9). Empty => unweighted.
+static Eigen::VectorXd load_optional_vector_weights(const py::object& weights_obj, int n, const char* name) {
+    if (weights_obj.is_none()) {
+        return Eigen::VectorXd();
+    }
+    auto arr = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(weights_obj);
+    if (!arr) {
+        throw std::runtime_error(std::string(name) + " must be convertible to float64 array");
+    }
+    auto buf = arr.request();
+    if (buf.ndim != 1 || static_cast<int>(buf.size) != n) {
+        throw std::runtime_error(std::string(name) + " must be 1D with length matching y");
+    }
+    Eigen::Map<Eigen::VectorXd> mapped(static_cast<double*>(buf.ptr), n);
+    Eigen::VectorXd w = mapped;
+    for (int i = 0; i < n; ++i) {
+        if (!std::isfinite(w(i)) || w(i) < 0.0) {
+            throw std::runtime_error(std::string(name) + " must be finite and non-negative");
+        }
+    }
+    if (!(w.sum() > 0.0)) {
+        throw std::runtime_error(std::string(name) + " must have positive total weight");
+    }
+    return w;
 }
 
 // Weighted helpers for Phase 2 candidate scoring (PhySO-style y_weights).
@@ -790,17 +829,27 @@ py::dict run_evolution_cpp(
     return result;
 }
 
-// Wrapper for refine_frequencies_cpp
-py::tuple refine_frequencies_wrapper(py::array_t<double> x_arr, py::array_t<double> y_arr, py::list initial_omegas, int steps = 100, double lr = 0.1) {
+// Wrapper for refine_frequencies_cpp (optional sample_weight — S5-9)
+py::tuple refine_frequencies_wrapper(
+    py::array_t<double> x_arr,
+    py::array_t<double> y_arr,
+    py::list initial_omegas,
+    int steps = 100,
+    double lr = 0.1,
+    py::object sample_weight = py::none()
+) {
     auto x_buf = x_arr.request();
     Eigen::Map<Eigen::VectorXd> x(static_cast<double*>(x_buf.ptr), x_buf.size);
     auto y_buf = y_arr.request();
     Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
+    Eigen::VectorXd sw = load_optional_vector_weights(
+        sample_weight, static_cast<int>(y_buf.size), "sample_weight"
+    );
 
     std::vector<double> omegas;
     for (auto item : initial_omegas) omegas.push_back(item.cast<double>());
 
-    auto res = sr::refine_frequencies_cpp(x, y, omegas, steps, lr);
+    auto res = sr::refine_frequencies_cpp(x, y, omegas, steps, lr, sw);
     
     py::list omegas_out;
     for (double w : res.omegas) omegas_out.append(w);
@@ -808,18 +857,29 @@ py::tuple refine_frequencies_wrapper(py::array_t<double> x_arr, py::array_t<doub
     return py::make_tuple(omegas_out, res.mse);
 }
 
-// Wrapper for refine_powers_model_cpp
-py::tuple refine_powers_model_wrapper(py::array_t<double> x_arr, py::array_t<double> y_arr, py::list initial_powers, py::list initial_omegas, int steps = 200, double lr = 0.05) {
+// Wrapper for refine_powers_model_cpp (optional sample_weight — S5-9)
+py::tuple refine_powers_model_wrapper(
+    py::array_t<double> x_arr,
+    py::array_t<double> y_arr,
+    py::list initial_powers,
+    py::list initial_omegas,
+    int steps = 200,
+    double lr = 0.05,
+    py::object sample_weight = py::none()
+) {
     auto x_buf = x_arr.request();
     Eigen::Map<Eigen::VectorXd> x(static_cast<double*>(x_buf.ptr), x_buf.size);
     auto y_buf = y_arr.request();
     Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
+    Eigen::VectorXd sw = load_optional_vector_weights(
+        sample_weight, static_cast<int>(y_buf.size), "sample_weight"
+    );
 
     std::vector<double> powers, omegas;
     for (auto item : initial_powers) powers.push_back(item.cast<double>());
     for (auto item : initial_omegas) omegas.push_back(item.cast<double>());
 
-    auto res = sr::refine_powers_model_cpp(x, y, powers, omegas, steps, lr);
+    auto res = sr::refine_powers_model_cpp(x, y, powers, omegas, steps, lr, sw);
     
     py::dict out;
     out["mse"] = res.mse;
@@ -838,14 +898,25 @@ py::tuple refine_powers_model_wrapper(py::array_t<double> x_arr, py::array_t<dou
     return py::make_tuple(out, res.mse);
 }
 
-// Wrapper for refine_periodic_rational_cpp
-py::dict refine_periodic_rational_wrapper(py::array_t<double> x_arr, py::array_t<double> y_arr, double omega0, double c0, int steps = 200, double lr = 0.05) {
+// Wrapper for refine_periodic_rational_cpp (optional sample_weight — S5-9)
+py::dict refine_periodic_rational_wrapper(
+    py::array_t<double> x_arr,
+    py::array_t<double> y_arr,
+    double omega0,
+    double c0,
+    int steps = 200,
+    double lr = 0.05,
+    py::object sample_weight = py::none()
+) {
     auto x_buf = x_arr.request();
     Eigen::Map<Eigen::VectorXd> x(static_cast<double*>(x_buf.ptr), x_buf.size);
     auto y_buf = y_arr.request();
     Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
+    Eigen::VectorXd sw = load_optional_vector_weights(
+        sample_weight, static_cast<int>(y_buf.size), "sample_weight"
+    );
 
-    auto res = sr::refine_periodic_rational_cpp(x, y, omega0, c0, steps, lr);
+    auto res = sr::refine_periodic_rational_cpp(x, y, omega0, c0, steps, lr, sw);
     
     py::dict out;
     out["omega"] = res.omega;
@@ -1044,6 +1115,28 @@ std::string reduce_formula_noise_wrapper(
     );
 }
 
+
+// S5-10 diagnostics: exact parse-tree evaluation (protected div/pow). Ranking uses graph path (S5-2).
+py::array_t<double> eval_formula_exact_wrapper(const std::string& formula, py::list X_list) {
+    std::vector<Eigen::ArrayXd> X;
+    int n = -1;
+    for (auto item : X_list) {
+        auto arr = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(item);
+        if (!arr) throw std::runtime_error("X_list entries must be float64 arrays");
+        auto buf = arr.request();
+        if (n < 0) n = static_cast<int>(buf.size);
+        if (static_cast<int>(buf.size) != n) throw std::runtime_error("X feature lengths mismatch");
+        X.emplace_back(Eigen::Map<Eigen::ArrayXd>(static_cast<double*>(buf.ptr), buf.size));
+    }
+    if (n <= 0) throw std::runtime_error("empty X");
+    auto root = parse_formula_exact(formula);
+    Eigen::ArrayXd out = evaluate_parse_node_exact(root, X, n);
+    py::array_t<double> result(n);
+    auto rbuf = result.request();
+    Eigen::Map<Eigen::ArrayXd>(static_cast<double*>(rbuf.ptr), n) = out;
+    return result;
+}
+
 PYBIND11_MODULE(_core, m) {
     m.doc() = "Fast C++ core for Glassbox Symbolic Regression";
     m.def("score_formula_candidates", &score_formula_candidates_cpp,
@@ -1101,9 +1194,21 @@ PYBIND11_MODULE(_core, m) {
           py::arg("elite_size")=10,
           py::arg("seed_fraction")=0.5);
 
-    m.def("refine_frequencies", &refine_frequencies_wrapper, "Refines frequencies via Eigen varpro");
-    m.def("refine_powers", &refine_powers_model_wrapper, "Refines powers via Eigen varpro");
-    m.def("refine_periodic_rational", &refine_periodic_rational_wrapper, "Refines periodic rational params via Eigen varpro");
+    m.def("refine_frequencies", &refine_frequencies_wrapper,
+          "Refines frequencies via Eigen varpro (optional sample_weight for WLS / S5-9)",
+          py::arg("x"), py::arg("y"), py::arg("initial_omegas"),
+          py::arg("steps")=100, py::arg("lr")=0.1, py::arg("sample_weight")=py::none());
+    m.def("refine_powers", &refine_powers_model_wrapper,
+          "Refines powers via Eigen varpro (optional sample_weight for WLS / S5-9)",
+          py::arg("x"), py::arg("y"), py::arg("initial_powers"), py::arg("initial_omegas"),
+          py::arg("steps")=200, py::arg("lr")=0.05, py::arg("sample_weight")=py::none());
+    m.def("refine_periodic_rational", &refine_periodic_rational_wrapper,
+          "Refines periodic rational params via Eigen varpro (optional sample_weight / S5-9)",
+          py::arg("x"), py::arg("y"), py::arg("omega0"), py::arg("c0"),
+          py::arg("steps")=200, py::arg("lr")=0.05, py::arg("sample_weight")=py::none());
+    m.def("eval_formula_exact", &eval_formula_exact_wrapper,
+          "Exact parse-tree formula eval with protected division (S5-10 diagnostics)",
+          py::arg("formula"), py::arg("X_list"));
     m.def("iterative_elastic_net", &iterative_elastic_net_wrapper,
           "Iterative Elastic Net for regularized pruning",
           py::arg("X"), py::arg("y"), py::arg("l1_weight"), py::arg("l2_weight"),
