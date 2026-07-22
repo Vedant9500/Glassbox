@@ -2263,6 +2263,8 @@ private:
         } else {
             ind.output_bias = 0.0;
         }
+        // E6: output layer changed — cached fitness is stale until re-scored.
+        ind.fitness_valid = false;
         return true;
     }
     
@@ -2329,6 +2331,8 @@ private:
         // Collect unaries in active output subtrees (S5-8 nested refine).
         std::vector<int> active_unary = collect_active_unary_indices(ind);
         if (active_unary.empty()) return;
+        // E6: about to mutate inner params — force re-score if interrupted/early-exit.
+        ind.fitness_valid = false;
         
         // Adam hyperparameters
         const double lr = 0.02;

@@ -1,6 +1,6 @@
 # Glassbox Implementation Plan
 
-**Source:** `glassbox_codebase_audit_tracker.md` (S1, S2, S4, S5 complete; S3/S6–S10 audit pending)  
+**Source:** `glassbox_codebase_audit_tracker.md` (S1–S10 audit complete; open P1s in Phase 6.x)  
 **Goal:** Turn audit findings into ordered, shippable workstreams.  
 **Convention:** phases are *implementation* waves (fix → harden → speed), not audit section numbers.
 
@@ -172,18 +172,31 @@ Phase 7  API polish & cleanup (P2)
 
 ## Phase 6 — Finish remaining audit sections
 
+**Status:** audit done (2026-07-22) — S3/S6–S10 inventoried; **S6-3 fixed** (seed weight normalize). Open P1s queued for 6.x fix wave / Phase 7.
+
 **Goal:** Complete findings inventory before claiming whole-codebase done.
 
-| Order | Section | Focus |
-|-------|---------|--------|
-| 6.1 | **S6** | Bindings, seed graphs, setup/export, dtype/contiguity, seed_graphs plumbing |
-| 6.2 | **S3** | Scoring, refine, snap, parsimony, final guards (Python) — overlaps N4, S1-5/6 |
-| 6.3 | **S7** | Blackbox multi-feature ranking / remap |
-| 6.4 | **S8** | Specialist vault poisoning / composition |
-| 6.5 | **S9** | Curve classifier integration (not train/data gen) |
-| 6.6 | **S10** | Proposer, Python evolution, optimizers, FPIP |
+| Order | Section | Focus | Status |
+|-------|---------|--------|--------|
+| 6.1 | **S6** | Bindings, seed graphs, setup/export, dtype/contiguity | **done** — S6-1..8; S6-3 fixed |
+| 6.2 | **S3** | Scoring, refine, snap, parsimony, final guards | **done** — S3-1..6 open |
+| 6.3 | **S7** | Blackbox multi-feature ranking / remap | **done** — S7-1..5 |
+| 6.4 | **S8** | Specialist vault poisoning / composition | **done** — S8-1..4 |
+| 6.5 | **S9** | Curve classifier integration | **done** — S9-1..5 |
+| 6.6 | **S10** | Proposer, Python evolution, optimizers, FPIP | **done** — S10-1..5 |
 
-After each: fold new P0/P1 into Phases 0–5 or a **Phase 6.x fix wave**.
+### Phase 6.x fix wave (recommended next)
+| Priority | ID | Work |
+|----------|-----|------|
+| P1 | **S3-1** | Score/structure rank without free affine, or keep affine but export base_formula + gate on unweighted structure |
+| P1 | **S3-2** | Unify guard/residual holdouts with `_selection_holdout_` |
+| P1 | **S7-1** | Safer drop policy / uncertainty floor for true-feature recall |
+| P1 | **S8-1** | Vault admission requires unweighted holdout / complexity gate |
+| P1 | **S9-2** | Cap budget shrink when residual_suspicious / low R² |
+| P1 | **S10-5** | Document guided vs C++ metric parity; optional route 1D to C++ |
+| P2 | S6-1/2/4, S3-3..6, rest | defaults expose, elite_size bind, polish |
+
+After each: fold new P0/P1 into a **Phase 6.x fix wave** or Phase 7.
 
 ---
 
@@ -295,7 +308,8 @@ S3 audit ──► deep scoring/guard redesign (S1-5/6)
 - [x] E6 elite re-eval skip
 
 ### Phase 6–7
-- [ ] Audit S6, S3, S7–S10
+- [x] Audit S6, S3, S7–S10
+- [ ] Phase 6.x P1 fix wave (S3-1/2, S7-1, S8-1, S9-2, S10-5)
 - [ ] S1-11 export API
 - [ ] Remaining P2
 

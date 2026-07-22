@@ -567,6 +567,25 @@ py::dict run_evolution_cpp(
         }
         
         if (gdict.contains("output_bias")) g.output_bias = gdict["output_bias"].cast<double>();
+
+        // S6: normalize weight vector length to node count (short → pad 0; long → trim).
+        // Mismatched lengths otherwise silently drop active terms or leave junk tails.
+        if (!g.nodes.empty()) {
+            if (g.output_weights.size() < g.nodes.size()) {
+                g.output_weights.resize(g.nodes.size(), 0.0);
+            } else if (g.output_weights.size() > g.nodes.size()) {
+                g.output_weights.resize(g.nodes.size());
+            }
+            // If all weights were missing/zero, activate last node so seed is not dead.
+            bool any_active = false;
+            for (double w : g.output_weights) {
+                if (std::abs(w) > 1e-12) { any_active = true; break; }
+            }
+            if (!any_active) {
+                g.output_weights.assign(g.nodes.size(), 0.0);
+                g.output_weights.back() = 1.0;
+            }
+        }
         
         if (static_cast<int>(g.nodes.size()) > seed_graph_node_limit) {
             ++seed_graphs_skipped_oversized;
