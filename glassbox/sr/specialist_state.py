@@ -311,7 +311,36 @@ class SpecialistVault:
             if r2 is None:
                 r2 = float(1.0 - mse / y_var)
             complexity = int((candidate or {}).get("complexity") or complexity_fn(formula))
-            rank = -float(r2) + 0.002 * float(complexity)
+            # S8-1: admission gate — reject bloated / overfit / weak-holdout specialists
+            # so vault memory is less easily poisoned by noisy false positives.
+            n_pts = int(y_arr.shape[0])
+            n_val = max(4, int(round(0.25 * n_pts)))
+            n_val = min(n_val, max(1, n_pts - 8)) if n_pts > 12 else max(1, n_pts // 5)
+            if n_pts >= 16 and n_val >= 4:
+                # Deterministic tail holdout (stable across runs of same data).
+                y_val = y_arr[-n_val:]
+                p_val = pred[-n_val:]
+                y_fit = y_arr[:-n_val]
+                p_fit = pred[:-n_val]
+                var_val = max(float(np.var(y_val)), 1e-15)
+                var_fit = max(float(np.var(y_fit)), 1e-15)
+                hold_mse = float(np.mean((p_val - y_val) ** 2))
+                fit_mse = float(np.mean((p_fit - y_fit) ** 2))
+                hold_r2 = float(1.0 - hold_mse / var_val)
+                fit_r2 = float(1.0 - fit_mse / var_fit)
+                gap = float(fit_r2 - hold_r2) if np.isfinite(fit_r2) and np.isfinite(hold_r2) else 0.0
+            else:
+                hold_r2 = float(r2) if r2 is not None else -1.0
+                gap = 0.0
+            n_feat = int(X_arr.shape[1]) if X_arr.ndim == 2 else 1
+            max_cx = 28 if n_feat <= 1 else 40
+            if complexity > max_cx:
+                continue
+            if not np.isfinite(hold_r2) or hold_r2 < 0.25:
+                continue
+            if gap > 0.50:
+                continue
+            rank = -float(hold_r2) + 0.002 * float(complexity)
             scored.append((rank, candidate, pred, residual))
 
         scored.sort(key=lambda item: item[0])

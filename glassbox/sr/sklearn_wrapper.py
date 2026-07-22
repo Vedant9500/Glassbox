@@ -1016,6 +1016,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         # Pipeline control
         use_fast_path=True,
         use_guided_evolution=True,
+        prefer_cpp_1d_evolution=True,  # S10-5: C++ metric contract for 1D by default
         use_simplification=True,
         classifier_path=DEFAULT_CURVE_CLASSIFIER_PATH,
         simplification_int_tol=0.05,
@@ -1097,6 +1098,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.arithmetic_temperature = arithmetic_temperature
         self.use_fast_path = use_fast_path
         self.use_guided_evolution = use_guided_evolution
+        self.prefer_cpp_1d_evolution = bool(prefer_cpp_1d_evolution)
         self.use_simplification = use_simplification
         self.classifier_path = classifier_path
         self.simplification_int_tol = simplification_int_tol
@@ -1254,9 +1256,28 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     if np.isfinite(ent) and np.isfinite(mar):
                         # High confidence (low entropy, high margin) → shrink budget
                         confidence = float(np.clip((1.0 - ent) * min(mar / 0.25, 1.0), 0.0, 1.0))
-                        
-                        # Map confidence ∈ [0,1] to multiplier ∈ [0.1, 1.0] (more aggressive than 0.3)
+                        # Map confidence ∈ [0,1] to multiplier ∈ [0.1, 1.0]
                         uncertainty_scale = 1.0 - 0.9 * confidence
+                        # S9-2: do not aggressively shrink when fit is still poor or
+                        # residual diagnostics look suspicious (overconfident miss).
+                        residual_suspicious = bool(
+                            uncertainty.get("residual_suspicious", False)
+                        )
+                        fp = getattr(self, "_fp_result", None)
+                        if isinstance(fp, dict):
+                            rd = fp.get("residual_diagnostics") or fp.get("details") or {}
+                            if isinstance(rd, dict):
+                                residual_suspicious = residual_suspicious or bool(
+                                    rd.get("residual_suspicious", False)
+                                )
+                        try:
+                            r2_now = float(current_r2)
+                        except Exception:
+                            r2_now = -1.0
+                        if residual_suspicious or (np.isfinite(r2_now) and r2_now < 0.90):
+                            uncertainty_scale = max(float(uncertainty_scale), 0.75)
+                        if np.isfinite(r2_now) and r2_now < 0.70:
+                            uncertainty_scale = max(float(uncertainty_scale), 1.0)
                         score *= uncertainty_scale
                 except (TypeError, ValueError):
                     pass
@@ -2927,6 +2948,31 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if wv is not None and float(np.sum(wv)) <= 0:
             return None
 
+        # S3-1: score *structure* (identity affine) and optional free affine separately.
+        # Free affine can make wrong shapes look excellent; rank by structure unless
+        # the raw prediction already matches target shape (high correlation).
+        loss_kw = self._search_loss_kwargs()
+        struct_search_fit = _robust_loss(x_fit, t_fit, sample_weight=wf, **loss_kw)
+        struct_search_val = _robust_loss(x_val, t_val, sample_weight=wv, **loss_kw)
+        if not np.isfinite(struct_search_fit) or not np.isfinite(struct_search_val):
+            return None
+        struct_u_fit = float(np.mean((x_fit - t_fit) ** 2))
+        struct_u_val = float(np.mean((x_val - t_val) ** 2))
+        val_var_u = float(np.var(t_val))
+        struct_u_r2 = (
+            1.0 if val_var_u < 1e-15 and struct_u_val < 1e-15
+            else (0.0 if val_var_u < 1e-15 else 1.0 - struct_u_val / val_var_u)
+        )
+        struct_w_r2 = None
+        if wv is not None:
+            mean_t0 = float(np.sum(wv * t_val) / float(np.sum(wv)))
+            val_var_w0 = float(np.sum(wv * (t_val - mean_t0) ** 2) / float(np.sum(wv)))
+            struct_w_mse = float(np.sum(wv * (x_val - t_val) ** 2) / float(np.sum(wv)))
+            struct_w_r2 = (
+                1.0 if val_var_w0 < 1e-15 and struct_w_mse < 1e-15
+                else (0.0 if val_var_w0 < 1e-15 else 1.0 - struct_w_mse / val_var_w0)
+            )
+
         try:
             if wf is None:
                 coef, _, _, _ = np.linalg.lstsq(
@@ -2940,16 +2986,19 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 coef, _, _, _ = np.linalg.lstsq(A, t_fit * sw, rcond=None)
             scale = float(coef[0])
             bias = float(coef[1])
+            if not (np.isfinite(scale) and np.isfinite(bias)):
+                scale, bias = 1.0, 0.0
             fit_pred = scale * x_fit + bias
             val_pred = scale * x_val + bias
         except Exception:
-            return None
+            scale, bias = 1.0, 0.0
+            fit_pred = x_fit
+            val_pred = x_val
 
         unweighted_fit_mse = float(np.mean((fit_pred - t_fit) ** 2))
         unweighted_val_mse = float(np.mean((val_pred - t_val) ** 2))
         if not np.isfinite(unweighted_fit_mse) or not np.isfinite(unweighted_val_mse):
             return None
-        val_var_u = float(np.var(t_val))
         unweighted_r2 = (
             1.0 if val_var_u < 1e-15 and unweighted_val_mse < 1e-15
             else (0.0 if val_var_u < 1e-15 else 1.0 - unweighted_val_mse / val_var_u)
@@ -2969,26 +3018,54 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 else (0.0 if val_var_w < 1e-15 else 1.0 - weighted_val_mse / val_var_w)
             )
 
-        # Search objective may use robust loss (Phase 4); keep plain MSE diagnostics.
-        loss_kw = self._search_loss_kwargs()
         search_fit = _robust_loss(fit_pred, t_fit, sample_weight=wf, **loss_kw)
         search_val = _robust_loss(val_pred, t_val, sample_weight=wv, **loss_kw)
         if not np.isfinite(search_fit) or not np.isfinite(search_val):
             return None
 
-        fit_mse = float(search_fit)
-        val_mse = float(search_val)
-        # R² stays unweighted/weighted MSE-based for interpretability
-        val_r2 = weighted_r2 if weighted_r2 is not None else unweighted_r2
+        # Shape agreement between raw structure prediction and target.
+        shape_corr = 0.0
+        try:
+            if float(np.std(x_val)) > 1e-12 and float(np.std(t_val)) > 1e-12:
+                shape_corr = float(np.corrcoef(x_val, t_val)[0, 1])
+                if not np.isfinite(shape_corr):
+                    shape_corr = 0.0
+        except Exception:
+            shape_corr = 0.0
+        shape_corr_abs = abs(shape_corr)
+
+        # Ranking: structure-first unless shape already matches (scale recovery).
+        use_affine_rank = shape_corr_abs >= 0.97
+        if use_affine_rank:
+            fit_mse = float(search_fit)
+            val_mse = float(search_val)
+            val_r2 = weighted_r2 if weighted_r2 is not None else unweighted_r2
+        else:
+            fit_mse = float(struct_search_fit)
+            val_mse = float(struct_search_val)
+            val_r2 = struct_w_r2 if struct_w_r2 is not None else struct_u_r2
 
         complexity = max(
             1,
             text.count("+") + text.count("-") + text.count("*")
             + text.count("/") + text.count("^") + 1,
         )
-        refined_formula = text
+        affine_formula = text
         if abs(scale - 1.0) > 1e-8 or abs(bias) > 1e-8:
-            refined_formula = f"(({scale:.12g})*({text})+({bias:.12g}))"
+            affine_formula = f"(({scale:.12g})*({text})+({bias:.12g}))"
+
+        # Export affine wrap only for near-identity, strong shape match, or
+        # already-good structure (hygiene) — never for low-correlation shapes.
+        near_identity = abs(scale - 1.0) <= 0.05 and abs(bias) <= max(1e-6, 0.05 * max(abs(float(np.mean(t_val))), 1.0))
+        export_affine = (
+            affine_formula != text
+            and (
+                near_identity
+                or use_affine_rank
+                or (struct_u_r2 >= 0.85 and unweighted_r2 + 1e-12 >= struct_u_r2 - 0.02)
+            )
+        )
+        refined_formula = affine_formula if export_affine else text
 
         risk_score = self._formula_risk_score(refined_formula, X_val)
         if wv is None:
@@ -3004,12 +3081,20 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         return {
             "formula": refined_formula,
             "base_formula": text,
+            "affine_formula": affine_formula,
             "fit_mse": fit_mse,
             "mse": val_mse,
             "r2": float(val_r2),
-            "unweighted_fit_mse": unweighted_fit_mse,
-            "unweighted_validation_mse": unweighted_val_mse,
-            "unweighted_r2": float(unweighted_r2),
+            "structure_mse": float(struct_search_val),
+            "structure_r2": float(struct_u_r2),
+            "affine_mse": float(search_val),
+            "affine_r2": float(unweighted_r2),
+            "shape_corr": float(shape_corr),
+            "used_affine_rank": bool(use_affine_rank),
+            "exported_affine": bool(export_affine),
+            "unweighted_fit_mse": float(struct_u_fit if not use_affine_rank else unweighted_fit_mse),
+            "unweighted_validation_mse": float(struct_u_val if not use_affine_rank else unweighted_val_mse),
+            "unweighted_r2": float(struct_u_r2 if not use_affine_rank else unweighted_r2),
             "weighted_fit_mse": weighted_fit_mse,
             "weighted_validation_mse": weighted_val_mse,
             "weighted_r2": None if weighted_r2 is None else float(weighted_r2),
@@ -3958,7 +4043,27 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             }
         return out
 
+    def _guard_validation_split(self, X, y, *, validation_fraction=0.25):
+        """S3-2: prefer once-per-fit selection holdout for guards/residual.
+
+        Falls back to domain-edge split only when selection holdout is unavailable.
+        Returns ``(split_dict_or_None, mode_str)``.
+        """
+        split = self._ensure_selection_holdout(X, y, validation_fraction=validation_fraction)
+        if split is not None:
+            return split, "selection_holdout"
+        try:
+            split = self._domain_edge_validation_split(
+                X, y, validation_fraction=validation_fraction
+            )
+        except Exception:
+            split = None
+        if split is not None:
+            return split, "domain_edge"
+        return None, "none"
+
     def _final_holdout_scores(self, base_formula, candidate_formula, X, y):
+
         """Score a final-stage candidate on the carved selection holdout (S1-5)."""
         split = self._ensure_selection_holdout(X, y, validation_fraction=0.25)
         if split is None:
@@ -4080,11 +4185,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         out["full_mse"] = float(full_mse) if np.isfinite(full_mse) else float("inf")
         out["full_r2"] = self._unweighted_r2_from_mse(full_mse, y)
 
-        # Deterministic edge holdout, unweighted (do not use sample_weight).
-        try:
-            split = self._domain_edge_validation_split(X, y, validation_fraction=0.25)
-        except Exception:
-            split = None
+        # S3-2: same holdout as selection when available (unweighted metrics).
+        split, holdout_mode = self._guard_validation_split(X, y, validation_fraction=0.25)
+        out["holdout_mode"] = holdout_mode
         if split is not None:
             try:
                 train_mse = self._display_formula_mse(text, split["X_fit"], split["y_fit"])
@@ -6957,10 +7060,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             self._residual_stage_guard_["reason"] = "no_refined_residual_candidates"
             return None
 
-        split = self._domain_edge_validation_split(X, y, validation_fraction=0.2)
+        split, split_mode = self._guard_validation_split(X, y, validation_fraction=0.2)
         if split is None:
             self._residual_stage_guard_["reason"] = "no_validation_split"
             return None
+        self._residual_stage_guard_["holdout_mode"] = split_mode
 
         # Phase 6: residual acceptance requires weighted val improvement AND
         # unweighted/edge val not worse beyond noise-aware slack.
@@ -8633,11 +8737,20 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             else:
                 evo_formula = None
                 evo_mse = float('inf')
-                # Try guided evolution (beam search) only if R² is low
-                if (self.use_guided_evolution and operator_hints
-                    and self.n_features_in_ == 1
+                # Try guided evolution (beam search) only if R² is low.
+                # S10-5: default prefer_cpp_1d_evolution skips Python/torch guided
+                # unless R² is very poor (emergency warm-start only) so 1D uses the
+                # same C++ raw_mse / weight contract as multi-feature.
+                _run_guided = (
+                    self.use_guided_evolution
+                    and operator_hints
+                    and int(getattr(self, "n_features_search_", self.n_features_in_) or self.n_features_in_) == 1
                     and (current_r2 < self.evolution_skip_r2 or not fast_path_cv_ok)
-                    and _elapsed() < effective_timeout):
+                    and _elapsed() < effective_timeout
+                )
+                if _run_guided and bool(getattr(self, "prefer_cpp_1d_evolution", True)):
+                    _run_guided = float(current_r2) < 0.50
+                if _run_guided:
                     try:
                         from classifier_fast_path import run_guided_evolution  # type: ignore
 

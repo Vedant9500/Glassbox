@@ -868,7 +868,7 @@ def prepare_blackbox_search(
             plateau_tol = max(0.02, 0.08 * max(abs(top_score), 1e-12))
             min_meaningful = max(0.12, 0.35 * max(abs(top_score), 1e-12))
             extend_i = k
-            max_extra = max(1, min(2, len(usable) - k))
+            max_extra = max(1, min(3, len(usable) - k))  # S7-1: allow slightly wider plateau
             while extend_i < len(ranked_usable) and (extend_i - k) < max_extra:
                 s_next = float(feature_scores.get(ranked_usable[extend_i], 0.0))
                 if s_next < min_meaningful:
@@ -897,6 +897,59 @@ def prepare_blackbox_search(
                 ):
                     selected = strong
                     extend_i = k  # treat as non-extended for reason labeling
+
+            # S7-1: rescue weak-but-supported features past top-k so true
+            # secondary variables are less often dropped under confident ranking.
+            top_cheap = max((float(v) for v in cheap_scores.values()), default=0.0)
+            rescue_floor = max(0.06, 0.15 * max(abs(top_score), 1e-12))
+            max_selected = min(len(usable), max(k + 3, int(max_features) + 2))
+            for idx in ranked_usable:
+                if idx in selected:
+                    continue
+                if len(selected) >= max_selected:
+                    break
+                s_idx = float(feature_scores.get(idx, 0.0))
+                if s_idx < rescue_floor:
+                    continue
+                supported = False
+                support_votes = 0
+                for votes in (ranker_votes or {}).values():
+                    if not isinstance(votes, dict) or not votes:
+                        continue
+                    ordered = sorted(
+                        votes.keys(),
+                        key=lambda j: float(votes.get(j, 0.0)),
+                        reverse=True,
+                    )
+                    top_v = float(max(votes.values())) if votes else 0.0
+                    # Top-2 among usable features with non-trivial relative vote.
+                    if (
+                        idx in ordered[: min(2, len(ordered))]
+                        and float(votes.get(idx, 0.0)) >= 0.20 * max(top_v, 1e-12)
+                    ):
+                        support_votes += 1
+                if support_votes >= 2:
+                    supported = True
+                cheap_i = float(cheap_scores.get(idx, 0.0))
+                if (
+                    not supported
+                    and top_cheap > 0
+                    and cheap_i >= 0.30 * top_cheap
+                    and s_idx >= 0.12 * max(abs(top_score), 1e-12)
+                ):
+                    supported = True
+                # Ensemble score itself is a support signal when not near noise floor.
+                if (
+                    not supported
+                    and s_idx >= 0.20 * max(abs(top_score), 1e-12)
+                    and s_idx >= 3.0 * max(
+                        float(feature_scores.get(ranked_usable[-1], 0.0)), 1e-12
+                    )
+                ):
+                    supported = True
+                if supported:
+                    selected.append(int(idx))
+
             kth_score = float(feature_scores.get(selected[-1], 0.0)) if selected else 0.0
             # Recompute next after possible head trim.
             ranked_sel = sorted(

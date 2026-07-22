@@ -185,16 +185,18 @@ Phase 7  API polish & cleanup (P2)
 | 6.5 | **S9** | Curve classifier integration | **done** — S9-1..5 |
 | 6.6 | **S10** | Proposer, Python evolution, optimizers, FPIP | **done** — S10-1..5 |
 
-### Phase 6.x fix wave (recommended next)
-| Priority | ID | Work |
-|----------|-----|------|
-| P1 | **S3-1** | Score/structure rank without free affine, or keep affine but export base_formula + gate on unweighted structure |
-| P1 | **S3-2** | Unify guard/residual holdouts with `_selection_holdout_` |
-| P1 | **S7-1** | Safer drop policy / uncertainty floor for true-feature recall |
-| P1 | **S8-1** | Vault admission requires unweighted holdout / complexity gate |
-| P1 | **S9-2** | Cap budget shrink when residual_suspicious / low R² |
-| P1 | **S10-5** | Document guided vs C++ metric parity; optional route 1D to C++ |
-| P2 | S6-1/2/4, S3-3..6, rest | defaults expose, elite_size bind, polish |
+### Phase 6.x fix wave
+**Status:** done (2026-07-22)
+
+| Priority | ID | Work | Status |
+|----------|-----|------|--------|
+| P1 | **S3-1** | Structure-first rank; corr-gated affine export | **done** |
+| P1 | **S3-2** | Guards/residual use selection holdout | **done** |
+| P1 | **S7-1** | Weak-but-supported feature rescue past top-k | **done** |
+| P1 | **S8-1** | Vault holdout R² + complexity admission | **done** |
+| P1 | **S9-2** | Cap budget shrink on poor R² / residual_suspicious | **done** |
+| P1 | **S10-5** | `prefer_cpp_1d_evolution=True` (guided only if R²<0.5) | **done** |
+| P2 | S6-1/2/4, S3-3..6, rest | defaults expose, elite_size bind, polish | open |
 
 After each: fold new P0/P1 into a **Phase 6.x fix wave** or Phase 7.
 
@@ -309,7 +311,7 @@ S3 audit ──► deep scoring/guard redesign (S1-5/6)
 
 ### Phase 6–7
 - [x] Audit S6, S3, S7–S10
-- [ ] Phase 6.x P1 fix wave (S3-1/2, S7-1, S8-1, S9-2, S10-5)
+- [x] Phase 6.x P1 fix wave (S3-1/2, S7-1, S8-1, S9-2, S10-5)
 - [ ] S1-11 export API
 - [ ] Remaining P2
 
