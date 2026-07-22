@@ -367,7 +367,108 @@ inline std::string normalize_formula_string(std::string formula) {
     }
     
     replace_all(formula, "**", "^");
+
+    // S5-14: "sin x" / "sin 2" / "abs (x)" → function(arg) for known unaries.
+    {
+        const char* funcs[] = {
+            "sin", "cos", "tan", "exp", "log", "ln", "abs", "sqrt", "sign", "asin", "acos", "atan"
+        };
+        for (const char* fn : funcs) {
+            const std::string f(fn);
+            size_t pos = 0;
+            while ((pos = formula.find(f, pos)) != std::string::npos) {
+                if (pos > 0) {
+                    char prev = formula[pos - 1];
+                    if (std::isalnum(static_cast<unsigned char>(prev)) || prev == '_') {
+                        pos += f.size();
+                        continue;
+                    }
+                }
+                size_t j = pos + f.size();
+                while (j < formula.size() && std::isspace(static_cast<unsigned char>(formula[j]))) ++j;
+                if (j >= formula.size() || formula[j] == '(') {
+                    pos = j < formula.size() ? j + 1 : formula.size();
+                    continue;
+                }
+                size_t start = j;
+                size_t end = start;
+                if (formula[start] == '(') {
+                    int depth = 0;
+                    for (; end < formula.size(); ++end) {
+                        if (formula[end] == '(') ++depth;
+                        else if (formula[end] == ')') {
+                            --depth;
+                            if (depth == 0) { ++end; break; }
+                        }
+                    }
+                } else if (std::isdigit(static_cast<unsigned char>(formula[start])) || formula[start] == '.') {
+                    bool has_dot = false, has_exp = false;
+                    while (end < formula.size()) {
+                        char c = formula[end];
+                        if (std::isdigit(static_cast<unsigned char>(c))) { ++end; continue; }
+                        if (c == '.' && !has_dot && !has_exp) { has_dot = true; ++end; continue; }
+                        if ((c == 'e' || c == 'E') && !has_exp) {
+                            has_exp = true; ++end;
+                            if (end < formula.size() && (formula[end] == '+' || formula[end] == '-')) ++end;
+                            continue;
+                        }
+                        break;
+                    }
+                } else if (std::isalpha(static_cast<unsigned char>(formula[start])) || formula[start] == '_') {
+                    while (end < formula.size() &&
+                           (std::isalnum(static_cast<unsigned char>(formula[end])) || formula[end] == '_')) {
+                        ++end;
+                    }
+                } else {
+                    pos = j + 1;
+                    continue;
+                }
+                if (end <= start) { pos = j + 1; continue; }
+                const std::string atom = formula.substr(start, end - start);
+                const std::string repl = f + "(" + atom + ")";
+                formula.replace(pos, end - pos, repl);
+                pos += repl.size();
+            }
+        }
+    }
     return formula;
+}
+
+// S5-14: insert explicit '*' for juxtaposition: 2x, 2(x+1), (x)(y), x(
+inline std::vector<Token> insert_implicit_multiplication(std::vector<Token> tokens) {
+    if (tokens.size() < 2) return tokens;
+    auto is_value_like = [](const Token& t) {
+        return t.type == TokenType::Number
+            || t.type == TokenType::Identifier
+            || t.type == TokenType::RParen;
+    };
+    auto is_atom_start = [](const Token& t) {
+        return t.type == TokenType::Number
+            || t.type == TokenType::Identifier
+            || t.type == TokenType::LParen;
+    };
+    auto is_func_name = [](const Token& t) {
+        if (t.type != TokenType::Identifier) return false;
+        const std::string& s = t.text;
+        return s == "sin" || s == "cos" || s == "tan" || s == "exp" || s == "log"
+            || s == "ln" || s == "abs" || s == "sqrt" || s == "sign"
+            || s == "asin" || s == "acos" || s == "atan";
+    };
+    std::vector<Token> out;
+    out.reserve(tokens.size() * 2);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        out.push_back(tokens[i]);
+        if (i + 1 >= tokens.size()) break;
+        const Token& a = tokens[i];
+        const Token& b = tokens[i + 1];
+        if (!is_value_like(a) || !is_atom_start(b)) continue;
+        // function call: sin (
+        if (is_func_name(a) && b.type == TokenType::LParen) continue;
+        // do not insert between two bare identifiers that look like multi-char vars only
+        // (still insert for 2x via Number+Identifier, and x( via Identifier+LParen)
+        out.push_back(Token{TokenType::Mul, "*"});
+    }
+    return out;
 }
 
 inline void collect_additive_terms(
@@ -670,7 +771,7 @@ struct GraphCompiler {
 
 inline IndividualGraph formula_to_graph(const std::string& formula_str) {
     std::string norm = normalize_formula_string(formula_str);
-    auto tokens = tokenize(norm);
+    auto tokens = insert_implicit_multiplication(tokenize(norm));
     Parser parser(tokens);
     auto root = parser.parse();
 

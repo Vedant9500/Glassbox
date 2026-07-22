@@ -119,7 +119,7 @@ Phase 7  API polish & cleanup (P2)
 
 ## Phase 3 — Graph / eval / refine harden (remaining S5)
 
-**Status:** done (2026-07-20) — S5-5/6/8/11/12/13/15 fixed; S5-14/S5-16 left open/P2.
+**Status:** done (2026-07-20) — S5-5/6/8/11/12/13/15 fixed; S5-14/S5-16 closed in Phase 7.
 
 **Goal:** Eval cache correctness; formula export completeness; refine reaches nested params.
 
@@ -130,7 +130,7 @@ Phase 7  API polish & cleanup (P2)
 | 3.3 | **S5-8** | Inner refine/snap: include nested unaries that are ancestors of active outputs, not only nonzero output-weight nodes | **done** |
 | 3.4 | **S5-11** / **O16** | `get_child` by const ref / Map — hot-path copy removal | **done** — `decltype(auto)` |
 | 3.5 | **S5-12** | `simplify.h` use `get_arithmetic_temperature()`; fold Aggregation constants | **done** |
-| 3.6 | **S5-13–S5-16** | P2: inactive_nodes units; partial-eval bounds; legacy `evaluate_fitness`; dual cache cleanup | **partial** — S5-13/15 done; S5-14/16 open |
+| 3.6 | **S5-13–S5-16** | P2: inactive_nodes units; partial-eval bounds; legacy `evaluate_fitness`; dual cache cleanup | **done** — S5-13/15 earlier; S5-14/16 in Phase 7 |
 
 **Done in this area:** S5-1..S5-4, S5-7.
 
@@ -204,13 +204,16 @@ After each: fold new P0/P1 into a **Phase 6.x fix wave** or Phase 7.
 
 ## Phase 7 — API polish & cleanup (P2)
 
-| ID | Work |
-|----|------|
-| **S1-11** | Export `GlassboxRegressor` from `glassbox.sr`; fix `__all__` / FPIPv2 name |
-| **S1-12** | Already largely O8 — remove scripts coupling |
-| **S5-14** | Optional grammar (implicit mul); power display parity |
-| **S5-15, S5-16** | Partial-eval safety; dead dual fitness path |
-| **E\*** remaining P2 | Global temp docs, kitchen-sink docs |
+**Status:** done (2026-07-22) — S1-11 export; S5-14 implicit mul + even-power print parity; S5-16 legacy fitness fields; S6-2 elite/seed bindings; S5-15/S1-12/E4/E10 already done earlier.
+
+| ID | Work | Status |
+|----|------|--------|
+| **S1-11** | Export `GlassboxRegressor` from `glassbox.sr`; fix `__all__` / FPIPv2 name | **done** |
+| **S1-12** | Already largely O8 — remove scripts coupling | **done** (local `_display_formula_mse`) |
+| **S5-14** | Optional grammar (implicit mul); power display parity | **done** |
+| **S5-15, S5-16** | Partial-eval safety; dead dual fitness path | **done** (15 earlier; 16 now) |
+| **S6-2** | Expose `elite_size` / `seed_fraction` in `run_evolution` bindings | **done** |
+| **E*** remaining P2 | Global temp docs, kitchen-sink docs | **done** (E4/E10 notes in eval.h) |
 
 ---
 
@@ -295,7 +298,7 @@ S3 audit ──► deep scoring/guard redesign (S1-5/6)
 - [x] S5-8 nested refine
 - [x] S5-11 get_child copies
 - [x] S5-12 simplify temp
-- [x] S5-13/15; S5-14/16 still open
+- [x] S5-13/15; S5-14/16 done (Phase 7)
 
 ### Phase 4
 - [x] S1-4 n_features_in_
@@ -312,8 +315,9 @@ S3 audit ──► deep scoring/guard redesign (S1-5/6)
 ### Phase 6–7
 - [x] Audit S6, S3, S7–S10
 - [x] Phase 6.x P1 fix wave (S3-1/2, S7-1, S8-1, S9-2, S10-5)
-- [ ] S1-11 export API
-- [ ] Remaining P2
+- [x] S1-11 export API
+- [x] S5-14/16 + S6-2 API polish
+- [x] Phase 7 remaining P2 polish
 
 ---
 

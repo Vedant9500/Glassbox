@@ -16,6 +16,7 @@
 #include <cctype>
 #include <string>
 #include <stdexcept>
+#include <algorithm>
 
 namespace py = pybind11;
 
@@ -427,7 +428,10 @@ py::dict run_evolution_cpp(
     py::object y_weights_obj = py::none(),
     std::string loss_mode = "mse",
     double huber_delta = -1.0,
-    double trim_fraction = 0.1
+    double trim_fraction = 0.1,
+    // S6-2: expose EvolutionConfig elite/seed knobs (engine defaults otherwise).
+    int elite_size = 10,
+    double seed_fraction = 0.5
 ) {
     // 1. Convert Python/Numpy inputs to C++/Eigen
     std::vector<Eigen::ArrayXd> X;
@@ -652,7 +656,10 @@ py::dict run_evolution_cpp(
     config.acceptable_complexity = acceptable_complexity;
     config.early_stop_max_nodes = early_stop_max_nodes;
     config.arithmetic_temperature = arithmetic_temperature;
-    // Default seed fraction 0.5 (E3); leave eval_num_threads=0 for auto.
+    // S6-2 / E3: allow Python to override elite count and seed injection capacity.
+    config.elite_size = std::max(1, elite_size);
+    config.seed_fraction = std::clamp(seed_fraction, 0.05, 1.0);
+    // leave eval_num_threads=0 for auto.
 
     // Phase 4: robust search loss (default mse preserves legacy behaviour).
     {
@@ -1090,7 +1097,9 @@ PYBIND11_MODULE(_core, m) {
           py::arg("y_weights")=py::none(),
           py::arg("loss_mode")="mse",
           py::arg("huber_delta")=-1.0,
-          py::arg("trim_fraction")=0.1);
+          py::arg("trim_fraction")=0.1,
+          py::arg("elite_size")=10,
+          py::arg("seed_fraction")=0.5);
 
     m.def("refine_frequencies", &refine_frequencies_wrapper, "Refines frequencies via Eigen varpro");
     m.def("refine_powers", &refine_powers_model_wrapper, "Refines powers via Eigen varpro");

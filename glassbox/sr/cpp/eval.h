@@ -342,10 +342,15 @@ inline Eigen::ArrayXd evaluate_graph_cached(const IndividualGraph& graph,
 }
 
 // Compute MSE fitness
+// S5-16: keep raw_mse/weighted_mse/fitness_valid in sync with the main scoring path.
+// Legacy helper has no sample weights — weighted_mse mirrors unweighted MSE.
 inline double evaluate_fitness(IndividualGraph& graph, const std::vector<Eigen::ArrayXd>& X, const Eigen::ArrayXd& y, int num_samples) {
     Eigen::ArrayXd pred = evaluate_graph_simple(graph, X, num_samples);
     double mse = (pred - y).square().mean();
     graph.fitness = mse;
+    graph.raw_mse = mse;
+    graph.weighted_mse = mse;
+    graph.fitness_valid = true;
     return mse;
 }
 
@@ -527,9 +532,17 @@ inline std::string format_node_to_string(
                     return result;
                 }
                 case UnaryOp::Power: {
-                    // Use integer if p is a whole number
+                    // S5-14: match eval parity for near-integer p.
+                    // Even integers use abs-base in evaluate_graph (power_sign_blend);
+                    // print abs form so external string eval cannot diverge on negatives.
+                    // Odd integers keep signed base; non-integers keep sign*(abs)^p.
                     if (std::abs(node.p - std::round(node.p)) < 1e-6) {
-                        snprintf(buf, sizeof(buf), "(%s)^%d", child_str.c_str(), (int)std::round(node.p));
+                        int n = static_cast<int>(std::round(node.p));
+                        if ((n % 2) == 0) {
+                            snprintf(buf, sizeof(buf), "(abs(%s))^%d", child_str.c_str(), n);
+                        } else {
+                            snprintf(buf, sizeof(buf), "(%s)^%d", child_str.c_str(), n);
+                        }
                     } else {
                         snprintf(buf, sizeof(buf), "sign(%s)*(abs(%s))^%.4g", child_str.c_str(), child_str.c_str(), node.p);
                     }

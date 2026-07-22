@@ -108,6 +108,11 @@ from glassbox.sr.fpip_v2 import (
     validate_fpip_v2_payload,
     FPIPv2,
 )
+# Back-compat alias (older __all__ listed FPIPv2Payload)
+FPIPv2Payload = FPIPv2
+
+# Public sklearn estimator (S1-11)
+from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
 # v2: GPU Optimization
 
@@ -190,5 +195,9 @@ __all__ = [
     # v2: FPIP v2
     'build_fpip_v2_from_fast_path',
     'validate_fpip_v2_payload',
-    'FPIPv2Payload',
+    'FPIPv2',
+    'FPIPv2Payload',  # alias of FPIPv2
+
+    # Public estimator
+    'GlassboxRegressor',
 ]
