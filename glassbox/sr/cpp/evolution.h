@@ -133,6 +133,13 @@ struct EvolutionConfig {
     // Islands use small island_size; higher fraction avoids seed starvation.
     double seed_fraction = 0.5;
 
+    // Macro mutation rate among offspring (historical hard-coded 0.15).
+    // Raise when product/rational structure is expected (e.g. x^2*sin(x)).
+    double macro_mutation_rate = 0.15;
+    // Relative weights for macro modes: [wrap, multiply, divide, nest].
+    // Empty => historical defaults {0.4, 0.2, 0.2, 0.2}.
+    std::vector<double> macro_mode_weights;
+
     // Phase 0 evaluation hooks
     double acceptable_mse = 1e-3;
     int acceptable_complexity = 20;
@@ -358,12 +365,13 @@ public:
                 // Generate offspring
                 std::uniform_int_distribution<int> p_dist(0, std::max(0, (int)population_.size() - 1));
                 std::uniform_real_distribution<double> co(0.0, 1.0);
+                const double macro_rate = std::clamp(config_.macro_mutation_rate, 0.0, 0.9);
                 for (int i = 0; i < config_.pop_size; ++i) {
                     IndividualGraph child;
                     double roll = co(rng_);
-                    if (roll < 0.15) {
+                    if (roll < macro_rate) {
                         child = macro_mutate(population_[p_dist(rng_)]);
-                    } else if (config_.elite_size >= 2 && roll < 0.15 + config_.crossover_rate) {
+                    } else if (config_.elite_size >= 2 && roll < macro_rate + config_.crossover_rate) {
                         int p1 = p_dist(rng_), p2 = p_dist(rng_);
                         while (p2 == p1) p2 = p_dist(rng_);
                         child = crossover_with_retry(population_[p1], population_[p2], 3);
@@ -448,15 +456,16 @@ public:
             // Fill remainder of main population with crossover + mutated offspring
             std::uniform_int_distribution<int> parent_dist(0, config_.elite_size - 1);
             std::uniform_real_distribution<double> coin(0.0, 1.0);
+            const double macro_rate = std::clamp(config_.macro_mutation_rate, 0.0, 0.9);
             while (next_gen.size() < main_pop_target) {
                 IndividualGraph child;
                 double roll = coin(rng_);
 
-                if (roll < 0.15) {
-                    // --- Macro-Mutation (15%) ---
+                if (roll < macro_rate) {
+                    // --- Macro-Mutation (configurable; default 15%) ---
                     int parent_idx = parent_dist(rng_);
                     child = macro_mutate(population_[parent_idx]);
-                } else if (config_.elite_size >= 2 && roll < 0.15 + config_.crossover_rate) {
+                } else if (config_.elite_size >= 2 && roll < macro_rate + config_.crossover_rate) {
                     // --- Subtree Crossover ---
                     int p1 = parent_dist(rng_);
                     int p2 = parent_dist(rng_);
@@ -1715,10 +1724,28 @@ private:
         if (n >= config_.max_nodes) {
             return mutate_lamarckian(child, 0.15);
         }
+
+        // Mode thresholds from [wrap, multiply, divide, nest] weights (default historical).
+        double w_wrap = 0.4, w_mul = 0.2, w_div = 0.2, w_nest = 0.2;
+        if (config_.macro_mode_weights.size() >= 4) {
+            w_wrap = std::max(0.0, config_.macro_mode_weights[0]);
+            w_mul = std::max(0.0, config_.macro_mode_weights[1]);
+            w_div = std::max(0.0, config_.macro_mode_weights[2]);
+            w_nest = std::max(0.0, config_.macro_mode_weights[3]);
+            double wsum = w_wrap + w_mul + w_div + w_nest;
+            if (wsum > 1e-12) {
+                w_wrap /= wsum; w_mul /= wsum; w_div /= wsum; w_nest /= wsum;
+            } else {
+                w_wrap = 0.4; w_mul = 0.2; w_div = 0.2; w_nest = 0.2;
+            }
+        }
+        const double t_wrap = w_wrap;
+        const double t_mul = t_wrap + w_mul;
+        const double t_div = t_mul + w_div;
         
         double roll = runif(rng_);
         
-        if (roll < 0.4) {
+        if (roll < t_wrap) {
             // ── Wrap Mutation ──
             // Prefer active building blocks, falling back to random nodes.
             int target = sample_active_node(child, 1, n - 1);
@@ -1762,7 +1789,7 @@ private:
             child.nodes.push_back(wrap_node);
             child.output_weights.push_back(0.5); // Small initial weight
             
-        } else if (roll < 0.6) {
+        } else if (roll < t_mul) {
             // ── Multiply Mutation ──
             // Recombine active modules into a product candidate.
             int left = sample_active_node(child, 0, n - 1);
@@ -1795,7 +1822,7 @@ private:
                 child.output_weights[right] = 0.0;
             }
             
-        } else if (roll < 0.8) {
+        } else if (roll < t_div) {
             // ── Divide / Rational Mutation ──
             // Prefer useful numerator/denominator modules (Analytic Quotient).
             int left = sample_active_node(child, 0, n - 1);
@@ -1838,6 +1865,7 @@ private:
             // ── Nest Mutation ──
             // Pick a unary node f and change its input to another node g
             // Creating f(g(x)) from f(old_input) and g(x)
+            (void)w_nest;
             std::vector<int> unary_indices;
             for (int i = 0; i < n; ++i) {
                 if (child.nodes[i].type == NodeType::Unary) {
@@ -3648,12 +3676,13 @@ private:
 
             std::uniform_real_distribution<double> coin(0.0, 1.0);
             std::uniform_int_distribution<int> any_parent(0, std::max(0, static_cast<int>(population_.size()) - 1));
+            const double macro_rate = std::clamp(config_.macro_mutation_rate, 0.0, 0.9);
             for (int i = 0; i < config_.pop_size; ++i) {
                 IndividualGraph child;
                 double roll = coin(rng_);
-                if (roll < 0.15) {
+                if (roll < macro_rate) {
                     child = macro_mutate(population_[any_parent(rng_)]);
-                } else if (config_.elite_size >= 2 && roll < 0.15 + config_.crossover_rate) {
+                } else if (config_.elite_size >= 2 && roll < macro_rate + config_.crossover_rate) {
                     int p1 = tournament_select();
                     int p2 = tournament_select();
                     while (p2 == p1) p2 = tournament_select();

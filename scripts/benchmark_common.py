@@ -34,6 +34,29 @@ def get_official_pmlb_regression_datasets():
     return list(regression_dataset_names)
 
 
+def formula_benchmark_seed(formula, x_range=None, *, base_seed=0, n_samples=None):
+    """Deterministic per-formula seed for reproducible benchmark A/B runs.
+
+    Same formula + range (+ optional n_samples) maps to the same C++/Python seed,
+    independent of tier order. *base_seed* lets a global ``--seed`` shift the space.
+    """
+    import hashlib
+    import struct
+
+    parts = [str(formula or "").strip().replace(" ", "")]
+    if x_range is not None:
+        try:
+            parts.append(f"{float(x_range[0]):.8g}:{float(x_range[1]):.8g}")
+        except Exception:
+            parts.append(str(x_range))
+    if n_samples is not None:
+        parts.append(f"n={int(n_samples)}")
+    digest = hashlib.sha256("|".join(parts).encode("utf-8")).digest()
+    # Stable positive 31-bit int so it fits typical RNG seeds.
+    derived = struct.unpack(">I", digest[:4])[0] & 0x7FFFFFFF
+    return int((int(base_seed) + derived) % (2**31 - 1))
+
+
 def _read_symbolic_formula_from_metadata(dataset_dir):
     """Best-effort extraction of the symbolic target formula from PMLB metadata."""
     for meta_name in ("metadata.yaml", "metadata.yml"):
@@ -310,6 +333,204 @@ def protect_fractional_powers(formula):
         return ast.unparse(tree)
     except Exception:
         return text
+
+
+def _extract_power_exponent(node):
+    """Return float exponent if *node* is a numeric power, else None."""
+    if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.Pow):
+        return None
+    if isinstance(node.right, ast.Constant) and isinstance(node.right.value, (int, float)):
+        return float(node.right.value)
+    if (
+        isinstance(node.right, ast.UnaryOp)
+        and isinstance(node.right.op, ast.USub)
+        and isinstance(node.right.operand, ast.Constant)
+        and isinstance(node.right.operand.value, (int, float))
+    ):
+        return -float(node.right.operand.value)
+    return None
+
+
+def round_powers_to_integers(formula, *, max_power=8, tol=0.25):
+    """Round near-integer ``x**p`` exponents into {1..max_power}.
+
+    Used by the post-search exactness pass to convert numerical twins like
+    ``x**2.33`` into integer-power candidates before re-fitting.
+    """
+    text = str(formula or "").replace("^", "**")
+    if "**" not in text:
+        return text
+
+    max_power = max(1, int(max_power))
+    tol = float(tol)
+
+    class _IntegerPowerRounder(ast.NodeTransformer):
+        def visit_BinOp(self, node):  # noqa: N802
+            node = self.generic_visit(node)
+            exponent = _extract_power_exponent(node)
+            if exponent is None:
+                return node
+            nearest = int(round(exponent))
+            if nearest < 1 or nearest > max_power:
+                return node
+            if abs(exponent - nearest) > tol and abs(exponent - nearest) > 1e-10:
+                return node
+            return ast.copy_location(
+                ast.BinOp(left=node.left, op=ast.Pow(), right=ast.Constant(value=nearest)),
+                node,
+            )
+
+    try:
+        tree = ast.parse(text, mode="eval")
+        tree = _IntegerPowerRounder().visit(tree)
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree).replace("^", "**")
+    except Exception:
+        return text
+
+
+def exactness_pass_candidates(formula, *, max_power=8):
+    """Generate cheap structural rewrites for the post-search exactness pass.
+
+    Returns a de-duplicated list starting with the original (normalized) formula.
+    """
+    from collections import OrderedDict
+
+    text = normalize_formula_text(formula)
+    if not text or text in {"N/A", "ERROR", "?"}:
+        return []
+
+    candidates = OrderedDict()
+
+    def _add(f):
+        f = str(f or "").strip()
+        if not f:
+            return
+        key = f.replace(" ", "")
+        if key not in candidates:
+            candidates[key] = f
+
+    _add(text)
+    rewritten = apply_canonical_rewrites(text)
+    _add(rewritten)
+
+    int_rounded = round_powers_to_integers(text, max_power=max_power)
+    _add(int_rounded)
+    _add(apply_canonical_rewrites(int_rounded))
+
+    # Trig product probe: sum of harmonics often hides a*sin(x)*cos(x) / a*x**2*sin(x).
+    # We only inject a few high-value templates when many sin/cos terms are present.
+    lower = text.lower()
+    n_sin = len(re.findall(r"\bsin\s*\(", lower))
+    n_cos = len(re.findall(r"\bcos\s*\(", lower))
+    has_power = bool(re.search(r"\*\*|x\s*\^", lower))
+    if n_sin + n_cos >= 2:
+        _add("sin(x)*cos(x)")
+        _add("0.5*sin(2*x)")
+        if has_power or n_sin >= 2:
+            _add("x*sin(x)")
+            _add("x**2*sin(x)")
+            _add("x**3*sin(x)")
+            _add("x*cos(x)")
+            _add("x**2*cos(x)")
+    if "/" in text or "1+" in text.replace(" ", ""):
+        _add("x**3/(1+x**4)")
+        _add("x/(1+x**2)")
+        _add("x**2/(1+x**2)")
+
+    return list(candidates.values())
+
+
+def run_exactness_pass(
+    formula,
+    X,
+    y,
+    *,
+    raw_mse=None,
+    raw_mse_threshold=1e-4,
+    display_mse=None,
+    max_power=8,
+    improve_tol=0.99,
+):
+    """If raw fit is strong but display form is weak, try integer-power / identity rewrites.
+
+    Returns ``(best_formula, diagnostics)``. Never worsens MSE beyond *improve_tol*
+    relative to the better of raw/display baselines.
+    """
+    diagnostics = {
+        "attempted": False,
+        "accepted": False,
+        "reason": None,
+        "n_candidates": 0,
+        "baseline_mse": None,
+        "best_mse": None,
+        "best_formula": None,
+    }
+    text = normalize_formula_text(formula)
+    if not text or text in {"N/A", "ERROR", "?"}:
+        diagnostics["reason"] = "empty_formula"
+        return text, diagnostics
+
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+
+    def _mse(f):
+        try:
+            return evaluate_formula_mse_on_X(f, X, y)
+        except Exception:
+            return float("inf")
+
+    base_display = float(display_mse) if display_mse is not None and np.isfinite(display_mse) else _mse(text)
+    base_raw = float(raw_mse) if raw_mse is not None and np.isfinite(raw_mse) else base_display
+    baseline = min(base_display, base_raw) if np.isfinite(base_display) or np.isfinite(base_raw) else float("inf")
+    diagnostics["baseline_mse"] = float(baseline) if np.isfinite(baseline) else None
+
+    # Eligibility (future_optimization #3): strong raw fit but display not exact,
+    # or large raw↔display drift. Skip when both metrics are already excellent.
+    thr = float(raw_mse_threshold)
+    raw_good = np.isfinite(base_raw) and base_raw <= thr
+    display_good = np.isfinite(base_display) and base_display <= thr
+    drifted = (
+        np.isfinite(base_raw)
+        and np.isfinite(base_display)
+        and base_display > max(base_raw * 10.0, thr)
+    )
+    if display_good and not drifted:
+        diagnostics["reason"] = "display_already_good"
+        return text, diagnostics
+    if not raw_good and not drifted:
+        diagnostics["reason"] = "raw_mse_not_eligible"
+        return text, diagnostics
+
+    candidates = exactness_pass_candidates(text, max_power=max_power)
+    diagnostics["attempted"] = True
+    diagnostics["n_candidates"] = len(candidates)
+
+    best_f = text
+    best_m = base_display if np.isfinite(base_display) else baseline
+    for cand in candidates:
+        m = _mse(cand)
+        if not np.isfinite(m):
+            continue
+        # Prefer simpler integer-power forms even if equal MSE.
+        if m < best_m * float(improve_tol) - 1e-18 or (
+            abs(m - best_m) <= 1e-18 and len(cand) < len(best_f)
+        ):
+            best_m = m
+            best_f = cand
+
+    diagnostics["best_mse"] = float(best_m) if np.isfinite(best_m) else None
+    diagnostics["best_formula"] = best_f
+    if best_f.replace(" ", "") != text.replace(" ", "") and np.isfinite(best_m):
+        if not np.isfinite(baseline) or best_m <= baseline * 1.05 + 1e-15:
+            diagnostics["accepted"] = True
+            diagnostics["reason"] = "improved_or_equal"
+            return best_f, diagnostics
+        diagnostics["reason"] = "rejected_worse"
+        return text, diagnostics
+
+    diagnostics["reason"] = "no_better_candidate"
+    return text, diagnostics
 
 
 def simplify_formula_native(formula, int_tol=0.05, zero_tol=1e-3):

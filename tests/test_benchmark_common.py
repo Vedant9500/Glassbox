@@ -94,6 +94,45 @@ def test_canonical_rewrites_exp_log_and_trig_identities():
     assert trig_identity == "1"
 
 
+def test_round_powers_to_integers_snaps_near_int_exponents():
+    assert "x**2" in bc.round_powers_to_integers("x**2.08").replace(" ", "")
+    assert "x**3" in bc.round_powers_to_integers("1.0*x**2.95").replace(" ", "")
+    # Far from integer should stay fractional (or unchanged structure)
+    far = bc.round_powers_to_integers("x**2.5", tol=0.1)
+    assert "2.5" in far.replace(" ", "") or "2.5" in far
+
+
+def test_exactness_pass_prefers_integer_power_when_raw_is_good():
+    X = np.linspace(-2.0, 2.0, 200).reshape(-1, 1)
+    y = X[:, 0] ** 2
+    # Numerical twin with fractional power close to 2; display MSE is weak.
+    formula = "x**2.02"
+    display_m = bc.evaluate_formula_mse_on_X(formula, X, y)
+    out, diag = bc.run_exactness_pass(
+        formula,
+        X,
+        y,
+        raw_mse=1e-6,
+        display_mse=display_m,
+        raw_mse_threshold=1e-3,
+    )
+    assert diag["attempted"] is True
+    assert diag["accepted"] is True
+    assert out.replace(" ", "") in {"x**2", "(x)**2"}
+    assert bc.evaluate_formula_mse_on_X(out, X, y) <= 1e-12
+
+
+def test_formula_benchmark_seed_is_stable_per_formula_and_range():
+    s1 = bc.formula_benchmark_seed("x**2+sin(x)", (-1, 1), base_seed=0)
+    s2 = bc.formula_benchmark_seed("x**2+sin(x)", (-1, 1), base_seed=0)
+    s3 = bc.formula_benchmark_seed("x**2+sin(x)", (-2, 2), base_seed=0)
+    s4 = bc.formula_benchmark_seed("x**2+sin(x)", (-1, 1), base_seed=7)
+    assert s1 == s2
+    assert s1 != s3
+    assert s1 != s4
+    assert 0 <= s1 < 2**31
+
+
 def test_postprocess_formula_with_fidelity_guard_accepts_safe_trig_rewrite():
     formula = "sin(x)*cos(x)"
     X = np.linspace(-2.0, 2.0, 200).reshape(-1, 1)

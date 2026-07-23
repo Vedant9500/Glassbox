@@ -128,6 +128,9 @@ def _planned_guided_budget(
         ))
 
     guided_plan: Dict[str, Any] = {}
+    # Always forward a per-formula deterministic seed when present.
+    if "random_seed" in search_plan and search_plan.get("random_seed") is not None:
+        guided_plan["random_seed"] = int(search_plan["random_seed"])
     if trust_plan:
         if "n_beams" in search_plan:
             guided_plan["n_beams"] = max(1, _finite_int(search_plan.get("n_beams"), 1))
@@ -1285,6 +1288,16 @@ def run_formula(
             dynamic_gens = int(max(20, evolution_generations))
             dynamic_pop = int(max(20, evolution_population))
             guided_plan: Dict[str, Any] = {}
+            # Per-formula deterministic C++ seed (same target + range → same seed).
+            try:
+                guided_plan["random_seed"] = bc.formula_benchmark_seed(
+                    formula_str,
+                    x_range,
+                    base_seed=int(noise_seed or 0),
+                    n_samples=n_samples,
+                )
+            except Exception:
+                pass
             
             if not disable_proposer and proposer_path:
                 try:
@@ -1305,12 +1318,15 @@ def run_formula(
                         difficulty = np.clip((entropy / 1.5) + (1.0 - margin), 0.0, 1.0)
                         proposer_confidence = float(np.clip(1.0 - difficulty, 0.0, 1.0))
                         
+                        formula_seed = guided_plan.get("random_seed")
                         dynamic_gens, dynamic_pop, guided_plan = _planned_guided_budget(
                             search_plan,
                             evolution_generations,
                             evolution_population,
                             trust_plan=trust_proposer_plan,
                         )
+                        if formula_seed is not None and "random_seed" not in guided_plan:
+                            guided_plan["random_seed"] = formula_seed
                         
                         proposer_priors = payload.get("operator_priors", {})
                         if proposer_priors:
@@ -1616,9 +1632,15 @@ def run_formula_cpp_evolution(
             max_seeds=12,
         )
         
-        # Run pure C++ evolution
+        # Run pure C++ evolution (deterministic per formula+range when possible)
+        try:
+            cpp_seed = bc.formula_benchmark_seed(
+                formula_str, x_range, base_seed=int(noise_seed or 0), n_samples=n_samples
+            )
+        except Exception:
+            cpp_seed = -1
         t0 = time.time()
-        cpp_result = _core.run_evolution(
+        evo_kwargs = dict(
             X_list=X_list,
             y=y_np,
             pop_size=pop_size,
@@ -1627,6 +1649,9 @@ def run_formula_cpp_evolution(
             seed_omegas=detected_omegas or [],
             seed_graphs_py=seed_graphs_py,
         )
+        if cpp_seed >= 0:
+            evo_kwargs["random_seed"] = int(cpp_seed)
+        cpp_result = _core.run_evolution(**evo_kwargs)
         elapsed = time.time() - t0
         
         result["formula_discovered"], result["postprocess_guard"] = _postprocess_formula_for_benchmark(

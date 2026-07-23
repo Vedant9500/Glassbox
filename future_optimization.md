@@ -170,12 +170,21 @@ No need for full neural-SR or MCTS unless you want a later phase.
 ---
 # Future Optimization Notes
 
-## Current Status (2026-06-03)
+## Current Status (2026-07-23)
 
-This note captures optimization ideas from earlier benchmark observations. Some
-items are now implemented or partially implemented: proposer/fast-path seed
-graphs feed C++ evolution, residual symbolic stages exist behind flags,
-displayed-formula scoring is the benchmark contract, polynomial/exact-match
-fast lanes exist, and C++ island specialization is the guided-evolution default.
-Use `docs/PROJECT_MAP.md` for current architecture and this file for historical
-idea context.
+This note captures optimization ideas from earlier benchmark observations.
+
+| # | Idea | Status |
+|---|------|--------|
+| 1 | Seed evolution from proposer + fast-path | **Done** (`seed_graphs_py`) |
+| 2 | Residual peeling / boosting | **Done** (flags on `GlassboxRegressor`) |
+| 3 | Post-search exactness pass | **Done** (`run_exactness_pass` + beam-search hook) |
+| 4 | Don’t shrink beams when confident | **Done** (confident → expand beams/rounds) |
+| 5 | Pure IntPow polynomial beam | **Done** (`poly-intpow-only` island) |
+| 6 | Product-aware macro mutation bias | **Done** (`macro_mutation_rate` / `macro_mode_weights`) |
+| 7 | Fixed seed per formula + range | **Done** (`formula_benchmark_seed`) |
+| 8 | Proposer product/rational grammar | **Done** (templates in univariate grammar) |
+| 9 | Rational / product islands | **Done** (`rational-island`, `product-island`) |
+| 10 | Dual structural + numeric scoring | Optional / research logging only |
+
+Use `docs/PROJECT_MAP.md` for current architecture.

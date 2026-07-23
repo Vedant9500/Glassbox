@@ -82,6 +82,18 @@ def test_grammar_decoder_prefers_periodic_candidates():
     assert ("sin(" in joined) or ("cos(" in joined)
 
 
+def test_univariate_grammar_includes_product_and_rational_templates():
+    from glassbox.universal_proposer.universal_proposer import (
+        _build_univariate_grammar_candidates,
+    )
+
+    cands = _build_univariate_grammar_candidates(max_depth=2)
+    joined = " | ".join(cands)
+    assert "x**2*sin(x)" in joined
+    assert "x**3/(1+x**4)" in joined
+    assert "x/(1+x**2)" in joined
+
+
 def test_multivariate_grammar_decoder_returns_cross_terms():
     x0 = np.linspace(-2.0, 2.0, 64, dtype=np.float64)
     x1 = np.linspace(1.0, 3.0, 64, dtype=np.float64)

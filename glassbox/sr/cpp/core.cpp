@@ -470,7 +470,10 @@ py::dict run_evolution_cpp(
     double trim_fraction = 0.1,
     // S6-2: expose EvolutionConfig elite/seed knobs (engine defaults otherwise).
     int elite_size = 10,
-    double seed_fraction = 0.5
+    double seed_fraction = 0.5,
+    // Macro mutation rate + mode weights [wrap, multiply, divide, nest].
+    double macro_mutation_rate = 0.15,
+    py::list macro_mode_weights = py::list()
 ) {
     // 1. Convert Python/Numpy inputs to C++/Eigen
     std::vector<Eigen::ArrayXd> X;
@@ -698,6 +701,16 @@ py::dict run_evolution_cpp(
     // S6-2 / E3: allow Python to override elite count and seed injection capacity.
     config.elite_size = std::max(1, elite_size);
     config.seed_fraction = std::clamp(seed_fraction, 0.05, 1.0);
+    config.macro_mutation_rate = std::clamp(macro_mutation_rate, 0.0, 0.9);
+    {
+        std::vector<double> mmw;
+        for (auto item : macro_mode_weights) {
+            mmw.push_back(item.cast<double>());
+        }
+        if (mmw.size() >= 4) {
+            config.macro_mode_weights = std::move(mmw);
+        }
+    }
     // leave eval_num_threads=0 for auto.
 
     // Phase 4: robust search loss (default mse preserves legacy behaviour).
@@ -1192,7 +1205,9 @@ PYBIND11_MODULE(_core, m) {
           py::arg("huber_delta")=-1.0,
           py::arg("trim_fraction")=0.1,
           py::arg("elite_size")=10,
-          py::arg("seed_fraction")=0.5);
+          py::arg("seed_fraction")=0.5,
+          py::arg("macro_mutation_rate")=0.15,
+          py::arg("macro_mode_weights")=py::list());
 
     m.def("refine_frequencies", &refine_frequencies_wrapper,
           "Refines frequencies via Eigen varpro (optional sample_weight for WLS / S5-9)",

@@ -323,6 +323,25 @@ def _build_univariate_grammar_candidates(max_depth: int = 2) -> List[str]:
         "exp(-x)*sin(x)",
         "exp(-x**2)*sin(x)",
         "log(abs(x)+1e-6)+sin(x)",
+        # Product templates (benchmark-driven; seeds for x**2*sin(x) class)
+        "x**2*sin(x)",
+        "x**2*cos(x)",
+        "x**3*sin(x)",
+        "x**3*cos(x)",
+        "x*sin(x)**2",
+        "sin(x)*cos(x)",
+        # One-layer rationals (fixes rational-collapse seeds)
+        "x/(1+x**2)",
+        "x**2/(1+x**2)",
+        "x**3/(1+x**4)",
+        "x/(1+abs(x))",
+        "1/(1+x**2)",
+        "x**2/(1+x**4)",
+        # Mixed sum/product common on mid tiers
+        "x**3+sin(x)",
+        "x**2+sin(x)+cos(x)",
+        "exp(-x)*x",
+        "exp(-x)*x**2",
     ]
     return base + composed
 

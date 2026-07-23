@@ -4123,14 +4123,23 @@ def beam_search_evolution(
             pop_size_cfg: int,
             generations_cfg: int,
             label_cfg: str,
+            *,
+            binary_op_priors_cfg: Optional[List[float]] = None,
+            allowed_unary_ops_cfg: Optional[List[int]] = None,
+            allowed_binary_ops_cfg: Optional[List[int]] = None,
+            p_min_cfg: Optional[float] = None,
+            p_max_cfg: Optional[float] = None,
         ) -> None:
             configs.append({
                 'op_priors': op_priors_cfg,
                 'seed_omegas': seed_omegas_cfg,
                 'pop_size': max(10, int(pop_size_cfg)),
                 'generations': max(10, int(generations_cfg)),
-                'p_min': adaptive_p_min,
-                'p_max': adaptive_p_max,
+                'p_min': adaptive_p_min if p_min_cfg is None else float(p_min_cfg),
+                'p_max': adaptive_p_max if p_max_cfg is None else float(p_max_cfg),
+                'binary_op_priors': list(binary_op_priors_cfg) if binary_op_priors_cfg is not None else None,
+                'allowed_unary_ops': list(allowed_unary_ops_cfg) if allowed_unary_ops_cfg is not None else None,
+                'allowed_binary_ops': list(allowed_binary_ops_cfg) if allowed_binary_ops_cfg is not None else None,
                 'label': label_cfg,
             })
         
@@ -4165,16 +4174,18 @@ def beam_search_evolution(
 
                 add_config(cand_priors, cand_omegas[:4], base_pop_size, base_generations,
                            f'candidate-seed-{ci}')
-        
-        if is_confident_proposer:
-            # For confident proposer, we only add a few fallback exploratory beams
-            # instead of the full diverse suite.
+
+        # Confident proposer: keep skeleton refinement beams, then still add
+        # specialist islands (poly/product/rational) instead of early-returning
+        # with only 2 exploratory fallbacks.
+        if is_confident_proposer and candidate_formulas:
             add_config(classifier_priors, fft_freqs, base_pop_size, base_generations, 'classifier-guided')
             add_config([0.25, 0.25, 0.25, 0.25], fft_freqs, base_pop_size, base_generations, 'uniform')
-            return configs[:n]
+            # Fall through to specialist islands rather than truncating search.
 
         # 1. Classifier-guided (primary hypothesis)
-        add_config(classifier_priors, fft_freqs, base_pop_size, base_generations, 'classifier-guided')
+        if not (is_confident_proposer and candidate_formulas):
+            add_config(classifier_priors, fft_freqs, base_pop_size, base_generations, 'classifier-guided')
         
         # 2. Sin-heavy
         add_config([0.8, 0.1, 0.05, 0.05], fft_freqs or [1.0, 2.0, 3.0], base_pop_size, base_generations, 'sin-heavy')
@@ -4197,18 +4208,74 @@ def beam_search_evolution(
                 int(base_generations * 2.0),
                 'poly-depth',
             )
+
+        # Pure IntPow polynomial lane: [Periodic, Power, IntPow, Exp, Log]
+        # with structural ops limited to IntPow + identity-like search.
+        if polynomial_mode or (has_power and not (has_sin or has_exp or has_log)):
+            poly_deg = max(2, int(poly_degree) if poly_degree else 2)
+            poly_deg = min(8, max(poly_deg, int(math.ceil(hinted_max_power or 2))))
+            add_config(
+                [0.0, 0.05, 0.90, 0.025, 0.025],  # IntPow-dominant 5-slot prior
+                [],
+                max(20, base_pop_size),
+                int(base_generations * 1.5),
+                'poly-intpow-only',
+                allowed_unary_ops_cfg=[2],  # UnaryOp::IntPow only
+                allowed_binary_ops_cfg=[0],  # Arithmetic only (no Division)
+                p_min_cfg=1.0,
+                p_max_cfg=float(poly_deg + 1),
+            )
         
         # 4. Exp-heavy
         add_config([0.05, 0.1, 0.8, 0.05], [], base_pop_size, base_generations, 'exp-heavy')
         
         # 5. Uniform exploration
-        add_config([0.25, 0.25, 0.25, 0.25], fft_freqs, base_pop_size, base_generations, 'uniform')
+        if not (is_confident_proposer and candidate_formulas):
+            add_config([0.25, 0.25, 0.25, 0.25], fft_freqs, base_pop_size, base_generations, 'uniform')
         
         # 6. Sin+Power combo (common case like x^2 + sin(x))
         add_config([0.45, 0.45, 0.05, 0.05], fft_freqs or [1.0, 2.0], base_pop_size, base_generations, 'sin+power')
         
         # 7. Exp+Sin combo (damped oscillation)
         add_config([0.4, 0.1, 0.4, 0.1], fft_freqs or [1.0, 3.0], base_pop_size, base_generations, 'exp+sin')
+
+        # 7b. Product island — favors multiply binary path (x^2*sin(x) class)
+        if has_power and has_sin:
+            add_config(
+                [0.40, 0.45, 0.10, 0.05],
+                fft_freqs or [1.0, 2.0],
+                base_pop_size,
+                base_generations,
+                'product-island',
+                binary_op_priors_cfg=[0.85, 0.05, 0.10],  # Arithmetic-heavy (multiply mode)
+                allowed_binary_ops_cfg=[0],  # Arithmetic only
+            )
+        elif has_sin or has_power:
+            add_config(
+                [0.35, 0.40, 0.15, 0.10],
+                fft_freqs or [1.0],
+                base_pop_size,
+                base_generations,
+                'product-island',
+                binary_op_priors_cfg=[0.80, 0.10, 0.10],
+            )
+
+        # 7c. Rational island — Division-heavy (x^3/(1+x^4) class)
+        has_rational_hint = bool(
+            operator_hints.get('has_rational')
+            or 'rational' in operators
+            or 'division' in operators
+        )
+        if has_rational_hint or has_power:
+            add_config(
+                [0.10, 0.55, 0.15, 0.20] if has_power else [0.20, 0.30, 0.20, 0.30],
+                [],
+                base_pop_size,
+                int(base_generations * 1.2),
+                'rational-island',
+                binary_op_priors_cfg=[0.25, 0.60, 0.15],  # Division-heavy
+                allowed_binary_ops_cfg=[0, 1],  # Arithmetic + Division
+            )
         
         # 8-11. Integer harmonic frequency variants
         for i, harmonics in enumerate(integer_harmonics):
@@ -4339,9 +4406,38 @@ def beam_search_evolution(
     # 1. Get initial configs
     configs = make_beam_configs(n=n_beams, round_idx=0)
 
-    # 2. Extract multi-priors and multi-seed-omegas
+    # 2. Extract multi-priors and multi-seed-omegas (+ optional binary/unary masks)
     multi_op_priors = [cfg.get('op_priors', []) for cfg in configs]
     multi_seed_omegas = [cfg.get('seed_omegas', []) for cfg in configs]
+    multi_binary_op_priors = []
+    multi_allowed_unary_ops = []
+    multi_allowed_binary_ops = []
+    for cfg in configs:
+        bop = cfg.get("binary_op_priors")
+        multi_binary_op_priors.append(list(bop) if bop else [])
+        au = cfg.get("allowed_unary_ops")
+        multi_allowed_unary_ops.append(list(au) if au else [])
+        ab = cfg.get("allowed_binary_ops")
+        multi_allowed_binary_ops.append(list(ab) if ab else [])
+
+    # Product/rational bias for macro mutations (C++ knobs; defaults if old _core).
+    want_product_macro = bool(has_power and has_sin)
+    want_rational_macro = bool(
+        operator_hints.get("has_rational")
+        or "rational" in operators
+        or "division" in operators
+    )
+    macro_mutation_rate = 0.15
+    macro_mode_weights = None  # [wrap, multiply, divide, nest]
+    if want_product_macro:
+        macro_mutation_rate = 0.28
+        macro_mode_weights = [0.20, 0.50, 0.15, 0.15]  # multiply-heavy
+    elif want_rational_macro:
+        macro_mutation_rate = 0.25
+        macro_mode_weights = [0.20, 0.20, 0.45, 0.15]  # divide-heavy
+    elif has_power and not has_sin:
+        # Mild boost for pure poly structural wraps
+        macro_mutation_rate = 0.18
 
     # 3. Launch the native C++ Island Model (one call to rule them all)
     total_pop_size = base_pop_size * n_beams
@@ -4351,6 +4447,11 @@ def beam_search_evolution(
     print(f"  - Islands: {n_beams}")
     print(f"  - Total Population: {total_pop_size}")
     print(f"  - Generations: {total_generations}")
+    if macro_mutation_rate != 0.15 or macro_mode_weights is not None:
+        print(
+            f"  - Macro mutation rate: {macro_mutation_rate:.2f}"
+            + (f", modes={macro_mode_weights}" if macro_mode_weights else "")
+        )
 
     import multiprocessing
     max_physical_threads = multiprocessing.cpu_count()
@@ -4388,6 +4489,16 @@ def beam_search_evolution(
         if preview:
             print(f"    e.g. {preview[0]}")
 
+    # Optional deterministic C++ seed (per-formula or global).
+    evolution_random_seed = -1
+    for key in ("random_seed", "evolution_random_seed", "seed"):
+        if key in search_plan and search_plan[key] is not None:
+            try:
+                evolution_random_seed = int(search_plan[key])
+                break
+            except (TypeError, ValueError):
+                pass
+
     try:
         acceptable_complexity = int(search_plan.get("acceptable_complexity", 15) or 15)
         early_stop_max_nodes = int(search_plan.get("early_stop_max_nodes", 50) or 50)
@@ -4415,6 +4526,18 @@ def beam_search_evolution(
             "num_threads": max_physical_threads,  # Use all available cores via OpenMP
             "seed_graphs_py": seed_graphs_py,
         }
+        if any(multi_binary_op_priors):
+            evolution_kwargs["multi_binary_op_priors"] = multi_binary_op_priors
+        if any(multi_allowed_unary_ops):
+            evolution_kwargs["multi_allowed_unary_ops"] = multi_allowed_unary_ops
+        if any(multi_allowed_binary_ops):
+            evolution_kwargs["multi_allowed_binary_ops"] = multi_allowed_binary_ops
+        if evolution_random_seed >= 0:
+            evolution_kwargs["random_seed"] = evolution_random_seed
+        # Macro knobs (graceful if older _core lacks them — filtered below on TypeError)
+        evolution_kwargs["macro_mutation_rate"] = float(macro_mutation_rate)
+        if macro_mode_weights is not None:
+            evolution_kwargs["macro_mode_weights"] = list(macro_mode_weights)
         if timeout_seconds is not None:
             evolution_kwargs["timeout_seconds"] = timeout_seconds
         if y_weights is not None:
@@ -4436,13 +4559,22 @@ def beam_search_evolution(
         try:
             result = _core.run_evolution(**evolution_kwargs)
         except TypeError:
-            evolution_kwargs.pop("y_weights", None)
-            evolution_kwargs.pop("loss_mode", None)
-            evolution_kwargs.pop("huber_delta", None)
-            evolution_kwargs.pop("trim_fraction", None)
-            evolution_kwargs.pop("input_units", None)
-            evolution_kwargs.pop("output_units", None)
-            evolution_kwargs.pop("dim_penalty_weight", None)
+            # Drop kwargs unsupported by older _core builds and retry.
+            for optional_key in (
+                "y_weights",
+                "loss_mode",
+                "huber_delta",
+                "trim_fraction",
+                "input_units",
+                "output_units",
+                "dim_penalty_weight",
+                "macro_mutation_rate",
+                "macro_mode_weights",
+                "multi_binary_op_priors",
+                "multi_allowed_unary_ops",
+                "multi_allowed_binary_ops",
+            ):
+                evolution_kwargs.pop(optional_key, None)
             result = _core.run_evolution(**evolution_kwargs)
     except Exception as e:
         print(f"  \u274c Native Island Search failed: {e}")
@@ -4502,10 +4634,39 @@ def beam_search_evolution(
     except Exception:
         display_mse = best_overall_mse
 
+    # Post-search exactness pass: integer powers + identity rewrites when
+    # raw fit is strong but display form is still approximate.
+    exactness_diag = None
+    try:
+        try:
+            from scripts.benchmark_common import run_exactness_pass
+        except ImportError:
+            from benchmark_common import run_exactness_pass  # type: ignore
+        x_for_exact = x_np.reshape(-1, 1) if x_np.ndim == 1 else x_np
+        formula_str, exactness_diag = run_exactness_pass(
+            formula_str,
+            x_for_exact,
+            y_np,
+            raw_mse=best_overall_mse,
+            display_mse=display_mse,
+        )
+        if exactness_diag.get("accepted"):
+            y_pred2 = _evaluate_formula_values(formula_str, x_np)
+            if y_pred2 is not None:
+                display_mse = float(np.mean((y_pred2 - y_np) ** 2))
+            print(
+                f"  [Exactness] accepted rewrite "
+                f"(mse {exactness_diag.get('baseline_mse')} -> {exactness_diag.get('best_mse')})"
+            )
+    except Exception:
+        exactness_diag = {"attempted": False, "accepted": False, "reason": "exception"}
+
     drift_penalty = abs(best_overall_mse - display_mse) / max(best_overall_mse, 1e-12)
     best_overall_result['display_mse'] = display_mse
     best_overall_result['drift_penalty'] = drift_penalty
     best_overall_result['formula'] = formula_str
+    if exactness_diag is not None:
+        best_overall_result['exactness_pass'] = exactness_diag
 
     # Build CppGraphModule from best result
     formula = formula_str
@@ -4600,23 +4761,31 @@ def run_guided_evolution(
     base_gens = generations
 
     if confidence > 0.8 and candidate_formulas:
-        # High confidence in skeletons → focus beams on refinement
+        # High confidence → more refinement beams on skeleton seeds (do NOT shrink).
         if "n_beams" not in search_plan:
-            n_beams = min(n_beams, len(candidate_formulas) + 2)
+            n_beams = max(n_beams, min(12, len(candidate_formulas) + 4))
         if "n_rounds" not in search_plan:
-            n_rounds = 1 # One round is enough to check the seeds
-        # REMOVED: base_gens = min(base_gens, 150)
-        # REMOVED: base_pop = min(base_pop, 50)
-        print(f"  [Adaptive] Confident proposer: focusing search on {n_beams} beams, {n_rounds} round(s), {base_pop} pop, {base_gens} gens.")
+            n_rounds = max(n_rounds, 2)
+        print(
+            f"  [Adaptive] Confident proposer: expanding refinement to "
+            f"{n_beams} beams, {n_rounds} round(s), {base_pop} pop, {base_gens} gens."
+        )
     elif candidate_formulas:
-        # Proposer gave skeletons but isn't super confident
+        # Moderate confidence → keep exploratory diversity; mild beam floor only.
         if "n_beams" not in search_plan:
-            n_beams = min(n_beams, 7)
-        if "n_rounds" not in search_plan:
-            n_rounds = 1
-        # REMOVED: base_gens = min(base_gens, 250)
-        # REMOVED: base_pop = min(base_pop, 60)
-        print(f"  [Adaptive] Proposer candidates available: focusing search on {n_beams} beams, {n_rounds} round(s), {base_pop} pop, {base_gens} gens.")
+            n_beams = max(n_beams, min(10, len(candidate_formulas) + 3))
+        if "n_rounds" not in search_plan and generations >= 100:
+            n_rounds = max(n_rounds, 2)
+        print(
+            f"  [Adaptive] Proposer candidates available: "
+            f"{n_beams} beams, {n_rounds} round(s), {base_pop} pop, {base_gens} gens."
+        )
+    else:
+        # Uncertain / no skeletons → full exploratory suite (default n_beams).
+        print(
+            f"  [Adaptive] Exploratory mode (no confident skeletons): "
+            f"{n_beams} beams, {n_rounds} round(s), {base_pop} pop, {base_gens} gens."
+        )
 
     beam_result = beam_search_evolution(
         x, y,
