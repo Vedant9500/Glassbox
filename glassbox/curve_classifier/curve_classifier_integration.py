@@ -46,6 +46,20 @@ except (ImportError, ValueError):
 CURVE_CLASSIFIER_UNIVARIATE_NEURAL_MODE = "canonical_univariate_xy"
 CURVE_CLASSIFIER_MULTIVARIATE_NEURAL_MODE = "heuristic_slice_aggregation"
 
+# S9-1: last load/predict status (fail-open diagnostics). Not mixed into
+# operator probability dicts so callers treating predictions as {op: float}
+# remain correct (empty dict still means "no operators / fail-open").
+LAST_CLASSIFIER_LOAD_STATUS: Dict[str, object] = {
+    "ok": False,
+    "reason": "never_called",
+    "fail_open": None,
+}
+
+
+def get_last_classifier_load_status() -> Dict[str, object]:
+    """Return a copy of the most recent classifier load/predict status (S9-1)."""
+    return dict(LAST_CLASSIFIER_LOAD_STATUS)
+
 
 def describe_curve_classifier_inference(x: np.ndarray) -> Dict[str, object]:
     """Describe the public classifier inference contract for the given input shape."""
@@ -471,9 +485,22 @@ def _extract_features_xy_cached(x: np.ndarray, y: np.ndarray, n_points: int = 25
     return feats
 
 
-def _resolve_device(device: Optional[str] = None) -> torch.device:
+def _resolve_device(
+    device: Optional[str] = None,
+    *,
+    n_samples: Optional[int] = None,
+) -> torch.device:
+    """Resolve torch device for classifier inference.
+
+    S9-5: when ``device`` is None/\"auto\" and ``n_samples`` is small
+    (default threshold 256), force CPU so CUDA transfer overhead does not
+    dominate tiny fits. Explicit ``device='cuda'`` still requests GPU.
+    """
     global _warned_no_cuda
+    tiny_n_cpu_threshold = 256
     if device is None or device == "auto":
+        if n_samples is not None and int(n_samples) < tiny_n_cpu_threshold:
+            return torch.device("cpu")
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     resolved = torch.device(device)
@@ -590,11 +617,19 @@ def _resolve_model_path(model_path: str) -> Path:
 def load_classifier(
     model_path: str = DEFAULT_CURVE_CLASSIFIER_PATH,
     device: Optional[str] = None,
+    *,
+    n_samples: Optional[int] = None,
 ):
-    """Load the trained PyTorch curve classifier."""
+    """Load the trained PyTorch curve classifier.
+
+    Parameters
+    ----------
+    n_samples :
+        Optional row count so device=auto can prefer CPU on tiny problems (S9-5).
+    """
     global _cached_classifier_by_device
     
-    resolved_device = _resolve_device(device)
+    resolved_device = _resolve_device(device, n_samples=n_samples)
     model_path_obj = _resolve_model_path(model_path)
     if model_path_obj.suffix.lower() not in ('.pt', '.pth'):
         raise ValueError(
@@ -800,49 +835,92 @@ def predict_operators(
     Returns:
         Dictionary mapping operator names to probabilities
     """
-    # Check if model exists before trying to load
-    if not Path(model_path).exists():
-        try:
-            model_path = str(_resolve_model_path(model_path))
-        except FileNotFoundError:
-            print(f"Warning: Curve classifier model not found at {model_path}. Skipping prediction.")
-            return {}
+    global LAST_CLASSIFIER_LOAD_STATUS
 
-    # Load classifier
-    try:
-        model = load_classifier(model_path, device=device)
-    except Exception as e:
-        print(f"Warning: Failed to load curve classifier: {e}")
-        return {}
-    
-    # Get cache key for metadata lookup
-    resolved_device = _resolve_device(device)
-    cache_key = _make_cache_key(str(_resolve_model_path(model_path)), resolved_device)
-    metadata = _cached_metadata_by_device.get(cache_key, {})
-    
-    # Detect multi-input
+    # Detect multi-input early (needed for S9-5 tiny-n device choice).
     x = np.asarray(x)
     y = np.asarray(y).flatten()
-    
     if x.ndim == 1:
         n_vars = 1
         x = x.reshape(-1, 1)
     else:
         n_vars = x.shape[1]
-    
+    n_samples = int(x.shape[0])
+
+    # S9-1: fail-open with explicit diagnostics (module-level, not in op dict).
+    # Returning {} keeps legacy callers (if not predictions: ...) correct.
+    load_status: Dict[str, object] = {
+        "ok": False,
+        "reason": None,
+        "model_path": str(model_path),
+        "fail_open": None,
+    }
+
+    # Check if model exists before trying to load
+    if not Path(model_path).exists():
+        try:
+            model_path = str(_resolve_model_path(model_path))
+            load_status["model_path"] = model_path
+        except FileNotFoundError:
+            print(
+                f"Warning: Curve classifier model not found at {model_path}. "
+                "Skipping prediction (fail-open → evolution)."
+            )
+            load_status.update({
+                "ok": False,
+                "reason": "model_not_found",
+                "model_path": str(model_path),
+                "fail_open": True,
+            })
+            LAST_CLASSIFIER_LOAD_STATUS = dict(load_status)
+            return {}
+
+    # Load classifier (S9-5: prefer CPU for tiny n under device=auto)
+    resolved_device = _resolve_device(device, n_samples=n_samples)
+    try:
+        model = load_classifier(model_path, device=str(resolved_device), n_samples=n_samples)
+        load_status["ok"] = True
+    except Exception as e:
+        print(
+            f"Warning: Failed to load curve classifier: {e}. "
+            "Skipping prediction (fail-open → evolution)."
+        )
+        load_status.update({
+            "ok": False,
+            "reason": "load_failed",
+            "error": str(e),
+            "model_path": str(model_path),
+            "fail_open": True,
+        })
+        LAST_CLASSIFIER_LOAD_STATUS = dict(load_status)
+        return {}
+
+    # Get cache key for metadata lookup (same device as load)
+    cache_key = _make_cache_key(str(_resolve_model_path(model_path)), resolved_device)
+    metadata = _cached_metadata_by_device.get(cache_key, {})
+
+    load_status.update({
+        "ok": True,
+        "reason": "loaded",
+        "fail_open": False,
+        "device": str(resolved_device),
+        "model_path": str(model_path),
+    })
+    LAST_CLASSIFIER_LOAD_STATUS = dict(load_status)
+
     # For multi-input: use per-variable slicing
     if n_vars > 1:
         return _predict_operators_multi_input(
             x, y, model, metadata, resolved_device, threshold, n_vars, cache_key
         )
-    
+
     # Single-input: standard prediction (S9-3: cached feature extract).
     features = _prepare_curve_features(
         _extract_features_xy_cached(x[:, 0], y),
         metadata.get('feature_scaler'),
     )
     probs = _predict_pytorch(model, features, metadata, resolved_device)
-    
+
     return _build_result_dict(probs, threshold, metadata, cache_key)
 
 

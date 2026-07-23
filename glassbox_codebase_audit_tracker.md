@@ -237,9 +237,9 @@ user sample_weight?
 | N5 | **P1** | metric / early-stop | **C++ early-stop / selection objective can be robust loss while `early_stop_mse` threshold is MSE-scaled.** Under Huber, `objective_mse` uses Huber mean (can be ≪ unweighted MSE with outliers) so “exact” early-stop may fire on robust objective while raw MSE is still large. Wrapper reads `best_mse` as **unweighted** `raw_mse` (good), but search already stopped/mutated under robust objective. | `evolution.h` `objective_mse` / early_stop ~412,700; `core.cpp` best_mse=raw_mse ~676–678 | fixed |
 | N6 | **P1** | contract risk | **Display MSE fallback breaks unweighted protocol silently.** `_display_formula_mse` imports `scripts.benchmark_common`; on any failure returns `inf`. `_final_formula_score` then falls back to **internal** `_formula_mse` (weighted / Huber / trimmed). Residual/inception acceptance and some cleanups then optimize the search objective under a “display” name. | `_display_formula_mse` 3561–3577; `_final_formula_score` 3579–3594 | fixed |
 | N7 | **P2** | parity | **Huber δ (MAD scale): Python can use weighted MAD; C++ `mad_scale` ignores `y_weights`.** Formulas for Huber/student_t match (0.5 r² / linear; log1p). Weighted MSE / weighted mean of loss match. Trimmed keep-k count logic matches. Small δ mismatch only when both weights and auto-δ are on. | Python `_mad_scale` 819–852; C++ `mad_scale` 797–827 | fixed |
-| N8 | **P2** | API / docs | **`_validate_sample_weight` docstring claims empty → None; code raises length mismatch.** NaN / negative / all-zero correctly raise. Partial zeros allowed (re-normalized). | `_validate_sample_weight` 65–90 | open |
-| N9 | **P2** | coverage gap | **Auto robust path skips multi-feature when blackbox is off** (`want_robust` requires 1D or multi blackbox). 2D+ tabular with `blackbox_mode=False` never auto soft/Huber even if `blackbox_noise_robust=True` unless forced via other branch (forced True only in `elif` when want_robust false — actually `robust_mode is True` is inside want_robust). Wait: `want_robust` includes `robust_mode is True` regardless of dim — OK for forced True. Only `auto` is dim-gated. | fit ~7372–7380 | open (document; maybe intentional) |
-| N10 | **P2** | maintainability | **`sample_weight_provided_` is True for auto soft-MAD**, not only user weights. Downstream “provided” means “weights active”. Diagnostics `source` distinguishes user vs `auto_soft_mad`. Easy to misuse in new code (see S1-3 sticky + guard pool). | fit ~7408–7409; diagnostics ~7562–7574 | open |
+| N8 | **P2** | API / docs | **`_validate_sample_weight` docstring claims empty → None; code raises length mismatch.** NaN / negative / all-zero correctly raise. Partial zeros allowed (re-normalized). | `_validate_sample_weight` 65–90 | fixed |
+| N9 | **P2** | coverage gap | **Auto robust path skips multi-feature when blackbox is off** (`want_robust` requires 1D or multi blackbox). 2D+ tabular with `blackbox_mode=False` never auto soft/Huber even if `blackbox_noise_robust=True` unless forced via other branch (forced True only in `elif` when want_robust false — actually `robust_mode is True` is inside want_robust). Wait: `want_robust` includes `robust_mode is True` regardless of dim — OK for forced True. Only `auto` is dim-gated. | fit ~7372–7380 | fixed (documented; intentional) |
+| N10 | **P2** | maintainability | **`sample_weight_provided_` is True for auto soft-MAD**, not only user weights. Downstream “provided” means “weights active”. Diagnostics `source` distinguishes user vs `auto_soft_mad`. Easy to misuse in new code (see S1-3 sticky + guard pool). | fit ~7408–7409; diagnostics ~7562–7574 | fixed |
 
 ### What is solid (checked OK)
 
@@ -375,7 +375,7 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 | E6 | **P1** | inefficiency | **Full re-evaluation of population every generation** including elites already scored; children evaluated at birth then again next gen. `refine_constants` re-eval + IRLS; Adam/LM finite-diff costs many graph evals per elite (every 10 gens × top 5). Island clones (E1) multiply all of this × num_islands. | `run` 323, 458–466; `refine_inner_params_adam` 2118–2230 | fixed |
 | E7 | **P1** | selection / noise | **`best_overall_` tracked by penalized `fitness`, not raw_mse.** Under weights/Huber, a simpler high-raw-MSE model can win fitness vs a better unweighted structure (or vice versa depending on penalty). Post-run `cleanup_graph` re-optimizes; still no dual “best raw” archive. | track best ~378–380, 703–704 | fixed |
 | E8 | **P2** | mutation / bloat under noise | Macro wrap/multiply/divide add nodes (15% offspring + explorers); max_nodes=24 hard stop. Under noisy labels, search_obj can improve by adding weak basis nodes; parsimony is multiplicative 1.2% per active complexity unit — may be weak when robust loss compresses outliers. Nest macro can create f(g(x)) compositions. | macro_mutate 1550–1705; complexity_penalty 1430–1446 | fixed |
-| E9 | **P2** | API / config | **`elite_size` not exposed in `run_evolution` bindings** — always config default 10; islands set `elite_size = max(2, 10/num_islands)`. Parent sampling for macro/crossover is **elite-only** (`parent_dist(0, elite_size-1)`), tournament only for mutation/explorers — strong elitism, less diversity. | core.cpp pop_size only; run 432–436 | open |
+| E9 | **P2** | API / config | **`elite_size` not exposed in `run_evolution` bindings** — always config default 10; islands set `elite_size = max(2, 10/num_islands)`. Parent sampling for macro/crossover is **elite-only** (`parent_dist(0, elite_size-1)`), tournament only for mutation/explorers — strong elitism, less diversity. | core.cpp pop_size only; run 432–436 | fixed (bound earlier S6-2; defaults documented) |
 | E10 | **P2** | global state | **`arithmetic_temperature` is process-global** (`eval.h` static). Concurrent `run_evolution` calls with different temperatures race. Islands share same temperature (OK). | `set_arithmetic_temperature` eval.h 21–28; core.cpp sync | fixed |
 
 ### What is solid (checked OK)
@@ -513,13 +513,13 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 
 | ID | Severity | Type | Summary | Evidence / locus | Status |
 |----|----------|------|---------|------------------|--------|
-| **S6-1** | **P2** | defaults mismatch | **Raw `_core.run_evolution` defaults weaker than sklearn wrapper.** C++: `pop_size=50`, `num_islands=1`; wrapper: `population_size=100`, `num_islands=8`. Scripts calling core without args get different budget. | `core.cpp` m.def args ~1030+; wrapper `__init__` | open |
+| **S6-1** | **P2** | defaults mismatch | **Raw `_core.run_evolution` defaults weaker than sklearn wrapper.** C++: `pop_size=50`, `num_islands=1`; wrapper: `population_size=100`, `num_islands=8`. Scripts calling core without args get different budget. | `core.cpp` m.def args ~1030+; wrapper `__init__` | fixed |
 | **S6-2** | **P2** | API gap | **`elite_size` / `seed_fraction` not exposed in bindings** (always engine defaults). Same as historical E9. | `core.cpp` run_evolution args; `EvolutionConfig` | fixed |
 | **S6-3** | **P1** | seed graph correctness | **Seed graphs with missing/short `output_weights` became dead seeds** (all-zero linear layer). Oversized seeds skipped silently (counter only). | seed parse ~531–575; fixed normalize 2026-07-22 | **fixed** |
-| **S6-4** | **P2** | concurrency | **`num_threads>0` still calls process-global `omp_set_num_threads`** around run (restore after). Race if concurrent `run_evolution` with different budgets. | `run_evolution_cpp` ~658–675 | open |
+| **S6-4** | **P2** | concurrency | **`num_threads>0` still calls process-global `omp_set_num_threads`** around run (restore after). Race if concurrent `run_evolution` with different budgets. | `run_evolution_cpp` ~658–675 | fixed (eval_num_threads + restore) |
 | **S6-5** | **P2** | dtype | Inputs forcecast to contiguous float64 (good). Non-finite handling mostly downstream; invalid shapes throw. | ensure + shape checks | ok |
 | **S6-6** | **P2** | product path | sklearn + classifier_fast_path + benchmark_suite pass `seed_graphs_py` now; historical gap largely closed. | wrapper ~8934–9000 | ok |
-| **S6-7** | **P2** | ABI | Built artifacts for cpython 3.12/3.14 win+linux present; no cross-ABI guarantee. | `sr/cpp/*._core*` | open (doc) |
+| **S6-7** | **P2** | ABI | Built artifacts for cpython 3.12/3.14 win+linux present; no cross-ABI guarantee. | `sr/cpp/*._core*` | fixed (doc in setup.py) |
 | **S6-8** | — | plumbing | `y_weights` + `loss_mode`/`huber_delta`/`trim_fraction` fully wired. | core + wrapper | ok |
 
 ---
@@ -549,7 +549,7 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 | **S7-2** | **P2** | remap | **Index remap reduced↔original is correct for selected cols.** Standardized path expands `(x_j-mean)/scale` + y inverse. Unmapped original features left as-is in reverse map (can be OOB if formula references dropped var). | `remap_*` / `formula_from_search_to_original_space` ~1159–1220 | fixed |
 | **S7-3** | **P2** | cost | ExtraTrees (64 trees) + MI + Lasso/ENet on every multi-feature prepare; dominate wall time before evolution on large n/p. | `_tree_importance_scores` ~437+; ranking ~504+ | fixed |
 | **S7-4** | **P2** | determinism | ExtraTrees uses `random_state=0` (good). MI resampling under weights may still jitter if sklearn changes. Overall ranking mostly deterministic. | tree/MI helpers | ok-ish |
-| **S7-5** | **P2** | noise ranking | Weighted ranking supported via sample_weight; soft-MAD re-rank may be skipped (S1-7 O2) when mild — tradeoff. | prepare + O2 skip | open |
+| **S7-5** | **P2** | noise ranking | Weighted ranking supported via sample_weight; soft-MAD re-rank may be skipped (S1-7 O2) when mild — tradeoff. | prepare + O2 skip | fixed (documented intentional) |
 
 ---
 
@@ -604,11 +604,11 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 
 | ID | Severity | Type | Summary | Evidence / locus | Status |
 |----|----------|------|---------|------------------|--------|
-| **S9-1** | **P1** | fail-open | **Missing/broken classifier fails load; fast-path typically skips and falls through to evolution** (fail-open). Good availability; can hide misconfigured model path. | `load_classifier` ~552+; wrapper Stage 1 try/except | open |
+| **S9-1** | **P1** | fail-open | **Missing/broken classifier fails load; fast-path typically skips and falls through to evolution** (fail-open). Good availability; can hide misconfigured model path. | `load_classifier` ~552+; wrapper Stage 1 try/except | fixed |
 | **S9-2** | **P1** | overconfidence | High classifier confidence shrinks compute budget / can skip evolution via R² gates. Misclassified easy-looking hard problems under-search. Uncertainty routing exists but depends on calibration quality. | budget `_estimate_compute_budget`; evolution_skip_r2 | fixed |
 | **S9-3** | **P2** | cost | Feature extraction + torch infer every fit when fast-path on; cached model per device helps. | integration + generate feature extract | fixed |
 | **S9-4** | **P2** | dual paths | Classifier fast-path vs universal proposer both propose skeletons; duplicate work / conflicting priors possible. | Stage 1 + proposer dual path | fixed |
-| **S9-5** | **P2** | device | CPU path OK; CUDA overhead can dominate tiny n. | `_resolve_device` | open |
+| **S9-5** | **P2** | device | CPU path OK; CUDA overhead can dominate tiny n. | `_resolve_device` | fixed |
 
 ---
 
@@ -638,10 +638,10 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 
 | ID | Severity | Type | Summary | Evidence / locus | Status |
 |----|----------|------|---------|------------------|--------|
-| **S10-1** | **P2** | FPIP contract | **`validate_fpip_v2_payload` exists and is used on proposer→FPIP path**; not all intermediate dicts re-validated. Schema version must be `fpip.v2`. | `fpip_v2.py` ~144+; `proposer_output_to_fpip_v2` | open |
-| **S10-2** | **P2** | dead weight | **Python evolution / phased / HC / RSPG still importable** via `glassbox.sr`; production fit uses C++ `_core.run_evolution` + guided path in classifier_fast_path. Import surface pays for unused stacks. | `sr/__init__.py`; `phased_regression.py` | open |
-| **S10-3** | **P2** | dual simplify | Python + C++ simplify/snap both used (`snap_formula_floats`, cleanup). Risk of drift (largely fixed by S5 printer/eval work). | wrapper cleanup; core simplify | open |
-| **S10-4** | **P2** | optimizers | Hybrid/BFGS optimizers secondary; non-finite grads generally caught in try/except and skip candidate. | `optimizers/*` | open |
+| **S10-1** | **P2** | FPIP contract | **`validate_fpip_v2_payload` exists and is used on proposer→FPIP path**; not all intermediate dicts re-validated. Schema version must be `fpip.v2`. | `fpip_v2.py` ~144+; `proposer_output_to_fpip_v2` | fixed |
+| **S10-2** | **P2** | dead weight | **Python evolution / phased / HC / RSPG still importable** via `glassbox.sr`; production fit uses C++ `_core.run_evolution` + guided path in classifier_fast_path. Import surface pays for unused stacks. | `sr/__init__.py`; `phased_regression.py` | fixed (lazy import) |
+| **S10-3** | **P2** | dual simplify | Python + C++ simplify/snap both used (`snap_formula_floats`, cleanup). Risk of drift (largely fixed by S5 printer/eval work). | wrapper cleanup; core simplify | fixed (C++ primary path) |
+| **S10-4** | **P2** | optimizers | Hybrid/BFGS optimizers secondary; non-finite grads generally caught in try/except and skip candidate. | `optimizers/*` | fixed |
 | **S10-5** | **P1** | guided path | **1D guided evolution still Python/torch path** (`run_guided_evolution`) while multi-feature uses C++. Behavior/metric parity not identical. | wrapper Stage 2 guided branch | fixed |
 
 ---
@@ -750,3 +750,4 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 11. S5-9/S5-10 fixed (weighted specialist refine + protected exact eval) — remaining open P2 backlog optional
 12. **Tier A open-P2 fixed** (2026-07-23): E8 (noise parsimony ×1.75 + nest down-weight), N7 (weighted C++ MAD), S3-3 (user weights/Huber enable guards), S3-4 (residual 1.5% + unweighted improve gate), S3-5 (`_snap_with_fidelity`), S7-2 (OOB remap → `0`), S8-2 (composition cap 4 + complexity filter). Tests: `tests/test_tier_a_p2_fixes.py`
 13. **Tier B perf fixed** (2026-07-23): S3-6 (skip/cheapen constant refine when near-exact), S7-3 (ranking subsample + fewer trees/alphas), S8-4 (screening/composition caps + skip when strong), S9-3 (curve feature cache + multi-var slice caps), S9-4 (skip universal proposer when fast-path high-confidence). Tests: `tests/test_tier_b_perf_fixes.py`
+14. **Tier C polish fixed** (2026-07-23): N8 (sample_weight docstring), N9 (auto robust dim gate documented), N10 (`user_sample_weight_provided_` + diag source), E9/S6-1 (core pop=100/islands=8; elite_size exposed), S6-4 (eval_num_threads + restore OMP), S6-7 (ABI note in setup.py), S7-5 (rerank skip documented), S9-1 (`get_last_classifier_load_status` fail-open), S9-5 (tiny-n CPU under auto), S10-1 (validate fast-path FPIP), S10-2 (lazy `glassbox.sr` alternate stacks), S10-3 (C++ simplify primary), S10-4 (non-finite grad guards). Tests: `tests/test_tier_c_polish_fixes.py`

@@ -67,8 +67,13 @@ def _validate_sample_weight(sample_weight, n_samples):
     """Validate and normalise per-point weights (PhySO `y_weights` analogue).
 
     Returns a float64 array of length ``n_samples`` with non-negative finite
-    entries and mean ~1. ``None`` or empty input resolves to None (uniform).
-    Raises ``ValueError`` for length mismatch, non-finite, or all-zero weights.
+    entries and mean ~1.
+
+    * ``None`` → uniform weights (returns ``None``).
+    * Empty array (length 0) → ``ValueError`` when ``n_samples > 0`` (length
+      mismatch); only ``None`` means "no weights".
+    * Length mismatch, non-finite, negative, or all-zero → ``ValueError``.
+    * Partial zeros are allowed and re-normalised to mean ~1.
     """
     if sample_weight is None:
         return None
@@ -1049,6 +1054,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         # Phase C: gated noise-robust blackbox search (auto|True|False).
         # auto = soft residual/y weights + optional huber when blackbox is noisy
         # or selection-uncertain; never overrides user-provided sample_weight.
+        # N9: auto applies only for 1D SR or multi-feature with blackbox_mode on.
+        # Multi-feature + blackbox_mode=False never auto soft/Huber (use True to force).
         blackbox_noise_robust="auto",
         enable_specialist_screening_diagnostics=True,
         enable_specialist_composition_screening=True,
@@ -7162,7 +7169,12 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return None, False
 
     def _simplify_formula(self, formula):
-        """Apply multipass formula simplification."""
+        """Apply multipass formula simplification via the C++ engine (S10-3).
+
+        Single simplify path: C++ ``simplify_formula`` (advanced multipass).
+        Python string rewrites only run inside cleanup snap helpers, not here.
+        On C++ failure the original formula is returned unchanged.
+        """
         if not formula or not self.use_simplification:
             return formula
         try:
@@ -7782,6 +7794,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         X, y = check_X_y(X, y, accept_sparse=False)
         self.sample_weight_ = _validate_sample_weight(sample_weight, X.shape[0])
+        # N10: sample_weight_provided_ means "weights active this fit" (user or
+        # auto soft-MAD). user_sample_weight_provided_ is True only for the
+        # caller-supplied sample_weight argument.
+        self.user_sample_weight_provided_ = self.sample_weight_ is not None
         self.sample_weight_provided_ = self.sample_weight_ is not None
         # Preserve user-requested loss mode so Phase 3/4 auto paths only switch
         # when the caller left the default ``mse``.
@@ -7883,8 +7899,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             and int(X.shape[1]) > 1
         )
         single_feature_sr = int(X.shape[1]) == 1
+        # N9: auto robust only on 1D or multi-feature blackbox; force True always.
+        # N10: gate on user weights only — auto soft-MAD may set sample_weight_
+        # later, but user-provided weights must never be overridden.
         want_robust = (
-            not self.sample_weight_provided_
+            not bool(getattr(self, "user_sample_weight_provided_", False))
             and (
                 robust_mode is True
                 or (
@@ -7920,6 +7939,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             )
             if activate and soft_w is not None:
                 self.sample_weight_ = _validate_sample_weight(soft_w, X.shape[0])
+                # N10: weights active (auto) but not user-provided.
                 self.sample_weight_provided_ = self.sample_weight_ is not None
                 # Prefer huber search loss when we auto-soft-weight blackbox noise
                 # but only if user left default mse.
@@ -7928,9 +7948,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     self.loss_mode = "huber"
                     self._loss_mode_auto_switched_ = True
                     loss_switched = True
-                # S1-7/O2: skip full second prepare when selection is stable under
-                # mild soft weights (no uncertain ranking / heavy low-weight mass).
-                # Evolution still receives sample_weight_; only feature re-ranking is skipped.
+                # S1-7/O2 + S7-5: skip full second prepare when selection is stable
+                # under mild soft weights. Evolution still receives sample_weight_;
+                # only feature re-ranking is skipped (tradeoff: weighted ranking
+                # may differ slightly when outliers are mild).
                 # Skip when blackbox ranking is off (1D / disabled) — second
                 # prepare is pure cleanup. When ranking is on, skip only if
                 # selection looks stable under mild soft weights.
@@ -8091,17 +8112,21 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.blackbox_diagnostics_ = state_to_dict(blackbox_state)
         if isinstance(self.blackbox_diagnostics_, dict):
             if self.sample_weight_provided_ and self.sample_weight_ is not None:
+                # N10: distinguish user-provided vs auto soft-MAD (both set provided=True).
+                if bool(getattr(self, "user_sample_weight_provided_", False)):
+                    sw_source = "user"
+                elif (getattr(self, "_blackbox_noise_robust_applied_", {}) or {}).get("active"):
+                    sw_source = "auto_soft_mad"
+                else:
+                    sw_source = "active"
                 self.blackbox_diagnostics_["sample_weight"] = {
                     "provided": True,
+                    "user_provided": bool(getattr(self, "user_sample_weight_provided_", False)),
                     "effective_sample_size": _effective_sample_size(self.sample_weight_),
                     "min_weight": float(np.min(self.sample_weight_)),
                     "max_weight": float(np.max(self.sample_weight_)),
                     "mean_weight": float(np.mean(self.sample_weight_)),
-                    "source": (
-                        "auto_soft_mad"
-                        if (getattr(self, "_blackbox_noise_robust_applied_", {}) or {}).get("active")
-                        else "user"
-                    ),
+                    "source": sw_source,
                 }
             else:
                 self.blackbox_diagnostics_["sample_weight"] = {"provided": False}

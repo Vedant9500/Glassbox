@@ -431,8 +431,8 @@ py::dict run_evolution_cpp(
     double p_max = 3.0,
     // P5: NSGA-II
     bool use_nsga2 = false,
-    // P6: Island Model
-    int num_islands = 1,
+    // P6: Island Model (S6-1: default 8 islands matches sklearn GlassboxRegressor)
+    int num_islands = 8,
     int migration_interval = 25,
     int migration_size = 2,
     // P7: Dimensional Analysis (Phase 5 public API)
@@ -732,9 +732,15 @@ py::dict run_evolution_cpp(
     // RAII restores prior process temperature after this call (E10).
     sr::ScopedArithmeticTemperature _scoped_run_temp(arithmetic_temperature);
 
+    // S6-4: prefer per-engine eval_num_threads over process-global omp_set_num_threads
+    // so concurrent run_evolution calls do not race on the OpenMP max-thread count.
+    // When num_threads>0 we still set global threads for outer island parallel regions,
+    // but restore immediately after the run; island eval budgets use eval_num_threads.
     int previous_omp_threads = omp_get_max_threads();
-    if (num_threads > 0) {
+    const bool set_global_omp = (num_threads > 0);
+    if (set_global_omp) {
         omp_set_num_threads(num_threads);
+        config.eval_num_threads = num_threads;
     }
     
     std::cout << "[v6-nsga2] Starting C++ Evolution with " << omp_get_max_threads() << " OpenMP Threads!";
@@ -745,6 +751,9 @@ py::dict run_evolution_cpp(
     sr::EvolutionEngine engine(
         config, X, y, cpp_seed_omegas, cpp_seed_graphs, y_weights
     );
+    if (set_global_omp) {
+        engine.set_eval_num_threads(num_threads);
+    }
     
     // 3. Run evolution loop natively in C++
     {
@@ -756,8 +765,8 @@ py::dict run_evolution_cpp(
         }
     }
 
-    // Restore thread count if modified
-    if (num_threads > 0) {
+    // Restore thread count if modified (S6-4).
+    if (set_global_omp) {
         omp_set_num_threads(previous_omp_threads);
     }
     
@@ -1159,8 +1168,10 @@ PYBIND11_MODULE(_core, m) {
           py::arg("formulas"), py::arg("X_fit"), py::arg("y_fit"),
           py::arg("X_val"), py::arg("y_val"), py::arg("num_threads")=-1,
           py::arg("fit_weights")=py::none(), py::arg("val_weights")=py::none());
+    // S6-1: align raw _core defaults with sklearn GlassboxRegressor (pop=100, islands=8).
+    // E9/S6-2: elite_size and seed_fraction are exposed (defaults match EvolutionConfig).
     m.def("run_evolution", &run_evolution_cpp, "Runs the evolutionary algorithm natively in C++",
-          py::arg("X_list"), py::arg("y"), py::arg("pop_size")=50, py::arg("generations")=1000, 
+          py::arg("X_list"), py::arg("y"), py::arg("pop_size")=100, py::arg("generations")=1000, 
           py::arg("early_stop_mse")=1e-6, py::arg("seed_omegas")=py::list(),
           py::arg("timeout_seconds")=120,
           py::arg("op_priors")=py::list(),
@@ -1170,7 +1181,7 @@ PYBIND11_MODULE(_core, m) {
           py::arg("p_min")=-2.0,
           py::arg("p_max")=3.0,
           py::arg("use_nsga2")=false,
-          py::arg("num_islands")=1,
+          py::arg("num_islands")=8,
           py::arg("migration_interval")=25,
           py::arg("migration_size")=2,
           py::arg("input_units")=py::list(),

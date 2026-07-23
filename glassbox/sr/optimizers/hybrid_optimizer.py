@@ -106,18 +106,25 @@ class LBFGSConstantOptimizer:
             self.optimizer.zero_grad()
             pred, _ = self.model(x, hard=hard)
             
-            # Check for NaN in predictions
-            if torch.isnan(pred).any():
-                return torch.tensor(float('inf'))
+            # S10-4: non-finite preds/loss/grads → skip step safely.
+            if not torch.isfinite(pred).all():
+                return torch.tensor(1e8, dtype=pred.dtype, device=pred.device)
             
             loss = self.loss_fn(pred, y)
             
-            # Check for NaN in loss
-            if torch.isnan(loss):
-                return torch.tensor(float('inf'))
+            if not torch.isfinite(loss):
+                return torch.tensor(1e8, dtype=loss.dtype, device=loss.device)
             
             loss.backward()
             
+            # Zero non-finite grads before clipping
+            for p in self.model.parameters():
+                if p.grad is not None and not torch.isfinite(p.grad).all():
+                    p.grad = torch.where(
+                        torch.isfinite(p.grad),
+                        p.grad,
+                        torch.zeros_like(p.grad),
+                    )
             # Clip gradients to prevent explosion
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             

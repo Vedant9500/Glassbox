@@ -138,7 +138,13 @@ def build_fpip_v2_from_fast_path(
         routing_signal=_routing_from_signals(uncertainty, residual_diagnostics),
     )
 
-    return fpip.to_dict()
+    # S10-1: validate every FPIP dict before downstream consumption.
+    payload = fpip.to_dict()
+    valid, errors = validate_fpip_v2_payload(payload)
+    payload["valid"] = valid
+    if not valid:
+        payload["validation_errors"] = errors
+    return payload
 
 
 def validate_fpip_v2_payload(payload: Dict[str, Any]) -> Tuple[bool, List[str]]:

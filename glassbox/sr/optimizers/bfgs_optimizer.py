@@ -119,10 +119,17 @@ class RegularizedBFGS:
             # Total loss
             loss = mse_loss + self.l1_weight * l1_loss + self.l2_weight * l2_loss
             
-            # Guard against both NaN and Inf to prevent poisoning the
-            # LBFGS line search with non-finite objective values.
+            # S10-4: Guard against NaN/Inf so LBFGS line search is never
+            # poisoned by non-finite objective or gradient values.
             if torch.isfinite(loss):
                 loss.backward()
+                # Zero non-finite grads in-place (skip bad directions).
+                if weights.grad is not None and not torch.isfinite(weights.grad).all():
+                    weights.grad = torch.where(
+                        torch.isfinite(weights.grad),
+                        weights.grad,
+                        torch.zeros_like(weights.grad),
+                    )
             else:
                 # Return a large but finite fallback so LBFGS can
                 # reject this step gracefully instead of diverging.
@@ -136,10 +143,12 @@ class RegularizedBFGS:
             # BFGS can fail on ill-conditioned problems; keep current weights.
             pass
         
-        # Final loss
+        # Final loss — non-finite → large finite penalty (skip candidate upstream).
         with torch.no_grad():
             pred = X @ weights
             final_mse = F.mse_loss(pred, y).item()
+            if not np.isfinite(final_mse):
+                final_mse = 1e8
         
         return weights.detach(), final_mse
 

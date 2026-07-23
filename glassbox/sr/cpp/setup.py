@@ -47,6 +47,12 @@ def _print_project_help() -> None:
               - Linux/macOS use -fopenmp and require compiler support.
               - Full setuptools help: python {script} --help-setuptools
               - Command help: python {script} build_ext --help
+
+            ABI / artifacts (S6-7):
+              Built wheels/extensions are ABI-specific (e.g. cpython-312 vs
+              cpython-314, win_amd64 vs linux_x86_64). There is no cross-ABI
+              guarantee — rebuild with the same Python used at runtime:
+                python {script} build_ext --inplace --force
             """
         ).strip()
     )
