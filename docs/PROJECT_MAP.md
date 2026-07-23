@@ -158,6 +158,4 @@ benchmark path prefers C++ evolution when available.
 | `docs/CPP_Migration_Roadmap.md` | Migration status and remaining C++ work. |
 | `docs/SEARCH_OPTIMIZATION_PLAN.md` | Search optimizations shipped + remaining research items. |
 | `docs/curve_classifier_universal_proposer_audit.md` | Classifier/proposer audit; residual production work. |
-| `glassbox_codebase_audit_tracker.md` | Package audit findings; open P2 backlog. |
-| `glassbox_implementation_plan.md` | Implementation waves from the audit. |
 | `research_notes/*.md` | Research/audit notes. They are intentionally broader than implemented code. |

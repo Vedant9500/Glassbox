@@ -25,9 +25,6 @@ canonical architecture docs.
 ## Related Root Docs
 
 - `README.md`: quick start and runtime overview.
-- `glassbox_codebase_audit_tracker.md`: package audit findings (many open P2s).
-- `glassbox_implementation_plan.md`: ordered fix plan from the audit (phases
-  0–7; residual polish still tracked).
 
 ## Research Notes
 
