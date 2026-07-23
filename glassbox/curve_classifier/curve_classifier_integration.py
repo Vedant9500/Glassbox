@@ -430,7 +430,45 @@ _cached_classifier_by_device = {}
 _cached_operator_classes_by_key = {}
 _cached_metadata_by_device = {}
 _cached_interpolators_by_signature: Dict[Tuple, Tuple[Optional[object], object]] = {}
+# S9-3: short-lived curve feature cache (same fit / dual-path re-entry).
+_cached_curve_features: Dict[Tuple, np.ndarray] = {}
 _warned_no_cuda = False
+
+
+def _curve_feature_cache_key(x: np.ndarray, y: np.ndarray, n_points: int = 256) -> Tuple:
+    """Coarse deterministic key for feature-vector reuse within a process."""
+    x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
+    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+    n = int(min(x_arr.size, y_arr.size))
+    if n <= 0:
+        return (0, 0.0, 0.0, 0.0, 0.0, int(n_points))
+    # Sample up to 32 points for a cheap content fingerprint.
+    step = max(1, n // 32)
+    xs = x_arr[::step][:32]
+    ys = y_arr[::step][:32]
+    return (
+        int(n),
+        float(np.nanmean(xs)),
+        float(np.nanstd(xs)),
+        float(np.nanmean(ys)),
+        float(np.nanstd(ys)),
+        float(np.nansum(ys * xs)),
+        int(n_points),
+    )
+
+
+def _extract_features_xy_cached(x: np.ndarray, y: np.ndarray, n_points: int = 256) -> np.ndarray:
+    """extract_all_features_xy with a small process-local cache (S9-3)."""
+    key = _curve_feature_cache_key(x, y, n_points=n_points)
+    hit = _cached_curve_features.get(key)
+    if hit is not None:
+        return hit
+    feats = extract_all_features_xy(x, y, n_points=n_points)
+    _cached_curve_features[key] = feats
+    # Bound memory: keep last ~32 feature vectors.
+    if len(_cached_curve_features) > 32:
+        _cached_curve_features.pop(next(iter(_cached_curve_features)))
+    return feats
 
 
 def _resolve_device(device: Optional[str] = None) -> torch.device:
@@ -798,9 +836,9 @@ def predict_operators(
             x, y, model, metadata, resolved_device, threshold, n_vars, cache_key
         )
     
-    # Single-input: standard prediction
+    # Single-input: standard prediction (S9-3: cached feature extract).
     features = _prepare_curve_features(
-        extract_all_features_xy(x[:, 0], y),
+        _extract_features_xy_cached(x[:, 0], y),
         metadata.get('feature_scaler'),
     )
     probs = _predict_pytorch(model, features, metadata, resolved_device)
@@ -927,19 +965,24 @@ def _predict_operators_multi_input(
     x_medians = np.median(x, axis=0)
     
     interactions = []
-    if nearest_interp is not None:
+    # S9-3: skip expensive pairwise interaction PD when p is large or n is huge.
+    if nearest_interp is not None and n_vars <= 6 and len(y) <= 4000:
         try:
-            interactions = detect_variable_interactions(x, y, nearest_interp)
+            interactions = detect_variable_interactions(
+                x, y, nearest_interp, n_grid=11 if n_vars >= 4 else 15
+            )
         except Exception as e:
             print(f"  Warning: Interaction detection failed: {e}")
 
-    for var_idx in range(n_vars):
+    # S9-3: cap per-variable slices and grid density on large problems.
+    max_vars = min(n_vars, 8)
+    n_slice_points = min(128 if len(y) >= 500 else 256, len(y))
+
+    for var_idx in range(max_vars):
         # Create 1D slice: fix other variables at median, vary this one
         x_min_var = x[:, var_idx].min()
         x_max_var = x[:, var_idx].max()
         
-        # Sample points along this variable
-        n_slice_points = min(256, len(y))
         x_slice_1d = np.linspace(x_min_var, x_max_var, n_slice_points)
         
         # Build full query points (other vars at median)
@@ -964,10 +1007,10 @@ def _predict_operators_multi_input(
         
         y_slice_valid = y_slice[valid_mask]
         
-        # Extract features and predict
+        # Extract features and predict (S9-3: cached extract)
         try:
             features = _prepare_curve_features(
-                extract_all_features_xy(x_slice_1d[valid_mask], y_slice_valid),
+                _extract_features_xy_cached(x_slice_1d[valid_mask], y_slice_valid),
                 scaler,
             )
             probs = _predict_pytorch(model, features, metadata, device)
@@ -996,7 +1039,7 @@ def _predict_operators_multi_input(
             x_min_i, x_max_i = x[:, i].min(), x[:, i].max()
             x_min_j, x_max_j = x[:, j].min(), x[:, j].max()
             
-            n_slice_points = min(256, len(y))
+            n_slice_points = min(128 if len(y) >= 500 else 256, len(y))
             xi_slice = np.linspace(x_min_i, x_max_i, n_slice_points)
             xj_slice = np.linspace(x_min_j, x_max_j, n_slice_points)
             
@@ -1021,7 +1064,7 @@ def _predict_operators_multi_input(
             
             try:
                 features = _prepare_curve_features(
-                    extract_all_features_xy(xi_slice[valid_mask], y_slice_valid),
+                    _extract_features_xy_cached(xi_slice[valid_mask], y_slice_valid),
                     scaler,
                 )
                 probs = _predict_pytorch(model, features, metadata, device)

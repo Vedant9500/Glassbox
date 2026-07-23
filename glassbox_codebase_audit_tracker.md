@@ -317,7 +317,7 @@ user sample_weight?
 | **S3-3** | **P2** | guard scope | **Auto complexity/holdout guards only when `_auto_noise_guard_active()`** (soft-MAD / diffuse Huber). User-provided weights + user Huber skip final rescue guards → possible bloat under user noise protocol. Intentional for not fighting user objective; document. | `_auto_noise_guard_active` ~4004; `_apply_auto_weight_final_guard` | fixed |
 | **S3-4** | **P2** | residual bloat | Residual stage has weighted+unweighted+edge gates (good) but still can add a second term under medium noise when improvement is tiny but passes 0.2% gate. | residual acceptance ~6880–7050 | fixed |
 | **S3-5** | **P2** | snap hygiene | Integer/known-constant snaps are string rewrites; known-bank snap relies on caller re-score. Fidelity guard covers many cleanup paths but not every intermediate snap call site. | `_snap_*` ~1824–1915; `_cleanup_formula_with_fidelity_guard` | fixed |
-| **S3-6** | **P2** | cost | Constant refine / IRLS / multi-candidate refine loops expensive on multi-feature blackbox; little gain when MSE already near exact. | `_refine_formula_constants` ~1626+ | open |
+| **S3-6** | **P2** | cost | Constant refine / IRLS / multi-candidate refine loops expensive on multi-feature blackbox; little gain when MSE already near exact. | `_refine_formula_constants` ~1626+ | fixed |
 
 ---
 
@@ -547,7 +547,7 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 |----|----------|------|---------|------------------|--------|
 | **S7-1** | **P1** | feature drop | **Top-k ranking can drop true weak-but-necessary features** when scores cliff; mitigated by uncertain/plateau retain-all, but confident wrong ranking still drops. | `prepare_blackbox_search` selection + uncertain ~900–992 | fixed |
 | **S7-2** | **P2** | remap | **Index remap reduced↔original is correct for selected cols.** Standardized path expands `(x_j-mean)/scale` + y inverse. Unmapped original features left as-is in reverse map (can be OOB if formula references dropped var). | `remap_*` / `formula_from_search_to_original_space` ~1159–1220 | fixed |
-| **S7-3** | **P2** | cost | ExtraTrees (64 trees) + MI + Lasso/ENet on every multi-feature prepare; dominate wall time before evolution on large n/p. | `_tree_importance_scores` ~437+; ranking ~504+ | open |
+| **S7-3** | **P2** | cost | ExtraTrees (64 trees) + MI + Lasso/ENet on every multi-feature prepare; dominate wall time before evolution on large n/p. | `_tree_importance_scores` ~437+; ranking ~504+ | fixed |
 | **S7-4** | **P2** | determinism | ExtraTrees uses `random_state=0` (good). MI resampling under weights may still jitter if sklearn changes. Overall ranking mostly deterministic. | tree/MI helpers | ok-ish |
 | **S7-5** | **P2** | noise ranking | Weighted ranking supported via sample_weight; soft-MAD re-rank may be skipped (S1-7 O2) when mild — tradeoff. | prepare + O2 skip | open |
 
@@ -575,7 +575,7 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 | **S8-1** | **P1** | vault poisoning | **Vault admits high-R² candidates from noisy labels** (only corr-dedup + stale eviction). False specialists can seed later multi_start runs / compositions within the same fit. | `SpecialistVault.add_candidates` ~266–320 | fixed |
 | **S8-2** | **P2** | composition bloat | Compositions up to 6 proposals; can increase complexity before final guards. Partly mitigated by later selection/guards. | `propose_compositions` ~398+ | fixed |
 | **S8-3** | — | leakage | **Vault recreated at each `fit` start** — no cross-fit leakage on estimator. | wrapper fit reset ~7508 | ok |
-| **S8-4** | **P2** | cost | Screening + composition re-evals many formulas per multi_start run. | vault hooks + specialist diagnostics | open |
+| **S8-4** | **P2** | cost | Screening + composition re-evals many formulas per multi_start run. | vault hooks + specialist diagnostics | fixed |
 
 ---
 
@@ -606,8 +606,8 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 |----|----------|------|---------|------------------|--------|
 | **S9-1** | **P1** | fail-open | **Missing/broken classifier fails load; fast-path typically skips and falls through to evolution** (fail-open). Good availability; can hide misconfigured model path. | `load_classifier` ~552+; wrapper Stage 1 try/except | open |
 | **S9-2** | **P1** | overconfidence | High classifier confidence shrinks compute budget / can skip evolution via R² gates. Misclassified easy-looking hard problems under-search. Uncertainty routing exists but depends on calibration quality. | budget `_estimate_compute_budget`; evolution_skip_r2 | fixed |
-| **S9-3** | **P2** | cost | Feature extraction + torch infer every fit when fast-path on; cached model per device helps. | integration + generate feature extract | open |
-| **S9-4** | **P2** | dual paths | Classifier fast-path vs universal proposer both propose skeletons; duplicate work / conflicting priors possible. | Stage 1 + proposer dual path | open |
+| **S9-3** | **P2** | cost | Feature extraction + torch infer every fit when fast-path on; cached model per device helps. | integration + generate feature extract | fixed |
+| **S9-4** | **P2** | dual paths | Classifier fast-path vs universal proposer both propose skeletons; duplicate work / conflicting priors possible. | Stage 1 + proposer dual path | fixed |
 | **S9-5** | **P2** | device | CPU path OK; CUDA overhead can dominate tiny n. | `_resolve_device` | open |
 
 ---
@@ -749,3 +749,4 @@ Linear outer layer is ridge / IRLS-refit each refine (`solve_output_weights`).
 10. Phase 7 API polish complete (S1-11, S5-14/16, S6-2)
 11. S5-9/S5-10 fixed (weighted specialist refine + protected exact eval) — remaining open P2 backlog optional
 12. **Tier A open-P2 fixed** (2026-07-23): E8 (noise parsimony ×1.75 + nest down-weight), N7 (weighted C++ MAD), S3-3 (user weights/Huber enable guards), S3-4 (residual 1.5% + unweighted improve gate), S3-5 (`_snap_with_fidelity`), S7-2 (OOB remap → `0`), S8-2 (composition cap 4 + complexity filter). Tests: `tests/test_tier_a_p2_fixes.py`
+13. **Tier B perf fixed** (2026-07-23): S3-6 (skip/cheapen constant refine when near-exact), S7-3 (ranking subsample + fewer trees/alphas), S8-4 (screening/composition caps + skip when strong), S9-3 (curve feature cache + multi-var slice caps), S9-4 (skip universal proposer when fast-path high-confidence). Tests: `tests/test_tier_b_perf_fixes.py`

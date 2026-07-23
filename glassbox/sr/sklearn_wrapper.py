@@ -1662,6 +1662,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         Under outliers, soft MAD / IRLS residual weights keep free-const recovery
         from drifting so near-integer snap can hit Exact on clean labels.
+
+        S3-6: skip expensive IRLS when the current formula is already near-exact
+        on fit (or multi-feature + excellent val), and cheapen budgets when the
+        structure is already strong.
         """
         if least_squares is None:
             return None
@@ -1706,6 +1710,44 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         y_fit = np.asarray(y_fit, dtype=np.float64).reshape(-1)
         y_val = np.asarray(y_val, dtype=np.float64).reshape(-1)
+        X_fit_arr = np.asarray(X_fit, dtype=np.float64)
+        n_feat = int(X_fit_arr.shape[1]) if X_fit_arr.ndim == 2 else 1
+        y_fit_var = float(np.var(y_fit)) if y_fit.size else 0.0
+        near_exact_abs = max(float(getattr(self, "early_stop_mse", 1e-10)), 1e-12)
+        near_exact_rel = max(1e-12 * max(y_fit_var, 1.0), near_exact_abs)
+
+        # S3-6 early exit: already near-exact → return identity (no LS/IRLS).
+        try:
+            pred0 = self._safe_eval_formula_array(text, X_fit_arr)
+            pred0 = np.asarray(pred0, dtype=np.float64).reshape(-1)
+            if pred0.shape == y_fit.shape and np.all(np.isfinite(pred0)):
+                fit0 = float(np.mean((pred0 - y_fit) ** 2))
+                if np.isfinite(fit0) and fit0 <= near_exact_rel:
+                    pred_v = self._safe_eval_formula_array(text, X_val)
+                    pred_v = np.asarray(pred_v, dtype=np.float64).reshape(-1)
+                    val0 = float(np.mean((pred_v - y_val) ** 2)) if pred_v.shape == y_val.shape else fit0
+                    val_var = float(np.var(y_val)) if y_val.size else 0.0
+                    val_r2 = 1.0 if val_var < 1e-15 and val0 < 1e-15 else (
+                        0.0 if val_var < 1e-15 else 1.0 - val0 / max(val_var, 1e-15)
+                    )
+                    return {
+                        "formula": text,
+                        "fit_mse": fit0,
+                        "mse": float(val0) if np.isfinite(val0) else fit0,
+                        "validation_mse": float(val0) if np.isfinite(val0) else fit0,
+                        "validation_r2": float(val_r2),
+                        "complexity": self._formula_complexity(text),
+                        "constant_refined": False,
+                        "robust_refined": False,
+                        "refine_skipped": "already_near_exact",
+                    }
+                # Multi-feature + already excellent: cheapen IRLS heavily.
+                if n_feat >= 2 and fit0 <= max(1e-6, 1e-4 * max(y_fit_var, 1.0)):
+                    robust = False
+                    irls_iters = 1
+        except Exception:
+            pass
+
         base_w = fit_weights if fit_weights is not None else sample_weight
         if base_w is not None:
             base_w = np.asarray(base_w, dtype=np.float64).reshape(-1)
@@ -1746,8 +1788,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         best_cost = float("inf")
         w_cur = np.asarray(base_w, dtype=np.float64).reshape(-1)
         n_irls = max(1, int(irls_iters) if robust else 1)
+        # S3-6: multi-feature blackbox — fewer LS evals when not in full robust mode.
+        if n_feat >= 2 and not robust:
+            n_irls = 1
         f_scale = max(1e-6, float(np.std(y_fit)) * (0.05 if robust else 0.1))
-        max_nfev = 400 if robust else 200
+        if n_feat >= 2:
+            max_nfev = 200 if robust else 80
+        else:
+            max_nfev = 400 if robust else 200
         x0 = initial.copy()
 
         for _irls in range(n_irls):
@@ -3165,9 +3213,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         }
 
     def _compute_specialist_screening_diagnostics(self, candidate_formulas, X, y, *, max_candidates=6, max_pairs=5):
-        """Summarize coarse segment behavior and pair complementarity for top candidates."""
+        """Summarize coarse segment behavior and pair complementarity for top candidates.
+
+        S8-4: tighter default caps so multi_start screening re-evals stay bounded.
+        """
         import time as _time
         _phase_start = _time.time()
+        # S8-4: hard caps (was up to 6 candidates / 5 pairs per multi_start run).
+        max_candidates = max(1, min(int(max_candidates), 4))
+        max_pairs = max(1, min(int(max_pairs), 3))
         try:
             state = compute_specialist_state(
                 candidate_formulas,
@@ -3188,7 +3242,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         return state.to_dict()
 
     def _compose_specialist_candidates(self, candidate_formulas, X, y, *, max_candidates=12):
-        """Generate and validate a tiny set of specialist-driven formula compositions."""
+        """Generate and validate a tiny set of specialist-driven formula compositions.
+
+        S8-4: refine at most 4 composition proposals (not full screening_budget).
+        """
         import time as _time
         _phase_start = _time.time()
         state = getattr(self, "specialist_state_", None)
@@ -3201,7 +3258,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 X,
                 y,
                 evaluate_formula=self._safe_eval_formula_array,
-                max_pairs=3,
+                max_pairs=2,
                 min_complementarity=0.30,
             )
             if not proposals:
@@ -3215,11 +3272,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 return []
 
             raw_candidates = [proposal.to_candidate_dict() for proposal in proposals]
+            # S8-4: never refine more than 4 compositions even if budget is higher.
+            refine_cap = max(2, min(4, int(max_candidates)))
             refined = self._refine_candidate_formulas(
                 raw_candidates,
                 X,
                 y,
-                max_candidates=max(4, int(max_candidates)),
+                max_candidates=refine_cap,
             )
             if not refined:
                 return []
@@ -5149,15 +5208,21 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 )
             if scored is None:
                 continue
-            constant_refined = self._refine_formula_constants(
-                scored["formula"],
-                split["X_fit"],
-                split["y_fit"],
-                split["X_val"],
-                split["y_val"],
-            )
+            # S3-6: skip constant refine when candidate already near-exact on val.
+            scored_mse = float(scored.get("mse", float("inf")) or float("inf"))
+            near_exact = scored_mse <= max(float(getattr(self, "early_stop_mse", 1e-10)), 1e-10)
+            constant_refined = None
+            if not near_exact:
+                constant_refined = self._refine_formula_constants(
+                    scored["formula"],
+                    split["X_fit"],
+                    split["y_fit"],
+                    split["X_val"],
+                    split["y_val"],
+                )
             if (
                 constant_refined is not None
+                and not constant_refined.get("refine_skipped")
                 and float(constant_refined.get("validation_mse", float("inf")))
                 < float(scored.get("mse", float("inf"))) * 0.995
             ):
@@ -5782,17 +5847,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             ],
         })
 
-        specialist_screening = self._compute_specialist_screening_diagnostics(
-            candidate_formulas,
-            X,
-            y,
-            max_candidates=6,
-            max_pairs=5,
-        )
-        if specialist_screening is None:
-            return candidate_formulas or []
-
-        screening_diag["specialist_screening"] = specialist_screening
+        # S8-4: score existing quality first — skip all screening when already exact.
         best_existing_mse = float("inf")
         best_existing_r2 = -float("inf")
         for cand in candidate_formulas or []:
@@ -5809,19 +5864,40 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             screening_diag["residual_skipped_reason"] = "existing_exact_candidate"
             screening_diag["best_existing_validation_mse"] = float(best_existing_mse)
             screening_diag["best_existing_validation_r2"] = float(best_existing_r2)
+            screening_diag["specialist_screening"] = "skipped_existing_exact"
             return candidate_formulas or []
 
+        # S8-4: also skip composition screening when already excellent (R²≥0.999).
+        existing_strong = best_existing_r2 >= 0.999 or (
+            np.isfinite(best_existing_mse)
+            and best_existing_mse <= max(1e-6, 1e-4 * max(float(np.var(np.asarray(y, dtype=np.float64).reshape(-1))), 1.0))
+        )
+
+        specialist_screening = self._compute_specialist_screening_diagnostics(
+            candidate_formulas,
+            X,
+            y,
+            max_candidates=4,
+            max_pairs=3,
+        )
+        if specialist_screening is None:
+            return candidate_formulas or []
+
+        screening_diag["specialist_screening"] = specialist_screening
+
         specialist_candidates = []
-        if getattr(self, "enable_specialist_composition_screening", True):
+        if (
+            getattr(self, "enable_specialist_composition_screening", True)
+            and not existing_strong
+        ):
             specialist_candidates = self._compose_specialist_candidates(
                 candidate_formulas,
                 X,
                 y,
-                max_candidates=max(
-                    8,
-                    int((blackbox_search_plan or {}).get("screening_budget", 8)),
-                ),
+                max_candidates=4,
             )
+        elif existing_strong:
+            screening_diag["composition_skipped_reason"] = "existing_strong_candidate"
 
         residual_merged_candidates = []
         if self.enable_residual_stage and specialist_candidates:
@@ -6980,9 +7056,39 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         Returns:
             Tuple[fpip_payload_or_none, force_evolution_bool]
+
+        S9-4: skip proposer entirely when fast-path already high-confidence /
+        near-exact (avoids dual skeleton search that conflicts with a good hit).
         """
         if not self.use_universal_proposer:
             return None, False
+
+        # S9-4: skip dual path when fast-path already solved / high confidence.
+        if isinstance(fast_path_result, dict) and fast_path_result.get("formula"):
+            fp_mse = float(fast_path_result.get("mse", float("inf")) or float("inf"))
+            fp_unc = fast_path_result.get("uncertainty") or {}
+            fp_details = fast_path_result.get("details") or {}
+            early = max(float(getattr(self, "early_stop_mse", 1e-10)), 1e-12)
+            high_conf = (
+                (np.isfinite(fp_mse) and fp_mse <= early * 10.0)
+                or bool(fp_details.get("compact_multivariate_basis", False))
+                or (
+                    isinstance(fp_unc, dict)
+                    and not bool(fp_unc.get("prediction_uncertain", False))
+                    and float(fp_unc.get("prediction_margin") or 0.0) >= 0.25
+                    and float(fp_unc.get("prediction_entropy") or 1.0) <= 0.45
+                )
+            )
+            if high_conf:
+                self.universal_proposer_status_ = "skipped_fast_path_high_confidence"
+                if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+                    self.blackbox_diagnostics_["universal_proposer_skip"] = {
+                        "reason": "fast_path_high_confidence",
+                        "fp_mse": fp_mse if np.isfinite(fp_mse) else None,
+                    }
+                if self.universal_proposer_log_routing:
+                    print("  [Proposer skipped: fast-path high confidence]")
+                return None, False
 
         try:
             from glassbox.universal_proposer import (

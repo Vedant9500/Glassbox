@@ -360,6 +360,43 @@ def _cheap_feature_scores(
     return scores
 
 
+def _ranking_subsample(
+    X: np.ndarray,
+    y: np.ndarray,
+    sample_weight: Optional[np.ndarray] = None,
+    *,
+    max_rows: int = 2000,
+    random_state: int = 0,
+) -> tuple:
+    """Cap ranking rows on large n so MI/trees/Lasso stay sub-second.
+
+    Deterministic subsample preserves relative feature signal for ranking.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    w = _as_sample_weight(sample_weight, y.shape[0])
+    n = int(y.shape[0])
+    if n <= int(max_rows):
+        return X, y, w
+    rng = np.random.RandomState(int(random_state))
+    if w is not None and float(np.sum(w)) > 0:
+        p = np.asarray(w, dtype=np.float64).reshape(-1)
+        p = np.clip(p, 0.0, None)
+        total = float(np.sum(p))
+        if total > 0:
+            p = p / total
+            idx = rng.choice(n, size=int(max_rows), replace=False, p=p)
+        else:
+            idx = rng.choice(n, size=int(max_rows), replace=False)
+    else:
+        idx = rng.choice(n, size=int(max_rows), replace=False)
+    idx = np.sort(idx)
+    Xs = X[idx] if X.ndim == 2 else X
+    ys = y[idx]
+    ws = w[idx] if w is not None else None
+    return Xs, ys, ws
+
+
 def _mutual_information_scores(
     X: np.ndarray,
     y: np.ndarray,
@@ -370,7 +407,8 @@ def _mutual_information_scores(
     try:
         X_arr = np.asarray(X, dtype=np.float64)
         y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
-        w = _as_sample_weight(sample_weight, y_arr.shape[0])
+        # S7-3: subsample large n before MI (O(n log n) per feature).
+        X_arr, y_arr, w = _ranking_subsample(X_arr, y_arr, sample_weight, max_rows=1500, random_state=0)
         # sklearn MI has no sample_weight; approximate by weighted resampling.
         if w is not None and X_arr.ndim == 2 and X_arr.shape[0] == y_arr.shape[0]:
             rng = np.random.RandomState(0)
@@ -378,7 +416,8 @@ def _mutual_information_scores(
             idx = rng.choice(y_arr.shape[0], size=int(y_arr.shape[0]), replace=True, p=p)
             X_arr = X_arr[idx]
             y_arr = y_arr[idx]
-        scores = mutual_info_regression(X_arr, y_arr, random_state=0)
+        n_neighbors = 3 if X_arr.shape[0] >= 200 else 5
+        scores = mutual_info_regression(X_arr, y_arr, random_state=0, n_neighbors=n_neighbors)
         return _normalize_score_dict({j: float(scores[j]) for j in range(len(scores))})
     except Exception:
         return {}
@@ -393,17 +432,23 @@ def _sparse_linear_scores(
         return {}
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
-    w = _as_sample_weight(sample_weight, y.shape[0])
+    # S7-3: subsample large n; cheaper CV grids.
+    X, y, w = _ranking_subsample(X, y, sample_weight, max_rows=1200, random_state=1)
     if X.ndim != 2 or X.shape[1] == 0 or X.shape[0] < max(24, X.shape[1] + 4):
         return {}
+
+    # Prefer Lasso only when p is large (ElasticNet CV is expensive).
+    n, p = int(X.shape[0]), int(X.shape[1])
+    run_enet = p <= 32 and n <= 800
 
     score_pool: List[np.ndarray] = []
     try:
         lasso = LassoCV(
             cv=3,
             random_state=0,
-            max_iter=5000,
-            alphas=32,
+            max_iter=2000,
+            alphas=16 if n >= 400 else 24,
+            n_jobs=1,
         )
         if w is None:
             lasso.fit(X, y)
@@ -412,21 +457,23 @@ def _sparse_linear_scores(
         score_pool.append(np.abs(np.asarray(lasso.coef_, dtype=np.float64)))
     except Exception:
         pass
-    try:
-        enet = ElasticNetCV(
-            cv=3,
-            random_state=0,
-            max_iter=5000,
-            alphas=24,
-            l1_ratio=(0.2, 0.5, 0.8, 0.95, 1.0),
-        )
-        if w is None:
-            enet.fit(X, y)
-        else:
-            enet.fit(X, y, sample_weight=w)
-        score_pool.append(np.abs(np.asarray(enet.coef_, dtype=np.float64)))
-    except Exception:
-        pass
+    if run_enet:
+        try:
+            enet = ElasticNetCV(
+                cv=3,
+                random_state=0,
+                max_iter=2000,
+                alphas=12 if n >= 400 else 16,
+                l1_ratio=(0.5, 0.9, 1.0),
+                n_jobs=1,
+            )
+            if w is None:
+                enet.fit(X, y)
+            else:
+                enet.fit(X, y, sample_weight=w)
+            score_pool.append(np.abs(np.asarray(enet.coef_, dtype=np.float64)))
+        except Exception:
+            pass
     if not score_pool:
         return {}
 
@@ -443,14 +490,19 @@ def _tree_importance_scores(
         return {}
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
-    w = _as_sample_weight(sample_weight, y.shape[0])
+    # S7-3: subsample + fewer trees (was 64 on full n).
+    X, y, w = _ranking_subsample(X, y, sample_weight, max_rows=1500, random_state=2)
     if X.ndim != 2 or X.shape[1] == 0 or X.shape[0] < 24:
         return {}
     try:
+        n = int(X.shape[0])
+        p = int(X.shape[1])
+        n_estimators = 24 if n >= 500 or p >= 20 else 32
         model = ExtraTreesRegressor(
-            n_estimators=64,
-            max_depth=min(8, max(3, int(np.sqrt(max(1, X.shape[0]))))),
+            n_estimators=n_estimators,
+            max_depth=min(6, max(3, int(np.sqrt(max(1, n))))),
             min_samples_leaf=2,
+            max_features="sqrt",
             random_state=0,
             n_jobs=1,
         )
