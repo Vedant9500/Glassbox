@@ -15,20 +15,19 @@ canonical architecture docs.
 - `Research_Roadmap.md`: current roadmap and status for benchmark discipline,
   blackbox/SRBench work, specialist composition, C++ migration, proposer usage,
   and remaining research risks.
-- `Universal_FastPath_AB_Report.md`: qualitative A/B rollout report for hybrid
-  fast path vs proposer-only/legacy modes.
 - `CPP_Migration_Roadmap.md`: current C++ backend migration status and remaining
   native-backend opportunities.
+- `SEARCH_OPTIMIZATION_PLAN.md`: search-path status plus remaining research
+  items (e.g. online semantic diversity, broader separability probes).
+- `curve_classifier_universal_proposer_audit.md`: classifier/proposer audit and
+  phase status (implementation largely done; production corpus work remaining).
 
 ## Related Root Docs
 
 - `README.md`: quick start and runtime overview.
-- `specialist_composition_plan.md` and `specialist_composition_audit.md`:
-  specialist composition design/history and audit notes.
-- `blackbox_optimization_plan.md`: blackbox/SRBench feature-reduction and
-  interaction-discovery plan.
-- `cuda_x_integration_plan.md`: GPU/CUDA-X planning notes.
-- `Implementation Plan.md`: native simplification migration notes.
+- `glassbox_codebase_audit_tracker.md`: package audit findings (many open P2s).
+- `glassbox_implementation_plan.md`: ordered fix plan from the audit (phases
+  0–7; residual polish still tracked).
 
 ## Research Notes
 

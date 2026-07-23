@@ -268,15 +268,17 @@ def test_propose_specialist_compositions_handles_reversed_nested_parent():
 
 
 def test_specialist_vault_dedupes_by_prediction_correlation_and_caps_entries():
-    x = np.linspace(-2.0, 2.0, 80)
-    X = x.reshape(-1, 1)
-    y = np.sin(x)
+    # 2D additive target: partial specialists x0/x1 both clear S8-1 holdout gate
+    # (1D partials often fail tail-holdout R² on sin/poly mixes).
+    rng = np.random.RandomState(0)
+    X = rng.uniform(-1.0, 1.0, size=(100, 2))
+    y = X[:, 0] + X[:, 1]
     vault = SpecialistVault(max_entries=2, corr_threshold=0.98)
     candidates = [
-        {"formula": "sin(x0)", "validation_r2": 1.0, "validation_mse": 0.0, "source": "a"},
-        {"formula": "sin(x0) + 0", "validation_r2": 0.999, "validation_mse": 1e-9, "source": "dup"},
-        {"formula": "cos(x0)", "validation_r2": 0.1, "validation_mse": 0.8, "source": "b"},
-        {"formula": "x0", "validation_r2": 0.0, "validation_mse": 1.0, "source": "c"},
+        {"formula": "x0", "validation_r2": 0.5, "validation_mse": 0.5, "source": "a"},
+        {"formula": "x0+0", "validation_r2": 0.5, "validation_mse": 0.5, "source": "dup"},
+        {"formula": "x1", "validation_r2": 0.5, "validation_mse": 0.5, "source": "b"},
+        {"formula": "0.1*x0", "validation_r2": 0.1, "validation_mse": 0.9, "source": "c"},
     ]
 
     added = vault.add_candidates(
@@ -285,48 +287,56 @@ def test_specialist_vault_dedupes_by_prediction_correlation_and_caps_entries():
         y,
         evaluate_formula=_eval_formula,
         complexity_fn=lambda formula: len(str(formula)),
-        family_signature_fn=lambda formula: "periodic" if "sin" in formula or "cos" in formula else "poly",
+        family_signature_fn=lambda formula: str(formula)[:2],
         run_index=0,
-        current_best_formula="0*x0",
+        current_best_formula="0",
         max_new=4,
     )
 
     assert added >= 2
     assert len(vault.entries) == 2
     formulas = {entry.formula for entry in vault.entries}
-    assert not {"sin(x0)", "sin(x0) + 0"}.issubset(formulas)
+    assert not {"x0", "x0+0"}.issubset(formulas)
     assert vault.rejected_duplicate_count >= 1
 
 
 def test_specialist_vault_proposes_capped_composition_candidates():
-    x = np.linspace(-1.0, 1.0, 80)
-    X = x.reshape(-1, 1)
-    y = np.sin(x + 1.0)
+    # Complementary 2D specialists that pass S8-1 and compose under S8-2 caps.
+    rng = np.random.RandomState(1)
+    X = rng.uniform(-1.0, 1.0, size=(100, 2))
+    y = X[:, 0] + X[:, 1]
     vault = SpecialistVault(max_entries=8)
     vault.add_candidates(
         [
-            {"formula": "sin(x0)", "validation_r2": 0.5, "validation_mse": 0.2, "source": "outer"},
-            {"formula": "x0+1.0", "validation_r2": 0.5, "validation_mse": 0.2, "source": "inner"},
+            {"formula": "x0", "validation_r2": 0.5, "validation_mse": 0.5, "source": "outer"},
+            {"formula": "x1", "validation_r2": 0.5, "validation_mse": 0.5, "source": "inner"},
         ],
         X,
         y,
         evaluate_formula=_eval_formula,
-        complexity_fn=lambda formula: 1,
-        family_signature_fn=lambda formula: "sin" if "sin" in str(formula) else "poly",
+        complexity_fn=lambda formula: 3,
+        family_signature_fn=lambda formula: str(formula)[:2],
         run_index=0,
         max_new=2,
     )
+    assert len(vault.entries) >= 1
 
     proposals = vault.propose_compositions(
         X,
         y,
         evaluate_formula=_eval_formula,
-        complexity_fn=lambda formula: 1,
-        family_signature_fn=lambda formula: "sin" if "sin" in str(formula) else "poly",
-        current_best_candidate={"formula": "x0", "validation_mse": 1.0, "validation_r2": 0.0, "source": "current"},
+        complexity_fn=lambda formula: 3,
+        family_signature_fn=lambda formula: str(formula)[:2],
+        current_best_candidate={
+            "formula": "x0+x1",
+            "validation_mse": 0.0,
+            "validation_r2": 1.0,
+            "source": "current",
+        },
     )
 
-    assert len(proposals) <= 6
+    # S8-2: hard cap of 4 (was 6).
+    assert len(proposals) <= 4
     assert proposals
     assert all(candidate["from_specialist_vault"] for candidate in proposals)
     assert all(candidate["from_specialist_composition"] for candidate in proposals)

@@ -874,32 +874,101 @@ private:
         return objective_mse(ind);
     }
 
+    // Weighted median of vals using optional per-point weights (same length).
+    // Falls back to unweighted middle element when weights are absent/mismatched.
+    static double weighted_median_of(std::vector<double>& vals,
+                                     const Eigen::ArrayXd* weights,
+                                     const std::vector<int>* weight_idx) {
+        if (vals.empty()) return 0.0;
+        if (weights == nullptr || weight_idx == nullptr ||
+            weight_idx->size() != vals.size()) {
+            std::sort(vals.begin(), vals.end());
+            return vals[vals.size() / 2];
+        }
+        std::vector<size_t> order(vals.size());
+        for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+        std::sort(order.begin(), order.end(),
+                  [&](size_t a, size_t b) { return vals[a] < vals[b]; });
+        double total = 0.0;
+        for (size_t k = 0; k < order.size(); ++k) {
+            const int wi = (*weight_idx)[order[k]];
+            double w = (wi >= 0 && wi < static_cast<int>(weights->size()))
+                           ? (*weights)(wi) : 0.0;
+            if (!std::isfinite(w) || w < 0.0) w = 0.0;
+            total += w;
+        }
+        if (!(total > 0.0)) {
+            std::sort(vals.begin(), vals.end());
+            return vals[vals.size() / 2];
+        }
+        double half = 0.5 * total;
+        double cum = 0.0;
+        for (size_t k = 0; k < order.size(); ++k) {
+            const int wi = (*weight_idx)[order[k]];
+            double w = (wi >= 0 && wi < static_cast<int>(weights->size()))
+                           ? (*weights)(wi) : 0.0;
+            if (!std::isfinite(w) || w < 0.0) w = 0.0;
+            cum += w;
+            if (cum >= half) return vals[order[k]];
+        }
+        return vals[order.back()];
+    }
+
+    // Robust residual scale via MAD (≈ σ for Gaussian).
+    // N7: when y_weights_ are set, use weighted median/MAD to match Python _mad_scale.
     double mad_scale(const Eigen::ArrayXd& resid) const {
         const int n = static_cast<int>(resid.size());
         if (n <= 0) return 1.0;
         std::vector<double> vals;
+        std::vector<int> idx;
         vals.reserve(static_cast<size_t>(n));
+        idx.reserve(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) {
-            if (std::isfinite(resid(i))) vals.push_back(resid(i));
+            if (std::isfinite(resid(i))) {
+                vals.push_back(resid(i));
+                idx.push_back(i);
+            }
         }
         if (vals.empty()) return 1.0;
-        std::sort(vals.begin(), vals.end());
-        double med = vals[vals.size() / 2];
-        for (double& v : vals) v = std::abs(v - med);
-        std::sort(vals.begin(), vals.end());
-        double mad = vals[vals.size() / 2];
+
+        const bool use_w = has_y_weights_ && y_weights_.size() == resid.size();
+        const Eigen::ArrayXd* wptr = use_w ? &y_weights_ : nullptr;
+        const std::vector<int>* iptr = use_w ? &idx : nullptr;
+
+        // Copy for median; weighted_median_of may reorder via index sort.
+        std::vector<double> vals_for_med = vals;
+        double med = weighted_median_of(vals_for_med, wptr, iptr);
+
+        std::vector<double> abs_dev;
+        abs_dev.reserve(vals.size());
+        for (double v : vals) abs_dev.push_back(std::abs(v - med));
+        double mad = weighted_median_of(abs_dev, wptr, iptr);
         double scale = 1.4826 * mad;
         if (!std::isfinite(scale) || scale < 1e-12) {
-            double acc = 0.0;
-            int c = 0;
-            for (int i = 0; i < n; ++i) {
-                if (std::isfinite(resid(i))) {
-                    acc += resid(i) * resid(i);
-                    ++c;
+            // Weighted RMSE fallback when MAD collapses.
+            if (use_w) {
+                double acc = 0.0, wsum = 0.0;
+                for (size_t k = 0; k < vals.size(); ++k) {
+                    double w = y_weights_(idx[k]);
+                    if (!std::isfinite(w) || w < 0.0) continue;
+                    acc += w * vals[k] * vals[k];
+                    wsum += w;
                 }
-            }
-            if (c > 0) {
-                scale = std::sqrt(acc / static_cast<double>(c));
+                if (wsum > 0.0) {
+                    scale = std::sqrt(acc / wsum);
+                }
+            } else {
+                double acc = 0.0;
+                int c = 0;
+                for (int i = 0; i < n; ++i) {
+                    if (std::isfinite(resid(i))) {
+                        acc += resid(i) * resid(i);
+                        ++c;
+                    }
+                }
+                if (c > 0) {
+                    scale = std::sqrt(acc / static_cast<double>(c));
+                }
             }
             if (!std::isfinite(scale) || scale < 1e-12) scale = 1.0;
         }
@@ -1602,6 +1671,15 @@ private:
             complexity_penalty_factor += 0.25 * (static_cast<int>(graph.nodes.size()) - config_.max_nodes);
         }
 
+        // E8: under robust loss or sample weights, robust objectives compress outliers
+        // so weak extra basis nodes can look cheap. Amplify parsimony so structure
+        // must pay a larger MSE improvement (~2.1% per active unit) to survive.
+        const bool robust_or_weighted =
+            (config_.loss_mode != LossMode::Mse) || has_y_weights_;
+        if (robust_or_weighted) {
+            complexity_penalty_factor *= 1.75;
+        }
+
         // Relax penalty if we have discovered an exact physical law
         if (mse < 1e-6) {
             complexity_penalty_factor *= 1e-4;
@@ -1737,6 +1815,15 @@ private:
                 w_wrap /= wsum; w_mul /= wsum; w_div /= wsum; w_nest /= wsum;
             } else {
                 w_wrap = 0.4; w_mul = 0.2; w_div = 0.2; w_nest = 0.2;
+            }
+        }
+        // E8: nest creates f(g(x)) compositions that bloat under noise; down-weight
+        // nest when robust/weighted search can absorb weak structure into fitness.
+        if ((config_.loss_mode != LossMode::Mse) || has_y_weights_) {
+            w_nest *= 0.35;
+            double wsum = w_wrap + w_mul + w_div + w_nest;
+            if (wsum > 1e-12) {
+                w_wrap /= wsum; w_mul /= wsum; w_div /= wsum; w_nest /= wsum;
             }
         }
         const double t_wrap = w_wrap;

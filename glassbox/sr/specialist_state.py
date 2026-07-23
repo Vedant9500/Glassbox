@@ -433,10 +433,20 @@ class SpecialistVault:
         complexity_fn: Callable[[str], int],
         family_signature_fn: Callable[[str], str],
         current_best_candidate: Optional[Dict[str, Any]] = None,
-        max_candidates: int = 6,
+        max_candidates: int = 4,
+        max_complexity: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        """Propose specialist compositions with a hard complexity/count cap (S8-2).
+
+        Defaults: at most 4 proposals (was 6); drop candidates whose complexity
+        exceeds ``max_complexity`` (default 28) so compositions cannot explode
+        before final guards.
+        """
         if not self.entries:
             return []
+        # S8-2: tighter defaults — fewer, simpler compositions (cap 4, was 6).
+        max_candidates = max(1, min(int(max_candidates), 4))
+        cx_cap = 28 if max_complexity is None else int(max_complexity)
         raw_candidates = self.candidate_dicts()
         if current_best_candidate and current_best_candidate.get("formula"):
             raw_candidates.insert(0, dict(current_best_candidate))
@@ -459,8 +469,18 @@ class SpecialistVault:
             min_complementarity=0.20,
         )
         out = []
-        for proposal in proposals[:6]:
+        for proposal in proposals:
+            if len(out) >= max_candidates:
+                break
             candidate = proposal.to_candidate_dict()
+            formula = str(candidate.get("formula") or "")
+            try:
+                cx = int(complexity_fn(formula)) if formula else 999
+            except Exception:
+                cx = 999
+            if cx > cx_cap:
+                continue
+            candidate["complexity"] = cx
             candidate["source"] = "specialist_vault_composition"
             candidate["from_specialist_vault"] = True
             candidate["from_specialist_composition"] = True

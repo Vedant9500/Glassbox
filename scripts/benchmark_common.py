@@ -485,8 +485,8 @@ def run_exactness_pass(
     baseline = min(base_display, base_raw) if np.isfinite(base_display) or np.isfinite(base_raw) else float("inf")
     diagnostics["baseline_mse"] = float(baseline) if np.isfinite(baseline) else None
 
-    # Eligibility (future_optimization #3): strong raw fit but display not exact,
-    # or large raw↔display drift. Skip when both metrics are already excellent.
+    # Eligibility: strong raw fit but display not exact, or large raw↔display
+    # drift. Skip when both metrics are already excellent.
     thr = float(raw_mse_threshold)
     raw_good = np.isfinite(base_raw) and base_raw <= thr
     display_good = np.isfinite(base_display) and base_display <= thr

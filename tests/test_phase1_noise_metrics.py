@@ -93,7 +93,13 @@ def test_n4_diffuse_huber_enables_noise_guard():
     assert est._auto_noise_guard_active() is True
 
 
-def test_n4_user_weights_still_skip_auto_guard():
+def test_n4_user_weights_still_skip_auto_noise_reason():
+    """User sample_weight source no longer blocks guards (S3-3).
+
+    Historical N4 behavior skipped guards for user weights so auto soft-MAD
+    rescue would not fight a user objective. S3-3 enables bloat rescue under
+    user noise protocols as well; user weights therefore *activate* guards.
+    """
     est = GlassboxRegressor(blackbox_noise_robust="auto", random_state=0)
     est._blackbox_noise_robust_applied_ = {
         "active": True,
@@ -103,7 +109,8 @@ def test_n4_user_weights_still_skip_auto_guard():
     est.blackbox_diagnostics_ = {
         "sample_weight": {"provided": True, "source": "user"},
     }
-    assert est._auto_noise_guard_active() is False
+    est.sample_weight_provided_ = True
+    assert est._auto_noise_guard_active() is True
 
 
 def test_n6_display_mse_local_no_scripts(monkeypatch):

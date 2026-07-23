@@ -1867,6 +1867,60 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         return number_pattern.sub(repl, text)
 
+    def _snap_with_fidelity(
+        self,
+        formula,
+        X=None,
+        y=None,
+        *,
+        mode="integer",
+        atol=1e-4,
+        max_abs=100,
+        max_rel_mse_increase=0.05,
+        prefer_inlier=False,
+    ):
+        """S3-5: apply integer/known-constant snap only if score fidelity holds.
+
+        Call sites that previously did bare string rewrites can use this so
+        intermediate snaps never silently degrade structure identity.
+        When X/y are omitted, returns the raw string snap (legacy behaviour).
+        """
+        text = str(formula or "").strip()
+        if not text:
+            return text
+        if mode == "known":
+            snapped = self._snap_known_structure_constants(text, atol=atol, max_abs=max_abs)
+        else:
+            snapped = self._snap_near_integer_constants(text, atol=atol, max_abs=max_abs)
+        if not snapped or snapped == text:
+            return text
+        if X is None or y is None:
+            return snapped
+        X_arr = np.asarray(X, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+        if X_arr.ndim != 2 or y_arr.size == 0:
+            return snapped
+        try:
+            pred0 = np.asarray(self._safe_eval_formula_array(text, X_arr), dtype=np.float64).reshape(-1)
+            pred1 = np.asarray(self._safe_eval_formula_array(snapped, X_arr), dtype=np.float64).reshape(-1)
+            if pred0.shape != y_arr.shape or pred1.shape != y_arr.shape:
+                return text
+            mse0 = float(np.mean((pred0 - y_arr) ** 2))
+            mse1 = float(np.mean((pred1 - y_arr) ** 2))
+            if not (np.isfinite(mse0) and np.isfinite(mse1)):
+                return text
+            allowed = mse0 * (1.0 + float(max_rel_mse_increase)) + 1e-15
+            if prefer_inlier and hasattr(self, "_inlier_mse"):
+                in0 = float(self._inlier_mse(pred0, y_arr))
+                in1 = float(self._inlier_mse(pred1, y_arr))
+                if np.isfinite(in0) and np.isfinite(in1) and in1 <= max(in0 * 1.15, 1e-12) + 1e-15:
+                    return snapped
+            if mse1 <= allowed:
+                return snapped
+            return text
+        except Exception:
+            return text
+
     # Known algebraic / physics constants tried when free-const inliers are excellent.
     # Score on inliers only — never force if structure fit degrades.
     _KNOWN_STRUCTURE_CONSTANTS = (
@@ -2330,19 +2384,20 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             inlier = inlier_sc
                 except Exception:
                     pass
-                snapped = self._snap_near_integer_constants(formula_orig, atol=1e-3)
-                try:
-                    pred_s = self._safe_eval_formula_array(snapped, X_all)
-                    pred_s = np.asarray(pred_s, dtype=np.float64).reshape(-1)
-                    mse_s = float(np.mean((pred_s - y_all) ** 2))
-                    inlier_s = self._inlier_mse(pred_s, y_all)
-                    if np.isfinite(inlier_s) and (
-                        inlier_s <= inlier * 1.10 + 1e-15
-                        or (np.isfinite(mse_s) and mse_s <= mse * 1.05 + 1e-12)
-                    ):
+                # S3-5: snap only when fidelity holds (inlier or mild full-MSE rise).
+                snapped = self._snap_with_fidelity(
+                    formula_orig, X_all, y_all, mode="integer", atol=1e-3,
+                    max_rel_mse_increase=0.05, prefer_inlier=True,
+                )
+                if snapped and snapped != formula_orig:
+                    try:
+                        pred_s = self._safe_eval_formula_array(snapped, X_all)
+                        pred_s = np.asarray(pred_s, dtype=np.float64).reshape(-1)
+                        mse_s = float(np.mean((pred_s - y_all) ** 2))
+                        inlier_s = self._inlier_mse(pred_s, y_all)
                         formula_orig, mse, inlier = snapped, mse_s, inlier_s
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
                 # Aggressive Exact snap when free-const inliers already excellent.
                 if np.isfinite(inlier) and inlier < 1e-3:
                     try:
@@ -4107,27 +4162,47 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self._loss_mode_auto_switched_ = False
 
     def _auto_noise_guard_active(self) -> bool:
+        """True when noise-aware complexity/holdout rescue guards should run.
 
-        """True when auto noise robustness is active (not user-provided weights).
+        Covers:
+          - Auto soft-MAD / diffuse Huber (N4) — primary auto noise path
+          - S3-3: user-provided sample weights or user Huber/trimmed/student_t
+            loss modes, which previously skipped final rescue and allowed bloat
+            under noisy user protocols
 
-        Covers soft-MAD weights *and* pure diffuse Huber (N4). Guards use
-        unweighted holdout/complexity checks so search under robust loss does
-        not accept bloated formulas that look good only under Huber/weights.
+        Guards use unweighted holdout/complexity checks so search under robust
+        loss does not accept bloated formulas that look good only under
+        Huber/weights.
         """
         applied = getattr(self, "_blackbox_noise_robust_applied_", None) or {}
-        if not isinstance(applied, dict) or not applied.get("active"):
-            return False
-        diag = getattr(self, "blackbox_diagnostics_", None) or {}
-        sw = diag.get("sample_weight") if isinstance(diag, dict) else None
-        if isinstance(sw, dict) and str(sw.get("source") or "") == "user":
-            return False
-        reason = str(applied.get("reason") or "")
-        # Explicit auto paths: soft-MAD and diffuse Huber without weights.
-        if reason in ("soft_mad_weights", "diffuse_noise_huber"):
+        if isinstance(applied, dict) and applied.get("active"):
+            diag = getattr(self, "blackbox_diagnostics_", None) or {}
+            sw = diag.get("sample_weight") if isinstance(diag, dict) else None
+            if not (isinstance(sw, dict) and str(sw.get("source") or "") == "user"):
+                reason = str(applied.get("reason") or "")
+                # Explicit auto paths: soft-MAD and diffuse Huber without weights.
+                if reason in ("soft_mad_weights", "diffuse_noise_huber"):
+                    return True
+                if bool(applied.get("loss_mode_switched_to_huber")):
+                    return True
+                if str(sw.get("source") if isinstance(sw, dict) else "") == "auto_soft_mad":
+                    return True
+
+        # S3-3: user noise protocol (weights or robust loss) also needs bloat rescue.
+        if bool(getattr(self, "sample_weight_provided_", False)):
+            diag = getattr(self, "blackbox_diagnostics_", None) or {}
+            sw = diag.get("sample_weight") if isinstance(diag, dict) else None
+            # Prefer diagnostic source when present; otherwise trust the flag.
+            if isinstance(sw, dict):
+                src = str(sw.get("source") or "")
+                if src in ("user", "auto_soft_mad") or bool(sw.get("provided")):
+                    return True
+            else:
+                return True
+        mode = str(getattr(self, "loss_mode", "mse") or "mse").lower()
+        if mode in ("huber", "trimmed_mse", "student_t"):
             return True
-        if bool(applied.get("loss_mode_switched_to_huber")):
-            return True
-        return str(sw.get("source") if isinstance(sw, dict) else "") == "auto_soft_mad"
+        return False
 
     def _unweighted_r2_from_mse(self, mse, y) -> float:
         target = np.asarray(y, dtype=np.float64).reshape(-1)
@@ -7135,10 +7210,27 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             if not np.isfinite(combined_mse_w) or not np.isfinite(combined_mse_u):
                 continue
             # Must improve weighted (or unweighted if no weights) validation.
+            # S3-4: raise the bar under noise/weights so tiny residual terms
+            # that pass a 0.2% gate cannot bloat the formula. Default 0.2% on
+            # clean paths; 1.5% when weights/auto-noise/robust loss is active.
             improvement_w = base_mse_w - combined_mse_w
-            if improvement_w <= max(1e-10, base_mse_w * 0.002):
+            noise_active = bool(
+                getattr(self, "sample_weight_provided_", False)
+                or self._auto_noise_guard_active()
+                or str(getattr(self, "loss_mode", "mse") or "mse").lower() != "mse"
+            )
+            min_rel_improve = 0.015 if noise_active else 0.002
+            if improvement_w <= max(1e-10, base_mse_w * min_rel_improve):
                 reject_noise += 1
                 continue
+            # S3-4: also require unweighted val improvement (not just "not worse").
+            # Under noise, weighted gains can come from fitting residual noise
+            # while unweighted holdout barely moves or degrades within slack.
+            if noise_active:
+                improvement_u = base_mse_u - combined_mse_u
+                if improvement_u <= max(1e-10, base_mse_u * 0.005):
+                    reject_noise += 1
+                    continue
             # Must not worsen unweighted validation beyond noise-aware slack.
             u_allowed = base_mse_u * (1.0 + rel_slack) + abs_slack
             if combined_mse_u > u_allowed:

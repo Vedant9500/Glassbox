@@ -1210,7 +1210,11 @@ def build_blackbox_seed_formulas(
 
 
 def remap_reduced_formula_to_original(formula: str, selected_features: List[int]) -> str:
-    """Map reduced feature names x0..xk back to original xJ names."""
+    """Map reduced feature names x0..xk back to original xJ names.
+
+    S7-2: unmapped local indices (OOB vs selected_features) become ``0`` so
+    the formula never references a feature that does not exist in original X.
+    """
     if not formula or not selected_features:
         return formula
 
@@ -1218,7 +1222,8 @@ def remap_reduced_formula_to_original(formula: str, selected_features: List[int]
         local_idx = int(match.group(1))
         if 0 <= local_idx < len(selected_features):
             return f"x{int(selected_features[local_idx])}"
-        return match.group(0)
+        # OOB local index — safe neutral constant (not a phantom feature).
+        return "0"
 
     mapped = re.sub(r"\bx(\d+)\b", repl, formula)
     if len(selected_features) == 1:
@@ -1227,7 +1232,11 @@ def remap_reduced_formula_to_original(formula: str, selected_features: List[int]
 
 
 def remap_original_formula_to_reduced(formula: str, selected_features: List[int]) -> str:
-    """Map original feature names xJ into reduced search-space names x0..xk."""
+    """Map original feature names xJ into reduced search-space names x0..xk.
+
+    S7-2: features not in the selected set (dropped vars) become ``0`` so the
+    reduced-space formula never references an OOB local index after reverse map.
+    """
     if not formula or not selected_features:
         return formula
 
@@ -1237,7 +1246,8 @@ def remap_original_formula_to_reduced(formula: str, selected_features: List[int]
         original_idx = int(match.group(1))
         if original_idx in inverse:
             return f"x{inverse[original_idx]}"
-        return match.group(0)
+        # Dropped / unselected original feature → neutral constant.
+        return "0"
 
     return re.sub(r"\bx(\d+)\b", repl, formula)
 
@@ -1247,6 +1257,7 @@ def formula_from_search_to_original_space(formula: str, state: BlackboxState) ->
 
     If standardization was used, local variables are expanded as
     ``(x_j - mean_j) / scale_j`` and the target inverse transform is applied.
+    S7-2: OOB local indices expand to ``0`` (not left as raw ``xK``).
     """
     if not formula or not state.enabled:
         return formula
@@ -1263,7 +1274,7 @@ def formula_from_search_to_original_space(formula: str, state: BlackboxState) ->
         local_idx = int(match.group(1))
         if 0 <= local_idx < len(state.selected_features):
             return feature_expr(local_idx)
-        return match.group(0)
+        return "0"
 
     mapped = re.sub(r"\bx(\d+)\b", repl, formula)
     if len(state.selected_features) == 1:

@@ -155,6 +155,9 @@ benchmark path prefers C++ evolution when available.
 | `docs/ONN_Architecture.md` | Current hybrid architecture summary plus ONN legacy/research notes. |
 | `docs/onn_runbook.md` | Current release gates and smoke matrix. |
 | `docs/Research_Roadmap.md` | Current roadmap/status, with older evolution-first context superseded where noted. |
-| `docs/Universal_FastPath_AB_Report.md` | A/B status summary, still qualitative unless paired with generated benchmark artifacts. |
 | `docs/CPP_Migration_Roadmap.md` | Migration status and remaining C++ work. |
+| `docs/SEARCH_OPTIMIZATION_PLAN.md` | Search optimizations shipped + remaining research items. |
+| `docs/curve_classifier_universal_proposer_audit.md` | Classifier/proposer audit; residual production work. |
+| `glassbox_codebase_audit_tracker.md` | Package audit findings; open P2 backlog. |
+| `glassbox_implementation_plan.md` | Implementation waves from the audit. |
 | `research_notes/*.md` | Research/audit notes. They are intentionally broader than implemented code. |
