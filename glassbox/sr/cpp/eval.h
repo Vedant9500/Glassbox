@@ -12,9 +12,7 @@
 
 namespace sr {
 
-// Math constants (prefer over polluting M_PI/M_E macros).
-inline constexpr double kPi = 3.14159265358979323846;
-inline constexpr double kE = 2.71828182845904523536;
+// kPi/kE live in ast.h (shared with parser/simplify).
 
 // E4 note: soft Arithmetic is a continuous relaxation during search (kitchen-sink
 // outer linear combo of node outputs + soft op blend). Higher temperature sharpens

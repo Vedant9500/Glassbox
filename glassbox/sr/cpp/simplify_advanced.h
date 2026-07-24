@@ -1,24 +1,17 @@
 #pragma once
 
-#define _USE_MATH_DEFINES
 #include "ast.h"
-#include "simplify.h"
 #include "eval.h"
 #include "formula_parser.h"
-#include <vector>
-#include <cmath>
-#include <algorithm>
-#include <unordered_map>
-#include <iostream>
-#include <stdexcept>
-#include <Eigen/Dense>
+#include "simplify.h"
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-#ifndef M_E
-#define M_E 2.71828182845904523536
-#endif
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
+#include <unordered_map>
+#include <vector>
+
+#include <Eigen/Dense>
 
 namespace sr {
 
@@ -62,12 +55,12 @@ inline bool is_trig_sq(const IndividualGraph& graph, int idx, const std::vector<
             if (arg_idx < 0 || arg_idx >= static_cast<int>(node_hashes.size())) return false;
             arg_hash = node_hashes[arg_idx];
             
-            double phi_norm = std::fmod(child.phi, 2.0 * M_PI);
-            if (phi_norm < 0.0) phi_norm += 2.0 * M_PI;
+            double phi_norm = std::fmod(child.phi, 2.0 * kPi);
+            if (phi_norm < 0.0) phi_norm += 2.0 * kPi;
             
             // cos has phi = PI/2.0
-            is_cos = std::abs(phi_norm - M_PI / 2.0) < 1e-4 || std::abs(phi_norm - 1.5 * M_PI) < 1e-4;
-            bool is_sin = std::abs(phi_norm) < 1e-4 || std::abs(phi_norm - M_PI) < 1e-4 || std::abs(phi_norm - 2.0 * M_PI) < 1e-4;
+            is_cos = std::abs(phi_norm - kPi / 2.0) < 1e-4 || std::abs(phi_norm - 1.5 * kPi) < 1e-4;
+            bool is_sin = std::abs(phi_norm) < 1e-4 || std::abs(phi_norm - kPi) < 1e-4 || std::abs(phi_norm - 2.0 * kPi) < 1e-4;
             
             return is_cos || is_sin;
         }
@@ -414,16 +407,15 @@ inline void simplify_ast_advanced(IndividualGraph& graph, double int_tol = 1e-5,
     }
 }
 
+// Core simplify: only int_tol/zero_tol/max_passes/n_features affect behavior.
+// Extra kwargs (use_nsimplify, identities, trig approx) are accepted by the
+// pybind wrapper for API compatibility with the Python sympy path, but are
+// intentionally unused here (graph identities always run via simplify_ast_advanced).
 inline std::string simplify_formula_cpp(
     const std::string& formula_str,
     double int_tol = 1e-5,
     double zero_tol = 1e-8,
     int max_passes = 6,
-    bool use_nsimplify = true,
-    bool use_identities = true,
-    bool approximate_trig = false,
-    double dominant_trig_ratio = 0.9,
-    double small_term_ratio = 0.08,
     int n_features = 1
 ) {
     if (formula_str.empty() || formula_str == "0") return formula_str;
@@ -431,13 +423,13 @@ inline std::string simplify_formula_cpp(
     if (!is_valid_graph_topology(graph)) {
         throw std::runtime_error("Invalid graph generated from formula");
     }
-    
+
     // Multi-pass simplification
     int pass_count = std::clamp(max_passes, 0, 8);
     for (int p = 0; p < pass_count; ++p) {
         simplify_ast_advanced(graph, int_tol, zero_tol);
     }
-    
+
     return get_formula_string(graph, n_features);
 }
 
@@ -608,7 +600,7 @@ inline std::string reduce_formula_noise_cpp(
     Eigen::VectorXd best_coef;
     double best_bic = get_bic(current_mask, best_coef);
     double base_hold = holdout_mse(current_mask, best_coef);
-    int initial_active = K;
+
 
     while (true) {
         int num_active = 0;
@@ -658,7 +650,6 @@ inline std::string reduce_formula_noise_cpp(
 
     std::fill(graph.output_weights.begin(), graph.output_weights.end(), 0.0);
     int coef_idx = 0;
-    int final_active = 0;
     for (int j = 0; j < K; ++j) {
         if (current_mask[j]) {
             int idx = candidate_nodes[j];
@@ -668,12 +659,9 @@ inline std::string reduce_formula_noise_cpp(
                     graph.output_weights.resize(idx + 1, 0.0);
                 }
                 graph.output_weights[idx] = c;
-                ++final_active;
             }
         }
     }
-    (void)initial_active;
-    (void)final_active;
 
     simplify_ast_advanced(graph);
     return get_formula_string(graph, X.size());

@@ -1021,22 +1021,24 @@ py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::array_t
     return w_out;
 }
 
-// Wrapper for simplify_formula_cpp
+// Wrapper for simplify_formula_cpp.
+// Extra kwargs (use_nsimplify, use_identities, approximate_trig, ratios) are
+// accepted for Python API compatibility with the sympy path but ignored in C++
+// (graph identities always run via simplify_ast_advanced).
 std::string simplify_formula_wrapper(
     std::string formula_str,
     double int_tol = 1e-5,
     double zero_tol = 1e-8,
     int max_passes = 6,
-    bool use_nsimplify = true,
-    bool use_identities = true,
-    bool approximate_trig = false,
-    double dominant_trig_ratio = 0.9,
-    double small_term_ratio = 0.08,
+    bool /*use_nsimplify*/ = true,
+    bool /*use_identities*/ = true,
+    bool /*approximate_trig*/ = false,
+    double /*dominant_trig_ratio*/ = 0.9,
+    double /*small_term_ratio*/ = 0.08,
     int n_features = 1
 ) {
     return sr::simplify_formula_cpp(
-        formula_str, int_tol, zero_tol, max_passes, use_nsimplify, use_identities,
-        approximate_trig, dominant_trig_ratio, small_term_ratio, n_features
+        formula_str, int_tol, zero_tol, max_passes, n_features
     );
 }
 

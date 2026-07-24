@@ -1,27 +1,24 @@
 #pragma once
 
-#define _USE_MATH_DEFINES
 #include "ast.h"
-#include "simplify.h"
-#include <string>
-#include <vector>
-#include <cctype>
-#include <sstream>
-#include <stdexcept>
-#include <cmath>
-#include <algorithm>
-#include <memory>
-#include <unordered_map>
-#include <cstring>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-#ifndef M_E
-#define M_E 2.71828182845904523536
-#endif
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace sr {
+
+// Safe ctype wrappers (plain char may be signed; high-bit values are UB otherwise).
+inline bool is_space_char(unsigned char c) { return std::isspace(c) != 0; }
+inline bool is_digit_char(unsigned char c) { return std::isdigit(c) != 0; }
+inline bool is_alpha_char(unsigned char c) { return std::isalpha(c) != 0; }
+inline bool is_alnum_char(unsigned char c) { return std::isalnum(c) != 0; }
+
 
 enum class TokenType {
     Number,
@@ -48,7 +45,7 @@ inline std::vector<Token> tokenize(const std::string& input) {
     size_t i = 0;
     while (i < input.size()) {
         char c = input[i];
-        if (std::isspace(c)) {
+        if (is_space_char(static_cast<unsigned char>(c))) {
             i++;
             continue;
         }
@@ -81,13 +78,13 @@ inline std::vector<Token> tokenize(const std::string& input) {
         } else if (c == ',') {
             tokens.push_back({TokenType::Comma, ","});
             i++;
-        } else if (std::isdigit(c) || c == '.') {
+        } else if (is_digit_char(static_cast<unsigned char>(c)) || c == '.') {
             std::string s;
             bool has_dot = false;
             bool has_exp = false;
             while (i < input.size()) {
                 char curr = input[i];
-                if (std::isdigit(curr)) {
+                if (is_digit_char(static_cast<unsigned char>(curr))) {
                     s += curr;
                     i++;
                 } else if (curr == '.' && !has_dot && !has_exp) {
@@ -107,9 +104,9 @@ inline std::vector<Token> tokenize(const std::string& input) {
                 }
             }
             tokens.push_back({TokenType::Number, s, std::stod(s)});
-        } else if (std::isalpha(c) || c == '_') {
+        } else if (is_alpha_char(static_cast<unsigned char>(c)) || c == '_') {
             std::string s;
-            while (i < input.size() && (std::isalnum(input[i]) || input[i] == '_')) {
+            while (i < input.size() && (is_alnum_char(static_cast<unsigned char>(input[i])) || input[i] == '_')) {
                 s += input[i];
                 i++;
             }
@@ -139,7 +136,7 @@ enum class ParseNodeType {
 };
 
 struct ParseNode {
-    ParseNodeType type;
+    ParseNodeType type = ParseNodeType::Constant;
     double value = 0.0;
     int feature_idx = 0;
     std::shared_ptr<ParseNode> left = nullptr;
@@ -147,12 +144,25 @@ struct ParseNode {
 };
 
 class Parser {
-    std::vector<Token> tokens;
-    size_t pos = 0;
+public:
+    explicit Parser(const std::vector<Token>& tokens) : tokens_(tokens), pos_(0) {}
+
+    std::shared_ptr<ParseNode> parse() {
+        auto node = parse_expression();
+        if (peek().type != TokenType::End) {
+            throw std::runtime_error(
+                "Unexpected token at end of formula: " + peek().text);
+        }
+        return node;
+    }
+
+private:
+    std::vector<Token> tokens_;
+    size_t pos_ = 0;
 
     Token peek() {
-        if (pos >= tokens.size()) return {TokenType::End, ""};
-        return tokens[pos];
+        if (pos_ >= tokens_.size()) return {TokenType::End, ""};
+        return tokens_[pos_];
     }
 
     Token consume(TokenType expected) {
@@ -160,26 +170,14 @@ class Parser {
         if (t.type != expected) {
             throw std::runtime_error("Expected token but got " + t.text);
         }
-        pos++;
+        pos_++;
         return t;
     }
 
     void advance() {
-        pos++;
+        pos_++;
     }
 
-public:
-    Parser(const std::vector<Token>& tokens) : tokens(tokens) {}
-
-    std::shared_ptr<ParseNode> parse() {
-        auto node = parse_expression();
-        if (peek().type != TokenType::End) {
-            throw std::runtime_error("Unexpected token at end of formula: " + peek().text);
-        }
-        return node;
-    }
-
-private:
     std::shared_ptr<ParseNode> parse_expression() {
         auto node = parse_term();
         while (peek().type == TokenType::Plus || peek().type == TokenType::Minus) {
@@ -288,18 +286,19 @@ private:
             if (t.text == "pi") {
                 auto node = std::make_shared<ParseNode>();
                 node->type = ParseNodeType::Constant;
-                node->value = M_PI;
+                node->value = kPi;
                 return node;
             }
             if (t.text == "E" || t.text == "e") {
                 auto node = std::make_shared<ParseNode>();
                 node->type = ParseNodeType::Constant;
-                node->value = M_E;
+                node->value = kE;
                 return node;
             }
 
             if (t.text == "x" || (t.text.size() > 1 && t.text[0] == 'x' &&
-                                   std::all_of(t.text.begin() + 1, t.text.end(), ::isdigit))) {
+                                   std::all_of(t.text.begin() + 1, t.text.end(),
+                                               [](unsigned char ch) { return is_digit_char(ch); }))) {
                 auto node = std::make_shared<ParseNode>();
                 node->type = ParseNodeType::Input;
                 node->feature_idx = (t.text == "x") ? 0 : std::stoi(t.text.substr(1));
@@ -312,7 +311,9 @@ private:
     }
 };
 
+
 inline std::string normalize_formula_string(std::string formula) {
+    // Intentionally Unicode: rewrite common math glyphs (x, pi, sqrt, ...) to ASCII ops.
     auto replace_all = [](std::string& str, const std::string& from, const std::string& to) {
         size_t start_pos = 0;
         while ((start_pos = str.find(from, start_pos)) != std::string::npos) {
@@ -500,7 +501,8 @@ inline void collect_additive_terms(
     }
 }
 
-struct GraphCompiler {
+class GraphCompiler {
+public:
     IndividualGraph graph;
     std::vector<uint64_t> node_hashes;
     std::unordered_map<uint64_t, int> node_index_cache;
@@ -714,7 +716,7 @@ struct GraphCompiler {
                 node.type = NodeType::Unary;
                 node.unary_op = UnaryOp::Periodic;
                 node.omega = 1.0;
-                node.phi = M_PI / 2.0;
+                node.phi = kPi / 2.0;
                 node.amplitude = 1.0;
                 break;
             case ParseNodeType::Exp:

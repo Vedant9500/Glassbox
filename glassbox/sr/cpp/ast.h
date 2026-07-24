@@ -12,6 +12,10 @@
 
 namespace sr {
 
+// Math constants (shared; prefer over M_PI/M_E macros).
+inline constexpr double kPi = 3.14159265358979323846;
+inline constexpr double kE = 2.71828182845904523536;
+
 // Unified output-weight activity threshold (S5-6).
 // Eval, formula export, and active_complexity must agree so terms that affect
 // predictions are not silently dropped from displayed formulas.
@@ -164,6 +168,82 @@ struct IndividualGraph {
         return n;
     }
 };
+
+
+// Remove dead nodes and compact the graph (shared by parse post-compile and simplify).
+// Child indices are bounds-checked so malformed graphs do not OOB.
+inline void compact_graph(IndividualGraph& graph) {
+    if (graph.nodes.empty()) return;
+
+    const int n = static_cast<int>(graph.nodes.size());
+    std::vector<int> new_indices(static_cast<size_t>(n), -1);
+    std::vector<OpNode> new_nodes;
+    std::vector<double> new_weights;
+
+    // Mark used nodes from output weights
+    std::vector<bool> used(static_cast<size_t>(n), false);
+    for (size_t i = 0; i < graph.output_weights.size() && i < static_cast<size_t>(n); ++i) {
+        if (std::abs(graph.output_weights[i]) > kOutputWeightDead) {
+            used[i] = true;
+        }
+    }
+
+    // Propagate used flags downwards
+    for (int i = n - 1; i >= 0; --i) {
+        if (!used[static_cast<size_t>(i)]) continue;
+        const OpNode& node = graph.nodes[static_cast<size_t>(i)];
+        if (node.type == NodeType::Unary) {
+            if (node.left_child >= 0 && node.left_child < n) {
+                used[static_cast<size_t>(node.left_child)] = true;
+            }
+        } else if (node.type == NodeType::Binary) {
+            if (node.left_child >= 0 && node.left_child < n) {
+                used[static_cast<size_t>(node.left_child)] = true;
+            }
+            if (node.right_child >= 0 && node.right_child < n) {
+                used[static_cast<size_t>(node.right_child)] = true;
+            }
+        }
+    }
+
+    // Build compacted nodes
+    for (int i = 0; i < n; ++i) {
+        if (!used[static_cast<size_t>(i)]) continue;
+        new_indices[static_cast<size_t>(i)] = static_cast<int>(new_nodes.size());
+        OpNode node = graph.nodes[static_cast<size_t>(i)];
+        if (node.type == NodeType::Unary) {
+            if (node.left_child >= 0 && node.left_child < n) {
+                node.left_child = new_indices[static_cast<size_t>(node.left_child)];
+            } else {
+                node.left_child = -1;
+            }
+        } else if (node.type == NodeType::Binary) {
+            if (node.left_child >= 0 && node.left_child < n) {
+                node.left_child = new_indices[static_cast<size_t>(node.left_child)];
+            } else {
+                node.left_child = -1;
+            }
+            if (node.right_child >= 0 && node.right_child < n) {
+                node.right_child = new_indices[static_cast<size_t>(node.right_child)];
+            } else {
+                node.right_child = -1;
+            }
+        }
+        new_nodes.push_back(node);
+
+        if (static_cast<size_t>(i) < graph.output_weights.size() &&
+            std::abs(graph.output_weights[static_cast<size_t>(i)]) > kOutputWeightDead) {
+            while (static_cast<int>(new_weights.size()) <= new_indices[static_cast<size_t>(i)]) {
+                new_weights.push_back(0.0);
+            }
+            new_weights[static_cast<size_t>(new_indices[static_cast<size_t>(i)])] =
+                graph.output_weights[static_cast<size_t>(i)];
+        }
+    }
+
+    graph.nodes = std::move(new_nodes);
+    graph.output_weights = std::move(new_weights);
+}
 
 // --- Structural Hashing -------------------------------------------------
 // Combines node type, op, quantized parameters, and children hashes into
