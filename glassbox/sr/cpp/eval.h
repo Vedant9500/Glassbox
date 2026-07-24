@@ -1,53 +1,57 @@
 #pragma once
 
-#define _USE_MATH_DEFINES
 #include "ast.h"
-#include <vector>
-#include <cmath>
-#include <algorithm>
-#include <iostream>
-#include <array>
 
-// MSVC fallbacks for M_PI and M_E
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-#ifndef M_E
-#define M_E 2.71828182845904523536
-#endif
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdio>
+#include <string>
+#include <vector>
 
 namespace sr {
 
+// Math constants (prefer over polluting M_PI/M_E macros).
+inline constexpr double kPi = 3.14159265358979323846;
+inline constexpr double kE = 2.71828182845904523536;
+
 // E4 note: soft Arithmetic is a continuous relaxation during search (kitchen-sink
 // outer linear combo of node outputs + soft op blend). Higher temperature sharpens
-// toward discrete +/×/÷/−. Final cleanup snaps near-discrete gates (see evolution).
+// toward discrete +/*/div/-. Final cleanup snaps near-discrete gates (see evolution).
 //
 // E10: temperature is process-global for OpenMP worker visibility (thread_local
-// would desync workers from the controlling engine). Use ScopedArithmeticTemperature
-// RAII at API boundaries, and re-apply engine config temperature on fitness eval.
-inline double& arithmetic_temperature_ref() {
-    static double t = 5.0;
+// would desync workers from the controlling engine). Stored as atomic so concurrent
+// API entry points do not race. Use ScopedArithmeticTemperature RAII at boundaries,
+// and re-apply engine config temperature on fitness eval.
+inline std::atomic<double>& arithmetic_temperature_ref() {
+    static std::atomic<double> t{5.0};
     return t;
 }
 
 inline void set_arithmetic_temperature(double t) {
     // Keep temperature in a numerically stable range.
-    arithmetic_temperature_ref() = std::clamp(t, 0.1, 100.0);
+    arithmetic_temperature_ref().store(
+        std::clamp(t, 0.1, 100.0), std::memory_order_relaxed);
 }
 
 inline double get_arithmetic_temperature() {
-    return arithmetic_temperature_ref();
+    return arithmetic_temperature_ref().load(std::memory_order_relaxed);
 }
 
 // RAII restore for concurrent / nested API entry points (score + run_evolution).
-struct ScopedArithmeticTemperature {
-    double prev_;
-    explicit ScopedArithmeticTemperature(double t) : prev_(get_arithmetic_temperature()) {
+class ScopedArithmeticTemperature {
+public:
+    explicit ScopedArithmeticTemperature(double t)
+        : prev_(get_arithmetic_temperature()) {
         set_arithmetic_temperature(t);
     }
     ~ScopedArithmeticTemperature() { set_arithmetic_temperature(prev_); }
     ScopedArithmeticTemperature(const ScopedArithmeticTemperature&) = delete;
     ScopedArithmeticTemperature& operator=(const ScopedArithmeticTemperature&) = delete;
+
+private:
+    double prev_;
 };
 
 inline double stabilized_tau(double tau) {
@@ -127,6 +131,7 @@ inline Eigen::ArrayXd evaluate_graph_impl(
         node_hashes.resize(graph.nodes.size(), 0);
     }
 
+    // Per-thread scratch for Simple policy (TLS; not process-global).
     thread_local Eigen::ArrayXXd arena;
     if constexpr (Policy == EvalPolicy::Simple) {
         const int n_nodes = static_cast<int>(graph.nodes.size());
@@ -183,10 +188,7 @@ inline Eigen::ArrayXd evaluate_graph_impl(
         
         const auto& node = graph.nodes[i];
         Eigen::ArrayXd val;
-        if constexpr (Policy == EvalPolicy::Simple) {
-            // Allocate a proxy/block reference... NO, let's just use Eigen::ArrayXd wrapper to standardize
-            // For simple we assign directly later.
-        } else {
+        if constexpr (Policy != EvalPolicy::Simple) {
             val = Eigen::ArrayXd::Zero(num_samples);
         }
         
@@ -214,6 +216,11 @@ inline Eigen::ArrayXd evaluate_graph_impl(
                 break;
             }
             case NodeType::Unary: {
+                const int n_nodes = static_cast<int>(graph.nodes.size());
+                if (node.left_child < 0 || node.left_child >= n_nodes) {
+                    val = Eigen::ArrayXd::Zero(num_samples);
+                    break;
+                }
                 auto x = get_child(node.left_child);
                 switch (node.unary_op) {
                     case UnaryOp::Periodic:
@@ -250,6 +257,12 @@ inline Eigen::ArrayXd evaluate_graph_impl(
                 break;
             }
             case NodeType::Binary: {
+                const int n_nodes = static_cast<int>(graph.nodes.size());
+                if (node.left_child < 0 || node.left_child >= n_nodes ||
+                    node.right_child < 0 || node.right_child >= n_nodes) {
+                    val = Eigen::ArrayXd::Zero(num_samples);
+                    break;
+                }
                 auto x = get_child(node.left_child);
                 auto y = get_child(node.right_child);
                 switch (node.binary_op) {
@@ -259,7 +272,7 @@ inline Eigen::ArrayXd evaluate_graph_impl(
                         auto res_sub = x - y;
                         auto res_mul = x * y;
                         
-                        // Division changed to y.square()+1e-12 in partial but y.abs()+... elsewhere. Let's stick to base implementation.
+                        // Soft division: x / sqrt(1 + y^2) (protected; matches display S5-4).
                         auto res_div = x / (1.0 + y.square()).sqrt();
                         
                         val = (w[0] * res_add + w[1] * res_mul + w[2] * res_div + w[3] * res_sub).max(-1e6).min(1e6);
@@ -313,24 +326,45 @@ inline Eigen::ArrayXd evaluate_graph_impl(
     return final_output;
 }
 
-inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::vector<Eigen::ArrayXd>& X, int num_samples) {
+inline Eigen::ArrayXd evaluate_graph(
+    const IndividualGraph& graph,
+    const std::vector<Eigen::ArrayXd>& X,
+    int num_samples) {
     return evaluate_graph_impl<EvalPolicy::Simple>(graph, X, num_samples);
 }
 
-inline Eigen::ArrayXd evaluate_graph(const IndividualGraph& graph, const std::vector<Eigen::ArrayXd>& X, int num_samples, std::vector<Eigen::ArrayXd>& cache_out) {
-    return evaluate_graph_impl<EvalPolicy::CacheOut>(graph, X, num_samples, &cache_out);
+inline Eigen::ArrayXd evaluate_graph(
+    const IndividualGraph& graph,
+    const std::vector<Eigen::ArrayXd>& X,
+    int num_samples,
+    std::vector<Eigen::ArrayXd>& cache_out) {
+    return evaluate_graph_impl<EvalPolicy::CacheOut>(
+        graph, X, num_samples, &cache_out);
 }
 
-inline void evaluate_graph_partial(const IndividualGraph& graph, 
-                                   int perturbed_node_idx,
-                                   const std::vector<Eigen::ArrayXd>& old_cache,
-                                   std::vector<Eigen::ArrayXd>& new_cache_out,
-                                   std::vector<int>& changed_indices_out) {
-    evaluate_graph_impl<EvalPolicy::Partial>(graph, std::vector<Eigen::ArrayXd>(), 0, &new_cache_out, nullptr, perturbed_node_idx, &old_cache, &changed_indices_out);
+inline void evaluate_graph_partial(
+    const IndividualGraph& graph,
+    int perturbed_node_idx,
+    const std::vector<Eigen::ArrayXd>& old_cache,
+    std::vector<Eigen::ArrayXd>& new_cache_out,
+    std::vector<int>& changed_indices_out) {
+    evaluate_graph_impl<EvalPolicy::Partial>(
+        graph,
+        std::vector<Eigen::ArrayXd>(),
+        0,
+        &new_cache_out,
+        nullptr,
+        perturbed_node_idx,
+        &old_cache,
+        &changed_indices_out);
 }
 
-inline Eigen::ArrayXd evaluate_graph_simple(const IndividualGraph& graph, const std::vector<Eigen::ArrayXd>& X, int num_samples) {
-    return evaluate_graph_impl<EvalPolicy::Simple>(graph, X, num_samples);
+// Alias of 3-arg evaluate_graph (kept for call-site compatibility).
+inline Eigen::ArrayXd evaluate_graph_simple(
+    const IndividualGraph& graph,
+    const std::vector<Eigen::ArrayXd>& X,
+    int num_samples) {
+    return evaluate_graph(graph, X, num_samples);
 }
 
 inline Eigen::ArrayXd evaluate_graph_cached(const IndividualGraph& graph,
@@ -341,11 +375,16 @@ inline Eigen::ArrayXd evaluate_graph_cached(const IndividualGraph& graph,
     return evaluate_graph_impl<EvalPolicy::SharedCache>(graph, X, num_samples, &cache_out, &shared_cache);
 }
 
-// Compute MSE fitness
-// S5-16: keep raw_mse/weighted_mse/fitness_valid in sync with the main scoring path.
-// Legacy helper has no sample weights — weighted_mse mirrors unweighted MSE.
-inline double evaluate_fitness(IndividualGraph& graph, const std::vector<Eigen::ArrayXd>& X, const Eigen::ArrayXd& y, int num_samples) {
-    Eigen::ArrayXd pred = evaluate_graph_simple(graph, X, num_samples);
+// Unweighted MSE only (legacy / tests). Search scoring uses
+// EvolutionEngine::evaluate_fitness_with_penalty (weights + complexity penalties).
+// S5-16: keep raw_mse/weighted_mse/fitness_valid in sync with that path's fields;
+// without sample weights, weighted_mse mirrors unweighted MSE.
+inline double evaluate_fitness(
+    IndividualGraph& graph,
+    const std::vector<Eigen::ArrayXd>& X,
+    const Eigen::ArrayXd& y,
+    int num_samples) {
+    Eigen::ArrayXd pred = evaluate_graph(graph, X, num_samples);
     double mse = (pred - y).square().mean();
     graph.fitness = mse;
     graph.raw_mse = mse;
@@ -359,8 +398,8 @@ inline bool near(double value, double target, double tol = 1e-4) {
 }
 
 inline double normalize_angle(double value) {
-    double out = std::fmod(value, 2.0 * M_PI);
-    if (out < 0.0) out += 2.0 * M_PI;
+    double out = std::fmod(value, 2.0 * kPi);
+    if (out < 0.0) out += 2.0 * kPi;
     return out;
 }
 
@@ -385,7 +424,7 @@ inline std::string format_pi_like(double value) {
     };
 
     for (const auto& candidate : kCandidates) {
-        double target = candidate.multiplier * M_PI;
+        double target = candidate.multiplier * kPi;
         if (near(abs_value, target, kPiTol)) {
             return negative ? std::string("-") + candidate.text : std::string(candidate.text);
         }
@@ -393,7 +432,7 @@ inline std::string format_pi_like(double value) {
 
     char buf[64];
     if (std::abs(abs_value - std::round(abs_value)) < 1e-6) {
-        snprintf(buf, sizeof(buf), "%s%d", negative ? "-" : "", (int)std::round(abs_value));
+        snprintf(buf, sizeof(buf), "%s%d", negative ? "-" : "", static_cast<int>(std::round(abs_value)));
     } else {
         snprintf(buf, sizeof(buf), "%s%.4g", negative ? "-" : "", abs_value);
     }
@@ -402,21 +441,21 @@ inline std::string format_pi_like(double value) {
 
 inline std::string format_constant_display(double value) {
     constexpr double kPiTol = 5e-3;
-    if (std::abs(value - M_PI) < kPiTol) return "pi";
-    if (std::abs(value + M_PI) < kPiTol) return "-pi";
-    if (std::abs(value - 2.0 * M_PI) < kPiTol) return "2*pi";
-    if (std::abs(value + 2.0 * M_PI) < kPiTol) return "-2*pi";
-    if (std::abs(value - M_PI / 2.0) < kPiTol) return "pi/2";
-    if (std::abs(value + M_PI / 2.0) < kPiTol) return "-pi/2";
-    if (std::abs(value - 3.0 * M_PI / 2.0) < kPiTol) return "3*pi/2";
-    if (std::abs(value + 3.0 * M_PI / 2.0) < kPiTol) return "-3*pi/2";
-    if (std::abs(value - M_PI / 3.0) < kPiTol) return "pi/3";
-    if (std::abs(value - M_PI / 4.0) < kPiTol) return "pi/4";
-    if (std::abs(value - M_PI / 6.0) < kPiTol) return "pi/6";
+    if (std::abs(value - kPi) < kPiTol) return "pi";
+    if (std::abs(value + kPi) < kPiTol) return "-pi";
+    if (std::abs(value - 2.0 * kPi) < kPiTol) return "2*pi";
+    if (std::abs(value + 2.0 * kPi) < kPiTol) return "-2*pi";
+    if (std::abs(value - kPi / 2.0) < kPiTol) return "pi/2";
+    if (std::abs(value + kPi / 2.0) < kPiTol) return "-pi/2";
+    if (std::abs(value - 3.0 * kPi / 2.0) < kPiTol) return "3*pi/2";
+    if (std::abs(value + 3.0 * kPi / 2.0) < kPiTol) return "-3*pi/2";
+    if (std::abs(value - kPi / 3.0) < kPiTol) return "pi/3";
+    if (std::abs(value - kPi / 4.0) < kPiTol) return "pi/4";
+    if (std::abs(value - kPi / 6.0) < kPiTol) return "pi/6";
 
     char buf[64];
     if (std::abs(value - std::round(value)) < 1e-6) {
-        snprintf(buf, sizeof(buf), "%d", (int)std::round(value));
+        snprintf(buf, sizeof(buf), "%d", static_cast<int>(std::round(value)));
     } else {
         snprintf(buf, sizeof(buf), "%.4g", value);
     }
@@ -491,13 +530,13 @@ inline std::string format_node_to_string(
             switch (node.unary_op) {
                 case UnaryOp::Periodic: {
                     // Build clean periodic string: [amp*]sin([omega*]child[ + phi])
-                    std::string result = "";
+                    std::string result;
                     
                     // Amplitude: omit if ~1.0
                     bool has_amp = std::abs(node.amplitude - 1.0) > 1e-4;
                     if (has_amp) {
                         if (std::abs(node.amplitude - std::round(node.amplitude)) < 1e-6) {
-                            snprintf(buf, sizeof(buf), "%d*", (int)std::round(node.amplitude));
+                            snprintf(buf, sizeof(buf), "%d*", static_cast<int>(std::round(node.amplitude)));
                         } else {
                             snprintf(buf, sizeof(buf), "%.4g*", node.amplitude);
                         }
@@ -506,8 +545,8 @@ inline std::string format_node_to_string(
                     
                     constexpr double kTrigTol = 5e-3;
                     double phi_norm = normalize_angle(node.phi);
-                    bool use_cos = near(phi_norm, M_PI / 2.0, kTrigTol) || near(phi_norm, 1.5 * M_PI, kTrigTol);
-                    bool negate = near(phi_norm, M_PI, kTrigTol) || near(phi_norm, 1.5 * M_PI, kTrigTol);
+                    bool use_cos = near(phi_norm, kPi / 2.0, kTrigTol) || near(phi_norm, 1.5 * kPi, kTrigTol);
+                    bool negate = near(phi_norm, kPi, kTrigTol) || near(phi_norm, 1.5 * kPi, kTrigTol);
                     child_str = strip_outer_parens_if_simple(child_str);
 
                     if (negate) {
@@ -556,13 +595,13 @@ inline std::string format_node_to_string(
                 }
                 case UnaryOp::Exp: {
                     // Build exp string: exp([omega*]child[ + phi])
-                    std::string exp_arg = "";
+                    std::string exp_arg;
                     bool has_omega_e = std::abs(node.omega - 1.0) > 1e-4;
                     if (has_omega_e) {
                         if (std::abs(node.omega - (-1.0)) < 1e-6) {
                             exp_arg += "-";
                         } else if (std::abs(node.omega - std::round(node.omega)) < 1e-6) {
-                            snprintf(buf, sizeof(buf), "%d*", (int)std::round(node.omega));
+                            snprintf(buf, sizeof(buf), "%d*", static_cast<int>(std::round(node.omega)));
                             exp_arg += std::string(buf);
                         } else {
                             snprintf(buf, sizeof(buf), "%.4g*", node.omega);
@@ -573,7 +612,7 @@ inline std::string format_node_to_string(
                     bool has_phi_e = std::abs(node.phi) > 1e-4;
                     if (has_phi_e) {
                         if (std::abs(node.phi - std::round(node.phi)) < 1e-6) {
-                            snprintf(buf, sizeof(buf), " + %d", (int)std::round(node.phi));
+                            snprintf(buf, sizeof(buf), " + %d", static_cast<int>(std::round(node.phi)));
                         } else {
                             snprintf(buf, sizeof(buf), " + %.4g", node.phi);
                         }
@@ -622,7 +661,6 @@ inline std::string format_node_to_string(
                     if (first) return "(" + l_str + " + " + r_str + ")";
                     blend += ")";
                     return blend;
-                    break;
                 }
                 case BinaryOp::Division:
                     // Match protected Division eval: x * sign(y) / (|y| + eps) (S5-4).
@@ -675,19 +713,19 @@ inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs
         if (std::abs(graph.output_bias) <= 1e-4) return "0";
         double abs_bias = std::abs(graph.output_bias);
         if (std::abs(abs_bias - std::round(abs_bias)) < 1e-6) {
-            snprintf(buf, sizeof(buf), "%s%d", graph.output_bias < 0 ? "-" : "", (int)std::round(abs_bias));
+            snprintf(buf, sizeof(buf), "%s%d", graph.output_bias < 0 ? "-" : "", static_cast<int>(std::round(abs_bias)));
         } else {
             snprintf(buf, sizeof(buf), "%s%.4g", graph.output_bias < 0 ? "-" : "", abs_bias);
         }
         return std::string(buf);
     }
     
-    std::string final_formula = "";
+    std::string final_formula;
     bool first = true;
     
     for (size_t i = 0; i < graph.output_weights.size() && i < graph.nodes.size(); ++i) {
         double w = graph.output_weights[i];
-        // S5-6: match eval activity threshold (was 1e-4 → silent dropped terms).
+        // S5-6: match eval activity threshold (was 1e-4 -> silent dropped terms).
         if (std::abs(w) > kOutputWeightActive) {
             std::string sub_formula = format_node_to_string(graph, static_cast<int>(i), n_inputs);
             
@@ -701,7 +739,7 @@ inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs
             if (std::abs(std::abs(w) - 1.0) > 1e-4) {
                 double abs_w = std::abs(w);
                 if (std::abs(abs_w - std::round(abs_w)) < 1e-6) {
-                    snprintf(buf, sizeof(buf), "%d*", (int)std::round(abs_w));
+                    snprintf(buf, sizeof(buf), "%d*", static_cast<int>(std::round(abs_w)));
                 } else {
                     snprintf(buf, sizeof(buf), "%.4g*", abs_w);
                 }
@@ -720,7 +758,7 @@ inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs
         }
         double abs_bias = std::abs(graph.output_bias);
         if (std::abs(abs_bias - std::round(abs_bias)) < 1e-6) {
-            snprintf(buf, sizeof(buf), "%d", (int)std::round(abs_bias));
+            snprintf(buf, sizeof(buf), "%d", static_cast<int>(std::round(abs_bias)));
         } else {
             snprintf(buf, sizeof(buf), "%.4g", abs_bias);
         }
