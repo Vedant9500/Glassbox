@@ -1,7 +1,4 @@
-#include <pybind11/pybind11.h>
-#include <pybind11/numpy.h>
-#include <pybind11/stl.h>
-#include <Eigen/Dense>
+// Glassbox SR pybind11 module (_core).
 #include "ast.h"
 #include "eval.h"
 #include "evolution.h"
@@ -10,17 +7,24 @@
 #include "simplify.h"
 #include "simplify_advanced.h"
 
-#include <omp.h>
+#include <algorithm>
 #include <iostream>
 #include <limits>
-#include <cctype>
-#include <string>
 #include <stdexcept>
-#include <algorithm>
+#include <string>
+#include <vector>
+
+#include <omp.h>
+
+#include <Eigen/Dense>
+#include <pybind11/numpy.h>
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
 
 namespace py = pybind11;
 
-Eigen::ArrayXd evaluate_parse_node_exact(
+
+static Eigen::ArrayXd evaluate_parse_node_exact(
     const std::shared_ptr<sr::ParseNode>& node,
     const std::vector<Eigen::ArrayXd>& X,
     int num_samples
@@ -43,7 +47,7 @@ Eigen::ArrayXd evaluate_parse_node_exact(
         case sr::ParseNodeType::Div: {
             // S5-10: protected division (match graph Division spirit).
             // Bare left/right produced Inf/NaN near zeros and desynced ranking
-            // from soft search eval. Keep a small ε so normal denominators stay exact.
+            // from soft search eval. Keep a small eps so normal denominators stay exact.
             Eigen::ArrayXd left = evaluate_parse_node_exact(node->left, X, num_samples);
             Eigen::ArrayXd right = evaluate_parse_node_exact(node->right, X, num_samples);
             constexpr double kDivEps = 1e-12;
@@ -82,8 +86,8 @@ Eigen::ArrayXd evaluate_parse_node_exact(
         case sr::ParseNodeType::Cos:
             return evaluate_parse_node_exact(node->left, X, num_samples).cos();
         case sr::ParseNodeType::Exp:
-            // S5-10 dual-domain note: exact path clamps the *argument* to ±500;
-            // graph eval clamps the *output* of exp to ±1e6. Prefer graph scorer
+            // S5-10 dual-domain note: exact path clamps the *argument* to +/-500;
+            // graph eval clamps the *output* of exp to +/-1e6. Prefer graph scorer
             // for ranking (S5-2); this path remains for display/exact diagnostics.
             return evaluate_parse_node_exact(node->left, X, num_samples).min(500.0).max(-500.0).exp();
         case sr::ParseNodeType::Log:
@@ -96,7 +100,7 @@ Eigen::ArrayXd evaluate_parse_node_exact(
     return Eigen::ArrayXd::Zero(num_samples);
 }
 
-std::shared_ptr<sr::ParseNode> parse_formula_exact(const std::string& formula) {
+static std::shared_ptr<sr::ParseNode> parse_formula_exact(const std::string& formula) {
     std::string norm = sr::normalize_formula_string(formula);
     auto tokens = sr::tokenize(norm);
     sr::Parser parser(tokens);
@@ -104,40 +108,16 @@ std::shared_ptr<sr::ParseNode> parse_formula_exact(const std::string& formula) {
 }
 
 
-// Optional 1D sample_weight for specialist refiners (S5-9). Empty => unweighted.
-static Eigen::VectorXd load_optional_vector_weights(const py::object& weights_obj, int n, const char* name) {
-    if (weights_obj.is_none()) {
-        return Eigen::VectorXd();
-    }
-    auto arr = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(weights_obj);
-    if (!arr) {
-        throw std::runtime_error(std::string(name) + " must be convertible to float64 array");
-    }
-    auto buf = arr.request();
-    if (buf.ndim != 1 || static_cast<int>(buf.size) != n) {
-        throw std::runtime_error(std::string(name) + " must be 1D with length matching y");
-    }
-    Eigen::Map<Eigen::VectorXd> mapped(static_cast<double*>(buf.ptr), n);
-    Eigen::VectorXd w = mapped;
-    for (int i = 0; i < n; ++i) {
-        if (!std::isfinite(w(i)) || w(i) < 0.0) {
-            throw std::runtime_error(std::string(name) + " must be finite and non-negative");
-        }
-    }
-    if (!(w.sum() > 0.0)) {
-        throw std::runtime_error(std::string(name) + " must have positive total weight");
-    }
-    return w;
-}
-
-// Weighted helpers for Phase 2 candidate scoring (PhySO-style y_weights).
+// Shared optional 1D weight loader (S5-9). Empty => unweighted / uniform.
+// length_msg distinguishes "match y" vs "match y split" error text.
 static Eigen::ArrayXd load_optional_weights(
     const py::object& weights_obj,
     int n,
-    const char* name
+    const char* name,
+    const char* length_msg = " must be 1D with length matching y"
 ) {
     if (weights_obj.is_none()) {
-        return Eigen::ArrayXd();  // empty => uniform
+        return Eigen::ArrayXd();
     }
     auto arr = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(weights_obj);
     if (!arr) {
@@ -145,9 +125,7 @@ static Eigen::ArrayXd load_optional_weights(
     }
     auto buf = arr.request();
     if (buf.ndim != 1 || static_cast<int>(buf.size) != n) {
-        throw std::runtime_error(
-            std::string(name) + " must be 1D with length matching the corresponding y split"
-        );
+        throw std::runtime_error(std::string(name) + length_msg);
     }
     Eigen::Map<Eigen::ArrayXd> mapped(static_cast<double*>(buf.ptr), n);
     Eigen::ArrayXd w = mapped;
@@ -163,6 +141,22 @@ static Eigen::ArrayXd load_optional_weights(
     return w;
 }
 
+static Eigen::VectorXd load_optional_vector_weights(
+    const py::object& weights_obj, int n, const char* name) {
+    Eigen::ArrayXd a = load_optional_weights(weights_obj, n, name);
+    if (a.size() == 0) return Eigen::VectorXd();
+    return a.matrix();
+}
+
+// Ensure float64 C-contiguous array (consistent NumPy intake).
+static py::array_t<double> ensure_f64_c(const py::object& obj) {
+    auto arr = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(obj);
+    if (!arr) {
+        throw std::runtime_error("array must be convertible to float64");
+    }
+    return arr;
+}
+
 static double weighted_mean(const Eigen::ArrayXd& v, const Eigen::ArrayXd& w, double w_sum) {
     return (w * v).sum() / w_sum;
 }
@@ -175,7 +169,7 @@ static double unweighted_mse(const Eigen::ArrayXd& err) {
     return err.square().mean();
 }
 
-py::list score_formula_candidates_cpp(
+static py::list score_formula_candidates_cpp(
     py::list formulas_py,
     py::array_t<double> X_fit_array,
     py::array_t<double> y_fit_array,
@@ -209,8 +203,10 @@ py::list score_formula_candidates_cpp(
     }
 
     // Optional per-point weights (Phase 2). Empty arrays => uniform / legacy path.
-    Eigen::ArrayXd w_fit = load_optional_weights(fit_weights_obj, n_fit, "fit_weights");
-    Eigen::ArrayXd w_val = load_optional_weights(val_weights_obj, n_val, "val_weights");
+    Eigen::ArrayXd w_fit = load_optional_weights(fit_weights_obj, n_fit, "fit_weights",
+        " must be 1D with length matching the corresponding y split");
+    Eigen::ArrayXd w_val = load_optional_weights(val_weights_obj, n_val, "val_weights",
+        " must be 1D with length matching the corresponding y split");
     const bool use_fit_w = w_fit.size() == n_fit;
     const bool use_val_w = w_val.size() == n_val;
     const double w_fit_sum = use_fit_w ? w_fit.sum() : static_cast<double>(n_fit);
@@ -268,7 +264,7 @@ py::list score_formula_candidates_cpp(
     {
         py::gil_scoped_release release;
         // Near-discrete soft arithmetic for ranking (set once outside OMP; E10).
-        sr::ScopedArithmeticTemperature _scoped_temp(100.0);
+        sr::ScopedArithmeticTemperature scoped_temp(100.0);
         #pragma omp parallel for schedule(dynamic)
         for (int idx = 0; idx < static_cast<int>(formulas.size()); ++idx) {
             CandidateScore score;
@@ -414,7 +410,7 @@ py::list score_formula_candidates_cpp(
 }
 
 // Pybind wrapper for the evolution engine
-py::dict run_evolution_cpp(
+static py::dict run_evolution_cpp(
     py::list X_list, // List of numpy arrays (features)
     py::array_t<double> y_array,
     int pop_size,
@@ -614,7 +610,7 @@ py::dict run_evolution_cpp(
         
         if (gdict.contains("output_bias")) g.output_bias = gdict["output_bias"].cast<double>();
 
-        // S6: normalize weight vector length to node count (short → pad 0; long → trim).
+        // S6: normalize weight vector length to node count (short -> pad 0; long -> trim).
         // Mismatched lengths otherwise silently drop active terms or leave junk tails.
         if (!g.nodes.empty()) {
             if (g.output_weights.size() < g.nodes.size()) {
@@ -730,7 +726,7 @@ py::dict run_evolution_cpp(
 
     // Sync evaluator temperature so arithmetic blend sharpness is tunable from Python.
     // RAII restores prior process temperature after this call (E10).
-    sr::ScopedArithmeticTemperature _scoped_run_temp(arithmetic_temperature);
+    sr::ScopedArithmeticTemperature scoped_run_temp(arithmetic_temperature);
 
     // S6-4: prefer per-engine eval_num_threads over process-global omp_set_num_threads
     // so concurrent run_evolution calls do not race on the OpenMP max-thread count.
@@ -743,10 +739,16 @@ py::dict run_evolution_cpp(
         config.eval_num_threads = num_threads;
     }
     
-    std::cout << "[v6-nsga2] Starting C++ Evolution with " << omp_get_max_threads() << " OpenMP Threads!";
-    if (use_nsga2) std::cout << " (NSGA-II mode)";
-    if (num_islands > 1) std::cout << " (Island Model: " << num_islands << " islands)";
-    std::cout << std::endl;
+    // Avoid always-on library stdout; only banner when tracing is enabled.
+    if (config.enable_trace) {
+        std::cout << "[v6-nsga2] Starting C++ Evolution with "
+                  << omp_get_max_threads() << " OpenMP Threads!";
+        if (use_nsga2) std::cout << " (NSGA-II mode)";
+        if (num_islands > 1) {
+            std::cout << " (Island Model: " << num_islands << " islands)";
+        }
+        std::cout << std::endl;
+    }
     
     sr::EvolutionEngine engine(
         config, X, y, cpp_seed_omegas, cpp_seed_graphs, y_weights
@@ -851,8 +853,8 @@ py::dict run_evolution_cpp(
     return result;
 }
 
-// Wrapper for refine_frequencies_cpp (optional sample_weight — S5-9)
-py::tuple refine_frequencies_wrapper(
+// Wrapper for refine_frequencies_cpp (optional sample_weight - S5-9)
+static py::tuple refine_frequencies_wrapper(
     py::array_t<double> x_arr,
     py::array_t<double> y_arr,
     py::list initial_omegas,
@@ -860,9 +862,11 @@ py::tuple refine_frequencies_wrapper(
     double lr = 0.1,
     py::object sample_weight = py::none()
 ) {
-    auto x_buf = x_arr.request();
+    auto x_arr_c = ensure_f64_c(x_arr);
+    auto y_arr_c = ensure_f64_c(y_arr);
+    auto x_buf = x_arr_c.request();
     Eigen::Map<Eigen::VectorXd> x(static_cast<double*>(x_buf.ptr), x_buf.size);
-    auto y_buf = y_arr.request();
+    auto y_buf = y_arr_c.request();
     Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
     Eigen::VectorXd sw = load_optional_vector_weights(
         sample_weight, static_cast<int>(y_buf.size), "sample_weight"
@@ -879,8 +883,8 @@ py::tuple refine_frequencies_wrapper(
     return py::make_tuple(omegas_out, res.mse);
 }
 
-// Wrapper for refine_powers_model_cpp (optional sample_weight — S5-9)
-py::tuple refine_powers_model_wrapper(
+// Wrapper for refine_powers_model_cpp (optional sample_weight - S5-9)
+static py::tuple refine_powers_model_wrapper(
     py::array_t<double> x_arr,
     py::array_t<double> y_arr,
     py::list initial_powers,
@@ -889,9 +893,11 @@ py::tuple refine_powers_model_wrapper(
     double lr = 0.05,
     py::object sample_weight = py::none()
 ) {
-    auto x_buf = x_arr.request();
+    auto x_arr_c = ensure_f64_c(x_arr);
+    auto y_arr_c = ensure_f64_c(y_arr);
+    auto x_buf = x_arr_c.request();
     Eigen::Map<Eigen::VectorXd> x(static_cast<double*>(x_buf.ptr), x_buf.size);
-    auto y_buf = y_arr.request();
+    auto y_buf = y_arr_c.request();
     Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
     Eigen::VectorXd sw = load_optional_vector_weights(
         sample_weight, static_cast<int>(y_buf.size), "sample_weight"
@@ -920,8 +926,8 @@ py::tuple refine_powers_model_wrapper(
     return py::make_tuple(out, res.mse);
 }
 
-// Wrapper for refine_periodic_rational_cpp (optional sample_weight — S5-9)
-py::dict refine_periodic_rational_wrapper(
+// Wrapper for refine_periodic_rational_cpp (optional sample_weight - S5-9)
+static py::dict refine_periodic_rational_wrapper(
     py::array_t<double> x_arr,
     py::array_t<double> y_arr,
     double omega0,
@@ -930,9 +936,11 @@ py::dict refine_periodic_rational_wrapper(
     double lr = 0.05,
     py::object sample_weight = py::none()
 ) {
-    auto x_buf = x_arr.request();
+    auto x_arr_c = ensure_f64_c(x_arr);
+    auto y_arr_c = ensure_f64_c(y_arr);
+    auto x_buf = x_arr_c.request();
     Eigen::Map<Eigen::VectorXd> x(static_cast<double*>(x_buf.ptr), x_buf.size);
-    auto y_buf = y_arr.request();
+    auto y_buf = y_arr_c.request();
     Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
     Eigen::VectorXd sw = load_optional_vector_weights(
         sample_weight, static_cast<int>(y_buf.size), "sample_weight"
@@ -953,13 +961,15 @@ py::dict refine_periodic_rational_wrapper(
 }
 
 // Wrapper for iterative_elastic_net (optional sample_weight / y_weights for S5-9)
-py::tuple iterative_elastic_net_wrapper(py::array_t<double> X_arr, py::array_t<double> y_arr, 
+static py::tuple iterative_elastic_net_wrapper(py::array_t<double> X_arr, py::array_t<double> y_arr, 
                                         double l1_weight, double l2_weight, 
-                                        int n_starts=3, int n_iterations=3, 
-                                        double prune_threshold=0.05, int max_iter=1000,
+                                        int n_starts = 3, int n_iterations = 3,
+                                        double prune_threshold = 0.05, int max_iter = 1000,
                                         py::object sample_weight = py::none()) {
-    auto X_buf = X_arr.request();
-    auto y_buf = y_arr.request();
+    auto X_arr_c = ensure_f64_c(X_arr);
+    auto y_arr_c = ensure_f64_c(y_arr);
+    auto X_buf = X_arr_c.request();
+    auto y_buf = y_arr_c.request();
     
     int n = X_buf.shape[0];
     int p = X_buf.shape[1];
@@ -989,11 +999,13 @@ py::tuple iterative_elastic_net_wrapper(py::array_t<double> X_arr, py::array_t<d
 }
 
 // Wrapper for lasso_coordinate_descent (optional sample_weight via sqrt scaling)
-py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::array_t<double> y_arr, 
-                                          double alpha, int max_iter=1000, double tol=1e-4,
+static py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::array_t<double> y_arr,
+                                          double alpha, int max_iter = 1000, double tol = 1e-4,
                                           py::object sample_weight = py::none()) {
-    auto X_buf = X_arr.request();
-    auto y_buf = y_arr.request();
+    auto X_arr_c = ensure_f64_c(X_arr);
+    auto y_arr_c = ensure_f64_c(y_arr);
+    auto X_buf = X_arr_c.request();
+    auto y_buf = y_arr_c.request();
     
     int n = X_buf.shape[0];
     int p = X_buf.shape[1];
@@ -1025,7 +1037,7 @@ py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::array_t
 // Extra kwargs (use_nsimplify, use_identities, approximate_trig, ratios) are
 // accepted for Python API compatibility with the sympy path but ignored in C++
 // (graph identities always run via simplify_ast_advanced).
-std::string simplify_formula_wrapper(
+static std::string simplify_formula_wrapper(
     std::string formula_str,
     double int_tol = 1e-5,
     double zero_tol = 1e-8,
@@ -1042,12 +1054,12 @@ std::string simplify_formula_wrapper(
     );
 }
 
-std::string simplify_formula_cpp_wrapper(std::string formula_str) {
+static std::string simplify_formula_cpp_wrapper(std::string formula_str) {
     return sr::simplify_formula_cpp(formula_str);
 }
 
 // Wrapper for formula_to_seed_graph_cpp
-py::dict formula_to_seed_graph_wrapper(std::string formula_str) {
+static py::dict formula_to_seed_graph_wrapper(std::string formula_str) {
     sr::IndividualGraph graph = sr::formula_to_graph(formula_str);
 
     py::dict result;
@@ -1083,14 +1095,14 @@ py::dict formula_to_seed_graph_wrapper(std::string formula_str) {
 }
 
 // Wrapper for snap_formula_floats_cpp
-std::string snap_formula_floats_wrapper(std::string formula_str, int n_features = 1) {
+static std::string snap_formula_floats_wrapper(std::string formula_str, int n_features = 1) {
     sr::IndividualGraph graph = sr::formula_to_graph(formula_str);
     sr::simplify_ast(graph);
     return sr::get_formula_string(graph, n_features);
 }
 
 // Wrapper for reduce_formula_noise_cpp (Phase 6: optional y_weights + holdout fidelity).
-std::string reduce_formula_noise_wrapper(
+static std::string reduce_formula_noise_wrapper(
     std::string formula_str,
     py::list X_list,
     py::array_t<double> y_array,
@@ -1141,7 +1153,7 @@ std::string reduce_formula_noise_wrapper(
 
 
 // S5-10 diagnostics: exact parse-tree evaluation (protected div/pow). Ranking uses graph path (S5-2).
-py::array_t<double> eval_formula_exact_wrapper(const std::string& formula, py::list X_list) {
+static py::array_t<double> eval_formula_exact_wrapper(const std::string& formula, py::list X_list) {
     std::vector<Eigen::ArrayXd> X;
     int n = -1;
     for (auto item : X_list) {

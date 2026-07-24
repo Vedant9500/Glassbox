@@ -1,11 +1,11 @@
 #pragma once
 
-#include <Eigen/Dense>
-#include <vector>
-#include <cmath>
 #include <algorithm>
-#include <iostream>
+#include <cmath>
 #include <random>
+#include <vector>
+
+#include <Eigen/Dense>
 
 namespace sr {
 
@@ -31,12 +31,12 @@ inline void apply_sqrt_sample_weights(Eigen::MatrixXd& X, Eigen::VectorXd& y,
 
 struct ElasticNetResult {
     Eigen::VectorXd weights;
-    double mse;
+    double mse = 1e15;
 };
 
 inline ElasticNetResult elastic_net_cd_cpp(const Eigen::MatrixXd& X, const Eigen::VectorXd& y,
                                            double l1_weight, double l2_weight, 
-                                           int max_iter=1000, double tol=1e-7,
+                                           int max_iter = 1000, double tol = 1e-7,
                                            const Eigen::VectorXd& initial_w = Eigen::VectorXd()) {
     int n = X.rows();
     int p = X.cols();
@@ -86,20 +86,21 @@ inline ElasticNetResult elastic_net_cd_cpp(const Eigen::MatrixXd& X, const Eigen
 
 inline ElasticNetResult multi_start_elastic_net(const Eigen::MatrixXd& X, const Eigen::VectorXd& y,
                                                 double l1_weight, double l2_weight, 
-                                                int n_starts=5, double init_scale=0.1,
-                                                int max_iter=1000) {
+                                                int n_starts = 5, double init_scale = 0.1,
+                                                int max_iter = 1000) {
     int p = X.cols();
     ElasticNetResult best_res;
     best_res.mse = 1e15;
     best_res.weights = Eigen::VectorXd::Zero(p);
     
-    std::mt19937 gen(42);
+    constexpr unsigned int kElasticNetSeed = 42;
+    std::mt19937 gen(kElasticNetSeed);
     std::normal_distribution<double> dist(0.0, init_scale);
     
     for (int i = 0; i < n_starts; ++i) {
         Eigen::VectorXd init_w = Eigen::VectorXd::Zero(p);
         if (i > 0) {
-            for(int j=0; j<p; ++j) init_w(j) = dist(gen);
+            for (int j = 0; j < p; ++j) init_w(j) = dist(gen);
         }
         
         auto res = elastic_net_cd_cpp(X, y, l1_weight, l2_weight, max_iter, 1e-7, init_w);
@@ -114,9 +115,9 @@ inline ElasticNetResult multi_start_elastic_net(const Eigen::MatrixXd& X, const 
 // via sqrt(w) row scaling (S5-9). Empty VectorXd keeps legacy unweighted path.
 inline ElasticNetResult iterative_elastic_net(const Eigen::MatrixXd& X, const Eigen::VectorXd& y,
                                               double l1_weight, double l2_weight, 
-                                              int n_starts=3, int n_iterations=3, 
-                                              double prune_threshold=0.05,
-                                              int max_iter=1000,
+                                              int n_starts = 3, int n_iterations = 3,
+                                              double prune_threshold = 0.05,
+                                              int max_iter = 1000,
                                               const Eigen::VectorXd& sample_weight = Eigen::VectorXd()) {
     Eigen::MatrixXd X_work = X;
     Eigen::VectorXd y_work = y;
@@ -312,10 +313,10 @@ inline FreqResult refine_frequencies_cpp(
 struct PowerResult {
     std::vector<double> powers;
     std::vector<double> coeffs;
-    double constant;
-    double linear;
+    double constant = 0.0;
+    double linear = 0.0;
     std::vector<double> periodic_coeffs; // sin_1, cos_1, ...
-    double mse;
+    double mse = 1e15;
 };
 
 // sign(x) * |x|^p (parity preserving)
