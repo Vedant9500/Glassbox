@@ -8,18 +8,15 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 CPP = REPO / "glassbox" / "sr" / "cpp"
-for p in (REPO, CPP):
-    if str(p) not in sys.path:
-        sys.path.insert(0, str(p))
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
 
-try:
-    import _core  # type: ignore
+from glassbox.sr.cpp import get_cpp_core
 
-    CPP_AVAILABLE = hasattr(_core, "formula_to_seed_graph") or hasattr(
-        _core, "formula_to_seed_graph_cpp"
-    )
-except ImportError:
-    CPP_AVAILABLE = False
+_core = get_cpp_core()
+CPP_AVAILABLE = _core is not None and (
+    hasattr(_core, "formula_to_seed_graph") or hasattr(_core, "formula_to_seed_graph_cpp")
+)
 
 requires_cpp = pytest.mark.skipif(not CPP_AVAILABLE, reason="C++ _core not built")
 

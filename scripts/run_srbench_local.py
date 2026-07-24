@@ -241,7 +241,8 @@ def simplify_formula_with_guard(formula, X_ref, y_ref, mse_slack=0.02):
         return formula
 
     try:
-        from glassbox.sr.cpp import _core
+        from glassbox.sr.cpp import get_cpp_core
+        _core = get_cpp_core()
     except Exception:
         _core = None
 

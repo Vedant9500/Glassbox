@@ -34,8 +34,6 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 CPP_DIR = ROOT / "glassbox" / "sr" / "cpp"
-if str(CPP_DIR) not in sys.path:
-    sys.path.insert(0, str(CPP_DIR))
 
 from glassbox.sr.core.operation_dag import OperationDAG
 import glassbox.evolution as evo_mod
@@ -456,7 +454,8 @@ def main() -> None:
     out_path = Path(args.output_dir) / f"{run_name}.jsonl"
 
     if args.cpp_trace:
-        import _core
+        from glassbox.sr.cpp import require_cpp_core
+        _core = require_cpp_core()
 
         x_np = x_t.detach().cpu().numpy().astype(np.float64)
         y_np = y_t.detach().cpu().numpy().astype(np.float64).reshape(-1)

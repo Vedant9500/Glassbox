@@ -14,12 +14,9 @@ for p in (REPO, CPP_DIR):
 
 from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
-try:
-    import _core  # type: ignore
+from glassbox.sr.cpp import CPP_AVAILABLE, get_cpp_core
 
-    CPP_AVAILABLE = hasattr(_core, "run_evolution")
-except ImportError:
-    CPP_AVAILABLE = False
+_core = get_cpp_core()
 
 requires_cpp = pytest.mark.skipif(not CPP_AVAILABLE, reason="C++ _core not built")
 

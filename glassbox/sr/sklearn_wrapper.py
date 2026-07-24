@@ -972,20 +972,22 @@ def _robust_loss(pred, target, loss_mode="mse", sample_weight=None, *, delta=Non
     return float(np.sum(w * loss) / float(np.sum(w)))
 
 
-# Path setup
+# Path setup (repo + scripts for optional helpers; C++ via glassbox.sr.cpp loader)
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _SCRIPTS_DIR = _REPO_ROOT / 'scripts'
 _CPP_DIR = Path(__file__).resolve().parent / 'cpp'
 
-for p in [str(_REPO_ROOT), str(_SCRIPTS_DIR), str(_CPP_DIR)]:
+for p in [str(_REPO_ROOT), str(_SCRIPTS_DIR)]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-try:
-    import _core  # type: ignore
-    CPP_AVAILABLE = True
-except ImportError:
-    CPP_AVAILABLE = False
+from glassbox.sr.cpp import (  # noqa: E402
+    CPP_AVAILABLE,
+    CPP_UNAVAILABLE_REASON,
+    call_with_optional_kwargs,
+    get_cpp_core,
+    load_cpp_core,
+)
 
 from glassbox.evolution import detect_dominant_frequency
 
@@ -5109,8 +5111,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             ordered_formulas.append(formula)
         if CPP_AVAILABLE and ordered_formulas:
             try:
-                import _core  # type: ignore
-                if hasattr(_core, "score_formula_candidates"):
+                _core = get_cpp_core()
+                if _core is not None and hasattr(_core, "score_formula_candidates"):
                     fit_w, val_w = self._split_sample_weights(
                         split, n_total=int(np.asarray(y).reshape(-1).shape[0])
                     )
@@ -5120,16 +5122,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     yv = np.ascontiguousarray(split["y_val"], dtype=np.float64)
                     fw = None if fit_w is None else np.ascontiguousarray(fit_w, dtype=np.float64)
                     vw = None if val_w is None else np.ascontiguousarray(val_w, dtype=np.float64)
-                    try:
-                        scored_cpp = _core.score_formula_candidates(
-                            ordered_formulas, Xf, yf, Xv, yv,
-                            fit_weights=fw, val_weights=vw,
-                        )
-                    except TypeError:
-                        # Older extension without weight args.
-                        scored_cpp = _core.score_formula_candidates(
-                            ordered_formulas, Xf, yf, Xv, yv,
-                        )
+                    scored_cpp = call_with_optional_kwargs(
+                        _core.score_formula_candidates,
+                        ordered_formulas, Xf, yf, Xv, yv,
+                        optional_kwargs={"fit_weights": fw, "val_weights": vw},
+                    )
                     for formula, scored in zip(ordered_formulas, list(scored_cpp)):
                         if isinstance(scored, dict):
                             cpp_scores[re.sub(r"\s+", "", formula.lower())] = dict(scored)
@@ -5557,6 +5554,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             }
             if CPP_AVAILABLE:
                 try:
+                    _core = get_cpp_core()
+                    if _core is None or not hasattr(_core, "score_formula_candidates"):
+                        raise ImportError(CPP_UNAVAILABLE_REASON or "C++ _core unavailable")
                     probe_w = None
                     if (
                         getattr(self, "sample_weight_provided_", False)
@@ -5570,21 +5570,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     Xa = np.ascontiguousarray(X_arr, dtype=np.float64)
                     ya = np.ascontiguousarray(y_arr, dtype=np.float64)
                     formulas_list = [str(item.get("formula", "")) for item in formulas]
-                    try:
-                        if probe_w is not None:
-                            w_c = np.ascontiguousarray(probe_w, dtype=np.float64)
-                            scored_cpp = _core.score_formula_candidates(
-                                formulas_list, Xa, ya, Xa, ya,
-                                fit_weights=w_c, val_weights=w_c,
-                            )
-                        else:
-                            scored_cpp = _core.score_formula_candidates(
-                                formulas_list, Xa, ya, Xa, ya,
-                            )
-                    except TypeError:
-                        scored_cpp = _core.score_formula_candidates(
-                            formulas_list, Xa, ya, Xa, ya,
-                        )
+                    optional = {}
+                    if probe_w is not None:
+                        w_c = np.ascontiguousarray(probe_w, dtype=np.float64)
+                        optional = {"fit_weights": w_c, "val_weights": w_c}
+                    scored_cpp = call_with_optional_kwargs(
+                        _core.score_formula_candidates,
+                        formulas_list, Xa, ya, Xa, ya,
+                        optional_kwargs=optional,
+                    )
                     ok_count = 0
                     for item, scored in zip(formulas, list(scored_cpp)):
                         if isinstance(scored, dict) and scored.get("ok"):
@@ -7174,19 +7168,20 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         Single simplify path: C++ ``simplify_formula`` (advanced multipass).
         Python string rewrites only run inside cleanup snap helpers, not here.
         On C++ failure the original formula is returned unchanged.
+        Dead sympy-path kwargs (use_nsimplify, etc.) are not forwarded (P6-007).
         """
         if not formula or not self.use_simplification:
             return formula
+        _core = get_cpp_core()
+        if _core is None or not hasattr(_core, "simplify_formula"):
+            return formula
         try:
-            from glassbox.sr.cpp import _core
             simplified = _core.simplify_formula(
                 formula,
                 int_tol=self.simplification_int_tol,
                 zero_tol=self.simplification_zero_tol,
                 max_passes=6,
-                use_nsimplify=True,
-                use_identities=True,
-                n_features=self.n_features_in_
+                n_features=self.n_features_in_,
             )
             return simplified
         except Exception:
@@ -8952,10 +8947,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         if need_evolution and _elapsed() < effective_timeout:
             if not CPP_AVAILABLE:
+                # P6-014: missing extension is a hard error when evolution is required
+                # and no prior formula exists; otherwise stages degrade without native ops.
                 if best_formula is None:
                     raise ImportError(
-                        "Glassbox C++ core (_core.pyd/.so) not found. "
-                        "Please build the backend first."
+                        CPP_UNAVAILABLE_REASON
+                        or (
+                            "Glassbox C++ core (_core) not found. "
+                            "Build: python glassbox/sr/cpp/setup.py build_ext --inplace --force"
+                        )
                     )
             else:
                 evo_formula = None
@@ -9085,6 +9085,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                     x_t, y_t, hints, **guided_kw
                                 )
                             except TypeError:
+                                # Prefer call_with_optional_kwargs at call site when possible.
                                 guided_kw.pop("y_weights", None)
                                 guided_kw.pop("loss_mode", None)
                                 guided_kw.pop("huber_delta", None)
@@ -9353,17 +9354,27 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                     getattr(self, "trim_fraction", 0.1) or 0.1
                                 )
                             evo_kwargs.update(self._evolution_units_kwargs())
-                            try:
-                                result = _core.run_evolution(**evo_kwargs)
-                            except TypeError:
-                                evo_kwargs.pop("y_weights", None)
-                                evo_kwargs.pop("loss_mode", None)
-                                evo_kwargs.pop("huber_delta", None)
-                                evo_kwargs.pop("trim_fraction", None)
-                                evo_kwargs.pop("input_units", None)
-                                evo_kwargs.pop("output_units", None)
-                                evo_kwargs.pop("dim_penalty_weight", None)
-                                result = _core.run_evolution(**evo_kwargs)
+                            # P6-003: drop only kwargs the extension signature rejects.
+                            optional = {}
+                            for k in (
+                                "y_weights",
+                                "loss_mode",
+                                "huber_delta",
+                                "trim_fraction",
+                                "input_units",
+                                "output_units",
+                                "dim_penalty_weight",
+                            ):
+                                if k in evo_kwargs:
+                                    optional[k] = evo_kwargs.pop(k)
+                            _core = get_cpp_core()
+                            if _core is None:
+                                raise ImportError(CPP_UNAVAILABLE_REASON or 'C++ _core unavailable')
+                            result = call_with_optional_kwargs(
+                                _core.run_evolution,
+                                optional_kwargs=optional,
+                                required_kwargs=evo_kwargs,
+                            )
 
                             raw_mse = result.get('best_mse', float('inf'))
                             raw_formula = result.get('formula', '')
@@ -10042,7 +10053,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return formula_str
 
         try:
-            from glassbox.sr.cpp import _core
+            _core = get_cpp_core()
+            if _core is None or not hasattr(_core, "reduce_formula_noise"):
+                return formula_str
             n_feat = int(np.asarray(X).shape[1]) if np.ndim(X) == 2 else 1
             X_list = [X[:, j] for j in range(n_feat)]
             w = self._active_sample_weight(n_targets=int(np.asarray(y).reshape(-1).shape[0]))
@@ -10052,21 +10065,16 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             # Phase 6 tighten: under auto soft-MAD allow more aggressive BIC pruning.
             if self._auto_noise_guard_active():
                 rel = max(rel, 0.22)
-            kwargs = {
+            optional = {
                 "holdout_fraction": 0.2,
                 "relative_slack": rel,
             }
             if w is not None:
-                kwargs["y_weights"] = np.asarray(w, dtype=np.float64)
-            try:
-                return _core.reduce_formula_noise(formula_str, X_list, y, **kwargs)
-            except TypeError:
-                # Older extension without Phase 6 kwargs.
-                if w is not None:
-                    try:
-                        return _core.reduce_formula_noise(formula_str, X_list, y, w)
-                    except TypeError:
-                        pass
-                return _core.reduce_formula_noise(formula_str, X_list, y)
+                optional["y_weights"] = np.asarray(w, dtype=np.float64)
+            return call_with_optional_kwargs(
+                _core.reduce_formula_noise,
+                formula_str, X_list, y,
+                optional_kwargs=optional,
+            )
         except Exception:
             return formula_str

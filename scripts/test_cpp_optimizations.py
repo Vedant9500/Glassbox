@@ -8,13 +8,9 @@ import sys
 import time
 from pathlib import Path
 
-# Setup path
-cpp_dir = Path(__file__).resolve().parent.parent / "glassbox" / "sr" / "cpp"
-sys.path.insert(0, str(cpp_dir))
-
 try:
-    import _core
-
+    from glassbox.sr.cpp import require_cpp_core
+    _core = require_cpp_core()
     print("✅ _core imported successfully\n")
 except ImportError as e:
     print(f"❌ Failed to import _core: {e}")

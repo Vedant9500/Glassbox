@@ -15,15 +15,10 @@ from glassbox.sr.sklearn_wrapper import (
 )
 
 CPP_DIR = REPO / "glassbox" / "sr" / "cpp"
-if str(CPP_DIR) not in sys.path:
-    sys.path.insert(0, str(CPP_DIR))
 
-try:
-    import _core  # type: ignore
+from glassbox.sr.cpp import CPP_AVAILABLE, get_cpp_core
 
-    CPP_AVAILABLE = hasattr(_core, "iterative_elastic_net")
-except ImportError:
-    CPP_AVAILABLE = False
+_core = get_cpp_core()
 
 requires_cpp = pytest.mark.skipif(not CPP_AVAILABLE, reason="C++ _core not built")
 

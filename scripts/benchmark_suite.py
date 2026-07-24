@@ -644,10 +644,13 @@ def _simplify_formula_native(formula: str, int_tol: float, zero_tol: float) -> O
     """Simplify with the native C++ Phase-1 simplifier, if available."""
     try:
         cpp_dir = _REPO_ROOT / "glassbox" / "sr" / "cpp"
-        if str(cpp_dir) not in sys.path:
-            sys.path.insert(0, str(cpp_dir))
+        from glassbox.sr.cpp import get_cpp_core
 
-        import _core  # type: ignore
+        _core = get_cpp_core()
+
+        if _core is None:
+
+            raise ImportError("C++ _core unavailable")
 
         simplified = _core.simplify_formula(
             formula,
@@ -1568,9 +1571,13 @@ def run_formula_cpp_evolution(
     try:
         # Import C++ backend
         cpp_dir = Path(__file__).resolve().parent.parent / 'glassbox' / 'sr' / 'cpp'
-        if str(cpp_dir) not in sys.path:
-            sys.path.insert(0, str(cpp_dir))
-        import _core
+        from glassbox.sr.cpp import get_cpp_core
+
+        _core = get_cpp_core()
+
+        if _core is None:
+
+            raise ImportError("C++ _core unavailable")
         
         # Generate data (keep clean labels for recovery; fit on optional noise)
         x_np, y_np, y_clean = _generate_xy_with_optional_noise(
@@ -2213,7 +2220,8 @@ def save_json_results(
 
 
 def _cpp_core_status() -> Dict[str, Any]:
-    core, reason = cfp._load_cpp_core()
+    from glassbox.sr.cpp import load_cpp_core
+    core, reason = load_cpp_core()
     built_extensions: List[str] = []
     try:
         cpp_dir = _REPO_ROOT / "glassbox" / "sr" / "cpp"

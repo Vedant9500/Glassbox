@@ -8,14 +8,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 cpp_dir = REPO_ROOT / "glassbox" / "sr" / "cpp"
-if str(cpp_dir) not in sys.path:
-    sys.path.insert(0, str(cpp_dir))
 
-try:
-    import _core
-    CPP_AVAILABLE = True
-except ImportError:
-    CPP_AVAILABLE = False
+from glassbox.sr.cpp import CPP_AVAILABLE, get_cpp_core
+
+_core = get_cpp_core()
 
 requires_cpp = pytest.mark.skipif(
     not CPP_AVAILABLE,

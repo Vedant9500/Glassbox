@@ -9,7 +9,6 @@ import numpy as np
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
-sys.path.insert(0, str(REPO / "glassbox" / "sr" / "cpp"))
 sys.path.insert(0, str(REPO / "scripts"))
 
 from glassbox.sr.sklearn_wrapper import (
@@ -70,7 +69,8 @@ def main():
     # B) C++ weighted evolution (Phase 3) — known-good
     # ------------------------------------------------------------------
     section("B) Phase 3 weighted C++ evolution (block outliers)")
-    import _core
+    from glassbox.sr.cpp import require_cpp_core
+_core = require_cpp_core()
 
     x = np.linspace(-3, 3, 120)
     y_clean = 2.0 * x + 1.0

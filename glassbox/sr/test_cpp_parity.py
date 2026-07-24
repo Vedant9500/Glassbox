@@ -19,15 +19,11 @@ import pytest
 
 # Ensure the built C++ extension can be found
 cpp_dir = Path(__file__).parent / 'cpp'
-if str(cpp_dir) not in sys.path:
-    sys.path.insert(0, str(cpp_dir))
 
 # ── Import guard ────────────────────────────────────────────────────────
-try:
-    import _core
-    CPP_AVAILABLE = True
-except ImportError:
-    CPP_AVAILABLE = False
+from glassbox.sr.cpp import CPP_AVAILABLE, get_cpp_core
+
+_core = get_cpp_core()
 
 requires_cpp = pytest.mark.skipif(
     not CPP_AVAILABLE,

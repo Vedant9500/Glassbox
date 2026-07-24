@@ -53,6 +53,12 @@ def _print_project_help() -> None:
               cpython-314, win_amd64 vs linux_x86_64). There is no cross-ABI
               guarantee — rebuild with the same Python used at runtime:
                 python {script} build_ext --inplace --force
+
+            Import (P6-001/P6-005):
+              The extension is named "_core" and written next to this package
+              (glassbox/sr/cpp/). Prefer:
+                from glassbox.sr.cpp import get_cpp_core, load_cpp_core
+              rather than sys.path hacks. CMakeLists.txt mirrors OpenMP flags.
             """
         ).strip()
     )

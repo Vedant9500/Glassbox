@@ -22,15 +22,10 @@ from glassbox.sr.sklearn_wrapper import (
 )
 
 cpp_dir = REPO / "glassbox" / "sr" / "cpp"
-if str(cpp_dir) not in sys.path:
-    sys.path.insert(0, str(cpp_dir))
 
-try:
-    import _core
+from glassbox.sr.cpp import CPP_AVAILABLE, get_cpp_core
 
-    CPP_AVAILABLE = True
-except ImportError:
-    CPP_AVAILABLE = False
+_core = get_cpp_core()
 
 requires_cpp = pytest.mark.skipif(not CPP_AVAILABLE, reason="C++ _core not built")
 

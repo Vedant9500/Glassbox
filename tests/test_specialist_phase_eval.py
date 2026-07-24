@@ -133,11 +133,9 @@ def test_univariate_specialist_candidate_pool_includes_targeted_probes():
 
 
 def test_cpp_batch_candidate_scoring_matches_affine_fit_when_available():
-    try:
-        import _core  # type: ignore
-    except Exception:
-        return
-    if not hasattr(_core, "score_formula_candidates"):
+    from glassbox.sr.cpp import get_cpp_core
+    _core = get_cpp_core()
+    if _core is None or not hasattr(_core, "score_formula_candidates"):
         return
 
     x = np.linspace(-2.0, 2.0, 80)

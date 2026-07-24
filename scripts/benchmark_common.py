@@ -537,10 +537,13 @@ def simplify_formula_native(formula, int_tol=0.05, zero_tol=1e-3):
     """Simplify with the native C++ simplifier when available."""
     try:
         cpp_dir = _REPO_ROOT / "glassbox" / "sr" / "cpp"
-        if str(cpp_dir) not in sys.path:
-            sys.path.insert(0, str(cpp_dir))
+        from glassbox.sr.cpp import get_cpp_core
 
-        import _core  # type: ignore
+        _core = get_cpp_core()
+
+        if _core is None:
+
+            raise ImportError("C++ _core unavailable")
 
         if hasattr(_core, "simplify_formula"):
             simplified = _core.simplify_formula(

@@ -1,14 +1,9 @@
 """Tests for formula → C++ seed graph conversion."""
-import sys
-from pathlib import Path
-
 import pytest
 
-cpp_dir = Path(__file__).parent / "cpp"
-if str(cpp_dir) not in sys.path:
-    sys.path.insert(0, str(cpp_dir))
-
-from seed_graph_builder import (  # noqa: E402
+from glassbox.sr.cpp import CPP_AVAILABLE, get_cpp_core
+from glassbox.sr.cpp import seed_graph_builder as sgb
+from glassbox.sr.cpp.seed_graph_builder import (
     TYPE_INPUT,
     TYPE_UNARY,
     UNARY_INTPOW,
@@ -19,14 +14,8 @@ from seed_graph_builder import (  # noqa: E402
     discover_seed_formulas_from_signal,
     formula_to_seed_graph,
 )
-import seed_graph_builder as sgb  # noqa: E402
 
-try:
-    import _core
-
-    CPP_AVAILABLE = True
-except ImportError:
-    CPP_AVAILABLE = False
+_core = get_cpp_core()
 
 requires_cpp = pytest.mark.skipif(
     not CPP_AVAILABLE,
@@ -139,7 +128,8 @@ def test_signal_seed_graphs_build() -> None:
 
 
 def test_multivariate_formula_to_seed_graph_builds(monkeypatch):
-    monkeypatch.setattr(sgb, "_core", None)
+    # Force pure-Python multi-feature path (no native formula_to_seed_graph).
+    monkeypatch.setattr(sgb, "get_cpp_core", lambda: None)
     graph = sgb.formula_to_seed_graph("x0*x1 + sin(x2)")
     assert graph is not None
     assert graph["nodes"]

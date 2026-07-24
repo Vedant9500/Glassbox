@@ -412,19 +412,11 @@ def fit_coefficients_bfgs(
     if method == 'iterative':
         # Try C++ native backend first
         try:
-            import sys
-            from pathlib import Path as _Path
             import numpy as np
-            try:
-                import _core
-            except ImportError:
-                try:
-                    cpp_dir = _Path(__file__).parent.parent / 'cpp'
-                    if str(cpp_dir) not in sys.path:
-                        sys.path.insert(0, str(cpp_dir))
-                    import _core
-                except ImportError:
-                    raise ImportError("C++ core not found")
+            from glassbox.sr.cpp import get_cpp_core
+            _core = get_cpp_core()
+            if _core is None:
+                raise ImportError("C++ core not found")
 
             sw = None
             if sample_weight is not None:

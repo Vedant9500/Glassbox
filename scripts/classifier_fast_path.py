@@ -37,27 +37,9 @@ DEFAULT_EXACT_MATCH_MAX_COMBOS = 50_000
 
 @lru_cache(maxsize=1)
 def _load_cpp_core() -> Tuple[Optional[Any], Optional[str]]:
-    """Load the optional C++ extension, returning a diagnostic instead of raising."""
-    import sys
-    from pathlib import Path as _Path
-
-    cpp_dir = _Path(__file__).resolve().parent.parent / 'glassbox' / 'sr' / 'cpp'
-    if str(cpp_dir) not in sys.path:
-        sys.path.insert(0, str(cpp_dir))
-
-    errors: List[str] = []
-    for module_name in ('_core', 'glassbox.sr.cpp._core'):
-        try:
-            return importlib.import_module(module_name), None
-        except ImportError as exc:
-            errors.append(f"{module_name}: {exc}")
-
-    built_extensions = sorted(p.name for p in cpp_dir.glob('_core.*'))
-    active_abi = getattr(sys.implementation, "cache_tag", "unknown ABI")
-    if built_extensions:
-        found = ", ".join(built_extensions)
-        return None, f"C++ _core extension unavailable for active ABI {active_abi}; found {found}"
-    return None, f"C++ _core extension unavailable for active ABI {active_abi} ({'; '.join(errors)})"
+    """Load the optional C++ extension (canonical glassbox.sr.cpp loader)."""
+    from glassbox.sr.cpp import load_cpp_core
+    return load_cpp_core()
 
 
 def _lasso_coordinate_descent_python(
@@ -3909,8 +3891,7 @@ def _build_cpp_seed_graphs(
         from pathlib import Path as _Path
 
         _cpp_dir = _Path(__file__).resolve().parent.parent / "glassbox" / "sr" / "cpp"
-        if str(_cpp_dir) not in sys.path:
-            sys.path.insert(0, str(_cpp_dir))
+        # C++ loader lives in glassbox.sr.cpp (no path insert).
         from seed_graph_builder import build_seed_graphs_from_candidates  # type: ignore
 
     return build_seed_graphs_from_candidates(candidate_formulas, max_seeds=max_seeds)
@@ -3930,8 +3911,7 @@ def _build_signal_seed_graphs(
         from pathlib import Path as _Path
 
         _cpp_dir = _Path(__file__).resolve().parent.parent / "glassbox" / "sr" / "cpp"
-        if str(_cpp_dir) not in sys.path:
-            sys.path.insert(0, str(_cpp_dir))
+        # C++ loader lives in glassbox.sr.cpp (no path insert).
         from seed_graph_builder import build_seed_graphs_from_signal  # type: ignore
 
     if operator_hints is None:

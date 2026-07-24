@@ -12,13 +12,22 @@ from typing import Any, Dict, List, Optional, Tuple
 import math
 import numpy as np
 
-try:
-    import _core  # type: ignore
-except Exception:  # pragma: no cover - fallback for direct execution
-    try:
-        import _core  # type: ignore
-    except Exception:  # pragma: no cover
-        _core = None
+from glassbox.sr.cpp import get_cpp_core
+from glassbox.sr.cpp.graph_enums import (
+    BINARY_AGGREGATION,
+    BINARY_ARITHMETIC,
+    BINARY_DIVISION,
+    TYPE_BINARY,
+    TYPE_CONSTANT,
+    TYPE_INPUT,
+    TYPE_UNARY,
+    UNARY_ABS,
+    UNARY_EXP,
+    UNARY_INTPOW,
+    UNARY_LOG,
+    UNARY_PERIODIC,
+    UNARY_POWER,
+)
 
 import sympy as sp
 from sympy.parsing.sympy_parser import (
@@ -27,23 +36,6 @@ from sympy.parsing.sympy_parser import (
     parse_expr,
     standard_transformations,
 )
-
-# Match glassbox/sr/cpp/export_pytorch.py and core.cpp enums
-TYPE_INPUT = 0
-TYPE_CONSTANT = 1
-TYPE_UNARY = 2
-TYPE_BINARY = 3
-
-UNARY_PERIODIC = 0
-UNARY_POWER = 1
-UNARY_INTPOW = 2
-UNARY_EXP = 3
-UNARY_LOG = 4
-UNARY_ABS = 5
-
-BINARY_ARITHMETIC = 0
-BINARY_DIVISION = 1
-BINARY_AGGREGATION = 2
 
 _TRANSFORMATIONS = standard_transformations + (
     convert_xor,
@@ -67,6 +59,7 @@ _LOCAL_DICT = {
 
 
 def _cpp_seed_graph_from_formula(formula: str, x_name: str = "x") -> Optional[Dict[str, Any]]:
+    _core = get_cpp_core()
     if _core is None or not hasattr(_core, "formula_to_seed_graph"):
         return None
     try:
