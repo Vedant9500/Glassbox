@@ -1,32 +1,25 @@
 #pragma once
 
-#define _USE_MATH_DEFINES
 #include "ast.h"
 #include "eval.h"
 #include "execution.h"
-#include <vector>
-#include <random>
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <limits>
+#include <random>
 #include <string>
-#include <sstream>
 #include <unordered_set>
 #include <utility>
-#include <atomic>
+#include <vector>
 
 #include <omp.h>
 
-// MSVC fallbacks for M_PI and M_E
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-#ifndef M_E
-#define M_E 2.71828182845904523536
-#endif
-
 namespace sr {
+// kPi/kE live in ast.h (shared with eval/parser).
 
 // Phase 4 robust search losses (display / best_mse stay plain MSE).
 enum class LossMode {
@@ -123,7 +116,7 @@ struct EvolutionConfig {
     int random_seed = -1; // <0 => nondeterministic random_device
 
     // Soft-arithmetic blend sharpness (synced to eval.h during fitness eval).
-    // Higher => closer to discrete +/×/÷/− (E4 / E10).
+    // Higher => closer to discrete +/x///- (E4 / E10).
     double arithmetic_temperature = 5.0;
 
     // Parallel pop evaluation thread budget. 0 => auto (max threads, or 1 if nested).
@@ -151,22 +144,6 @@ struct EvolutionConfig {
 };
 
 class DifferentialGramian {
-private:
-    Eigen::MatrixXd A_; // Full design matrix: n_samples x (n_features + 1)
-    Eigen::MatrixXd G_; // A^T W A : size (F+1) x (F+1)
-    Eigen::VectorXd c_; // A^T W y : size (F+1)
-    Eigen::ArrayXd y_;  // Target vector reference
-    Eigen::ArrayXd w_;  // Optional per-point weights (empty => uniform)
-    double w_sum_ = 0.0;
-    bool use_weights_ = false;
-    int n_samples_ = 0;
-    int n_features_ = 0;
-
-    // Cholesky cache: avoid re-factoring when only c_ changes
-    mutable Eigen::LLT<Eigen::MatrixXd> llt_cache_;
-    mutable double cached_lambda_ = -1.0;
-    mutable bool llt_valid_ = false;
-
 public:
     int n_features() const { return n_features_; }
     int n_samples() const { return n_samples_; }
@@ -207,19 +184,17 @@ public:
             G_ = A_.transpose() * A_;
             c_ = A_.transpose() * y.matrix();
         }
-        llt_valid_ = false;
     }
 
-    void update_nodes(const std::vector<int>& changed_indices, 
-                      const std::vector<Eigen::ArrayXd>& /*old_cache*/, 
+    void update_nodes(const std::vector<int>& changed_indices,
+                      const std::vector<Eigen::ArrayXd>& /*old_cache*/,
                       const std::vector<Eigen::ArrayXd>& new_cache) {
         if (changed_indices.empty()) return;
-        llt_valid_ = false;
-        
+
         for (int idx : changed_indices) {
             // 1. Update Design Matrix
             A_.col(idx) = new_cache[idx].matrix();
-            
+
             // 2. Update Gramian Row and Column
             if (use_weights_) {
                 Eigen::VectorXd wA = (w_ * A_.col(idx).array()).matrix();
@@ -237,8 +212,7 @@ public:
     }
 
     bool solve_ridge(double lambda, Eigen::VectorXd& w_out) const {
-        // Use ColPivHouseholderQR for maximum robustness in ill-conditioned problems.
-        // It's slower than LDLT but much safer for near-singular bases.
+        // ColPivHouseholderQR for robustness on near-singular bases (no LLT cache).
         Eigen::MatrixXd G_ridge = G_;
         G_ridge.diagonal().array() += lambda;
         w_out = G_ridge.colPivHouseholderQr().solve(c_);
@@ -260,7 +234,35 @@ public:
             : err2.mean();
         return std::isfinite(mse) ? mse : std::numeric_limits<double>::infinity();
     }
+
+private:
+    Eigen::MatrixXd A_; // Full design matrix: n_samples x (n_features + 1)
+    Eigen::MatrixXd G_; // A^T W A : size (F+1) x (F+1)
+    Eigen::VectorXd c_; // A^T W y : size (F+1)
+    Eigen::ArrayXd y_;  // Target vector (owned copy, not a reference)
+    Eigen::ArrayXd w_;  // Optional per-point weights (empty => uniform)
+    double w_sum_ = 0.0;
+    bool use_weights_ = false;
+    int n_samples_ = 0;
+    int n_features_ = 0;
+
 };
+
+
+// Shared anti-trig-bloat predicates (soft penalty + hard ban share the same rules).
+inline bool is_low_omega_periodic(const OpNode& node) {
+    return node.type == NodeType::Unary &&
+           node.unary_op == UnaryOp::Periodic &&
+           std::abs(node.omega) < 0.1;
+}
+
+inline bool is_nested_periodic(const IndividualGraph& graph, const OpNode& node) {
+    if (node.type != NodeType::Unary || node.unary_op != UnaryOp::Periodic) return false;
+    const int n = static_cast<int>(graph.nodes.size());
+    if (node.left_child < 0 || node.left_child >= n) return false;
+    const auto& child = graph.nodes[static_cast<size_t>(node.left_child)];
+    return child.type == NodeType::Unary && child.unary_op == UnaryOp::Periodic;
+}
 
 class EvolutionEngine {
 public:
@@ -274,8 +276,8 @@ public:
                     rng_(config.random_seed >= 0
                             ? static_cast<unsigned int>(config.random_seed)
                             : std::random_device{}()) {
-    set_y_weights(y_weights);
-    sanitize_config();
+        set_y_weights(y_weights);
+        sanitize_config();
 
         if (config_.enable_trace && !config_.trace_path.empty()) {
             trace_stream_.open(config_.trace_path, std::ios::out | std::ios::trunc);
@@ -363,7 +365,7 @@ public:
                     combined.push_back(ind);
                 }
                 // Generate offspring
-                std::uniform_int_distribution<int> p_dist(0, std::max(0, (int)population_.size() - 1));
+                std::uniform_int_distribution<int> p_dist(0, std::max(0, static_cast<int>(population_.size()) - 1));
                 std::uniform_real_distribution<double> co(0.0, 1.0);
                 const double macro_rate = std::clamp(config_.macro_mutation_rate, 0.0, 0.9);
                 for (int i = 0; i < config_.pop_size; ++i) {
@@ -521,7 +523,7 @@ public:
             }
             
             // Periodic inner-param refinement on top elite only (every 10 gens)
-            // This is where Adam refines omega/p/phi — crucial for sin(3x), exp(-x) etc.
+            // This is where Adam refines omega/p/phi - crucial for sin(3x), exp(-x) etc.
             if (gen % 10 == 9) {
                 for (int i = 0; i < std::min(5, config_.elite_size); ++i) {
                     refine_inner_params(population_[i]);
@@ -737,7 +739,7 @@ public:
                 islands[i].evolve_one_generation(gen);
             }
 
-            // Migration: ring topology (island i → island i+1)
+            // Migration: ring topology (island i -> island i+1)
             if (gen > 0 && gen % config_.migration_interval == 0) {
                 for (int i = 0; i < config_.num_islands; ++i) {
                     int next = (i + 1) % config_.num_islands;
@@ -756,7 +758,7 @@ public:
                                   return is_better_champion(a, b);
                               });
 
-                    int n_migrate = std::min(config_.migration_size, (int)src.size() / 2);
+                    int n_migrate = std::min(config_.migration_size, static_cast<int>(src.size()) / 2);
                     for (int m = 0; m < n_migrate; ++m) {
                         dst[dst.size() - 1 - m] = src[m];
                     }
@@ -980,7 +982,7 @@ private:
         const int n = static_cast<int>(resid.size());
         if (n <= 0) return std::numeric_limits<double>::infinity();
 
-        // Plain (optionally weighted) MSE path — also used for diagnostics.
+        // Plain (optionally weighted) MSE path - also used for diagnostics.
         auto weighted_mean_of = [&](const Eigen::ArrayXd& vals) -> double {
             if (has_y_weights_ && y_weights_.size() == vals.size()) {
                 return (y_weights_ * vals).sum() / y_weight_sum_;
@@ -1369,12 +1371,12 @@ private:
             }
 
             node.phi = rnorm(rng_);
-            node.amplitude = 1.0;  // Fixed — SVD handles scaling via output_weights
+            node.amplitude = 1.0;  // Fixed - SVD handles scaling via output_weights
             node.beta = 1.5 + rnorm(rng_)*0.5;
             node.gamma = 1.0 + rnorm(rng_)*0.5;
             node.tau = 1.0;
 
-            // ── FIX: Only node 0 is Input. All others are Unary/Binary. ──
+            // -- FIX: Only node 0 is Input. All others are Unary/Binary. --
             // This prevents multiple collinear 'x' columns in the SVD.
             if (i < n_inputs) {
                 node.type = NodeType::Input;
@@ -1439,7 +1441,7 @@ private:
         return ind;
     }
 
-    // E3: seed capacity — allow up to seed_fraction of pop (default 50%),
+    // E3: seed capacity - allow up to seed_fraction of pop (default 50%),
     // and on tiny island pops keep almost all slots for seeds while leaving
     // at least one random individual when pop > 1.
     int max_seed_capacity() const {
@@ -1452,7 +1454,7 @@ private:
         int by_frac = std::max(1, static_cast<int>(std::ceil(frac * static_cast<double>(pop))));
         int cap;
         if (pop <= 12) {
-            // Small island/pop: avoid historical pop/4 starvation (e.g. 12→3).
+            // Small island/pop: avoid historical pop/4 starvation (e.g. 12->3).
             cap = std::max(by_frac, pop - 1);
         } else {
             cap = by_frac;
@@ -1461,7 +1463,7 @@ private:
         return std::min(cap, n_seeds);
     }
 
-    // E5/E7(tracker): champion compare — lower penalized fitness wins; on near-ties
+    // E5/E7(tracker): champion compare - lower penalized fitness wins; on near-ties
     // prefer better unweighted raw_mse (export/protocol accuracy).
     static bool is_better_champion(const IndividualGraph& cand, const IndividualGraph& best) {
         constexpr double kFitEps = 1e-12;
@@ -1602,7 +1604,9 @@ private:
     // weighted_mse: search objective (weights and/or robust loss from residual_mse).
     // fitness: search objective * complexity penalty.
     double evaluate_fitness_with_penalty(IndividualGraph& graph, const std::vector<Eigen::ArrayXd>& X, const Eigen::ArrayXd& y, int num_samples, SubtreeCache* tc = nullptr) {
-        // Keep worker threads aligned with this engine's soft-arith temperature (E10).
+        // Process-global soft-arith temperature (atomic; see eval.h E10 / X-001).
+        // Re-applied each eval so OpenMP workers and nested API entry stay aligned
+        // with this engine's config_.arithmetic_temperature.
         set_arithmetic_temperature(config_.arithmetic_temperature);
         Eigen::ArrayXd pred;
         if (tc != nullptr) {
@@ -1630,22 +1634,15 @@ private:
                     double dist_o = std::min(frac_o, 1.0 - frac_o);
                     penalty += dist_o * dist_o;
 
-                    // P8: Anti-Trigonometric Bloat Penalty
-                    // Prevent model from using sin(w*x) to approximate linear x by penalizing w -> 0.
-                    // Also explicitly penalize nested periodic functions (sin(sin(x))).
-                    if (node.unary_op == UnaryOp::Periodic) {
-                        if (std::abs(node.omega) < 0.1) {
-                            penalty += 5.0 * (0.1 - std::abs(node.omega));
-                        }
-                        if (node.left_child >= 0 && node.left_child < graph.nodes.size()) {
-                            const auto& child_node = graph.nodes[node.left_child];
-                            if (child_node.type == NodeType::Unary && child_node.unary_op == UnaryOp::Periodic) {
-                                penalty += 5.0; // High penalty for nested trig functions
-                            }
-                        }
+                    // P8: soft anti-trig-bloat (shared predicates with hard ban below).
+                    if (is_low_omega_periodic(node)) {
+                        penalty += 5.0 * (0.1 - std::abs(node.omega));
+                    }
+                    if (is_nested_periodic(graph, node)) {
+                        penalty += 5.0;
                     }
                 }
-                // P2: Arithmetic entropy penalty — push soft binary ops toward discrete
+                // P2: Arithmetic entropy penalty - push soft binary ops toward discrete
                 // selection. Lower entropy = more committed to one operation.
                 if (node.type == NodeType::Binary && node.binary_op == BinaryOp::Arithmetic) {
                     auto w = arithmetic_soft_weights(node);
@@ -1687,22 +1684,15 @@ private:
         }
 
         // Apply multiplicative complexity penalty to guarantee scale invariance
-        graph.fitness = mse * (1.0 + complexity_penalty_factor) + config_.round_penalty_weight * penalty / std::max(1.0, (double)graph.nodes.size());
+        graph.fitness = mse * (1.0 + complexity_penalty_factor) + config_.round_penalty_weight * penalty / std::max(1.0, static_cast<double>(graph.nodes.size()));
 
-        // P8: Hard Anti-Trigonometric Bloat Penalty
-        // Prevent model from using sin(w*x) to approximate linear x by penalizing w -> 0.
-        // Also explicitly penalize nested periodic functions (sin(sin(x))).
+        // P8: hard anti-trig-bloat ban (same predicates as soft penalty above).
         for (const auto& node : graph.nodes) {
-            if (node.type == NodeType::Unary && node.unary_op == UnaryOp::Periodic) {
-                if (std::abs(node.omega) < 0.1) {
-                    graph.fitness += 100.0; // Hard ban on taylor expansions
-                }
-                if (node.left_child >= 0 && node.left_child < graph.nodes.size()) {
-                    const auto& child_node = graph.nodes[node.left_child];
-                    if (child_node.type == NodeType::Unary && child_node.unary_op == UnaryOp::Periodic) {
-                        graph.fitness += 100.0; // Hard ban on nested trig functions
-                    }
-                }
+            if (is_low_omega_periodic(node)) {
+                graph.fitness += 100.0;
+            }
+            if (is_nested_periodic(graph, node)) {
+                graph.fitness += 100.0;
             }
         }
 
@@ -1766,7 +1756,7 @@ private:
                     node.p += rnorm(rng_);
                     node.omega += rnorm(rng_);
                     node.phi += rnorm(rng_);
-                    // amplitude is fixed at 1.0 — SVD handles scaling
+                    // amplitude is fixed at 1.0 - SVD handles scaling
                     if (node.type == NodeType::Constant) node.value += rnorm(rng_);
                     
                     node.omega = std::clamp(node.omega, config_.omega_min, config_.omega_max);
@@ -1788,11 +1778,11 @@ private:
         return child;
     }
 
-    // ── Macro-Mutations ────────────────────────────────────────────────────
+    // -- Macro-Mutations ----------------------------------------------------
     // Structural mutations that preserve building blocks:
-    //   - Wrap:     f(x) → sin(f(x)) or exp(f(x)) or |f(x)|^p
-    //   - Multiply: f(x), g(x) → f(x) * g(x)
-    //   - Nest:     f(x), g(x) → f(g(x))
+    //   - Wrap:     f(x) -> sin(f(x)) or exp(f(x)) or |f(x)|^p
+    //   - Multiply: f(x), g(x) -> f(x) * g(x)
+    //   - Nest:     f(x), g(x) -> f(g(x))
     IndividualGraph macro_mutate(const IndividualGraph& parent) {
         IndividualGraph child = parent;
         child.fitness_valid = false;  // E6
@@ -1834,7 +1824,7 @@ private:
         double roll = runif(rng_);
         
         if (roll < t_wrap) {
-            // ── Wrap Mutation ──
+            // -- Wrap Mutation --
             // Prefer active building blocks, falling back to random nodes.
             int target = sample_active_node(child, 1, n - 1);
             
@@ -1878,7 +1868,7 @@ private:
             child.output_weights.push_back(0.5); // Small initial weight
             
         } else if (roll < t_mul) {
-            // ── Multiply Mutation ──
+            // -- Multiply Mutation --
             // Recombine active modules into a product candidate.
             int left = sample_active_node(child, 0, n - 1);
             int right = sample_active_node(child, 0, n - 1);
@@ -1911,7 +1901,7 @@ private:
             }
             
         } else if (roll < t_div) {
-            // ── Divide / Rational Mutation ──
+            // -- Divide / Rational Mutation --
             // Prefer useful numerator/denominator modules (Analytic Quotient).
             int left = sample_active_node(child, 0, n - 1);
             int right = sample_active_node(child, 0, n - 1);
@@ -1950,7 +1940,7 @@ private:
             }
             
         } else {
-            // ── Nest Mutation ──
+            // -- Nest Mutation --
             // Pick a unary node f and change its input to another node g
             // Creating f(g(x)) from f(old_input) and g(x)
             (void)w_nest;
@@ -1981,7 +1971,7 @@ private:
         return child;
     }
     
-    // ── Subtree Crossover ──────────────────────────────────────────────────
+    // -- Subtree Crossover --------------------------------------------------
     // Swaps a contiguous subtree between two parents to produce one child.
     // A "subtree" here is all nodes reachable from a selected crossover point.
     IndividualGraph crossover(const IndividualGraph& parent_a, const IndividualGraph& parent_b) {
@@ -2234,7 +2224,7 @@ private:
         return candidates[dist(rng_)];
     }
     
-    // ── Ridge Regression solver for output weights ──────────────────────
+    // -- Ridge Regression solver for output weights ----------------------
     // Replaces bare SVD with (A^T W A + λI)^{-1} A^T W b to prevent
     // multicollinearity from producing massive cancelling coefficients.
     // When y_weights_ are set, W is diag(weights); otherwise W = I.
@@ -2379,7 +2369,7 @@ private:
         } else {
             ind.output_bias = 0.0;
         }
-        // E6: output layer changed — cached fitness is stale until re-scored.
+        // E6: output layer changed - cached fitness is stale until re-scored.
         ind.fitness_valid = false;
         return true;
     }
@@ -2394,12 +2384,12 @@ private:
         if (!ind.nodes.empty()) {
             solve_output_weights(ind, cache);
             evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
-            // NOTE: refine_inner_params is NOT called here — too expensive
+            // NOTE: refine_inner_params is NOT called here - too expensive
             // for per-child use. It runs once on the best graph in cleanup_graph.
         }
     }
     
-    // ── Finite-Difference Adam Optimizer for Inner Parameters ────────────
+    // -- Finite-Difference Adam Optimizer for Inner Parameters ------------
     // Alternates between: (1) Adam steps on {p, omega, phi},
     // then (2) SVD refit of output weights. This ensures linear weights
     // stay in sync with the refined inner parameters.
@@ -2447,7 +2437,7 @@ private:
         // Collect unaries in active output subtrees (S5-8 nested refine).
         std::vector<int> active_unary = collect_active_unary_indices(ind);
         if (active_unary.empty()) return;
-        // E6: about to mutate inner params — force re-score if interrupted/early-exit.
+        // E6: about to mutate inner params - force re-score if interrupted/early-exit.
         ind.fitness_valid = false;
         
         // Adam hyperparameters
@@ -2455,9 +2445,9 @@ private:
         const double beta1 = 0.9, beta2 = 0.999, eps_adam = 1e-8;
         const double epsilon = 1e-4; // Finite difference step
         const int adam_steps_per_round = 25;  // P2: boosted from 10 for better constant discovery
-        const int num_rounds = 3; // Alternate Adam → SVD this many times
+        const int num_rounds = 3; // Alternate Adam -> SVD this many times
         
-        int n_params = static_cast<int>(active_unary.size()) * 3; // {p, omega, phi} — NOT amplitude (redundant with SVD output_weight)
+        int n_params = static_cast<int>(active_unary.size()) * 3; // {p, omega, phi} - NOT amplitude (redundant with SVD output_weight)
         std::vector<double> m(n_params, 0.0), v(n_params, 0.0);
         
         double best_mse = objective_mse(ind);
@@ -2465,14 +2455,14 @@ private:
         int global_step = 0;
         
         for (int round = 0; round < num_rounds; ++round) {
-            // ── Phase 1: Adam steps on inner params ──
+            // -- Phase 1: Adam steps on inner params --
             for (int step = 0; step < adam_steps_per_round; ++step) {
                 std::vector<double> grads(n_params, 0.0);
                 
                 for (int ai = 0; ai < static_cast<int>(active_unary.size()); ++ai) {
                     int node_idx = active_unary[ai];
                     auto& node = ind.nodes[node_idx];
-                    // Only optimize {p, omega, phi} — amplitude handled by SVD
+                    // Only optimize {p, omega, phi} - amplitude handled by SVD
                     double* params[3] = {&node.p, &node.omega, &node.phi};
                     
                     for (int pi = 0; pi < 3; ++pi) {
@@ -2520,7 +2510,7 @@ private:
                 global_step++;
             }
             
-            // ── Phase 2: Ridge refit of output weights ──
+            // -- Phase 2: Ridge refit of output weights --
             // Inner params changed, so re-solve the linear layer analytically
             {
                 std::vector<Eigen::ArrayXd> cache;
@@ -2545,7 +2535,7 @@ private:
         }
     }
 
-    // ── Levenberg-Marquardt-style optimizer for inner nonlinear params ───
+    // -- Levenberg-Marquardt-style optimizer for inner nonlinear params --─
     // Optimizes unary {p, omega, phi} while analytically refitting output
     // weights for each trial point (variable projection style).
     bool refine_inner_params_lm(IndividualGraph& ind) {
@@ -2754,7 +2744,7 @@ private:
         refine_inner_params_adam(ind);
     }
     
-    // ── Post-Evolution Graph Cleanup ─────────────────────────────────────
+    // -- Post-Evolution Graph Cleanup ------------------------------------─
     // Uses output-correlation-based deduplication (like PyTorch pruning.py):
     // Nodes producing identical outputs get merged regardless of structure.
     // This catches x == (x+x)/2 == (x+x+x)/3 etc.
@@ -2762,11 +2752,11 @@ private:
         if (ind.nodes.empty()) return;
         int n_samples = static_cast<int>(y_.size());
         
-        // ── Step 1: Evaluate all nodes to get their actual output vectors ──
+        // -- Step 1: Evaluate all nodes to get their actual output vectors --
         std::vector<Eigen::ArrayXd> cache;
         evaluate_graph(ind, X_, n_samples, cache);
         
-        // ── Step 2: Correlation-based deduplication ──
+        // -- Step 2: Correlation-based deduplication --
         // Group nodes that produce (nearly) identical outputs
         int n_nodes = static_cast<int>(ind.nodes.size());
         std::vector<int> canonical(n_nodes); // Maps each node to its canonical representative
@@ -2794,10 +2784,10 @@ private:
                 bool is_duplicate = false;
                 
                 if (var_i < 1e-12 && var_j < 1e-12) {
-                    // Both constant — check if same constant
+                    // Both constant - check if same constant
                     is_duplicate = std::abs(cache[i].mean() - cache[j].mean()) < 1e-6;
                 } else if (var_i > 1e-12 && var_j > 1e-12) {
-                    // Both non-constant — check correlation AND scale
+                    // Both non-constant - check correlation AND scale
                     Eigen::ArrayXd diff = cache[i] - cache[j];
                     double max_abs_diff = diff.abs().maxCoeff();
                     double max_abs_val = cache[i].abs().maxCoeff();
@@ -2828,14 +2818,14 @@ private:
         }
         
         // Merge: for each group, keep canonical node, zero out duplicates
-        // Don't sum weights — let SVD refit handle optimal weights
+        // Don't sum weights - let SVD refit handle optimal weights
         for (int j = 0; j < n_nodes; ++j) {
             if (canonical[j] != j && j < static_cast<int>(ind.output_weights.size())) {
                 ind.output_weights[j] = 0.0;
             }
         }
         
-        // ── Step 3: Remove dead nodes (zero output weight, not a dependency) ──
+        // -- Step 3: Remove dead nodes (zero output weight, not a dependency) --
         std::vector<bool> keep(n_nodes, false);
         
         // First pass: mark nodes with non-zero weight
@@ -2895,7 +2885,7 @@ private:
             ind.output_weights = std::move(clean_weights);
         }
         
-        // ── Step 4: Ridge refit on clean graph ──
+        // -- Step 4: Ridge refit on clean graph --
         if (!ind.nodes.empty()) {
             std::vector<Eigen::ArrayXd> new_cache;
             evaluate_graph(ind, X_, n_samples, new_cache);
@@ -2905,7 +2895,7 @@ private:
         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
         double baseline_mse = objective_mse(ind);
         
-        // ── Step 5: Iterative Backward Elimination ──
+        // -- Step 5: Iterative Backward Elimination --
         // Greedily remove least-important node, re-solve Ridge, repeat
         // until removing any more node degrades MSE too much.
         for (int elim_iter = 0; elim_iter < 10; ++elim_iter) {
@@ -2945,9 +2935,9 @@ private:
             }
         }
         
-        // ── Step 6: Parameter & Coefficient Snapping ─────────────────────────
+        // -- Step 6: Parameter & Coefficient Snapping ------------------------─
         // Try rounding inner parameters and output weights to clean values.
-        // This converts 0.9997*sin(2.998*x + 0.0012) → sin(3*x).
+        // This converts 0.9997*sin(2.998*x + 0.0012) -> sin(3*x).
         {
             evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
             double snap_baseline_mse = objective_mse(ind);
@@ -3006,7 +2996,7 @@ private:
             };
 
             auto classify_omega_tier = [&](double candidate) -> SnapTier {
-                if (is_near(candidate, M_PI) || is_near(candidate, 2.0 * M_PI) || is_near(candidate, M_PI / 2.0)) {
+                if (is_near(candidate, kPi) || is_near(candidate, 2.0 * kPi) || is_near(candidate, kPi / 2.0)) {
                     return SnapTier::Special;
                 }
                 return std::abs(candidate - std::round(candidate)) < 1e-9 ? SnapTier::Integer : SnapTier::Fraction;
@@ -3030,10 +3020,10 @@ private:
             const double snap_candidates_p[] = {-2, -1.5, -1, -0.5, 0, 0.25, 1.0/3.0, 0.5, 2.0/3.0, 0.75, 1, 1.5, 2, 2.5, 3, 4, 5};
             const int n_snap_p = sizeof(snap_candidates_p) / sizeof(snap_candidates_p[0]);
             
-            const double snap_candidates_omega[] = {0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8, M_PI, 2*M_PI, M_PI/2};
+            const double snap_candidates_omega[] = {0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 5, 6, 7, 8, kPi, 2*kPi, kPi/2};
             const int n_snap_omega = sizeof(snap_candidates_omega) / sizeof(snap_candidates_omega[0]);
             
-            const double snap_candidates_phi[] = {0.0, M_PI/4, M_PI/2, M_PI, 3*M_PI/2, -M_PI/4, -M_PI/2, -M_PI};
+            const double snap_candidates_phi[] = {0.0, kPi/4, kPi/2, kPi, 3*kPi/2, -kPi/4, -kPi/2, -kPi};
             const int n_snap_phi = sizeof(snap_candidates_phi) / sizeof(snap_candidates_phi[0]);
             
             for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
@@ -3366,21 +3356,21 @@ private:
                 double w = ind.output_weights[i];
                 
                 // Remove full 2*pi multiples from phi
-                if (std::abs(node.phi) > M_PI) {
-                    double reduced = std::fmod(node.phi, 2.0 * M_PI);
-                    if (reduced > M_PI) reduced -= 2.0 * M_PI;
-                    if (reduced < -M_PI) reduced += 2.0 * M_PI;
+                if (std::abs(node.phi) > kPi) {
+                    double reduced = std::fmod(node.phi, 2.0 * kPi);
+                    if (reduced > kPi) reduced -= 2.0 * kPi;
+                    if (reduced < -kPi) reduced += 2.0 * kPi;
                     node.phi = reduced;
                 }
                 
                 // -sin(x + pi) = sin(x): if phi ≈ ±π and weight is negative,
                 // flip weight sign and zero out phi
-                if (std::abs(std::abs(node.phi) - M_PI) < 0.05 && w < 0) {
+                if (std::abs(std::abs(node.phi) - kPi) < 0.05 && w < 0) {
                     node.phi = 0.0;
                     ind.output_weights[i] = -w;  // Flip sign
                 }
-                // sin(x + pi) with positive weight → -sin(x)
-                else if (std::abs(std::abs(node.phi) - M_PI) < 0.05 && w > 0) {
+                // sin(x + pi) with positive weight -> -sin(x)
+                else if (std::abs(std::abs(node.phi) - kPi) < 0.05 && w > 0) {
                     node.phi = 0.0;
                     ind.output_weights[i] = -w;  // Flip sign
                 }
@@ -3469,7 +3459,7 @@ private:
                 }
             }
             
-            // Build node output cache for 6b/6c — weight/bias snapping only
+            // Build node output cache for 6b/6c - weight/bias snapping only
             // changes output coefficients, not node params, so we can compute
             // MSE from cached outputs instead of re-evaluating the full graph.
             std::vector<Eigen::ArrayXd> snap_base_cache;
@@ -3491,12 +3481,12 @@ private:
                 return std::isfinite(mse) ? mse : std::numeric_limits<double>::infinity();
             };
 
-            // 6b. Output weight snapping — using cached node outputs (no graph re-eval)
+            // 6b. Output weight snapping - using cached node outputs (no graph re-eval)
             {
                 const double snap_weight_values[] = {
                     0.0, 0.25, 1.0/3.0, 0.5, 2.0/3.0, 0.75,
                     1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0,
-                    M_PI, M_E, std::sqrt(2.0), std::sqrt(3.0)
+                    kPi, kE, std::sqrt(2.0), std::sqrt(3.0)
                 };
                 const int n_snap_w = sizeof(snap_weight_values) / sizeof(snap_weight_values[0]);
                 
@@ -3534,14 +3524,14 @@ private:
                 }
             }
             
-            // 6c. Output bias snapping — using cached node outputs (no graph re-eval)
+            // 6c. Output bias snapping - using cached node outputs (no graph re-eval)
             {
                 double bias = ind.output_bias;
                 if (std::abs(bias) > 1e-6) {
                     const double snap_bias_values[] = {
                         0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0,
                         -0.25, -0.5, -0.75, -1.0, -1.5, -2.0, -3.0, -4.0, -5.0,
-                        M_PI, -M_PI, M_E, -M_E
+                        kPi, -kPi, kE, -kE
                     };
                     const int n_snap_b = sizeof(snap_bias_values) / sizeof(snap_bias_values[0]);
                     
@@ -3590,7 +3580,7 @@ private:
         refine_inner_params(ind);
     }
 
-    // ── P5: NSGA-II Non-Dominated Sort ────────────────────────────────────
+    // -- P5: NSGA-II Non-Dominated Sort ------------------------------------
     // Assigns pareto_rank to each individual in the population.
     // Objectives: minimize raw_mse, minimize complexity(), minimize age (AFPO).
     void non_dominated_sort(std::vector<IndividualGraph>& pop) {
@@ -3653,7 +3643,7 @@ private:
         }
     }
 
-    // ── P5: Crowding Distance Assignment ──────────────────────────────────
+    // -- P5: Crowding Distance Assignment ----------------------------------
     // Assigns crowding_distance to individuals within the same Pareto front.
     // 3 objectives: raw_mse, complexity, age (AFPO).
     void crowding_distance_assignment(std::vector<IndividualGraph*>& front) {
@@ -3691,7 +3681,8 @@ private:
         double comp_range = front.back()->active_complexity() - front.front()->active_complexity();
         if (comp_range > 1e-15) {
             for (int i = 1; i < n - 1; ++i) {
-                front[i]->crowding_distance += (double)(front[i+1]->active_complexity() - front[i-1]->active_complexity()) / comp_range;
+                front[i]->crowding_distance += static_cast<double>(
+                    front[i+1]->active_complexity() - front[i-1]->active_complexity()) / comp_range;
             }
         }
 
@@ -3705,12 +3696,13 @@ private:
         double age_range = static_cast<double>(front.back()->age - front.front()->age);
         if (age_range > 0.5) {
             for (int i = 1; i < n - 1; ++i) {
-                front[i]->crowding_distance += (double)(front[i+1]->age - front[i-1]->age) / age_range;
+                front[i]->crowding_distance += static_cast<double>(
+                    front[i+1]->age - front[i-1]->age) / age_range;
             }
         }
     }
 
-    // ── P5: NSGA-II Selection ─────────────────────────────────────────────
+    // -- P5: NSGA-II Selection --------------------------------------------─
     // Select pop_size individuals from a combined pool using NSGA-II ranking.
     std::vector<IndividualGraph> nsga2_select(std::vector<IndividualGraph>& combined, int target_size) {
         non_dominated_sort(combined);
@@ -3744,7 +3736,7 @@ private:
         return selected;
     }
 
-    // ── P6: Single-generation evolution step (for island model) ───────────
+    // -- P6: Single-generation evolution step (for island model) ----------─
     void evolve_one_generation(int gen) {
         evaluate_population();
 
@@ -3812,7 +3804,9 @@ private:
 
         if (!population_.empty()) { consider_champion(population_[0]); }
 
-        // Create next generation (same logic as run() loop body)
+        // Create next generation. Non-NSGA island path is intentionally simpler than
+        // run(): fitness-only sort (not is_better_champion), no elite age++,
+        // no macro/staged/adaptive restart (see X-003 / P4-004).
         std::vector<IndividualGraph> next_gen;
         next_gen.reserve(config_.pop_size);
 
@@ -3863,7 +3857,7 @@ private:
         }
     }
 
-    // ── P7: Dimensional Analysis Penalty ──────────────────────────────────
+    // -- P7: Dimensional Analysis Penalty ----------------------------------
     double dimensional_penalty(const IndividualGraph& graph) {
         if (config_.input_units.empty()) return 0.0;
 
@@ -3903,7 +3897,7 @@ private:
                         // sin, exp, log: argument must be dimensionless
                         // Result is dimensionless too
                         // Penalty for non-zero child units
-                        // (units stay as zero — result is dimensionless)
+                        // (units stay as zero - result is dimensionless)
                     }
                     break;
                 }
