@@ -1535,8 +1535,9 @@ private:
     
     void evaluate_population() {
         int samples = static_cast<int>(y_.size());
-        ParallelExecutionEngine executor(X_, y_);
-        
+        // Engine does not own X/y; eval lambda closes over EvolutionEngine data.
+        ParallelExecutionEngine executor;
+
         // E6: skip re-eval of individuals already scored (elites carried over,
         // children scored at birth). Mutate/crossover clear fitness_valid.
         executor.evaluate_population(population_, [&](IndividualGraph& ind, SubtreeCache& tc) {

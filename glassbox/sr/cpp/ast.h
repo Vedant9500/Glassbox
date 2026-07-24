@@ -1,14 +1,13 @@
 #pragma once
 
-#include <vector>
-#include <string>
-#include <memory>
-#include <unordered_map>
-#include <functional>
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <limits>
-#include <cstdint>
+#include <unordered_map>
+#include <vector>
+
 #include <Eigen/Dense>
 
 namespace sr {
@@ -46,18 +45,19 @@ enum class BinaryOp {
 
 // Represents a node in the computational graph
 struct OpNode {
-    NodeType type;
-    
+    NodeType type = NodeType::Constant;
+
     // For Input nodes
     int feature_idx = 0;
-    
+
     // For Constant nodes
     double value = 0.0;
-    
-    // For Unary/Binary nodes
-    UnaryOp unary_op;
-    BinaryOp binary_op;
-    
+
+    // For Unary/Binary nodes — default so value-init / default-construct is defined
+    // (Google: initialize all members; avoids indeterminate enums on seed/export paths).
+    UnaryOp unary_op = UnaryOp::Periodic;
+    BinaryOp binary_op = BinaryOp::Arithmetic;
+
     // Meta-operation parameters
     double p = 1.0;          // Power / IntPow exponent
     double omega = 1.0;      // Periodic frequency
@@ -66,18 +66,46 @@ struct OpNode {
     double beta = 1.5;       // Arithmetic (1.0 = add, 2.0 = mul)
     double gamma = 1.0;      // Arithmetic sign (for sub/div)
     double tau = 1.0;        // Aggregation temperature
-    
+
     // Child pointers (indices in the layer)
     int left_child = -1;
     int right_child = -1;
 };
+
+// Mark nodes reachable from active output weights (shared by complexity metrics).
+inline void mark_active_nodes(const std::vector<OpNode>& nodes,
+                              const std::vector<double>& output_weights,
+                              std::vector<char>& active) {
+    active.assign(nodes.size(), 0);
+    if (nodes.empty()) return;
+    const int n = static_cast<int>(nodes.size());
+    const int nw = static_cast<int>(output_weights.size());
+    for (int i = 0; i < n && i < nw; ++i) {
+        if (std::abs(output_weights[i]) <= kOutputWeightActive) continue;
+        std::vector<int> stack = {i};
+        while (!stack.empty()) {
+            int idx = stack.back();
+            stack.pop_back();
+            if (idx < 0 || idx >= n || active[idx]) continue;
+            active[idx] = 1;
+            const auto& node = nodes[idx];
+            if ((node.type == NodeType::Unary || node.type == NodeType::Binary) &&
+                node.left_child >= 0) {
+                stack.push_back(node.left_child);
+            }
+            if (node.type == NodeType::Binary && node.right_child >= 0) {
+                stack.push_back(node.right_child);
+            }
+        }
+    }
+}
 
 // Pre-allocated array representing a formula's structure
 struct IndividualGraph {
     std::vector<OpNode> nodes;
     std::vector<double> output_weights; // Linear combination of top nodes
     double output_bias = 0.0;
-    
+
     double fitness = 1e9; // Penalized fitness (uses weighted MSE when weights set)
     double raw_mse = 1e9; // Unweighted mathematical MSE (diagnostics / back-compat)
     double weighted_mse = 1e9; // Weighted MSE when y_weights provided; else == raw_mse
@@ -89,27 +117,14 @@ struct IndividualGraph {
     int pareto_rank = 0;           // Non-domination rank (0 = Pareto front)
     double crowding_distance = 0.0; // Crowding distance within the same rank
     int age = 0;                    // AFPO: generations survived (0 = newly created)
-    int complexity() const { return static_cast<int>(nodes.size()); } // AST node count as 2nd objective
+    int complexity() const {
+        return static_cast<int>(nodes.size());
+    } // AST node count as 2nd objective
+
     int active_complexity() const {
         if (nodes.empty()) return 0;
-        std::vector<char> active(nodes.size(), 0);
-        for (int i = 0; i < static_cast<int>(nodes.size()) && i < static_cast<int>(output_weights.size()); ++i) {
-            if (std::abs(output_weights[i]) <= kOutputWeightActive) continue;
-            std::vector<int> stack = {i};
-            while (!stack.empty()) {
-                int idx = stack.back();
-                stack.pop_back();
-                if (idx < 0 || idx >= static_cast<int>(nodes.size()) || active[idx]) continue;
-                active[idx] = 1;
-                const auto& node = nodes[idx];
-                if ((node.type == NodeType::Unary || node.type == NodeType::Binary) && node.left_child >= 0) {
-                    stack.push_back(node.left_child);
-                }
-                if (node.type == NodeType::Binary && node.right_child >= 0) {
-                    stack.push_back(node.right_child);
-                }
-            }
-        }
+        std::vector<char> active;
+        mark_active_nodes(nodes, output_weights, active);
 
         int total = 0;
         for (int i = 0; i < static_cast<int>(nodes.size()); ++i) {
@@ -142,31 +157,15 @@ struct IndividualGraph {
     // Count distinct active nodes (S5-13): unit-matched with nodes.size().
     int active_node_count() const {
         if (nodes.empty()) return 0;
-        std::vector<char> active(nodes.size(), 0);
-        for (int i = 0; i < static_cast<int>(nodes.size()) && i < static_cast<int>(output_weights.size()); ++i) {
-            if (std::abs(output_weights[i]) <= kOutputWeightActive) continue;
-            std::vector<int> stack = {i};
-            while (!stack.empty()) {
-                int idx = stack.back();
-                stack.pop_back();
-                if (idx < 0 || idx >= static_cast<int>(nodes.size()) || active[idx]) continue;
-                active[idx] = 1;
-                const auto& node = nodes[idx];
-                if ((node.type == NodeType::Unary || node.type == NodeType::Binary) && node.left_child >= 0) {
-                    stack.push_back(node.left_child);
-                }
-                if (node.type == NodeType::Binary && node.right_child >= 0) {
-                    stack.push_back(node.right_child);
-                }
-            }
-        }
+        std::vector<char> active;
+        mark_active_nodes(nodes, output_weights, active);
         int n = 0;
         for (char a : active) if (a) ++n;
         return n;
     }
 };
 
-// ── Structural Hashing ──────────────────────────────────────────────────
+// --- Structural Hashing -------------------------------------------------
 // Combines node type, op, quantized parameters, and children hashes into
 // a 64-bit fingerprint. Two subtrees with the same hash produce identical
 // outputs and can share cached Eigen::ArrayXd results.
@@ -176,8 +175,8 @@ inline uint64_t hash_combine(uint64_t seed, uint64_t v) {
     return seed;
 }
 
-// S5-5: default was 2 decimals → SharedCache collisions (ω=1.004 vs 1.006).
-// Use 8 decimals for eval cache keys. decimals < 0 ⇒ bit-exact double bits.
+// S5-5: default was 2 decimals -> SharedCache collisions (omega=1.004 vs 1.006).
+// Use 8 decimals for eval cache keys. decimals < 0 => bit-exact double bits.
 // Coarse CSE (if desired) can call quantize(v, 2) explicitly.
 inline uint64_t quantize(double v, int decimals = 8) {
     if (decimals < 0) {
@@ -196,8 +195,10 @@ inline uint64_t quantize(double v, int decimals = 8) {
         std::memcpy(&u, &v, sizeof(u));
         return u;
     }
-    if (scaled > static_cast<double>(std::numeric_limits<int64_t>::max())) scaled = static_cast<double>(std::numeric_limits<int64_t>::max());
-    if (scaled < static_cast<double>(std::numeric_limits<int64_t>::min())) scaled = static_cast<double>(std::numeric_limits<int64_t>::min());
+    const double kMaxI64 = static_cast<double>(std::numeric_limits<int64_t>::max());
+    const double kMinI64 = static_cast<double>(std::numeric_limits<int64_t>::min());
+    if (scaled > kMaxI64) scaled = kMaxI64;
+    if (scaled < kMinI64) scaled = kMinI64;
     int64_t q = static_cast<int64_t>(std::round(scaled));
     uint64_t u;
     std::memcpy(&u, &q, sizeof(u));
@@ -245,7 +246,7 @@ inline uint64_t compute_node_hash(const IndividualGraph& graph, int idx,
     return h;
 }
 
-// Cache type: maps subtree hash → evaluated ArrayXd
+// Cache type: maps subtree hash -> evaluated ArrayXd
 using SubtreeCache = std::unordered_map<uint64_t, Eigen::ArrayXd>;
 
 } // namespace sr

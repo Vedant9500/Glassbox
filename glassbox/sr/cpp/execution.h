@@ -1,39 +1,30 @@
 #pragma once
 
+#include <algorithm>
 #include <vector>
-#include <memory>
+
 #include <omp.h>
+
 #include "ast.h"
-#include "eval.h"
-#include <chrono>
 
 namespace sr {
 
-// Fwd declarations from evolution if they aren't here
-struct EvolutionConfig;
-
-// An engine responsible exclusively for parallel evaluation and caching.
+// Parallel evaluation and generation-level subtree caching.
+// Does not own training data: callers pass X/y into the eval lambda.
+// (Engine only merges thread-local SubtreeCache maps.)
 class ParallelExecutionEngine {
-private:
-    const std::vector<Eigen::ArrayXd>& X_;
-    const Eigen::ArrayXd& y_;
-    int n_samples_;
-
-    // Shared generation cache storing evaluated subtree basis functions
-    SubtreeCache gen_cache_;
-
 public:
-    ParallelExecutionEngine(const std::vector<Eigen::ArrayXd>& X, const Eigen::ArrayXd& y)
-        : X_(X), y_(y), n_samples_(static_cast<int>(y.size())) {}
+    ParallelExecutionEngine() = default;
 
-    // Evaluate a population safely in parallel, returning nothing 
-    // but mutating each individual's fitness.
-    // Also builds a shared subtree cache cleanly without thread contention.
+    // Evaluate a population in parallel, mutating each individual's fitness
+    // via the caller-provided eval_func. Builds a shared subtree cache without
+    // thread contention (thread-local caches merged serially).
     // num_threads: 0 => omp_get_max_threads(). When already inside an outer
     // OpenMP region (island parallel), prefer caller-provided inner budget to
     // avoid process-wide omp_set_num_threads races (E7 / tracker E5).
     template <typename EvaluateFunc>
-    void evaluate_population(std::vector<IndividualGraph>& population, EvaluateFunc&& eval_func,
+    void evaluate_population(std::vector<IndividualGraph>& population,
+                             EvaluateFunc&& eval_func,
                              int num_threads = 0) {
         gen_cache_.clear();
 
@@ -60,7 +51,8 @@ public:
         // 3. Serial merge of caches back into the global generation cache
         for (auto& tc : thread_caches) {
             for (auto& pair : tc) {
-                // try_emplace prevents overwriting if multiple threads found the same subtree
+                // try_emplace prevents overwriting if multiple threads found
+                // the same subtree
                 gen_cache_.try_emplace(pair.first, std::move(pair.second));
             }
         }
@@ -73,6 +65,10 @@ public:
     void clear_cache() {
         gen_cache_.clear();
     }
+
+private:
+    // Shared generation cache storing evaluated subtree basis functions
+    SubtreeCache gen_cache_;
 };
 
 } // namespace sr
