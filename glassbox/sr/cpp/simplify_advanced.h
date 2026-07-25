@@ -100,10 +100,17 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
                     break;
                 }
                 case UnaryOp::IntPow: res = std::pow(v, std::clamp(static_cast<int>(std::round(node.p)), 2, 6)); break;
-                case UnaryOp::Exp: res = std::exp(node.omega * v + node.phi); break;
+                case UnaryOp::Exp:
+                    // H-02: match eval clamp; bare exp can yield Inf.
+                    res = std::exp(std::clamp(node.omega * v + node.phi, -50.0, 50.0));
+                    res = std::clamp(res, -1e6, 1e6);
+                    break;
                 case UnaryOp::Log: res = std::log(std::abs(v) + 1e-6); break;
                 case UnaryOp::Abs: res = std::abs(v); break;
             }
+            // H-02: never store Inf/NaN constants from folds.
+            if (!std::isfinite(res)) res = 0.0;
+            res = std::clamp(res, -1e8, 1e8);
             node.type = NodeType::Constant;
             node.value = snap_val(res, int_tol, zero_tol);
             return;
@@ -139,7 +146,11 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
             node.phi = snap_val(node.phi, int_tol, zero_tol);
             if (node.omega == 0.0) {
                 node.type = NodeType::Constant;
-                node.value = snap_val(std::exp(node.phi), int_tol, zero_tol);
+                // H-02: clamp exp(phi) fold like live eval.
+                double folded = std::exp(std::clamp(node.phi, -50.0, 50.0));
+                if (!std::isfinite(folded)) folded = 0.0;
+                folded = std::clamp(folded, -1e6, 1e6);
+                node.value = snap_val(folded, int_tol, zero_tol);
             } else if (child.type == NodeType::Unary && child.unary_op == UnaryOp::Log && std::abs(node.omega - 1.0) < 1e-4 && std::abs(node.phi) < 1e-4) {
                 // exp(log(|y|)) = |y|
                 node.unary_op = UnaryOp::Abs;
@@ -194,6 +205,9 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
                 res = (l / (std::abs(r) + 1e-6)) * ((r >= 0) ? 1.0 : -1.0);
             }
             
+            // H-02: sanitize folded binary constants.
+            if (!std::isfinite(res)) res = 0.0;
+            res = std::clamp(res, -1e8, 1e8);
             node.type = NodeType::Constant;
             node.value = snap_val(res, int_tol, zero_tol);
             return;

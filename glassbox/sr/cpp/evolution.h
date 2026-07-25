@@ -42,6 +42,12 @@ struct EvolutionConfig {
     // Bounds
     double p_min = -2.0, p_max = 3.0;
     double omega_min = -8.0, omega_max = 8.0;
+    // Phase shift (Periodic/Exp). ±4π covers multi-period wraps; Exp uses a
+    // tighter clamp in optimizers to avoid exp-argument blow-ups (H-03).
+    double phi_min = -4.0 * kPi;
+    double phi_max =  4.0 * kPi;
+    double exp_phi_min = -4.0, exp_phi_max = 4.0;
+    double exp_omega_min = -4.0, exp_omega_max = 4.0;
     int max_nodes = 24;  // Hard structural bloat cap for mutation/crossover
 
     // Phase 4: search fitness loss (default mse = legacy behaviour)
@@ -978,16 +984,25 @@ private:
     }
 
     double residual_mse(const Eigen::ArrayXd& pred, const Eigen::ArrayXd& y) const {
+        const int n = static_cast<int>(pred.size());
+        if (n <= 0 || pred.size() != y.size()) {
+            return std::numeric_limits<double>::infinity();
+        }
+        // H-01: reject non-finite predictions before any loss aggregation so
+        // NaN never enters fitness / std::sort comparisons.
+        if (!pred.isFinite().all() || !y.isFinite().all()) {
+            return std::numeric_limits<double>::infinity();
+        }
         Eigen::ArrayXd resid = pred - y;
-        const int n = static_cast<int>(resid.size());
-        if (n <= 0) return std::numeric_limits<double>::infinity();
 
         // Plain (optionally weighted) MSE path - also used for diagnostics.
         auto weighted_mean_of = [&](const Eigen::ArrayXd& vals) -> double {
             if (has_y_weights_ && y_weights_.size() == vals.size()) {
-                return (y_weights_ * vals).sum() / y_weight_sum_;
+                const double m = (y_weights_ * vals).sum() / y_weight_sum_;
+                return std::isfinite(m) ? m : std::numeric_limits<double>::infinity();
             }
-            return vals.mean();
+            const double m = vals.mean();
+            return std::isfinite(m) ? m : std::numeric_limits<double>::infinity();
         };
 
         if (config_.loss_mode == LossMode::Mse) {
@@ -1039,7 +1054,15 @@ private:
 
     double residual_mse_unweighted(const Eigen::ArrayXd& pred, const Eigen::ArrayXd& y) const {
         // Always plain MSE for raw_mse diagnostics / back-compat.
-        return (pred - y).square().mean();
+        // H-01: non-finite predictions must not yield NaN (ill-defined sort).
+        if (pred.size() != y.size() || pred.size() == 0) {
+            return std::numeric_limits<double>::infinity();
+        }
+        if (!pred.isFinite().all() || !y.isFinite().all()) {
+            return std::numeric_limits<double>::infinity();
+        }
+        const double mse = (pred - y).square().mean();
+        return std::isfinite(mse) ? mse : std::numeric_limits<double>::infinity();
     }
 
     static void normalize_prior_vector(std::vector<double>& priors) {
@@ -1349,6 +1372,22 @@ private:
         }
         node.tau = 1.0;
     }
+
+    // H-03: keep unary inner params in safe ranges after Adam/LM/mutation.
+    // Exp uses tighter omega/phi so omega*x+phi cannot explode into Inf.
+    void clamp_unary_inner_params(OpNode& node) const {
+        node.p = std::clamp(node.p, config_.p_min, config_.p_max);
+        if (node.type == NodeType::Unary && node.unary_op == UnaryOp::Exp) {
+            node.omega = std::clamp(node.omega, config_.exp_omega_min, config_.exp_omega_max);
+            node.phi = std::clamp(node.phi, config_.exp_phi_min, config_.exp_phi_max);
+        } else {
+            node.omega = std::clamp(node.omega, config_.omega_min, config_.omega_max);
+            node.phi = std::clamp(node.phi, config_.phi_min, config_.phi_max);
+        }
+        if (!std::isfinite(node.p)) node.p = 1.0;
+        if (!std::isfinite(node.omega)) node.omega = 1.0;
+        if (!std::isfinite(node.phi)) node.phi = 0.0;
+    }
     
     IndividualGraph create_random_individual(int n_inputs) {
         IndividualGraph ind;
@@ -1604,9 +1643,9 @@ private:
     // weighted_mse: search objective (weights and/or robust loss from residual_mse).
     // fitness: search objective * complexity penalty.
     double evaluate_fitness_with_penalty(IndividualGraph& graph, const std::vector<Eigen::ArrayXd>& X, const Eigen::ArrayXd& y, int num_samples, SubtreeCache* tc = nullptr) {
-        // Process-global soft-arith temperature (atomic; see eval.h E10 / X-001).
-        // Re-applied each eval so OpenMP workers and nested API entry stay aligned
-        // with this engine's config_.arithmetic_temperature.
+        // H-06: re-apply engine temperature on every fitness eval so this thread's
+        // TLS (and, via set_arithmetic_temperature, the process default for fresh
+        // OMP workers) matches config_. Concurrent engines keep independent TLS.
         set_arithmetic_temperature(config_.arithmetic_temperature);
         Eigen::ArrayXd pred;
         if (tc != nullptr) {
@@ -1615,10 +1654,25 @@ private:
         } else {
             pred = evaluate_graph_simple(graph, X, num_samples);
         }
+        // H-01: non-finite pred/MSE → worst finite fitness so sort stays total-ordered.
+        if (pred.size() != y.size() || !pred.isFinite().all()) {
+            graph.raw_mse = std::numeric_limits<double>::infinity();
+            graph.weighted_mse = std::numeric_limits<double>::infinity();
+            graph.fitness = 1e30;
+            graph.fitness_valid = true;
+            return graph.fitness;
+        }
         const double unweighted_mse = residual_mse_unweighted(pred, y);
         const double search_obj = residual_mse(pred, y);
         graph.raw_mse = unweighted_mse;
         graph.weighted_mse = search_obj;
+        if (!std::isfinite(unweighted_mse) || !std::isfinite(search_obj)) {
+            graph.raw_mse = std::numeric_limits<double>::infinity();
+            graph.weighted_mse = std::numeric_limits<double>::infinity();
+            graph.fitness = 1e30;
+            graph.fitness_valid = true;
+            return graph.fitness;
+        }
         // Selection always uses search objective (weights + robust loss when set).
         const double mse = search_obj;
         
@@ -1759,8 +1813,8 @@ private:
                     // amplitude is fixed at 1.0 - SVD handles scaling
                     if (node.type == NodeType::Constant) node.value += rnorm(rng_);
                     
-                    node.omega = std::clamp(node.omega, config_.omega_min, config_.omega_max);
-                    node.p = std::clamp(node.p, config_.p_min, config_.p_max);
+                    // H-03: clamp p/omega/phi (Exp tighter) after parametric mutation.
+                    clamp_unary_inner_params(node);
                     if (node.type == NodeType::Unary && node.unary_op == UnaryOp::IntPow) {
                         node.p = static_cast<double>(std::clamp(static_cast<int>(std::round(node.p)), 2, 6));
                     }
@@ -2396,11 +2450,12 @@ private:
 
     // S5-8: unaries that participate in any active output basis (including nested
     // ancestors), not only those with nonzero *output* weight.
-    std::vector<int> collect_active_unary_indices(const IndividualGraph& ind) const {
-        std::vector<int> out;
-        if (ind.nodes.empty()) return out;
+    // Reachable nodes under active output weights (direct basis + nested).
+    // Used for unary refine and for binary Arithmetic snap (H-05).
+    std::vector<char> collect_active_reachable_mask(const IndividualGraph& ind) const {
         const int n = static_cast<int>(ind.nodes.size());
-        std::vector<char> reachable(static_cast<size_t>(n), 0);
+        std::vector<char> reachable(static_cast<size_t>(std::max(0, n)), 0);
+        if (n <= 0) return reachable;
         std::vector<int> stack;
         stack.reserve(static_cast<size_t>(n));
         for (int i = 0; i < n && i < static_cast<int>(ind.output_weights.size()); ++i) {
@@ -2421,6 +2476,14 @@ private:
                 stack.push_back(node.right_child);
             }
         }
+        return reachable;
+    }
+
+    std::vector<int> collect_active_unary_indices(const IndividualGraph& ind) const {
+        std::vector<int> out;
+        if (ind.nodes.empty()) return out;
+        const int n = static_cast<int>(ind.nodes.size());
+        const std::vector<char> reachable = collect_active_reachable_mask(ind);
         for (int i = 0; i < n; ++i) {
             if (!reachable[static_cast<size_t>(i)]) continue;
             if (ind.nodes[static_cast<size_t>(i)].type == NodeType::Unary) {
@@ -2504,8 +2567,7 @@ private:
                         *params[pi] -= update;
                     }
                     
-                    node.p = std::clamp(node.p, config_.p_min, config_.p_max);
-                    node.omega = std::clamp(node.omega, config_.omega_min, config_.omega_max);
+                    clamp_unary_inner_params(node);
                 }
                 global_step++;
             }
@@ -2563,9 +2625,11 @@ private:
         auto unpack_params = [&](IndividualGraph& g, const Eigen::VectorXd& theta) {
             for (int ai = 0; ai < static_cast<int>(active_unary.size()); ++ai) {
                 auto& node = g.nodes[active_unary[ai]];
-                node.p = std::clamp(theta(ai * 3 + 0), config_.p_min, config_.p_max);
-                node.omega = std::clamp(theta(ai * 3 + 1), config_.omega_min, config_.omega_max);
+                node.p = theta(ai * 3 + 0);
+                node.omega = theta(ai * 3 + 1);
                 node.phi = theta(ai * 3 + 2);
+                // H-03: clamp p/omega/phi (Exp gets tighter omega/phi bounds).
+                clamp_unary_inner_params(node);
             }
         };
 
@@ -2644,9 +2708,47 @@ private:
             
             for (int ai = 0; ai < static_cast<int>(active_unary.size()); ++ai) {
                 int node_idx = active_unary[ai];
-                const auto& node = base_graph.nodes[node_idx];
-                const auto& child_out = base_cache[node.left_child];
-                double wi = base_w(node_idx);
+                if (node_idx < 0 || node_idx >= static_cast<int>(base_graph.nodes.size())) continue;
+                const auto& node = base_graph.nodes[static_cast<size_t>(node_idx)];
+                // H-04: bounds-check left_child before indexing cache.
+                const int n_nodes = static_cast<int>(base_graph.nodes.size());
+                const int child_idx = node.left_child;
+                const bool child_ok = (child_idx >= 0 && child_idx < n_nodes
+                    && child_idx < static_cast<int>(base_cache.size())
+                    && base_cache[static_cast<size_t>(child_idx)].size() == n_samples);
+                double wi = (node_idx < base_w.size()) ? base_w(node_idx) : 0.0;
+                // Nested unaries often have near-zero direct output weight; the
+                // analytical path multiplies by wi and starves gradients. Fall
+                // back to residual finite differences when |wi| is tiny (H-04).
+                constexpr double kDirectWeightEps = 1e-6;
+                const bool use_fd = !child_ok || !(std::abs(wi) > kDirectWeightEps)
+                    || node_idx >= static_cast<int>(base_cache.size())
+                    || base_cache[static_cast<size_t>(node_idx)].size() != n_samples;
+
+                if (use_fd) {
+                    auto& mut_node = base_graph.nodes[static_cast<size_t>(node_idx)];
+                    double* params[3] = {&mut_node.p, &mut_node.omega, &mut_node.phi};
+                    for (int pi = 0; pi < 3; ++pi) {
+                        const double original = *params[pi];
+                        *params[pi] = original + fd_eps;
+                        Eigen::VectorXd r_plus;
+                        evaluate_residual(base_graph, &r_plus);
+                        *params[pi] = original - fd_eps;
+                        Eigen::VectorXd r_minus;
+                        evaluate_residual(base_graph, &r_minus);
+                        *params[pi] = original;
+                        int pidx = ai * 3 + pi;
+                        if (r_plus.size() == n_samples && r_minus.size() == n_samples) {
+                            J.col(pidx) = (r_plus - r_minus) / (2.0 * fd_eps);
+                            if (!J.col(pidx).allFinite()) J.col(pidx).setZero();
+                        }
+                    }
+                    // Restore graph params from theta (FD may have left clamps).
+                    unpack_params(base_graph, theta);
+                    continue;
+                }
+
+                const auto& child_out = base_cache[static_cast<size_t>(child_idx)];
 
                 Eigen::ArrayXd df_dp, df_domega, df_dphi;
 
@@ -2661,7 +2763,7 @@ private:
                     }
                     case UnaryOp::Exp: {
                         // base_cache[node_idx] is exactly exp(omega*x + phi) * amplitude
-                        Eigen::ArrayXd val = base_cache[node_idx]; 
+                        Eigen::ArrayXd val = base_cache[static_cast<size_t>(node_idx)];
                         df_domega = child_out * val;
                         df_dphi   = val;
                         df_dp     = Eigen::ArrayXd::Zero(n_samples);
@@ -2670,7 +2772,7 @@ private:
                     case UnaryOp::Power: {
                         // derivative of |x|^p w.r.t p is |x|^p * ln(|x|)
                         Eigen::ArrayXd abs_x = child_out.abs() + 1e-10;
-                        df_dp     = base_cache[node_idx] * abs_x.log();
+                        df_dp     = base_cache[static_cast<size_t>(node_idx)] * abs_x.log();
                         df_domega = Eigen::ArrayXd::Zero(n_samples);
                         df_dphi   = Eigen::ArrayXd::Zero(n_samples);
                         break;
@@ -3008,15 +3110,10 @@ private:
             
             // 6a. Inner parameter snapping (p, omega, phi)
             // S5-8: allow nested unaries under active outputs, not only direct basis terms.
-            std::vector<char> snap_active_unary(static_cast<size_t>(ind.nodes.size()), 0);
-            {
-                auto idxs = collect_active_unary_indices(ind);
-                for (int ui : idxs) {
-                    if (ui >= 0 && ui < static_cast<int>(ind.nodes.size())) {
-                        snap_active_unary[static_cast<size_t>(ui)] = 1;
-                    }
-                }
-            }
+            // H-05: full reachable mask (Unary + Binary) so Arithmetic gate snap can run.
+            std::vector<char> snap_active_nodes = collect_active_reachable_mask(ind);
+            // Alias kept for unary snap loops (same mask; Binary bits are simply unused there).
+            const std::vector<char>& snap_active_unary = snap_active_nodes;
             const double snap_candidates_p[] = {-2, -1.5, -1, -0.5, 0, 0.25, 1.0/3.0, 0.5, 2.0/3.0, 0.75, 1, 1.5, 2, 2.5, 3, 4, 5};
             const int n_snap_p = sizeof(snap_candidates_p) / sizeof(snap_candidates_p[0]);
             
@@ -3396,10 +3493,12 @@ private:
             // 6a.6 Arithmetic gate snapping
             // If an arithmetic blend is already close to a discrete operator,
             // snap it only when the fitted MSE stays effectively unchanged.
+            // H-05: gate on full active-subtree mask (Binary nodes are reachable
+            // there; the old unary-only mask made this entire loop dead code).
             for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
                 if (ind.nodes[i].type != NodeType::Binary) continue;
                 if (ind.nodes[i].binary_op != BinaryOp::Arithmetic) continue;
-                if (i < 0 || i >= static_cast<int>(snap_active_unary.size()) || !snap_active_unary[static_cast<size_t>(i)]) continue;
+                if (i < 0 || i >= static_cast<int>(snap_active_nodes.size()) || !snap_active_nodes[static_cast<size_t>(i)]) continue;
 
                 auto& node = ind.nodes[i];
                 const double original_beta = node.beta;

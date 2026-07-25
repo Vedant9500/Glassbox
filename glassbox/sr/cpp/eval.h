@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -18,38 +19,67 @@ namespace sr {
 // outer linear combo of node outputs + soft op blend). Higher temperature sharpens
 // toward discrete +/*/div/-. Final cleanup snaps near-discrete gates (see evolution).
 //
-// E10: temperature is process-global for OpenMP worker visibility (thread_local
-// would desync workers from the controlling engine). Stored as atomic so concurrent
-// API entry points do not race. Use ScopedArithmeticTemperature RAII at boundaries,
-// and re-apply engine config temperature on fitness eval.
-inline std::atomic<double>& arithmetic_temperature_ref() {
+// H-06 / E10: temperature is primarily **thread_local** so concurrent engines /
+// scoring jobs on different threads do not stomp each other. A process-wide
+// atomic default seeds newly spawned OpenMP workers that have not set TLS yet.
+// Always re-apply engine config temperature on fitness eval (and at the start of
+// OMP worker bodies that evaluate) so workers pick up the intended value.
+// ScopedArithmeticTemperature restores only the calling thread's TLS.
+inline std::atomic<double>& arithmetic_temperature_default_ref() {
     static std::atomic<double> t{5.0};
     return t;
 }
 
+inline double& arithmetic_temperature_tls_ref() {
+    // NaN => "unset"; fall back to process default (for fresh OMP workers).
+    thread_local double t = std::numeric_limits<double>::quiet_NaN();
+    return t;
+}
+
+// Backward-compatible alias used by older call sites / docs.
+inline std::atomic<double>& arithmetic_temperature_ref() {
+    return arithmetic_temperature_default_ref();
+}
+
 inline void set_arithmetic_temperature(double t) {
     // Keep temperature in a numerically stable range.
-    arithmetic_temperature_ref().store(
-        std::clamp(t, 0.1, 100.0), std::memory_order_relaxed);
+    t = std::clamp(t, 0.1, 100.0);
+    arithmetic_temperature_tls_ref() = t;
+    // Publish default so newly spawned workers inherit until they set TLS.
+    arithmetic_temperature_default_ref().store(t, std::memory_order_relaxed);
 }
 
 inline double get_arithmetic_temperature() {
-    return arithmetic_temperature_ref().load(std::memory_order_relaxed);
+    const double tls = arithmetic_temperature_tls_ref();
+    if (std::isfinite(tls) && tls > 0.0) {
+        return tls;
+    }
+    return arithmetic_temperature_default_ref().load(std::memory_order_relaxed);
 }
 
-// RAII restore for concurrent / nested API entry points (score + run_evolution).
+// RAII restore for nested API entry points on the **same thread**.
+// Only TLS is restored; process default is left alone so concurrent engines
+// on other threads keep their published default.
 class ScopedArithmeticTemperature {
 public:
     explicit ScopedArithmeticTemperature(double t)
-        : prev_(get_arithmetic_temperature()) {
+        : prev_tls_(arithmetic_temperature_tls_ref())
+        , had_tls_(std::isfinite(prev_tls_) && prev_tls_ > 0.0) {
         set_arithmetic_temperature(t);
     }
-    ~ScopedArithmeticTemperature() { set_arithmetic_temperature(prev_); }
+    ~ScopedArithmeticTemperature() {
+        if (had_tls_) {
+            arithmetic_temperature_tls_ref() = prev_tls_;
+        } else {
+            arithmetic_temperature_tls_ref() = std::numeric_limits<double>::quiet_NaN();
+        }
+    }
     ScopedArithmeticTemperature(const ScopedArithmeticTemperature&) = delete;
     ScopedArithmeticTemperature& operator=(const ScopedArithmeticTemperature&) = delete;
 
 private:
-    double prev_;
+    double prev_tls_;
+    bool had_tls_;
 };
 
 inline double stabilized_tau(double tau) {

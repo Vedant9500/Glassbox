@@ -67,7 +67,9 @@ inline void simplify_node(IndividualGraph& graph, int node_idx) {
                         v, std::clamp(static_cast<int>(std::round(node.p)), 2, 6));
                     break;
                 case UnaryOp::Exp:
-                    res = std::exp(node.omega * v + node.phi);
+                    // Match eval.h clamp band for exp (H-02).
+                    res = std::exp(std::clamp(node.omega * v + node.phi, -50.0, 50.0));
+                    res = std::clamp(res, -1e6, 1e6);
                     break;
                 case UnaryOp::Log:
                     res = std::log(std::abs(v) + 1e-6);
@@ -76,6 +78,9 @@ inline void simplify_node(IndividualGraph& graph, int node_idx) {
                     res = std::abs(v);
                     break;
             }
+            // H-02: never store Inf/NaN constants from folds (eval clamps live path).
+            if (!std::isfinite(res)) res = 0.0;
+            res = std::clamp(res, -1e8, 1e8);
             node.type = NodeType::Constant;
             node.value = res;
         }
@@ -114,6 +119,9 @@ inline void simplify_node(IndividualGraph& graph, int node_idx) {
                 res = (den > 0.0) ? (l * ex + r * ey) / den : 0.5 * (l + r);
             }
 
+            // H-02: sanitize folded binary constants.
+            if (!std::isfinite(res)) res = 0.0;
+            res = std::clamp(res, -1e8, 1e8);
             node.type = NodeType::Constant;
             node.value = res;
         }
