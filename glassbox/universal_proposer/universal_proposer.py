@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import os
 import re
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import torch
@@ -436,6 +436,32 @@ def grammar_decode_topk_skeletons(
     return scored[: max(1, int(top_k))]
 
 
+def _rank_columns_by_target_relevance(x: np.ndarray, y: np.ndarray) -> List[int]:
+    """Order feature columns by |corr| with y (variance fallback). H-13."""
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    n = int(x.shape[1]) if x.ndim == 2 else 0
+    scores: List[Tuple[float, int]] = []
+    for i in range(n):
+        xi = x[:, i]
+        mask = np.isfinite(xi) & np.isfinite(y)
+        if int(mask.sum()) < 4:
+            scores.append((0.0, i))
+            continue
+        a = xi[mask]
+        b = y[mask]
+        sa = float(np.std(a))
+        sb = float(np.std(b))
+        if sa < 1e-12 or sb < 1e-12:
+            rel = float(np.var(a))
+        else:
+            corr = float(np.corrcoef(a, b)[0, 1])
+            rel = abs(corr) if np.isfinite(corr) else float(np.var(a))
+        scores.append((rel, i))
+    scores.sort(key=lambda t: (-t[0], t[1]))
+    return [i for _, i in scores]
+
+
 def grammar_decode_multivariate_skeletons(
     operator_priors: Dict[str, float],
     x: np.ndarray,
@@ -452,10 +478,20 @@ def grammar_decode_multivariate_skeletons(
     y_var = float(np.var(y)) + 1e-12
     scored: List[Dict[str, Any]] = []
     feature_names = [f"x{i}" for i in range(x.shape[1])]
-    limit = min(x.shape[1], max(2, int(max_rank)))
+    n_features = int(x.shape[1])
+    limit = min(n_features, max(2, int(max_rank)))
+    # H-13: pair among target-relevant columns, not the column-index prefix.
+    # Small-D: enumerate all pairs (cheap). Larger-D: top-`limit` by |corr(y, xi)|.
+    if n_features <= 8:
+        selected_cols = list(range(n_features))
+    else:
+        ranked = _rank_columns_by_target_relevance(x, y)
+        selected_cols = sorted(ranked[:limit])
 
-    for i in range(limit):
-        for j in range(i + 1, limit):
+    for a_idx in range(len(selected_cols)):
+        for b_idx in range(a_idx + 1, len(selected_cols)):
+            i = selected_cols[a_idx]
+            j = selected_cols[b_idx]
             xi = x[:, i]
             xj = x[:, j]
             mask = np.isfinite(xi) & np.isfinite(xj) & np.isfinite(y)

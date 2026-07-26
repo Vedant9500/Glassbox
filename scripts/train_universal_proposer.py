@@ -38,6 +38,7 @@ from glassbox.universal_proposer import (
 try:
     from glassbox.curve_classifier.generate_curve_data import (
         extract_all_features,
+        extract_all_features_xy,
         evaluate_formula,
         OPERATOR_CLASSES,
         FEATURE_DIM,
@@ -67,6 +68,7 @@ try:
 except Exception:
     from glassbox.curve_classifier.generate_curve_data import (
         extract_all_features,
+        extract_all_features_xy,
         evaluate_formula,
         OPERATOR_CLASSES,
         FEATURE_DIM,
@@ -323,9 +325,12 @@ class SyntheticCurveDataset(Dataset):
             y = x + np.sin(x)
             ops = ["identity", "sin", "periodic"]
 
-        # Extract real analytical features (Invariants, FFT, Derivatives)
+        # H-15: match inference — extract_all_features_xy sorts/resamples by x.
         y = y + 0.01 * self.rng.randn(*y.shape).astype(np.float32)
-        features = extract_all_features(y)
+        try:
+            features = extract_all_features_xy(x, y)
+        except Exception:
+            features = extract_all_features(y)
 
         features = apply_feature_transform(features)
 

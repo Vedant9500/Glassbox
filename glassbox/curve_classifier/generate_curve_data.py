@@ -2359,9 +2359,18 @@ def generate_chunk(
         elif noise_std > 0.0:
             y_aug = y_aug + np.random.normal(0.0, noise_std * (np.std(y_aug) + 1e-10), size=y_aug.shape)
 
-        # Extract features from augmented curve
+        # H-15: train with the same xy-sorted/resampled path as inference
+        # (extract_all_features_xy), not raw y-only order. Shuffled or
+        # non-grid x would otherwise create a large train/serve feature gap.
         try:
-            features = extract_all_features(y_aug)
+            x_feat = np.asarray(x)
+            if x_feat.ndim == 2 and x_feat.shape[1] == 1:
+                x_feat = x_feat[:, 0]
+            if x_feat.ndim == 1 and np.asarray(y_aug).ndim == 1:
+                features = extract_all_features_xy(x_feat, y_aug)
+            else:
+                # Multivariate / non-1D: keep y-path (no shared xy grid contract).
+                features = extract_all_features(y_aug)
             if np.any(np.isnan(features)) or np.any(np.isinf(features)):
                 stats['feature_invalid'] += 1
                 continue

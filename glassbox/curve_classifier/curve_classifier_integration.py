@@ -1002,15 +1002,27 @@ def _predict_operators_multi_input(
     """
     from scipy.interpolate import LinearNDInterpolator, NearestNDInterpolator
     
-    # Build/reuse interpolators for y values (hot path for repeated calls)
-    interp_signature = (
-        int(x.__array_interface__['data'][0]),
-        tuple(x.shape),
-        str(x.dtype),
-        int(y.__array_interface__['data'][0]),
-        tuple(y.shape),
-        str(y.dtype),
-    )
+    # Build/reuse interpolators for y values (hot path for repeated calls).
+    # H-14: never key only on buffer pointers — in-place y/x mutation would
+    # reuse a stale interpolator. Content fingerprint (or sample+ptr) invalidates.
+    def _interp_array_fp(arr: np.ndarray) -> Tuple:
+        a = np.asarray(arr)
+        shape = tuple(a.shape)
+        dtype_s = str(a.dtype)
+        n_elem = int(np.prod(shape)) if shape else 0
+        if n_elem > 0 and n_elem <= 8192 and a.dtype.kind in "fcibu":
+            return (shape, dtype_s, hash(np.ascontiguousarray(a).tobytes()))
+        flat = np.ascontiguousarray(a).reshape(-1)
+        step = max(1, int(flat.size) // 64) if flat.size else 1
+        sample = flat[::step][:64]
+        try:
+            ptr = int(a.__array_interface__["data"][0])
+        except Exception:
+            ptr = id(a)
+        sample_fp = hash(np.ascontiguousarray(sample).tobytes()) if sample.size else 0
+        return (shape, dtype_s, ptr, sample_fp, float(np.nanmean(flat)) if flat.size else 0.0)
+
+    interp_signature = (_interp_array_fp(x), _interp_array_fp(y))
     interpolators = _cached_interpolators_by_signature.get(interp_signature)
     if interpolators is None:
         linear_interp = None

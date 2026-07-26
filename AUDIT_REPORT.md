@@ -5,7 +5,7 @@
 **Supersedes:** first-pass audit text and the interim verification pass (formerly split across two files) — merged here as the sole report  
 **Scope:** Entire active tree (`glassbox/`, `scripts/`, `tests/`, `docs/`, C++ under `glassbox/sr/cpp/`); Eigen vendored, `.tmp/`, `results/`, local `models/` weights out of scope for product bugs  
 **Method:** Multi-pass static analysis + cross-module verification + secondary cascade + full re-verification of every prior finding against current sources  
-**Code modified:** H-01…H-09 fixed (`evolution.h`, `simplify*.h`, `eval.h`, `core.cpp`, `sklearn_wrapper.py`, `blackbox_preprocessor.py`); report marks them **FIXED**
+**Code modified:** H-01…H-15 fixed (C++ core, sklearn wrapper, blackbox, universal proposer, curve classifier, train paths); report marks them **FIXED**
 
 This document is the **only** audit report to maintain. It combines:
 
@@ -313,12 +313,12 @@ Matches `x`, `x0`, `x1`, … So `nest_formulas("sin(x0)+x1", "x0**2")` → `sin(
 | **H-07** | **FIXED** | Seeds validated with `is_valid_graph_topology` + `feature_idx < n_features`; invalid counted/skipped |
 | **H-08** | **FIXED** | Final accept / `best_mse_` use `_final_formula_score` display MSE (not search/engine loss) |
 | **H-09** | **FIXED** | Blackbox `_as_sample_weight` raises `ValueError` on invalid weights (None still unweighted) |
-| **H-10** | CONFIRMED | Broad `except Exception` around evolution (~8399, 9103, 9420 class of sites); no `evolution_error_` fail-closed flag |
-| **H-11** | CONFIRMED | Cache key includes `id(X)` (`:6891–6906`) — in-place mutation hazard; shape/dtype help but not content |
-| **H-12** | CONFIRMED | `_mad_scale` (`:869–891`) filters finite `r` then compares `w.shape == r.shape` — length desync → silent unweighted |
-| **H-13** | CONFIRMED | `universal_proposer.py:455–458` pairs only among first `max_rank` columns |
-| **H-14** | CONFIRMED | Interpolator cache uses buffer pointers (`curve_classifier_integration.py:1006–1031`) |
-| **H-15** | CONFIRMED | Train often uses y-only features; inference `extract_all_features_xy` sorts by x |
+| **H-10** | **FIXED** | `evolution_error_` / `evolution_required_`; fail closed when required+failed+no formula; restore loss_mode |
+| **H-11** | **FIXED** | Formula eval cache keys content hash (≤4096 elems) or ptr+strides — not bare `id(X)` |
+| **H-12** | **FIXED** | `_mad_scale` applies same finite mask to weights; pre-filter length mismatch raises |
+| **H-13** | **FIXED** | Multivariate pairs among all cols (D≤8) or top-`max_rank` by \|corr(y,xi)\| — not index prefix |
+| **H-14** | **FIXED** | Interpolator cache keys content hash / sample fingerprint — not bare buffer pointers |
+| **H-15** | **FIXED** | Train curve gen + synthetic proposer use `extract_all_features_xy` (match inference sort/resample) |
 | **H-16** | CONFIRMED | CNN/GLU n_features fallback risk on missing config (`:684–707` class) |
 | **H-17** | CONFIRMED | `set_model_tau` (`evolution.py:104–114`) sets any module with `tau` / `set_tau`, including MetaAggregation |
 | **H-18** | CONFIRMED | Elite skip after global tau change (evolution loop ~2200 / 2770) |
@@ -541,8 +541,12 @@ Key = `(n, mean/std moments, dot, n_points)` over 32 samples — different formu
 | H-08 | **DONE** Final accept always `_final_formula_score` / display MSE | wrapper + fast path | M |
 | H-09 | **DONE** Raise on invalid blackbox weights | `blackbox_preprocessor.py` | S |
 | H-07 | **DONE** Seed topology + feature_idx validation | `core.cpp` | S |
-| H-10 | `evolution_error_`; fail closed when required | `sklearn_wrapper.py` | S |
-| H-13 | All-pairs or MI-ranked pairs in grammar | `universal_proposer.py:455` | M |
+| H-10 | **DONE** `evolution_error_`; fail closed when required | `sklearn_wrapper.py` | S |
+| H-11 | **DONE** Formula eval cache content fingerprint | `sklearn_wrapper.py` | S |
+| H-12 | **DONE** `_mad_scale` finite-mask weights | `sklearn_wrapper.py` | S |
+| H-13 | **DONE** All-pairs or relevance-ranked pairs in grammar | `universal_proposer.py` | M |
+| H-14 | **DONE** Interpolator cache content fingerprint | `curve_classifier_integration.py` | S |
+| H-15 | **DONE** Train with `extract_all_features_xy` | `generate_curve_data.py`, train script | S |
 
 ### 4.3 P2 — ONN research path (if still supported)
 
@@ -690,7 +694,7 @@ primary_sources = self.router.get_primary_sources()
 | Severity | First-pass claimed | Verified + new |
 |----------|------------|-------------------|
 | CRITICAL | 13 (C-01…C-13) | **14** production-critical themes (C-01…C-13 + C-14); C-05 exposure refined |
-| HIGH | 22+ | **24+** open themes originally; **H-01…H-09 FIXED** (remaining from H-10+) |
+| HIGH | 22+ | **24+** open themes originally; **H-01…H-15 FIXED** (remaining from H-16+) |
 | MEDIUM / PERF / ROBUST | 30+ | **35+** including P-09/10, M-06, D-* |
 | FALSE POSITIVES | — | **0** full FPs among C-*; **2–3** overstatements refined |
 
@@ -832,62 +836,68 @@ Invalid weights → `None` (unweighted) without error; desync if caller believes
 ---
 
 ### H-10 — C++ / guided evolution failures swallowed
+**Status: FIXED**
 
-**File:** `sklearn_wrapper.py` ~8399, 9103, 9420  
+**File:** `sklearn_wrapper.py` evolution try/except  
 
 `except Exception: print` → fit continues with weak incumbent, no `evolution_error_` flag.
 
-**Fix:** Record `self.evolution_error_`; fail closed when evolution was required and no formula.
+**Fix applied:** set `evolution_error_` / `evolution_required_`; raise `RuntimeError` when required+failed+no formula; restore user `loss_mode` before raise.
 
 ---
 
 ### H-11 — Formula eval cache keyed by `id(X)`
+**Status: FIXED**
 
-**File:** `sklearn_wrapper.py:6891–6906`  
+**File:** `sklearn_wrapper.py` `_safe_eval_formula_array`  
 
 In-place mutation or recycled ndarray identity → stale predictions.
 
-**Fix:** Content fingerprint for small X, or disable cache outside candidate loops; never key only on `id(X)`.
+**Fix applied:** cache key = expr + shape + dtype + content hash (≤4096 elems) or (data ptr, strides).
 
 ---
 
 ### H-12 — `_mad_scale` weight length mismatch after filtering non-finite residuals
+**Status: FIXED**
 
-**File:** `sklearn_wrapper.py:869–891`  
+**File:** `sklearn_wrapper.py` `_mad_scale`  
 
 Finite mask applied to `r` but not weights → silent unweighted MAD.
 
-**Fix:** Apply the same finite mask to weights; raise on pre-filter length mismatch.
+**Fix applied:** raise on pre-filter length mismatch; apply same finite mask to weights.
 
 ---
 
 ### H-13 — Multivariate grammar only pairs first `max_rank` columns
+**Status: FIXED**
 
-**File:** `universal_proposer.py:455–458`  
+**File:** `universal_proposer/universal_proposer.py`  
 
 `limit = min(n, max_rank)`; pairs only among prefix. `y = x2*x3` with `max_rank=2` fails.
 
-**Fix:** Enumerate all pairs (or top-K by mutual information / variance), not column prefix.
+**Fix applied:** D≤8 enumerate all pairs; else top-`max_rank` columns by \|corr(y, xi)\| (variance fallback).
 
 ---
 
 ### H-14 — Multi-input interpolator cache keyed by buffer pointer
+**Status: FIXED**
 
-**File:** `curve_classifier_integration.py:1006–1031`  
+**File:** `curve_classifier/curve_classifier_integration.py`  
 
 `__array_interface__['data'][0]` only; in-place y mutation reuses stale interpolators.
 
-**Fix:** Hash content samples or generation counter.
+**Fix applied:** content hash for small arrays; sample+mean+ptr fingerprint for large.
 
 ---
 
 ### H-15 — Train features ignore x-order; inference sorts by x
+**Status: FIXED**
 
-**File:** `generate_curve_data.py` train path vs `extract_all_features_xy`  
+**File:** `generate_curve_data.py` train path; `train_universal_proposer.py` synthetic  
 
 Shuffled curves: large feature shift → train/serve gap.
 
-**Fix:** Always train with `extract_all_features_xy(x, y)`.
+**Fix applied:** univariate train extraction uses `extract_all_features_xy(x, y)`.
 
 ---
 

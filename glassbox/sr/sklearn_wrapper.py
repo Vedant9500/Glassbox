@@ -867,27 +867,39 @@ def _formula_unit_compatible(formula, input_units, output_units, unit_mode="soft
 
 
 def _mad_scale(resid, sample_weight=None):
-    """Robust residual scale via MAD (≈ σ for Gaussian). Floor avoids zero delta."""
+    """Robust residual scale via MAD (≈ σ for Gaussian). Floor avoids zero delta.
+
+    H-12: when ``sample_weight`` is provided it must match residual length
+    *before* the finite filter; the same finite mask is applied to both.
+    Pre-filter length mismatch raises ``ValueError`` (no silent unweighted MAD).
+    """
     r = np.asarray(resid, dtype=np.float64).reshape(-1)
     if r.size == 0 or not np.any(np.isfinite(r)):
         return 1.0
-    r = r[np.isfinite(r)]
+    finite = np.isfinite(r)
+    w = None
     if sample_weight is not None:
         w = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
-        if w.shape == r.shape and float(np.sum(w)) > 0:
-            # Weighted median via sort + cumulative weights
-            order = np.argsort(r)
-            rs, ws = r[order], w[order]
-            c = np.cumsum(ws)
-            mid = 0.5 * float(c[-1])
-            med = float(rs[int(np.searchsorted(c, mid))])
-            abs_dev = np.abs(rs - med)
-            order2 = np.argsort(abs_dev)
-            c2 = np.cumsum(ws[order2])
-            mad = float(abs_dev[order2][int(np.searchsorted(c2, mid))])
-        else:
-            med = float(np.median(r))
-            mad = float(np.median(np.abs(r - med)))
+        if w.shape[0] != r.shape[0]:
+            raise ValueError(
+                f"sample_weight length {w.shape[0]} does not match residual length {r.shape[0]}"
+            )
+        # Align weights with finite residuals (same mask).
+        w = w[finite]
+        if not np.all(np.isfinite(w)) or float(np.sum(np.maximum(w, 0.0))) <= 0.0:
+            w = None
+    r = r[finite]
+    if w is not None and w.shape == r.shape and float(np.sum(w)) > 0:
+        # Weighted median via sort + cumulative weights
+        order = np.argsort(r)
+        rs, ws = r[order], w[order]
+        c = np.cumsum(ws)
+        mid = 0.5 * float(c[-1])
+        med = float(rs[int(np.searchsorted(c, mid))])
+        abs_dev = np.abs(rs - med)
+        order2 = np.argsort(abs_dev)
+        c2 = np.cumsum(ws[order2])
+        mad = float(abs_dev[order2][int(np.searchsorted(c2, mid))])
     else:
         med = float(np.median(r))
         mad = float(np.median(np.abs(r - med)))
@@ -6888,12 +6900,24 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             lock = threading.Lock()
             self._formula_eval_lock_ = lock
 
-        cache_key = (
-            expr,
-            id(X),
-            tuple(getattr(X, "shape", ())),
-            str(getattr(X, "dtype", "")),
-        )
+        # H-11: never key only on id(X) — in-place mutation / buffer reuse
+        # would return stale predictions. Fingerprint small arrays by content;
+        # large arrays use shape/dtype/strides/data-ptr (still safer than id alone).
+        X_arr = np.asarray(X)
+        shape = tuple(X_arr.shape)
+        dtype_s = str(X_arr.dtype)
+        n_elem = int(np.prod(shape)) if shape else 0
+        if n_elem > 0 and n_elem <= 4096 and X_arr.dtype.kind in "fc":
+            # Content hash: catches in-place value changes with same identity.
+            content_fp = hash(np.ascontiguousarray(X_arr).tobytes())
+        else:
+            try:
+                ptr = int(X_arr.__array_interface__["data"][0])
+            except Exception:
+                ptr = id(X_arr)
+            strides = tuple(int(s) for s in getattr(X_arr, "strides", ()) or ())
+            content_fp = (ptr, strides)
+        cache_key = (expr, shape, dtype_s, content_fp)
         with lock:
             self.formula_eval_count_ = int(getattr(self, "formula_eval_count_", 0) or 0) + 1
             cache = getattr(self, "_formula_eval_cache_", None)
@@ -7825,6 +7849,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "best_mse_",
             "evolution_candidate_formula_",
             "evolution_candidate_mse_",
+            "evolution_error_",
             "pareto_front_",
             "nodes_",
             "output_weights_",
@@ -7835,6 +7860,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         ):
             if hasattr(self, _attr):
                 delattr(self, _attr)
+        # H-10: last evolution failure message (None if clean); required flag for fail-closed.
+        self.evolution_error_ = None
+        self.evolution_required_ = False
         # S1-4: public sklearn contract is always original input width.
         self.n_features_in_ = X.shape[1]
         self.original_n_features_in_ = X.shape[1]
@@ -8955,17 +8983,21 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             }
 
         if need_evolution and _elapsed() < effective_timeout:
+            # H-10: mark that evolution was required this fit (for fail-closed).
+            self.evolution_required_ = True
             if not CPP_AVAILABLE:
                 # P6-014: missing extension is a hard error when evolution is required
                 # and no prior formula exists; otherwise stages degrade without native ops.
-                if best_formula is None:
-                    raise ImportError(
-                        CPP_UNAVAILABLE_REASON
-                        or (
-                            "Glassbox C++ core (_core) not found. "
-                            "Build: python glassbox/sr/cpp/setup.py build_ext --inplace --force"
-                        )
+                msg = (
+                    CPP_UNAVAILABLE_REASON
+                    or (
+                        "Glassbox C++ core (_core) not found. "
+                        "Build: python glassbox/sr/cpp/setup.py build_ext --inplace --force"
                     )
+                )
+                self.evolution_error_ = msg
+                if best_formula is None:
+                    raise ImportError(msg)
             else:
                 evo_formula = None
                 evo_mse = float('inf')
@@ -9110,7 +9142,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 evo_formula = guided_result['formula']
                                 evo_mse = guided_result.get('mse', float('inf'))
                     except Exception as e:
+                        # H-10: record failure; do not silently pretend evolution ran clean.
+                        self.evolution_error_ = f"guided_evolution: {type(e).__name__}: {e}"
                         print(f"  [Guided evolution skipped: {e}]")
+                        if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+                            self.blackbox_diagnostics_["guided_evolution_error"] = self.evolution_error_
 
                 # Fall back to raw C++ evolution
                 if (evo_formula is None or evo_mse >= self.early_stop_mse) and _elapsed() < effective_timeout:
@@ -9427,7 +9463,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             if 'pareto_front' in best_cpp_result:
                                 self.pareto_front_ = best_cpp_result['pareto_front']
                     except Exception as e:
+                        # H-10: surface C++ evolution failures on the estimator.
+                        self.evolution_error_ = f"cpp_evolution: {type(e).__name__}: {e}"
                         print(f"  [C++ evolution error: {e}]")
+                        if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+                            self.blackbox_diagnostics_["cpp_evolution_error"] = self.evolution_error_
 
                 # Take evolution result if it wins under direct formula evaluation.
                 # H-08: accept/report with display (unweighted) MSE, not search/engine loss.
@@ -9512,7 +9552,27 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         f"formula={(evo_formula or '0')[:120]}"
                     )
         elif need_evolution and _elapsed() >= effective_timeout:
+            self.evolution_required_ = True
+            if self.evolution_error_ is None:
+                self.evolution_error_ = (
+                    f"timeout: skipped evolution after {_elapsed():.1f}s "
+                    f"(budget={effective_timeout:.1f}s)"
+                )
             print(f"  [Timeout: skipping evolution after {_elapsed():.1f}s (budget={effective_timeout:.1f}s)]")
+
+        # H-10: fail closed when evolution was required, failed, and no usable formula.
+        if (
+            getattr(self, "evolution_required_", False)
+            and getattr(self, "evolution_error_", None)
+            and (best_formula is None or not str(best_formula).strip() or str(best_formula).strip() == "0")
+            and not (getattr(self, "evolution_candidate_formula_", None))
+        ):
+            # Restore public loss_mode before raising so interrupted fits do not
+            # leave sticky auto-Huber (sklearn get_params / reuse contract).
+            self._restore_user_loss_mode_if_auto_switched()
+            raise RuntimeError(
+                f"Evolution was required but failed with no formula: {self.evolution_error_}"
+            )
 
         # ── Stage 3: Formula Simplification & Noise Reduction ──
         if best_formula:
