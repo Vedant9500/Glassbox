@@ -5,7 +5,7 @@
 **Supersedes:** first-pass audit text and the interim verification pass (formerly split across two files) — merged here as the sole report  
 **Scope:** Entire active tree (`glassbox/`, `scripts/`, `tests/`, `docs/`, C++ under `glassbox/sr/cpp/`); Eigen vendored, `.tmp/`, `results/`, local `models/` weights out of scope for product bugs  
 **Method:** Multi-pass static analysis + cross-module verification + secondary cascade + full re-verification of every prior finding against current sources  
-**Code modified:** None (read-only audit)
+**Code modified:** H-01…H-09 fixed (`evolution.h`, `simplify*.h`, `eval.h`, `core.cpp`, `sklearn_wrapper.py`, `blackbox_preprocessor.py`); report marks them **FIXED**
 
 This document is the **only** audit report to maintain. It combines:
 
@@ -25,6 +25,7 @@ This document is the **only** audit report to maintain. It combines:
 | **PARTIAL** | Core issue real; description incomplete, overstated, or understated |
 | **FALSE POSITIVE** | Claim does not hold on current code |
 | **ALREADY ADDRESSED** | Issue fixed or mitigated enough that the original bug report is stale |
+| **FIXED** | Remediation landed in tree; original bug report is closed |
 | **NEW** | Not in the first pass (or only implied); first-class finding here |
 
 Stable IDs from the first pass (`C-01`…`C-13`, `H-*`, `P-*`, `R-*`, `M-*`, `L-*`) are preserved. New IDs continue the series (`C-14+`, `H-23+`, `P-09+`, `R-10+`, `M-06+`).
@@ -303,15 +304,15 @@ Matches `x`, `x0`, `x1`, … So `nest_formulas("sin(x0)+x1", "x0**2")` → `sin(
 
 | ID | Verdict | Notes |
 |----|---------|-------|
-| **H-01** | CONFIRMED | `residual_mse_unweighted` (`evolution.h:1040–1043`) is bare `(pred-y).square().mean()` — NaN propagates; fitness sort ill-defined |
-| **H-02** | CONFIRMED | `simplify.h:70` `std::exp(omega*v+phi)` folded without finite/clamp (eval clamps) |
-| **H-03** | CONFIRMED | Adam clamps `p`/`omega` only (`evolution.h` ~2507–2508 region); **no `phi` clamp** anywhere in evolution.h |
-| **H-04** | CONFIRMED | LM Jacobian uses output weight sensitivity; nested near-zero weights starve grads (`:2645–2691`) |
-| **H-05** | CONFIRMED | Arithmetic snap gated on `snap_active_unary` mask (`:3399–3402`) — Binary nodes never marked → dead |
-| **H-06** | CONFIRMED | Process-global `static atomic` temperature in `eval.h:21–37` |
-| **H-07** | CONFIRMED | Seeds accepted in `core.cpp:573–636` without full topology/feature validation; eval zeros bad indices |
-| **H-08** | CONFIRMED / PARTIAL | Display-vs-engine split is partially intentional (S1-6 comments in `_final_formula_score`); residual risk at blackbox accept / post-simplify boundaries still real |
-| **H-09** | CONFIRMED | `blackbox_preprocessor._as_sample_weight` (`:56–68`) returns `None` on invalid weights |
+| **H-01** | **FIXED** | Non-finite pred → fitness=`1e30`, raw_mse=`+inf`; residual MSE rejects non-finite pred/y |
+| **H-02** | **FIXED** | Simplify unary/binary constant folds sanitize Inf/NaN and clamp; Exp matches eval band |
+| **H-03** | **FIXED** | `clamp_unary_inner_params`: phi ±4π; Exp tighter omega/phi ±4 — Adam, LM, mutation |
+| **H-04** | **FIXED** | LM Jacobian bounds-checks children; FD residual fallback when `|wi|≤1e-6` / nested |
+| **H-05** | **FIXED** | Arithmetic snap uses full active-subtree mask (`collect_active_reachable_mask`) |
+| **H-06** | **FIXED** | Thread-local arithmetic temperature + process default for fresh OMP workers |
+| **H-07** | **FIXED** | Seeds validated with `is_valid_graph_topology` + `feature_idx < n_features`; invalid counted/skipped |
+| **H-08** | **FIXED** | Final accept / `best_mse_` use `_final_formula_score` display MSE (not search/engine loss) |
+| **H-09** | **FIXED** | Blackbox `_as_sample_weight` raises `ValueError` on invalid weights (None still unweighted) |
 | **H-10** | CONFIRMED | Broad `except Exception` around evolution (~8399, 9103, 9420 class of sites); no `evolution_error_` fail-closed flag |
 | **H-11** | CONFIRMED | Cache key includes `id(X)` (`:6891–6906`) — in-place mutation hazard; shape/dtype help but not content |
 | **H-12** | CONFIRMED | `_mad_scale` (`:869–891`) filters finite `r` then compares `w.shape == r.shape` — length desync → silent unweighted |
@@ -522,7 +523,7 @@ Key = `(n, mean/std moments, dot, n_points)` over 32 samples — different formu
 | P0.5 | C-12 | Nest only primary feature (or explicit map); never global `x\d*` | `specialist_state.py:994–997` | S | `nest_formulas("sin(x0)+x1","x0**2")` keeps `x1` |
 | P0.6 | C-05 | After NSGA select in `run()`, `continue` (mirror island `return`) | `evolution.h:393–444` | S | gen counter / pop genealogy under `use_nsga2` + `num_islands=1` |
 | P0.7 | C-06, R-10 | Validate X/y sizes at `run_evolution`; refuse `n_features==0` | `core.cpp:474+`; `evolution.h` init | S | empty X throws; mismatched lengths throw |
-| P0.8 | H-01 | Non-finite pred → fitness=`1e30`, raw_mse=`+inf` | `evolution.h:1606–1705,1040` | S | NaN pred never sorts above finite |
+| P0.8 | H-01 | **DONE** Non-finite pred → fitness=`1e30`, raw_mse=`+inf` | `evolution.h` | S | NaN pred never sorts above finite |
 
 ### 4.2 P1 — Search quality / silent wrong formulas
 
@@ -530,13 +531,16 @@ Key = `(n, mean/std moments, dot, n_points)` over 32 samples — different formu
 |-------|--------|-------|--------|
 | C-07, M-03 | Index-map crossover; export `crossover_valid_rate` | `evolution.h`, `core.cpp` | L |
 | R-06′ | Force Division or div-gate params in macro divide | `evolution.h:1903–1930` | S |
-| H-05 | Arithmetic snap uses full active mask / binary mask | `evolution.h:3399+` | S |
-| H-02, H-03 | Clamp simplify folds; clamp `phi` (and Exp ω) in Adam/LM | `simplify*.h`, `evolution.h` | S |
+| H-05 | **DONE** Arithmetic snap uses full active mask / binary mask | `evolution.h` | S |
+| H-02, H-03 | **DONE** Clamp simplify folds; clamp `phi` (and Exp ω) in Adam/LM | `simplify*.h`, `evolution.h` | S |
+| H-04 | **DONE** LM FD fallback + child bounds for nested unaries | `evolution.h` | S |
+| H-06 | **DONE** Thread-local arithmetic temperature isolation | `eval.h` | S |
 | H-21, H-25 | Multi-token family signatures | `sklearn_wrapper.py:5272` | S |
 | H-22 | Use residual_relevance in vault ranking or delete | `specialist_state.py` | S |
 | C-13 | Python seed: treat `x0` as single-feature alias of `x` | `seed_graph_builder.py:88,610` | S |
-| H-08 | Final accept always `_final_formula_score` / display MSE | wrapper + fast path | M |
-| H-09 | Raise on invalid blackbox weights | `blackbox_preprocessor.py:56` | S |
+| H-08 | **DONE** Final accept always `_final_formula_score` / display MSE | wrapper + fast path | M |
+| H-09 | **DONE** Raise on invalid blackbox weights | `blackbox_preprocessor.py` | S |
+| H-07 | **DONE** Seed topology + feature_idx validation | `core.cpp` | S |
 | H-10 | `evolution_error_`; fail closed when required | `sklearn_wrapper.py` | S |
 | H-13 | All-pairs or MI-ranked pairs in grammar | `universal_proposer.py:455` | M |
 
@@ -686,7 +690,7 @@ primary_sources = self.router.get_primary_sources()
 | Severity | First-pass claimed | Verified + new |
 |----------|------------|-------------------|
 | CRITICAL | 13 (C-01…C-13) | **14** production-critical themes (C-01…C-13 + C-14); C-05 exposure refined |
-| HIGH | 22+ | **24+** (H-01…H-22 + H-23…H-26 + R-06′ + R-10) |
+| HIGH | 22+ | **24+** open themes originally; **H-01…H-09 FIXED** (remaining from H-10+) |
 | MEDIUM / PERF / ROBUST | 30+ | **35+** including P-09/10, M-06, D-* |
 | FALSE POSITIVES | — | **0** full FPs among C-*; **2–3** overstatements refined |
 
@@ -729,98 +733,101 @@ Report path: `/mnt/windows_d/Glassbox/AUDIT_REPORT.md`
 ### A.1 High-severity narratives (H-01 … H-20)
 
 ### H-01 — C++ fitness does not sanitize NaN/Inf predictions
+**Status: FIXED**
 
-**File:** `evolution.h` fitness path ~1606–1705  
+**File:** `evolution.h` fitness path  
 
 After eval clamps, residual NaNs (bad seeds, constant fold Inf) can still produce non-finite MSE. `std::sort` on NaN fitness is ill-defined.
 
-**Fix:** If `!pred.isFinite().all()` or non-finite MSE → set `fitness = 1e30`, `raw_mse = +inf`, return early.
+**Fix applied:** If `!pred.isFinite().all()` or non-finite MSE → set `fitness = 1e30`, `raw_mse = +inf`, return early. `residual_mse*` also reject non-finite pred/y.
 
 ---
 
 ### H-02 — Constant-fold simplify can store Inf/NaN
+**Status: FIXED**
 
-**Files:** `simplify.h:69–80`, `simplify_advanced.h` fold paths  
+**Files:** `simplify.h`, `simplify_advanced.h` fold paths  
 
 `std::exp(omega*v+phi)` folded without clamp (eval path clamps; simplify does not).
 
-**Fix:**
-
-```cpp
-if (!std::isfinite(res)) res = 0.0;
-res = std::clamp(res, -1e8, 1e8);
-node.value = res;
-```
+**Fix applied:** non-finite → 0; clamp to `[-1e8, 1e8]`; Exp argument clamp + eval-matched band.
 
 ---
 
 ### H-03 — Adam/LM leave `phi` unconstrained
+**Status: FIXED**
 
-**File:** `evolution.h:2507–2508`  
+**File:** `evolution.h`  
 
 Only `p` and `omega` clamped; `phi` free → Exp argument explosion, flat regions at output clamps.
 
-**Fix:** Clamp `phi` (e.g. ±4π generally; tighter for Exp); clamp Exp `omega` to a safe range; same in LM `unpack_params`.
+**Fix applied:** `clamp_unary_inner_params` — phi ±4π; Exp omega/phi ±4; used in Adam, LM `unpack_params`, mutation.
 
 ---
 
 ### H-04 — LM analytical Jacobian ignores nested active unaries
+**Status: FIXED**
 
-**File:** `evolution.h:2645–2691`  
+**File:** `evolution.h` LM Jacobian  
 
 Uses output weight as sensitivity; nested unaries with near-zero output weight get zero Jacobian. Unchecked `left_child` indexing risk.
 
-**Fix:** Chain-rule sensitivity to active outputs, or FD fallback when `|w| < eps`; bounds-check children.
+**Fix applied:** bounds-check children; residual FD fallback when `|wi| ≤ 1e-6` or child/cache invalid.
 
 ---
 
 ### H-05 — Arithmetic-gate snapping is dead code
+**Status: FIXED**
 
-**File:** `evolution.h:3399–3402`  
+**File:** `evolution.h` cleanup snap  
 
 `snap_active_unary` only marks Unary nodes; Arithmetic snap requires Binary **and** that mask → never runs.
 
-**Fix:** Use full active-node mask for Binary Arithmetic snaps.
+**Fix applied:** `collect_active_reachable_mask` for full active subtree; Arithmetic snap gates on that mask.
 
 ---
 
 ### H-06 — Process-global arithmetic temperature races concurrent engines
+**Status: FIXED**
 
-**File:** `eval.h:21–37`, used from evolution/core  
+**File:** `eval.h`, used from evolution/core  
 
 `static std::atomic<double>` temperature is process-wide. Concurrent `run_evolution` / scoring with different temps stomp each other.
 
-**Fix:** Prefer per-eval temperature parameter; document that concurrent multi-engine needs isolation. RAII `ScopedArithmeticTemperature` helps nested calls on one thread but not two engines in parallel.
+**Fix applied:** thread-local primary storage; process atomic as default for fresh OMP workers; Scoped restores TLS only; fitness re-applies engine config temp.
 
 ---
 
 ### H-07 — Seeds accepted without topology / feature-index validation
+**Status: FIXED**
 
-**File:** `core.cpp:573–636`, eval fallbacks  
+**File:** `core.cpp` seed_graphs parse  
 
 Bad `left_child` / `feature_idx` evaluate as zero silently.
 
-**Fix:** `is_valid_graph_topology` + `feature_idx < n_features`; skip with counted reason.
+**Fix applied:** `is_valid_graph_topology` + Input `feature_idx ∈ [0, n_features)`; skip empty/invalid; export `seed_graphs_skipped_invalid`.
 
 ---
 
 ### H-08 — Display MSE vs engine/search MSE mixed in final accept
+**Status: FIXED**
 
-**Files:** `sklearn_wrapper.py` blackbox accept ~9427+; guided evolution returns; `classifier_fast_path` SymPy rewrite  
+**Files:** `sklearn_wrapper.py` blackbox/evolution accept + final `best_mse_`  
 
 Contract says displayed unweighted MSE for reporting; blackbox/C++ paths often rank with robust/weighted/`best_mse` engine metrics. Post-simplify display can regress without rejection at every boundary.
 
-**Fix:** Single final scorer `_display_formula_mse` / `_final_formula_score` for accept/reject; engine metrics only inside search.
+**Fix applied:** Evolution selection MSEs via `_final_formula_score`; public `best_mse_` / fast-path finish re-scored with display MSE.
 
 ---
 
 ### H-09 — Blackbox `_as_sample_weight` silently drops invalid weights
+**Status: FIXED**
 
-**File:** `blackbox_preprocessor.py:56–68`  
+**File:** `blackbox_preprocessor.py`  
 
 Invalid weights → `None` (unweighted) without error; desync if caller believes weights are active.
 
-**Fix:** Raise `ValueError` when `sample_weight is not None` and invalid (match wrapper validator).
+**Fix applied:** Raise `ValueError` on length/non-finite/negative/all-zero; `None` still means unweighted.
 
 ---
 
@@ -1123,16 +1130,20 @@ Budget split per start; C++ may overrun slightly; no absolute deadline cancel.
 2. C-02 predict  
 3. C-03 timeout cap  
 4. C-04 benchmark multi-var  
-5. H-09 blackbox weights  
+5. H-09 blackbox weights — **DONE**  
+6. H-08 display MSE final accept — **DONE**
 
 ### Patch pack B (C++ evolution safety) — ~2–4 hours
 
 1. C-05 NSGA continue  
 2. C-06 X/y validation  
-3. H-01 finite fitness  
-4. H-02 simplify clamp  
-5. H-03 phi clamp  
-6. H-05 arithmetic snap mask  
+3. H-01 finite fitness — **DONE**  
+4. H-02 simplify clamp — **DONE**  
+5. H-03 phi clamp — **DONE**  
+6. H-05 arithmetic snap mask — **DONE**  
+7. H-04 LM Jacobian FD fallback — **DONE**  
+8. H-06 thread-local arithmetic temperature — **DONE**  
+9. H-07 seed topology / feature_idx validation — **DONE**  
 
 ### Patch pack C (ONN correctness) — ~2–3 hours
 

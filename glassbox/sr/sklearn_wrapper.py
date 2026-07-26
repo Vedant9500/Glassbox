@@ -8269,8 +8269,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     final_formula = self._apply_auto_weight_final_guard(
                         final_formula, eval_X, eval_y, stage="fast_path_exact"
                     )
-                    pred = self._safe_eval_formula_array(final_formula, eval_X)
-                    final_mse = float(np.mean((pred - np.asarray(eval_y, dtype=np.float64).reshape(-1)) ** 2))
+                    # H-08: report display (plain unweighted) MSE, not raw engine mse.
+                    score, _, display_mse = self._final_formula_score(
+                        final_formula, eval_X, eval_y
+                    )
+                    if np.isfinite(score):
+                        final_mse = float(score)
+                    elif np.isfinite(display_mse):
+                        final_mse = float(display_mse)
+                    else:
+                        pred = self._safe_eval_formula_array(final_formula, eval_X)
+                        final_mse = float(np.mean((pred - np.asarray(eval_y, dtype=np.float64).reshape(-1)) ** 2))
                 except Exception:
                     pass
             self.formula_ = final_formula or "0"
@@ -9421,15 +9430,18 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         print(f"  [C++ evolution error: {e}]")
 
                 # Take evolution result if it wins under direct formula evaluation.
+                # H-08: accept/report with display (unweighted) MSE, not search/engine loss.
                 if evo_formula:
                     self.evolution_candidate_formula_ = evo_formula
                     self.evolution_candidate_mse_ = evo_mse
                     if getattr(self, "blackbox_state_", None) is not None and self.blackbox_state_.enabled:
                         selection_source = self._compare_blackbox_formulas(best_formula, evo_formula, X, y)
                         if selection_source == "challenger":
-                            selected_formula, selected_mse = evo_formula, self._formula_mse(evo_formula, X, y)
+                            selected_formula = evo_formula
+                            selected_mse, _, _ = self._final_formula_score(evo_formula, X, y)
                         else:
-                            selected_formula, selected_mse = best_formula, self._formula_mse(best_formula, X, y)
+                            selected_formula = best_formula
+                            selected_mse, _, _ = self._final_formula_score(best_formula, X, y) if best_formula else (float("inf"), float("inf"), float("inf"))
                     else:
                         selected_formula, selected_mse, selection_source = self._select_final_formula(
                             best_formula,
@@ -9461,7 +9473,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         if not allow_simpler:
                             selection_source = "incumbent"
                             selected_formula = best_formula
-                            selected_mse = self._formula_mse(best_formula, X, y)
+                            selected_mse, _, _ = self._final_formula_score(best_formula, X, y)
                     if selection_source == "challenger":
                         # Auto-weight guard: do not promote bloated evolution winners
                         # that fail unweighted full/holdout R² (Nguyen-1 outliers).
@@ -9470,7 +9482,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             if not g.get("ok"):
                                 selection_source = "incumbent"
                                 selected_formula = best_formula
-                                selected_mse = self._formula_mse(best_formula, X, y) if best_formula else selected_mse
+                                if best_formula:
+                                    selected_mse, _, _ = self._final_formula_score(best_formula, X, y)
                                 if isinstance(self.blackbox_diagnostics_, dict):
                                     self.blackbox_diagnostics_["evolution_auto_weight_guard"] = g
                             else:
@@ -9490,6 +9503,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             "challenger_formula": evo_formula,
                             "challenger_mse": float(evo_mse) if np.isfinite(evo_mse) else None,
                             "selected": selection_source,
+                            "selected_display_mse": float(selected_mse) if np.isfinite(selected_mse) else None,
                         }
                     print(
                         "  [Evolution] "
@@ -10013,6 +10027,24 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 }
 
         self.formula_ = best_formula or "0"
+        # H-08: public best_mse_ is always plain unweighted display MSE on the
+        # evaluation space (never robust/weighted search loss or engine best_mse).
+        try:
+            eval_X_report = X_original if (
+                getattr(self, "blackbox_state_", None) is not None
+                and getattr(self.blackbox_state_, "enabled", False)
+            ) else X
+            eval_y_report = y_original if eval_X_report is X_original else y
+            if self.formula_ and self.formula_ != "0":
+                display_score, _, display_mse = self._final_formula_score(
+                    self.formula_, eval_X_report, eval_y_report
+                )
+                if np.isfinite(display_score):
+                    best_mse = float(display_score)
+                elif np.isfinite(display_mse):
+                    best_mse = float(display_mse)
+        except Exception:
+            pass
         self.best_mse_ = best_mse
         # S1-4: always expose original feature count publicly after fit.
         if getattr(self, "original_n_features_in_", None) is not None:

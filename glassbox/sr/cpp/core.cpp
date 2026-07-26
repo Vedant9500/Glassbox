@@ -573,7 +573,9 @@ static py::dict run_evolution_cpp(
     // Parse seed_graphs
     std::vector<sr::IndividualGraph> cpp_seed_graphs;
     int seed_graphs_skipped_oversized = 0;
+    int seed_graphs_skipped_invalid = 0;  // H-07: topology / feature_idx
     int seed_graph_node_limit = std::max(24, std::min(64, early_stop_max_nodes));
+    const int n_features = static_cast<int>(X.size());
     for (auto item : seed_graphs_py) {
         auto gdict = item.cast<py::dict>();
         sr::IndividualGraph g;
@@ -629,11 +631,34 @@ static py::dict run_evolution_cpp(
             }
         }
         
+        if (g.nodes.empty()) {
+            ++seed_graphs_skipped_invalid;
+            continue;
+        }
         if (static_cast<int>(g.nodes.size()) > seed_graph_node_limit) {
             ++seed_graphs_skipped_oversized;
             continue;
         }
-        cpp_seed_graphs.push_back(g);
+        // H-07: refuse seeds with bad topology or out-of-range feature indices.
+        // Eval would otherwise silently treat them as zero and poison search.
+        if (!sr::is_valid_graph_topology(g)) {
+            ++seed_graphs_skipped_invalid;
+            continue;
+        }
+        bool features_ok = true;
+        for (const auto& node : g.nodes) {
+            if (node.type == sr::NodeType::Input) {
+                if (node.feature_idx < 0 || node.feature_idx >= n_features) {
+                    features_ok = false;
+                    break;
+                }
+            }
+        }
+        if (!features_ok) {
+            ++seed_graphs_skipped_invalid;
+            continue;
+        }
+        cpp_seed_graphs.push_back(std::move(g));
     }
 
     // Parse input_units (list of lists)
@@ -794,6 +819,7 @@ static py::dict run_evolution_cpp(
     result["island_inner_threads"] = engine.get_last_island_inner_threads();
     result["seed_graphs_used"] = static_cast<int>(cpp_seed_graphs.size());
     result["seed_graphs_skipped_oversized"] = seed_graphs_skipped_oversized;
+    result["seed_graphs_skipped_invalid"] = seed_graphs_skipped_invalid;  // H-07
     result["seed_graph_node_limit"] = seed_graph_node_limit;
     
     // Serialize graph structure

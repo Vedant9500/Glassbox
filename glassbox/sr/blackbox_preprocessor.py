@@ -54,17 +54,28 @@ def _safe_std(values: np.ndarray) -> np.ndarray:
 
 
 def _as_sample_weight(sample_weight, n: int) -> Optional[np.ndarray]:
-    """Validate optional per-point weights; return length-n array or None."""
+    """Validate optional per-point weights; return length-n array or None.
+
+    ``None`` means unweighted. When weights are provided they must be valid —
+    length match, finite, non-negative, positive total — otherwise raise
+    ``ValueError`` (H-09). Silent drop previously desynced callers that believed
+    weights were active.
+    """
     if sample_weight is None:
         return None
     try:
         w = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
-    except Exception:
-        return None
-    if w.shape[0] != int(n) or not np.all(np.isfinite(w)) or np.any(w < 0.0):
-        return None
+    except Exception as exc:
+        raise ValueError("sample_weight must be array-like") from exc
+    n = int(n)
+    if w.shape[0] != n:
+        raise ValueError(f"sample_weight has length {w.shape[0]}, expected {n}")
+    if not np.all(np.isfinite(w)):
+        raise ValueError("sample_weight must contain only finite values")
+    if np.any(w < 0.0):
+        raise ValueError("sample_weight must be non-negative")
     if float(np.sum(w)) <= 1e-15:
-        return None
+        raise ValueError("sample_weight must have positive total weight")
     return w
 
 
