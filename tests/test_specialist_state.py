@@ -409,3 +409,37 @@ def test_specialist_vault_proposes_capped_composition_candidates():
     assert proposals
     assert all(candidate["from_specialist_vault"] for candidate in proposals)
     assert all(candidate["from_specialist_composition"] for candidate in proposals)
+
+
+def test_m01_permuted_index_holdout():
+    """M-01: SpecialistVault holdout uses deterministic permuted indices rather than deterministic tail.
+    
+    When y is ordered (e.g. sorted domain [-2, 2]), the tail slice y[-n_val:] has low variance (~0.09),
+    so tail noise causes tail holdout R2 to plummet below 0.25 (rejecting the candidate).
+    Permuted holdout samples uniformly across the domain (variance ~1.25), keeping holdout R2 high.
+    """
+    n = 40
+    X = np.linspace(-2, 2, n).reshape(-1, 1)
+    y = X[:, 0].copy()
+
+    vault = SpecialistVault(max_entries=5)
+
+    def _eval_tail_noisy(formula, X_in):
+        arr = X_in[:, 0].copy()
+        if "tail_noisy" in formula:
+            arr[-5:] += 0.8
+        return arr
+
+    candidates = [{"formula": "tail_noisy_x0"}]
+    added = vault.add_candidates(
+        candidates,
+        X,
+        y,
+        evaluate_formula=_eval_tail_noisy,
+        complexity_fn=lambda f: 5,
+        family_signature_fn=lambda f: "identity",
+        run_index=0,
+    )
+    assert added == 1
+
+

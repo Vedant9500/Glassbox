@@ -358,7 +358,7 @@ Matches `x`, `x0`, `x1`, … So `nest_formulas("sin(x0)+x1", "x0**2")` → `sin(
 
 | ID | Verdict | Notes |
 |----|---------|-------|
-| **M-01** | CONFIRMED | Vault holdout = deterministic tail (`specialist_state.py:317–324`) |
+| **M-01** | **FIXED** | Vault holdout uses deterministic permuted index split instead of deterministic tail (`specialist_state.py`) |
 | **M-02** | CONFIRMED | FPIP `search_plan={}`, skeleton `probability=None` (`fpip_v2.py:105–106,137`) |
 | **M-03** | CONFIRMED | `last_crossover_valid_` not in `core.cpp` result dict (`:778–853` region) |
 | **M-04** | CONFIRMED (refined) | Meta soft-div = abs-form (`meta_ops.py:573`); C++ **Arithmetic** soft-div = sqrt-form (`eval.h:273`); C++ **Division** matches meta abs-form (`eval.h:280`) — meta ≠ Arithmetic soft |

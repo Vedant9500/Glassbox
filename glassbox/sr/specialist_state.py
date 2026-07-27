@@ -317,7 +317,7 @@ class SpecialistVault:
         existing_keys = {self._formula_key(entry.formula) for entry in self.entries}
         y_var = max(float(np.var(y_arr)), 1e-15)
 
-        scored: List[tuple[float, Dict[str, Any], np.ndarray, np.ndarray]] = []
+        scored: List[tuple[float, Dict[str, Any], np.ndarray, np.ndarray, float]] = []
         for candidate in list(candidate_formulas):
             formula = str((candidate or {}).get("formula", "")).strip()
             if not formula:
@@ -348,11 +348,14 @@ class SpecialistVault:
             n_val = max(4, int(round(0.25 * n_pts)))
             n_val = min(n_val, max(1, n_pts - 8)) if n_pts > 12 else max(1, n_pts // 5)
             if n_pts >= 16 and n_val >= 4:
-                # Deterministic tail holdout (stable across runs of same data).
-                y_val = y_arr[-n_val:]
-                p_val = pred[-n_val:]
-                y_fit = y_arr[:-n_val]
-                p_fit = pred[:-n_val]
+                # M-01: Deterministic permuted index holdout (uniform across dataset, stable for fixed n_pts).
+                perm = np.random.RandomState(42).permutation(n_pts)
+                val_idx = perm[:n_val]
+                fit_idx = perm[n_val:]
+                y_val = y_arr[val_idx]
+                p_val = pred[val_idx]
+                y_fit = y_arr[fit_idx]
+                p_fit = pred[fit_idx]
                 var_val = max(float(np.var(y_val)), 1e-15)
                 var_fit = max(float(np.var(y_fit)), 1e-15)
                 hold_mse = float(np.mean((p_val - y_val) ** 2))
