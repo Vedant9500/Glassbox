@@ -254,6 +254,37 @@ class SpecialistVault:
             return 0.0
         return corr if np.isfinite(corr) else 0.0
 
+    @classmethod
+    def residual_relevance_score(cls, pred: np.ndarray, residual: np.ndarray) -> float:
+        """|corr(pred, y - pred)| — structural residual signal for vault ranking (H-22).
+
+        residual is expected as ``pred - y``; we correlate against ``-residual = y - pred``.
+        Higher values mean the prediction still carries information about the residual
+        direction and is a better residual/composition building block than a pure noise fit.
+        """
+        pred_arr = np.asarray(pred, dtype=np.float64).reshape(-1)
+        res_arr = np.asarray(residual, dtype=np.float64).reshape(-1)
+        if pred_arr.size != res_arr.size or pred_arr.size < 3:
+            return 0.0
+        score = abs(cls._prediction_corr(pred_arr, -res_arr))
+        return float(score) if np.isfinite(score) else 0.0
+
+    def _rank_entry_key(self, entry: "SpecialistVaultEntry") -> tuple:
+        """Vault retention order: better MSE, then higher residual relevance, then simpler."""
+        mse = float("inf") if entry.validation_mse is None else float(entry.validation_mse)
+        relevance = float(entry.residual_relevance) if entry.residual_relevance is not None else 0.0
+        if not np.isfinite(relevance):
+            relevance = 0.0
+        return (
+            mse,
+            -relevance,  # higher residual_relevance ranks first
+            int(entry.complexity),
+            str(entry.formula),
+        )
+
+    def _sort_entries(self) -> None:
+        self.entries.sort(key=self._rank_entry_key)
+
     def _evict_stale(self, run_index: int) -> None:
         kept = []
         for entry in self.entries:
@@ -340,13 +371,19 @@ class SpecialistVault:
                 continue
             if gap > 0.50:
                 continue
-            rank = -float(hold_r2) + 0.002 * float(complexity)
-            scored.append((rank, candidate, pred, residual))
+            # H-22: residual_relevance boosts specialists useful for residual composition
+            relevance = self.residual_relevance_score(pred, residual)
+            rank = (
+                -float(hold_r2)
+                + 0.002 * float(complexity)
+                - 0.08 * float(relevance)
+            )
+            scored.append((rank, candidate, pred, residual, relevance))
 
         scored.sort(key=lambda item: item[0])
         added = 0
         max_new = max(0, int(max_new))
-        for _, candidate, pred, residual in scored:
+        for _, candidate, pred, residual, relevance in scored:
             if added >= max_new:
                 break
             formula = str((candidate or {}).get("formula", "")).strip()
@@ -378,21 +415,19 @@ class SpecialistVault:
                 prediction_vector=np.asarray(pred, dtype=np.float64),
                 run_index=int(run_index),
                 last_improved_run=int(run_index),
+                residual_relevance=float(relevance),
             )
             self.entries.append(entry)
             existing_keys.add(key)
             self.added_count += 1
             added += 1
 
-        self.entries.sort(key=lambda entry: (
-            float("inf") if entry.validation_mse is None else float(entry.validation_mse),
-            int(entry.complexity),
-            entry.formula,
-        ))
+        self._sort_entries()
         if len(self.entries) > int(self.max_entries):
             self.evicted_count += len(self.entries) - int(self.max_entries)
             self.entries = self.entries[: int(self.max_entries)]
         self._evict_stale(run_index)
+        self._sort_entries()
         return int(added)
 
     def rescore_against_target(
@@ -406,6 +441,7 @@ class SpecialistVault:
             return
         X_arr = np.asarray(X, dtype=np.float64)
         y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+        y_var = max(float(np.var(y_arr)), 1e-15)
         for entry in self.entries:
             try:
                 pred = np.asarray(evaluate_formula(entry.formula, X_arr), dtype=np.float64).reshape(-1)
@@ -418,10 +454,17 @@ class SpecialistVault:
             residual = pred - y_arr
             entry.prediction_vector = pred
             entry.residual_vector = residual
-            target_residual = -residual
-            entry.residual_relevance = abs(self._prediction_corr(pred, target_residual))
+            entry.residual_relevance = self.residual_relevance_score(pred, residual)
+            # Keep validation metrics in sync with current target for ranking
+            mse = float(np.mean(residual ** 2))
+            if np.isfinite(mse):
+                entry.validation_mse = mse
+                entry.validation_r2 = float(1.0 - mse / y_var)
+        # H-22: re-rank vault after residual relevance is refreshed
+        self._sort_entries()
 
     def candidate_dicts(self) -> List[Dict[str, Any]]:
+        # Entries are kept sorted by _sort_entries (MSE, residual_relevance, complexity)
         return [entry.to_candidate_dict() for entry in self.entries]
 
     def propose_compositions(
@@ -1076,16 +1119,21 @@ def propose_specialist_compositions(
 
         # 2. Nested: f(g)
         def _maybe_add_nested(outer_formula: str, inner_formula: str, outer_family: str, inner_pred: Optional[np.ndarray]) -> None:
-            if outer_family not in {"sin", "cos", "exp", "log"}:
+            # H-21: family may be multi-token ("exp+sin") or legacy single-token ("sin")
+            family_tokens = {
+                t for t in str(outer_family or "").split("+") if t
+            }
+            nestable = family_tokens & {"sin", "cos", "exp", "log"}
+            if not nestable:
                 return
             if y is not None and inner_pred is not None:
                 std_inner = np.std(inner_pred)
                 range_inner = np.max(inner_pred) - np.min(inner_pred)
                 if std_inner <= 1e-5 or range_inner >= 20.0:
                     return
-                if outer_family == "exp" and np.max(inner_pred) >= 5.0:
+                if "exp" in nestable and np.max(inner_pred) >= 5.0:
                     return
-                if outer_family == "log" and np.min(inner_pred) <= 0.01:
+                if "log" in nestable and np.min(inner_pred) <= 0.01:
                     return
             _dedupe_append(forms, "nested", nest_formulas(outer_formula, inner_formula))
 

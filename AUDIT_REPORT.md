@@ -5,7 +5,7 @@
 **Supersedes:** first-pass audit text and the interim verification pass (formerly split across two files) — merged here as the sole report  
 **Scope:** Entire active tree (`glassbox/`, `scripts/`, `tests/`, `docs/`, C++ under `glassbox/sr/cpp/`); Eigen vendored, `.tmp/`, `results/`, local `models/` weights out of scope for product bugs  
 **Method:** Multi-pass static analysis + cross-module verification + secondary cascade + full re-verification of every prior finding against current sources  
-**Code modified:** H-01…H-18 fixed (C++ core, sklearn wrapper, blackbox, universal proposer, curve classifier, train paths, ONN tau/elite); report marks them **FIXED**
+**Code modified:** H-01…H-22 fixed (C++ core, sklearn wrapper, blackbox, universal proposer, curve classifier, train paths, ONN tau/elite/BN, phased regression, family signatures, specialist vault ranking); report marks them **FIXED**
 
 This document is the **only** audit report to maintain. It combines:
 
@@ -322,10 +322,10 @@ Matches `x`, `x0`, `x1`, … So `nest_formulas("sin(x0)+x1", "x0**2")` → `sin(
 | **H-16** | **FIXED** | Derive `n_features` from `eql` / `other_mlp` weights (or `feature_dim`); no wrong `classifier_in-512` / `fc1` combined width |
 | **H-17** | **FIXED** | `set_model_tau` only touches HardConcrete selectors/gates + plain float node tau; skips `MetaAggregation` |
 | **H-18** | **FIXED** | Clear `_is_elite` when selection tau changes so elites are re-evaluated under new temperature |
-| **H-19** | CONFIRMED | Wrong import `.bfgs_optimizer` (`phased_regression.py:22–26`); unary 0/1 comments+logic treat 0 as Power but `OperationNode.unary_ops` is `[MetaPeriodic, MetaPower, ...]` |
-| **H-20** | CONFIRMED (ONN) | Train-mode refine vs eval-mode fitness BN mismatch |
-| **H-21** | CONFIRMED | `_formula_family_signature` first-token wins (`sklearn_wrapper.py:5272–5292`) → nest eligibility wrong for multi-op formulas |
-| **H-22** | CONFIRMED (refined) | `residual_relevance = abs(corr(pred, -residual))` (`specialist_state.py:418–422`); **computed and exported, never used to rank/select** |
+| **H-19** | **FIXED** | BFGS import via `optimizers.bfgs_optimizer`; `_unary_op_kind` uses node op list (`periodic=0`, `power=1`) |
+| **H-20** | **FIXED** | `refine_constants` / `quick_refine_internal` run in `eval()` so BN and HardConcrete match fitness |
+| **H-21** | **FIXED** | Multi-token family signature (`sin+exp+multiplicative`); nest eligibility accepts token sets |
+| **H-22** | **FIXED** | `residual_relevance` set on vault admission; ranks retention/export (MSE, −relevance, complexity); rescore re-sorts |
 
 ### 2.3 Performance (P-01 … P-08)
 
@@ -487,9 +487,8 @@ Extends R-02; production path for all displayed formulas.
 
 #### H-25 — Family signature + nest: multi-op formulas monopolized by first keyword  
 **Severity: HIGH (extends H-21)**  
-`sin(x)*exp(x)` → family `"sin"` only; composition eligibility and diversity pruning mis-bucket.
-
-**Fix:** Set/frozenset of ops or sorted multi-token signature.
+**Status: FIXED** (same change as H-21)  
+`sin(x)*exp(x)` → multi-token `"exp+multiplicative+sin"`; nest eligibility uses token sets.
 
 ---
 
@@ -535,8 +534,8 @@ Key = `(n, mean/std moments, dot, n_points)` over 32 samples — different formu
 | H-02, H-03 | **DONE** Clamp simplify folds; clamp `phi` (and Exp ω) in Adam/LM | `simplify*.h`, `evolution.h` | S |
 | H-04 | **DONE** LM FD fallback + child bounds for nested unaries | `evolution.h` | S |
 | H-06 | **DONE** Thread-local arithmetic temperature isolation | `eval.h` | S |
-| H-21, H-25 | Multi-token family signatures | `sklearn_wrapper.py:5272` | S |
-| H-22 | Use residual_relevance in vault ranking or delete | `specialist_state.py` | S |
+| H-21, H-25 | **DONE** Multi-token family signatures + nest token sets | `sklearn_wrapper.py`, `specialist_state.py` | S |
+| H-22 | **DONE** residual_relevance in vault rank/admission/rescore | `specialist_state.py` | S |
 | C-13 | Python seed: treat `x0` as single-feature alias of `x` | `seed_graph_builder.py:88,610` | S |
 | H-08 | **DONE** Final accept always `_final_formula_score` / display MSE | wrapper + fast path | M |
 | H-09 | **DONE** Raise on invalid blackbox weights | `blackbox_preprocessor.py` | S |
@@ -560,7 +559,7 @@ Key = `(n, mean/std moments, dot, n_points)` over 32 samples — different formu
 | C-10 | `invalidate_cache` after every mutation | S |
 | C-11 | Windowed compiled forward | M |
 | H-17–H-18 | **DONE** tau filters + elite re-eval | S |
-| H-19–H-20 | BFGS import, unary index map, BN mode | M |
+| H-19–H-20 | **DONE** BFGS import, unary index map, BN mode | S |
 
 ### 4.4 P3 — Performance
 
@@ -698,7 +697,7 @@ primary_sources = self.router.get_primary_sources()
 | Severity | First-pass claimed | Verified + new |
 |----------|------------|-------------------|
 | CRITICAL | 13 (C-01…C-13) | **14** production-critical themes (C-01…C-13 + C-14); C-05 exposure refined |
-| HIGH | 22+ | **24+** open themes originally; **H-01…H-18 FIXED** (remaining from H-19+) |
+| HIGH | 22+ | **24+** open themes originally; **H-01…H-22 FIXED** (remaining open: H-23+ if any, plus C/P/R) |
 | MEDIUM / PERF / ROBUST | 30+ | **35+** including P-09/10, M-06, D-* |
 | FALSE POSITIVES | — | **0** full FPs among C-*; **2–3** overstatements refined |
 
@@ -939,27 +938,46 @@ Selection annealing and aggregation temperature share API → wrong aggregation 
 ---
 
 ### H-19 — Phased regression: wrong BFGS import + unary index swap
+**Status: FIXED**
 
-**File:** `phased_regression.py:22–26`, ~311–315  
+**File:** `phased_regression.py`  
 
-`from .bfgs_optimizer` always fails (`optimizers/bfgs_optimizer.py`); unary 0/1 mapped opposite of actual `[MetaPeriodic, MetaPower]`.
+`from .bfgs_optimizer` always failed (`optimizers/bfgs_optimizer.py`); unary 0/1 mapped opposite of actual `[MetaPeriodic, MetaPower]`.
 
-**Fix:**
-
-```python
-from .optimizers.bfgs_optimizer import fit_coefficients_bfgs, build_formula_from_weights
-# 0=periodic, 1=power, 2=exp, 3=log
-```
+**Fix applied:** Import from `.optimizers.bfgs_optimizer`; `_unary_op_kind` uses `node._unary_op_names` with fallback `periodic=0, power=1, exp=2, log=3`.
 
 ---
 
 ### H-20 — Train vs eval BatchNorm mismatch (refine vs fitness)
+**Status: FIXED**
 
-**File:** ONN refine in train mode; fitness in eval  
+**File:** `evolution.py` `refine_constants`, `quick_refine_internal`  
 
-Numerics disagree (~0.01+ growing).
+Refine used `model.train()` while fitness used `model.eval()` → BN / HardConcrete discrete path disagree.
 
-**Fix:** Shared mode for refine and fitness; or disable BN for SR.
+**Fix applied:** Both refine helpers force `model.eval()` for the whole optimization (including L-BFGS closures) and leave the model in eval for fitness.
+
+---
+
+### H-21 — Family signature first-token monopoly (extends H-25)
+**Status: FIXED**
+
+**File:** `sklearn_wrapper.py` `_formula_family_signature`; nest checks in `specialist_state.py`  
+
+`sin(x)*exp(x)` → family `"sin"` only; diversity prune and nest eligibility mis-bucket multi-op formulas.
+
+**Fix applied:** Multi-token sorted signature joined with `+` (e.g. `exp+multiplicative+sin`); `_formula_family_contains` for operator hints; nest eligibility splits multi-token families.
+
+---
+
+### H-22 — `residual_relevance` computed but unused for vault ranking
+**Status: FIXED**
+
+**File:** `specialist_state.py` `SpecialistVault`  
+
+`rescore_against_target` set `residual_relevance = abs(corr(pred, -residual))` but vault order was MSE + complexity only; the metric was exported and ignored for selection.
+
+**Fix applied:** Compute relevance on admission; admission rank includes `-0.08 * relevance`; retention/export order is `(mse, -relevance, complexity)`; `rescore_against_target` refreshes metrics and re-sorts.
 
 ---
 

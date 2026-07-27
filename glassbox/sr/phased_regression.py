@@ -18,12 +18,45 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional, Callable
 import copy
 
-# Import BFGS optimizer for better coefficient fitting
+# Import BFGS optimizer for better coefficient fitting (lives under optimizers/)
 try:
-    from .bfgs_optimizer import fit_coefficients_bfgs, build_formula_from_weights
+    from .optimizers.bfgs_optimizer import fit_coefficients_bfgs, build_formula_from_weights
     BFGS_AVAILABLE = True
-except ImportError:
-    BFGS_AVAILABLE = False
+except ImportError:  # pragma: no cover - package layout always present in tree
+    try:
+        from glassbox.sr.optimizers.bfgs_optimizer import (
+            fit_coefficients_bfgs,
+            build_formula_from_weights,
+        )
+        BFGS_AVAILABLE = True
+    except ImportError:
+        BFGS_AVAILABLE = False
+        fit_coefficients_bfgs = None  # type: ignore[assignment]
+        build_formula_from_weights = None  # type: ignore[assignment]
+
+
+def _unary_op_kind(node, unary_idx: int) -> str:
+    """Map unary selector index to op kind using the node's actual op list (H-19).
+
+    ``OperationNode.unary_ops`` order is ``[MetaPeriodic, MetaPower, ...]``
+    (simplified and full). Older comments incorrectly claimed ``[MetaPower,
+    MetaPeriodic]`` and swapped the indices.
+    """
+    names = getattr(node, "_unary_op_names", None)
+    if names is not None:
+        try:
+            return str(names[int(unary_idx)])
+        except (IndexError, TypeError, ValueError):
+            pass
+    # Fallback matches OperationNode construction order
+    fallback = ("periodic", "power", "exp", "log")
+    try:
+        idx = int(unary_idx)
+    except (TypeError, ValueError):
+        return "unknown"
+    if 0 <= idx < len(fallback):
+        return fallback[idx]
+    return "unknown"
 
 
 class PhasedSymbolicRegressor:
@@ -184,47 +217,48 @@ class PhasedSymbolicRegressor:
                                 # Get operation name based on index
                                 if op_type == 'unary':
                                     unary_idx = sel.get('unary_idx', 0)
-                                    # Check if it's a periodic function (sin/cos)
-                                    if hasattr(node, 'unary_ops'):
-                                        # Simplified ops: [MetaPower, MetaPeriodic]
-                                        if unary_idx == 1:  # MetaPeriodic
-                                            # Check if sin or cos based on output
-                                            sin_output = torch.sin(x)
-                                            cos_output = torch.cos(x)
-                                            sin_corr = torch.corrcoef(torch.stack([
-                                                sin_output.squeeze(), node_output.squeeze()
-                                            ]))[0, 1].abs().item()
-                                            cos_corr = torch.corrcoef(torch.stack([
-                                                cos_output.squeeze(), node_output.squeeze()
-                                            ]))[0, 1].abs().item()
-                                            
-                                            if sin_corr > 0.9:
-                                                node_formula = "sin(x0)"
-                                            elif cos_corr > 0.9:
-                                                node_formula = "cos(x0)"
-                                            else:
-                                                node_formula = "periodic(x0)"
-                                        elif unary_idx == 0:  # MetaPower
-                                            # Check what power
-                                            x2_corr = torch.corrcoef(torch.stack([
-                                                (x**2).squeeze(), node_output.squeeze()
-                                            ]))[0, 1].abs().item()
-                                            x3_corr = torch.corrcoef(torch.stack([
-                                                (x**3).squeeze(), node_output.squeeze()
-                                            ]))[0, 1].abs().item()
-                                            x1_corr = torch.corrcoef(torch.stack([
-                                                x.squeeze(), node_output.squeeze()
-                                            ]))[0, 1].abs().item()
-                                            
-                                            if x2_corr > 0.95:
-                                                node_formula = "x0²"
-                                            elif x3_corr > 0.95:
-                                                node_formula = "x0³"
-                                            elif x1_corr > 0.95:
-                                                node_formula = "x0"
-                                            else:
-                                                node_formula = f"x0^p"
-                                                
+                                    kind = _unary_op_kind(node, unary_idx)
+                                    if kind == 'periodic':
+                                        # Check if sin or cos based on output
+                                        sin_output = torch.sin(x)
+                                        cos_output = torch.cos(x)
+                                        sin_corr = torch.corrcoef(torch.stack([
+                                            sin_output.squeeze(), node_output.squeeze()
+                                        ]))[0, 1].abs().item()
+                                        cos_corr = torch.corrcoef(torch.stack([
+                                            cos_output.squeeze(), node_output.squeeze()
+                                        ]))[0, 1].abs().item()
+
+                                        if sin_corr > 0.9:
+                                            node_formula = "sin(x0)"
+                                        elif cos_corr > 0.9:
+                                            node_formula = "cos(x0)"
+                                        else:
+                                            node_formula = "periodic(x0)"
+                                    elif kind == 'power':
+                                        x2_corr = torch.corrcoef(torch.stack([
+                                            (x**2).squeeze(), node_output.squeeze()
+                                        ]))[0, 1].abs().item()
+                                        x3_corr = torch.corrcoef(torch.stack([
+                                            (x**3).squeeze(), node_output.squeeze()
+                                        ]))[0, 1].abs().item()
+                                        x1_corr = torch.corrcoef(torch.stack([
+                                            x.squeeze(), node_output.squeeze()
+                                        ]))[0, 1].abs().item()
+
+                                        if x2_corr > 0.95:
+                                            node_formula = "x0²"
+                                        elif x3_corr > 0.95:
+                                            node_formula = "x0³"
+                                        elif x1_corr > 0.95:
+                                            node_formula = "x0"
+                                        else:
+                                            node_formula = "x0^p"
+                                    elif kind == 'exp':
+                                        node_formula = "exp(x0)"
+                                    elif kind == 'log':
+                                        node_formula = "log(x0)"
+
                                 elif op_type == 'binary':
                                     # Binary ops: multiplication
                                     x2_corr = torch.corrcoef(torch.stack([
@@ -309,10 +343,9 @@ class PhasedSymbolicRegressor:
                             unary_idx = sel.get('unary_idx', 0)
                             
                             if op_type == 'unary':
-                                if unary_idx == 0:  # MetaPower
-                                    discovered_ops.add('power')
-                                elif unary_idx == 1:  # MetaPeriodic
-                                    discovered_ops.add('periodic')
+                                kind = _unary_op_kind(node, unary_idx)
+                                if kind in ('power', 'periodic', 'exp', 'log'):
+                                    discovered_ops.add(kind)
                             elif op_type == 'binary':
                                 discovered_ops.add('multiply')
                         except:

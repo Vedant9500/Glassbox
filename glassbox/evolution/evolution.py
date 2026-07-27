@@ -1012,7 +1012,10 @@ def refine_constants(
         refine_internal: If True, ALSO tune p, omega, phi, etc. (use for final polish)
         use_amp: If True, use FP16 mixed precision for ~2x speedup (CUDA only)
     """
-    model.train()
+    # H-20: refine in eval mode so BatchNorm/HardConcrete match fitness scoring.
+    # train-mode BN uses per-batch stats while fitness uses running stats → mismatch.
+    was_training = model.training
+    model.eval()
     
     # Check if AMP is available (CUDA only)
     amp_enabled = use_amp and x.is_cuda
@@ -1041,6 +1044,8 @@ def refine_constants(
                 constant_params.append(param)
     
     if not constant_params:
+        if was_training:
+            model.train()
         return float('inf')
     
     best_loss = float('inf')
@@ -1089,6 +1094,8 @@ def refine_constants(
                     loss = F.mse_loss(pred, y_squeezed)
                 
                 if torch.isnan(loss):
+                    if was_training:
+                        model.train()
                     return float('inf')
                 
                 # Backward pass with scaler for FP16
@@ -1108,11 +1115,17 @@ def refine_constants(
         logger.debug(f"refine_constants memory/runtime error: {e}")
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        if was_training:
+            model.train()
         return float('inf')
     except Exception as e:
         logger.warning(f"refine_constants unexpected error: {e}")
+        if was_training:
+            model.train()
         return float('inf')
     
+    # Leave in eval (fitness path); caller may train() if needed
+    model.eval()
     return best_loss
 
 
@@ -1143,7 +1156,8 @@ def quick_refine_internal(
     Returns:
         Best MSE achieved (float('inf') on failure)
     """
-    model.train()
+    # H-20: same mode as fitness (eval) so BN / discrete selection match scoring
+    model.eval()
     
     # Collect ONLY internal constant parameters
     internal_params = []
@@ -1171,6 +1185,8 @@ def quick_refine_internal(
         def closure():
             nonlocal best_loss
             optimizer.zero_grad()
+            # Keep eval mode inside L-BFGS steps (do not flip to train)
+            model.eval()
             pred, _ = model(x, hard=True)
             pred = pred.squeeze()
             loss = F.mse_loss(pred, y_squeezed)
@@ -1184,6 +1200,7 @@ def quick_refine_internal(
         
     except Exception as e:
         logger.debug(f"quick_refine_internal failed: {e}")
+        model.eval()
         return float('inf')
     
     model.eval()

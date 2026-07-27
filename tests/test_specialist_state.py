@@ -267,6 +267,75 @@ def test_propose_specialist_compositions_handles_reversed_nested_parent():
     )
 
 
+def test_h22_residual_relevance_computed_and_used_in_vault_rank():
+    """H-22: residual_relevance is set on admission and breaks ties in vault order."""
+    rng = np.random.RandomState(7)
+    X = rng.uniform(-2.0, 2.0, size=(120, 1))
+    x0 = X[:, 0]
+    # Target has structure shared with sin but residual is linear
+    y = np.sin(x0) + 0.4 * x0
+
+    vault = SpecialistVault(max_entries=3, corr_threshold=0.999)
+    candidates = [
+        # Structural partial: high residual relevance
+        {"formula": "sin(x0)", "source": "struct"},
+        # Weak constant-like (mean of y is near 0 on symmetric domain → low relevance)
+        {"formula": "0.01*x0", "source": "weak"},
+        # Complementary linear piece
+        {"formula": "0.4*x0", "source": "lin"},
+    ]
+    added = vault.add_candidates(
+        candidates,
+        X,
+        y,
+        evaluate_formula=_eval_formula,
+        complexity_fn=lambda formula: len(str(formula)),
+        family_signature_fn=lambda formula: str(formula)[:3],
+        run_index=0,
+        current_best_formula="0",
+        max_new=3,
+    )
+    assert added >= 1
+    # Every retained entry must have residual_relevance populated
+    for entry in vault.entries:
+        assert entry.residual_relevance is not None
+        assert 0.0 <= float(entry.residual_relevance) <= 1.0 + 1e-9
+
+    # Rescore re-ranks; order key is (mse, -relevance, complexity)
+    vault.rescore_against_target(X, y, evaluate_formula=_eval_formula)
+    keys = [vault._rank_entry_key(e) for e in vault.entries]
+    assert keys == sorted(keys)
+
+    # Explicit tie-break: equal MSE → higher residual_relevance ranks first
+    from glassbox.sr.specialist_state import SpecialistVaultEntry
+
+    low = SpecialistVaultEntry(
+        formula="a",
+        source="t",
+        validation_r2=0.5,
+        validation_mse=0.1,
+        complexity=5,
+        family_signature="a",
+        segment_scores=[],
+        residual_vector=np.zeros(3),
+        prediction_vector=np.zeros(3),
+        residual_relevance=0.1,
+    )
+    high = SpecialistVaultEntry(
+        formula="b",
+        source="t",
+        validation_r2=0.5,
+        validation_mse=0.1,
+        complexity=5,
+        family_signature="b",
+        segment_scores=[],
+        residual_vector=np.zeros(3),
+        prediction_vector=np.zeros(3),
+        residual_relevance=0.9,
+    )
+    assert vault._rank_entry_key(high) < vault._rank_entry_key(low)
+
+
 def test_specialist_vault_dedupes_by_prediction_correlation_and_caps_entries():
     # 2D additive target: partial specialists x0/x1 both clear S8-1 holdout gate
     # (1D partials often fail tail-holdout R² on sin/poly mixes).

@@ -5281,27 +5281,48 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         )
         return ranked[: max(1, int(max_candidates))]
 
-    def _formula_family_signature(self, formula):
+    def _formula_family_tokens(self, formula):
+        """Return sorted op-family tokens present in a formula (H-21 / H-25).
+
+        Multi-op expressions like ``sin(x)*exp(x)`` yield ``("exp", "multiplicative", "sin")``
+        instead of first-match-only ``"sin"``.
+        """
         text = str(formula or "").strip().lower()
         if not text:
-            return "empty"
+            return ("empty",)
+        tokens = []
         if "sin(" in text:
-            return "sin"
+            tokens.append("sin")
         if "cos(" in text:
-            return "cos"
+            tokens.append("cos")
         if "exp(" in text:
-            return "exp"
+            tokens.append("exp")
         if "log(" in text:
-            return "log"
+            tokens.append("log")
         if "/" in text:
-            return "rational"
+            tokens.append("rational")
         if "*" in text:
-            return "multiplicative"
-        if "+" in text or "-" in text:
-            return "additive"
-        if "^" in text:
-            return "power"
-        return "univariate"
+            tokens.append("multiplicative")
+        # Power before additive so "x**2" / "x^2" are not only "additive"
+        if "**" in text or "^" in text or "pow(" in text:
+            tokens.append("power")
+        # Coarse additive: explicit + or binary-looking minus (not scientific e- notation)
+        if "+" in text:
+            tokens.append("additive")
+        elif re.search(r"[)x0-9]\s*-\s*[(\w]", text):
+            tokens.append("additive")
+        if not tokens:
+            return ("univariate",)
+        return tuple(sorted(set(tokens)))
+
+    def _formula_family_signature(self, formula):
+        """Stable multi-token family key for diversity / nest eligibility (H-21)."""
+        return "+".join(self._formula_family_tokens(formula))
+
+    def _formula_family_contains(self, formula, *kinds):
+        """True if any of ``kinds`` appears in the multi-token family of ``formula``."""
+        tokens = set(self._formula_family_tokens(formula))
+        return any(k in tokens for k in kinds)
 
     def _formula_feature_signature(self, formula):
         text = str(formula or "")
@@ -5392,18 +5413,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             if not formula:
                 continue
             hints["active_terms"].append(formula)
-            family = self._formula_family_signature(formula)
-            if family in ("sin", "cos"):
+            if self._formula_family_contains(formula, "sin", "cos"):
                 hints["operators"].add("periodic")
-            elif family == "exp":
+            if self._formula_family_contains(formula, "exp"):
                 hints["operators"].add("exp")
                 hints["has_exp_decay"] = True
-            elif family == "log":
+            if self._formula_family_contains(formula, "log"):
                 hints["operators"].add("log")
-            elif family == "rational":
+            if self._formula_family_contains(formula, "rational"):
                 hints["operators"].add("rational")
                 hints["has_rational"] = True
-            elif family == "power":
+            if self._formula_family_contains(formula, "power"):
                 hints["operators"].add("power")
 
         hints["powers"] = sorted(set(int(p) for p in hints["powers"] if isinstance(p, (int, np.integer)) and 1 <= int(p) <= 8))
