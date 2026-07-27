@@ -645,6 +645,75 @@ def load_classifier(
     return _load_pytorch_classifier(model_path_obj, resolved_device, cache_key)
 
 
+def _resolve_n_features_from_state_dict(
+    model_type: str,
+    state_dict: dict,
+    model_config: dict,
+    checkpoint: dict,
+) -> int:
+    """Resolve input feature dimension for classifier reconstruction (H-16).
+
+    Preference order:
+    1. ``model_config['n_features']`` (current checkpoints)
+    2. top-level ``feature_dim`` (legacy metadata)
+    3. architecture-specific weight shapes that encode true input width
+
+    Avoids the old CNN heuristic ``classifier_in - 512`` (yields curve_dim, not
+    full feature dim) and the GLU/MLP mistake of reading *combined* layer widths
+    (``fc1`` / ``net.0``) instead of the EQL input projection.
+    """
+    if 'n_features' in model_config and model_config['n_features'] is not None:
+        return int(model_config['n_features'])
+
+    feature_dim = checkpoint.get('feature_dim')
+    if feature_dim is not None:
+        return int(feature_dim)
+
+    if model_type == 'cnn':
+        # other_mlp.0: Linear(other_dim, 128) where other_dim = n_features - curve_dim
+        if 'other_mlp.0.weight' in state_dict:
+            other_dim = int(state_dict['other_mlp.0.weight'].shape[1])
+            curve_dim = int(model_config.get('curve_dim', 128))
+            return int(max(1, curve_dim + other_dim))
+        # Last resort: classifier is Linear(128*4 + 128, …) — cannot recover
+        # full n_features; raise rather than silently build a wrong model.
+        raise ValueError(
+            "Cannot derive CNN n_features from checkpoint: missing model_config"
+            "['n_features'], feature_dim, and other_mlp.0.weight. "
+            "Re-export the checkpoint with n_features in model_config."
+        )
+
+    if model_type == 'glu':
+        # eql.linear: Linear(n_features, eql_out_dim) — true input width
+        if 'eql.linear.weight' in state_dict:
+            return int(state_dict['eql.linear.weight'].shape[1])
+        raise ValueError(
+            "Cannot derive GLU n_features from checkpoint: missing model_config"
+            "['n_features'], feature_dim, and eql.linear.weight. "
+            "Re-export the checkpoint with n_features in model_config."
+        )
+
+    # MLP (default)
+    if 'eql.linear.weight' in state_dict:
+        return int(state_dict['eql.linear.weight'].shape[1])
+    if 'net.0.weight' in state_dict:
+        # net.0 is Linear(n_features + eql_out, hidden); eql_out is 256 in arch
+        combined = int(state_dict['net.0.weight'].shape[1])
+        eql_out_dim = 256
+        n_features = combined - eql_out_dim
+        if n_features < 1:
+            raise ValueError(
+                f"Derived MLP n_features={n_features} from net.0 combined "
+                f"width {combined}; checkpoint is corrupt or architecture mismatch."
+            )
+        return int(n_features)
+    raise ValueError(
+        "Cannot derive MLP n_features from checkpoint: missing model_config"
+        "['n_features'], feature_dim, eql.linear.weight, and net.0.weight. "
+        "Re-export the checkpoint with n_features in model_config."
+    )
+
+
 def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, cache_key: str) -> nn.Module:
     """Load PyTorch classifier from .pt file."""
     global _cached_classifier_by_device, _cached_operator_classes_by_key, _cached_metadata_by_device
@@ -673,22 +742,23 @@ def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, ca
     if model_type is None:
         if any(k.startswith('conv.') for k in state_dict.keys()):
             model_type = 'cnn'
+        elif any(k.startswith('fc1.') for k in state_dict.keys()) and any(
+            k.startswith('eql.') for k in state_dict.keys()
+        ):
+            model_type = 'glu'
         elif any(k.startswith('net.') for k in state_dict.keys()):
             model_type = 'mlp'
         else:
             raise ValueError(
                 "Unable to infer classifier architecture from checkpoint; "
-                "expected MLP keys ('net.*') or CNN keys ('conv.*')."
+                "expected MLP keys ('net.*'), CNN keys ('conv.*'), or GLU keys ('fc1.*'+'eql.*')."
             )
 
-    if model_type == 'cnn':
-        if 'n_features' in model_config:
-            n_features = int(model_config['n_features'])
-        else:
-            # Derive from first conv classifier layer input: 128*4 + 128(other)
-            classifier_in = state_dict['classifier.0.weight'].shape[1]
-            n_features = int(max(1, classifier_in - (128 * 4)))
+    n_features = _resolve_n_features_from_state_dict(
+        model_type, state_dict, model_config, checkpoint
+    )
 
+    if model_type == 'cnn':
         curve_dim = int(model_config.get('curve_dim', min(128, n_features)))
         model = CurveClassifierCNN(
             n_classes=int(model_config.get('n_classes', n_classes)),
@@ -696,14 +766,21 @@ def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, ca
             curve_dim=curve_dim,
         )
     elif model_type == 'glu':
-        input_weights = state_dict['fc1.weight']
-        n_features = int(model_config.get('n_features', input_weights.shape[1]))
-        hidden_size = int(model_config.get('hidden', input_weights.shape[0] // 2))
+        if 'hidden' in model_config and model_config['hidden'] is not None:
+            hidden_size = int(model_config['hidden'])
+        elif 'fc1.weight' in state_dict:
+            # fc1 is Linear(combined, hidden*2) for GLU
+            hidden_size = int(state_dict['fc1.weight'].shape[0] // 2)
+        else:
+            hidden_size = 512
         model = CurveClassifierGLU(n_features=n_features, n_classes=n_classes, hidden=hidden_size)
     else:
-        input_weights = state_dict['net.0.weight']
-        n_features = int(model_config.get('n_features', input_weights.shape[1]))
-        hidden_size = int(model_config.get('hidden', input_weights.shape[0]))
+        if 'hidden' in model_config and model_config['hidden'] is not None:
+            hidden_size = int(model_config['hidden'])
+        elif 'net.0.weight' in state_dict:
+            hidden_size = int(state_dict['net.0.weight'].shape[0])
+        else:
+            hidden_size = 512
         model = CurveClassifierMLP(n_features=n_features, n_classes=n_classes, hidden=hidden_size)
 
     model.load_state_dict(state_dict)
@@ -717,6 +794,7 @@ def _load_pytorch_classifier(model_path: Path, resolved_device: torch.device, ca
         'feature_scaler': checkpoint.get('feature_scaler'),
         'type': 'pytorch',
         'model_type': model_type,
+        'n_features': n_features,
         'operator_classes': operator_classes,
         'isotonic_calibration': checkpoint.get('isotonic_calibration'),
         'architecture_version': metadata_report.get('architecture_version'),

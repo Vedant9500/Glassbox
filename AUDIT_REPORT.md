@@ -5,7 +5,7 @@
 **Supersedes:** first-pass audit text and the interim verification pass (formerly split across two files) — merged here as the sole report  
 **Scope:** Entire active tree (`glassbox/`, `scripts/`, `tests/`, `docs/`, C++ under `glassbox/sr/cpp/`); Eigen vendored, `.tmp/`, `results/`, local `models/` weights out of scope for product bugs  
 **Method:** Multi-pass static analysis + cross-module verification + secondary cascade + full re-verification of every prior finding against current sources  
-**Code modified:** H-01…H-15 fixed (C++ core, sklearn wrapper, blackbox, universal proposer, curve classifier, train paths); report marks them **FIXED**
+**Code modified:** H-01…H-18 fixed (C++ core, sklearn wrapper, blackbox, universal proposer, curve classifier, train paths, ONN tau/elite); report marks them **FIXED**
 
 This document is the **only** audit report to maintain. It combines:
 
@@ -319,9 +319,9 @@ Matches `x`, `x0`, `x1`, … So `nest_formulas("sin(x0)+x1", "x0**2")` → `sin(
 | **H-13** | **FIXED** | Multivariate pairs among all cols (D≤8) or top-`max_rank` by \|corr(y,xi)\| — not index prefix |
 | **H-14** | **FIXED** | Interpolator cache keys content hash / sample fingerprint — not bare buffer pointers |
 | **H-15** | **FIXED** | Train curve gen + synthetic proposer use `extract_all_features_xy` (match inference sort/resample) |
-| **H-16** | CONFIRMED | CNN/GLU n_features fallback risk on missing config (`:684–707` class) |
-| **H-17** | CONFIRMED | `set_model_tau` (`evolution.py:104–114`) sets any module with `tau` / `set_tau`, including MetaAggregation |
-| **H-18** | CONFIRMED | Elite skip after global tau change (evolution loop ~2200 / 2770) |
+| **H-16** | **FIXED** | Derive `n_features` from `eql` / `other_mlp` weights (or `feature_dim`); no wrong `classifier_in-512` / `fc1` combined width |
+| **H-17** | **FIXED** | `set_model_tau` only touches HardConcrete selectors/gates + plain float node tau; skips `MetaAggregation` |
+| **H-18** | **FIXED** | Clear `_is_elite` when selection tau changes so elites are re-evaluated under new temperature |
 | **H-19** | CONFIRMED | Wrong import `.bfgs_optimizer` (`phased_regression.py:22–26`); unary 0/1 comments+logic treat 0 as Power but `OperationNode.unary_ops` is `[MetaPeriodic, MetaPower, ...]` |
 | **H-20** | CONFIRMED (ONN) | Train-mode refine vs eval-mode fitness BN mismatch |
 | **H-21** | CONFIRMED | `_formula_family_signature` first-token wins (`sklearn_wrapper.py:5272–5292`) → nest eligibility wrong for multi-op formulas |
@@ -547,6 +547,9 @@ Key = `(n, mean/std moments, dot, n_points)` over 32 samples — different formu
 | H-13 | **DONE** All-pairs or relevance-ranked pairs in grammar | `universal_proposer.py` | M |
 | H-14 | **DONE** Interpolator cache content fingerprint | `curve_classifier_integration.py` | S |
 | H-15 | **DONE** Train with `extract_all_features_xy` | `generate_curve_data.py`, train script | S |
+| H-16 | **DONE** Derive CNN/GLU/MLP `n_features` from weights | `curve_classifier_integration.py` | S |
+| H-17 | **DONE** `set_model_tau` HardConcrete-only | `evolution.py` | S |
+| H-18 | **DONE** Clear elite skip on tau change | `evolution.py` | S |
 
 ### 4.3 P2 — ONN research path (if still supported)
 
@@ -556,7 +559,8 @@ Key = `(n, mean/std moments, dot, n_points)` over 32 samples — different formu
 | C-09 | Token-equality for `p` / include lists | S |
 | C-10 | `invalidate_cache` after every mutation | S |
 | C-11 | Windowed compiled forward | M |
-| H-17–H-20, H-19 | tau filters, elite re-eval, BFGS import, unary index map, BN mode | M |
+| H-17–H-18 | **DONE** tau filters + elite re-eval | S |
+| H-19–H-20 | BFGS import, unary index map, BN mode | M |
 
 ### 4.4 P3 — Performance
 
@@ -694,7 +698,7 @@ primary_sources = self.router.get_primary_sources()
 | Severity | First-pass claimed | Verified + new |
 |----------|------------|-------------------|
 | CRITICAL | 13 (C-01…C-13) | **14** production-critical themes (C-01…C-13 + C-14); C-05 exposure refined |
-| HIGH | 22+ | **24+** open themes originally; **H-01…H-15 FIXED** (remaining from H-16+) |
+| HIGH | 22+ | **24+** open themes originally; **H-01…H-18 FIXED** (remaining from H-19+) |
 | MEDIUM / PERF / ROBUST | 30+ | **35+** including P-09/10, M-06, D-* |
 | FALSE POSITIVES | — | **0** full FPs among C-*; **2–3** overstatements refined |
 
@@ -902,32 +906,35 @@ Shuffled curves: large feature shift → train/serve gap.
 ---
 
 ### H-16 — CNN/GLU n_features fallback reconstructs wrong model
+**Status: FIXED**
 
-**File:** `curve_classifier_integration.py:684–707`  
+**File:** `curve_classifier_integration.py` load path  
 
 Missing `model_config` → wrong dims → load fail → empty predictions (fail-open).
 
-**Fix:** Derive dims from `eql` / `other_mlp` weights; require `n_features` in new checkpoints.
+**Fix applied:** `_resolve_n_features_from_state_dict` prefers `model_config['n_features']` / `feature_dim`, else derives from `other_mlp.0` (CNN: `curve_dim + other_dim`) or `eql.linear` (GLU/MLP). Raises rather than guessing when weights are insufficient. GLU arch detection also fixed for missing `model_type`.
 
 ---
 
 ### H-17 — `set_model_tau` overwrites `MetaAggregation.tau`
+**Status: FIXED**
 
-**File:** `evolution.py:104–114`, `meta_ops.py`  
+**File:** `evolution.py` `set_model_tau`, `meta_ops.py`  
 
 Selection annealing and aggregation temperature share API → wrong aggregation math.
 
-**Fix:** Only set tau on HardConcrete selectors/gates via `isinstance` filters.
+**Fix applied:** Only set tau on `HardConcreteGate` / `HardConcreteSelector` / `HardConcreteOperationSelector` (and plain float node/DAG `tau`); skip `MetaAggregation` entirely (including its `set_tau`).
 
 ---
 
 ### H-18 — Elite fitness skip after global tau change
+**Status: FIXED**
 
-**File:** `evolution.py:2200–2204`, `2770–2793`  
+**File:** `evolution.py` train loop + hybrid ES cycle  
 
 `set_model_tau` then skip re-eval for elites → stale fitness.
 
-**Fix:** Clear elite skip when tau/environment changes; or always re-eval.
+**Fix applied:** Track `_last_applied_tau`; when selection tau changes, clear `_is_elite` so `evaluate_fitness` re-scores. Elite skip remains when tau is unchanged.
 
 ---
 

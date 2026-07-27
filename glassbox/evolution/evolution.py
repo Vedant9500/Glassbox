@@ -103,15 +103,54 @@ except ImportError:
 
 def set_model_tau(model: nn.Module, tau: float):
     """
-    Set temperature (tau) on all selectors in the model.
-    
-    Lower tau = more discrete selection (sharper softmax).
+    Set selection temperature (tau) on HardConcrete selectors/gates only.
+
+    Lower tau = more discrete selection (sharper sampling).
+
+    Intentionally does **not** touch ``MetaAggregation.tau``: that parameter
+    controls aggregation softness (mean / max / min) and must stay independent
+    of selection annealing (H-17). Also updates plain float ``tau`` attributes
+    on OperationNode / OperationDAG (selection routing temperature).
     """
+    try:
+        from glassbox.sr.hard_concrete import (
+            HardConcreteGate,
+            HardConcreteSelector,
+            HardConcreteOperationSelector,
+        )
+        from glassbox.sr.operations.meta_ops import MetaAggregation
+        _selector_types = (
+            HardConcreteGate,
+            HardConcreteSelector,
+            HardConcreteOperationSelector,
+        )
+        _skip_types = (MetaAggregation,)
+    except ImportError:  # pragma: no cover - hard_concrete always present in tree
+        _selector_types = ()
+        _skip_types = ()
+
     for module in model.modules():
+        if _skip_types and isinstance(module, _skip_types):
+            continue
+        if _selector_types and isinstance(module, _selector_types):
+            if hasattr(module, 'set_tau') and callable(getattr(module, 'set_tau')):
+                module.set_tau(tau)
+            elif hasattr(module, 'tau') and not isinstance(getattr(module, 'tau'), nn.Parameter):
+                module.tau = tau
+            continue
+        # OperationNode / OperationDAG: selection tau is a plain Python float
+        tau_attr = getattr(module, 'tau', None)
+        if tau_attr is None:
+            continue
+        if isinstance(tau_attr, torch.Tensor):
+            continue  # buffers / parameters belong to non-selector modules
         if hasattr(module, 'set_tau') and callable(getattr(module, 'set_tau')):
-            module.set_tau(tau)
-        elif hasattr(module, 'tau') and not isinstance(getattr(module, 'tau'), nn.Parameter):
-            module.tau = tau
+            # Avoid calling set_tau on modules we did not whitelist (e.g. MetaAggregation)
+            continue
+        try:
+            module.tau = float(tau)
+        except (TypeError, AttributeError):
+            pass
 
 
 def detect_dominant_frequency(
@@ -2770,8 +2809,12 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         for gen in range(generations):
             # Anneal tau for all individuals (early soft, late hard)
             current_tau = anneal_tau(gen, generations, self.tau_start, self.tau_end)
+            tau_changed = getattr(self, '_last_applied_tau', None) != current_tau
             for ind in self.population:
                 set_model_tau(ind.model, current_tau)
+                # H-18: elite fitness was computed under the previous tau; force re-eval
+                if tau_changed and getattr(ind, '_is_elite', False):
+                    ind._is_elite = False
             
             # Explorers keep HIGHER tau (stay soft for more exploration)
             # Only apply when not in refinement-only mode
@@ -2779,6 +2822,9 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 explorer_tau = max(current_tau, MIN_EXPLORER_TAU)  # Explorers never go below min
                 for explorer in self.explorers:
                     set_model_tau(explorer.model, explorer_tau)
+                    if tau_changed and getattr(explorer, '_is_elite', False):
+                        explorer._is_elite = False
+            self._last_applied_tau = current_tau
             
             # Reset nested BFGS refinement flags for all individuals
             # This ensures each individual is refined once per generation
@@ -3413,6 +3459,9 @@ def train_onn_hybrid(
             )
             for ind in trainer.population:
                 set_model_tau(ind.model, current_tau)
+                # H-18: re-evaluate elites after selection-tau environment change
+                if getattr(ind, '_is_elite', False):
+                    ind._is_elite = False
             
             trainer.evaluate_fitness(
                 x, y, 
