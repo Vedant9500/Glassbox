@@ -821,6 +821,10 @@ static py::dict run_evolution_cpp(
     result["seed_graphs_skipped_oversized"] = seed_graphs_skipped_oversized;
     result["seed_graphs_skipped_invalid"] = seed_graphs_skipped_invalid;  // H-07
     result["seed_graph_node_limit"] = seed_graph_node_limit;
+    result["last_crossover_valid"] = engine.get_last_crossover_valid();
+    result["crossover_attempts"] = engine.get_crossover_attempts();
+    result["crossover_successes"] = engine.get_crossover_successes();
+    result["crossover_valid_rate"] = engine.get_crossover_valid_rate();
     
     // Serialize graph structure
     py::list nodes_list;

@@ -568,6 +568,13 @@ public:
     int get_random_seed() const { return config_.random_seed; }
     int get_last_island_outer_threads() const { return last_island_outer_threads_; }
     int get_last_island_inner_threads() const { return last_island_inner_threads_; }
+    bool get_last_crossover_valid() const { return last_crossover_valid_; }
+    int get_crossover_attempts() const { return crossover_attempts_; }
+    int get_crossover_successes() const { return crossover_successes_; }
+    double get_crossover_valid_rate() const {
+        if (crossover_attempts_ <= 0) return 0.0;
+        return static_cast<double>(crossover_successes_) / static_cast<double>(crossover_attempts_);
+    }
 
     // P5: Return entire Pareto front (rank-0 individuals)
     // Re-runs non_dominated_sort on the current population to get clean ranks.
@@ -792,6 +799,9 @@ public:
         for (auto& island : islands) {
             auto best = island.get_best();
             consider_champion(best);
+            crossover_attempts_ += island.get_crossover_attempts();
+            crossover_successes_ += island.get_crossover_successes();
+            last_crossover_valid_ = island.get_last_crossover_valid();
         }
 
         // Merge all island populations for Pareto front (if NSGA-II)
@@ -833,6 +843,8 @@ private:
     std::ofstream trace_stream_;
     bool trace_enabled_ = false;
     bool last_crossover_valid_ = false;
+    int crossover_attempts_ = 0;
+    int crossover_successes_ = 0;
     int first_exact_generation_ = -1;
     double first_exact_time_sec_ = -1.0;
     int first_acceptable_generation_ = -1;
@@ -2029,6 +2041,7 @@ private:
     // Swaps a contiguous subtree between two parents to produce one child.
     // A "subtree" here is all nodes reachable from a selected crossover point.
     IndividualGraph crossover(const IndividualGraph& parent_a, const IndividualGraph& parent_b) {
+        ++crossover_attempts_;
         last_crossover_valid_ = false;
         IndividualGraph child = parent_a; // Start from parent A
 
@@ -2137,6 +2150,7 @@ private:
         child.weighted_mse = 1e9;
         child.fitness_valid = false;  // E6
         last_crossover_valid_ = true;
+        ++crossover_successes_;
         return child;
     }
 

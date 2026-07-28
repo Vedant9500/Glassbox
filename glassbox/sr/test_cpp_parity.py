@@ -64,6 +64,39 @@ def test_basic_execution(simple_data):
 
 
 @requires_cpp
+def test_crossover_diagnostics_exported(simple_data):
+    """M-03: run_evolution exports crossover validity diagnostics."""
+    X_list, y = simple_data
+    result = _core.run_evolution(
+        X_list,
+        y,
+        pop_size=24,
+        generations=12,
+        elite_size=2,
+        num_islands=1,
+        early_stop_mse=1e-12,
+        random_seed=11,
+    )
+
+    for key in (
+        "last_crossover_valid",
+        "crossover_attempts",
+        "crossover_successes",
+        "crossover_valid_rate",
+    ):
+        assert key in result, f"Result missing '{key}' key"
+
+    assert isinstance(result["last_crossover_valid"], bool)
+    assert result["crossover_attempts"] >= 0
+    assert result["crossover_successes"] >= 0
+    assert result["crossover_successes"] <= result["crossover_attempts"]
+    assert 0.0 <= result["crossover_valid_rate"] <= 1.0
+    if result["crossover_attempts"] > 0:
+        expected = result["crossover_successes"] / result["crossover_attempts"]
+        assert abs(result["crossover_valid_rate"] - expected) < 1e-12
+
+
+@requires_cpp
 def test_seed_omegas(simple_data):
     """run_evolution should accept seed_omegas without crashing."""
     X_list, y = simple_data
