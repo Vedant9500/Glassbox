@@ -6,6 +6,8 @@ from scripts.classifier_fast_path import run_fast_path
 
 
 def test_fpip_v2_builder_and_validator():
+    x = np.linspace(-1.0, 1.0, 64)
+    y = np.sin(x)
     payload = build_fpip_v2_from_fast_path(
         formula="sin(x)",
         mse=1e-4,
@@ -17,6 +19,8 @@ def test_fpip_v2_builder_and_validator():
         uncertainty={"prediction_entropy": 0.2, "prediction_margin": 0.6, "prediction_uncertain": False},
         residual_diagnostics={"residual_suspicious": False, "residual_spectral_peak_ratio": 0.1},
         operator_hints={"operators": {"sin", "periodic"}, "frequencies": [1.0]},
+        x=x,
+        y=y,
     )
 
     ok, errors = validate_fpip_v2_payload(payload)
@@ -24,6 +28,10 @@ def test_fpip_v2_builder_and_validator():
     assert errors == []
     assert payload["schema_version"] == "fpip.v2"
     assert len(payload["candidate_skeletons"]) == 2
+    assert all(c.get("probability") is not None for c in payload["candidate_skeletons"])
+    assert abs(sum(c["probability"] for c in payload["candidate_skeletons"]) - 1.0) < 1e-9
+    assert payload["search_plan"]
+    assert payload["search_plan"].get("seed_budget", 0) >= 4
 
 
 def test_run_fast_path_constant_emits_fpip_v2():
@@ -39,3 +47,6 @@ def test_run_fast_path_constant_emits_fpip_v2():
     assert ok is True
     assert errors == []
     assert np.isfinite(result["mse"])
+    fpip = result["fpip_v2"]
+    assert fpip["search_plan"]
+    assert all(c.get("probability") is not None for c in fpip["candidate_skeletons"])

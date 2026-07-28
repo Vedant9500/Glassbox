@@ -3469,6 +3469,8 @@ def run_fast_path(
             uncertainty=result.get('uncertainty', {}),
             residual_diagnostics=result.get('residual_diagnostics', {}),
             operator_hints=result.get('operator_hints', {}),
+            x=x_np,
+            y=y_np,
         )
         fpip_ok, fpip_errors = validate_fpip_v2_payload(fpip_v2)
         result['fpip_v2'] = fpip_v2
@@ -3647,6 +3649,8 @@ def run_fast_path(
         uncertainty=result.get('uncertainty', {}),
         residual_diagnostics=result.get('residual_diagnostics', {}),
         operator_hints=result.get('operator_hints', {}),
+        x=x_np,
+        y=y_np,
     )
     fpip_ok, fpip_errors = validate_fpip_v2_payload(fpip_v2)
     result['fpip_v2'] = fpip_v2
