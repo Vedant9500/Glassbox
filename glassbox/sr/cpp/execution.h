@@ -36,8 +36,18 @@ public:
         }
         nt = std::max(1, nt);
 
-        // 1. Thread-local caching to prevent locking during parallel evaluation
+        // 1. Thread-local caching to prevent locking during parallel evaluation.
+        // Split the global byte/entry budget across threads so peak RAM stays
+        // near the generation cap rather than nt × cap (P-01).
         std::vector<SubtreeCache> thread_caches(static_cast<size_t>(nt));
+        const std::size_t per_thread_entries = std::max<std::size_t>(
+            64, SubtreeCache::kDefaultMaxEntries / static_cast<std::size_t>(nt));
+        const std::size_t per_thread_bytes = std::max<std::size_t>(
+            8ull * 1024ull * 1024ull,
+            SubtreeCache::kDefaultMaxBytes / static_cast<std::size_t>(nt));
+        for (auto& tc : thread_caches) {
+            tc.set_limits(per_thread_entries, per_thread_bytes);
+        }
 
         // 2. Parallel evaluation mapping
         #pragma omp parallel for schedule(dynamic) num_threads(nt)
@@ -48,11 +58,11 @@ public:
             eval_func(population[i], thread_caches[static_cast<size_t>(tid)]);
         }
 
-        // 3. Serial merge of caches back into the global generation cache
+        // 3. Serial merge of caches back into the global generation cache.
+        // SubtreeCache is entry/byte capped (P-01/P-10); try_emplace respects LRU limits.
         for (auto& tc : thread_caches) {
+            gen_cache_.add_evictions(tc.evictions());
             for (auto& pair : tc) {
-                // try_emplace prevents overwriting if multiple threads found
-                // the same subtree
                 gen_cache_.try_emplace(pair.first, std::move(pair.second));
             }
         }
@@ -60,6 +70,12 @@ public:
 
     const SubtreeCache& get_gen_cache() const {
         return gen_cache_;
+    }
+
+    SubtreeCache take_gen_cache() {
+        SubtreeCache out = std::move(gen_cache_);
+        gen_cache_ = SubtreeCache();
+        return out;
     }
 
     void clear_cache() {

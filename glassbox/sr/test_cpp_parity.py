@@ -64,6 +64,39 @@ def test_basic_execution(simple_data):
 
 
 @requires_cpp
+def test_subtree_cache_diagnostics_exported(simple_data):
+    """P-01: run_evolution exports bounded subtree-cache diagnostics."""
+    X_list, y = simple_data
+    result = _core.run_evolution(
+        X_list,
+        y,
+        pop_size=24,
+        generations=8,
+        elite_size=2,
+        num_islands=1,
+        early_stop_mse=1e-12,
+        random_seed=17,
+    )
+
+    for key in (
+        "subtree_cache_entries",
+        "subtree_cache_bytes",
+        "subtree_cache_evictions",
+        "subtree_cache_max_entries",
+        "subtree_cache_max_bytes",
+    ):
+        assert key in result, f"Result missing '{key}' key"
+
+    assert result["subtree_cache_max_entries"] > 0
+    assert result["subtree_cache_max_bytes"] > 0
+    assert result["subtree_cache_entries"] >= 0
+    assert result["subtree_cache_entries"] <= result["subtree_cache_max_entries"]
+    assert result["subtree_cache_bytes"] >= 0
+    assert result["subtree_cache_bytes"] <= result["subtree_cache_max_bytes"]
+    assert result["subtree_cache_evictions"] >= 0
+
+
+@requires_cpp
 def test_crossover_diagnostics_exported(simple_data):
     """M-03: run_evolution exports crossover validity diagnostics."""
     X_list, y = simple_data

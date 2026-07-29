@@ -825,6 +825,11 @@ static py::dict run_evolution_cpp(
     result["crossover_attempts"] = engine.get_crossover_attempts();
     result["crossover_successes"] = engine.get_crossover_successes();
     result["crossover_valid_rate"] = engine.get_crossover_valid_rate();
+    result["subtree_cache_entries"] = static_cast<int>(engine.get_subtree_cache_entries());
+    result["subtree_cache_bytes"] = static_cast<long long>(engine.get_subtree_cache_bytes());
+    result["subtree_cache_evictions"] = static_cast<long long>(engine.get_subtree_cache_evictions());
+    result["subtree_cache_max_entries"] = static_cast<int>(engine.get_subtree_cache_max_entries());
+    result["subtree_cache_max_bytes"] = static_cast<long long>(engine.get_subtree_cache_max_bytes());
     
     // Serialize graph structure
     py::list nodes_list;

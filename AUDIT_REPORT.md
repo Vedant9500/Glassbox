@@ -331,7 +331,7 @@ Matches `x`, `x0`, `x1`, … So `nest_formulas("sin(x0)+x1", "x0**2")` → `sin(
 
 | ID | Verdict | Notes |
 |----|---------|-------|
-| **P-01** | CONFIRMED | `SubtreeCache = unordered_map<uint64_t, ArrayXd>` (`ast.h`); gen merge in `execution.h` unbounded per gen peak |
+| **P-01** | **FIXED** | `SubtreeCache` is LRU with entry/byte caps (`ast.h`); thread budgets split; mid-depth-only inserts (`eval.h`); diagnostics exported |
 | **P-02** | CONFIRMED | Default islands use weaker non-NSGA `evolve_one_generation` else-branch (`:3800–3857`) |
 | **P-03** | CONFIRMED | `LBFGSConstantOptimizer(..., max_iter=self.lbfgs_steps)` **and** loop `for _ in range(self.lbfgs_steps)` → up to steps² |
 | **P-04** | CONFIRMED | FD Adam full re-eval per param |
@@ -457,7 +457,8 @@ Thread-local `arena` grows with `num_samples` and only shrinks when `rows > num_
 
 #### P-10 — Generation subtree cache stores full `ArrayXd` per hash with no byte cap  
 **Severity: MEDIUM (extends P-01)**  
-Even with per-gen clear, a single generation on n=1e5 × diverse subtrees can OOM before clear.
+**Status: FIXED** (same change as P-01)  
+Even with per-gen clear, a single generation on n=1e5 × diverse subtrees can OOM before clear. Cap is now entry+byte LRU on `SubtreeCache`.
 
 ---
 
@@ -565,7 +566,7 @@ Key = `(n, mean/std moments, dot, n_points)` over 32 samples — different formu
 
 | ID | Action | Effort |
 |----|--------|--------|
-| P-01, P-10 | LRU/byte cap on subtree cache | M |
+| P-01, P-10 | **DONE** LRU/byte-capped `SubtreeCache` + mid-depth inserts + diagnostics | `ast.h`, `execution.h`, `eval.h`, `core.cpp` | M |
 | P-02 | Share reproduce implementation islands ↔ run | L |
 | P-03 | Single LBFGS step with `max_iter=steps` | S |
 | P-04 | LM-first / skip dead nodes in FD | M |
@@ -984,12 +985,13 @@ Refine used `model.train()` while fitness used `model.eval()` → BN / HardConcr
 ### A.2 Performance narratives (P-01 … P-08)
 
 ### P-01 — Shared subtree eval cache can spike multi-GB
+**Status: FIXED**
 
-**File:** `execution.h:29–58`, evolution ~1550  
+**File:** `ast.h` SubtreeCache, `execution.h` merge, `eval.h` SharedCache inserts  
 
 Each unique hash stores full `ArrayXd(n_samples)`. Large pop × deep graphs × big N → peak RAM spike (cleared per gen, but peak matters).
 
-**Proposed refactor:** Cap entries/bytes with LRU; only cache mid-depth nodes; optional disable under memory pressure.
+**Fix applied:** LRU `SubtreeCache` with default caps (4096 entries / 256 MiB); per-thread budgets split across OpenMP workers; only mid/deep operator subtrees are inserted; `run_evolution` exports cache diagnostics.
 
 ---
 

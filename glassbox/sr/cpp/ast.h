@@ -5,7 +5,9 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <list>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -326,7 +328,232 @@ inline uint64_t compute_node_hash(const IndividualGraph& graph, int idx,
     return h;
 }
 
-// Cache type: maps subtree hash -> evaluated ArrayXd
-using SubtreeCache = std::unordered_map<uint64_t, Eigen::ArrayXd>;
+// Bounded LRU subtree cache (P-01 / P-10).
+// Each entry stores a full ArrayXd(n_samples); without caps a single generation
+// can spike multi-GB. Evicts least-recently-used entries when over entry/byte limits.
+class SubtreeCache {
+public:
+    static constexpr std::size_t kDefaultMaxEntries = 4096;
+    // ~256 MiB default hard ceiling for cached ArrayXd payloads.
+    static constexpr std::size_t kDefaultMaxBytes = 256ull * 1024ull * 1024ull;
+
+    using key_type = uint64_t;
+    using mapped_type = Eigen::ArrayXd;
+    using entry_type = std::pair<key_type, mapped_type>;
+    using list_type = std::list<entry_type>;
+    using iterator = list_type::iterator;
+    using const_iterator = list_type::const_iterator;
+
+    explicit SubtreeCache(std::size_t max_entries = kDefaultMaxEntries,
+                          std::size_t max_bytes = kDefaultMaxBytes)
+        : max_entries_(max_entries == 0 ? kDefaultMaxEntries : max_entries),
+          max_bytes_(max_bytes == 0 ? kDefaultMaxBytes : max_bytes) {}
+
+    SubtreeCache(const SubtreeCache& other)
+        : max_entries_(other.max_entries_),
+          max_bytes_(other.max_bytes_),
+          bytes_used_(other.bytes_used_),
+          evictions_(other.evictions_) {
+        for (const auto& entry : other.order_) {
+            order_.push_back(entry);
+            index_.emplace(order_.back().first, std::prev(order_.end()));
+        }
+    }
+
+    SubtreeCache& operator=(const SubtreeCache& other) {
+        if (this == &other) return *this;
+        clear();
+        max_entries_ = other.max_entries_;
+        max_bytes_ = other.max_bytes_;
+        bytes_used_ = other.bytes_used_;
+        evictions_ = other.evictions_;
+        for (const auto& entry : other.order_) {
+            order_.push_back(entry);
+            index_.emplace(order_.back().first, std::prev(order_.end()));
+        }
+        return *this;
+    }
+
+    SubtreeCache(SubtreeCache&& other) noexcept
+        : order_(std::move(other.order_)),
+          index_(std::move(other.index_)),
+          max_entries_(other.max_entries_),
+          max_bytes_(other.max_bytes_),
+          bytes_used_(other.bytes_used_),
+          evictions_(other.evictions_) {
+        other.bytes_used_ = 0;
+    }
+
+    SubtreeCache& operator=(SubtreeCache&& other) noexcept {
+        if (this == &other) return *this;
+        order_ = std::move(other.order_);
+        index_ = std::move(other.index_);
+        max_entries_ = other.max_entries_;
+        max_bytes_ = other.max_bytes_;
+        bytes_used_ = other.bytes_used_;
+        evictions_ = other.evictions_;
+        other.bytes_used_ = 0;
+        return *this;
+    }
+
+    iterator begin() { return order_.begin(); }
+    iterator end() { return order_.end(); }
+    const_iterator begin() const { return order_.begin(); }
+    const_iterator end() const { return order_.end(); }
+    const_iterator cbegin() const { return order_.cbegin(); }
+    const_iterator cend() const { return order_.cend(); }
+
+    std::size_t size() const { return order_.size(); }
+    bool empty() const { return order_.empty(); }
+    std::size_t bytes_used() const { return bytes_used_; }
+    std::size_t evictions() const { return evictions_; }
+    std::size_t max_entries() const { return max_entries_; }
+    std::size_t max_bytes() const { return max_bytes_; }
+
+    void add_evictions(std::size_t n) { evictions_ += n; }
+
+    void set_limits(std::size_t max_entries, std::size_t max_bytes) {
+        max_entries_ = max_entries == 0 ? kDefaultMaxEntries : max_entries;
+        max_bytes_ = max_bytes == 0 ? kDefaultMaxBytes : max_bytes;
+        evict_while_over_budget();
+    }
+
+    void clear() {
+        order_.clear();
+        index_.clear();
+        bytes_used_ = 0;
+        // Keep eviction counter cumulative within a process/run for diagnostics.
+    }
+
+    iterator find(key_type key) {
+        auto it = index_.find(key);
+        if (it == index_.end()) return order_.end();
+        touch(it->second);
+        return it->second;
+    }
+
+    const_iterator find(key_type key) const {
+        auto it = index_.find(key);
+        if (it == index_.end()) return order_.cend();
+        return it->second;
+    }
+
+    // Insert or replace; returns true if stored (may evict LRU peers).
+    bool insert_or_assign(key_type key, mapped_type value) {
+        const std::size_t new_bytes = entry_bytes(value);
+        // Refuse a single entry larger than the whole budget.
+        if (new_bytes > max_bytes_) {
+            ++evictions_;
+            return false;
+        }
+
+        auto it = index_.find(key);
+        if (it != index_.end()) {
+            bytes_used_ -= entry_bytes(it->second->second);
+            it->second->second = std::move(value);
+            bytes_used_ += new_bytes;
+            touch(it->second);
+            evict_while_over_budget(/*keep=*/key);
+            return true;
+        }
+
+        order_.emplace_front(key, std::move(value));
+        index_.emplace(key, order_.begin());
+        bytes_used_ += new_bytes;
+        evict_while_over_budget(/*keep=*/key);
+        return index_.find(key) != index_.end();
+    }
+
+    // Map-compatible insert: no-op if key already present.
+    template <typename M>
+    std::pair<iterator, bool> try_emplace(key_type key, M&& value) {
+        auto it = index_.find(key);
+        if (it != index_.end()) {
+            touch(it->second);
+            return {it->second, false};
+        }
+        mapped_type owned(std::forward<M>(value));
+        const std::size_t new_bytes = entry_bytes(owned);
+        if (new_bytes > max_bytes_) {
+            ++evictions_;
+            return {order_.end(), false};
+        }
+        order_.emplace_front(key, std::move(owned));
+        auto inserted = index_.emplace(key, order_.begin());
+        bytes_used_ += new_bytes;
+        evict_while_over_budget(/*keep=*/key);
+        auto kept = index_.find(key);
+        if (kept == index_.end()) {
+            return {order_.end(), false};
+        }
+        return {kept->second, inserted.second};
+    }
+
+    // Convenience for sites that previously used operator[] = value.
+    mapped_type& operator[](key_type key) {
+        auto it = index_.find(key);
+        if (it != index_.end()) {
+            touch(it->second);
+            return it->second->second;
+        }
+        order_.emplace_front(key, mapped_type());
+        index_.emplace(key, order_.begin());
+        // Empty array contributes 0 bytes until assigned; callers that only
+        // use operator[] for assignment should prefer insert_or_assign.
+        evict_while_over_budget(/*keep=*/key);
+        auto kept = index_.find(key);
+        if (kept == index_.end()) {
+            // Extremely constrained budget: re-insert empty sentinel.
+            order_.emplace_front(key, mapped_type());
+            index_[key] = order_.begin();
+            return order_.begin()->second;
+        }
+        return kept->second->second;
+    }
+
+private:
+    static std::size_t entry_bytes(const mapped_type& v) {
+        if (v.size() <= 0) return 0;
+        return static_cast<std::size_t>(v.size()) * sizeof(double);
+    }
+
+    void touch(iterator it) {
+        if (it != order_.begin()) {
+            order_.splice(order_.begin(), order_, it);
+        }
+    }
+
+    void erase_iterator(iterator it) {
+        bytes_used_ -= entry_bytes(it->second);
+        index_.erase(it->first);
+        order_.erase(it);
+        ++evictions_;
+    }
+
+    void evict_while_over_budget(key_type keep = 0) {
+        const bool has_keep = index_.find(keep) != index_.end();
+        while ((order_.size() > max_entries_ || bytes_used_ > max_bytes_) && !order_.empty()) {
+            auto victim = std::prev(order_.end());
+            if (has_keep && victim->first == keep) {
+                // Keep the just-inserted key; evict next-oldest if possible.
+                if (order_.size() == 1) break;
+                victim = std::prev(victim);
+                if (victim->first == keep) break;
+            }
+            erase_iterator(victim);
+        }
+        // If still over bytes with only `keep`, drop keep as last resort.
+        if (bytes_used_ > max_bytes_ && !order_.empty()) {
+            erase_iterator(order_.begin());
+        }
+    }
+
+    list_type order_; // front = MRU, back = LRU
+    std::unordered_map<key_type, iterator> index_;
+    std::size_t max_entries_;
+    std::size_t max_bytes_;
+    std::size_t bytes_used_ = 0;
+    std::size_t evictions_ = 0;
+};
 
 } // namespace sr

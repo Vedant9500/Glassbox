@@ -331,8 +331,22 @@ inline Eigen::ArrayXd evaluate_graph_impl(
         }
         
         if constexpr (Policy == EvalPolicy::SharedCache) {
+            // P-01: only cache mid/deep operator subtrees. Depth-1 ops over
+            // Input/Constant are cheap to recompute and dominate entry count.
             if (node.type == NodeType::Unary || node.type == NodeType::Binary) {
-                (*shared_cache)[node_hashes[i]] = (*cache_out)[i];
+                auto is_op_child = [&](int child_idx) -> bool {
+                    return child_idx >= 0
+                        && child_idx < static_cast<int>(graph.nodes.size())
+                        && (graph.nodes[static_cast<size_t>(child_idx)].type == NodeType::Unary
+                            || graph.nodes[static_cast<size_t>(child_idx)].type == NodeType::Binary);
+                };
+                const bool worth_caching =
+                    (node.type == NodeType::Unary && is_op_child(node.left_child))
+                    || (node.type == NodeType::Binary
+                        && (is_op_child(node.left_child) || is_op_child(node.right_child)));
+                if (worth_caching) {
+                    shared_cache->insert_or_assign(node_hashes[i], (*cache_out)[i]);
+                }
             }
         }
     }

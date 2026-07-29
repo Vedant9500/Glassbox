@@ -575,6 +575,11 @@ public:
         if (crossover_attempts_ <= 0) return 0.0;
         return static_cast<double>(crossover_successes_) / static_cast<double>(crossover_attempts_);
     }
+    std::size_t get_subtree_cache_entries() const { return gen_cache_.size(); }
+    std::size_t get_subtree_cache_bytes() const { return gen_cache_.bytes_used(); }
+    std::size_t get_subtree_cache_evictions() const { return gen_cache_.evictions(); }
+    std::size_t get_subtree_cache_max_entries() const { return gen_cache_.max_entries(); }
+    std::size_t get_subtree_cache_max_bytes() const { return gen_cache_.max_bytes(); }
 
     // P5: Return entire Pareto front (rank-0 individuals)
     // Re-runs non_dominated_sort on the current population to get clean ranks.
@@ -802,6 +807,8 @@ public:
             crossover_attempts_ += island.get_crossover_attempts();
             crossover_successes_ += island.get_crossover_successes();
             last_crossover_valid_ = island.get_last_crossover_valid();
+            // P-01 diagnostics: sum island cache pressure into the parent engine.
+            gen_cache_.add_evictions(island.get_subtree_cache_evictions());
         }
 
         // Merge all island populations for Pareto front (if NSGA-II)
@@ -1599,7 +1606,7 @@ private:
         }, config_.eval_num_threads);
 
         // Pull the global merged cache out of executor
-        gen_cache_ = executor.get_gen_cache();
+        gen_cache_ = executor.take_gen_cache();
     }
 
     uint64_t graph_signature(const IndividualGraph& graph) const {
