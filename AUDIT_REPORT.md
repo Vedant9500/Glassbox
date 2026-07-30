@@ -332,7 +332,7 @@ Matches `x`, `x0`, `x1`, … So `nest_formulas("sin(x0)+x1", "x0**2")` → `sin(
 | ID | Verdict | Notes |
 |----|---------|-------|
 | **P-01** | **FIXED** | `SubtreeCache` is LRU with entry/byte caps (`ast.h`); thread budgets split; mid-depth-only inserts (`eval.h`); diagnostics exported |
-| **P-02** | CONFIRMED | Default islands use weaker non-NSGA `evolve_one_generation` else-branch (`:3800–3857`) |
+| **P-02** | **FIXED** | Default islands & single-pop share `evolve_one_generation` (macro mutations, staged schedule, elite age++, restart, inner refine) |
 | **P-03** | CONFIRMED | `LBFGSConstantOptimizer(..., max_iter=self.lbfgs_steps)` **and** loop `for _ in range(self.lbfgs_steps)` → up to steps² |
 | **P-04** | CONFIRMED | FD Adam full re-eval per param |
 | **P-05** | CONFIRMED | 10k-LOC god module + Python `eval` scoring |
@@ -567,7 +567,7 @@ Key = `(n, mean/std moments, dot, n_points)` over 32 samples — different formu
 | ID | Action | Effort |
 |----|--------|--------|
 | P-01, P-10 | **DONE** LRU/byte-capped `SubtreeCache` + mid-depth inserts + diagnostics | `ast.h`, `execution.h`, `eval.h`, `core.cpp` | M |
-| P-02 | Share reproduce implementation islands ↔ run | L |
+| P-02 | **DONE** Share reproduce implementation islands ↔ run | `evolution.h` | M |
 | P-03 | Single LBFGS step with `max_iter=steps` | S |
 | P-04 | LM-first / skip dead nodes in FD | M |
 | P-05 | Split wrapper; C++ display score batch API | L |
@@ -996,12 +996,13 @@ Each unique hash stores full `ArrayXd(n_samples)`. Large pop × deep graphs × b
 ---
 
 ### P-02 — Island non-NSGA path weaker than `run()` (primary default)
+**Status: FIXED**
 
 **File:** `evolution.h` island evolve ~3800–3857  
 
 Default `num_islands=8` uses fitness-only sort, no macro mutations, no staged schedule, no adaptive restart, no elite aging — while single-pop `run()` has them.
 
-**Proposed refactor:** Share one `reproduce_generation()` implementation.
+**Fix applied:** Unified single-pop `run()` and multi-island `evolve_one_generation()` in `evolution.h` to share full reproduction generation logic (including `is_better_champion` sort, elite `age++`, macro mutations, staged topology boost schedule, mutation rate decay, adaptive restarts, inner-param refinement, and clean NSGA-II return).
 
 ---
 

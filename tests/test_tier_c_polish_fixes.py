@@ -197,7 +197,7 @@ def test_s9_5_tiny_n_device_is_cpu():
 def test_s6_1_core_defaults_aligned():
     try:
         from glassbox.sr.cpp import get_cpp_core
-_core = get_cpp_core()
+        _core = get_cpp_core()
     except ImportError:
         pytest.skip("_core not built")
     # pybind11 builtins often lack inspect.signature; use __doc__ / __text_signature__.

@@ -328,6 +328,10 @@ public:
             config_.allowed_binary_ops,
             static_cast<int>(BinaryOp::Aggregation)
         );
+        current_structural_mutation_rate_ = config_.mutation_rate_structural;
+        best_mse_history_ = 1e9;
+        plateau_counter_ = 0;
+        recent_best_.reserve(config_.stagnation_window + 2);
     }
 
     // Main run loop
@@ -340,12 +344,6 @@ public:
             refine_constants(ind);
         }
         trace_event("init.refined", -1);
-        
-        double current_structural_mutation_rate = config_.mutation_rate_structural;
-        double best_mse_history = 1e9;
-        int plateau_counter = 0;
-        std::vector<double> recent_best;
-        recent_best.reserve(config_.stagnation_window + 2);
 
         for (int gen = 0; gen < config_.generations; ++gen) {
             auto now = std::chrono::steady_clock::now();
@@ -353,190 +351,14 @@ public:
                 break;
             }
 
-            evaluate_population();
-            trace_event("generation.post_eval", gen);
-            bool in_topology_phase = config_.use_staged_schedule && (gen < config_.topology_phase_generations);
-            double scheduled_mutation_rate = current_structural_mutation_rate;
-            if (in_topology_phase) {
-                scheduled_mutation_rate = std::min(1.0, current_structural_mutation_rate * config_.topology_phase_mutation_boost);
-            }
-            
-            // P5: NSGA-II selection or standard sort
-            if (config_.use_nsga2) {
-                // Create offspring pool
-                std::vector<IndividualGraph> combined;
-                combined.reserve(population_.size() * 2);
-                for (auto& ind : population_) {
-                    ind.age++;  // AFPO: existing population ages
-                    combined.push_back(ind);
-                }
-                // Generate offspring
-                std::uniform_int_distribution<int> p_dist(0, std::max(0, static_cast<int>(population_.size()) - 1));
-                std::uniform_real_distribution<double> co(0.0, 1.0);
-                const double macro_rate = std::clamp(config_.macro_mutation_rate, 0.0, 0.9);
-                for (int i = 0; i < config_.pop_size; ++i) {
-                    IndividualGraph child;
-                    double roll = co(rng_);
-                    if (roll < macro_rate) {
-                        child = macro_mutate(population_[p_dist(rng_)]);
-                    } else if (config_.elite_size >= 2 && roll < macro_rate + config_.crossover_rate) {
-                        int p1 = p_dist(rng_), p2 = p_dist(rng_);
-                        while (p2 == p1) p2 = p_dist(rng_);
-                        child = crossover_with_retry(population_[p1], population_[p2], 3);
-                        child = mutate_lamarckian(child, scheduled_mutation_rate * 0.3);
-                    } else {
-                        child = mutate_lamarckian(population_[p_dist(rng_)], scheduled_mutation_rate);
-                    }
-                    child.age = 0;  // AFPO: new children start young
-                    bool do_refine = in_topology_phase
-                        ? (gen % config_.topology_refine_interval == 0)
-                        : (gen % 5 == 0);
-                    if (do_refine) refine_constants(child);
-                    else evaluate_fitness_with_penalty(child, X_, y_, y_.size());
-                    combined.push_back(std::move(child));
-                }
-                // NSGA-II selection from combined pool
-                population_ = nsga2_select(combined, config_.pop_size);
-                // Track best (fitness primary, raw_mse secondary)
-                for (auto& ind : population_) {
-                    consider_champion(ind);
-                }
-            } else {
-                // Standard single-objective sort (raw_mse tie-break)
-                std::sort(population_.begin(), population_.end(), 
-                          [](const IndividualGraph& a, const IndividualGraph& b) {
-                              return is_better_champion(a, b);
-                          });
-                
-                // Track best (fitness primary, raw_mse secondary)
-                if (!population_.empty()) {
-                    consider_champion(population_[0]);
-                }
-            }
-            
-            // Dynamic mutation decay based on plateauing
-            if (best_overall_.fitness >= best_mse_history * 0.99) {
-                plateau_counter++;
-            } else {
-                plateau_counter = 0;
-                best_mse_history = best_overall_.fitness;
-            }
-
-            if (plateau_counter > 50) {
-                // If stuck for 50 gens, lower mutation rate to exploit
-                current_structural_mutation_rate = std::max(0.05, current_structural_mutation_rate * 0.9);
-                plateau_counter = 0; // Reset
-            }
-
-            recent_best.push_back(best_overall_.fitness);
-            if (recent_best.size() > static_cast<size_t>(config_.stagnation_window)) {
-                recent_best.erase(recent_best.begin());
-            }
-
-            bool should_restart = false;
-            if (config_.use_adaptive_restart && recent_best.size() >= static_cast<size_t>(config_.stagnation_window)) {
-                double window_improvement = recent_best.front() - recent_best.back();
-                double diversity = population_diversity_ratio(population_);
-                should_restart = (window_improvement < config_.stagnation_min_improvement) && (diversity < config_.diversity_floor);
-            }
+            evolve_one_generation(gen);
 
             update_discovery_metrics(gen, start_time);
 
             if (config_.use_early_stop && early_stop_metric(best_overall_) < config_.early_stop_mse && best_overall_.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
                 trace_event("run.early_stop", gen);
-                break; // Exact algebraic match found that is simple
+                break;
             }
-            
-            // Create next generation
-            std::vector<IndividualGraph> next_gen;
-            next_gen.reserve(config_.pop_size);
-            
-            // Elitism ensures top survivors pass verbatim (age incremented)
-            for (int i = 0; i < config_.elite_size; ++i) {
-                IndividualGraph elite = population_[i];
-                elite.age++;  // AFPO: survivors age
-                next_gen.push_back(std::move(elite));
-            }
-            
-            int num_explorers = static_cast<int>(config_.pop_size * config_.explorer_fraction);
-            int main_pop_target = config_.pop_size - num_explorers;
-
-            // Fill remainder of main population with crossover + mutated offspring
-            std::uniform_int_distribution<int> parent_dist(0, config_.elite_size - 1);
-            std::uniform_real_distribution<double> coin(0.0, 1.0);
-            const double macro_rate = std::clamp(config_.macro_mutation_rate, 0.0, 0.9);
-            while (next_gen.size() < main_pop_target) {
-                IndividualGraph child;
-                double roll = coin(rng_);
-
-                if (roll < macro_rate) {
-                    // --- Macro-Mutation (configurable; default 15%) ---
-                    int parent_idx = parent_dist(rng_);
-                    child = macro_mutate(population_[parent_idx]);
-                } else if (config_.elite_size >= 2 && roll < macro_rate + config_.crossover_rate) {
-                    // --- Subtree Crossover ---
-                    int p1 = parent_dist(rng_);
-                    int p2 = parent_dist(rng_);
-                    while (p2 == p1) p2 = parent_dist(rng_); // ensure distinct parents
-                    child = crossover_with_retry(population_[p1], population_[p2], 3);
-                    // Light mutation on crossover children for diversity
-                    child = mutate_lamarckian(child, scheduled_mutation_rate * 0.3);
-                } else {
-                    // --- Mutation-only ---
-                    int parent_idx = tournament_select();
-                    child = mutate_lamarckian(population_[parent_idx], scheduled_mutation_rate);
-                }
-
-                child.age = 0;  // AFPO: new children start young
-
-                bool do_refine = in_topology_phase
-                    ? (gen % config_.topology_refine_interval == 0)
-                    : (gen % 5 == 0);
-                if (do_refine) {
-                    refine_constants(child); // Gradient refinement on constants
-                } else {
-                    // Fast re-evaluation
-                    evaluate_fitness_with_penalty(child, X_, y_, y_.size());
-                }
-                next_gen.push_back(std::move(child));
-            }
-
-            // Fill explorer population
-            while (next_gen.size() < config_.pop_size) {
-                 int parent_idx = tournament_select(); // Use tournament selection for explorers too
-                 double explorer_rate = std::min(1.0, scheduled_mutation_rate * config_.explorer_mutation_multiplier);
-                 IndividualGraph explorer;
-                 if (coin(rng_) < 0.2) {
-                     explorer = macro_mutate(population_[parent_idx]);
-                 } else {
-                     explorer = mutate_lamarckian(population_[parent_idx], explorer_rate);
-                 }
-                 explorer.age = 0;  // AFPO: explorers start young
-                 if (gen % 10 == 0) {
-                     refine_constants(explorer); 
-                 } else {
-                     evaluate_fitness_with_penalty(explorer, X_, y_, y_.size());
-                 }
-                 next_gen.push_back(std::move(explorer));
-            }
-            
-            population_ = std::move(next_gen);
-
-            if (should_restart) {
-                inject_restarts(population_);
-                current_structural_mutation_rate = std::min(1.0, current_structural_mutation_rate * config_.post_restart_mutation_boost);
-                trace_event("population.restart", gen);
-            }
-            
-            // Periodic inner-param refinement on top elite only (every 10 gens)
-            // This is where Adam refines omega/p/phi - crucial for sin(3x), exp(-x) etc.
-            if (gen % 10 == 9) {
-                for (int i = 0; i < std::min(5, config_.elite_size); ++i) {
-                    refine_inner_params(population_[i]);
-                }
-            }
-
-            trace_event("generation.post_reproduce", gen);
         }
         
         // Post-evolution cleanup: deduplicate + prune; then export may prefer raw champion.
@@ -550,7 +372,7 @@ public:
         run_wall_time_sec_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
         trace_event("run.end", -1);
     }
-    
+
     IndividualGraph get_best() const {
         return select_export_champion();
     }
@@ -858,6 +680,11 @@ private:
     double first_acceptable_time_sec_ = -1.0;
     int last_island_outer_threads_ = 1;
     int last_island_inner_threads_ = 1;
+
+    double current_structural_mutation_rate_ = 0.05;
+    double best_mse_history_ = 1e9;
+    int plateau_counter_ = 0;
+    std::vector<double> recent_best_;
 
     void set_y_weights(const Eigen::ArrayXd& y_weights) {
         has_y_weights_ = false;
@@ -1569,6 +1396,11 @@ private:
     }
 
     void initialize_population() {
+        current_structural_mutation_rate_ = config_.mutation_rate_structural;
+        best_mse_history_ = 1e9;
+        plateau_counter_ = 0;
+        recent_best_.clear();
+        recent_best_.reserve(config_.stagnation_window + 2);
         population_.resize(config_.pop_size);
         int n_inputs = static_cast<int>(X_.size());
         
@@ -3857,43 +3689,46 @@ private:
     }
 
     // -- P6: Single-generation evolution step (for island model) ----------─
+    // -- P6: Single-generation evolution step (used by island model and run()) ---
     void evolve_one_generation(int gen) {
         evaluate_population();
+        trace_event("generation.post_eval", gen);
 
+        bool in_topology_phase = config_.use_staged_schedule && (gen < config_.topology_phase_generations);
+        double scheduled_mutation_rate = current_structural_mutation_rate_;
+        if (in_topology_phase) {
+            scheduled_mutation_rate = std::min(1.0, current_structural_mutation_rate_ * config_.topology_phase_mutation_boost);
+        }
+
+        // P5: NSGA-II selection or standard sort
         if (config_.use_nsga2) {
-            bool in_topology_phase = config_.use_staged_schedule && (gen < config_.topology_phase_generations);
-            double current_structural_mutation_rate = config_.mutation_rate_structural;
-            if (in_topology_phase) {
-                current_structural_mutation_rate = std::min(1.0, current_structural_mutation_rate * config_.topology_phase_mutation_boost);
-            }
-
+            // Create offspring pool
             std::vector<IndividualGraph> combined;
             combined.reserve(population_.size() + static_cast<size_t>(config_.pop_size));
             for (auto& ind : population_) {
-                ind.age++;
+                ind.age++;  // AFPO: existing population ages
                 combined.push_back(ind);
             }
 
-            std::uniform_real_distribution<double> coin(0.0, 1.0);
-            std::uniform_int_distribution<int> any_parent(0, std::max(0, static_cast<int>(population_.size()) - 1));
+            std::uniform_int_distribution<int> p_dist(0, std::max(0, static_cast<int>(population_.size()) - 1));
+            std::uniform_real_distribution<double> co(0.0, 1.0);
             const double macro_rate = std::clamp(config_.macro_mutation_rate, 0.0, 0.9);
+
             for (int i = 0; i < config_.pop_size; ++i) {
                 IndividualGraph child;
-                double roll = coin(rng_);
+                double roll = co(rng_);
                 if (roll < macro_rate) {
-                    child = macro_mutate(population_[any_parent(rng_)]);
+                    child = macro_mutate(population_[p_dist(rng_)]);
                 } else if (config_.elite_size >= 2 && roll < macro_rate + config_.crossover_rate) {
-                    int p1 = tournament_select();
-                    int p2 = tournament_select();
-                    while (p2 == p1) p2 = tournament_select();
+                    int p1 = p_dist(rng_), p2 = p_dist(rng_);
+                    while (p2 == p1) p2 = p_dist(rng_);
                     child = crossover_with_retry(population_[p1], population_[p2], 3);
-                    child = mutate_lamarckian(child, current_structural_mutation_rate * 0.3);
+                    child = mutate_lamarckian(child, scheduled_mutation_rate * 0.3);
                 } else {
-                    int parent_idx = tournament_select();
-                    child = mutate_lamarckian(population_[parent_idx], current_structural_mutation_rate);
+                    child = mutate_lamarckian(population_[p_dist(rng_)], scheduled_mutation_rate);
                 }
+                child.age = 0;  // AFPO: new children start young
 
-                child.age = 0;
                 bool do_refine = in_topology_phase
                     ? (gen % config_.topology_refine_interval == 0)
                     : (gen % 5 == 0);
@@ -3905,54 +3740,104 @@ private:
                 combined.push_back(std::move(child));
             }
 
+            // NSGA-II selection from combined pool
             population_ = nsga2_select(combined, config_.pop_size);
-            for (const auto& ind : population_) {
+
+            // Track best (fitness primary, raw_mse secondary)
+            for (auto& ind : population_) {
                 consider_champion(ind);
             }
+
             if (gen % 10 == 9) {
                 for (int i = 0; i < std::min(5, config_.elite_size) && i < static_cast<int>(population_.size()); ++i) {
                     refine_inner_params(population_[i]);
                 }
             }
+
+            trace_event("generation.post_reproduce", gen);
             return;
         }
 
+        // Standard single-objective sort (raw_mse tie-break)
         std::sort(population_.begin(), population_.end(),
                   [](const IndividualGraph& a, const IndividualGraph& b) {
-                      return a.fitness < b.fitness;
+                      return is_better_champion(a, b);
                   });
 
-        if (!population_.empty()) { consider_champion(population_[0]); }
+        // Track best (fitness primary, raw_mse secondary)
+        if (!population_.empty()) {
+            consider_champion(population_[0]);
+        }
 
-        // Create next generation. Non-NSGA island path is intentionally simpler than
-        // run(): fitness-only sort (not is_better_champion), no elite age++,
-        // no macro/staged/adaptive restart (see X-003 / P4-004).
+        // Dynamic mutation decay based on plateauing
+        if (best_overall_.fitness >= best_mse_history_ * 0.99) {
+            plateau_counter_++;
+        } else {
+            plateau_counter_ = 0;
+            best_mse_history_ = best_overall_.fitness;
+        }
+
+        if (plateau_counter_ > 50) {
+            current_structural_mutation_rate_ = std::max(0.05, current_structural_mutation_rate_ * 0.9);
+            plateau_counter_ = 0;
+        }
+
+        recent_best_.push_back(best_overall_.fitness);
+        if (recent_best_.size() > static_cast<size_t>(config_.stagnation_window)) {
+            recent_best_.erase(recent_best_.begin());
+        }
+
+        bool should_restart = false;
+        if (config_.use_adaptive_restart && recent_best_.size() >= static_cast<size_t>(config_.stagnation_window)) {
+            double window_improvement = recent_best_.front() - recent_best_.back();
+            double diversity = population_diversity_ratio(population_);
+            should_restart = (window_improvement < config_.stagnation_min_improvement) && (diversity < config_.diversity_floor);
+        }
+
+        // Create next generation
         std::vector<IndividualGraph> next_gen;
         next_gen.reserve(config_.pop_size);
 
-        for (int i = 0; i < config_.elite_size && i < static_cast<int>(population_.size()); ++i) {
-            next_gen.push_back(population_[i]);
+        // Elitism ensures top survivors pass verbatim (age incremented)
+        int elite_count = std::min(config_.elite_size, static_cast<int>(population_.size()));
+        for (int i = 0; i < elite_count; ++i) {
+            IndividualGraph elite = population_[i];
+            elite.age++;  // AFPO: survivors age
+            next_gen.push_back(std::move(elite));
         }
 
-        double current_structural_mutation_rate = config_.mutation_rate_structural;
-        std::uniform_real_distribution<double> coin(0.0, 1.0);
-
         int num_explorers = static_cast<int>(config_.pop_size * config_.explorer_fraction);
-        int main_pop_target = config_.pop_size - num_explorers;
+        int main_pop_target = std::max(elite_count, config_.pop_size - num_explorers);
 
+        std::uniform_int_distribution<int> parent_dist(0, std::max(0, elite_count - 1));
+        std::uniform_real_distribution<double> coin(0.0, 1.0);
+        const double macro_rate = std::clamp(config_.macro_mutation_rate, 0.0, 0.9);
+
+        // Fill remainder of main population with crossover + mutated offspring
         while (static_cast<int>(next_gen.size()) < main_pop_target) {
             IndividualGraph child;
-            if (config_.elite_size >= 2 && coin(rng_) < config_.crossover_rate) {
-                int p1 = tournament_select();
-                int p2 = tournament_select();
-                while (p2 == p1) p2 = tournament_select();
+            double roll = coin(rng_);
+
+            if (roll < macro_rate) {
+                int parent_idx = parent_dist(rng_);
+                child = macro_mutate(population_[parent_idx]);
+            } else if (elite_count >= 2 && roll < macro_rate + config_.crossover_rate) {
+                int p1 = parent_dist(rng_);
+                int p2 = parent_dist(rng_);
+                while (p2 == p1) p2 = parent_dist(rng_);
                 child = crossover_with_retry(population_[p1], population_[p2], 3);
-                child = mutate_lamarckian(child, current_structural_mutation_rate * 0.3);
+                child = mutate_lamarckian(child, scheduled_mutation_rate * 0.3);
             } else {
                 int parent_idx = tournament_select();
-                child = mutate_lamarckian(population_[parent_idx], current_structural_mutation_rate);
+                child = mutate_lamarckian(population_[parent_idx], scheduled_mutation_rate);
             }
-            if (gen % 5 == 0) {
+
+            child.age = 0;  // AFPO: new children start young
+
+            bool do_refine = in_topology_phase
+                ? (gen % config_.topology_refine_interval == 0)
+                : (gen % 5 == 0);
+            if (do_refine) {
                 refine_constants(child);
             } else {
                 evaluate_fitness_with_penalty(child, X_, y_, static_cast<int>(y_.size()));
@@ -3960,21 +3845,41 @@ private:
             next_gen.push_back(std::move(child));
         }
 
+        // Fill explorer population
         while (static_cast<int>(next_gen.size()) < config_.pop_size) {
             int parent_idx = tournament_select();
-            double explorer_rate = std::min(1.0, current_structural_mutation_rate * config_.explorer_mutation_multiplier);
-            IndividualGraph explorer = mutate_lamarckian(population_[parent_idx], explorer_rate);
-            evaluate_fitness_with_penalty(explorer, X_, y_, static_cast<int>(y_.size()));
+            double explorer_rate = std::min(1.0, scheduled_mutation_rate * config_.explorer_mutation_multiplier);
+            IndividualGraph explorer;
+            if (coin(rng_) < 0.2) {
+                explorer = macro_mutate(population_[parent_idx]);
+            } else {
+                explorer = mutate_lamarckian(population_[parent_idx], explorer_rate);
+            }
+            explorer.age = 0;  // AFPO: explorers start young
+            if (gen % 10 == 0) {
+                refine_constants(explorer);
+            } else {
+                evaluate_fitness_with_penalty(explorer, X_, y_, static_cast<int>(y_.size()));
+            }
             next_gen.push_back(std::move(explorer));
         }
 
         population_ = std::move(next_gen);
 
+        if (should_restart) {
+            inject_restarts(population_);
+            current_structural_mutation_rate_ = std::min(1.0, current_structural_mutation_rate_ * config_.post_restart_mutation_boost);
+            trace_event("population.restart", gen);
+        }
+
+        // Periodic inner-param refinement on top elite only (every 10 gens)
         if (gen % 10 == 9) {
-            for (int i = 0; i < std::min(3, config_.elite_size); ++i) {
+            for (int i = 0; i < std::min(5, config_.elite_size) && i < static_cast<int>(population_.size()); ++i) {
                 refine_inner_params(population_[i]);
             }
         }
+
+        trace_event("generation.post_reproduce", gen);
     }
 
     // -- P7: Dimensional Analysis Penalty ----------------------------------
