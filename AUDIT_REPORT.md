@@ -361,7 +361,7 @@ Matches `x`, `x0`, `x1`, … So `nest_formulas("sin(x0)+x1", "x0**2")` → `sin(
 | **M-01** | **FIXED** | Vault holdout uses deterministic permuted index split instead of deterministic tail (`specialist_state.py`) |
 | **M-02** | **FIXED** | FPIP fast-path builder now assigns candidate probabilities and builds `search_plan` from x/y via `build_search_plan` (`fpip_v2.py`) |
 | **M-03** | **FIXED** | `last_crossover_valid`, `crossover_attempts`, `crossover_successes`, and `crossover_valid_rate` exported from `core.cpp` |
-| **M-04** | CONFIRMED (refined) | Meta soft-div = abs-form (`meta_ops.py:573`); C++ **Arithmetic** soft-div = sqrt-form (`eval.h:273`); C++ **Division** matches meta abs-form (`eval.h:280`) — meta ≠ Arithmetic soft |
+| **M-04** | **FIXED** | Meta soft-div = abs-form (`meta_ops.py:573`); C++ **Arithmetic** soft-div = sqrt-form (`eval.h:273`); C++ **Division** matches meta abs-form (`eval.h:280`) — meta ≠ Arithmetic soft |
 | **M-05** | CONFIRMED | `hard_concrete_log_prob` stretched BinaryConcrete only (`:94–108`) |
 | **L-01** | CONFIRMED | `compute_specialist_state` first-N slice (`:723`) without rank sort |
 

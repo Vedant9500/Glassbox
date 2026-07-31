@@ -16,7 +16,7 @@ Reference: "The Concrete Distribution" (Maddison et al., 2016)
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 import math
 
 
@@ -73,7 +73,7 @@ def hard_concrete_sample(
 def hard_concrete_log_prob(
     z: torch.Tensor,
     logits: torch.Tensor,
-    tau: float = 0.5,
+    tau: Union[float, torch.Tensor] = 0.5,
     beta: float = 0.1,
     eps: float = 1e-8,
 ) -> torch.Tensor:
@@ -87,22 +87,23 @@ def hard_concrete_log_prob(
         logits: Log-odds parameter
         tau: Temperature
         beta: Stretch parameter
+        eps: Small constant for numerical stability
         
     Returns:
         Log probabilities (same shape as z)
     """
-    # This is approximate; the true density is complex at the boundaries
-    # For regularization purposes, we use the stretched BinaryConcrete density
-    
-    # Transform z back to pre-clipped space
+    # Transform z back to pre-clipped space in (0, 1)
     s = (z + beta) / (1 + 2 * beta)
     s = s.clamp(eps, 1 - eps)
     
-    # Log-density of logistic
     log_s = torch.log(s)
     log_1_minus_s = torch.log(1 - s)
+    logit_s = log_s - log_1_minus_s
     
-    log_prob = (logits / tau) - (1 / tau + 1) * log_s - (1 / tau + 1) * log_1_minus_s
+    log_tau = math.log(tau) if isinstance(tau, (int, float)) else torch.log(tau)
+    
+    x = tau * logit_s - logits
+    log_prob = log_tau - log_s - log_1_minus_s + F.logsigmoid(x) + F.logsigmoid(-x)
     log_prob = log_prob - math.log(1 + 2 * beta)
     
     return log_prob
