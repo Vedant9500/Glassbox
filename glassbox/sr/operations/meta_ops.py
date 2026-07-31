@@ -570,7 +570,7 @@ class MetaArithmeticExtended(nn.Module):
         res_add = x + y
         res_sub = x - y
         res_mul = x * y
-        res_div = x / (torch.abs(y) + 1e-6) * torch.sign(y) # Safe division
+        res_div = x / torch.sqrt(1.0 + torch.square(y)) # Soft division matching C++ eval.h
         
         # Weighted sum
         result = (
