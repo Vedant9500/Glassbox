@@ -5,7 +5,7 @@
 **Supersedes:** first-pass audit text and the interim verification pass (formerly split across two files) — merged here as the sole report  
 **Scope:** Entire active tree (`glassbox/`, `scripts/`, `tests/`, `docs/`, C++ under `glassbox/sr/cpp/`); Eigen vendored, `.tmp/`, `results/`, local `models/` weights out of scope for product bugs  
 **Method:** Multi-pass static analysis + cross-module verification + secondary cascade + full re-verification of every prior finding against current sources  
-**Code modified:** H-01…H-22 fixed (C++ core, sklearn wrapper, blackbox, universal proposer, curve classifier, train paths, ONN tau/elite/BN, phased regression, family signatures, specialist vault ranking); report marks them **FIXED**
+**Code modified:** H-01…H-22 fixed (C++ core, sklearn wrapper, blackbox, universal proposer, curve classifier, train paths, ONN tau/elite/BN, phased regression, family signatures, specialist vault ranking); M-04/M-05/L-01 fixed; report marks them **FIXED**
 
 This document is the **only** audit report to maintain. It combines:
 
@@ -362,8 +362,8 @@ Matches `x`, `x0`, `x1`, … So `nest_formulas("sin(x0)+x1", "x0**2")` → `sin(
 | **M-02** | **FIXED** | FPIP fast-path builder now assigns candidate probabilities and builds `search_plan` from x/y via `build_search_plan` (`fpip_v2.py`) |
 | **M-03** | **FIXED** | `last_crossover_valid`, `crossover_attempts`, `crossover_successes`, and `crossover_valid_rate` exported from `core.cpp` |
 | **M-04** | **FIXED** | Meta soft-div = abs-form (`meta_ops.py:573`); C++ **Arithmetic** soft-div = sqrt-form (`eval.h:273`); C++ **Division** matches meta abs-form (`eval.h:280`) — meta ≠ Arithmetic soft |
-| **M-05** | CONFIRMED | `hard_concrete_log_prob` stretched BinaryConcrete only (`:94–108`) |
-| **L-01** | CONFIRMED | `compute_specialist_state` first-N slice (`:723`) without rank sort |
+| **M-05** | **FIXED** | `hard_concrete_log_prob` now the true Hard-Concrete density (`hard_concrete.py:73–109`); regression test `tests/test_audit_m05_fix.py` |
+| **L-01** | **FIXED** | `compute_specialist_state` rank-sorts candidates (validation MSE/R²) before the first-N slice (`specialist_state.py:767–786`); regression test `test_compute_specialist_state_ranks_before_slice` |
 
 ### 2.6 Docs / dead code (V1 §6) — verification
 

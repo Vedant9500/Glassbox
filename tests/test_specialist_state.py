@@ -443,3 +443,30 @@ def test_m01_permuted_index_holdout():
     assert added == 1
 
 
+def test_compute_specialist_state_ranks_before_slice():
+    x = np.linspace(-3.0, 3.0, 160)
+    X = np.column_stack([x, np.sin(x), np.cos(x)])
+    y = np.where(x < 0.0, x * x, np.sin(2.0 * x))
+    # Best formula placed LAST in input order; weaker ones first.
+    candidates = [
+        {"formula": "sin(x0)", "validation_r2": 0.2, "validation_mse": 5.0, "source": "weak"},
+        {"formula": "cos(x0)", "validation_r2": 0.1, "validation_mse": 6.0, "source": "weaker"},
+        {"formula": "x0^2", "validation_r2": 0.9, "validation_mse": 0.1, "source": "best"},
+    ]
+
+    state = compute_specialist_state(
+        candidates,
+        X,
+        y,
+        evaluate_formula=_eval_formula,
+        complexity_fn=lambda formula: len(str(formula)),
+        family_signature_fn=lambda formula: "periodic" if "sin" in str(formula) else "poly",
+        max_candidates=2,
+        max_pairs=3,
+    )
+
+    assert state is not None
+    formula_best = state.hot_spot_base_formula
+    assert formula_best == "x0^2"
+
+

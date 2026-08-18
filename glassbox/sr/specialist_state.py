@@ -764,9 +764,26 @@ def compute_specialist_state(
     if y_arr.shape[0] != int(X_arr.shape[0]):
         return None
 
+    # Rank candidates before the first-N slice so the top performers are kept
+    # (L-01: previously sliced by input order with no rank sort).
+    def _pre_rank(candidate: Any) -> tuple:
+        meta = candidate or {}
+        mse = _clean_float(meta.get("validation_mse"))
+        r2 = _clean_float(meta.get("validation_r2"))
+        if mse is None:
+            mse = float("inf")
+        if r2 is None:
+            r2 = -float("inf")
+        return (float(mse), -float(r2))
+
+    ranked_candidate_formulas = sorted(
+        candidate_formulas,
+        key=_pre_rank,
+    )
+
     # First, evaluate and create temporary candidate info
     temp_candidates = []
-    for candidate in list(candidate_formulas)[: max(1, int(max_candidates))]:
+    for candidate in ranked_candidate_formulas[: max(1, int(max_candidates))]:
         formula = str((candidate or {}).get("formula", "")).strip()
         if not formula:
             continue
