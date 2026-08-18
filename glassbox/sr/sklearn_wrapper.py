@@ -22,7 +22,7 @@ from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 try:
     from scipy.optimize import least_squares
-except Exception:  # pragma: no cover - scipy is declared but keep import optional
+except ImportError:  # pragma: no cover - scipy is declared but keep import optional
     least_squares = None
 from glassbox.sr.blackbox_preprocessor import (
     build_search_space_structure_seeds,
@@ -42,7 +42,7 @@ from glassbox.model_registry import DEFAULT_CURVE_CLASSIFIER_PATH
 def _clamp_int(value, default, lo, hi):
     try:
         value = int(round(float(value)))
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         value = default
     return int(max(lo, min(hi, value)))
 
@@ -50,7 +50,7 @@ def _clamp_int(value, default, lo, hi):
 def _clamp_float(value, default, lo, hi):
     try:
         value = float(value)
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         value = default
     return float(max(lo, min(hi, value)))
 
@@ -58,7 +58,7 @@ def _clamp_float(value, default, lo, hi):
 def _finite_float(value, default=0.0):
     try:
         out = float(value)
-    except Exception:
+    except (TypeError, ValueError, OverflowError):
         return float(default)
     return out if np.isfinite(out) else float(default)
 
@@ -1218,6 +1218,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.boosting_diagnostics_ = {}
         self.inception_rounds_ = []
         self.inception_diagnostics_ = {}
+        # R-01: every intentionally-swallowed exception is counted here so
+        # soft-fail paths stay observable instead of hiding remap/scoring bugs.
+        self.swallowed_errors_ = {}
+        self.swallowed_errors_enabled_ = True
 
     def _add_phase_time(self, phase: str, elapsed: float) -> None:
         try:
@@ -1231,6 +1235,36 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             timings = {}
             self.phase_timings_ = timings
         timings[phase] = float(timings.get(phase, 0.0) or 0.0) + value
+
+    def _record_swallowed_error(self, site: str, exc, *, detail: str = "") -> None:
+        """R-01: record an intentionally-swallowed exception for diagnostics.
+
+        Bare ``except Exception`` soft-fail paths must be visible post-fit so
+        remap/scoring bugs are not hidden. Thread-safe for ThreadPool-shared
+        estimators (S1-8). No-op when ``swallowed_errors_enabled_`` is False.
+        """
+        if not getattr(self, "swallowed_errors_enabled_", True):
+            return
+        lock = getattr(self, "_formula_eval_lock_", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._formula_eval_lock_ = lock
+        counts = getattr(self, "swallowed_errors_", None)
+        if not isinstance(counts, dict):
+            counts = {}
+            self.swallowed_errors_ = counts
+        with lock:
+            key = str(site) or "unknown"
+            entry = counts.get(key)
+            if entry is None:
+                entry = {"count": 0, "types": {}}
+                counts[key] = entry
+            entry["count"] += 1
+            type_name = type(exc).__name__
+            entry["types"][type_name] = entry["types"].get(type_name, 0) + 1
+            entry["last"] = str(exc)[:200]
+            if detail:
+                entry["detail"] = detail[:200]
 
     def _estimate_compute_budget(self, X, current_r2, term_count, uncertainty=None):
         """Adaptive compute budget: easy problems get short runs, hard problems get longer runs.
@@ -2436,7 +2470,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     pred = np.asarray(pred, dtype=np.float64).reshape(-1)
                     mse = float(np.mean((pred - y_all) ** 2))
                     inlier = self._inlier_mse(pred, y_all)
-                except Exception:
+                except Exception as exc:
+                    self._record_swallowed_error("free_const.remap_eval", exc)
                     continue
                 if not np.isfinite(mse):
                     continue
@@ -3471,7 +3506,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         try:
             from glassbox.sr.cpp.seed_graph_builder import _parse_formula_expr
             import sympy as sp
-        except Exception:
+        except ImportError:
             return []
         expr = _parse_formula_expr(text)
         if expr is None:
@@ -3829,7 +3864,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return float("inf")
         try:
             pred = self._safe_eval_formula_array(text, X)
-        except Exception:
+        except Exception as exc:
+            self._record_swallowed_error("formula_mse.eval", exc)
             return float("inf")
         pred = np.asarray(pred, dtype=np.float64).reshape(-1)
         target = np.asarray(y, dtype=np.float64).reshape(-1)
@@ -3856,7 +3892,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return float("inf")
         try:
             pred = self._safe_eval_formula_array(text, X)
-        except Exception:
+        except Exception as exc:
+            self._record_swallowed_error("plain_unweighted_mse.eval", exc)
             return float("inf")
         pred = np.asarray(pred, dtype=np.float64).reshape(-1)
         target = np.asarray(y, dtype=np.float64).reshape(-1)
@@ -3887,7 +3924,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 if np.isfinite(mse_f):
                     # Prefer local when both finite (same contract); keep local.
                     return local_mse if np.isfinite(local_mse) else mse_f
-        except Exception:
+        except Exception as exc:
+            self._record_swallowed_error("display_formula_mse.scripts_parity", exc)
             pass
         return local_mse
 
@@ -4831,10 +4869,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return None
         try:
             from classifier_fast_path import _maybe_match_easy_multivariate_formula  # type: ignore
-        except Exception:
+        except ImportError:
             try:
                 from scripts.classifier_fast_path import _maybe_match_easy_multivariate_formula  # type: ignore
-            except Exception:
+            except ImportError:
                 return None
         cols = [int(i) for i in selected_features]
         if any(i < 0 or i >= X_all.shape[1] for i in cols):
@@ -4851,7 +4889,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         try:
             pred = self._safe_eval_formula_array(formula, X_all)
             full_mse = float(np.mean((np.asarray(pred, dtype=np.float64).reshape(-1) - y_all) ** 2))
-        except Exception:
+        except Exception as exc:
+            self._record_swallowed_error("fast_path_remap.full_mse", exc)
             full_mse = float(mse)
         if not np.isfinite(full_mse):
             return None
@@ -5722,7 +5761,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         max_seeds=max(6, min(12, int(max_candidates) if max_candidates else 8)),
                         blackbox_state=blackbox_state,
                     )
-                except Exception:
+                except Exception as exc:
+                    self._record_swallowed_error("candidates.structure_seeds", exc)
                     structure_seeds = []
                 for seed in structure_seeds:
                     formula = str((seed or {}).get("formula") or "").strip()
@@ -6267,7 +6307,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         try:
             from sklearn.linear_model import ElasticNetCV, RidgeCV
             from sklearn.exceptions import ConvergenceWarning
-        except Exception:
+        except ImportError:
             ElasticNetCV = RidgeCV = None
             ConvergenceWarning = Warning
 
@@ -6911,7 +6951,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             try:
                 from scripts.benchmark_common import protect_fractional_powers
                 expr = protect_fractional_powers(expr)
-            except Exception:
+            except Exception as exc:
+                self._record_swallowed_error("safe_eval.protect_fractional_powers", exc)
                 pass
 
         # S1-8: ThreadPool workers share this estimator — protect counters/cache.
@@ -6933,7 +6974,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         else:
             try:
                 ptr = int(X_arr.__array_interface__["data"][0])
-            except Exception:
+            except Exception as exc:
+                self._record_swallowed_error("safe_eval.data_ptr", exc)
                 ptr = id(X_arr)
             strides = tuple(int(s) for s in getattr(X_arr, "strides", ()) or ())
             content_fp = (ptr, strides)
@@ -7005,7 +7047,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             if raw_arr.shape[0] != X.shape[0]:
                 return 1.0
             return float(np.mean(~np.isfinite(raw_arr)))
-        except Exception:
+        except Exception as exc:
+            self._record_swallowed_error("domain_failure_rate.eval", exc)
             return 1.0
 
     def _passes_cross_validation_skip_guard(self, formula, X, y, sample_weight=None):
@@ -10123,7 +10166,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     best_mse = float(display_score)
                 elif np.isfinite(display_mse):
                     best_mse = float(display_mse)
-        except Exception:
+        except Exception as exc:
+            self._record_swallowed_error("final_guard.score", exc)
             pass
         self.best_mse_ = best_mse
         # S1-4: always expose original feature count publicly after fit.
@@ -10133,6 +10177,18 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             self.blackbox_diagnostics_["n_features_in_"] = int(self.n_features_in_)
             self.blackbox_diagnostics_["n_features_search_"] = int(
                 getattr(self, "n_features_search_", self.n_features_in_)
+            )
+        # R-01: expose swallowed-exception summary on the estimator after fit.
+        if isinstance(getattr(self, "swallowed_errors_", None), dict) and self.swallowed_errors_:
+            self.swallowed_errors_summary_ = {
+                "total": sum(int(e.get("count", 0)) for e in self.swallowed_errors_.values()),
+                "sites": dict(self.swallowed_errors_),
+            }
+        else:
+            self.swallowed_errors_summary_ = {"total": 0, "sites": {}}
+        if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+            self.blackbox_diagnostics_["swallowed_errors"] = getattr(
+                self, "swallowed_errors_summary_", {"total": 0, "sites": {}}
             )
         self._restore_user_loss_mode_if_auto_switched()
         self._add_phase_time("total_fit", _time.time() - fit_start)
@@ -10151,6 +10207,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         try:
             return self._safe_eval_formula_array(self.formula_, X)
         except Exception as e:
+            self._record_swallowed_error("predict.eval", e)
             print(f"Prediction error: {e}")
             return np.zeros(X.shape[0])
 

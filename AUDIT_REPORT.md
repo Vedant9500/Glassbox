@@ -5,7 +5,7 @@
 **Supersedes:** first-pass audit text and the interim verification pass (formerly split across two files) — merged here as the sole report  
 **Scope:** Entire active tree (`glassbox/`, `scripts/`, `tests/`, `docs/`, C++ under `glassbox/sr/cpp/`); Eigen vendored, `.tmp/`, `results/`, local `models/` weights out of scope for product bugs  
 **Method:** Multi-pass static analysis + cross-module verification + secondary cascade + full re-verification of every prior finding against current sources  
-**Code modified:** H-01…H-22 fixed (C++ core, sklearn wrapper, blackbox, universal proposer, curve classifier, train paths, ONN tau/elite/BN, phased regression, family signatures, specialist vault ranking); M-04/M-05/L-01 fixed; report marks them **FIXED**
+**Code modified:** H-01…H-22 fixed (C++ core, sklearn wrapper, blackbox, universal proposer, curve classifier, train paths, ONN tau/elite/BN, phased regression, family signatures, specialist vault ranking); M-04/M-05/L-01 fixed; R-01 fixed (swallowed-error diagnostics counter + typed fallbacks); report marks them **FIXED**
 
 This document is the **only** audit report to maintain. It combines:
 
@@ -63,7 +63,7 @@ The older **ONN Python evolution path** (`glassbox/evolution/evolution.py` + `sr
 |-----------|----|----|-------|
 | Hybrid pipeline design | B+ | **B+** | Unchanged; stages clear |
 | C++ search core | B- | **B-** | C-05 exposure refined; C-07/H-05/R-06′ still serious |
-| Python orchestration | C+ | **C** | Zero-fill + 175 bare `except Exception` dominate risk |
+| Python orchestration | C+ | **C** | Zero-fill + 175 bare `except Exception` dominate risk; R-01 now counters/observes them |
 | ONN research path | D+ | **D+** | C-08…C-11 all confirmed |
 | Classifier / proposer | B- | **B-** | Train/serve + multi-var prefix gaps stand |
 | Benchmark honesty | C | **C-** | 1D force exists in both suite **and** `benchmark_common.evaluate_formula_mse` |
@@ -90,7 +90,7 @@ The older **ONN Python evolution path** (`glassbox/evolution/evolution.py` + `sr
 | `scripts/classifier_fast_path.py` | 4,864 |
 | `glassbox/sr/cpp/eval.h` | 771 |
 | `glassbox/sr/cpp/core.cpp` | 1,290 |
-| `except Exception` in `sklearn_wrapper.py` | **175** |
+| `except Exception` in `sklearn_wrapper.py` | **170** (175 before R-01) |
 | Pytest modules under `tests/` | 44+ |
 
 ---
@@ -344,7 +344,7 @@ Matches `x`, `x0`, `x1`, … So `nest_formulas("sin(x0)+x1", "x0**2")` → `sin(
 
 | ID | Verdict | Notes |
 |----|---------|-------|
-| **R-01** | CONFIRMED | 175× `except Exception` in sklearn_wrapper alone |
+| **R-01** | **FIXED** | `swallowed_errors_` counter + `_record_swallowed_error`; typed exceptions at conversion/import fallbacks; hot-path instrumentation; `swallowed_errors_summary_` + `blackbox_diagnostics_["swallowed_errors"]`; regression tests `tests/test_audit_r01_swallowed_errors.py` |
 | **R-02** | CONFIRMED | Restricted `eval` still expression-injection surface |
 | **R-03** | CONFIRMED | Pickle/`weights_only=False` policy per SECURITY.md |
 | **R-04** | CONFIRMED | Soft-div `x/sqrt(1+y²)` ≠ algebraic `/` |
@@ -676,7 +676,7 @@ primary_sources = self.router.get_primary_sources()
 
 | Module | Pass 1 | Re-verify depth | Primary residual risks |
 |--------|----|----------|------------------------|
-| `sr/sklearn_wrapper.py` | sectional | re-verified hot paths | C-01–03, H-08–12, R-01 |
+| `sr/sklearn_wrapper.py` | sectional | re-verified hot paths | C-01–03, H-08–12; R-01 **FIXED** |
 | `sr/cpp/evolution.h` | yes | re-verified NSGA/XO/macro/fitness | C-05–07, H-01–05, R-06′, P-02/08 |
 | `sr/cpp/eval.h` | yes | re-verified | H-06, C-14, R-04, M-04 |
 | `sr/cpp/core.cpp` | yes | entry validation gap | C-06, R-10, H-07 |
@@ -1069,6 +1069,7 @@ Key from coarse moments over 32 samples → wrong feature reuse across problems.
 ### A.3 Robustness narratives (R-01 … R-09)
 
 ### R-01 — Exception swallowing culture
+**Status: FIXED**
 
 | Location | Approx. count |
 |----------|---------------|
@@ -1077,6 +1078,15 @@ Key from coarse moments over 32 samples → wrong feature reuse across problems.
 | glassbox package total | ~255 |
 
 Many are intentional soft-fail for optional polish, but they hide remap/scoring bugs. Prefer typed exceptions + counters in diagnostics (`swallowed_errors_`).
+
+**Fix applied (`sklearn_wrapper.py`):**
+- `swallowed_errors_` counter + thread-safe `_record_swallowed_error(site, exc)` helper (S1-8 ThreadPool-safe).
+- Hot-path instrumentation (12 sites): `formula_mse.eval`, `plain_unweighted_mse.eval`, `display_formula_mse.scripts_parity`, `domain_failure_rate.eval`, `safe_eval.protect_fractional_powers`, `safe_eval.data_ptr`, `fast_path_remap.full_mse`, `free_const.remap_eval`, `candidates.structure_seeds`, `final_guard.score`, `predict.eval`.
+- Typed exceptions at safe fallback sites: `_clamp_int`/`_clamp_float`/`_finite_float` → `(TypeError, ValueError, OverflowError)`; scipy/sympy/classifier_fast_path/sklearn imports → `ImportError`.
+- `fit()` exposes `swallowed_errors_summary_` (total + per-site count/type/last) and mirrors into `blackbox_diagnostics_["swallowed_errors"]`.
+- Regression tests: `tests/test_audit_r01_swallowed_errors.py` (7 tests).
+
+Remaining ~170 bare `except Exception` are intentional soft-fail polish paths; the critical scoring/remap/predict sites are now observable post-fit.
 
 ### R-02 — Formula `eval` with restricted builtins
 
