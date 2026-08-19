@@ -529,7 +529,7 @@ def test_multivariate_blackbox_cpp_seeds_use_reduced_indices(monkeypatch):
         return None
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
-    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
     monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
     # Keep evolution path live so seed_graphs / search-plan kwargs are exercised.
     monkeypatch.setattr(
@@ -601,7 +601,7 @@ def test_blackbox_refined_candidate_can_skip_cpp(monkeypatch):
         }
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
-    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
     monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
 
     rng = np.random.RandomState(17)
@@ -650,7 +650,7 @@ def test_blackbox_basis_model_skips_cpp_on_additive_signal(monkeypatch):
         return None
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
-    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
     monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
 
     rng = np.random.RandomState(23)
@@ -704,7 +704,7 @@ def test_blackbox_demotes_unstable_fast_path_incumbent(monkeypatch):
         }
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
-    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
     monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
 
     rng = np.random.RandomState(61)
@@ -842,7 +842,7 @@ def test_blackbox_high_uncertainty_disables_universal_fast_path(monkeypatch):
         }
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
-    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
     monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
 
     rng = np.random.RandomState(73)
@@ -1031,7 +1031,7 @@ def test_blackbox_cpp_receives_binary_priors(monkeypatch):
         }
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
-    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
     monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
     monkeypatch.setattr(sw.GlassboxRegressor, "_refine_candidate_formulas", lambda self, *args, **kwargs: [])
     monkeypatch.setattr(sw.GlassboxRegressor, "_fit_blackbox_basis_model", lambda self, *args, **kwargs: None)
@@ -1096,7 +1096,7 @@ def test_blackbox_candidate_screening_exports_interaction_operator_hints(monkeyp
         return None
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
-    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
     monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
 
     rng = np.random.RandomState(41)
@@ -1152,7 +1152,7 @@ def test_blackbox_candidate_screening_exports_specialist_pair_diagnostics(monkey
         return None
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
-    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
     monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
 
     rng = np.random.RandomState(53)
@@ -1207,7 +1207,7 @@ def test_blackbox_candidate_screening_can_disable_specialist_diagnostics(monkeyp
         return None
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
-    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
     monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
 
     rng = np.random.RandomState(59)
@@ -1255,7 +1255,7 @@ def test_blackbox_candidate_screening_can_accept_specialist_compositions(monkeyp
         return None
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
-    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
     monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
 
     x = np.linspace(-3.0, 3.0, 180)
@@ -1305,7 +1305,7 @@ def test_blackbox_candidate_pool_can_skip_cpp_from_interaction_formula(monkeypat
         return None
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
-    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
     monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
 
     rng = np.random.RandomState(43)
@@ -1362,7 +1362,7 @@ def test_evolution_result_is_selected_via_direct_formula_evaluation(monkeypatch)
         }
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
-    monkeypatch.setattr(sw, "_core", _FakeCore)
+    monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
     monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
 
     rng = np.random.RandomState(31)
