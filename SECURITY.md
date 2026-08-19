@@ -38,8 +38,9 @@ Security reports are especially helpful for:
 
 Glassbox model checkpoints are treated as trusted local artifacts. PyTorch
 loaders first attempt weights-only loading. If an older pickle-backed checkpoint
-is required, fallback loading is restricted to repository-local `models/` and
-`artifacts/` paths. Do not load checkpoints from untrusted users or remote
-locations without converting them to a weights-only format first.
+is required, fallback loading requires BOTH an explicit opt-in via the
+`GLASSBOX_ALLOW_PICKLE_CHECKPOINT=1` environment variable AND a repository-local
+`models/` or `artifacts/` path. Do not load checkpoints from untrusted users or
+remote locations without converting them to a weights-only format first.
 
 Thank you for helping keep Glassbox and its users safe.

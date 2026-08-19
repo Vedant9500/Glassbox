@@ -535,6 +535,13 @@ def _load_torch_checkpoint(model_path: Path):
                 "Refusing unsafe pickle checkpoint load outside trusted local model directories. "
                 f"Move {model_path} under models/ or artifacts/, or convert it to a weights-only checkpoint."
             ) from safe_error
+        if not os.environ.get("GLASSBOX_ALLOW_PICKLE_CHECKPOINT"):
+            raise RuntimeError(
+                "weights-only checkpoint load failed for a trusted local checkpoint; refusing "
+                "unsafe pickle fallback without explicit opt-in. Set "
+                "GLASSBOX_ALLOW_PICKLE_CHECKPOINT=1 to allow pickle loading for trusted local "
+                f"checkpoints, or convert {model_path} to a weights-only checkpoint."
+            ) from safe_error
         if os.environ.get("GLASSBOX_VERBOSE_CHECKPOINT_LOAD"):
             print(
                 "weights-only checkpoint load failed; falling back to trusted local "
@@ -880,9 +887,10 @@ def _prepare_curve_features(features: np.ndarray, scaler: Optional[dict] = None)
         prepared[192:end] = np.sign(prepared[192:end]) * np.log1p(np.abs(prepared[192:end]))
 
     if scaler is not None:
-        dim = len(scaler['mean'])
-        prepared = prepared[:dim]
-        prepared = (prepared - scaler['mean']) / (scaler['std'] + 1e-8)
+        mean = np.asarray(scaler['mean'], dtype=np.float32)
+        std = np.asarray(scaler['std'], dtype=np.float32)
+        prepared = prepared[:len(mean)]
+        prepared = (prepared - mean) / (std + 1e-8)
 
     return prepared
 

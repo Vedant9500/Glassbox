@@ -1218,6 +1218,13 @@ def _load_torch_checkpoint(checkpoint_path: Path):
                 "Refusing unsafe pickle checkpoint load outside trusted local model directories. "
                 f"Move {checkpoint_path} under models/ or artifacts/, or convert it to a weights-only checkpoint."
             ) from safe_error
+        if not os.environ.get("GLASSBOX_ALLOW_PICKLE_CHECKPOINT"):
+            raise RuntimeError(
+                "weights-only checkpoint load failed for a trusted local checkpoint; refusing "
+                "unsafe pickle fallback without explicit opt-in. Set "
+                "GLASSBOX_ALLOW_PICKLE_CHECKPOINT=1 to allow pickle loading for trusted local "
+                f"checkpoints, or convert {checkpoint_path} to a weights-only checkpoint."
+            ) from safe_error
         if os.environ.get("GLASSBOX_VERBOSE_CHECKPOINT_LOAD"):
             print(
                 "weights-only checkpoint load failed; falling back to trusted local "
