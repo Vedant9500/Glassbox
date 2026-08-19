@@ -104,3 +104,60 @@ def test_scoring_hot_path_records_eval_failure():
     inf_plain = est._plain_unweighted_mse("x9 + 1", X, y)
     assert not np.isfinite(inf_plain)
     assert est.swallowed_errors_.get("plain_unweighted_mse.eval", {}).get("count", 0) >= 1
+
+
+# ---------------------------------------------------------------------------
+# Final-selection / polish soft-fail sites are observable (bare-pass audit)
+# ---------------------------------------------------------------------------
+def test_final_selection_bare_pass_sites_instrumented():
+    """The 9 previously-bare-pass polish sites must now record their failures.
+
+    Source-wiring check: each site name must appear as a ``_record_swallowed_error``
+    call so a future refactor cannot silently revert them to bare ``pass``.
+    """
+    import pathlib
+
+    src = pathlib.Path("glassbox/sr/sklearn_wrapper.py").read_text()
+    expected_sites = {
+        "final_score.finish_eval",
+        "structure_seed.promote",
+        "pareto.prefer_simple",
+        "polish.original_space_structure",
+        "original_structure.inlier_eval",
+        "original_structure.polish",
+        "original_structure.winner",
+        "original_space.holdout_rescore",
+        "final_guard.recompute_mse",
+    }
+    for site in expected_sites:
+        assert f'_record_swallowed_error("{site}"' in src, f"missing wiring for {site}"
+
+
+def test_finalize_summary_empty_and_populated():
+    est = GlassboxRegressor(random_state=0)
+    est.swallowed_errors_ = {}
+    est.blackbox_diagnostics_ = {}
+    est._finalize_swallowed_errors_summary()
+    assert est.swallowed_errors_summary_ == {"total": 0, "sites": {}}
+    assert est.blackbox_diagnostics_["swallowed_errors"] == {"total": 0, "sites": {}}
+
+    est.swallowed_errors_ = {"scoring.eval": {"count": 2, "types": {"ValueError": 2}, "last": "x"}}
+    est._finalize_swallowed_errors_summary()
+    assert est.swallowed_errors_summary_["total"] == 2
+    assert est.swallowed_errors_summary_["sites"] == est.swallowed_errors_
+    assert est.blackbox_diagnostics_["swallowed_errors"]["total"] == 2
+
+
+def test_early_exit_fast_path_exposes_summary():
+    """The fast-path early return must still publish the R-01 summary.
+
+    Previously ``_finish_with_formula`` returned ``self`` before the summary was
+    set, so ``swallowed_errors_summary_`` was missing on the most common exit.
+    """
+    est = GlassboxRegressor(random_state=0, use_fast_path=True)
+    rng = np.random.RandomState(0)
+    X = rng.uniform(0.0, 1.0, size=(60, 1))
+    y = 2.0 * X[:, 0] + 1.0
+    est.fit(X, y)
+    assert hasattr(est, "swallowed_errors_summary_")
+    assert est.swallowed_errors_summary_["total"] >= 0

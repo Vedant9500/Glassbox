@@ -1083,10 +1083,11 @@ Many are intentional soft-fail for optional polish, but they hide remap/scoring 
 - `swallowed_errors_` counter + thread-safe `_record_swallowed_error(site, exc)` helper (S1-8 ThreadPool-safe).
 - Hot-path instrumentation (12 sites): `formula_mse.eval`, `plain_unweighted_mse.eval`, `display_formula_mse.scripts_parity`, `domain_failure_rate.eval`, `safe_eval.protect_fractional_powers`, `safe_eval.data_ptr`, `fast_path_remap.full_mse`, `free_const.remap_eval`, `candidates.structure_seeds`, `final_guard.score`, `predict.eval`.
 - Typed exceptions at safe fallback sites: `_clamp_int`/`_clamp_float`/`_finite_float` → `(TypeError, ValueError, OverflowError)`; scipy/sympy/classifier_fast_path/sklearn imports → `ImportError`.
-- `fit()` exposes `swallowed_errors_summary_` (total + per-site count/type/last) and mirrors into `blackbox_diagnostics_["swallowed_errors"]`.
-- Regression tests: `tests/test_audit_r01_swallowed_errors.py` (7 tests).
+- `fit()` exposes `swallowed_errors_summary_` (total + per-site count/type/last) and mirrors into `blackbox_diagnostics_["swallowed_errors"]`; summary published from every fit exit path via `_finalize_swallowed_errors_summary()` (incl. fast-path early return).
+- Final-selection/polish bare-`pass` sites instrumented (9 sites): `final_score.finish_eval`, `structure_seed.promote`, `pareto.prefer_simple`, `polish.original_space_structure`, `original_structure.inlier_eval`, `original_structure.polish`, `original_structure.winner`, `original_space.holdout_rescore`, `final_guard.recompute_mse`.
+- Regression tests: `tests/test_audit_r01_swallowed_errors.py` (10 tests).
 
-Remaining ~170 bare `except Exception` are intentional soft-fail polish paths; the critical scoring/remap/predict sites are now observable post-fit.
+Remaining ~160 bare `except Exception` are intentional candidate-loop/soft-fail polish paths (a failing candidate is a normal search event, not a bug; typing them would miss heterogeneous failure modes and crash on edge data). The critical scoring/remap/predict and final-selection sites are now observable post-fit.
 
 ### R-02 — Formula `eval` with restricted builtins
 
