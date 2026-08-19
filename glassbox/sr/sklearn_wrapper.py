@@ -7012,6 +7012,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
+            # R-02: gate the eval with the AST allowlist before it runs (cache-miss only).
+            from glassbox.sr.formula_safety import validate_formula_expr
+            validate_formula_expr(expr, context.keys())
             y_pred = eval(expr, {"__builtins__": None}, context)
 
         if isinstance(y_pred, (int, float)):
@@ -7059,6 +7062,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
+                # R-02: gate the eval with the AST allowlist before it runs.
+                from glassbox.sr.formula_safety import validate_formula_expr
+                validate_formula_expr(expr, context.keys())
                 raw = eval(expr, {"__builtins__": None}, context)
             if isinstance(raw, (int, float)):
                 raw = np.full(X.shape[0], raw, dtype=np.float64)

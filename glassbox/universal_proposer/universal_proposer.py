@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from glassbox.sr.fpip_v2 import validate_fpip_v2_payload
+from glassbox.sr.formula_safety import validate_formula_expr
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -256,6 +257,8 @@ def _safe_formula_eval_multivariate(formula: str, x: np.ndarray) -> Optional[np.
 
     expr = formula.replace("^", "**")
     try:
+        # R-02: gate the eval with the AST allowlist before it runs.
+        validate_formula_expr(expr, context.keys())
         y = eval(expr, {"__builtins__": None}, context)
     except Exception:
         return None
@@ -361,6 +364,8 @@ def _safe_formula_eval(formula: str, x: np.ndarray) -> Optional[np.ndarray]:
     }
     expr = formula.replace("^", "**")
     try:
+        # R-02: gate the eval with the AST allowlist before it runs.
+        validate_formula_expr(expr, context.keys())
         y = eval(expr, {"__builtins__": None}, context)
     except Exception:
         return None

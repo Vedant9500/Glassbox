@@ -7,6 +7,8 @@ from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
 
+from glassbox.sr.formula_safety import validate_formula_expr
+
 
 def _clean_float(value: Any) -> Optional[float]:
     if value is None:
@@ -1100,6 +1102,8 @@ def propose_specialist_compositions(
         if X_val.shape[1] == 1:
             context["x"] = X_val[:, 0]
         cleaned_expr = str(expr_str).replace("^", "**")
+        # R-02: gate the eval with the AST allowlist before it runs.
+        validate_formula_expr(cleaned_expr, context.keys())
         return np.asarray(eval(cleaned_expr, {"__builtins__": None}, context), dtype=np.float64)
 
     eval_fn = evaluate_formula if evaluate_formula is not None else _local_eval

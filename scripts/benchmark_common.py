@@ -739,6 +739,9 @@ def evaluate_formula(formula_str, X, *, return_diagnostics=False):
 
     try:
         with np.errstate(divide="raise", invalid="raise", over="raise", under="ignore"):
+            # R-02: gate the eval with the AST allowlist before it runs.
+            from glassbox.sr.formula_safety import validate_formula_expr
+            validate_formula_expr(formula, context.keys())
             y_pred = eval(formula, {"__builtins__": None}, context)
         if isinstance(y_pred, (int, float)):
             y_pred = np.full(X.shape[0], y_pred, dtype=np.float64)

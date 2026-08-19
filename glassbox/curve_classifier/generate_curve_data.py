@@ -16,6 +16,8 @@ from typing import List, Tuple, Dict, Set
 from pathlib import Path
 import ast
 
+from glassbox.sr.formula_safety import validate_formula_expr
+
 # Make scipy optional - provide fallbacks
 try:
     from scipy.stats import skew, kurtosis
@@ -1419,6 +1421,8 @@ def evaluate_formula(formula: str, x: np.ndarray, safe_eval: bool = True) -> Tup
             else:
                 context = {"x": x, "np": np}
                 context.update(_build_variable_context(x))
+                # R-02: gate the raw-eval branch with the AST allowlist.
+                validate_formula_expr(formula, context.keys())
                 y = eval(formula, context)
             
             # Broadcast scalar results (e.g. from constant PCFG formulas)
