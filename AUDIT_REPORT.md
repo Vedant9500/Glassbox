@@ -5,7 +5,7 @@
 **Supersedes:** first-pass audit text and the interim verification pass (formerly split across two files) — merged here as the sole report  
 **Scope:** Entire active tree (`glassbox/`, `scripts/`, `tests/`, `docs/`, C++ under `glassbox/sr/cpp/`); Eigen vendored, `.tmp/`, `results/`, local `models/` weights out of scope for product bugs  
 **Method:** Multi-pass static analysis + cross-module verification + secondary cascade + full re-verification of every prior finding against current sources  
-**Code modified:** H-01…H-22 fixed (C++ core, sklearn wrapper, blackbox, universal proposer, curve classifier, train paths, ONN tau/elite/BN, phased regression, family signatures, specialist vault ranking); M-04/M-05/L-01 fixed; R-01 fixed (swallowed-error diagnostics counter + typed fallbacks); R-02/R-12 fixed (AST-allowlist gate for formula `eval`); report marks them **FIXED**
+**Code modified:** H-01…H-22 fixed (C++ core, sklearn wrapper, blackbox, universal proposer, curve classifier, train paths, ONN tau/elite/BN, phased regression, family signatures, specialist vault ranking); M-04/M-05/L-01 fixed; R-01 fixed (swallowed-error diagnostics counter + typed fallbacks); R-02/R-12 fixed (AST-allowlist gate for formula `eval`); R-03 fixed (env-gated pickle checkpoint fallback + weights-only artifacts); report marks them **FIXED**
 
 This document is the **only** audit report to maintain. It combines:
 
@@ -333,8 +333,8 @@ Matches `x`, `x0`, `x1`, … So `nest_formulas("sin(x0)+x1", "x0**2")` → `sin(
 |----|---------|-------|
 | **P-01** | **FIXED** | `SubtreeCache` is LRU with entry/byte caps (`ast.h`); thread budgets split; mid-depth-only inserts (`eval.h`); diagnostics exported |
 | **P-02** | **FIXED** | Default islands & single-pop share `evolve_one_generation` (macro mutations, staged schedule, elite age++, restart, inner refine) |
-| **P-03** | CONFIRMED | `LBFGSConstantOptimizer(..., max_iter=self.lbfgs_steps)` **and** loop `for _ in range(self.lbfgs_steps)` → up to steps² |
-| **P-04** | CONFIRMED | FD Adam full re-eval per param |
+| **P-03** | **FIXED** | `LBFGSConstantOptimizer(..., max_iter=self.lbfgs_steps)` **and** loop `for _ in range(self.lbfgs_steps)` → up to steps². Fix: single `optimizer.step()` with full `max_iter` budget (`hybrid_optimizer.py`); regression test `tests/test_audit_p03_fix.py` |
+| **P-04** | **FIXED** | FD Adam full re-eval per param. Fix: per-step base cache + `evaluate_graph_partial` subtree probes (`eval.h` `evaluate_perturbed_pred`); inert-param skip (p on Periodic/Exp, ω/φ on Power, all on Log/Abs) gated by `fd_skip_inert_params`; LM skips Log/Abs nodes; exports `fd_probes_total`/`fd_probes_skipped_inert`; regression tests `tests/test_audit_p04_fix.py` |
 | **P-05** | CONFIRMED | 10k-LOC god module + Python `eval` scoring |
 | **P-06** | CONFIRMED | Vault stores full residual/prediction vectors |
 | **P-07** | CONFIRMED | Coarse 32-sample moment cache key (`curve_classifier_integration.py:450–470`) |
@@ -346,7 +346,7 @@ Matches `x`, `x0`, `x1`, … So `nest_formulas("sin(x0)+x1", "x0**2")` → `sin(
 |----|---------|-------|
 | **R-01** | **FIXED** | `swallowed_errors_` counter + `_record_swallowed_error`; typed exceptions at conversion/import fallbacks; hot-path instrumentation; `swallowed_errors_summary_` + `blackbox_diagnostics_["swallowed_errors"]`; regression tests `tests/test_audit_r01_swallowed_errors.py` |
 | **R-02** | **FIXED** | AST-allowlist gate (`glassbox/sr/formula_safety.py`) before every formula `eval` in sklearn_wrapper, benchmark_common, universal_proposer, specialist_state (+ generate_curve_data raw branch); rejects attribute traversal / subscript / lambda / import; regression tests `tests/test_audit_r02_expression_injection.py` |
-| **R-03** | CONFIRMED | Pickle/`weights_only=False` policy per SECURITY.md |
+| **R-03** | **FIXED** | Env-gated pickle fallback (`GLASSBOX_ALLOW_PICKLE_CHECKPOINT=1` opt-in + trusted `models/`/`artifacts/` path) in both torch checkpoint loaders; shipped artifacts migrated to weights-only; regression tests `tests/test_audit_r03_pickle_checkpoint.py` |
 | **R-04** | CONFIRMED | Soft-div `x/sqrt(1+y²)` ≠ algebraic `/` |
 | **R-05** | CONFIRMED | Power/log folds on signed domains in `simplify_advanced.h` |
 | **R-06** | CONFIRMED → see **R-06′** | Divide macro uses `sample_binary_op()`; can be Aggregation |
@@ -569,8 +569,8 @@ Key = `(n, mean/std moments, dot, n_points)` over 32 samples — different formu
 |----|--------|--------|
 | P-01, P-10 | **DONE** LRU/byte-capped `SubtreeCache` + mid-depth inserts + diagnostics | `ast.h`, `execution.h`, `eval.h`, `core.cpp` | M |
 | P-02 | **DONE** Share reproduce implementation islands ↔ run | `evolution.h` | M |
-| P-03 | Single LBFGS step with `max_iter=steps` | S |
-| P-04 | LM-first / skip dead nodes in FD | M |
+| P-03 | **DONE** Single LBFGS step with `max_iter=steps` | S |
+| P-04 | **DONE** Incremental FD probes + inert-param skip (+ LM Log/Abs skip) | M |
 | P-05 | Split wrapper; C++ display score batch API | L |
 | P-06 | Residual sketches for large n | S |
 | P-08 | Macro nest attempt counter | S |
@@ -1101,6 +1101,8 @@ Used in `sklearn_wrapper`, `benchmark_common`, `universal_proposer`, `specialist
 Documented in `SECURITY.md`. `weights_only=False` allowed under trusted `models/` / `artifacts/`. Compromised local checkpoint = RCE.
 
 **Mitigation:** Env-gated fallback; migrate all artifacts to weights-only.
+
+**Status:** FIXED — `_load_torch_checkpoint` in both `universal_proposer.py` and `curve_classifier_integration.py` attempt weights-only first and now refuse pickle fallback unless `GLASSBOX_ALLOW_PICKLE_CHECKPOINT=1` is set in addition to a trusted `models/`/`artifacts/` path. All 16 shipped runtime `.pt` artifacts migrated to weights-only-safe format (embedded numpy arrays → plain Python lists). Regression tests `tests/test_audit_r03_pickle_checkpoint.py`.
 
 ### R-04 — Soft arithmetic “division” ≠ algebraic `/`
 

@@ -469,6 +469,8 @@ static py::dict run_evolution_cpp(
     double seed_fraction = 0.5,
     // Macro mutation rate + mode weights [wrap, multiply, divide, nest].
     double macro_mutation_rate = 0.15,
+    // P-04 test hook: force the FD-Adam inner optimizer (default LM).
+    bool use_lm_inner_optimizer = true,
     py::list macro_mode_weights = py::list()
 ) {
     // 1. Convert Python/Numpy inputs to C++/Eigen
@@ -723,6 +725,8 @@ static py::dict run_evolution_cpp(
     config.elite_size = std::max(1, elite_size);
     config.seed_fraction = std::clamp(seed_fraction, 0.05, 1.0);
     config.macro_mutation_rate = std::clamp(macro_mutation_rate, 0.0, 0.9);
+    // P-04: optional override for tests / experiments (engine default true).
+    config.use_lm_inner_optimizer = use_lm_inner_optimizer;
     {
         std::vector<double> mmw;
         for (auto item : macro_mode_weights) {
@@ -825,6 +829,9 @@ static py::dict run_evolution_cpp(
     result["crossover_attempts"] = engine.get_crossover_attempts();
     result["crossover_successes"] = engine.get_crossover_successes();
     result["crossover_valid_rate"] = engine.get_crossover_valid_rate();
+    // P-04 diagnostics: FD probe volume + inert-parameter probes avoided.
+    result["fd_probes_total"] = engine.get_fd_probes_total();
+    result["fd_probes_skipped_inert"] = engine.get_fd_probes_skipped_inert();
     result["subtree_cache_entries"] = static_cast<int>(engine.get_subtree_cache_entries());
     result["subtree_cache_bytes"] = static_cast<long long>(engine.get_subtree_cache_bytes());
     result["subtree_cache_evictions"] = static_cast<long long>(engine.get_subtree_cache_evictions());
@@ -1267,6 +1274,7 @@ PYBIND11_MODULE(_core, m) {
           py::arg("elite_size")=10,
           py::arg("seed_fraction")=0.5,
           py::arg("macro_mutation_rate")=0.15,
+          py::arg("use_lm_inner_optimizer")=true,
           py::arg("macro_mode_weights")=py::list());
 
     m.def("refine_frequencies", &refine_frequencies_wrapper,

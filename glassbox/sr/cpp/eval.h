@@ -409,6 +409,49 @@ inline Eigen::ArrayXd evaluate_graph_simple(
     return evaluate_graph(graph, X, num_samples);
 }
 
+// P-04: assemble the model output from a per-node cache (same reduction as
+// evaluate_graph_impl's final-output step): bias + active-weighted nodes.
+inline Eigen::ArrayXd assemble_prediction(
+    const IndividualGraph& graph,
+    const std::vector<Eigen::ArrayXd>& cache,
+    int num_samples) {
+    Eigen::ArrayXd out = Eigen::ArrayXd::Constant(num_samples, graph.output_bias);
+    for (size_t i = 0; i < graph.output_weights.size() && i < cache.size(); ++i) {
+        if (std::abs(graph.output_weights[i]) > kOutputWeightActive) {
+            out += graph.output_weights[i] * cache[static_cast<size_t>(i)];
+        }
+    }
+    return out;
+}
+
+// P-04: prediction after perturbing one node's parameters, without a full
+// re-evaluation. Only the changed subtree is recomputed
+// (evaluate_graph_partial) and its value deltas applied onto base_pred.
+// Exact because combination weights (Arithmetic soft gates, Aggregation tau,
+// output weights, bias) do not depend on unary inner params {p, omega, phi}.
+inline Eigen::ArrayXd evaluate_perturbed_pred(
+    const IndividualGraph& graph,
+    int perturbed_node_idx,
+    const std::vector<Eigen::ArrayXd>& old_cache,
+    const Eigen::ArrayXd& base_pred,
+    int num_samples) {
+    std::vector<Eigen::ArrayXd> trial_cache;
+    std::vector<int> changed;
+    evaluate_graph_partial(graph, perturbed_node_idx, old_cache, trial_cache, changed);
+
+    Eigen::ArrayXd pred = base_pred;
+    for (int idx : changed) {
+        if (idx < 0 || idx >= static_cast<int>(graph.output_weights.size())) continue;
+        const double w = graph.output_weights[static_cast<size_t>(idx)];
+        if (!(std::abs(w) > kOutputWeightActive)) continue;
+        const size_t u = static_cast<size_t>(idx);
+        if (u >= trial_cache.size() || u >= old_cache.size()) continue;
+        pred += w * (trial_cache[u] - old_cache[u]);
+    }
+    (void)num_samples;
+    return pred;
+}
+
 inline Eigen::ArrayXd evaluate_graph_cached(const IndividualGraph& graph,
                                              const std::vector<Eigen::ArrayXd>& X,
                                              int num_samples,

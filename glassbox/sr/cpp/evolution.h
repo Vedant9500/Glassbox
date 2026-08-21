@@ -62,6 +62,9 @@ struct EvolutionConfig {
     // Inner-parameter optimizer (nonlinear constants like p/omega/phi)
     bool use_lm_inner_optimizer = true;
     bool lm_fallback_to_adam = true;
+    // P-04: skip FD probes for parameters that are analytically inert for the
+    // node's unary op (p on Periodic/Exp, omega/phi on Power, all on Log/Abs).
+    bool fd_skip_inert_params = true;
     int lm_max_iterations = 15;
     double lm_lambda_init = 1e-2;
     int timeout_seconds = 120;
@@ -392,6 +395,11 @@ public:
     int get_last_island_inner_threads() const { return last_island_inner_threads_; }
     bool get_last_crossover_valid() const { return last_crossover_valid_; }
     int get_crossover_attempts() const { return crossover_attempts_; }
+    // P-04 diagnostics.
+    long long get_fd_probes_total() const { return fd_probes_total_; }
+    long long get_fd_probes_skipped_inert() const {
+        return fd_probes_skipped_inert_;
+    }
     int get_crossover_successes() const { return crossover_successes_; }
     double get_crossover_valid_rate() const {
         if (crossover_attempts_ <= 0) return 0.0;
@@ -629,6 +637,9 @@ public:
             crossover_attempts_ += island.get_crossover_attempts();
             crossover_successes_ += island.get_crossover_successes();
             last_crossover_valid_ = island.get_last_crossover_valid();
+            // P-04 diagnostics: aggregate island FD probe counters.
+            fd_probes_total_ += island.get_fd_probes_total();
+            fd_probes_skipped_inert_ += island.get_fd_probes_skipped_inert();
             // P-01 diagnostics: sum island cache pressure into the parent engine.
             gen_cache_.add_evictions(island.get_subtree_cache_evictions());
         }
@@ -674,6 +685,12 @@ private:
     bool last_crossover_valid_ = false;
     int crossover_attempts_ = 0;
     int crossover_successes_ = 0;
+    // P-04 diagnostics: FD probe volume + inert-param probes avoided.
+    // Plain counters: each island engine is confined to one OpenMP thread
+    // (parallel-for over islands) and the parent aggregates post-join.
+    // NOTE: must stay copyable/movable — islands.reserve() moves engines.
+    long long fd_probes_total_ = 0;
+    long long fd_probes_skipped_inert_ = 0;
     int first_exact_generation_ = -1;
     double first_exact_time_sec_ = -1.0;
     int first_acceptable_generation_ = -1;
@@ -2362,38 +2379,73 @@ private:
         const double epsilon = 1e-4; // Finite difference step
         const int adam_steps_per_round = 25;  // P2: boosted from 10 for better constant discovery
         const int num_rounds = 3; // Alternate Adam -> SVD this many times
-        
+
+        // P-04: which of {p, omega, phi} actually enter the eval for each op.
+        // p feeds only Power/IntPow; omega/phi feed only Periodic/Exp;
+        // Log/Abs have no inner parameters at all. Probing inert slots cost
+        // two full-graph evals per slot per step for pure finite-difference
+        // noise (analytically zero gradient).
+        static constexpr bool kParamLive[6][3] = {
+            /*Periodic*/ {false, true,  true},
+            /*Power*/    {true,  false, false},
+            /*IntPow*/   {true,  false, false},
+            /*Exp*/      {false, true,  true},
+            /*Log*/      {false, false, false},
+            /*Abs*/      {false, false, false},
+        };
+        auto slot_live = [&](const OpNode& node, int pi) -> bool {
+            if (!config_.fd_skip_inert_params) return true;
+            const int op = static_cast<int>(node.unary_op);
+            return op >= 0 && op < 6 && kParamLive[op][pi];
+        };
+
         int n_params = static_cast<int>(active_unary.size()) * 3; // {p, omega, phi} - NOT amplitude (redundant with SVD output_weight)
         std::vector<double> m(n_params, 0.0), v(n_params, 0.0);
-        
+
         double best_mse = objective_mse(ind);
         IndividualGraph best_snapshot = ind; // Keep best seen
         int global_step = 0;
-        
+
         for (int round = 0; round < num_rounds; ++round) {
             // -- Phase 1: Adam steps on inner params --
             for (int step = 0; step < adam_steps_per_round; ++step) {
+                // P-04: one base cache + prediction per step; every FD probe
+                // below recomputes only the perturbed subtree
+                // (evaluate_graph_partial + value deltas onto base_pred)
+                // instead of re-evaluating the whole graph twice per parameter.
+                std::vector<Eigen::ArrayXd> base_cache;
+                evaluate_graph(ind, X_, n_samples, base_cache);
+                Eigen::ArrayXd base_pred = assemble_prediction(ind, base_cache, n_samples);
+
                 std::vector<double> grads(n_params, 0.0);
-                
+
                 for (int ai = 0; ai < static_cast<int>(active_unary.size()); ++ai) {
                     int node_idx = active_unary[ai];
                     auto& node = ind.nodes[node_idx];
                     // Only optimize {p, omega, phi} - amplitude handled by SVD
                     double* params[3] = {&node.p, &node.omega, &node.phi};
-                    
+
                     for (int pi = 0; pi < 3; ++pi) {
+                        fd_probes_total_ += 2;  // P-04: plus/minus probe pair
+                        if (!slot_live(node, pi)) {
+                            fd_probes_skipped_inert_ += 2;
+                            continue;
+                        }
+
                         double original = *params[pi];
-                        
+
                         *params[pi] = original + epsilon;
-                        Eigen::ArrayXd pred_plus = evaluate_graph_simple(ind, X_, n_samples);
+                        Eigen::ArrayXd pred_plus = evaluate_perturbed_pred(
+                            ind, node_idx, base_cache, base_pred, n_samples);
                         double mse_plus = residual_mse(pred_plus, y_);
-                        
+
                         *params[pi] = original - epsilon;
-                        Eigen::ArrayXd pred_minus = evaluate_graph_simple(ind, X_, n_samples);
+                        Eigen::ArrayXd pred_minus = evaluate_perturbed_pred(
+                            ind, node_idx, base_cache, base_pred, n_samples);
                         double mse_minus = residual_mse(pred_minus, y_);
-                        
+
                         *params[pi] = original;
-                        
+
                         double grad = (mse_plus - mse_minus) / (2.0 * epsilon);
                         if (!std::isfinite(grad)) grad = 0.0;
                         grads[ai * 3 + pi] = grad;
@@ -2577,6 +2629,20 @@ private:
                 const bool use_fd = !child_ok || !(std::abs(wi) > kDirectWeightEps)
                     || node_idx >= static_cast<int>(base_cache.size())
                     || base_cache[static_cast<size_t>(node_idx)].size() != n_samples;
+
+                // P-04: Log/Abs have no inner parameters — all three Jacobian
+                // columns are analytically zero. Skip entirely; count the six
+                // FD residual evals avoided only when this node would have
+                // taken the finite-difference fallback (the analytical branch
+                // merely wasted zero-column Gramian work, not evals).
+                if (config_.fd_skip_inert_params
+                        && (node.unary_op == UnaryOp::Log || node.unary_op == UnaryOp::Abs)) {
+                    if (use_fd) {
+                        fd_probes_total_ += 6;
+                        fd_probes_skipped_inert_ += 6;
+                    }
+                    continue;
+                }
 
                 if (use_fd) {
                     auto& mut_node = base_graph.nodes[static_cast<size_t>(node_idx)];

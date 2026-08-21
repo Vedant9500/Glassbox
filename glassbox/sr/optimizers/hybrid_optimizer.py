@@ -373,10 +373,12 @@ class EvolutionaryOptimizer:
             child = self.mutate(child)
             
             # L-BFGS refinement
+            # P-03: one optimizer.step() already runs up to max_iter internal
+            # iterations, so looping step() lbfgs_steps times cost steps**2
+            # line searches for the same total iteration budget.
             if self.use_lbfgs_refinement:
                 lbfgs = LBFGSConstantOptimizer(child.model, max_iter=self.lbfgs_steps)
-                for _ in range(self.lbfgs_steps):
-                    lbfgs.step(x_train, y_train)
+                lbfgs.step(x_train, y_train)
             
             new_population.append(child)
         
