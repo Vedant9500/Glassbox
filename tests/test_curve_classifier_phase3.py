@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from glassbox.curve_classifier import train_curve_classifier as tcc
 from glassbox.curve_classifier.generate_curve_data import (
     FEATURE_DIM,
     N_CLASSES,
@@ -15,18 +16,19 @@ from glassbox.curve_classifier.validation import (
     family_holdout_split,
     formula_overlap_report,
     grouped_train_val_split,
-    multilabel_metrics_by_group,
     multilabel_metric_summary,
+    multilabel_metrics_by_group,
     row_train_val_split,
 )
-from glassbox.curve_classifier import train_curve_classifier as tcc
 from scripts import train_universal_proposer as tup
 
 
 def test_grouped_train_val_split_has_no_formula_overlap():
     groups = np.array(["a", "a", "b", "b", "c", "c", "d", "d"], dtype=object)
 
-    train_idx, val_idx, details = grouped_train_val_split(groups, val_ratio=0.25, seed=7)
+    train_idx, val_idx, details = grouped_train_val_split(
+        groups, val_ratio=0.25, seed=7
+    )
 
     assert len(train_idx) > 0
     assert len(val_idx) > 0
@@ -37,7 +39,10 @@ def test_grouped_train_val_split_has_no_formula_overlap():
 
 
 def test_grouped_train_val_split_prefers_formula_diversity_over_largest_groups():
-    groups = np.array(["huge_a"] * 40 + ["huge_b"] * 35 + [f"small_{i}" for i in range(20)], dtype=object)
+    groups = np.array(
+        ["huge_a"] * 40 + ["huge_b"] * 35 + [f"small_{i}" for i in range(20)],
+        dtype=object,
+    )
 
     train_idx, val_idx, details = grouped_train_val_split(groups, val_ratio=0.2, seed=3)
 
@@ -58,13 +63,17 @@ def test_family_holdout_split_uses_only_heldout_family_for_validation():
 
 
 def test_validation_report_includes_overlap_and_distributions():
-    labels = np.vstack([
-        operators_to_labels(set(), formula="np.sin(x)"),
-        operators_to_labels(set(), formula="np.sin(x)"),
-        operators_to_labels(set(), formula="x ** 2"),
-        operators_to_labels(set(), formula="x ** 2"),
-    ])
-    keys = np.array([formula_to_key("np.sin(x)")] * 2 + [formula_to_key("x ** 2")] * 2, dtype=object)
+    labels = np.vstack(
+        [
+            operators_to_labels(set(), formula="np.sin(x)"),
+            operators_to_labels(set(), formula="np.sin(x)"),
+            operators_to_labels(set(), formula="x ** 2"),
+            operators_to_labels(set(), formula="x ** 2"),
+        ]
+    )
+    keys = np.array(
+        [formula_to_key("np.sin(x)")] * 2 + [formula_to_key("x ** 2")] * 2, dtype=object
+    )
     families = np.array(["simple", "simple", "simple", "simple"], dtype=object)
     templates = np.array([1, 1, 2, 2], dtype=object)
     train_idx = np.array([0, 1])
@@ -76,7 +85,17 @@ def test_validation_report_includes_overlap_and_distributions():
         train_idx=train_idx,
         val_idx=val_idx,
         labels=labels,
-        operator_classes=["identity", "sin", "cos", "power", "exp", "log", "addition", "multiplication", "rational"],
+        operator_classes=[
+            "identity",
+            "sin",
+            "cos",
+            "power",
+            "exp",
+            "log",
+            "addition",
+            "multiplication",
+            "rational",
+        ],
         formula_keys=keys,
         generator_families=families,
         template_ids=templates,
@@ -93,22 +112,30 @@ def test_validation_report_includes_overlap_and_distributions():
 
 
 def test_multilabel_metric_summary_reports_precision_recall_and_group_breakdown():
-    probs = np.array([
-        [0.9, 0.1],
-        [0.8, 0.7],
-        [0.2, 0.6],
-        [0.1, 0.4],
-    ], dtype=np.float32)
-    labels = np.array([
-        [1, 0],
-        [1, 0],
-        [0, 1],
-        [0, 1],
-    ], dtype=np.float32)
+    probs = np.array(
+        [
+            [0.9, 0.1],
+            [0.8, 0.7],
+            [0.2, 0.6],
+            [0.1, 0.4],
+        ],
+        dtype=np.float32,
+    )
+    labels = np.array(
+        [
+            [1, 0],
+            [1, 0],
+            [0, 1],
+            [0, 1],
+        ],
+        dtype=np.float32,
+    )
     groups = np.array(["simple", "simple", "pcfg", "pcfg"], dtype=object)
 
     summary = multilabel_metric_summary(probs, labels, ["a", "b"])
-    by_group = multilabel_metrics_by_group(probs, labels, groups, ["a", "b"], min_rows=1)
+    by_group = multilabel_metrics_by_group(
+        probs, labels, groups, ["a", "b"], min_rows=1
+    )
 
     assert summary["precision_per_class"][0] == 1.0
     assert summary["recall_per_class"][0] == 1.0
@@ -135,18 +162,29 @@ def test_training_data_loader_reads_phase2_validation_metadata():
     ]
     out = Path("scratch") / "pytest_phase3_dataset.npz"
     out.parent.mkdir(parents=True, exist_ok=True)
-    save_dataset(out, features, labels, formulas, generation_metadata=generation_metadata)
+    save_dataset(
+        out, features, labels, formulas, generation_metadata=generation_metadata
+    )
 
-    old_shape_loaded = tcc.load_training_data([str(out)], None, FEATURE_DIM, N_CLASSES, False)
+    old_shape_loaded = tcc.load_training_data(
+        [str(out)], None, FEATURE_DIM, N_CLASSES, False
+    )
     assert len(old_shape_loaded) == 5
 
-    loaded = tcc.load_training_data([str(out)], None, FEATURE_DIM, N_CLASSES, False, return_metadata=True)
+    loaded = tcc.load_training_data(
+        [str(out)], None, FEATURE_DIM, N_CLASSES, False, return_metadata=True
+    )
     _, _, operator_classes, feature_dim, _schema, metadata = loaded
 
     assert feature_dim == FEATURE_DIM
     assert operator_classes[:4] == ["identity", "sin", "cos", "power"]
     assert metadata["formula_keys"].tolist() == [formula_to_key(f) for f in formulas]
-    assert metadata["generator_families"].tolist() == ["simple", "simple", "simple", "hyperbolic"]
+    assert metadata["generator_families"].tolist() == [
+        "simple",
+        "simple",
+        "simple",
+        "hyperbolic",
+    ]
     assert metadata["template_ids"].tolist() == [0, 1, 2, 3]
     assert metadata["labels_match_semantic"].tolist() == [True, True, True, True]
 
@@ -162,7 +200,9 @@ def test_proposer_replay_dataset_preserves_loader_compatibility():
     old_shape_loaded = tup.load_training_data(str(out), n_classes=N_CLASSES)
     assert len(old_shape_loaded) == 6
 
-    metadata_shape_loaded = tup.load_training_data(str(out), n_classes=N_CLASSES, return_metadata=True)
+    metadata_shape_loaded = tup.load_training_data(
+        str(out), n_classes=N_CLASSES, return_metadata=True
+    )
     assert len(metadata_shape_loaded) == 7
 
     ds = tup.FormulaReplayDataset(out)
@@ -174,12 +214,14 @@ def test_proposer_replay_dataset_preserves_loader_compatibility():
 
 
 def test_proposer_skeleton_metric_summary_reports_topk_and_calibration():
-    logits = torch.tensor([
-        [5.0, 0.0, 0.0],
-        [0.0, 4.0, 0.0],
-        [0.0, 0.0, 3.0],
-        [3.0, 0.0, 0.0],
-    ])
+    logits = torch.tensor(
+        [
+            [5.0, 0.0, 0.0],
+            [0.0, 4.0, 0.0],
+            [0.0, 0.0, 3.0],
+            [3.0, 0.0, 0.0],
+        ]
+    )
     targets = torch.tensor([0, 1, 1, -1])
 
     metrics = tup._skeleton_metric_summary(logits, targets)
@@ -199,7 +241,17 @@ def test_proposer_operator_pos_weight_maps_periodic_from_sin_cos():
     weights = tup.compute_operator_pos_weight(
         labels,
         np.arange(10),
-        ["identity", "sin", "cos", "power", "exp", "log", "addition", "multiplication", "rational"],
+        [
+            "identity",
+            "sin",
+            "cos",
+            "power",
+            "exp",
+            "log",
+            "addition",
+            "multiplication",
+            "rational",
+        ],
         cap=8.0,
     )
 
@@ -222,8 +274,18 @@ def test_proposer_skeleton_loss_gate_disables_low_coverage_dataset():
 
 
 def test_proposer_checkpoint_metric_prefers_candidate_recall_then_micro_f1():
-    assert tup.select_checkpoint_metric({"candidate_recall_after_affine_fit": 0.7, "micro_f1": 0.2}) == 0.7
-    assert tup.select_checkpoint_metric({"candidate_recall_after_affine_fit": None, "micro_f1": 0.8}) == 0.8
+    assert (
+        tup.select_checkpoint_metric(
+            {"candidate_recall_after_affine_fit": 0.7, "micro_f1": 0.2}
+        )
+        == 0.7
+    )
+    assert (
+        tup.select_checkpoint_metric(
+            {"candidate_recall_after_affine_fit": None, "micro_f1": 0.8}
+        )
+        == 0.8
+    )
 
 
 def test_row_train_val_split_preserves_sizes():
@@ -250,7 +312,9 @@ def test_classifier_validation_calibration_split_keeps_eval_disjoint():
     assert details["calibration_split"] is True
     assert calibration_idx is not None
     assert set(eval_idx).isdisjoint(set(calibration_idx))
-    assert sorted(np.concatenate([eval_idx, calibration_idx]).tolist()) == val_idx.tolist()
+    assert (
+        sorted(np.concatenate([eval_idx, calibration_idx]).tolist()) == val_idx.tolist()
+    )
 
 
 def test_classifier_threshold_beta_can_prefer_precision():

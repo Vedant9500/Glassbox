@@ -13,11 +13,11 @@ Reference: "The Concrete Distribution" (Maddison et al., 2016)
            "Learning Sparse Neural Networks through L0 Regularization" (Louizos et al., 2017)
 """
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional, Tuple, Union
 import math
+
+import torch
+import torch.nn.functional as F
+from torch import nn
 
 
 def hard_concrete_sample(
@@ -30,10 +30,10 @@ def hard_concrete_sample(
 ) -> torch.Tensor:
     """
     Sample from Hard Concrete distribution.
-    
+
     The Hard Concrete stretches the sigmoid to [-β, 1+β] and then clips to [0, 1].
     This allows exact 0s and 1s to be sampled.
-    
+
     Args:
         logits: Log-odds of the underlying Bernoulli (can be any shape)
         tau: Temperature (lower = more discrete)
@@ -41,7 +41,7 @@ def hard_concrete_sample(
         hard: If True, use straight-through estimator
         training: If False, return deterministic sigmoid(logits)
         eps: Small constant for numerical stability
-        
+
     Returns:
         Samples in [0, 1] with exact 0s and 1s possible
     """
@@ -49,76 +49,76 @@ def hard_concrete_sample(
         # Deterministic during inference - return soft sigmoid values
         # The actual discrete selection is handled at a higher level
         return torch.sigmoid(logits).clamp(0, 1)
-    
+
     # Sample uniform noise
     u = torch.rand_like(logits).clamp(eps, 1 - eps)
-    
+
     # Inverse CDF of logistic distribution (Gumbel-like sampling)
     s = torch.sigmoid((torch.log(u) - torch.log(1 - u) + logits) / tau)
-    
+
     # Stretch to [-beta, 1+beta]
     s_stretched = s * (1 + 2 * beta) - beta
-    
+
     # Hard clip to [0, 1] (this is what creates exact 0s and 1s)
     z = s_stretched.clamp(0, 1)
-    
+
     if hard:
         # Straight-through estimator: forward uses hard values, backward uses soft
         z_hard = (z > 0.5).float()
         z = z + (z_hard - z).detach()
-    
+
     return z
 
 
 def hard_concrete_log_prob(
     z: torch.Tensor,
     logits: torch.Tensor,
-    tau: Union[float, torch.Tensor] = 0.5,
+    tau: float | torch.Tensor = 0.5,
     beta: float = 0.1,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     """
     Compute log probability under Hard Concrete distribution.
-    
+
     Used for regularization (penalize high probability of being "on").
-    
+
     Args:
         z: Sampled values in [0, 1]
         logits: Log-odds parameter
         tau: Temperature
         beta: Stretch parameter
         eps: Small constant for numerical stability
-        
+
     Returns:
         Log probabilities (same shape as z)
     """
     # Transform z back to pre-clipped space in (0, 1)
     s = (z + beta) / (1 + 2 * beta)
     s = s.clamp(eps, 1 - eps)
-    
+
     log_s = torch.log(s)
     log_1_minus_s = torch.log(1 - s)
     logit_s = log_s - log_1_minus_s
-    
+
     log_tau = math.log(tau) if isinstance(tau, (int, float)) else torch.log(tau)
-    
+
     x = tau * logit_s - logits
     log_prob = log_tau - log_s - log_1_minus_s + F.logsigmoid(x) + F.logsigmoid(-x)
     log_prob = log_prob - math.log(1 + 2 * beta)
-    
+
     return log_prob
 
 
 class HardConcreteGate(nn.Module):
     """
     Learnable gate using Hard Concrete distribution.
-    
+
     Can be used to:
     - Prune operations (gate = 0 means operation disabled)
     - Prune edges (gate = 0 means edge removed)
     - Select discrete options (multiple gates, take argmax)
     """
-    
+
     def __init__(
         self,
         n_gates: int = 1,
@@ -136,34 +136,34 @@ class HardConcreteGate(nn.Module):
             learn_tau: If True, tau is learnable
         """
         super().__init__()
-        
+
         self.logits = nn.Parameter(torch.full((n_gates,), init_logit))
         self.beta = beta
-        
+
         if learn_tau:
             self.log_tau = nn.Parameter(torch.tensor(math.log(tau)))
             self._learn_tau = True
         else:
-            self.register_buffer('log_tau', torch.tensor(math.log(tau)))
+            self.register_buffer("log_tau", torch.tensor(math.log(tau)))
             self._learn_tau = False
-    
+
     @property
     def tau(self) -> float:
         """Get tau value. Returns float for non-learnable, keeps tensor for learnable."""
         return torch.exp(self.log_tau).item()
-    
+
     @property
     def tau_tensor(self) -> torch.Tensor:
         """Get tau as tensor (preserves gradients when learnable)."""
         return torch.exp(self.log_tau)
-    
+
     def forward(self, hard: bool = True) -> torch.Tensor:
         """
         Sample gate values.
-        
+
         Args:
             hard: Use straight-through estimator
-            
+
         Returns:
             Gate values in [0, 1], shape (n_gates,)
         """
@@ -184,15 +184,15 @@ class HardConcreteGate(nn.Module):
                 self.log_tau.copy_(torch.log(torch.tensor(tau)))
             else:
                 self.log_tau.copy_(torch.tensor(math.log(tau)))
-    
+
     def get_mask(self, threshold: float = 0.5) -> torch.Tensor:
         """Get deterministic binary mask."""
         return (torch.sigmoid(self.logits) > threshold).float()
-    
+
     def l0_regularization(self) -> torch.Tensor:
         """
         Compute L0 regularization term (expected number of active gates).
-        
+
         This encourages sparsity by penalizing the probability of gates being on.
         """
         # Probability that gate is non-zero (not clipped to 0)
@@ -201,7 +201,7 @@ class HardConcreteGate(nn.Module):
         tau = self.tau_tensor if self._learn_tau else self.tau
         prob_nonzero = torch.sigmoid(self.logits - self.beta * tau)
         return prob_nonzero.sum()
-    
+
     def expected_gates(self) -> torch.Tensor:
         """Get expected value of gates (for soft computation without sampling)."""
         return torch.sigmoid(self.logits)
@@ -210,18 +210,18 @@ class HardConcreteGate(nn.Module):
 class HardConcreteSelector(nn.Module):
     """
     Select one option from K choices using Hard Concrete.
-    
+
     Unlike softmax which always sums to 1, this allows:
     - All options to be "off" (sparse)
     - True discrete selection (one-hot at inference)
-    
+
     Great for operation selection!
     """
-    
+
     def __init__(
         self,
         n_options: int,
-        init_mode: str = 'uniform',
+        init_mode: str = "uniform",
         tau: float = 0.5,
         beta: float = 0.1,
     ):
@@ -236,24 +236,24 @@ class HardConcreteSelector(nn.Module):
         self.n_options = n_options
         self.tau = tau
         self.beta = beta
-        
+
         # Logits for each option
         self.logits = nn.Parameter(torch.zeros(n_options))
-        
-        if init_mode == 'uniform':
+
+        if init_mode == "uniform":
             pass  # Already zeros
-        elif init_mode == 'first':
+        elif init_mode == "first":
             self.logits.data[0] = 1.0
         else:
             nn.init.normal_(self.logits, mean=0, std=0.1)
-    
+
     def forward(self, hard: bool = True) -> torch.Tensor:
         """
         Sample selection weights.
-        
+
         Args:
             hard: Use straight-through for discrete selection
-            
+
         Returns:
             Weights in [0, 1]^K (NOT guaranteed to sum to 1)
         """
@@ -262,7 +262,7 @@ class HardConcreteSelector(nn.Module):
             one_hot = torch.zeros_like(self.logits)
             one_hot[self.logits.argmax()] = 1.0
             return one_hot
-        
+
         # Training: use hard concrete sampling
         gates = hard_concrete_sample(
             self.logits,
@@ -271,7 +271,7 @@ class HardConcreteSelector(nn.Module):
             hard=hard,
             training=self.training,
         )
-        
+
         if hard and self.training:
             # Straight-through one-hot: use argmax in forward pass
             # but keep soft gradients for backprop.  This closes the
@@ -281,26 +281,26 @@ class HardConcreteSelector(nn.Module):
             one_hot = torch.zeros_like(gates)
             one_hot[idx] = 1.0
             gates = gates + (one_hot - gates).detach()
-        
+
         return gates
-    
+
     def select(self) -> int:
         """Get deterministic selection (argmax of expected values)."""
         return self.logits.argmax().item()
-    
+
     def set_tau(self, tau: float):
         """Update temperature for annealing during training."""
         self.tau = tau
-        
+
     def entropy(self) -> torch.Tensor:
         """Compute entropy of selection distribution."""
         probs = F.softmax(self.logits, dim=-1)
         return -(probs * torch.log(probs + 1e-10)).sum()
-    
+
     def l0_regularization(self) -> torch.Tensor:
         """
         Compute L0 regularization (expected number of active options).
-        
+
         Encourages sparsity by penalizing probability of being on.
         """
         # Probability that each option is non-zero
@@ -308,36 +308,35 @@ class HardConcreteSelector(nn.Module):
         return prob_nonzero.sum()
 
 
-
 class HardConcreteOperationSelector(nn.Module):
     """
     Specialized selector for choosing between operation types.
-    
+
     Designed for ONN where we need to select:
     - Unary vs Binary vs Aggregation
     - Which specific meta-operation within each type
-    
+
     Two-level selection:
     1. Select operation TYPE (unary/binary/aggregation)
     2. Select specific operation within type
-    
+
     OPTIMIZED: Batches all logits into a single hard_concrete_sample call.
-    
+
     FairDARTS Mode (fair_mode=True):
     - Uses independent sigmoids instead of competing softmax
     - Prevents any single operation from "crowding out" others
     - Better exploration of the operation space
-    
+
     Normalization Control (normalize_gates=True, default):
     - When True: gates are normalized to sum to 1 (approximate one-hot)
     - When False: raw Hard Concrete values allow all-off sparsity
     - Set to False for true L0 behavior where all gates can be zero
     """
-    
+
     def __init__(
         self,
-        n_unary: int = 4,      # periodic, power, exp, log
-        n_binary: int = 2,     # arithmetic, aggregation
+        n_unary: int = 4,  # periodic, power, exp, log
+        n_binary: int = 2,  # arithmetic, aggregation
         tau: float = 0.5,
         beta: float = 0.1,
         fair_mode: bool = False,  # FairDARTS-style independent sigmoids
@@ -350,19 +349,21 @@ class HardConcreteOperationSelector(nn.Module):
         self.beta = beta
         self.fair_mode = fair_mode
         self.normalize_gates = normalize_gates
-        
+
         # Batch all logits together: [type(2), unary(n_unary), binary(n_binary)]
         total = 2 + n_unary + n_binary
         self.logits = nn.Parameter(torch.zeros(total))
-        
+
         # Slice indices
         self._type_end = 2
         self._unary_end = 2 + n_unary
-    
-    def forward(self, hard: bool = True) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+
+    def forward(
+        self, hard: bool = True
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample operation selection.
-        
+
         Returns:
             type_weights: (2,) weights for [unary, binary]
             unary_weights: (n_unary,) weights for unary ops
@@ -373,9 +374,9 @@ class HardConcreteOperationSelector(nn.Module):
             type_weights = torch.zeros(self._type_end, device=self.logits.device)
             unary_weights = torch.zeros(self.n_unary, device=self.logits.device)
             binary_weights = torch.zeros(self.n_binary, device=self.logits.device)
-            type_weights[self.logits[:self._type_end].argmax()] = 1.0
-            unary_weights[self.logits[self._type_end:self._unary_end].argmax()] = 1.0
-            binary_weights[self.logits[self._unary_end:].argmax()] = 1.0
+            type_weights[self.logits[: self._type_end].argmax()] = 1.0
+            unary_weights[self.logits[self._type_end : self._unary_end].argmax()] = 1.0
+            binary_weights[self.logits[self._unary_end :].argmax()] = 1.0
             return type_weights, unary_weights, binary_weights
 
         # Training (and soft mode): use Hard Concrete sampling
@@ -386,12 +387,12 @@ class HardConcreteOperationSelector(nn.Module):
             hard=hard,
             training=self.training,
         )
-        
+
         # Split into components
-        type_weights = all_gates[:self._type_end]
-        unary_weights = all_gates[self._type_end:self._unary_end]
-        binary_weights = all_gates[self._unary_end:]
-        
+        type_weights = all_gates[: self._type_end]
+        unary_weights = all_gates[self._type_end : self._unary_end]
+        binary_weights = all_gates[self._unary_end :]
+
         if self.fair_mode:
             # FairDARTS: Independent sigmoids - no normalization
             # Each op has its own gate that doesn't compete with others
@@ -408,122 +409,122 @@ class HardConcreteOperationSelector(nn.Module):
                 oh = torch.zeros_like(w)
                 oh[idx] = 1.0
                 return w + (oh - w).detach()
-            
+
             type_weights = _straight_through_onehot(type_weights)
             unary_weights = _straight_through_onehot(unary_weights)
             binary_weights = _straight_through_onehot(binary_weights)
 
         return type_weights, unary_weights, binary_weights
-    
+
     def get_selected(self) -> dict:
         """Get deterministic selection."""
-        type_idx = self.logits[:self._type_end].argmax().item()
-        unary_idx = self.logits[self._type_end:self._unary_end].argmax().item()
-        binary_idx = self.logits[self._unary_end:].argmax().item()
-        
+        type_idx = self.logits[: self._type_end].argmax().item()
+        unary_idx = self.logits[self._type_end : self._unary_end].argmax().item()
+        binary_idx = self.logits[self._unary_end :].argmax().item()
+
         return {
-            'type': 'unary' if type_idx == 0 else 'binary',
-            'unary_idx': unary_idx,
-            'binary_idx': binary_idx,
+            "type": "unary" if type_idx == 0 else "binary",
+            "unary_idx": unary_idx,
+            "binary_idx": binary_idx,
         }
-    
+
     def set_tau(self, tau: float):
         """Update temperature for annealing during training."""
         self.tau = tau
-    
+
     def l0_regularization(self) -> torch.Tensor:
         """Total L0 regularization for sparsity."""
         prob_nonzero = torch.sigmoid(self.logits - self.beta * self.tau)
         return prob_nonzero.sum()
-    
+
     def entropy_regularization(self) -> torch.Tensor:
         """Total entropy (negative = encourages discrete selection)."""
         # Compute entropy for each group
-        type_probs = F.softmax(self.logits[:self._type_end], dim=-1)
-        unary_probs = F.softmax(self.logits[self._type_end:self._unary_end], dim=-1)
-        binary_probs = F.softmax(self.logits[self._unary_end:], dim=-1)
-        
+        type_probs = F.softmax(self.logits[: self._type_end], dim=-1)
+        unary_probs = F.softmax(self.logits[self._type_end : self._unary_end], dim=-1)
+        binary_probs = F.softmax(self.logits[self._unary_end :], dim=-1)
+
         type_ent = -(type_probs * torch.log(type_probs + 1e-10)).sum()
         unary_ent = -(unary_probs * torch.log(unary_probs + 1e-10)).sum()
         binary_ent = -(binary_probs * torch.log(binary_probs + 1e-10)).sum()
-        
+
         return type_ent + unary_ent + binary_ent
-    
+
     def zero_one_loss(self) -> torch.Tensor:
         """
         Zero-One Loss (FairDARTS) to close the discretization gap.
-        
+
         L_{0-1} = Σ(σ(α) - 0.5)²
-        
+
         This loss is MINIMIZED when σ(α) ∈ {0, 1} (pushed to extremes)
         and MAXIMIZED when σ(α) = 0.5 (ambiguous).
-        
+
         The loss encourages architecture weights to be binary during training,
         so there's no "shock" when snapping to discrete values at inference.
-        
+
         Recommended weight: ~10 (per FairDARTS paper)
-        
+
         Reference: FairDARTS (Chu et al., 2019) Section 2.3.2
         """
         # Apply sigmoid to get soft selection probabilities
         soft_weights = torch.sigmoid(self.logits)
-        
+
         # Penalize being close to 0.5 (ambiguous)
         # (σ(α) - 0.5)² is minimized at σ(α) ∈ {0, 1}
         zero_one = ((soft_weights - 0.5) ** 2).sum()
-        
+
         # We want to MAXIMIZE this (push away from 0.5)
         # So we return negative to minimize in the loss
         return -zero_one
-    
+
     def gate_regularization(self) -> torch.Tensor:
         """
         Gate Regularization to force gates toward binary values.
-        
+
         L_gate = Σ g_i * (1 - g_i)
-        
+
         This is minimized when g_i ∈ {0, 1} (binary gates)
         and maximized when g_i = 0.5 (ambiguous half-add/half-multiply).
-        
+
         Unlike zero_one_loss which operates on logits, this operates on
         the actual gate values used in computation.
-        
+
         The product g*(1-g) has gradient:
         - ∂L/∂g = 1 - 2g, which pushes g away from 0.5
-        
+
         Reference: research3.md Section 5.4
         """
         soft_weights = torch.sigmoid(self.logits)
-        
+
         # g * (1 - g) is minimized at g ∈ {0, 1}
         gate_reg = (soft_weights * (1 - soft_weights)).sum()
-        
+
         return gate_reg
-    
+
     def beta_decay_loss(self) -> torch.Tensor:
         """
         Beta-Decay Regularization to prevent premature convergence.
-        
+
         L_beta = Σ |α_i|² + λ_var * Var(|α_i|)
-        
+
         This acts as a "speed limit" on entropy collapse by:
         1. Penalizing large magnitude architecture weights (L2)
         2. Penalizing variance to keep all options viable longer
-        
+
         Without this, strong initial biases can cause one operation
         to dominate before the network has explored alternatives.
-        
+
         Reference: research3.md Section 2.3.3
-        
+
         Returns:
             Beta-decay loss (scalar tensor)
         """
         # L2 penalty on architecture parameters
-        l2_penalty = (self.logits ** 2).sum()
-        
+        l2_penalty = (self.logits**2).sum()
+
         # Variance penalty - keep logits similar in magnitude
         logit_var = self.logits.var()
-        
+
         # Combined: mostly L2 with small variance term
         return l2_penalty + 0.1 * logit_var
 
@@ -532,37 +533,38 @@ class HardConcreteOperationSelector(nn.Module):
 # Annealing Utilities
 # ============================================================================
 
+
 def anneal_tau(
     step: int,
     total_steps: int,
     tau_start: float = 1.0,
     tau_end: float = 0.1,
-    schedule: str = 'cosine',
+    schedule: str = "cosine",
 ) -> float:
     """
     Anneal temperature from high (exploration) to low (exploitation).
-    
+
     Args:
         step: Current training step
         total_steps: Total training steps
         tau_start: Initial temperature
         tau_end: Final temperature
         schedule: 'linear', 'cosine', or 'exponential'
-        
+
     Returns:
         Current temperature
     """
     progress = min(step / max(total_steps, 1), 1.0)
-    
-    if schedule == 'linear':
+
+    if schedule == "linear":
         tau = tau_start + (tau_end - tau_start) * progress
-    elif schedule == 'cosine':
+    elif schedule == "cosine":
         tau = tau_end + 0.5 * (tau_start - tau_end) * (1 + math.cos(math.pi * progress))
-    elif schedule == 'exponential':
+    elif schedule == "exponential":
         tau = tau_start * (tau_end / tau_start) ** progress
     else:
         raise ValueError(f"Unknown schedule: {schedule}")
-    
+
     return tau
 
 
@@ -574,7 +576,7 @@ def anneal_beta(
 ) -> float:
     """
     Anneal stretch parameter (higher beta = more zeros/ones).
-    
+
     Start with small beta (softer) and increase to force discreteness.
     """
     progress = min(step / max(total_steps, 1), 1.0)

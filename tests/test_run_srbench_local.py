@@ -1,8 +1,8 @@
 import numpy as np
 
-from scripts import run_srbench_local as rsl
-from scripts import classifier_fast_path as cfp
 from scripts import benchmark_common as bc
+from scripts import classifier_fast_path as cfp
+from scripts import run_srbench_local as rsl
 
 
 def test_run_track1_uses_per_run_params_without_hard_timeout(monkeypatch):
@@ -33,16 +33,22 @@ def test_run_track1_uses_per_run_params_without_hard_timeout(monkeypatch):
             return "x0"
 
     monkeypatch.setattr(rsl, "postprocess_formula", lambda formula: formula)
-    monkeypatch.setattr(rsl, "evaluate_formula", lambda formula, X: np.zeros(X.shape[0], dtype=float))
+    monkeypatch.setattr(
+        rsl, "evaluate_formula", lambda formula, X: np.zeros(X.shape[0], dtype=float)
+    )
     monkeypatch.setattr(rsl, "r2_score", lambda y_true, y_pred: 0.0)
     monkeypatch.setattr(rsl, "mse_score", lambda y_true, y_pred: 1.0)
     monkeypatch.setattr(rsl, "model_size", lambda formula: 1)
     monkeypatch.setattr(rsl, "estimate_timeout_budget", lambda **kwargs: 19)
-    monkeypatch.setattr(rsl, "summarize_seed_runs", lambda runs: {
-        "r2_stats": {"median": 0.0},
-        "mse_stats": {"median": 1.0},
-        "time_stats": {"median": 0.0},
-    })
+    monkeypatch.setattr(
+        rsl,
+        "summarize_seed_runs",
+        lambda runs: {
+            "r2_stats": {"median": 0.0},
+            "mse_stats": {"median": 1.0},
+            "time_stats": {"median": 0.0},
+        },
+    )
     monkeypatch.setattr(rsl, "summarize_time_to_discovery", lambda *args, **kwargs: {})
 
     class _FakePMLB:
@@ -53,6 +59,7 @@ def test_run_track1_uses_per_run_params_without_hard_timeout(monkeypatch):
             return X, y
 
     import sys
+
     sys.modules["pmlb"] = _FakePMLB
 
     est = _FakeEstimator()
@@ -122,7 +129,9 @@ def test_evaluate_formula_protects_fractional_powers_on_negative_inputs():
     X = np.random.RandomState(2).randn(20, 4)
     X[:5, 1] = -np.abs(X[:5, 1]) - 0.1
 
-    y_pred, diag = rsl.evaluate_formula("x1**1.5 + 0.25*x2**0.67", X, return_diagnostics=True)
+    y_pred, diag = rsl.evaluate_formula(
+        "x1**1.5 + 0.25*x2**0.67", X, return_diagnostics=True
+    )
 
     assert y_pred is not None
     assert diag["ok"] is True
@@ -157,14 +166,21 @@ def test_evaluate_formula_clips_exp_overflow():
 def test_postprocess_formula_protects_fractional_power_terms():
     formula = rsl.postprocess_formula("0.25*x1**1.5 - 0.04272*x2**0.67")
 
-    assert "_signed_power" in formula or "Abs(" in formula or "abs(" in formula or "sign(" in formula
+    assert (
+        "_signed_power" in formula
+        or "Abs(" in formula
+        or "abs(" in formula
+        or "sign(" in formula
+    )
 
 
 def test_fallback_estimator_predictions_marks_display_formula_failure():
     run_result = {"y_pred_test": np.array([1.0, 2.0, 3.0])}
     eval_diag = {"ok": False, "reason": "invalid_log"}
 
-    y_pred, diag = rsl._fallback_estimator_predictions(run_result, eval_diag, split="test")
+    y_pred, diag = rsl._fallback_estimator_predictions(
+        run_result, eval_diag, split="test"
+    )
 
     assert np.allclose(y_pred, [1.0, 2.0, 3.0])
     assert diag["ok"] is True
@@ -226,7 +242,9 @@ def test_multivariate_universal_fast_path_basis_avoids_fragile_families():
 
     assert basis.shape[0] == X.shape[0]
     assert not any("1/(exp(" in name for name in names)
-    assert not any("^1.5" in name or "^0.67" in name or "^1.33" in name for name in names)
+    assert not any(
+        "^1.5" in name or "^0.67" in name or "^1.33" in name for name in names
+    )
     assert not any("sin(1/" in name for name in names)
     assert not any("1/sqrt(1-" in name for name in names)
 
@@ -251,4 +269,6 @@ def test_multivariate_low_trust_fast_path_basis_avoids_fragile_families_even_wit
 
     assert basis.shape[0] == X.shape[0]
     assert not any("1/(exp(" in name for name in names)
-    assert not any("^1.5" in name or "^0.67" in name or "^1.33" in name for name in names)
+    assert not any(
+        "^1.5" in name or "^0.67" in name or "^1.33" in name for name in names
+    )

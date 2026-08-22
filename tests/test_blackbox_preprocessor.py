@@ -6,8 +6,8 @@ from glassbox.sr.blackbox_preprocessor import (
     discover_blackbox_interactions,
     formula_from_search_to_original_space,
     prepare_blackbox_search,
-    remap_reduced_formula_to_original,
     remap_original_formula_to_reduced,
+    remap_reduced_formula_to_original,
 )
 
 
@@ -129,11 +129,15 @@ def test_discover_blackbox_interactions_returns_pairs():
     X = rng.randn(120, 4)
     y = X[:, 0] * X[:, 2] + 0.05 * rng.randn(120)
 
-    interactions = discover_blackbox_interactions(X, y, selected_features=[0, 1, 2, 3], max_pairs=3)
+    interactions = discover_blackbox_interactions(
+        X, y, selected_features=[0, 1, 2, 3], max_pairs=3
+    )
 
     assert interactions["interaction_pairs"]
     assert interactions["interaction_terms"]
-    assert any("x0*x2" in term or "x2*x0" in term for term in interactions["interaction_terms"])
+    assert any(
+        "x0*x2" in term or "x2*x0" in term for term in interactions["interaction_terms"]
+    )
 
 
 def test_blackbox_state_includes_interactions():
@@ -270,13 +274,17 @@ def test_interaction_discovery_includes_nonlinear_terms():
     X = rng.randn(180, 3)
     y = X[:, 0] * np.sin(X[:, 1]) + 0.01 * rng.randn(180)
 
-    interactions = discover_blackbox_interactions(X, y, selected_features=[0, 1, 2], max_pairs=5)
+    interactions = discover_blackbox_interactions(
+        X, y, selected_features=[0, 1, 2], max_pairs=5
+    )
 
     assert any("sin" in term for term in interactions["interaction_terms"])
 
 
 def test_blackbox_seed_formulas_include_features_and_interactions():
-    formulas = build_blackbox_seed_formulas([3, 7], interaction_terms=["x3*sin(x7)"], max_seeds=20)
+    formulas = build_blackbox_seed_formulas(
+        [3, 7], interaction_terms=["x3*sin(x7)"], max_seeds=20
+    )
 
     assert "x3" in formulas
     assert "sin(x7)" in formulas
@@ -327,5 +335,9 @@ def test_interaction_discovery_prunes_redundant_variants():
 
     terms = interactions["interaction_terms"]
     assert len(terms) == len(set(terms))
-    multiplicative_terms = [term for term in terms if "*" in term and "sin" not in term and "cos" not in term]
+    multiplicative_terms = [
+        term
+        for term in terms
+        if "*" in term and "sin" not in term and "cos" not in term
+    ]
     assert len(multiplicative_terms) <= 2

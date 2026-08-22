@@ -14,18 +14,16 @@ Usage:
   python scripts/run_srbench_local.py --pop-size 200 --gens 2000  # Higher budget
 """
 
-import sys
 import argparse
-import time
 import json
 import math  # noqa: F401
+import sys
+import time
 import warnings
-import re
-import gzip
-import ast
-from pathlib import Path
 from datetime import datetime
 from multiprocessing import get_context
+from pathlib import Path
+
 import numpy as np
 
 # Project root
@@ -36,8 +34,8 @@ if str(_REPO_ROOT) not in sys.path:
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
-from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_signal
+from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 from scripts import benchmark_common as bc
 
 # ---------------------------------------------------------------------------
@@ -47,70 +45,177 @@ from scripts import benchmark_common as bc
 
 GROUND_TRUTH_PROBLEMS = [
     # --- Nguyen Suite ---
-    ("Nguyen-1", lambda X: X[:, 0]**3 + X[:, 0]**2 + X[:, 0],
-     1, [(-1, 1)], "x0**3 + x0**2 + x0"),
-    ("Nguyen-2", lambda X: X[:, 0]**4 + X[:, 0]**3 + X[:, 0]**2 + X[:, 0],
-     1, [(-1, 1)], "x0**4 + x0**3 + x0**2 + x0"),
-    ("Nguyen-3", lambda X: X[:, 0]**5 + X[:, 0]**4 + X[:, 0]**3 + X[:, 0]**2 + X[:, 0],
-     1, [(-1, 1)], "x0**5 + x0**4 + x0**3 + x0**2 + x0"),
-    ("Nguyen-4", lambda X: X[:, 0]**6 + X[:, 0]**5 + X[:, 0]**4 + X[:, 0]**3 + X[:, 0]**2 + X[:, 0],
-     1, [(-1, 1)], "x0**6 + x0**5 + x0**4 + x0**3 + x0**2 + x0"),
-    ("Nguyen-5", lambda X: np.sin(X[:, 0]**2) * np.cos(X[:, 0]) - 1,
-     1, [(-1, 1)], "sin(x0**2)*cos(x0) - 1"),
-    ("Nguyen-6", lambda X: np.sin(X[:, 0]) + np.sin(X[:, 0] + X[:, 0]**2),
-     1, [(-1, 1)], "sin(x0) + sin(x0 + x0**2)"),
-    ("Nguyen-7", lambda X: np.log(X[:, 0] + 1) + np.log(X[:, 0]**2 + 1),
-     1, [(0.01, 2)], "log(x0 + 1) + log(x0**2 + 1)"),
-    ("Nguyen-8", lambda X: np.sqrt(X[:, 0]),
-     1, [(0.01, 4)], "sqrt(x0)"),
-    ("Nguyen-9", lambda X: np.sin(X[:, 0]) + np.sin(X[:, 0]**2),
-     1, [(-3, 3)], "sin(x0) + sin(x0**2)"),
-    ("Nguyen-10", lambda X: 2 * np.sin(X[:, 0]) * np.cos(X[:, 0]),
-     1, [(-3, 3)], "2*sin(x0)*cos(x0)"),
-
+    (
+        "Nguyen-1",
+        lambda X: X[:, 0] ** 3 + X[:, 0] ** 2 + X[:, 0],
+        1,
+        [(-1, 1)],
+        "x0**3 + x0**2 + x0",
+    ),
+    (
+        "Nguyen-2",
+        lambda X: X[:, 0] ** 4 + X[:, 0] ** 3 + X[:, 0] ** 2 + X[:, 0],
+        1,
+        [(-1, 1)],
+        "x0**4 + x0**3 + x0**2 + x0",
+    ),
+    (
+        "Nguyen-3",
+        lambda X: X[:, 0] ** 5 + X[:, 0] ** 4 + X[:, 0] ** 3 + X[:, 0] ** 2 + X[:, 0],
+        1,
+        [(-1, 1)],
+        "x0**5 + x0**4 + x0**3 + x0**2 + x0",
+    ),
+    (
+        "Nguyen-4",
+        lambda X: (
+            X[:, 0] ** 6
+            + X[:, 0] ** 5
+            + X[:, 0] ** 4
+            + X[:, 0] ** 3
+            + X[:, 0] ** 2
+            + X[:, 0]
+        ),
+        1,
+        [(-1, 1)],
+        "x0**6 + x0**5 + x0**4 + x0**3 + x0**2 + x0",
+    ),
+    (
+        "Nguyen-5",
+        lambda X: np.sin(X[:, 0] ** 2) * np.cos(X[:, 0]) - 1,
+        1,
+        [(-1, 1)],
+        "sin(x0**2)*cos(x0) - 1",
+    ),
+    (
+        "Nguyen-6",
+        lambda X: np.sin(X[:, 0]) + np.sin(X[:, 0] + X[:, 0] ** 2),
+        1,
+        [(-1, 1)],
+        "sin(x0) + sin(x0 + x0**2)",
+    ),
+    (
+        "Nguyen-7",
+        lambda X: np.log(X[:, 0] + 1) + np.log(X[:, 0] ** 2 + 1),
+        1,
+        [(0.01, 2)],
+        "log(x0 + 1) + log(x0**2 + 1)",
+    ),
+    ("Nguyen-8", lambda X: np.sqrt(X[:, 0]), 1, [(0.01, 4)], "sqrt(x0)"),
+    (
+        "Nguyen-9",
+        lambda X: np.sin(X[:, 0]) + np.sin(X[:, 0] ** 2),
+        1,
+        [(-3, 3)],
+        "sin(x0) + sin(x0**2)",
+    ),
+    (
+        "Nguyen-10",
+        lambda X: 2 * np.sin(X[:, 0]) * np.cos(X[:, 0]),
+        1,
+        [(-3, 3)],
+        "2*sin(x0)*cos(x0)",
+    ),
     # --- Keijzer Suite ---
-    ("Keijzer-4", lambda X: 0.3 * X[:, 0] * np.sin(2 * np.pi * X[:, 0]),
-     1, [(-3, 3)], "0.3*x0*sin(2*pi*x0)"),
-
+    (
+        "Keijzer-4",
+        lambda X: 0.3 * X[:, 0] * np.sin(2 * np.pi * X[:, 0]),
+        1,
+        [(-3, 3)],
+        "0.3*x0*sin(2*pi*x0)",
+    ),
     # --- Feynman Easy ---
-    ("Feynman-I.6.20a", lambda X: np.exp(-X[:, 0]**2 / 2) / np.sqrt(2 * np.pi),
-     1, [(-3, 3)], "exp(-x0**2/2) / sqrt(2*pi)"),
-    ("Feynman-I.8.14", lambda X: np.sqrt((X[:, 0] - X[:, 1])**2 + (X[:, 2] - X[:, 3])**2),
-     4, [(-5, 5)] * 4, "sqrt((x0-x1)**2 + (x2-x3)**2)"),
-    ("Feynman-I.9.18", lambda X: X[:, 0] * X[:, 1] / (4 * np.pi * (X[:, 2]**2)),
-     3, [(0.1, 5)] * 3, "x0*x1 / (4*pi*x2**2)"),
-    ("Feynman-I.10.7", lambda X: X[:, 0] / np.sqrt(1 - (X[:, 1] / X[:, 2])**2),
-     3, [(0.1, 5), (0.1, 2), (3, 10)], "x0 / sqrt(1 - (x1/x2)**2)"),
-
+    (
+        "Feynman-I.6.20a",
+        lambda X: np.exp(-(X[:, 0] ** 2) / 2) / np.sqrt(2 * np.pi),
+        1,
+        [(-3, 3)],
+        "exp(-x0**2/2) / sqrt(2*pi)",
+    ),
+    (
+        "Feynman-I.8.14",
+        lambda X: np.sqrt((X[:, 0] - X[:, 1]) ** 2 + (X[:, 2] - X[:, 3]) ** 2),
+        4,
+        [(-5, 5)] * 4,
+        "sqrt((x0-x1)**2 + (x2-x3)**2)",
+    ),
+    (
+        "Feynman-I.9.18",
+        lambda X: X[:, 0] * X[:, 1] / (4 * np.pi * (X[:, 2] ** 2)),
+        3,
+        [(0.1, 5)] * 3,
+        "x0*x1 / (4*pi*x2**2)",
+    ),
+    (
+        "Feynman-I.10.7",
+        lambda X: X[:, 0] / np.sqrt(1 - (X[:, 1] / X[:, 2]) ** 2),
+        3,
+        [(0.1, 5), (0.1, 2), (3, 10)],
+        "x0 / sqrt(1 - (x1/x2)**2)",
+    ),
     # --- Simple classics ---
-    ("Pagie-1", lambda X: 1.0 / (1.0 + X[:, 0]**(-4)) + 1.0 / (1.0 + X[:, 1]**(-4)),
-     2, [(0.1, 5)] * 2, "1/(1+x0**-4) + 1/(1+x1**-4)"),
-    ("Korns-11", lambda X: 6.87 + 11 * np.cos(7.23 * X[:, 0]**3),
-     1, [(-3, 3)], "6.87 + 11*cos(7.23*x0**3)"),
-    ("Vladislavleva-4", lambda X: 10.0 / (5.0 + np.sum((X[:, :5] - 3)**2, axis=1)),
-     5, [(0.05, 6.05)] * 5, "10 / (5 + sum((xi-3)**2))"),
-
+    (
+        "Pagie-1",
+        lambda X: 1.0 / (1.0 + X[:, 0] ** (-4)) + 1.0 / (1.0 + X[:, 1] ** (-4)),
+        2,
+        [(0.1, 5)] * 2,
+        "1/(1+x0**-4) + 1/(1+x1**-4)",
+    ),
+    (
+        "Korns-11",
+        lambda X: 6.87 + 11 * np.cos(7.23 * X[:, 0] ** 3),
+        1,
+        [(-3, 3)],
+        "6.87 + 11*cos(7.23*x0**3)",
+    ),
+    (
+        "Vladislavleva-4",
+        lambda X: 10.0 / (5.0 + np.sum((X[:, :5] - 3) ** 2, axis=1)),
+        5,
+        [(0.05, 6.05)] * 5,
+        "10 / (5 + sum((xi-3)**2))",
+    ),
     # --- Polynomial ---
-    ("Poly-x2", lambda X: X[:, 0]**2,
-     1, [(-5, 5)], "x0**2"),
-    ("Poly-x3-x", lambda X: X[:, 0]**3 - X[:, 0],
-     1, [(-3, 3)], "x0**3 - x0"),
-    ("Poly-chebyshev-T4", lambda X: 8 * X[:, 0]**4 - 8 * X[:, 0]**2 + 1,
-     1, [(-1, 1)], "8*x0**4 - 8*x0**2 + 1"),
-
+    ("Poly-x2", lambda X: X[:, 0] ** 2, 1, [(-5, 5)], "x0**2"),
+    ("Poly-x3-x", lambda X: X[:, 0] ** 3 - X[:, 0], 1, [(-3, 3)], "x0**3 - x0"),
+    (
+        "Poly-chebyshev-T4",
+        lambda X: 8 * X[:, 0] ** 4 - 8 * X[:, 0] ** 2 + 1,
+        1,
+        [(-1, 1)],
+        "8*x0**4 - 8*x0**2 + 1",
+    ),
     # --- Trig ---
-    ("Trig-sin", lambda X: np.sin(X[:, 0]),
-     1, [(-6, 6)], "sin(x0)"),
-    ("Trig-sin+cos", lambda X: np.sin(X[:, 0]) + np.cos(X[:, 0]),
-     1, [(-6, 6)], "sin(x0) + cos(x0)"),
-    ("Trig-damped-sine", lambda X: np.exp(-X[:, 0]) * np.sin(X[:, 0]),
-     1, [(0, 10)], "exp(-x0)*sin(x0)"),
-
+    ("Trig-sin", lambda X: np.sin(X[:, 0]), 1, [(-6, 6)], "sin(x0)"),
+    (
+        "Trig-sin+cos",
+        lambda X: np.sin(X[:, 0]) + np.cos(X[:, 0]),
+        1,
+        [(-6, 6)],
+        "sin(x0) + cos(x0)",
+    ),
+    (
+        "Trig-damped-sine",
+        lambda X: np.exp(-X[:, 0]) * np.sin(X[:, 0]),
+        1,
+        [(0, 10)],
+        "exp(-x0)*sin(x0)",
+    ),
     # --- Rational ---
-    ("Rational-sigmoid", lambda X: 1.0 / (1.0 + np.exp(-X[:, 0])),
-     1, [(-6, 6)], "1/(1+exp(-x0))"),
-    ("Rational-lorentz", lambda X: 1.0 / (1.0 + X[:, 0]**2),
-     1, [(-5, 5)], "1/(1+x0**2)"),
+    (
+        "Rational-sigmoid",
+        lambda X: 1.0 / (1.0 + np.exp(-X[:, 0])),
+        1,
+        [(-6, 6)],
+        "1/(1+exp(-x0))",
+    ),
+    (
+        "Rational-lorentz",
+        lambda X: 1.0 / (1.0 + X[:, 0] ** 2),
+        1,
+        [(-5, 5)],
+        "1/(1+x0**2)",
+    ),
 ]
 
 # ---------------------------------------------------------------------------
@@ -242,6 +347,7 @@ def simplify_formula_with_guard(formula, X_ref, y_ref, mse_slack=0.02):
 
     try:
         from glassbox.sr.cpp import get_cpp_core
+
         _core = get_cpp_core()
     except Exception:
         _core = None
@@ -282,12 +388,16 @@ def simplify_formula_with_guard(formula, X_ref, y_ref, mse_slack=0.02):
     mse_simpl = mse_score(y_ref, y_simpl)
 
     # Accept simplification if it preserves fit quality and is at least as compact.
-    if mse_simpl <= mse_orig * (1.0 + max(0.0, mse_slack)) and model_size(simplified) <= model_size(formula):
+    if mse_simpl <= mse_orig * (1.0 + max(0.0, mse_slack)) and model_size(
+        simplified
+    ) <= model_size(formula):
         return simplified
     return formula
 
 
-def _build_srbench_seed_graphs(x_np, y_np, detected_omegas, candidate_formulas=None, max_seeds=12):
+def _build_srbench_seed_graphs(
+    x_np, y_np, detected_omegas, candidate_formulas=None, max_seeds=12
+):
     """Build seed graphs with the current shared signal-based helper."""
     try:
         graphs = build_seed_graphs_from_signal(
@@ -303,7 +413,10 @@ def _build_srbench_seed_graphs(x_np, y_np, detected_omegas, candidate_formulas=N
 
     try:
         from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_candidates
-        return build_seed_graphs_from_candidates(candidate_formulas, max_seeds=max_seeds)
+
+        return build_seed_graphs_from_candidates(
+            candidate_formulas, max_seeds=max_seeds
+        )
     except Exception:
         return []
 
@@ -315,16 +428,18 @@ def _fit_worker(payload, result_queue):
 
     def _send_result(result):
         result_queue.put(result)
-    
+
     def timeout_handler(signum, frame):
-        raise TimeoutError(f"Process timeout after {payload.get('timeout_seconds', '?')}s")
-    
+        raise TimeoutError(
+            f"Process timeout after {payload.get('timeout_seconds', '?')}s"
+        )
+
     try:
         timeout_sec = payload.get("timeout_seconds", 120)
         if sys.platform != "win32":
             signal.signal(signal.SIGALRM, timeout_handler)
             signal.alarm(int(timeout_sec))
-        
+
         est = GlassboxRegressor(**payload["est_params"])
         X_train = payload["X_train"]
         y_train = payload["y_train"]
@@ -348,30 +463,36 @@ def _fit_worker(payload, result_queue):
         time_to_first_exact = getattr(est, "time_to_first_exact_sec_", None)
         time_to_first_acceptable = getattr(est, "time_to_first_acceptable_sec_", None)
         generation_to_first_exact = getattr(est, "generation_to_first_exact_", None)
-        generation_to_first_acceptable = getattr(est, "generation_to_first_acceptable_", None)
+        generation_to_first_acceptable = getattr(
+            est, "generation_to_first_acceptable_", None
+        )
 
-        _send_result({
-            "status": "ok",
-            "fit_time": fit_time,
-            "formula": formula,
-            "y_pred_test": y_pred_test,
-            "y_pred_full": y_pred_full,
-            "raw_mse": raw_mse,
-            "blackbox_diagnostics": blackbox_diagnostics,
-            "specialist_metadata": specialist_metadata,
-            "evolution_wall_time_sec": evolution_wall_time,
-            "time_to_first_exact": time_to_first_exact,
-            "time_to_first_acceptable": time_to_first_acceptable,
-            "generation_to_first_exact": generation_to_first_exact,
-            "generation_to_first_acceptable": generation_to_first_acceptable,
-        })
+        _send_result(
+            {
+                "status": "ok",
+                "fit_time": fit_time,
+                "formula": formula,
+                "y_pred_test": y_pred_test,
+                "y_pred_full": y_pred_full,
+                "raw_mse": raw_mse,
+                "blackbox_diagnostics": blackbox_diagnostics,
+                "specialist_metadata": specialist_metadata,
+                "evolution_wall_time_sec": evolution_wall_time,
+                "time_to_first_exact": time_to_first_exact,
+                "time_to_first_acceptable": time_to_first_acceptable,
+                "generation_to_first_exact": generation_to_first_exact,
+                "generation_to_first_acceptable": generation_to_first_acceptable,
+            }
+        )
     except TimeoutError as te:
         _send_result({"status": "timeout", "error": str(te)})
     except Exception as err:
         _send_result({"status": "error", "error": str(err)})
 
 
-def run_with_hard_timeout(est_params, X_train, y_train, X_test, timeout_seconds, X_full=None):
+def run_with_hard_timeout(
+    est_params, X_train, y_train, X_test, timeout_seconds, X_full=None
+):
     """Run fit/predict in a separate process and enforce a hard wall-clock timeout."""
     import queue as queue_mod
 
@@ -424,7 +545,10 @@ def run_with_hard_timeout(est_params, X_train, y_train, X_test, timeout_seconds,
                         process.join(timeout=1)
                 except Exception:
                     pass
-                return {"status": "timeout", "error": f"hard timeout after {elapsed:.1f}s"}
+                return {
+                    "status": "timeout",
+                    "error": f"hard timeout after {elapsed:.1f}s",
+                }
 
         if result is not None:
             if result.get("status") == "timeout":
@@ -433,11 +557,20 @@ def run_with_hard_timeout(est_params, X_train, y_train, X_test, timeout_seconds,
 
         process.join(timeout=1)
         if process.exitcode == 0:
-            return {"status": "timeout", "error": f"no result after {time.time() - t0:.1f}s"}
+            return {
+                "status": "timeout",
+                "error": f"no result after {time.time() - t0:.1f}s",
+            }
         else:
-            return {"status": "error", "error": f"worker crashed with code {process.exitcode}"}
+            return {
+                "status": "error",
+                "error": f"worker crashed with code {process.exitcode}",
+            }
     except Exception as outer_err:
-        return {"status": "error", "error": f"spawn error: {type(outer_err).__name__}: {outer_err!r}"}
+        return {
+            "status": "error",
+            "error": f"spawn error: {type(outer_err).__name__}: {outer_err!r}",
+        }
     finally:
         try:
             result_queue.close()
@@ -446,7 +579,9 @@ def run_with_hard_timeout(est_params, X_train, y_train, X_test, timeout_seconds,
             pass
 
 
-def resolve_specialist_phase_config(*, disable_specialist=False, enable_residual_stage=False, specialist_full=False):
+def resolve_specialist_phase_config(
+    *, disable_specialist=False, enable_residual_stage=False, specialist_full=False
+):
     """Resolve SRBench specialist phase flags into estimator constructor booleans."""
     enabled = not bool(disable_specialist)
     full = bool(specialist_full and enabled)
@@ -482,15 +617,20 @@ def make_seeded_train_test_split(X, y, *, n_samples, seed, train_fraction=0.8):
 # Runners
 # ---------------------------------------------------------------------------
 
+
 def generate_ground_truth_data(problem, n_samples=500, seed=42):
     """Generate data from a ground-truth problem."""
     name, fn, n_features, x_ranges, formula_str = problem
     rng = np.random.RandomState(seed)
 
-    X = np.column_stack([
-        rng.uniform(lo, hi, size=n_samples)
-        for lo, hi in (x_ranges if len(x_ranges) == n_features else x_ranges * n_features)
-    ])
+    X = np.column_stack(
+        [
+            rng.uniform(lo, hi, size=n_samples)
+            for lo, hi in (
+                x_ranges if len(x_ranges) == n_features else x_ranges * n_features
+            )
+        ]
+    )
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -522,15 +662,16 @@ def run_track1_blackbox(
         from pmlb import fetch_data
     except ImportError:
         import subprocess
+
         subprocess.check_call([sys.executable, "-m", "pip", "install", "pmlb"])
         from pmlb import fetch_data
 
     results = []
     ds_list = datasets[:max_datasets] if max_datasets else datasets
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"  TRACK 1: BLACK-BOX REGRESSION ({len(ds_list)} datasets)")
-    print(f"{'='*70}\n")
+    print(f"{'=' * 70}\n")
 
     seeds = list(seeds or [42])
 
@@ -539,8 +680,12 @@ def run_track1_blackbox(
             X, y = fetch_data(ds_name, return_X_y=True)
         except Exception as e:
             if verbose:
-                print(f"  [{idx+1:3d}/{len(ds_list)}] {ds_name:40s} SKIP (fetch error: {e})")
-            results.append({"dataset": ds_name, "r2": None, "mse": None, "error": str(e)})
+                print(
+                    f"  [{idx + 1:3d}/{len(ds_list)}] {ds_name:40s} SKIP (fetch error: {e})"
+                )
+            results.append(
+                {"dataset": ds_name, "r2": None, "mse": None, "error": str(e)}
+            )
             continue
 
         seed_runs = []
@@ -561,7 +706,9 @@ def run_track1_blackbox(
                         n_train=n_train,
                         adaptive_timeout=adaptive_timeout,
                     )
-                    est_params = _apply_srbench_run_budget(est.get_params(), timeout_budget)
+                    est_params = _apply_srbench_run_budget(
+                        est.get_params(), timeout_budget
+                    )
                     est_params["random_state"] = repeat_seed
 
                     # If bloat-skip enabled, make evolution skip more aggressively on good fast-path results
@@ -586,7 +733,9 @@ def run_track1_blackbox(
                                     "r2": None,
                                     "mse": None,
                                     "time": elapsed,
-                                    "error": run_result.get("error", run_result["status"]),
+                                    "error": run_result.get(
+                                        "error", run_result["status"]
+                                    ),
                                     "run_label": run_label,
                                     "n_train": len(train_y),
                                     "n_test": len(test_X),
@@ -596,14 +745,18 @@ def run_track1_blackbox(
 
                             formula = postprocess_formula(run_result.get("formula", ""))
                             if post_simplify and formula:
-                                formula = simplify_formula_with_guard(formula, train_X, train_y)
-                            y_pred, eval_diag = evaluate_formula(formula, test_X, return_diagnostics=True)
+                                formula = simplify_formula_with_guard(
+                                    formula, train_X, train_y
+                                )
+                            y_pred, eval_diag = evaluate_formula(
+                                formula, test_X, return_diagnostics=True
+                            )
                             if y_pred is None:
                                 y_pred, eval_diag = _fallback_estimator_predictions(
                                     run_result,
                                     eval_diag,
                                     split="test",
-                            )
+                                )
                             blackbox_diag = run_result.get("blackbox_diagnostics")
                             specialist_metadata = run_result.get("specialist_metadata")
                         else:
@@ -611,16 +764,26 @@ def run_track1_blackbox(
                             est_copy.fit(train_X, train_y)
                             formula = postprocess_formula(est_copy.get_formula())
                             if post_simplify and formula:
-                                formula = simplify_formula_with_guard(formula, train_X, train_y)
-                            y_pred, eval_diag = evaluate_formula(formula, test_X, return_diagnostics=True)
+                                formula = simplify_formula_with_guard(
+                                    formula, train_X, train_y
+                                )
+                            y_pred, eval_diag = evaluate_formula(
+                                formula, test_X, return_diagnostics=True
+                            )
                             elapsed = time.time() - t0
-                            blackbox_diag = getattr(est_copy, "blackbox_diagnostics_", None)
-                            specialist_metadata = bc.specialist_metadata_from_estimator(est_copy)
+                            blackbox_diag = getattr(
+                                est_copy, "blackbox_diagnostics_", None
+                            )
+                            specialist_metadata = bc.specialist_metadata_from_estimator(
+                                est_copy
+                            )
 
                         if y_pred is None:
                             error_reason = "formula_eval_failed"
                             if isinstance(eval_diag, dict) and eval_diag.get("reason"):
-                                error_reason = f"formula_eval_failed:{eval_diag['reason']}"
+                                error_reason = (
+                                    f"formula_eval_failed:{eval_diag['reason']}"
+                                )
                             return {
                                 "seed": repeat_seed,
                                 "r2": None,
@@ -658,9 +821,11 @@ def run_track1_blackbox(
                             "n_test": len(y_test),
                             "n_features": train_X.shape[1],
                             "timeout_budget": timeout_budget,
-                            }
+                        }
 
-                    selected_result = _run_once("selected_features", X_train, y_train, X_test, est_params)
+                    selected_result = _run_once(
+                        "selected_features", X_train, y_train, X_test, est_params
+                    )
                     seed_runs.append(selected_result)
                     if verbose:
                         if selected_result.get("error"):
@@ -682,7 +847,13 @@ def run_track1_blackbox(
                         all_features_params = est_params.copy()
                         all_features_params["blackbox_feature_selection"] = False
                         all_features_params["blackbox_mode"] = False
-                        all_features_result = _run_once("all_features", X_train, y_train, X_test, all_features_params)
+                        all_features_result = _run_once(
+                            "all_features",
+                            X_train,
+                            y_train,
+                            X_test,
+                            all_features_params,
+                        )
                         seed_runs.append(all_features_result)
                         if verbose:
                             if all_features_result.get("error"):
@@ -701,25 +872,39 @@ def run_track1_blackbox(
                                 )
                 except Exception as e:
                     elapsed = 0.0
-                    seed_runs.append({"seed": repeat_seed, "r2": None, "mse": None, "time": elapsed, "error": str(e), "run_label": "selected_features"})
+                    seed_runs.append(
+                        {
+                            "seed": repeat_seed,
+                            "r2": None,
+                            "mse": None,
+                            "time": elapsed,
+                            "error": str(e),
+                            "run_label": "selected_features",
+                        }
+                    )
                     if "timeout" in str(e).lower():
                         break
 
         valid_seed_runs = [r for r in seed_runs if r.get("r2") is not None]
         if not valid_seed_runs:
-            err_msg = "; ".join(str(r.get("error")) for r in seed_runs if r.get("error")) or "all_seeds_failed"
+            err_msg = (
+                "; ".join(str(r.get("error")) for r in seed_runs if r.get("error"))
+                or "all_seeds_failed"
+            )
             if verbose:
-                print(f"  [{idx+1:3d}/{len(ds_list)}] {ds_name:40s} ERROR: {err_msg}")
-            results.append({
-                "dataset": ds_name,
-                "r2": None,
-                "mse": None,
-                "time": None,
-                "error": err_msg,
-                "seed_runs": seed_runs,
-                "stability": summarize_seed_runs(seed_runs),
-                "scoring_source": "displayed_formula",
-            })
+                print(f"  [{idx + 1:3d}/{len(ds_list)}] {ds_name:40s} ERROR: {err_msg}")
+            results.append(
+                {
+                    "dataset": ds_name,
+                    "r2": None,
+                    "mse": None,
+                    "time": None,
+                    "error": err_msg,
+                    "seed_runs": seed_runs,
+                    "stability": summarize_seed_runs(seed_runs),
+                    "scoring_source": "displayed_formula",
+                }
+            )
             continue
 
         stability = summarize_seed_runs(seed_runs)
@@ -739,7 +924,9 @@ def run_track1_blackbox(
             "error": None,
             "seed_runs": seed_runs,
             "stability": stability,
-            "time_to_discovery": summarize_time_to_discovery(seed_runs, exact_key="exact_match"),
+            "time_to_discovery": summarize_time_to_discovery(
+                seed_runs, exact_key="exact_match"
+            ),
             "scoring_source": "displayed_formula",
             "runs_per_formula": int(max(1, int(runs_per_formula))),
             "ablation_mode": bool(ablation_mode),
@@ -754,7 +941,7 @@ def run_track1_blackbox(
         symbol = "OK" if median_r2 > 0.9 else "MID" if median_r2 > 0.5 else "LOW"
         if verbose:
             print(
-                f"  [{idx+1:3d}/{len(ds_list)}] {ds_name:40s} "
+                f"  [{idx + 1:3d}/{len(ds_list)}] {ds_name:40s} "
                 f"R²(med)={median_r2:7.4f}  MSE(med)={median_mse:.3e}  "
                 f"{median_time:5.1f}s  {symbol}  "
                 f"(budget={aggregate.get('timeout_budget')}s, seeds={len(seeds)})"
@@ -782,9 +969,9 @@ def run_track2_ground_truth(
     results = []
     prob_list = problems[:max_problems] if max_problems else problems
 
-    print(f"\n{'='*70}")
+    print(f"\n{'=' * 70}")
     print(f"  TRACK 2: GROUND-TRUTH SYMBOLIC REGRESSION ({len(prob_list)} problems)")
-    print(f"{'='*70}\n")
+    print(f"{'=' * 70}\n")
 
     seeds = list(seeds or [42])
 
@@ -794,10 +981,20 @@ def run_track2_ground_truth(
         for seed in seeds:
             for run_idx in range(max(1, int(runs_per_formula))):
                 repeat_seed = int(seed) + run_idx * 10007
-                X, y, true_formula = generate_ground_truth_data(problem, n_samples=n_samples, seed=repeat_seed)
+                X, y, true_formula = generate_ground_truth_data(
+                    problem, n_samples=n_samples, seed=repeat_seed
+                )
 
                 if X is None:
-                    seed_runs.append({"seed": repeat_seed, "r2": None, "mse": None, "time": None, "error": "bad_data"})
+                    seed_runs.append(
+                        {
+                            "seed": repeat_seed,
+                            "r2": None,
+                            "mse": None,
+                            "time": None,
+                            "error": "bad_data",
+                        }
+                    )
                     continue
 
                 # Train/test split (80/20)
@@ -813,7 +1010,9 @@ def run_track2_ground_truth(
                 )
                 t0 = time.time()
                 try:
-                    est_params = _apply_srbench_run_budget(est.get_params(), timeout_budget)
+                    est_params = _apply_srbench_run_budget(
+                        est.get_params(), timeout_budget
+                    )
                     est_params["random_state"] = repeat_seed
 
                     if skip_evolution_if_bloated:
@@ -831,21 +1030,29 @@ def run_track2_ground_truth(
                         )
                         elapsed = time.time() - t0
                         if run_result["status"] != "ok":
-                            seed_runs.append({
-                                "seed": repeat_seed,
-                                "r2": None,
-                                "mse": None,
-                                "time": elapsed,
-                                "error": run_result.get("error", run_result["status"]),
-                            })
+                            seed_runs.append(
+                                {
+                                    "seed": repeat_seed,
+                                    "r2": None,
+                                    "mse": None,
+                                    "time": elapsed,
+                                    "error": run_result.get(
+                                        "error", run_result["status"]
+                                    ),
+                                }
+                            )
                             if "timeout" in str(run_result.get("error", "")).lower():
                                 break
                             continue
 
                         formula = postprocess_formula(run_result.get("formula", ""))
                         if post_simplify and formula:
-                            formula = simplify_formula_with_guard(formula, X_train, y_train)
-                        y_pred_all, eval_diag = evaluate_formula(formula, X, return_diagnostics=True)
+                            formula = simplify_formula_with_guard(
+                                formula, X_train, y_train
+                            )
+                        y_pred_all, eval_diag = evaluate_formula(
+                            formula, X, return_diagnostics=True
+                        )
                         if y_pred_all is None:
                             y_pred_all, eval_diag = _fallback_estimator_predictions(
                                 run_result,
@@ -858,27 +1065,35 @@ def run_track2_ground_truth(
                         est_copy.fit(X_train, y_train)
                         formula = postprocess_formula(est_copy.get_formula())
                         if post_simplify and formula:
-                            formula = simplify_formula_with_guard(formula, X_train, y_train)
-                        y_pred_all, eval_diag = evaluate_formula(formula, X, return_diagnostics=True)
+                            formula = simplify_formula_with_guard(
+                                formula, X_train, y_train
+                            )
+                        y_pred_all, eval_diag = evaluate_formula(
+                            formula, X, return_diagnostics=True
+                        )
                         elapsed = time.time() - t0
-                        specialist_metadata = bc.specialist_metadata_from_estimator(est_copy)
+                        specialist_metadata = bc.specialist_metadata_from_estimator(
+                            est_copy
+                        )
 
                     if y_pred_all is None:
                         error_reason = "formula_eval_failed"
                         if isinstance(eval_diag, dict) and eval_diag.get("reason"):
                             error_reason = f"formula_eval_failed:{eval_diag['reason']}"
-                        seed_runs.append({
-                            "seed": repeat_seed,
-                            "r2": None,
-                            "mse": None,
-                            "time": elapsed,
-                            "problem": name,
-                            "true_formula": true_formula,
-                            "discovered_formula": formula,
-                            "model_size": model_size(formula),
-                            "formula_eval_diagnostics": eval_diag,
-                            "error": error_reason,
-                        })
+                        seed_runs.append(
+                            {
+                                "seed": repeat_seed,
+                                "r2": None,
+                                "mse": None,
+                                "time": elapsed,
+                                "problem": name,
+                                "true_formula": true_formula,
+                                "discovered_formula": formula,
+                                "model_size": model_size(formula),
+                                "formula_eval_diagnostics": eval_diag,
+                                "error": error_reason,
+                            }
+                        )
                         continue
 
                     y_pred_test = y_pred_all[n_train:]
@@ -889,45 +1104,62 @@ def run_track2_ground_truth(
                     exact_match = full_mse < 1e-6
                     failure_bucket = None
                     if not exact_match:
-                        failure_bucket = classify_failure_taxonomy(true_formula, formula, r2, full_mse)
+                        failure_bucket = classify_failure_taxonomy(
+                            true_formula, formula, r2, full_mse
+                        )
 
-                    seed_runs.append({
-                        "seed": repeat_seed,
-                        "problem": name,
-                        "true_formula": true_formula,
-                        "discovered_formula": formula,
-                        "r2": r2,
-                        "mse": mse,
-                        "full_mse": full_mse,
-                        "exact_match": exact_match,
-                        "time": elapsed,
+                    seed_runs.append(
+                        {
+                            "seed": repeat_seed,
+                            "problem": name,
+                            "true_formula": true_formula,
+                            "discovered_formula": formula,
+                            "r2": r2,
+                            "mse": mse,
+                            "full_mse": full_mse,
+                            "exact_match": exact_match,
+                            "time": elapsed,
                             "model_size": size,
                             "failure_bucket": failure_bucket,
                             "specialist_metadata": specialist_metadata,
                             "formula_eval_diagnostics": eval_diag,
-                        "error": None,
-                    })
+                            "error": None,
+                        }
+                    )
                 except Exception as e:
                     elapsed = time.time() - t0
-                    seed_runs.append({"seed": repeat_seed, "r2": None, "mse": None, "time": elapsed, "error": str(e)})
+                    seed_runs.append(
+                        {
+                            "seed": repeat_seed,
+                            "r2": None,
+                            "mse": None,
+                            "time": elapsed,
+                            "error": str(e),
+                        }
+                    )
                     if "timeout" in str(e).lower():
                         break
 
         valid_seed_runs = [r for r in seed_runs if r.get("r2") is not None]
         if not valid_seed_runs:
-            err_msg = "; ".join(str(r.get("error")) for r in seed_runs if r.get("error")) or "all_seeds_failed"
+            err_msg = (
+                "; ".join(str(r.get("error")) for r in seed_runs if r.get("error"))
+                or "all_seeds_failed"
+            )
             if verbose:
-                print(f"  [{idx+1:3d}/{len(prob_list)}] {name:40s} ERROR: {err_msg}")
-            results.append({
-                "problem": name,
-                "r2": None,
-                "mse": None,
-                "time": None,
-                "error": err_msg,
-                "seed_runs": seed_runs,
-                "stability": summarize_seed_runs(seed_runs),
-                "scoring_source": "displayed_formula",
-            })
+                print(f"  [{idx + 1:3d}/{len(prob_list)}] {name:40s} ERROR: {err_msg}")
+            results.append(
+                {
+                    "problem": name,
+                    "r2": None,
+                    "mse": None,
+                    "time": None,
+                    "error": err_msg,
+                    "seed_runs": seed_runs,
+                    "stability": summarize_seed_runs(seed_runs),
+                    "scoring_source": "displayed_formula",
+                }
+            )
             continue
 
         stability = summarize_seed_runs(seed_runs)
@@ -940,7 +1172,7 @@ def run_track2_ground_truth(
 
         median_run = min(
             valid_seed_runs,
-            key=lambda r: abs(float(r["r2"]) - float(stability["r2_stats"]["median"]))
+            key=lambda r: abs(float(r["r2"]) - float(stability["r2_stats"]["median"])),
         )
 
         best_run = min(valid_seed_runs, key=lambda r: float(r.get("mse", float("inf"))))
@@ -950,7 +1182,15 @@ def run_track2_ground_truth(
             "discovered_formula": best_run.get("discovered_formula"),
             "r2": stability["r2_stats"]["median"],
             "mse": stability["mse_stats"]["median"],
-            "full_mse": float(np.median([r["full_mse"] for r in valid_seed_runs if r.get("full_mse") is not None])),
+            "full_mse": float(
+                np.median(
+                    [
+                        r["full_mse"]
+                        for r in valid_seed_runs
+                        if r.get("full_mse") is not None
+                    ]
+                )
+            ),
             "exact_match": bool(stability.get("exact_recovery_rate", 0.0) == 1.0),
             "exact_recovery_rate": stability.get("exact_recovery_rate"),
             "time": stability["time_stats"]["median"],
@@ -971,7 +1211,7 @@ def run_track2_ground_truth(
         symbol = "OK" if exact_rate >= 0.8 else "MID" if median_r2 > 0.9 else "LOW"
         if verbose:
             print(
-                f"  [{idx+1:3d}/{len(prob_list)}] {name:40s} "
+                f"  [{idx + 1:3d}/{len(prob_list)}] {name:40s} "
                 f"EXACT-rate={exact_rate:5.2f}  R²(med)={median_r2:7.4f}  "
                 f"MSE(med)={median_mse:.3e}  {median_time:5.1f}s  {symbol}  "
                 f"(seeds={len(seeds)})"
@@ -986,29 +1226,40 @@ def run_track2_ground_truth(
 # Summary & Report
 # ---------------------------------------------------------------------------
 
+
 def print_summary(track1_results, track2_results, output_dir=None):
     """Print aggregate summary and optionally save to JSON."""
-    print(f"\n{'='*70}")
-    print(f"  SRBENCH RESULTS SUMMARY - Glassbox")
-    print(f"{'='*70}")
+    print(f"\n{'=' * 70}")
+    print("  SRBENCH RESULTS SUMMARY - Glassbox")
+    print(f"{'=' * 70}")
 
     # Track 1 summary
     if track1_results:
         valid = [r for r in track1_results if r.get("r2") is not None]
         r2_vals = [r["r2"] for r in valid]
         times = [r.get("time", 0) for r in valid]
-        r2_worst_decile = compute_stability_stats(r2_vals).get("worst_decile") if r2_vals else None
-        print(f"\n  TRACK 1 - Black-Box Regression")
-        print(f"  {'-'*50}")
+        r2_worst_decile = (
+            compute_stability_stats(r2_vals).get("worst_decile") if r2_vals else None
+        )
+        print("\n  TRACK 1 - Black-Box Regression")
+        print(f"  {'-' * 50}")
         print(f"  Datasets tested:    {len(valid)}/{len(track1_results)}")
         if r2_vals:
             print(f"  Mean R²:            {np.mean(r2_vals):.4f}")
             print(f"  Median R²:          {np.median(r2_vals):.4f}")
-            print(f"  R² IQR:             {compute_stability_stats(r2_vals)['iqr']:.4f}")
-            print(f"  R² Std:             {compute_stability_stats(r2_vals)['std']:.4f}")
+            print(
+                f"  R² IQR:             {compute_stability_stats(r2_vals)['iqr']:.4f}"
+            )
+            print(
+                f"  R² Std:             {compute_stability_stats(r2_vals)['std']:.4f}"
+            )
             print(f"  R² Worst-decile:    {r2_worst_decile:.4f}")
-            print(f"  R² > 0.9:           {sum(1 for v in r2_vals if v > 0.9)}/{len(r2_vals)}")
-            print(f"  R² > 0.5:           {sum(1 for v in r2_vals if v > 0.5)}/{len(r2_vals)}")
+            print(
+                f"  R² > 0.9:           {sum(1 for v in r2_vals if v > 0.9)}/{len(r2_vals)}"
+            )
+            print(
+                f"  R² > 0.5:           {sum(1 for v in r2_vals if v > 0.5)}/{len(r2_vals)}"
+            )
             print(f"  Mean time:          {np.mean(times):.2f}s")
             print(f"  Total time:         {sum(times):.1f}s")
 
@@ -1017,9 +1268,22 @@ def print_summary(track1_results, track2_results, output_dir=None):
         valid = [r for r in track2_results if r.get("r2") is not None]
         r2_vals = [r["r2"] for r in valid]
         exact = [r for r in valid if r.get("exact_match")]
-        exact_rates = [r.get("exact_recovery_rate") for r in valid if r.get("exact_recovery_rate") is not None]
-        tfe = [r.get("time_to_discovery", {}).get("time_to_first_exact") for r in valid if r.get("time_to_discovery", {}).get("time_to_first_exact") is not None]
-        tfa = [r.get("time_to_discovery", {}).get("time_to_first_acceptable") for r in valid if r.get("time_to_discovery", {}).get("time_to_first_acceptable") is not None]
+        exact_rates = [
+            r.get("exact_recovery_rate")
+            for r in valid
+            if r.get("exact_recovery_rate") is not None
+        ]
+        tfe = [
+            r.get("time_to_discovery", {}).get("time_to_first_exact")
+            for r in valid
+            if r.get("time_to_discovery", {}).get("time_to_first_exact") is not None
+        ]
+        tfa = [
+            r.get("time_to_discovery", {}).get("time_to_first_acceptable")
+            for r in valid
+            if r.get("time_to_discovery", {}).get("time_to_first_acceptable")
+            is not None
+        ]
         times = [r.get("time", 0) for r in valid]
         failure_counts = {}
         for row in valid:
@@ -1028,19 +1292,27 @@ def print_summary(track1_results, track2_results, output_dir=None):
                 if not bucket:
                     continue
                 failure_counts[bucket] = failure_counts.get(bucket, 0) + 1
-        print(f"\n  TRACK 2 - Ground-Truth Symbolic Regression")
-        print(f"  {'-'*50}")
+        print("\n  TRACK 2 - Ground-Truth Symbolic Regression")
+        print(f"  {'-' * 50}")
         print(f"  Problems tested:    {len(valid)}/{len(track2_results)}")
         if r2_vals:
             print(f"  Exact matches:      {len(exact)}/{len(valid)}")
             print(f"  Mean R²:            {np.mean(r2_vals):.4f}")
             print(f"  Median R²:          {np.median(r2_vals):.4f}")
-            print(f"  R² IQR:             {compute_stability_stats(r2_vals)['iqr']:.4f}")
-            print(f"  R² Std:             {compute_stability_stats(r2_vals)['std']:.4f}")
-            print(f"  R² Worst-decile:    {compute_stability_stats(r2_vals)['worst_decile']:.4f}")
+            print(
+                f"  R² IQR:             {compute_stability_stats(r2_vals)['iqr']:.4f}"
+            )
+            print(
+                f"  R² Std:             {compute_stability_stats(r2_vals)['std']:.4f}"
+            )
+            print(
+                f"  R² Worst-decile:    {compute_stability_stats(r2_vals)['worst_decile']:.4f}"
+            )
             if exact_rates:
                 print(f"  Mean exact-rate:    {np.mean(exact_rates):.4f}")
-            print(f"  R² > 0.9:           {sum(1 for v in r2_vals if v > 0.9)}/{len(r2_vals)}")
+            print(
+                f"  R² > 0.9:           {sum(1 for v in r2_vals if v > 0.9)}/{len(r2_vals)}"
+            )
             print(f"  Mean time:          {np.mean(times):.2f}s")
             print(f"  Total time:         {sum(times):.1f}s")
             if tfe:
@@ -1048,11 +1320,13 @@ def print_summary(track1_results, track2_results, output_dir=None):
             if tfa:
                 print(f"  TTF accept (median):{np.median(tfa):.2f}s")
             if failure_counts:
-                top_failures = sorted(failure_counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+                top_failures = sorted(
+                    failure_counts.items(), key=lambda kv: kv[1], reverse=True
+                )[:5]
                 failure_text = ", ".join([f"{k}:{v}" for k, v in top_failures])
                 print(f"  Top failures:       {failure_text}")
 
-    print(f"\n{'='*70}\n")
+    print(f"\n{'=' * 70}\n")
 
     # Save results JSON
     if output_dir:
@@ -1076,76 +1350,183 @@ def print_summary(track1_results, track2_results, output_dir=None):
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(description="Glassbox SRBench Benchmark")
-    parser.add_argument("--track", type=int, choices=[1, 2], default=None,
-                        help="Run specific track only (1=black-box, 2=ground-truth)")
-    parser.add_argument("--max-datasets", type=int, default=None,
-                        help="Limit number of datasets (for quick testing)")
-    parser.add_argument("--n-samples", type=int, default=500,
-                        help="Number of data points per problem")
-    parser.add_argument("--pop-size", type=int, default=100,
-                        help="C++ evolution population size")
-    parser.add_argument("--gens", type=int, default=1000,
-                        help="C++ evolution generations")
-    parser.add_argument("--num-islands", type=int, default=8,
-                        help="Number of C++ evolution islands")
-    parser.add_argument("--migration-interval", type=int, default=25,
-                        help="Generations between island migrations")
-    parser.add_argument("--migration-size", type=int, default=2,
-                        help="Individuals migrated between islands")
-    parser.add_argument("--multi-start-runs", type=int, default=1,
-                        help="Internal C++ restarts per seed; keep at 1 when using multi-seed SRBench runs")
-    parser.add_argument("--enable-residual-stage", action="store_true",
-                        help="Enable expensive residual symbolic stage during SRBench runs")
-    parser.add_argument("--specialist-full", action="store_true",
-                        help="Enable all specialist phases for SRBench, including residual search")
-    parser.add_argument("--disable-specialist", action="store_true",
-                        help="Disable specialist screening/composition diagnostics for SRBench ablation runs")
-    parser.add_argument("--classifier-model", type=str, default="models/curve_classifier_multi.pt",
-                        help="Classifier model path")
-    parser.add_argument("--proposer-model", type=str, default="models/universal_proposer_multi.pt",
-                        help="Universal proposer model path")
-    parser.add_argument("--no-fast-path", action="store_true",
-                        help="Disable fast-path discovery")
-    parser.add_argument("--no-guided-evolution", action="store_true",
-                        help="Disable guided evolution")
-    parser.add_argument("--output-dir", type=str, default="results/srbench",
-                        help="Output directory for results JSON")
-    parser.add_argument("--quiet", action="store_true",
-                        help="Suppress per-dataset output")
-    parser.add_argument("--timeout", type=int, default=60,
-                        help="Max seconds per problem (default: 60s for PMLB)")
-    parser.add_argument("--no-hard-timeout", action="store_true",
-                        help="Disable process-level hard timeout enforcement")
-    parser.add_argument("--no-adaptive-timeout", action="store_true",
-                        help="Disable adaptive timeout scaling (now enabled by default)")
-    parser.add_argument("--post-simplify", action="store_true",
-                        help="Post-simplify formulas with a fidelity guard")
-    parser.add_argument("--skip-evolution-if-bloated", action="store_true",
-                        help="Skip C++ evolution if fast-path formula exceeds 20 terms")
-    parser.add_argument("--seeds", type=str, default="42,1337,2027,7,11",
-                        help="Comma-separated fixed seeds for reproducible multi-seed protocol")
-    parser.add_argument("--runs-per-formula", type=int, default=1,
-                        help="Repeat each formula this many times; use 1 for smoke tests")
-    parser.add_argument("--data-dir", type=str, default=None,
-                        help="Optional local PMLB checkout for official-style symbolic dataset discovery")
-    parser.add_argument("--official", action="store_true",
-                        help="Prefer official SRBench-like dataset discovery when available")
-    parser.add_argument("--acceptable-r2", type=float, default=0.9,
-                        help="R2 threshold for acceptable discovery metric")
-    parser.add_argument("--complexity-cap", type=int, default=20,
-                        help="Complexity cap (model size) for acceptable discovery metric")
-    parser.add_argument("--blackbox-max-features", type=int, default=6,
-                        help="Max selected features used by the reduced search path")
-    parser.add_argument("--blackbox-mode", choices=["auto", "on", "off"], default="auto",
-                        help="Blackbox preprocessing mode for Track 1 runs")
-    parser.add_argument("--no-blackbox-feature-selection", action="store_true",
-                        help="Disable blackbox feature selection/reduction")
-    parser.add_argument("--blackbox-interactions", action=argparse.BooleanOptionalAction, default=True,
-                        help="Enable or disable blackbox interaction discovery")
-    parser.add_argument("--blackbox-ablation", action="store_true",
-                        help="Run an additional all-features baseline alongside reduced search")
+    parser.add_argument(
+        "--track",
+        type=int,
+        choices=[1, 2],
+        default=None,
+        help="Run specific track only (1=black-box, 2=ground-truth)",
+    )
+    parser.add_argument(
+        "--max-datasets",
+        type=int,
+        default=None,
+        help="Limit number of datasets (for quick testing)",
+    )
+    parser.add_argument(
+        "--n-samples", type=int, default=500, help="Number of data points per problem"
+    )
+    parser.add_argument(
+        "--pop-size", type=int, default=100, help="C++ evolution population size"
+    )
+    parser.add_argument(
+        "--gens", type=int, default=1000, help="C++ evolution generations"
+    )
+    parser.add_argument(
+        "--num-islands", type=int, default=8, help="Number of C++ evolution islands"
+    )
+    parser.add_argument(
+        "--migration-interval",
+        type=int,
+        default=25,
+        help="Generations between island migrations",
+    )
+    parser.add_argument(
+        "--migration-size",
+        type=int,
+        default=2,
+        help="Individuals migrated between islands",
+    )
+    parser.add_argument(
+        "--multi-start-runs",
+        type=int,
+        default=1,
+        help="Internal C++ restarts per seed; keep at 1 when using multi-seed SRBench runs",
+    )
+    parser.add_argument(
+        "--enable-residual-stage",
+        action="store_true",
+        help="Enable expensive residual symbolic stage during SRBench runs",
+    )
+    parser.add_argument(
+        "--specialist-full",
+        action="store_true",
+        help="Enable all specialist phases for SRBench, including residual search",
+    )
+    parser.add_argument(
+        "--disable-specialist",
+        action="store_true",
+        help="Disable specialist screening/composition diagnostics for SRBench ablation runs",
+    )
+    parser.add_argument(
+        "--classifier-model",
+        type=str,
+        default="models/curve_classifier_multi.pt",
+        help="Classifier model path",
+    )
+    parser.add_argument(
+        "--proposer-model",
+        type=str,
+        default="models/universal_proposer_multi.pt",
+        help="Universal proposer model path",
+    )
+    parser.add_argument(
+        "--no-fast-path", action="store_true", help="Disable fast-path discovery"
+    )
+    parser.add_argument(
+        "--no-guided-evolution", action="store_true", help="Disable guided evolution"
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="results/srbench",
+        help="Output directory for results JSON",
+    )
+    parser.add_argument(
+        "--quiet", action="store_true", help="Suppress per-dataset output"
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=60,
+        help="Max seconds per problem (default: 60s for PMLB)",
+    )
+    parser.add_argument(
+        "--no-hard-timeout",
+        action="store_true",
+        help="Disable process-level hard timeout enforcement",
+    )
+    parser.add_argument(
+        "--no-adaptive-timeout",
+        action="store_true",
+        help="Disable adaptive timeout scaling (now enabled by default)",
+    )
+    parser.add_argument(
+        "--post-simplify",
+        action="store_true",
+        help="Post-simplify formulas with a fidelity guard",
+    )
+    parser.add_argument(
+        "--skip-evolution-if-bloated",
+        action="store_true",
+        help="Skip C++ evolution if fast-path formula exceeds 20 terms",
+    )
+    parser.add_argument(
+        "--seeds",
+        type=str,
+        default="42,1337,2027,7,11",
+        help="Comma-separated fixed seeds for reproducible multi-seed protocol",
+    )
+    parser.add_argument(
+        "--runs-per-formula",
+        type=int,
+        default=1,
+        help="Repeat each formula this many times; use 1 for smoke tests",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Optional local PMLB checkout for official-style symbolic dataset discovery",
+    )
+    parser.add_argument(
+        "--official",
+        action="store_true",
+        help="Prefer official SRBench-like dataset discovery when available",
+    )
+    parser.add_argument(
+        "--acceptable-r2",
+        type=float,
+        default=0.9,
+        help="R2 threshold for acceptable discovery metric",
+    )
+    parser.add_argument(
+        "--complexity-cap",
+        type=int,
+        default=20,
+        help="Complexity cap (model size) for acceptable discovery metric",
+    )
+    parser.add_argument(
+        "--blackbox-max-features",
+        type=int,
+        default=6,
+        help="Max selected features used by the reduced search path",
+    )
+    parser.add_argument(
+        "--blackbox-mode",
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Blackbox preprocessing mode for Track 1 runs",
+    )
+    parser.add_argument(
+        "--no-blackbox-feature-selection",
+        action="store_true",
+        help="Disable blackbox feature selection/reduction",
+    )
+    parser.add_argument(
+        "--blackbox-interactions",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable or disable blackbox interaction discovery",
+    )
+    parser.add_argument(
+        "--blackbox-ablation",
+        action="store_true",
+        help="Run an additional all-features baseline alongside reduced search",
+    )
     args = parser.parse_args()
     if args.specialist_full and args.disable_specialist:
         print("Error: --specialist-full conflicts with --disable-specialist.")
@@ -1192,7 +1573,7 @@ def main():
         blackbox_interaction_search=bool(args.blackbox_interactions),
     )
 
-    print(f"\n  Glassbox SRBench Benchmark")
+    print("\n  Glassbox SRBench Benchmark")
     print(
         f"  Population: {effective_pop_size} total "
         f"({args.pop_size}/island)  |  Generations: {args.gens}"
@@ -1225,7 +1606,9 @@ def main():
         if specialist_phase_config["enabled"]
         else "  Specialist phases: disabled"
     )
-    print(f"  Acceptable criteria: R2>={args.acceptable_r2:.2f}, size<={args.complexity_cap}")
+    print(
+        f"  Acceptable criteria: R2>={args.acceptable_r2:.2f}, size<={args.complexity_cap}"
+    )
     print(
         f"  Blackbox mode: {args.blackbox_mode}  |  "
         f"feature selection: {not args.no_blackbox_feature_selection}  |  "
@@ -1233,12 +1616,20 @@ def main():
         f"max features: {args.blackbox_max_features}"
     )
 
-    blackbox_datasets = get_official_pmlb_regression_datasets() if args.official else list(PMLB_DATASETS)
-    discovered_gt = discover_official_ground_truth_problems(args.data_dir) if args.data_dir else []
+    blackbox_datasets = (
+        get_official_pmlb_regression_datasets()
+        if args.official
+        else list(PMLB_DATASETS)
+    )
+    discovered_gt = (
+        discover_official_ground_truth_problems(args.data_dir) if args.data_dir else []
+    )
     if discovered_gt:
         print(f"  Discovered official-style symbolic datasets: {len(discovered_gt)}")
     elif args.official:
-        print("  Official symbolic dataset checkout not found; using built-in ground-truth smoke suite.")
+        print(
+            "  Official symbolic dataset checkout not found; using built-in ground-truth smoke suite."
+        )
 
     track1_results = []
     track2_results = []
@@ -1248,7 +1639,8 @@ def main():
     if args.track is None or args.track == 2:
         track2_source = discovered_gt if discovered_gt else GROUND_TRUTH_PROBLEMS
         track2_results = run_track2_ground_truth(
-            est, track2_source,
+            est,
+            track2_source,
             max_problems=args.max_datasets,
             n_samples=args.n_samples,
             seeds=seeds,
@@ -1264,7 +1656,8 @@ def main():
 
     if args.track is None or args.track == 1:
         track1_results = run_track1_blackbox(
-            est, blackbox_datasets,
+            est,
+            blackbox_datasets,
             max_datasets=args.max_datasets,
             n_samples=args.n_samples,
             seeds=seeds,

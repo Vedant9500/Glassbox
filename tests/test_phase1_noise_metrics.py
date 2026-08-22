@@ -1,4 +1,5 @@
 """Phase 1: noise & metric contracts (N3, N4, N6, S1-6, S5-9)."""
+
 import sys
 from pathlib import Path
 
@@ -52,7 +53,10 @@ def test_n3_clean_multifeature_no_soft_force():
     applied = getattr(est, "_blackbox_noise_robust_applied_", {}) or {}
     # Must not activate soft-MAD solely because blackbox retained all features.
     if applied.get("reason") == "soft_mad_weights":
-        assert applied.get("active") is not True or float(applied.get("outlier_fraction_target") or 0) >= 0.02
+        assert (
+            applied.get("active") is not True
+            or float(applied.get("outlier_fraction_target") or 0) >= 0.02
+        )
     assert not (
         applied.get("active")
         and applied.get("reason") == "soft_mad_weights"
@@ -117,6 +121,7 @@ def test_n6_display_mse_local_no_scripts(monkeypatch):
 
     # Poison scripts path: import failure must not force robust fallback.
     import builtins
+
     real_import = builtins.__import__
 
     def _block_scripts(name, *args, **kwargs):
@@ -199,7 +204,9 @@ def test_s5_9_elastic_net_respects_sample_weights():
     w_down[0] = 1e-6
 
     w_u, mse_u = _core.iterative_elastic_net(X, y, 0.01, 0.001, 3, 3, 0.05, 1000)
-    w_w, mse_w = _core.iterative_elastic_net(X, y, 0.01, 0.001, 3, 3, 0.05, 1000, w_down)
+    w_w, mse_w = _core.iterative_elastic_net(
+        X, y, 0.01, 0.001, 3, 3, 0.05, 1000, w_down
+    )
 
     # Coefficient on x1 (index 1) should be closer to 2 under downweighting.
     assert abs(float(w_w[1]) - 2.0) < abs(float(w_u[1]) - 2.0) + 0.25

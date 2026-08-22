@@ -1,4 +1,5 @@
 """Phase 2: evolution search reliability (E3, E5, E7, E10)."""
+
 import sys
 from pathlib import Path
 
@@ -55,8 +56,18 @@ def test_e3_many_seeds_accepted_under_islands():
     x = np.linspace(-1.5, 1.5, 60).astype(np.float64)
     y = (np.sin(x) + 0.1 * x).astype(np.float64)
     formulas = [
-        "sin(x0)", "x0", "x0**2", "cos(x0)", "exp(x0)", "x0**3",
-        "sin(2*x0)", "x0 + 1", "2*x0", "x0**2 + x0", "sin(x0) + x0", "cos(x0) + x0",
+        "sin(x0)",
+        "x0",
+        "x0**2",
+        "cos(x0)",
+        "exp(x0)",
+        "x0**3",
+        "sin(2*x0)",
+        "x0 + 1",
+        "2*x0",
+        "x0**2 + x0",
+        "sin(x0) + x0",
+        "cos(x0) + x0",
     ]
     seeds = []
     for f in formulas:
@@ -133,7 +144,7 @@ def test_e7_island_thread_budgets_reported():
 @requires_cpp
 def test_e10_arithmetic_temperature_restore_after_scoring():
     x = np.linspace(-1, 1, 40).astype(np.float64)
-    y = (x ** 2).astype(np.float64)
+    y = (x**2).astype(np.float64)
     if hasattr(_core, "score_formula_candidates"):
         try:
             _core.score_formula_candidates(["x0**2", "x0"], [x], y)

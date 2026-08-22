@@ -3,10 +3,11 @@
 Converts a C++ evolution result dict into a live torch.nn.Module for use
 inside PyTorch pipelines (training, export, ONNX, etc.).
 """
+
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from glassbox.sr.cpp import graph_enums as _ge
 
@@ -56,12 +57,8 @@ class CppGraphModule(nn.Module):
         weights = cpp_result["output_weights"]
         bias = cpp_result["output_bias"]
 
-        self.output_weights = nn.Parameter(
-            torch.tensor(weights, dtype=torch.float64)
-        )
-        self.output_bias = nn.Parameter(
-            torch.tensor(bias, dtype=torch.float64)
-        )
+        self.output_weights = nn.Parameter(torch.tensor(weights, dtype=torch.float64))
+        self.output_bias = nn.Parameter(torch.tensor(bias, dtype=torch.float64))
 
         for i, node in enumerate(self.nodes):
             ntype = node["type"]
@@ -179,13 +176,9 @@ class CppGraphModule(nn.Module):
                     out = torch.clamp(child.pow(n), -1e8, 1e8)
                 elif unary_op == self.UNARY_EXP:
                     # eval.h clamps *output* of exp to +/- 1e6 (not arg to +/-20).
-                    out = torch.clamp(
-                        torch.exp(omega * child + phi), -1e6, 1e6
-                    )
+                    out = torch.clamp(torch.exp(omega * child + phi), -1e6, 1e6)
                 elif unary_op == self.UNARY_LOG:
-                    out = torch.clamp(
-                        torch.log(torch.abs(child) + 1e-6), -1e6, 1e6
-                    )
+                    out = torch.clamp(torch.log(torch.abs(child) + 1e-6), -1e6, 1e6)
                 elif unary_op == self.UNARY_ABS:
                     out = torch.abs(child)
                 else:
@@ -228,9 +221,7 @@ class CppGraphModule(nn.Module):
                     out = torch.clamp(out, -1e6, 1e6)
                 elif binary_op == self.BINARY_DIVISION:
                     out = (
-                        left_val
-                        / (torch.abs(right_val) + 1e-6)
-                        * torch.sign(right_val)
+                        left_val / (torch.abs(right_val) + 1e-6) * torch.sign(right_val)
                     )
                     out = torch.clamp(out, -1e6, 1e6)
                 elif binary_op == self.BINARY_AGGREGATION:

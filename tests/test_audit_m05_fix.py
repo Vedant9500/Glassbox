@@ -1,7 +1,5 @@
-import math
-import torch
-import torch.nn.functional as F
 import pytest
+import torch
 
 from glassbox.sr.hard_concrete import hard_concrete_log_prob
 

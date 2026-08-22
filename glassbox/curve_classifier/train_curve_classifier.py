@@ -8,16 +8,15 @@ Usage:
     python scripts/train_curve_classifier.py --data data/curve_dataset_10k.npz --epochs 50
 """
 
+import argparse
+import sys
+from pathlib import Path
+
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 from torch.utils.data import DataLoader, Dataset
-import argparse
-from pathlib import Path
-from tqdm import tqdm
-from typing import Tuple, Optional, List, Dict
-import sys
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
@@ -28,113 +27,119 @@ if str(_REPO_ROOT) not in sys.path:
 # MODEL ARCHITECTURES
 # =============================================================================
 
+
 class CurveClassifierMLP(nn.Module):
     """Deep MLP classifier for curve features."""
-    
+
     def __init__(self, n_features: int = 398, n_classes: int = 9, hidden: int = 512):
         super().__init__()
-        
+
         eql_out_dim = 256
         self.eql = EQLLayer(in_features=n_features, out_features=eql_out_dim)
-        
+
         layers = []
         combined_dim = n_features + eql_out_dim
-        
-        layers.extend([
-            nn.Linear(combined_dim, hidden),
-            nn.BatchNorm1d(hidden),
-            nn.ReLU(),
-            nn.Dropout(0.2)
-        ])
-        
-        for _ in range(6):
-            layers.extend([
-                nn.Linear(hidden, hidden),
+
+        layers.extend(
+            [
+                nn.Linear(combined_dim, hidden),
                 nn.BatchNorm1d(hidden),
                 nn.ReLU(),
-                nn.Dropout(0.2)
-            ])
-            
-        layers.extend([
-            nn.Linear(hidden, hidden // 2),
-            nn.BatchNorm1d(hidden // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden // 2, n_classes)
-        ])
-        
+                nn.Dropout(0.2),
+            ]
+        )
+
+        for _ in range(6):
+            layers.extend(
+                [
+                    nn.Linear(hidden, hidden),
+                    nn.BatchNorm1d(hidden),
+                    nn.ReLU(),
+                    nn.Dropout(0.2),
+                ]
+            )
+
+        layers.extend(
+            [
+                nn.Linear(hidden, hidden // 2),
+                nn.BatchNorm1d(hidden // 2),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden // 2, n_classes),
+            ]
+        )
+
         self.net = nn.Sequential(*layers)
         self._init_weights()
-    
+
     def _init_weights(self):
         """Initialize weights using Kaiming initialization."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-    
+
     def forward(self, x):
         eql_feats = self.eql(x)
         combined = torch.cat([x, eql_feats], dim=1)
         return self.net(combined)
 
+
 class CurveClassifierCNN(nn.Module):
     """1D CNN that operates on the raw curve portion of features."""
-    
+
     def __init__(self, n_classes: int = 9, n_features: int = 398, curve_dim: int = 128):
         super().__init__()
-        
+
         self.curve_dim = min(curve_dim, n_features)
-        
+
         self.conv = nn.Sequential(
             nn.Conv1d(1, 32, kernel_size=7, padding=3),
             nn.ReLU(),
             nn.MaxPool1d(2),
-            
             nn.Conv1d(32, 64, kernel_size=5, padding=2),
             nn.ReLU(),
             nn.MaxPool1d(2),
-            
             nn.Conv1d(64, 128, kernel_size=3, padding=1),
             nn.ReLU(),
             nn.AdaptiveAvgPool1d(4),
         )
-        
+
         other_dim = max(1, n_features - self.curve_dim)
         self.other_mlp = nn.Sequential(
             nn.Linear(other_dim, 128),
             nn.ReLU(),
             nn.Dropout(0.3),
         )
-        
+
         self.classifier = nn.Sequential(
             nn.Linear(128 * 4 + 128, 256),
             nn.ReLU(),
             nn.Dropout(0.3),
             nn.Linear(256, n_classes),
         )
-        
+
         self._init_weights()
-    
+
     def _init_weights(self):
         """Initialize weights using Kaiming initialization."""
         for m in self.modules():
             if isinstance(m, (nn.Linear, nn.Conv1d)):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
-    
+
     def forward(self, x):
-        raw_curve = x[:, :self.curve_dim]
-        other_features = x[:, self.curve_dim:]
-        
+        raw_curve = x[:, : self.curve_dim]
+        other_features = x[:, self.curve_dim :]
+
         raw_curve = raw_curve.unsqueeze(1)
         conv_out = self.conv(raw_curve)
         conv_out = conv_out.flatten(1)
-        
+
         other_out = self.other_mlp(other_features)
-        
+
         combined = torch.cat([conv_out, other_out], dim=1)
         return self.classifier(combined)
 
@@ -144,10 +149,11 @@ class SemanticFeatureAttention(nn.Module):
     Semantic Attention that treats each feature group as a distinct token.
     Allows the model to attend across different modalities (FFT, derivatives, stats, etc.).
     """
+
     def __init__(self, embed_dim: int = 128):
         super().__init__()
         self.embed_dim = embed_dim
-        
+
         # Project each semantic group independently
         self.proj_raw = nn.Linear(128, embed_dim)
         self.proj_fft = nn.Linear(32, embed_dim)
@@ -156,38 +162,42 @@ class SemanticFeatureAttention(nn.Module):
         self.proj_stats = nn.Linear(9, embed_dim)
         self.proj_curv = nn.Linear(37, embed_dim)
         self.proj_invars = nn.Linear(32, embed_dim)
-        
+
         # 7 feature tokens + 1 CLS token
-        self.n_tokens = 8 
+        self.n_tokens = 8
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        
+
         # Token type embeddings (tells attention which modality is which)
-        self.token_type_embed = nn.Parameter(torch.randn(1, self.n_tokens, embed_dim) * 0.02)
-        
-        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=4, batch_first=True)
+        self.token_type_embed = nn.Parameter(
+            torch.randn(1, self.n_tokens, embed_dim) * 0.02
+        )
+
+        self.attention = nn.MultiheadAttention(
+            embed_dim=embed_dim, num_heads=4, batch_first=True
+        )
         self.norm1 = nn.LayerNorm(embed_dim)
         self.norm2 = nn.LayerNorm(embed_dim)
         self.ffn = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 4),
             nn.GELU(),
             nn.Dropout(0.1),
-            nn.Linear(embed_dim * 4, embed_dim)
+            nn.Linear(embed_dim * 4, embed_dim),
         )
         self.dropout = nn.Dropout(0.1)
-        
+
         self._init_weights()
-        
+
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
         nn.init.normal_(self.cls_token, std=0.02)
 
     def forward(self, x):
         b = x.size(0)
-        
+
         # Slice based on FEATURE_SCHEMA from generate_curve_data.py
         # Fallbacks added in case feature dimension doesn't perfectly match
         raw = x[:, 0:128]
@@ -196,13 +206,13 @@ class SemanticFeatureAttention(nn.Module):
         deriv = x[:, 192:320]
         stats = x[:, 320:329]
         curv = x[:, 329:366]
-        
+
         # Handle cases where feature dimension might be slightly different
         if x.shape[1] > 366:
             invars = x[:, 366:398]
         else:
             invars = torch.zeros(b, 32, device=x.device, dtype=x.dtype)
-            
+
         # Create tokens
         t_raw = self.proj_raw(raw).unsqueeze(1)
         t_fft = self.proj_fft(fft).unsqueeze(1)
@@ -211,25 +221,26 @@ class SemanticFeatureAttention(nn.Module):
         t_stats = self.proj_stats(stats).unsqueeze(1)
         t_curv = self.proj_curv(curv).unsqueeze(1)
         t_invars = self.proj_invars(invars).unsqueeze(1)
-        
+
         cls_tokens = self.cls_token.expand(b, -1, -1)
-        
+
         # Sequence of 8 tokens
-        tokens = torch.cat([
-            cls_tokens, t_raw, t_fft, t_fft_phase, t_deriv, t_stats, t_curv, t_invars
-        ], dim=1)
-        
+        tokens = torch.cat(
+            [cls_tokens, t_raw, t_fft, t_fft_phase, t_deriv, t_stats, t_curv, t_invars],
+            dim=1,
+        )
+
         tokens = tokens + self.token_type_embed
         tokens = self.dropout(tokens)
-        
+
         # Attention
         attn_out, _ = self.attention(tokens, tokens, tokens)
         tokens = self.norm1(tokens + attn_out)
-        
+
         # FFN
         ffn_out = self.ffn(tokens)
         tokens = self.norm2(tokens + ffn_out)
-        
+
         # Flatten all tokens to maintain the 1024-dim output expected
         return tokens.flatten(1)
 
@@ -237,34 +248,39 @@ class SemanticFeatureAttention(nn.Module):
 class EQLLayer(nn.Module):
     """
     Equation Learner (EQL) Layer.
-    Applies explicit mathematical transformations to the input to act as a 
+    Applies explicit mathematical transformations to the input to act as a
     'cheat sheet' for the network to detect mathematical operators.
     """
+
     def __init__(self, in_features: int, out_features: int):
         super().__init__()
-        
+
         # 6 explicit mathematical functions
         self.n_funcs = 6
         self.features_per_func = out_features // self.n_funcs
         self.rem_features = out_features % self.n_funcs
-        
+
         # Project input features to the space where functions will be applied
         self.linear = nn.Linear(in_features, out_features)
-        
+
         # Initialize weights to be small to prevent extreme values going into exp/log early on
         nn.init.xavier_normal_(self.linear.weight, gain=0.1)
         nn.init.zeros_(self.linear.bias)
 
     def forward(self, x):
         z = self.linear(x)
-        
+
         out = []
         start_idx = 0
-        
+
         for i in range(self.n_funcs):
-            end_idx = start_idx + self.features_per_func + (self.rem_features if i == 0 else 0)
+            end_idx = (
+                start_idx
+                + self.features_per_func
+                + (self.rem_features if i == 0 else 0)
+            )
             chunk = z[:, start_idx:end_idx]
-            
+
             if i == 0:
                 # Identity
                 out.append(chunk)
@@ -283,9 +299,9 @@ class EQLLayer(nn.Module):
             elif i == 5:
                 # Square
                 out.append(torch.square(chunk))
-                
+
             start_idx = end_idx
-            
+
         return torch.cat(out, dim=1)
 
 
@@ -294,34 +310,35 @@ class CurveClassifierGLU(nn.Module):
     First-Principles Mathematical Classifier using Gated Linear Units (GLU).
     Mathematically models multiplicative function composition (e.g. x * sin(x)) natively.
     """
+
     def __init__(self, n_features: int = 398, n_classes: int = 9, hidden: int = 512):
         super().__init__()
-        
+
         # 1. Semantic Feature Attention
         n_tokens = 8
         embed_dim = 128
         self.attn = SemanticFeatureAttention(embed_dim=embed_dim)
         attn_out_dim = n_tokens * embed_dim
-        
+
         # 2. EQL Layer
         eql_out_dim = 256
         self.eql = EQLLayer(in_features=n_features, out_features=eql_out_dim)
-        
+
         # 3. Combine outputs
         combined_dim = attn_out_dim + eql_out_dim
-        
+
         self.fc1 = nn.Linear(combined_dim, hidden * 2)
         self.bn1 = nn.BatchNorm1d(hidden * 2)
-        
+
         self.fc2 = nn.Linear(hidden, hidden * 2)
         self.bn2 = nn.BatchNorm1d(hidden * 2)
-        
+
         self.fc3 = nn.Linear(hidden, hidden * 2)
         self.bn3 = nn.BatchNorm1d(hidden * 2)
-        
+
         self.fc4 = nn.Linear(hidden, hidden * 2)
         self.bn4 = nn.BatchNorm1d(hidden * 2)
-        
+
         self.classifier = nn.Linear(hidden, n_classes)
         self.dropout = nn.Dropout(0.2)
 
@@ -334,48 +351,67 @@ class CurveClassifierGLU(nn.Module):
                 nn.init.xavier_normal_(m.weight)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.1)
-                    
+
     def forward(self, x):
         # Extract abstract semantic tokens
         attn_features = self.attn(x)
-        
+
         # Extract explicit mathematical transformations
         eql_features = self.eql(x)
-        
+
         # Combine
         x = torch.cat([attn_features, eql_features], dim=1)
-        
+
         x = self.fc1(x)
         x = self.bn1(x)
         x = F.glu(x, dim=1)
         x = self.dropout(x)
-        
+
         x = self.fc2(x)
         x = self.bn2(x)
         x = F.glu(x, dim=1)
         x = self.dropout(x)
-        
+
         x = self.fc3(x)
         x = self.bn3(x)
         x = F.glu(x, dim=1)
         x = self.dropout(x)
-        
+
         x = self.fc4(x)
         x = self.bn4(x)
         x = F.glu(x, dim=1)
         x = self.dropout(x)
-        
+
         return self.classifier(x)
 
 
 try:
     from .models import (
         CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
+    )
+    from .models import (
         CurveClassifierCNN as CurveClassifierCNN,
+    )
+    from .models import (
         CurveClassifierGLU as CurveClassifierGLU,
+    )
+    from .models import (
         CurveClassifierMLP as CurveClassifierMLP,
+    )
+    from .models import (
         EQLLayer as EQLLayer,
+    )
+    from .models import (
         SemanticFeatureAttention as SemanticFeatureAttention,
+    )
+    from .rollout import (
+        build_checkpoint_card,
+        build_rollout_comparison,
+        default_checkpoint_card_path,
+        default_rollout_comparison_path,
+        load_json_report,
+        write_checkpoint_card,
+        write_rollout_comparison,
     )
     from .validation import (
         build_validation_report,
@@ -387,7 +423,26 @@ try:
         row_train_val_split,
         write_validation_report,
     )
-    from .rollout import (
+except (ImportError, ValueError):
+    from glassbox.curve_classifier.models import (
+        CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
+    )
+    from glassbox.curve_classifier.models import (
+        CurveClassifierCNN as CurveClassifierCNN,
+    )
+    from glassbox.curve_classifier.models import (
+        CurveClassifierGLU as CurveClassifierGLU,
+    )
+    from glassbox.curve_classifier.models import (
+        CurveClassifierMLP as CurveClassifierMLP,
+    )
+    from glassbox.curve_classifier.models import (
+        EQLLayer as EQLLayer,
+    )
+    from glassbox.curve_classifier.models import (
+        SemanticFeatureAttention as SemanticFeatureAttention,
+    )
+    from glassbox.curve_classifier.rollout import (
         build_checkpoint_card,
         build_rollout_comparison,
         default_checkpoint_card_path,
@@ -395,15 +450,6 @@ try:
         load_json_report,
         write_checkpoint_card,
         write_rollout_comparison,
-    )
-except (ImportError, ValueError):
-    from glassbox.curve_classifier.models import (
-        CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
-        CurveClassifierCNN as CurveClassifierCNN,
-        CurveClassifierGLU as CurveClassifierGLU,
-        CurveClassifierMLP as CurveClassifierMLP,
-        EQLLayer as EQLLayer,
-        SemanticFeatureAttention as SemanticFeatureAttention,
     )
     from glassbox.curve_classifier.validation import (
         build_validation_report,
@@ -414,15 +460,6 @@ except (ImportError, ValueError):
         multilabel_metrics_by_group,
         row_train_val_split,
         write_validation_report,
-    )
-    from glassbox.curve_classifier.rollout import (
-        build_checkpoint_card,
-        build_rollout_comparison,
-        default_checkpoint_card_path,
-        default_rollout_comparison_path,
-        load_json_report,
-        write_checkpoint_card,
-        write_rollout_comparison,
     )
 
 
@@ -436,8 +473,8 @@ class IndexedFeatureDataset(Dataset):
         features: np.ndarray | torch.Tensor,
         labels: np.ndarray | torch.Tensor,
         indices: np.ndarray,
-        scaler: Optional[dict] = None,
-        device: Optional[torch.device] = None,
+        scaler: dict | None = None,
+        device: torch.device | None = None,
     ):
         self.indices = np.asarray(indices, dtype=np.int64)
         self.scaler = scaler
@@ -445,15 +482,19 @@ class IndexedFeatureDataset(Dataset):
         # Determine if data is already on target device
         self.is_on_device = False
 
-        if device is not None and device.type == 'cuda':
+        if device is not None and device.type == "cuda":
             print(f"Transferring dataset split to {device}...")
             # We slice the required features/labels first to save memory before moving to GPU
             x_sliced = np.asarray(features[self.indices], dtype=np.float32)
 
             # Apply SymLog compression selectively to non-raw/fft features
-            x_sliced[:, 192:398] = np.sign(x_sliced[:, 192:398]) * np.log1p(np.abs(x_sliced[:, 192:398]))
+            x_sliced[:, 192:398] = np.sign(x_sliced[:, 192:398]) * np.log1p(
+                np.abs(x_sliced[:, 192:398])
+            )
             if self.scaler is not None:
-                x_sliced = (x_sliced - self.scaler['mean']) / (self.scaler['std'] + 1e-8)
+                x_sliced = (x_sliced - self.scaler["mean"]) / (
+                    self.scaler["std"] + 1e-8
+                )
             y_sliced = np.asarray(labels[self.indices], dtype=np.float32)
 
             # Store directly as tensors on device. Reset indices mapping since we sliced.
@@ -486,7 +527,7 @@ class IndexedFeatureDataset(Dataset):
         x[192:398] = np.sign(x[192:398]) * np.log1p(np.abs(x[192:398]))
 
         if self.scaler is not None:
-            x = (x - self.scaler['mean']) / (self.scaler['std'] + 1e-8)
+            x = (x - self.scaler["mean"]) / (self.scaler["std"] + 1e-8)
         y = np.asarray(self.labels[sample_idx], dtype=np.float32)
         return torch.from_numpy(x), torch.from_numpy(y)
 
@@ -495,7 +536,7 @@ def compute_feature_stats(
     features: np.ndarray,
     indices: np.ndarray,
     chunk_size: int = 65536,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Compute feature mean/std on selected rows without full subset materialization."""
     indices = np.asarray(indices, dtype=np.int64)
     if len(indices) == 0:
@@ -507,11 +548,13 @@ def compute_feature_stats(
     sum_x2 = np.zeros(n_features, dtype=np.float64)
 
     for start in range(0, len(indices), chunk_size):
-        batch_idx = indices[start:start + chunk_size]
+        batch_idx = indices[start : start + chunk_size]
         batch = np.asarray(features[batch_idx], dtype=np.float64)
 
         # Apply SymLog compression selectively to non-raw/fft features
-        batch[:, 192:398] = np.sign(batch[:, 192:398]) * np.log1p(np.abs(batch[:, 192:398]))
+        batch[:, 192:398] = np.sign(batch[:, 192:398]) * np.log1p(
+            np.abs(batch[:, 192:398])
+        )
 
         sum_x += batch.sum(axis=0)
         sum_x2 += np.square(batch).sum(axis=0)
@@ -522,70 +565,79 @@ def compute_feature_stats(
     var = np.maximum(var, 0.0)
     std = np.sqrt(var) + 1e-8
     return mean.astype(np.float32), std.astype(np.float32)
+
+
 # =============================================================================
 # TRAINING
 # =============================================================================
 
-def train_epoch(model, dataloader, optimizer, criterion, device, scaler, max_grad_norm: float = 1.0):
+
+def train_epoch(
+    model, dataloader, optimizer, criterion, device, scaler, max_grad_norm: float = 1.0
+):
     """Train for one epoch with gradient clipping and AMP scaling."""
     model.train()
-    
+
     # Fast-path for VRAM-resident datasets (Bypasses Python DataLoader overhead)
     ds = dataloader.dataset
-    if hasattr(ds, "is_on_device") and ds.is_on_device and device.type == 'cuda':
+    if hasattr(ds, "is_on_device") and ds.is_on_device and device.type == "cuda":
         total_loss = torch.zeros(1, device=device)
         n_samples = len(ds)
         batch_size = dataloader.batch_size
-        
+
         # Fast GPU-side shuffle
         indices = torch.randperm(n_samples, device=device)
-        
+
         for start_idx in range(0, n_samples, batch_size):
             end_idx = min(start_idx + batch_size, n_samples)
             batch_idx = indices[start_idx:end_idx]
-            
+
             x_batch = ds.features[batch_idx]
             y_batch = ds.labels[batch_idx]
-            
+
             optimizer.zero_grad(set_to_none=True)
-            
+
             # Use AMP if scaler is present
             if scaler is not None:
-                with torch.amp.autocast('cuda'):
+                with torch.amp.autocast("cuda"):
                     logits = model(x_batch)
                     loss = criterion(logits, y_batch)
-                
+
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=max_grad_norm
+                )
                 scaler.step(optimizer)
                 scaler.update()
             else:
                 logits = model(x_batch)
                 loss = criterion(logits, y_batch)
-                
+
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), max_norm=max_grad_norm
+                )
                 optimizer.step()
-            
+
             total_loss += loss.detach() * (end_idx - start_idx)
-            
+
         return float((total_loss / max(n_samples, 1)).item())
 
     # Standard path for RAM/Disk loaded datasets
     total_loss = torch.zeros(1, device=device)
     n_batches = 0
-    
+
     for x_batch, y_batch in dataloader:
         x_batch = x_batch.to(device, non_blocking=True)
         y_batch = y_batch.to(device, non_blocking=True)
-        
+
         optimizer.zero_grad(set_to_none=True)
-        
+
         # No AMP - Use FP32
         if True:
             logits = model(x_batch)
-            loss = criterion(logits, y_batch)            
+            loss = criterion(logits, y_batch)
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -596,11 +648,11 @@ def train_epoch(model, dataloader, optimizer, criterion, device, scaler, max_gra
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
             optimizer.step()
-        
+
         # Accumulate without .item() to keep the CPU/GPU working in parallel
         total_loss += loss.detach()
         n_batches += 1
-    
+
     return float((total_loss / max(n_batches, 1)).item())
 
 
@@ -619,26 +671,26 @@ def evaluate(
     all_preds = []
     all_labels = []
     all_logits = []
-    
+
     ds = dataloader.dataset
-    if hasattr(ds, "is_on_device") and ds.is_on_device and device.type == 'cuda':
+    if hasattr(ds, "is_on_device") and ds.is_on_device and device.type == "cuda":
         total_loss = 0.0
         n_samples = len(ds)
         batch_size = dataloader.batch_size
-        
+
         with torch.no_grad():
             for start_idx in range(0, n_samples, batch_size):
                 end_idx = min(start_idx + batch_size, n_samples)
-                
+
                 x_batch = ds.features[start_idx:end_idx]
                 y_batch = ds.labels[start_idx:end_idx]
-                
+
                 # No AMP - Use FP32
                 logits = model(x_batch)
                 loss = criterion(logits, y_batch)
-                    
+
                 total_loss += loss.item() * (end_idx - start_idx)
-                
+
                 if temperature is None:
                     preds = torch.sigmoid(logits)
                 else:
@@ -648,24 +700,24 @@ def evaluate(
                 all_labels.append(y_batch.cpu())
                 if return_logits:
                     all_logits.append(logits.cpu())
-                    
+
         avg_loss = total_loss / max(n_samples, 1)
     else:
         total_loss = 0.0
         total_samples = 0
-        
+
         with torch.no_grad():
             for x_batch, y_batch in dataloader:
                 x_batch = x_batch.to(device, non_blocking=True)
                 y_batch = y_batch.to(device, non_blocking=True)
-                
+
                 # No AMP - Use FP32
                 if True:
                     logits = model(x_batch)
-                    loss = criterion(logits, y_batch)                    
+                    loss = criterion(logits, y_batch)
                 total_loss += loss.item() * x_batch.shape[0]
                 total_samples += x_batch.shape[0]
-                
+
                 if temperature is None:
                     preds = torch.sigmoid(logits)
                 else:
@@ -675,26 +727,30 @@ def evaluate(
                 all_labels.append(y_batch.cpu())
                 if return_logits:
                     all_logits.append(logits.cpu())
-                    
+
         avg_loss = total_loss / max(total_samples, 1)
-    
+
     all_preds = torch.cat(all_preds)
     all_labels = torch.cat(all_labels)
-    
+
     # Per-class accuracy (threshold = 0.5 or tuned thresholds)
     if thresholds is None:
         binary_preds = (all_preds > 0.5).float()
     else:
-        thresholds_cpu = thresholds.detach().cpu() if isinstance(thresholds, torch.Tensor) else torch.as_tensor(thresholds)
+        thresholds_cpu = (
+            thresholds.detach().cpu()
+            if isinstance(thresholds, torch.Tensor)
+            else torch.as_tensor(thresholds)
+        )
         binary_preds = (all_preds > thresholds_cpu).float()
-    per_class_acc = ((binary_preds == all_labels).float().mean(dim=0))
+    per_class_acc = (binary_preds == all_labels).float().mean(dim=0)
     overall_acc = (binary_preds == all_labels).float().mean()
-    
+
     # F1 score per class
     tp = ((binary_preds == 1) & (all_labels == 1)).float().sum(dim=0)
     fp = ((binary_preds == 1) & (all_labels == 0)).float().sum(dim=0)
     fn = ((binary_preds == 0) & (all_labels == 1)).float().sum(dim=0)
-    
+
     precision = tp / (tp + fp + 1e-10)
     recall = tp / (tp + fn + 1e-10)
     f1 = 2 * precision * recall / (precision + recall + 1e-10)
@@ -704,29 +760,30 @@ def evaluate(
     fp_sum = fp.sum()
     fn_sum = fn.sum()
     micro_f1 = (2 * tp_sum) / (2 * tp_sum + fp_sum + fn_sum + 1e-10)
-    
+
     metrics = {
-        'loss': avg_loss,
-        'accuracy': overall_acc.item(),
-        'per_class_acc': per_class_acc.numpy(),
-        'f1_mean': f1.mean().item(),
-        'micro_f1': micro_f1.item(),
-        'precision_per_class': precision.numpy(),
-        'recall_per_class': recall.numpy(),
-        'f1_per_class': f1.numpy(),
+        "loss": avg_loss,
+        "accuracy": overall_acc.item(),
+        "per_class_acc": per_class_acc.numpy(),
+        "f1_mean": f1.mean().item(),
+        "micro_f1": micro_f1.item(),
+        "precision_per_class": precision.numpy(),
+        "recall_per_class": recall.numpy(),
+        "f1_per_class": f1.numpy(),
     }
 
     if return_preds:
-        metrics['preds'] = all_preds
-        metrics['labels'] = all_labels
+        metrics["preds"] = all_preds
+        metrics["labels"] = all_labels
     if return_logits:
-        metrics['logits'] = torch.cat(all_logits)
-
+        metrics["logits"] = torch.cat(all_logits)
 
     return metrics
 
 
-def calibrate_temperature(logits: torch.Tensor, labels: torch.Tensor, max_iter: int = 50) -> float:
+def calibrate_temperature(
+    logits: torch.Tensor, labels: torch.Tensor, max_iter: int = 50
+) -> float:
     """Single-temperature scaling for multi-label logits."""
     device = logits.device
     log_t = torch.zeros(1, device=device, requires_grad=True)
@@ -794,14 +851,16 @@ def calibrate_isotonic_per_class(
             # Using centers avoids edge artifacts from step-bin lookup.
             bin_edges = np.linspace(0.0, 1.0, n_bins + 1)
             bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
-            calibration_maps.append({
-                'boundaries': bin_edges.tolist(),
-                'values': bin_centers.tolist(),
-            })
+            calibration_maps.append(
+                {
+                    "boundaries": bin_edges.tolist(),
+                    "values": bin_centers.tolist(),
+                }
+            )
             continue
 
         # Fit isotonic regression
-        ir = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='clip')
+        ir = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds="clip")
         ir.fit(raw_probs, true_labels)
 
         # Discretize into bins for compact storage in checkpoint
@@ -809,10 +868,12 @@ def calibrate_isotonic_per_class(
         bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2.0
         calibrated_values = ir.predict(bin_centers)
 
-        calibration_maps.append({
-            'boundaries': bin_edges.tolist(),
-            'values': calibrated_values.tolist(),
-        })
+        calibration_maps.append(
+            {
+                "boundaries": bin_edges.tolist(),
+                "values": calibrated_values.tolist(),
+            }
+        )
 
     return calibration_maps
 
@@ -843,8 +904,8 @@ def apply_isotonic_calibration(
 
     for c in range(min(n_classes, len(calibration_maps))):
         cmap = calibration_maps[c]
-        boundaries = np.array(cmap['boundaries'])
-        values = np.array(cmap['values'])
+        boundaries = np.array(cmap["boundaries"])
+        values = np.array(cmap["values"])
         # np.digitize returns index i such that boundaries[i-1] <= x < boundaries[i]
         indices = np.digitize(raw_probs[:, c], boundaries, right=False) - 1
         indices = np.clip(indices, 0, len(values) - 1)
@@ -877,7 +938,12 @@ def tune_thresholds(
             fn = ((preds == 0) & (labels == 1)).float().sum()
             precision = tp / (tp + fp + 1e-10)
             recall = tp / (tp + fn + 1e-10)
-            score = (1.0 + beta_sq) * precision * recall / (beta_sq * precision + recall + 1e-10)
+            score = (
+                (1.0 + beta_sq)
+                * precision
+                * recall
+                / (beta_sq * precision + recall + 1e-10)
+            )
             if score > best_score:
                 best_score = score
                 best_t = float(t)
@@ -886,7 +952,9 @@ def tune_thresholds(
     return thresholds
 
 
-def multilabel_stratified_split(labels: np.ndarray, val_ratio: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+def multilabel_stratified_split(
+    labels: np.ndarray, val_ratio: float, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
     """Approximate multi-label stratified split without external dependencies."""
     rng = np.random.RandomState(seed)
     n_samples = labels.shape[0]
@@ -948,15 +1016,19 @@ def split_validation_calibration(
     labels: np.ndarray,
     calibration_ratio: float,
     seed: int,
-) -> Tuple[np.ndarray, Optional[np.ndarray], Dict[str, object]]:
+) -> tuple[np.ndarray, np.ndarray | None, dict[str, object]]:
     """Split validation rows into report and calibration/threshold rows."""
     val_idx = np.asarray(val_idx, dtype=np.int64)
     calibration_ratio = float(calibration_ratio)
     if calibration_ratio <= 0.0 or len(val_idx) < 4:
-        return val_idx, None, {
-            "calibration_split": False,
-            "reason": "disabled_or_too_small",
-        }
+        return (
+            val_idx,
+            None,
+            {
+                "calibration_split": False,
+                "reason": "disabled_or_too_small",
+            },
+        )
 
     local_train, local_cal = multilabel_stratified_split(
         np.asarray(labels[val_idx], dtype=np.float32),
@@ -965,12 +1037,16 @@ def split_validation_calibration(
     )
     eval_idx = val_idx[local_train]
     cal_idx = val_idx[local_cal]
-    return eval_idx, cal_idx, {
-        "calibration_split": True,
-        "calibration_ratio": calibration_ratio,
-        "eval_rows": int(len(eval_idx)),
-        "calibration_rows": int(len(cal_idx)),
-    }
+    return (
+        eval_idx,
+        cal_idx,
+        {
+            "calibration_split": True,
+            "calibration_ratio": calibration_ratio,
+            "eval_rows": len(eval_idx),
+            "calibration_rows": len(cal_idx),
+        },
+    )
 
 
 def train_model(
@@ -989,9 +1065,9 @@ def train_model(
     tune_thresholds_flag: bool = True,
     threshold_beta: float = 0.5,
     calibrate_flag: bool = False,
-    class_weights: Optional[torch.Tensor] = None,
+    class_weights: torch.Tensor | None = None,
     calibration_loader=None,
-    val_groups: Optional[np.ndarray] = None,
+    val_groups: np.ndarray | None = None,
 ):
     """Full training loop with early stopping."""
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -999,106 +1075,132 @@ def train_model(
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode=scheduler_mode, factor=0.5, patience=5
     )
-    
+
     # Use class weights for imbalanced labels if provided
     if class_weights is not None:
         criterion = nn.BCEWithLogitsLoss(pos_weight=class_weights.to(device))
         print(f"Using class weights: {class_weights.numpy()}")
     else:
         criterion = nn.BCEWithLogitsLoss()
-        
-    scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
-    
-    best_val_loss = float('inf')
+
+    scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
+
+    best_val_loss = float("inf")
     best_val_f1 = -1.0
     best_epoch = 0
     patience_counter = 0
-    
+
     for epoch in range(epochs):
         # Train
         try:
-            train_loss = train_epoch(model, train_loader, optimizer, criterion, device, scaler)
+            train_loss = train_epoch(
+                model, train_loader, optimizer, criterion, device, scaler
+            )
         except Exception as e:
             # Handle lazy compilation failures (common on Windows)
             if "inductor" in str(e).lower() and hasattr(model, "_orig_mod"):
                 print(f"\n[!] torch.compile failed during first forward pass: {e}")
                 print("[!] Falling back to eager mode for the rest of training.")
                 model = model._orig_mod
-                train_loss = train_epoch(model, train_loader, optimizer, criterion, device, scaler)
+                train_loss = train_epoch(
+                    model, train_loader, optimizer, criterion, device, scaler
+                )
             else:
                 raise e
-        
+
         # Evaluate
         val_metrics = evaluate(model, val_loader, criterion, device)
-        
+
         # Scheduler step
-        scheduler_value = val_metrics['f1_mean'] if early_stop_metric == "f1" else val_metrics['loss']
+        scheduler_value = (
+            val_metrics["f1_mean"] if early_stop_metric == "f1" else val_metrics["loss"]
+        )
         scheduler.step(scheduler_value)
-        
+
         # Logging
-        print(f"Epoch {epoch+1:3d}/{epochs} | "
+        print(
+            f"Epoch {epoch + 1:3d}/{epochs} | "
             f"Train Loss: {train_loss:.4f} | "
             f"Val Loss: {val_metrics['loss']:.4f} | "
             f"Val Acc: {val_metrics['accuracy']:.4f} | "
             f"Val F1: {val_metrics['f1_mean']:.4f} | "
-            f"Val Micro-F1: {val_metrics['micro_f1']:.4f}")
-        
+            f"Val Micro-F1: {val_metrics['micro_f1']:.4f}"
+        )
+
         # Save best model
         if early_stop_metric == "f1":
-            is_best = val_metrics['f1_mean'] > best_val_f1
+            is_best = val_metrics["f1_mean"] > best_val_f1
         else:
-            is_best = val_metrics['loss'] < best_val_loss
+            is_best = val_metrics["loss"] < best_val_loss
 
         if is_best:
-            best_val_loss = val_metrics['loss']
-            best_val_f1 = val_metrics['f1_mean']
+            best_val_loss = val_metrics["loss"]
+            best_val_f1 = val_metrics["f1_mean"]
             best_epoch = epoch + 1
             patience_counter = 0
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'epoch': epoch,
-                'val_loss': val_metrics['loss'],
-                'val_acc': val_metrics['accuracy'],
-                'val_f1': val_metrics['f1_mean'],
-                'val_micro_f1': val_metrics['micro_f1'],
-                'val_precision_per_class': val_metrics['precision_per_class'],
-                'val_recall_per_class': val_metrics['recall_per_class'],
-                'val_f1_per_class': val_metrics['f1_per_class'],
-                'val_per_class_acc': val_metrics['per_class_acc'],
-                'operator_classes': operator_classes,
-                'model_type': model_type,
-                'model_config': {
-                    **model_config,
-                    'architecture_version': CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "epoch": epoch,
+                    "val_loss": val_metrics["loss"],
+                    "val_acc": val_metrics["accuracy"],
+                    "val_f1": val_metrics["f1_mean"],
+                    "val_micro_f1": val_metrics["micro_f1"],
+                    "val_precision_per_class": val_metrics["precision_per_class"],
+                    "val_recall_per_class": val_metrics["recall_per_class"],
+                    "val_f1_per_class": val_metrics["f1_per_class"],
+                    "val_per_class_acc": val_metrics["per_class_acc"],
+                    "operator_classes": operator_classes,
+                    "model_type": model_type,
+                    "model_config": {
+                        **model_config,
+                        "architecture_version": CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
+                    },
+                    "architecture_version": CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
                 },
-                'architecture_version': CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
-            }, save_path)
-            print(f"  -> Saved best model (val_loss: {val_metrics['loss']:.4f}, val_f1: {val_metrics['f1_mean']:.4f})")
+                save_path,
+            )
+            print(
+                f"  -> Saved best model (val_loss: {val_metrics['loss']:.4f}, val_f1: {val_metrics['f1_mean']:.4f})"
+            )
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"\nEarly stopping at epoch {epoch+1} (no improvement for {patience} epochs)")
+                print(
+                    f"\nEarly stopping at epoch {epoch + 1} (no improvement for {patience} epochs)"
+                )
                 break
-    
-    print(f"\nBest model at epoch {best_epoch} with val_loss: {best_val_loss:.4f}, val_f1: {best_val_f1:.4f}")
-    
+
+    print(
+        f"\nBest model at epoch {best_epoch} with val_loss: {best_val_loss:.4f}, val_f1: {best_val_f1:.4f}"
+    )
+
     # Reload best model for final evaluation
     checkpoint = torch.load(save_path, weights_only=False)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    val_metrics = evaluate(model, val_loader, criterion, device, return_preds=True, return_logits=True)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    val_metrics = evaluate(
+        model, val_loader, criterion, device, return_preds=True, return_logits=True
+    )
     if val_groups is not None:
-        checkpoint['val_metrics_by_family'] = multilabel_metrics_by_group(
-            val_metrics['preds'].detach().cpu().numpy(),
-            val_metrics['labels'].detach().cpu().numpy(),
+        checkpoint["val_metrics_by_family"] = multilabel_metrics_by_group(
+            val_metrics["preds"].detach().cpu().numpy(),
+            val_metrics["labels"].detach().cpu().numpy(),
             val_groups,
             operator_classes,
         )
     calibration_metrics = (
-        evaluate(model, calibration_loader, criterion, device, return_preds=True, return_logits=True)
+        evaluate(
+            model,
+            calibration_loader,
+            criterion,
+            device,
+            return_preds=True,
+            return_logits=True,
+        )
         if calibration_loader is not None
         else val_metrics
     )
-    
+
     # Final per-class report using best model
     print("\nPer-class F1 scores (best model):")
     for i, name in enumerate(operator_classes):
@@ -1111,38 +1213,46 @@ def train_model(
     temperature = None
     isotonic_maps = []
     if calibrate_flag:
-        temperature = calibrate_temperature(calibration_metrics['logits'], calibration_metrics['labels'])
-        checkpoint['temperature'] = temperature
+        temperature = calibrate_temperature(
+            calibration_metrics["logits"], calibration_metrics["labels"]
+        )
+        checkpoint["temperature"] = temperature
         print(f"\nCalibrated temperature saved to checkpoint: {temperature:.4f}")
 
         # Isotonic per-class calibration (more expressive than temperature scaling)
         isotonic_maps = calibrate_isotonic_per_class(
-            calibration_metrics['logits'],
-            calibration_metrics['labels'],
+            calibration_metrics["logits"],
+            calibration_metrics["labels"],
             temperature=temperature,
         )
         if isotonic_maps:
-            checkpoint['isotonic_calibration'] = isotonic_maps
-            print(f"Per-class isotonic calibration maps saved ({len(isotonic_maps)} classes)")
+            checkpoint["isotonic_calibration"] = isotonic_maps
+            print(
+                f"Per-class isotonic calibration maps saved ({len(isotonic_maps)} classes)"
+            )
 
     # Threshold tuning (optionally on calibrated probabilities)
     if tune_thresholds_flag:
-        preds_for_tuning = calibration_metrics['preds']
+        preds_for_tuning = calibration_metrics["preds"]
         if temperature is not None:
-            preds_for_tuning = torch.sigmoid(calibration_metrics['logits'] / temperature)
+            preds_for_tuning = torch.sigmoid(
+                calibration_metrics["logits"] / temperature
+            )
         if isotonic_maps:
             calibrated_np = apply_isotonic_calibration(
                 preds_for_tuning.detach().cpu().numpy(),
                 isotonic_maps,
             )
-            preds_for_tuning = torch.from_numpy(calibrated_np).to(preds_for_tuning.dtype)
+            preds_for_tuning = torch.from_numpy(calibrated_np).to(
+                preds_for_tuning.dtype
+            )
         thresholds = tune_thresholds(
             preds_for_tuning,
-            calibration_metrics['labels'],
+            calibration_metrics["labels"],
             beta=threshold_beta,
         )
-        checkpoint['thresholds'] = thresholds.numpy()
-        checkpoint['threshold_beta'] = float(threshold_beta)
+        checkpoint["thresholds"] = thresholds.numpy()
+        checkpoint["threshold_beta"] = float(threshold_beta)
         thresholded_metrics = evaluate(
             model,
             val_loader,
@@ -1151,36 +1261,46 @@ def train_model(
             thresholds=thresholds.to(device),
             temperature=temperature,
         )
-        checkpoint['thresholded_val_f1'] = thresholded_metrics['f1_mean']
-        checkpoint['thresholded_val_micro_f1'] = thresholded_metrics['micro_f1']
-        checkpoint['thresholded_precision_per_class'] = thresholded_metrics['precision_per_class']
-        checkpoint['thresholded_recall_per_class'] = thresholded_metrics['recall_per_class']
-        checkpoint['thresholded_f1_per_class'] = thresholded_metrics['f1_per_class']
-        print(f"\nTuned per-class thresholds saved to checkpoint (F-beta beta={threshold_beta:.2f})")
+        checkpoint["thresholded_val_f1"] = thresholded_metrics["f1_mean"]
+        checkpoint["thresholded_val_micro_f1"] = thresholded_metrics["micro_f1"]
+        checkpoint["thresholded_precision_per_class"] = thresholded_metrics[
+            "precision_per_class"
+        ]
+        checkpoint["thresholded_recall_per_class"] = thresholded_metrics[
+            "recall_per_class"
+        ]
+        checkpoint["thresholded_f1_per_class"] = thresholded_metrics["f1_per_class"]
+        print(
+            f"\nTuned per-class thresholds saved to checkpoint (F-beta beta={threshold_beta:.2f})"
+        )
 
     torch.save(checkpoint, save_path)
-    
+
     return model
 
 
 def load_training_data(
-    data_args: List[str],
-    n_samples: Optional[int],
+    data_args: list[str],
+    n_samples: int | None,
     feature_dim: int,
     n_classes: int,
     load_into_ram: bool,
     return_metadata: bool = False,
 ):
     """Load training data from .npz or streamed .dat files."""
-    dataset_metadata: Dict[str, object] = {}
+    dataset_metadata: dict[str, object] = {}
     # Case 1: single .npz file
     if len(data_args) == 1 and data_args[0].endswith(".npz"):
         data = np.load(data_args[0], allow_pickle=True)
         features = data["features"]
         labels = data["labels"]
         operator_classes = data["operator_classes"].tolist()
-        detected_feature_dim = int(data["feature_dim"]) if "feature_dim" in data else features.shape[1]
-        feature_schema = data["feature_schema"].item() if "feature_schema" in data else None
+        detected_feature_dim = (
+            int(data["feature_dim"]) if "feature_dim" in data else features.shape[1]
+        )
+        feature_schema = (
+            data["feature_schema"].item() if "feature_schema" in data else None
+        )
         formulas = data["formulas"].tolist() if "formulas" in data else None
         n_loaded = int(features.shape[0])
         dataset_metadata = {
@@ -1193,20 +1313,32 @@ def load_training_data(
             ),
             "generator_families": (
                 np.asarray(data["generator_families"][:n_loaded], dtype=object)
-                if "generator_families" in data else None
+                if "generator_families" in data
+                else None
             ),
             "template_ids": (
                 np.asarray(data["template_ids"][:n_loaded], dtype=object)
-                if "template_ids" in data else None
+                if "template_ids" in data
+                else None
             ),
-            "labeler_version": str(data["labeler_version"]) if "labeler_version" in data else None,
+            "labeler_version": str(data["labeler_version"])
+            if "labeler_version" in data
+            else None,
             "labels_match_semantic": (
                 np.asarray(data["labels_match_semantic"][:n_loaded], dtype=bool)
-                if "labels_match_semantic" in data else None
+                if "labels_match_semantic" in data
+                else None
             ),
         }
         if return_metadata:
-            return features, labels, operator_classes, detected_feature_dim, feature_schema, dataset_metadata
+            return (
+                features,
+                labels,
+                operator_classes,
+                detected_feature_dim,
+                feature_schema,
+                dataset_metadata,
+            )
         return features, labels, operator_classes, detected_feature_dim, feature_schema
 
     # Case 2: base path or explicit feature/label files
@@ -1224,7 +1356,12 @@ def load_training_data(
             elif arg.endswith(".labels.dat"):
                 labels_path = Path(arg)
 
-    if features_path is None or labels_path is None or not features_path.exists() or not labels_path.exists():
+    if (
+        features_path is None
+        or labels_path is None
+        or not features_path.exists()
+        or not labels_path.exists()
+    ):
         raise FileNotFoundError(
             "Expected either a .npz file or .features.dat and .labels.dat files."
         )
@@ -1234,8 +1371,12 @@ def load_training_data(
         n_samples = file_size // (feature_dim * 4)
         print(f"Inferred n_samples={n_samples} from {features_path.name}")
 
-    features = np.memmap(features_path, dtype=np.float32, mode="r", shape=(n_samples, feature_dim))
-    labels = np.memmap(labels_path, dtype=np.float32, mode="r", shape=(n_samples, n_classes))
+    features = np.memmap(
+        features_path, dtype=np.float32, mode="r", shape=(n_samples, feature_dim)
+    )
+    labels = np.memmap(
+        labels_path, dtype=np.float32, mode="r", shape=(n_samples, n_classes)
+    )
 
     if load_into_ram:
         print("Loading features into RAM...")
@@ -1245,8 +1386,15 @@ def load_training_data(
         labels = np.array(labels)
 
     operator_classes = [
-        "identity", "sin", "cos", "power", "exp",
-        "log", "addition", "multiplication", "rational",
+        "identity",
+        "sin",
+        "cos",
+        "power",
+        "exp",
+        "log",
+        "addition",
+        "multiplication",
+        "rational",
     ][:n_classes]
     dataset_metadata = {"dataset_path": str(data_args[0]) if data_args else None}
     if return_metadata:
@@ -1258,96 +1406,208 @@ def load_training_data(
 # MAIN
 # =============================================================================
 
+
 def main():
     parser = argparse.ArgumentParser(description="Train curve classifier")
-    parser.add_argument("--data", type=str, nargs="+", required=True,
-                        help="Path to training data (.npz file) or base path / .features.dat + .labels.dat")
-    parser.add_argument("--n-samples", type=int, default=None,
-                        help="Number of samples (required for .dat if file size cannot be inferred)")
-    parser.add_argument("--feature-dim", type=int, default=398,
-                        help="Feature dimension for .dat files (default: 398)")
-    parser.add_argument("--n-classes", type=int, default=9,
-                        help="Number of classes for .dat files (default: 9)")
-    parser.add_argument("--load-into-ram", "--load-into-vram", dest="load_into_ram", action="store_true",
-                        help="Load dataset fully into RAM/VRAM for maximum throughput")
-    parser.add_argument("--model", type=str, default="glu",
-                        choices=["glu", "mlp", "cnn"], help="Model architecture")
-    parser.add_argument("--epochs", type=int, default=50,
-                        help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=8192,
-                        help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-3,
-                        help="Learning rate")
-    parser.add_argument("--hidden", type=int, default=512,
-                        help="Hidden layer size (default: 512)")
-    parser.add_argument("--val-split", type=float, default=0.1,
-                        help="Validation split ratio")
-    parser.add_argument("--output", type=str, default="models/curve_classifier.pt",
-                        help="Output model path")
-    parser.add_argument("--device", type=str, default="auto",
-                        help="Device (auto, cpu, cuda)")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for reproducibility")
-    parser.add_argument("--patience", type=int, default=10,
-                        help="Early stopping patience")
-    parser.add_argument("--early-stop", type=str, default="f1",
-                        choices=["loss", "f1"], help="Early stopping metric")
-    parser.add_argument("--standardize", action="store_true",
-                        help="Standardize features using training set statistics (default: on)")
-    parser.add_argument("--no-standardize", action="store_true",
-                        help="Disable feature standardization")
-    parser.add_argument("--tune-thresholds", action="store_true",
-                        help="Tune per-class thresholds on validation set (default: on)")
-    parser.add_argument("--no-tune-thresholds", action="store_true",
-                        help="Disable per-class threshold tuning")
-    parser.add_argument("--threshold-beta", type=float, default=0.5,
-                        help="F-beta used for threshold tuning; beta<1 favors precision")
-    parser.add_argument("--stratified-split", action="store_true",
-                        help="Use approximate multi-label stratified train/val split (default: on)")
-    parser.add_argument("--no-stratified-split", action="store_true",
-                        help="Disable stratified split")
-    parser.add_argument("--split-policy", type=str, default="auto",
-                        choices=["auto", "row", "stratified", "formula_group", "family_holdout"],
-                        help="Validation split policy. auto uses formula groups when dataset metadata is present.")
-    parser.add_argument("--heldout-family", type=str, default="",
-                        help="Generator family to hold out when --split-policy=family_holdout")
-    parser.add_argument("--validation-report", type=str, default="",
-                        help="Optional output path for Phase 3 validation report JSON")
-    parser.add_argument("--checkpoint-card", type=str, default="",
-                        help="Optional output path for Phase 6 checkpoint card JSON")
-    parser.add_argument("--data-generation-command", type=str, default="",
-                        help="Command used to generate this training dataset, saved in the checkpoint card")
-    parser.add_argument("--baseline-card", type=str, default="",
-                        help="Optional baseline checkpoint card for Phase 6 rollout comparison")
-    parser.add_argument("--rollout-comparison", type=str, default="",
-                        help="Optional output path for Phase 6 rollout comparison JSON")
-    parser.add_argument("--rollout-metric", type=str, default="val_f1",
-                        help="Metric name used for optional baseline comparison")
-    parser.add_argument("--min-relative-improvement", type=float, default=0.0,
-                        help="Minimum relative improvement over the baseline metric for rollout readiness")
-    parser.add_argument("--calibrate", action="store_true",
-                        help="Calibrate probabilities with temperature scaling")
-    parser.add_argument("--calibration-split", type=float, default=0.25,
-                        help="Fraction of validation rows reserved for calibration/threshold tuning")
-    parser.add_argument("--class-weights", action="store_true",
-                        help="Use inverse frequency class weights for imbalanced labels")
-    parser.add_argument("--class-weight-cap", type=float, default=3.0,
-                        help="Maximum positive class weight when --class-weights is enabled")
-    parser.add_argument("--compile", action="store_true",
-                        help="Use torch.compile (PyTorch 2.0+) for kernel fusion")
-    
+    parser.add_argument(
+        "--data",
+        type=str,
+        nargs="+",
+        required=True,
+        help="Path to training data (.npz file) or base path / .features.dat + .labels.dat",
+    )
+    parser.add_argument(
+        "--n-samples",
+        type=int,
+        default=None,
+        help="Number of samples (required for .dat if file size cannot be inferred)",
+    )
+    parser.add_argument(
+        "--feature-dim",
+        type=int,
+        default=398,
+        help="Feature dimension for .dat files (default: 398)",
+    )
+    parser.add_argument(
+        "--n-classes",
+        type=int,
+        default=9,
+        help="Number of classes for .dat files (default: 9)",
+    )
+    parser.add_argument(
+        "--load-into-ram",
+        "--load-into-vram",
+        dest="load_into_ram",
+        action="store_true",
+        help="Load dataset fully into RAM/VRAM for maximum throughput",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="glu",
+        choices=["glu", "mlp", "cnn"],
+        help="Model architecture",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=50, help="Number of training epochs"
+    )
+    parser.add_argument("--batch-size", type=int, default=8192, help="Batch size")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument(
+        "--hidden", type=int, default=512, help="Hidden layer size (default: 512)"
+    )
+    parser.add_argument(
+        "--val-split", type=float, default=0.1, help="Validation split ratio"
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default="models/curve_classifier.pt",
+        help="Output model path",
+    )
+    parser.add_argument(
+        "--device", type=str, default="auto", help="Device (auto, cpu, cuda)"
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for reproducibility"
+    )
+    parser.add_argument(
+        "--patience", type=int, default=10, help="Early stopping patience"
+    )
+    parser.add_argument(
+        "--early-stop",
+        type=str,
+        default="f1",
+        choices=["loss", "f1"],
+        help="Early stopping metric",
+    )
+    parser.add_argument(
+        "--standardize",
+        action="store_true",
+        help="Standardize features using training set statistics (default: on)",
+    )
+    parser.add_argument(
+        "--no-standardize", action="store_true", help="Disable feature standardization"
+    )
+    parser.add_argument(
+        "--tune-thresholds",
+        action="store_true",
+        help="Tune per-class thresholds on validation set (default: on)",
+    )
+    parser.add_argument(
+        "--no-tune-thresholds",
+        action="store_true",
+        help="Disable per-class threshold tuning",
+    )
+    parser.add_argument(
+        "--threshold-beta",
+        type=float,
+        default=0.5,
+        help="F-beta used for threshold tuning; beta<1 favors precision",
+    )
+    parser.add_argument(
+        "--stratified-split",
+        action="store_true",
+        help="Use approximate multi-label stratified train/val split (default: on)",
+    )
+    parser.add_argument(
+        "--no-stratified-split", action="store_true", help="Disable stratified split"
+    )
+    parser.add_argument(
+        "--split-policy",
+        type=str,
+        default="auto",
+        choices=["auto", "row", "stratified", "formula_group", "family_holdout"],
+        help="Validation split policy. auto uses formula groups when dataset metadata is present.",
+    )
+    parser.add_argument(
+        "--heldout-family",
+        type=str,
+        default="",
+        help="Generator family to hold out when --split-policy=family_holdout",
+    )
+    parser.add_argument(
+        "--validation-report",
+        type=str,
+        default="",
+        help="Optional output path for Phase 3 validation report JSON",
+    )
+    parser.add_argument(
+        "--checkpoint-card",
+        type=str,
+        default="",
+        help="Optional output path for Phase 6 checkpoint card JSON",
+    )
+    parser.add_argument(
+        "--data-generation-command",
+        type=str,
+        default="",
+        help="Command used to generate this training dataset, saved in the checkpoint card",
+    )
+    parser.add_argument(
+        "--baseline-card",
+        type=str,
+        default="",
+        help="Optional baseline checkpoint card for Phase 6 rollout comparison",
+    )
+    parser.add_argument(
+        "--rollout-comparison",
+        type=str,
+        default="",
+        help="Optional output path for Phase 6 rollout comparison JSON",
+    )
+    parser.add_argument(
+        "--rollout-metric",
+        type=str,
+        default="val_f1",
+        help="Metric name used for optional baseline comparison",
+    )
+    parser.add_argument(
+        "--min-relative-improvement",
+        type=float,
+        default=0.0,
+        help="Minimum relative improvement over the baseline metric for rollout readiness",
+    )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="Calibrate probabilities with temperature scaling",
+    )
+    parser.add_argument(
+        "--calibration-split",
+        type=float,
+        default=0.25,
+        help="Fraction of validation rows reserved for calibration/threshold tuning",
+    )
+    parser.add_argument(
+        "--class-weights",
+        action="store_true",
+        help="Use inverse frequency class weights for imbalanced labels",
+    )
+    parser.add_argument(
+        "--class-weight-cap",
+        type=float,
+        default=3.0,
+        help="Maximum positive class weight when --class-weights is enabled",
+    )
+    parser.add_argument(
+        "--compile",
+        action="store_true",
+        help="Use torch.compile (PyTorch 2.0+) for kernel fusion",
+    )
+
     args = parser.parse_args()
 
     standardize = not args.no_standardize
     tune_thresholds_flag = not args.no_tune_thresholds
     stratified_split = not args.no_stratified_split
-    
+
     # Set random seeds for reproducibility
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    
+
     # Device
     if args.device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1356,12 +1616,19 @@ def main():
     print(f"Using device: {device}")
 
     # Enable TF32 for better performance on Ampere+ GPUs
-    if device.type == 'cuda':
-        torch.set_float32_matmul_precision('high')
-    
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+
     # Load data
     print(f"Loading data from {args.data}...")
-    features, labels, operator_classes, feature_dim, feature_schema, dataset_metadata = load_training_data(
+    (
+        features,
+        labels,
+        operator_classes,
+        feature_dim,
+        feature_schema,
+        dataset_metadata,
+    ) = load_training_data(
         args.data,
         args.n_samples,
         args.feature_dim,
@@ -1369,17 +1636,19 @@ def main():
         args.load_into_ram,
         return_metadata=True,
     )
-    
+
     print(f"  Features: {features.shape}")
     print(f"  Labels: {labels.shape}")
     print(f"  Classes: {operator_classes}")
 
     expected_features = feature_dim or 366
     if features.shape[1] != expected_features:
-        print(f"Warning: expected {expected_features} features, got {features.shape[1]}. ")
+        print(
+            f"Warning: expected {expected_features} features, got {features.shape[1]}. "
+        )
     if feature_schema is not None:
         print(f"  Feature schema: {feature_schema}")
-    
+
     formula_keys = dataset_metadata.get("formula_keys")
     generator_families = dataset_metadata.get("generator_families")
     template_ids = dataset_metadata.get("template_ids")
@@ -1390,26 +1659,38 @@ def main():
     # groups when metadata is present so checkpoint metrics are not row-leaky.
     if split_policy == "family_holdout" or args.heldout_family:
         if generator_families is None:
-            raise ValueError("--split-policy=family_holdout requires generator_families metadata")
+            raise ValueError(
+                "--split-policy=family_holdout requires generator_families metadata"
+            )
         heldout_family = args.heldout_family
         if not heldout_family:
             family_counts = {}
             for family in np.asarray(generator_families, dtype=object).astype(str):
                 family_counts[family] = family_counts.get(family, 0) + 1
             if not family_counts:
-                raise ValueError("No generator families available for family_holdout split")
+                raise ValueError(
+                    "No generator families available for family_holdout split"
+                )
             heldout_family = min(family_counts, key=family_counts.get)
-        train_idx, val_idx, split_details = family_holdout_split(generator_families, heldout_family)
+        train_idx, val_idx, split_details = family_holdout_split(
+            generator_families, heldout_family
+        )
         split_policy = "family_holdout"
     elif split_policy in {"auto", "formula_group"} and formula_keys is not None:
-        train_idx, val_idx, split_details = grouped_train_val_split(formula_keys, args.val_split, args.seed)
+        train_idx, val_idx, split_details = grouped_train_val_split(
+            formula_keys, args.val_split, args.seed
+        )
         split_policy = str(split_details.get("policy", "formula_group"))
     elif split_policy in {"auto", "stratified"} and stratified_split:
-        train_idx, val_idx = multilabel_stratified_split(labels, args.val_split, args.seed)
+        train_idx, val_idx = multilabel_stratified_split(
+            labels, args.val_split, args.seed
+        )
         split_policy = "stratified"
         split_details = {"policy": "stratified", "exclusive_groups": False}
     else:
-        train_idx, val_idx = row_train_val_split(len(features), args.val_split, args.seed)
+        train_idx, val_idx = row_train_val_split(
+            len(features), args.val_split, args.seed
+        )
         split_policy = "row"
         split_details = {"policy": "row", "exclusive_groups": False}
 
@@ -1424,7 +1705,7 @@ def main():
     scaler = None
     if standardize:
         mean, std = compute_feature_stats(features, train_idx)
-        scaler = {'mean': mean, 'std': std}
+        scaler = {"mean": mean, "std": std}
 
     validation_report = build_validation_report(
         dataset_path=str(args.data[0]) if args.data else None,
@@ -1454,58 +1735,61 @@ def main():
             f"{overlap['overlap_unique_formulas']} unique, "
             f"{overlap['val_rows_with_train_formula_fraction']:.3f} val-row fraction"
         )
-    
+
     # Data loaders with optimizations and lazy memmap-backed access
     train_dataset = IndexedFeatureDataset(
-        features, labels, train_idx, scaler=scaler, 
-        device=device if args.load_into_ram else None
+        features,
+        labels,
+        train_idx,
+        scaler=scaler,
+        device=device if args.load_into_ram else None,
     )
     val_dataset = IndexedFeatureDataset(
-        features, labels, eval_idx, scaler=scaler, 
-        device=device if args.load_into_ram else None
+        features,
+        labels,
+        eval_idx,
+        scaler=scaler,
+        device=device if args.load_into_ram else None,
     )
     calibration_dataset = (
         IndexedFeatureDataset(
-            features, labels, calibration_idx, scaler=scaler,
+            features,
+            labels,
+            calibration_idx,
+            scaler=scaler,
             device=device if args.load_into_ram else None,
         )
         if calibration_idx is not None
         else None
     )
-    
+
     # Use pin_memory for GPU and num_workers for parallel data loading
     # On Windows, num_workers > 0 often causes deadlocks or hangs.
     import os
     import platform
-    use_cuda = device.type == 'cuda'
-    
+
+    use_cuda = device.type == "cuda"
+
     # Default to 0 workers on Windows for stability, or allow override
-    n_workers = 0 
+    n_workers = 0
     if platform.system() != "Windows" and use_cuda:
         num_cpus = os.cpu_count() or 4
         n_workers = min(12, max(2, num_cpus - 2))
-    
+
     loader_kwargs = {
-        'num_workers': n_workers,
-        'pin_memory': use_cuda,
+        "num_workers": n_workers,
+        "pin_memory": use_cuda,
     }
-    
+
     # Only use advanced loader options on Linux/CUDA
     if n_workers > 0 and platform.system() != "Windows":
-        loader_kwargs['prefetch_factor'] = 4
-        loader_kwargs['persistent_workers'] = True
-    
+        loader_kwargs["prefetch_factor"] = 4
+        loader_kwargs["persistent_workers"] = True
+
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=True,
-        **loader_kwargs
+        train_dataset, batch_size=args.batch_size, shuffle=True, **loader_kwargs
     )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=args.batch_size,
-        **loader_kwargs
-    )
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, **loader_kwargs)
     calibration_loader = (
         DataLoader(
             calibration_dataset,
@@ -1515,24 +1799,24 @@ def main():
         if calibration_dataset is not None
         else None
     )
-    
+
     # Model
     n_features = features.shape[1]
     n_classes = labels.shape[1]
-    
+
     if args.model == "glu":
         model = CurveClassifierGLU(n_features, n_classes, args.hidden)
         model_config = {
-            'n_features': int(n_features),
-            'n_classes': int(n_classes),
-            'hidden': int(args.hidden),
+            "n_features": int(n_features),
+            "n_classes": int(n_classes),
+            "hidden": int(args.hidden),
         }
     elif args.model == "mlp":
         model = CurveClassifierMLP(n_features, n_classes, args.hidden)
         model_config = {
-            'n_features': int(n_features),
-            'n_classes': int(n_classes),
-            'hidden': int(args.hidden),
+            "n_features": int(n_features),
+            "n_classes": int(n_classes),
+            "hidden": int(args.hidden),
         }
     else:
         curve_dim = 128
@@ -1540,13 +1824,15 @@ def main():
             raw_slice = feature_schema["raw"]
             if isinstance(raw_slice, (list, tuple)) and len(raw_slice) == 2:
                 curve_dim = int(raw_slice[1] - raw_slice[0])
-        model = CurveClassifierCNN(n_classes=n_classes, n_features=n_features, curve_dim=curve_dim)
+        model = CurveClassifierCNN(
+            n_classes=n_classes, n_features=n_features, curve_dim=curve_dim
+        )
         model_config = {
-            'n_classes': int(n_classes),
-            'n_features': int(n_features),
-            'curve_dim': int(curve_dim),
+            "n_classes": int(n_classes),
+            "n_features": int(n_features),
+            "curve_dim": int(curve_dim),
         }
-    
+
     model = model.to(device)
     print(f"\nModel: {args.model.upper()}")
     print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -1557,11 +1843,11 @@ def main():
             model = torch.compile(model)
         except Exception as e:
             print(f"Warning: torch.compile failed ({e}). Falling back to eager mode.")
-    
+
     # Output directory
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # Compute class weights if requested
     class_weights = None
     if args.class_weights:
@@ -1576,7 +1862,7 @@ def main():
         class_weights = torch.tensor(pos_weights, dtype=torch.float32)
         print(f"Class label counts: {pos_counts.astype(int)}")
         print(f"Computed pos_weights: {pos_weights.round(2)}")
-    
+
     # Train
     print(f"\nTraining for {args.epochs} epochs...")
     train_model(
@@ -1607,11 +1893,11 @@ def main():
     # Persist scaler and schema metadata
     checkpoint = torch.load(output_path, weights_only=False)
     if scaler is not None:
-        checkpoint['feature_scaler'] = scaler
-    checkpoint['feature_schema'] = feature_schema
-    checkpoint['feature_dim'] = feature_dim or features.shape[1]
-    checkpoint['validation_split_policy'] = split_policy
-    checkpoint['validation_split_details'] = dict(split_details)
+        checkpoint["feature_scaler"] = scaler
+    checkpoint["feature_schema"] = feature_schema
+    checkpoint["feature_dim"] = feature_dim or features.shape[1]
+    checkpoint["validation_split_policy"] = split_policy
+    checkpoint["validation_split_details"] = dict(split_details)
     validation_report_path = (
         Path(args.validation_report)
         if args.validation_report
@@ -1633,16 +1919,22 @@ def main():
             "thresholded_val_f1": checkpoint.get("thresholded_val_f1"),
             "thresholded_val_micro_f1": checkpoint.get("thresholded_val_micro_f1"),
             "thresholded_f1_per_class": checkpoint.get("thresholded_f1_per_class"),
-            "thresholded_precision_per_class": checkpoint.get("thresholded_precision_per_class"),
-            "thresholded_recall_per_class": checkpoint.get("thresholded_recall_per_class"),
+            "thresholded_precision_per_class": checkpoint.get(
+                "thresholded_precision_per_class"
+            ),
+            "thresholded_recall_per_class": checkpoint.get(
+                "thresholded_recall_per_class"
+            ),
             "operator_classes": checkpoint.get("operator_classes"),
             "by_family": checkpoint.get("val_metrics_by_family"),
         }
     }
     write_validation_report(validation_report_path, validation_report)
-    checkpoint['validation_report_path'] = str(validation_report_path)
-    checkpoint['labeler_version'] = dataset_metadata.get("labeler_version")
-    checkpoint['data_generation_command'] = args.data_generation_command or "not_provided"
+    checkpoint["validation_report_path"] = str(validation_report_path)
+    checkpoint["labeler_version"] = dataset_metadata.get("labeler_version")
+    checkpoint["data_generation_command"] = (
+        args.data_generation_command or "not_provided"
+    )
     checkpoint_card = build_checkpoint_card(
         model_kind="curve_classifier",
         checkpoint_path=output_path,
@@ -1661,7 +1953,7 @@ def main():
         else default_checkpoint_card_path(output_path)
     )
     write_checkpoint_card(checkpoint_card_path, checkpoint_card)
-    checkpoint['checkpoint_card_path'] = str(checkpoint_card_path)
+    checkpoint["checkpoint_card_path"] = str(checkpoint_card_path)
 
     if args.baseline_card:
         baseline_card_path = Path(args.baseline_card)
@@ -1679,7 +1971,7 @@ def main():
                 else default_rollout_comparison_path(output_path)
             )
             write_rollout_comparison(rollout_comparison_path, rollout_comparison)
-            checkpoint['rollout_comparison_path'] = str(rollout_comparison_path)
+            checkpoint["rollout_comparison_path"] = str(rollout_comparison_path)
         else:
             print(
                 f"Warning: baseline card not found at {baseline_card_path}; "
@@ -1687,11 +1979,11 @@ def main():
             )
 
     torch.save(checkpoint, output_path)
-    
+
     print(f"\nModel saved to {output_path}")
     print(f"Validation report saved to {validation_report_path}")
     print(f"Checkpoint card saved to {checkpoint_card_path}")
-    if checkpoint.get('rollout_comparison_path'):
+    if checkpoint.get("rollout_comparison_path"):
         print(f"Rollout comparison saved to {checkpoint['rollout_comparison_path']}")
 
 

@@ -3,13 +3,15 @@ Test the C++ evolution engine (P1-P8 optimizations) against formulas
 from the benchmark suite.
 """
 
-import numpy as np
 import sys
 import time
 from pathlib import Path
 
+import numpy as np
+
 try:
     from glassbox.sr.cpp import require_cpp_core
+
     _core = require_cpp_core()
     print("✅ _core imported successfully\n")
 except ImportError as e:
@@ -208,11 +210,11 @@ print(f"  Formula: {res_island['formula'][:70]}")
 # Grade
 mse_island = res_island["best_mse"]
 if mse_island < 1e-6:
-    print(f"  Result:  🟢 EXACT")
+    print("  Result:  🟢 EXACT")
 elif mse_island < 1.0:
-    print(f"  Result:  🟡 APPROX/LOOSE")
+    print("  Result:  🟡 APPROX/LOOSE")
 else:
-    print(f"  Result:  🔴 FAIL")
+    print("  Result:  🔴 FAIL")
 
 # ── P8 TEST: nn.Module Deserialization ────────────────────────────────
 print("\n" + "=" * 72)
@@ -257,9 +259,9 @@ try:
 
     # Check that PyTorch prediction roughly matches C++ MSE
     if mse_torch < res_p8["best_mse"] * 10 + 1e-4:
-        print(f"  Parity:      ✅ PASS (PyTorch matches C++)")
+        print("  Parity:      ✅ PASS (PyTorch matches C++)")
     else:
-        print(f"  Parity:      ⚠️ LOOSE (MSE diverged)")
+        print("  Parity:      ⚠️ LOOSE (MSE diverged)")
 
     # Test parameter count
     n_params = sum(p.numel() for p in module.parameters())

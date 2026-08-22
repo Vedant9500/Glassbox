@@ -6,35 +6,35 @@
 # public estimator (S10-2: lazy-load heavy alternate stacks).
 
 # Public sklearn estimator (S1-11) — primary surface
-from glassbox.sr.sklearn_wrapper import GlassboxRegressor
-
 # v2: FPIP v2 (used by fast-path / proposer handoff)
 from glassbox.sr.fpip_v2 import (
+    FPIPv2,
     build_fpip_v2_from_fast_path,
     validate_fpip_v2_payload,
-    FPIPv2,
 )
+from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
 # Back-compat alias (older __all__ listed FPIPv2Payload)
 FPIPv2Payload = FPIPv2
 
 # Lightweight meta-ops / constants used by multiple paths
 from glassbox.sr.operations.meta_ops import (
-    MetaPeriodic,
-    MetaPower,
+    KNOWN_CONSTANTS,
+    ConstantAwareLinear,
+    MetaAggregation,
     MetaArithmetic,
     MetaArithmeticExtended,
-    MetaAggregation,
     MetaExp,
     MetaLog,
     MetaOperationLibrary,
+    MetaPeriodic,
+    MetaPower,
     create_meta_op,
-    KNOWN_CONSTANTS,
-    snap_to_constant,
-    snap_tensor_to_constants,
     get_constant_symbol,
     snap_edge_weights,
+    snap_tensor_to_constants,
+    snap_to_constant,
     snap_value_to_constant,
-    ConstantAwareLinear,
 )
 
 
@@ -55,6 +55,7 @@ def __getattr__(name: str):
         "anneal_beta",
     ):
         from glassbox.sr import hard_concrete as _hc
+
         mapping = {
             "hard_concrete_sample": _hc.hard_concrete_sample,
             "HardConcreteGate": _hc.HardConcreteGate,
@@ -77,6 +78,7 @@ def __getattr__(name: str):
     ):
         from glassbox.sr.core import operation_dag as _dag
         from glassbox.sr.core import operation_node as _node
+
         mapping = {
             "OperationDAG": _dag.OperationDAG,
             "OperationDAGSimple": _dag.OperationDAGSimple,
@@ -100,8 +102,9 @@ def __getattr__(name: str):
         "fit_coefficients_bfgs",
         "build_formula_from_weights",
     ):
-        from glassbox.sr.optimizers import hybrid_optimizer as _hyb
         from glassbox.sr.optimizers import bfgs_optimizer as _bfgs
+        from glassbox.sr.optimizers import hybrid_optimizer as _hyb
+
         mapping = {
             "LBFGSConstantOptimizer": _hyb.LBFGSConstantOptimizer,
             "EvolutionaryOptimizer": _hyb.EvolutionaryOptimizer,
@@ -126,10 +129,10 @@ def __getattr__(name: str):
         try:
             from glassbox.evolution import (
                 EvolutionaryONNTrainer,
-                train_onn_evolutionary,
-                random_operation_init,
                 mutate_operations,
+                random_operation_init,
                 refine_constants,
+                train_onn_evolutionary,
             )
         except ImportError as exc:  # pragma: no cover
             raise AttributeError(name) from exc
@@ -150,6 +153,7 @@ def __getattr__(name: str):
         "visualize_evolution",
     ):
         from glassbox.sr import visualization as _viz
+
         mapping = {
             "ONNVisualizer": _viz.ONNVisualizer,
             "LiveTrainingVisualizer": _viz.LiveTrainingVisualizer,
@@ -161,6 +165,7 @@ def __getattr__(name: str):
     # v2: Post-Training Pruning
     if name in ("PostTrainingPruner", "prune_model", "analyze_model_sensitivity"):
         from glassbox.sr import pruning as _pr
+
         mapping = {
             "PostTrainingPruner": _pr.PostTrainingPruner,
             "prune_model": _pr.prune_model,
@@ -176,6 +181,7 @@ def __getattr__(name: str):
         "compute_selection_probabilities_rspg",
     ):
         from glassbox.sr import risk_seeking_policy_gradient as _rspg
+
         mapping = {
             "GradientMonitor": _rspg.GradientMonitor,
             "RiskSeekingEvolutionMixin": _rspg.RiskSeekingEvolutionMixin,

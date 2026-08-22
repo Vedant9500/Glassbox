@@ -4,15 +4,16 @@ Covers the public ``fit(X, y, sample_weight=...)`` contract introduced to
 mirror PhySO's ``y_weights`` hook. Scope is the Python contract only; native
 C++ weighting lands in Phase 2.
 """
+
 import numpy as np
 import pytest
 
 from glassbox.sr.sklearn_wrapper import (
     GlassboxRegressor,
+    _effective_sample_size,
     _validate_sample_weight,
     _weighted_mse,
     _weighted_r2,
-    _effective_sample_size,
 )
 
 
@@ -35,14 +36,16 @@ def test_uniform_weights_match_unweighted():
     pred = np.array([0.0, 0.0, 0.0, 0.0])
     target = np.array([0.0, 0.0, 0.0, 1.0])
     w = _validate_sample_weight([1, 1, 1, 1], 4)
-    assert pytest.approx(_weighted_mse(pred, target, w), rel=1e-12) == _weighted_mse(pred, target, None)
+    assert pytest.approx(_weighted_mse(pred, target, w), rel=1e-12) == _weighted_mse(
+        pred, target, None
+    )
 
 
 def test_weighted_mse_shifts_toward_high_weight_point():
     pred = np.zeros(4)
     target = np.array([0.0, 0.0, 0.0, 1.0])
     w_down = _validate_sample_weight([1.0, 1.0, 1.0, 0.0], 4)  # drop last point
-    w_up = _validate_sample_weight([1.0, 1.0, 1.0, 9.0], 4)    # emphasise last point
+    w_up = _validate_sample_weight([1.0, 1.0, 1.0, 9.0], 4)  # emphasise last point
     base = _weighted_mse(pred, target, None)
     assert _weighted_mse(pred, target, w_down) < base
     assert _weighted_mse(pred, target, w_up) > base
@@ -50,13 +53,13 @@ def test_weighted_mse_shifts_toward_high_weight_point():
 
 def test_validate_sample_weight_rejects_invalid():
     with pytest.raises(ValueError):
-        _validate_sample_weight([1.0, 1.0, 1.0], 4)            # length mismatch
+        _validate_sample_weight([1.0, 1.0, 1.0], 4)  # length mismatch
     with pytest.raises(ValueError):
-        _validate_sample_weight([-1.0, 1.0, 1.0, 1.0], 4)      # negative
+        _validate_sample_weight([-1.0, 1.0, 1.0, 1.0], 4)  # negative
     with pytest.raises(ValueError):
-        _validate_sample_weight([np.nan, 1.0, 1.0, 1.0], 4)    # non-finite
+        _validate_sample_weight([np.nan, 1.0, 1.0, 1.0], 4)  # non-finite
     with pytest.raises(ValueError):
-        _validate_sample_weight([0.0, 0.0, 0.0, 0.0], 4)       # all zero
+        _validate_sample_weight([0.0, 0.0, 0.0, 0.0], 4)  # all zero
 
 
 def test_effective_sample_size_kish():
@@ -84,7 +87,9 @@ def _linear_data(n=200, seed=0, outlier=False):
 
 def test_fit_accepts_none_weights_and_stores_flag():
     X, y = _linear_data()
-    est = GlassboxRegressor(random_state=1, generations=20, multi_start_runs=1, timeout=30)
+    est = GlassboxRegressor(
+        random_state=1, generations=20, multi_start_runs=1, timeout=30
+    )
     est.fit(X, y, sample_weight=None)
     assert est.sample_weight_provided_ is False
     assert est.sample_weight_ is None
@@ -93,7 +98,9 @@ def test_fit_accepts_none_weights_and_stores_flag():
 def test_fit_accepts_and_stores_weights():
     X, y = _linear_data()
     w = np.where(np.arange(len(y)) % 2 == 0, 1.0, 0.5)
-    est = GlassboxRegressor(random_state=1, generations=20, multi_start_runs=1, timeout=30)
+    est = GlassboxRegressor(
+        random_state=1, generations=20, multi_start_runs=1, timeout=30
+    )
     est.fit(X, y, sample_weight=w)
     assert est.sample_weight_provided_ is True
     assert est.sample_weight_ is not None
@@ -103,9 +110,15 @@ def test_fit_accepts_and_stores_weights():
 def test_fit_diagnostics_record_effective_sample_size():
     X, y = _linear_data()
     w = np.where(np.arange(len(y)) % 2 == 0, 1.0, 0.1)
-    est = GlassboxRegressor(random_state=1, generations=20, multi_start_runs=1, timeout=30)
+    est = GlassboxRegressor(
+        random_state=1, generations=20, multi_start_runs=1, timeout=30
+    )
     est.fit(X, y, sample_weight=w)
-    diag = est.blackbox_diagnostics_.get("sample_weight", {}) if isinstance(est.blackbox_diagnostics_, dict) else {}
+    diag = (
+        est.blackbox_diagnostics_.get("sample_weight", {})
+        if isinstance(est.blackbox_diagnostics_, dict)
+        else {}
+    )
     assert diag.get("provided") is True
     assert "effective_sample_size" in diag
     assert diag["effective_sample_size"] is not None
@@ -113,20 +126,26 @@ def test_fit_diagnostics_record_effective_sample_size():
 
 def test_fit_rejects_invalid_weight_length():
     X, y = _linear_data(n=50)
-    est = GlassboxRegressor(random_state=1, generations=5, multi_start_runs=1, timeout=30)
+    est = GlassboxRegressor(
+        random_state=1, generations=5, multi_start_runs=1, timeout=30
+    )
     with pytest.raises(ValueError):
         est.fit(X, y, sample_weight=np.ones(len(y) - 1))
 
 
 def test_formula_mse_uses_weights_when_set(monkeypatch):
     X, y = _linear_data(n=20)
-    est = GlassboxRegressor(random_state=1, generations=5, multi_start_runs=1, timeout=10)
+    est = GlassboxRegressor(
+        random_state=1, generations=5, multi_start_runs=1, timeout=10
+    )
     est.fit(X, y, sample_weight=None)
     est.sample_weight_ = _validate_sample_weight([1.0] * 19 + [50.0], 20)
     est.sample_weight_provided_ = True
 
     # monkeypatch eval so prediction is identically zero -> error dominated by last point
-    monkeypatch.setattr(est, "_safe_eval_formula_array", lambda formula, X_in: np.zeros(X_in.shape[0]))
+    monkeypatch.setattr(
+        est, "_safe_eval_formula_array", lambda formula, X_in: np.zeros(X_in.shape[0])
+    )
     weighted = est._formula_mse("0", X, y)
     est.sample_weight_provided_ = False
     unweighted = est._formula_mse("0", X, y)
@@ -154,10 +173,14 @@ def test_cv_skip_guard_is_weight_aware(monkeypatch):
     y_pred_good = y.copy()
     y_pred_bad = y.copy()
     y_pred_bad[folds[0]] += 8.0
-    monkeypatch.setattr(est, "_safe_eval_formula_array", lambda formula, X_in: y_pred_good)
+    monkeypatch.setattr(
+        est, "_safe_eval_formula_array", lambda formula, X_in: y_pred_good
+    )
 
     # Uniform: passes.
-    assert est._passes_cross_validation_skip_guard("x", X, y, sample_weight=None) is True
+    assert (
+        est._passes_cross_validation_skip_guard("x", X, y, sample_weight=None) is True
+    )
 
     # Same perfect pred but we now explicitly mark the noisy fold points with
     # huge weight while keeping preds perfect on them -> still passes.
@@ -165,7 +188,9 @@ def test_cv_skip_guard_is_weight_aware(monkeypatch):
     assert est._passes_cross_validation_skip_guard("x", X, y, sample_weight=w) is True
 
     # Now expose the noise and rely on weights to surface it.
-    monkeypatch.setattr(est, "_safe_eval_formula_array", lambda formula, X_in: y_pred_bad)
+    monkeypatch.setattr(
+        est, "_safe_eval_formula_array", lambda formula, X_in: y_pred_bad
+    )
     w_focus = np.ones(n)
     w_focus[folds[0]] = 100.0  # concentrate on the bad fold
     ok_focus = est._passes_cross_validation_skip_guard("x", X, y, sample_weight=w_focus)
@@ -184,6 +209,7 @@ def test_weighted_mse_rejects_length_mismatch():
 
 def test_slice_sample_weight_indices():
     from glassbox.sr.sklearn_wrapper import _slice_sample_weight
+
     w = np.array([1.0, 2.0, 3.0, 4.0])
     assert np.allclose(_slice_sample_weight(w, indices=[0, 2]), [1.0, 3.0])
     assert _slice_sample_weight(None, indices=[0, 1]) is None
@@ -194,7 +220,9 @@ def test_slice_sample_weight_indices():
 def test_formula_mse_uses_sliced_weights_on_holdout_like_subset():
     """Holdout scoring must not silently drop weights when n_val != n_train."""
     X, y = _linear_data(n=40)
-    est = GlassboxRegressor(random_state=1, generations=5, multi_start_runs=1, timeout=10)
+    est = GlassboxRegressor(
+        random_state=1, generations=5, multi_start_runs=1, timeout=10
+    )
     est.fit(X, y, sample_weight=None)
     # Emphasize the last 10 points only in the stored full-length weight vector.
     w = np.ones(40)
@@ -205,19 +233,27 @@ def test_formula_mse_uses_sliced_weights_on_holdout_like_subset():
     # Predictions constant 0 so error is just y^2; last-10 slice should be weighted.
     est._safe_eval_formula_array = lambda formula, X_in: np.zeros(X_in.shape[0])
     full = est._formula_mse("0", X, y)
-    holdout = est._formula_mse("0", X[30:], y[30:], sample_weight_indices=np.arange(30, 40))
+    holdout = est._formula_mse(
+        "0", X[30:], y[30:], sample_weight_indices=np.arange(30, 40)
+    )
     # Holdout only has high-weight region; after mean-1 normalize the relative
     # pattern still applies within the slice.
     assert np.isfinite(full) and np.isfinite(holdout)
     # Sliced call must not raise and must equal direct weighted mse on the subset
-    from glassbox.sr.sklearn_wrapper import _weighted_mse, _slice_sample_weight
-    direct = _weighted_mse(np.zeros(10), y[30:], _slice_sample_weight(est.sample_weight_, indices=np.arange(30, 40)))
+    from glassbox.sr.sklearn_wrapper import _slice_sample_weight, _weighted_mse
+
+    direct = _weighted_mse(
+        np.zeros(10),
+        y[30:],
+        _slice_sample_weight(est.sample_weight_, indices=np.arange(30, 40)),
+    )
     assert pytest.approx(holdout, rel=1e-9) == direct
 
 
 def test_auto_soft_weights_activate_on_1d_outliers():
     """Phase 3: 1D SR should auto soft-weight outliers so evolution gets y_weights."""
     import numpy as np
+
     from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
     rng = np.random.RandomState(0)
@@ -259,12 +295,13 @@ def test_auto_soft_weights_activate_on_1d_outliers():
 def test_auto_soft_weights_skip_clean_1d():
     """Clean 1D targets should not invent soft weights (preserve Phase 0 clean Exact)."""
     import numpy as np
+
     from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
     for y_fn, label in (
         (lambda x: 2.0 * x + 1.0, "linear"),
-        (lambda x: x ** 2, "poly_x2"),
-        (lambda x: x ** 3 + x ** 2 + x, "nguyen1"),
+        (lambda x: x**2, "poly_x2"),
+        (lambda x: x**3 + x**2 + x, "nguyen1"),
     ):
         x = np.linspace(-2.0, 2.0, 100).reshape(-1, 1)
         y = y_fn(x[:, 0])
@@ -285,16 +322,20 @@ def test_auto_soft_weights_skip_clean_1d():
             pass
         applied = getattr(est, "_blackbox_noise_robust_applied_", {}) or {}
         assert applied.get("active") is not True, (label, applied)
-        assert not getattr(est, "sample_weight_provided_", False) or est.sample_weight_ is None
+        assert (
+            not getattr(est, "sample_weight_provided_", False)
+            or est.sample_weight_ is None
+        )
 
 
 def test_auto_residual_soft_weights_helper_matrix():
     """Residual soft weights: clean families off; block outliers on."""
     import numpy as np
+
     from glassbox.sr.sklearn_wrapper import _auto_residual_soft_weights
 
     x = np.linspace(-2.0, 2.0, 200)
-    soft, out = _auto_residual_soft_weights(x.reshape(-1, 1), x ** 2)
+    soft, out = _auto_residual_soft_weights(x.reshape(-1, 1), x**2)
     assert soft is None
 
     y = (2.0 * x + 1.0).copy()
@@ -308,6 +349,7 @@ def test_auto_residual_soft_weights_helper_matrix():
 def test_auto_weight_final_guard_rejects_bloated_formula():
     """Guardrail: bloated bad formula fails unweighted checks under auto soft-weights."""
     import numpy as np
+
     from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
     x = np.linspace(-2.0, 2.0, 120).reshape(-1, 1)
@@ -346,12 +388,15 @@ def test_auto_weight_final_guard_rejects_bloated_formula():
     diag = est.blackbox_diagnostics_.get("auto_weight_final_guard") or {}
     assert diag.get("active") is True
     assert diag.get("primary_ok") is False
-    assert "complexity_cap" in (diag.get("primary_reasons") or []) or not diag.get("primary_ok")
+    assert "complexity_cap" in (diag.get("primary_reasons") or []) or not diag.get(
+        "primary_ok"
+    )
 
 
 def test_auto_weight_guard_inactive_without_auto_weights():
     """Guard must not rewrite formulas when auto soft-weights are off."""
     import numpy as np
+
     from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
     x = np.linspace(-1, 1, 40).reshape(-1, 1)
@@ -367,6 +412,7 @@ def test_auto_weight_guard_inactive_without_auto_weights():
 
 def test_evaluate_auto_weight_guard_ok_on_true_structure():
     import numpy as np
+
     from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
     x = np.linspace(-2, 2, 80).reshape(-1, 1)
@@ -382,6 +428,7 @@ def test_evaluate_auto_weight_guard_ok_on_true_structure():
 def test_phase6_parsimony_prefers_simpler_similar_r2():
     """Phase 6: under auto soft-MAD, prefer simpler formula with similar unweighted fit."""
     import numpy as np
+
     from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
     x = np.linspace(-2.0, 2.0, 100).reshape(-1, 1)
@@ -396,7 +443,9 @@ def test_phase6_parsimony_prefers_simpler_similar_r2():
         "reason": "soft_mad_weights",
         "path": "1d_sr",
     }
-    est.blackbox_diagnostics_ = {"sample_weight": {"provided": True, "source": "auto_soft_mad"}}
+    est.blackbox_diagnostics_ = {
+        "sample_weight": {"provided": True, "source": "auto_soft_mad"}
+    }
     est.sample_weight_provided_ = True
     est.sample_weight_ = np.ones(len(y))
     simple = "x**2"
@@ -416,6 +465,7 @@ def test_phase6_parsimony_prefers_simpler_similar_r2():
 def test_residual_skipped_when_auto_weight_1d_already_good():
     """Phase 6: residual boosting skipped under auto weights when 1D fit is already excellent."""
     import numpy as np
+
     from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
     x = np.linspace(-2.0, 2.0, 80).reshape(-1, 1)
@@ -433,7 +483,9 @@ def test_residual_skipped_when_auto_weight_1d_already_good():
         "reason": "soft_mad_weights",
         "path": "1d_sr",
     }
-    est.blackbox_diagnostics_ = {"sample_weight": {"provided": True, "source": "auto_soft_mad"}}
+    est.blackbox_diagnostics_ = {
+        "sample_weight": {"provided": True, "source": "auto_soft_mad"}
+    }
     out = est._run_residual_boosting_impl(x, y, "2*x + 1")
     assert out == "2*x + 1"
     assert (est.boosting_diagnostics_ or {}).get("skip_reason") in (
@@ -445,6 +497,7 @@ def test_residual_skipped_when_auto_weight_1d_already_good():
 
 def test_estimate_diffuse_noise_ratio_clean_vs_noisy():
     import numpy as np
+
     from glassbox.sr.sklearn_wrapper import _estimate_diffuse_noise_ratio
 
     rng = np.random.RandomState(0)
@@ -460,6 +513,7 @@ def test_estimate_diffuse_noise_ratio_clean_vs_noisy():
 def test_phase4_diffuse_noise_enables_huber():
     """Phase 4: 10% Gaussian (no sparse outliers) switches search loss to huber."""
     import numpy as np
+
     from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
     rng = np.random.RandomState(0)
@@ -486,14 +540,17 @@ def test_phase4_diffuse_noise_enables_huber():
     assert applied.get("active") is True, applied
     assert applied.get("reason") in ("diffuse_noise_huber", "soft_mad_weights"), applied
     # Search used huber; public hyperparameter must remain user default after fit.
-    assert applied.get("loss_mode_switched_to_huber") is True or str(
-        ((est.blackbox_diagnostics_ or {}).get("loss_mode") or {}).get("mode")
-    ) == "huber"
+    assert (
+        applied.get("loss_mode_switched_to_huber") is True
+        or str(((est.blackbox_diagnostics_ or {}).get("loss_mode") or {}).get("mode"))
+        == "huber"
+    )
     assert str(est.loss_mode) == "mse"
 
 
 def test_phase4_clean_stays_mse():
     import numpy as np
+
     from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
     x = np.linspace(-2.0, 2.0, 80).reshape(-1, 1)
@@ -515,7 +572,10 @@ def test_phase4_clean_stays_mse():
     except Exception:
         pass
     applied = getattr(est, "_blackbox_noise_robust_applied_", {}) or {}
-    assert applied.get("active") is not True or applied.get("reason") != "diffuse_noise_huber"
+    assert (
+        applied.get("active") is not True
+        or applied.get("reason") != "diffuse_noise_huber"
+    )
     # Clean should keep mse unless something else forced robust
     if not applied.get("active"):
         assert str(est.loss_mode) == "mse"
@@ -523,6 +583,7 @@ def test_phase4_clean_stays_mse():
 
 def test_phase4_user_loss_mode_not_overridden():
     import numpy as np
+
     from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
     rng = np.random.RandomState(0)
@@ -547,10 +608,10 @@ def test_phase4_user_loss_mode_not_overridden():
     assert str(est.loss_mode) == "trimmed_mse"
 
 
-
 def test_auto_huber_does_not_stick_loss_mode_across_fits():
     """Phase 4 auto Huber must not permanently mutate public loss_mode (sklearn reuse)."""
     import numpy as np
+
     from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
     rng = np.random.RandomState(0)
@@ -581,7 +642,9 @@ def test_auto_huber_does_not_stick_loss_mode_across_fits():
     # Diagnostics should still record that search used huber when activated.
     if applied.get("reason") == "diffuse_noise_huber":
         lm = (est.blackbox_diagnostics_ or {}).get("loss_mode") or {}
-        assert str(lm.get("mode") or "") == "huber" or applied.get("loss_mode_switched_to_huber")
+        assert str(lm.get("mode") or "") == "huber" or applied.get(
+            "loss_mode_switched_to_huber"
+        )
 
     try:
         est.fit(x, y_clean)

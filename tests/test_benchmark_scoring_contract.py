@@ -5,14 +5,14 @@ from pathlib import Path
 
 import numpy as np
 
-from scripts import benchmark_suite as bs
 from scripts import benchmark_common as bc
+from scripts import benchmark_suite as bs
 from scripts import classifier_fast_path as cfp
 
 
 def test_formula_mse_eval_returns_none_on_parse_failure():
     x = np.linspace(-2.0, 2.0, 64)
-    y = x ** 2
+    y = x**2
 
     assert bs._evaluate_formula_mse("x^2", x, y) is not None
     assert bs._evaluate_formula_mse("sin(", x, y) is None
@@ -27,25 +27,34 @@ def test_compare_benchmark_results_counts_same_score_formula_and_mse_changes():
     scratch = Path("scratch")
     scratch.mkdir(exist_ok=True)
     previous_path = scratch / "test_compare_previous.json"
-    previous_path.write_text(json.dumps({
-        "tiers": {
-            "1": {
-                "results": [{
-                    "formula_target": "x",
-                    "score": "EXACT",
-                    "mse": 1e-8,
-                    "formula_discovered": "x",
-                }]
+    previous_path.write_text(
+        json.dumps(
+            {
+                "tiers": {
+                    "1": {
+                        "results": [
+                            {
+                                "formula_target": "x",
+                                "score": "EXACT",
+                                "mse": 1e-8,
+                                "formula_discovered": "x",
+                            }
+                        ]
+                    }
+                }
             }
-        }
-    }), encoding="utf-8")
+        ),
+        encoding="utf-8",
+    )
     current = {
-        1: [{
-            "formula_target": "x",
-            "score": "EXACT",
-            "mse": 5e-8,
-            "formula_discovered": "1*x",
-        }]
+        1: [
+            {
+                "formula_target": "x",
+                "score": "EXACT",
+                "mse": 5e-8,
+                "formula_discovered": "1*x",
+            }
+        ]
     }
 
     try:
@@ -190,7 +199,10 @@ def test_decomposition_probe_candidates_capture_product_sum():
     assert candidates
     assert candidates[0]["mse"] < 1e-10
     assert candidates[0]["source"] == "decomposition_probe"
-    assert candidates[0]["decomposition_probe_type"] in {"additive_pair", "multiplicative_pair"}
+    assert candidates[0]["decomposition_probe_type"] in {
+        "additive_pair",
+        "multiplicative_pair",
+    }
 
 
 def test_benchmark_guided_evolution_receives_fast_path_candidate_pool(monkeypatch):
@@ -221,7 +233,11 @@ def test_benchmark_guided_evolution_receives_fast_path_candidate_pool(monkeypatc
 
     monkeypatch.setattr(bs, "run_fast_path", _fake_fast_path)
     monkeypatch.setattr(bs, "run_guided_evolution", _fake_guided)
-    monkeypatch.setattr(bs, "_evaluate_formula_mse", lambda formula, *a, **k: 1.0 if formula == "x" else 0.0)
+    monkeypatch.setattr(
+        bs,
+        "_evaluate_formula_mse",
+        lambda formula, *a, **k: 1.0 if formula == "x" else 0.0,
+    )
 
     result = bs.run_formula(
         formula_str="sin(x)*cos(x)+0.25*x",
@@ -374,7 +390,11 @@ def test_run_formula_can_trust_proposer_search_plan(monkeypatch):
     monkeypatch.setattr(bs, "run_fast_path", _fake_fast_path)
     monkeypatch.setattr(bs, "run_guided_evolution", _fake_guided)
     monkeypatch.setattr(bs, "_get_proposer", lambda *args, **kwargs: object())
-    monkeypatch.setattr(bs, "_evaluate_formula_mse", lambda formula, *a, **k: 1.0 if formula == "x" else 0.0)
+    monkeypatch.setattr(
+        bs,
+        "_evaluate_formula_mse",
+        lambda formula, *a, **k: 1.0 if formula == "x" else 0.0,
+    )
 
     import glassbox.universal_proposer as up
 
@@ -408,8 +428,22 @@ def test_run_formula_can_trust_proposer_search_plan(monkeypatch):
 
 def test_run_formula_passes_candidate_formulas(monkeypatch):
     candidates = [
-        {"formula": "x", "mse": 0.0, "score": 0.0, "n_nonzero": 1, "active_terms": ["x"], "alpha": 0.0},
-        {"formula": "2*x", "mse": 0.1, "score": 0.101, "n_nonzero": 1, "active_terms": ["x"], "alpha": 0.1},
+        {
+            "formula": "x",
+            "mse": 0.0,
+            "score": 0.0,
+            "n_nonzero": 1,
+            "active_terms": ["x"],
+            "alpha": 0.0,
+        },
+        {
+            "formula": "2*x",
+            "mse": 0.1,
+            "score": 0.101,
+            "n_nonzero": 1,
+            "active_terms": ["x"],
+            "alpha": 0.1,
+        },
     ]
 
     def _fake_fast_path(*args, **kwargs):
@@ -456,7 +490,11 @@ def test_run_formula_preserves_guided_raw_mse_and_seed_candidates(monkeypatch):
 
     monkeypatch.setattr(bs, "run_fast_path", _fake_fast_path)
     monkeypatch.setattr(bs, "run_guided_evolution", _fake_guided)
-    monkeypatch.setattr(bs, "_evaluate_formula_mse", lambda formula, *a, **k: 1.0 if formula == "x" else 0.0)
+    monkeypatch.setattr(
+        bs,
+        "_evaluate_formula_mse",
+        lambda formula, *a, **k: 1.0 if formula == "x" else 0.0,
+    )
 
     result = bs.run_formula(
         formula_str="x^2",
@@ -570,10 +608,18 @@ def test_specialist_regressor_benchmark_can_enable_full_phases(monkeypatch):
 
 def test_classifier_prior_trust_from_uncertainty_extremes():
     high_trust = cfp._classifier_prior_trust_from_uncertainty(
-        {"prediction_entropy": 0.05, "prediction_margin": 0.45, "prediction_uncertain": False}
+        {
+            "prediction_entropy": 0.05,
+            "prediction_margin": 0.45,
+            "prediction_uncertain": False,
+        }
     )
     low_trust = cfp._classifier_prior_trust_from_uncertainty(
-        {"prediction_entropy": 0.99, "prediction_margin": 0.0, "prediction_uncertain": True}
+        {
+            "prediction_entropy": 0.99,
+            "prediction_margin": 0.0,
+            "prediction_uncertain": True,
+        }
     )
 
     assert 0.0 <= low_trust <= high_trust <= 1.0
@@ -589,7 +635,10 @@ def test_blend_priors_with_uniform_respects_trust():
     assert abs(sum(almost_uniform) - 1.0) < 1e-12
     assert abs(sum(almost_base) - 1.0) < 1e-12
     assert max(abs(v - 0.25) for v in almost_uniform) < 1e-12
-    assert max(abs(v - e) for v, e in zip(almost_base, cfp._normalize_priors(base))) < 1e-12
+    assert (
+        max(abs(v - e) for v, e in zip(almost_base, cfp._normalize_priors(base)))
+        < 1e-12
+    )
 
 
 def test_attach_clean_target_metrics_flags_wrong_structure():
@@ -624,7 +673,10 @@ def test_attach_clean_target_metrics_true_formula_recovers():
 
 def test_generate_xy_with_optional_noise_keeps_clean_copy():
     x, y_fit, y_clean = bs._generate_xy_with_optional_noise(
-        "2*x", -2.0, 2.0, 64,
+        "2*x",
+        -2.0,
+        2.0,
+        64,
         noise_cfg={"noise_type": "gaussian", "noise_level": 0.1},
         noise_seed=7,
     )

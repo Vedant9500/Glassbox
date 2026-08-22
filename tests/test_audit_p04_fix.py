@@ -14,7 +14,7 @@ diagnostics ``fd_probes_total`` / ``fd_probes_skipped_inert``.
 import numpy as np
 import pytest
 
-from glassbox.sr.cpp import get_cpp_core, CPP_AVAILABLE
+from glassbox.sr.cpp import CPP_AVAILABLE, get_cpp_core
 
 pytestmark = pytest.mark.skipif(not CPP_AVAILABLE, reason="C++ core unavailable")
 
@@ -28,7 +28,7 @@ def core():
 def periodic_power_problem(core):
     """sin + power target whose seed graphs contain inert-param nodes."""
     x = np.linspace(0.2, 3.0, 120)
-    y = np.sin(3.0 * x) + x ** 1.5
+    y = np.sin(3.0 * x) + x**1.5
     seeds = [
         core.formula_to_seed_graph(s)
         for s in ("sin(3*x0)+x0**1.5", "sin(2*x0)", "x0**2", "log(x0+1)")
@@ -38,7 +38,8 @@ def periodic_power_problem(core):
 
 def _run(core, x, y, seeds, use_lm):
     return core.run_evolution(
-        [x], y,
+        [x],
+        y,
         pop_size=30,
         generations=15,
         num_islands=1,

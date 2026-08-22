@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import argparse
 import re
-from pathlib import Path
 import sys
-from typing import List, Tuple, Optional, Sequence
+from collections.abc import Sequence
+from pathlib import Path
 
 # Add the repository root to sys.path so we can import glassbox
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -23,38 +23,24 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from glassbox.universal_proposer import (
-    UniversalProposer,
-    UniversalProposerConfig,
     DEFAULT_OPERATOR_VOCAB,
     DEFAULT_SKELETON_VOCAB,
     DEFAULT_UNIVARIATE_SKELETON_VOCAB,
-    DEFAULT_MULTIVARIATE_SKELETON_VOCAB,
     UNIVERSAL_PROPOSER_ARCHITECTURE_VERSION,
     UNIVERSAL_PROPOSER_CONTRACT_VERSION,
     UNIVERSAL_PROPOSER_ROLE,
+    UniversalProposer,
+    UniversalProposerConfig,
     normalize_formula_key,
 )
 
 try:
     from glassbox.curve_classifier.generate_curve_data import (
+        FEATURE_DIM,
+        N_CLASSES,
+        OPERATOR_CLASSES,
         extract_all_features,
         extract_all_features_xy,
-        evaluate_formula,
-        OPERATOR_CLASSES,
-        FEATURE_DIM,
-        FEATURE_SCHEMA,
-        N_CLASSES,
-    )
-    from glassbox.curve_classifier.validation import (
-        build_validation_report,
-        default_validation_report_path,
-        family_holdout_split,
-        formula_keys_from_metadata_or_formulas,
-        grouped_train_val_split,
-        multilabel_metrics_by_group,
-        metrics_to_json_dict,
-        row_train_val_split,
-        write_validation_report,
     )
     from glassbox.curve_classifier.rollout import (
         build_checkpoint_card,
@@ -64,27 +50,25 @@ try:
         load_json_report,
         write_checkpoint_card,
         write_rollout_comparison,
+    )
+    from glassbox.curve_classifier.validation import (
+        build_validation_report,
+        default_validation_report_path,
+        family_holdout_split,
+        formula_keys_from_metadata_or_formulas,
+        grouped_train_val_split,
+        metrics_to_json_dict,
+        multilabel_metrics_by_group,
+        row_train_val_split,
+        write_validation_report,
     )
 except Exception:
     from glassbox.curve_classifier.generate_curve_data import (
+        FEATURE_DIM,
+        N_CLASSES,
+        OPERATOR_CLASSES,
         extract_all_features,
         extract_all_features_xy,
-        evaluate_formula,
-        OPERATOR_CLASSES,
-        FEATURE_DIM,
-        FEATURE_SCHEMA,
-        N_CLASSES,
-    )
-    from glassbox.curve_classifier.validation import (
-        build_validation_report,
-        default_validation_report_path,
-        family_holdout_split,
-        formula_keys_from_metadata_or_formulas,
-        grouped_train_val_split,
-        multilabel_metrics_by_group,
-        metrics_to_json_dict,
-        row_train_val_split,
-        write_validation_report,
     )
     from glassbox.curve_classifier.rollout import (
         build_checkpoint_card,
@@ -94,6 +78,17 @@ except Exception:
         load_json_report,
         write_checkpoint_card,
         write_rollout_comparison,
+    )
+    from glassbox.curve_classifier.validation import (
+        build_validation_report,
+        default_validation_report_path,
+        family_holdout_split,
+        formula_keys_from_metadata_or_formulas,
+        grouped_train_val_split,
+        metrics_to_json_dict,
+        multilabel_metrics_by_group,
+        row_train_val_split,
+        write_validation_report,
     )
 
 
@@ -111,7 +106,7 @@ def apply_feature_transform(features: np.ndarray) -> np.ndarray:
     return x
 
 
-def _coerce_operator_classes(raw, n_classes: int) -> List[str]:
+def _coerce_operator_classes(raw, n_classes: int) -> list[str]:
     if raw is None:
         return list(OPERATOR_CLASSES.keys())[:n_classes]
     if isinstance(raw, np.ndarray):
@@ -147,7 +142,9 @@ def load_training_data(
         blob["operator_classes"] if "operator_classes" in blob else None,
         n_classes,
     )
-    feature_dim = int(blob["feature_dim"]) if "feature_dim" in blob else int(features.shape[1])
+    feature_dim = (
+        int(blob["feature_dim"]) if "feature_dim" in blob else int(features.shape[1])
+    )
     feature_schema = blob["feature_schema"].item() if "feature_schema" in blob else None
     n_loaded = int(features.shape[0])
     metadata = {
@@ -159,20 +156,33 @@ def load_training_data(
         ),
         "generator_families": (
             np.asarray(blob["generator_families"][:n_loaded], dtype=object)
-            if "generator_families" in blob else None
+            if "generator_families" in blob
+            else None
         ),
         "template_ids": (
             np.asarray(blob["template_ids"][:n_loaded], dtype=object)
-            if "template_ids" in blob else None
+            if "template_ids" in blob
+            else None
         ),
-        "labeler_version": str(blob["labeler_version"]) if "labeler_version" in blob else None,
+        "labeler_version": str(blob["labeler_version"])
+        if "labeler_version" in blob
+        else None,
         "labels_match_semantic": (
             np.asarray(blob["labels_match_semantic"][:n_loaded], dtype=bool)
-            if "labels_match_semantic" in blob else None
+            if "labels_match_semantic" in blob
+            else None
         ),
     }
     if return_metadata:
-        return features, labels, formulas, operator_classes, feature_dim, feature_schema, metadata
+        return (
+            features,
+            labels,
+            formulas,
+            operator_classes,
+            feature_dim,
+            feature_schema,
+            metadata,
+        )
     return features, labels, formulas, operator_classes, feature_dim, feature_schema
 
 
@@ -180,7 +190,7 @@ def compute_feature_stats(
     features: np.ndarray,
     indices: np.ndarray,
     chunk_size: int = 65536,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Compute feature mean/std on selected rows without full subset materialization."""
     indices = np.asarray(indices, dtype=np.int64)
     if len(indices) == 0:
@@ -192,7 +202,7 @@ def compute_feature_stats(
     sum_x2 = np.zeros(n_features, dtype=np.float64)
 
     for start in range(0, len(indices), chunk_size):
-        batch_idx = indices[start:start + chunk_size]
+        batch_idx = indices[start : start + chunk_size]
         batch = np.asarray(features[batch_idx], dtype=np.float64)
 
         batch = apply_feature_transform(batch).astype(np.float64, copy=False)
@@ -231,25 +241,44 @@ def compute_operator_pos_weight(
 ) -> torch.Tensor:
     """Compute BCE positive weights for the proposer operator vocabulary."""
     subset = np.asarray(labels[np.asarray(indices, dtype=np.int64)], dtype=np.float32)
-    source_idx = {name: i for i, name in enumerate(_coerce_operator_classes(operator_classes, subset.shape[1]))}
+    source_idx = {
+        name: i
+        for i, name in enumerate(
+            _coerce_operator_classes(operator_classes, subset.shape[1])
+        )
+    }
     weights = []
     for name in DEFAULT_OPERATOR_VOCAB:
         if name == "periodic":
             sin_idx = source_idx.get("sin")
             cos_idx = source_idx.get("cos")
-            sin_val = subset[:, sin_idx] if sin_idx is not None and sin_idx < subset.shape[1] else 0.0
-            cos_val = subset[:, cos_idx] if cos_idx is not None and cos_idx < subset.shape[1] else 0.0
+            sin_val = (
+                subset[:, sin_idx]
+                if sin_idx is not None and sin_idx < subset.shape[1]
+                else 0.0
+            )
+            cos_val = (
+                subset[:, cos_idx]
+                if cos_idx is not None and cos_idx < subset.shape[1]
+                else 0.0
+            )
             positive = np.maximum(sin_val, cos_val)
         else:
             idx = source_idx.get(name)
-            positive = subset[:, idx] if idx is not None and idx < subset.shape[1] else np.zeros(subset.shape[0])
+            positive = (
+                subset[:, idx]
+                if idx is not None and idx < subset.shape[1]
+                else np.zeros(subset.shape[0])
+            )
         pos = float(np.sum(positive > 0.5))
         neg = float(max(0, subset.shape[0] - pos))
         weights.append(np.clip(neg / max(pos, 1.0), 0.5, float(cap)))
     return torch.tensor(weights, dtype=torch.float32)
 
 
-def skeleton_loss_enabled_from_coverage(dataset: Dataset, min_coverage: float = 0.80) -> tuple[bool, float]:
+def skeleton_loss_enabled_from_coverage(
+    dataset: Dataset, min_coverage: float = 0.80
+) -> tuple[bool, float]:
     """Enable skeleton loss only when fixed vocab covers enough training rows."""
     targets = getattr(dataset, "skeleton_targets", None)
     if targets is not None:
@@ -301,7 +330,7 @@ class SyntheticCurveDataset(Dataset):
             y = x
             ops = ["identity"]
         elif kind == 1:
-            y = x ** 2
+            y = x**2
             ops = ["power"]
         elif kind == 2:
             y = np.sin(x)
@@ -354,13 +383,13 @@ class FormulaReplayDataset(Dataset):
     def __init__(
         self,
         features: np.ndarray | str | Path,
-        labels: Optional[np.ndarray] = None,
-        indices: Optional[np.ndarray] = None,
-        operator_classes: Optional[Sequence[str]] = None,
-        formulas: Optional[Sequence[str]] = None,
-        scaler: Optional[dict] = None,
-        device: Optional[torch.device] = None,
-        n_points: Optional[int] = None,
+        labels: np.ndarray | None = None,
+        indices: np.ndarray | None = None,
+        operator_classes: Sequence[str] | None = None,
+        formulas: Sequence[str] | None = None,
+        scaler: dict | None = None,
+        device: torch.device | None = None,
+        n_points: int | None = None,
     ):
         if labels is None and isinstance(features, (str, Path)):
             (
@@ -373,7 +402,9 @@ class FormulaReplayDataset(Dataset):
             ) = load_training_data(str(features), n_classes=N_CLASSES)
 
         if labels is None:
-            raise ValueError("labels must be provided when features is not a dataset path")
+            raise ValueError(
+                "labels must be provided when features is not a dataset path"
+            )
 
         self.indices = (
             np.asarray(indices, dtype=np.int64)
@@ -383,32 +414,42 @@ class FormulaReplayDataset(Dataset):
         self.scaler = scaler
         self.operator_vocab = list(DEFAULT_OPERATOR_VOCAB)
         self.skeleton_vocab = list(DEFAULT_SKELETON_VOCAB)
-        self.operator_classes = _coerce_operator_classes(operator_classes, int(labels.shape[1]))
+        self.operator_classes = _coerce_operator_classes(
+            operator_classes, int(labels.shape[1])
+        )
         self.formulas = list(formulas) if formulas is not None else None
         self.n_points = n_points
         self.n_input_vars = 1
         if self.formulas:
             self.n_input_vars = max(1, self._infer_formula_input_vars(self.formulas))
-        self.skeleton_vocab_keys = [self._canonical_vocab_key(item) for item in self.skeleton_vocab]
+        self.skeleton_vocab_keys = [
+            self._canonical_vocab_key(item) for item in self.skeleton_vocab
+        ]
 
         self.is_on_device = False
-        if device is not None and device.type == 'cuda':
+        if device is not None and device.type == "cuda":
             print(f"Transferring dataset to {device}...")
             # Slice first to save memory
             x_sliced = apply_feature_transform(features[self.indices])
             y_sliced = np.asarray(labels[self.indices], dtype=np.float32)
 
             if self.scaler is not None:
-                x_sliced = (x_sliced - self.scaler['mean']) / (self.scaler['std'] + 1e-8)
-            
+                x_sliced = (x_sliced - self.scaler["mean"]) / (
+                    self.scaler["std"] + 1e-8
+                )
+
             # Convert labels to targets eagerly
-            op_targets = np.zeros((len(y_sliced), len(self.operator_vocab)), dtype=np.float32)
+            op_targets = np.zeros(
+                (len(y_sliced), len(self.operator_vocab)), dtype=np.float32
+            )
             skeleton_targets = np.full(len(y_sliced), -1, dtype=np.int64)
             for i, row in enumerate(y_sliced):
                 op_targets[i] = self._labels_to_operator_target(row)
                 if self.formulas is not None:
-                    skeleton_targets[i] = self._formula_to_skeleton_target(self.formulas[int(self.indices[i])])
-                
+                    skeleton_targets[i] = self._formula_to_skeleton_target(
+                        self.formulas[int(self.indices[i])]
+                    )
+
             self.features = torch.from_numpy(x_sliced).to(device)
             self.labels = torch.from_numpy(op_targets).to(device)
             self.skeleton_targets = torch.from_numpy(skeleton_targets).to(device)
@@ -454,9 +495,15 @@ class FormulaReplayDataset(Dataset):
         if "periodic" in self.operator_vocab:
             sin_idx = source_idx.get("sin")
             cos_idx = source_idx.get("cos")
-            sin_val = row[sin_idx] if sin_idx is not None and sin_idx < row.shape[0] else 0.0
-            cos_val = row[cos_idx] if cos_idx is not None and cos_idx < row.shape[0] else 0.0
-            op[self.operator_vocab.index("periodic")] = max(float(sin_val), float(cos_val))
+            sin_val = (
+                row[sin_idx] if sin_idx is not None and sin_idx < row.shape[0] else 0.0
+            )
+            cos_val = (
+                row[cos_idx] if cos_idx is not None and cos_idx < row.shape[0] else 0.0
+            )
+            op[self.operator_vocab.index("periodic")] = max(
+                float(sin_val), float(cos_val)
+            )
         return op
 
     def _formula_to_skeleton_target(self, formula: str) -> int:
@@ -470,19 +517,25 @@ class FormulaReplayDataset(Dataset):
 
     def __getitem__(self, idx: int):
         sample_idx = int(self.indices[idx])
-        
+
         if self.is_on_device:
-            return self.features[sample_idx], self.labels[sample_idx], self.skeleton_targets[sample_idx]
-            
+            return (
+                self.features[sample_idx],
+                self.labels[sample_idx],
+                self.skeleton_targets[sample_idx],
+            )
+
         feat = apply_feature_transform(self.features[sample_idx])
-        
+
         if self.scaler is not None:
-            feat = (feat - self.scaler['mean']) / (self.scaler['std'] + 1e-8)
-            
+            feat = (feat - self.scaler["mean"]) / (self.scaler["std"] + 1e-8)
+
         op_target = self._labels_to_operator_target(self.labels[sample_idx])
         skeleton_target = -1
         if self.formulas is not None:
-            skeleton_target = self._formula_to_skeleton_target(self.formulas[sample_idx])
+            skeleton_target = self._formula_to_skeleton_target(
+                self.formulas[sample_idx]
+            )
         return (
             torch.from_numpy(feat.astype(np.float32)),
             torch.from_numpy(op_target),
@@ -496,31 +549,31 @@ def _train_epoch(
     optimizer,
     device,
     scaler=None,
-    operator_pos_weight: Optional[torch.Tensor] = None,
+    operator_pos_weight: torch.Tensor | None = None,
     skeleton_loss_weight: float = 0.2,
 ) -> float:
     model.train()
-    
+
     # Fast-path for VRAM-resident datasets (Bypasses Python DataLoader overhead)
     ds = loader.dataset
-    if hasattr(ds, "is_on_device") and ds.is_on_device and device.type == 'cuda':
+    if hasattr(ds, "is_on_device") and ds.is_on_device and device.type == "cuda":
         total_loss = torch.zeros(1, device=device)
         n_samples = len(ds)
         batch_size = loader.batch_size
-        
+
         # GPU-side shuffle (Zero CPU overhead)
         indices = torch.randperm(n_samples, device=device)
-        
+
         for start_idx in range(0, n_samples, batch_size):
             end_idx = min(start_idx + batch_size, n_samples)
             batch_idx = indices[start_idx:end_idx]
-            
+
             features = ds.features[batch_idx]
             op_target = ds.labels[batch_idx]
-            
+
             optimizer.zero_grad(set_to_none=True)
             # Automatic Mixed Precision for max Tensor Core utilization
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
                 out = model(features)
                 loss = F.binary_cross_entropy_with_logits(
                     out["operator_logits"],
@@ -534,7 +587,7 @@ def _train_epoch(
                         out["skeleton_logits"][valid_skeleton],
                         skeleton_target[valid_skeleton],
                     )
-                
+
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -542,9 +595,9 @@ def _train_epoch(
             else:
                 loss.backward()
                 optimizer.step()
-            
+
             total_loss += loss.detach() * (end_idx - start_idx)
-            
+
         return float((total_loss / max(n_samples, 1)).item())
 
     # Standard path for RAM/Disk loaded datasets
@@ -557,9 +610,11 @@ def _train_epoch(
         op_target = op_target.to(device, non_blocking=True)
         skeleton_target = skeleton_target.to(device, non_blocking=True)
 
-        optimizer.zero_grad(set_to_none=True) 
-        
-        with torch.autocast(device_type=device.type, enabled=device.type=='cuda', dtype=torch.float16):
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.autocast(
+            device_type=device.type, enabled=device.type == "cuda", dtype=torch.float16
+        ):
             out = model(features)
             loss = F.binary_cross_entropy_with_logits(
                 out["operator_logits"],
@@ -642,30 +697,30 @@ def _evaluate(
     model,
     loader,
     device,
-    operator_pos_weight: Optional[torch.Tensor] = None,
+    operator_pos_weight: torch.Tensor | None = None,
     skeleton_loss_weight: float = 0.2,
 ) -> dict:
     model.eval()
-    
+
     ds = loader.dataset
     all_preds = []
     all_labels = []
     all_skeleton_logits = []
     all_skeleton_targets = []
-    
-    if hasattr(ds, "is_on_device") and ds.is_on_device and device.type == 'cuda':
+
+    if hasattr(ds, "is_on_device") and ds.is_on_device and device.type == "cuda":
         total_loss = 0.0
         n_samples = len(ds)
         batch_size = loader.batch_size
-        
+
         with torch.no_grad():
             for start_idx in range(0, n_samples, batch_size):
                 end_idx = min(start_idx + batch_size, n_samples)
-                
+
                 features = ds.features[start_idx:end_idx]
                 op_target = ds.labels[start_idx:end_idx]
-                
-                with torch.autocast(device_type='cuda', dtype=torch.float16):
+
+                with torch.autocast(device_type="cuda", dtype=torch.float16):
                     out = model(features)
                     loss = F.binary_cross_entropy_with_logits(
                         out["operator_logits"],
@@ -679,25 +734,29 @@ def _evaluate(
                             out["skeleton_logits"][valid_skeleton],
                             skeleton_target[valid_skeleton],
                         )
-                    
+
                 total_loss += loss.item() * (end_idx - start_idx)
                 all_preds.append(torch.sigmoid(out["operator_logits"]).cpu())
                 all_labels.append(op_target.cpu())
                 all_skeleton_logits.append(out["skeleton_logits"].detach().cpu())
                 all_skeleton_targets.append(skeleton_target.detach().cpu())
-                
+
         avg_loss = total_loss / max(n_samples, 1)
     else:
         total_loss = 0.0
         total_samples = 0
-        
+
         with torch.no_grad():
             for features, op_target, skeleton_target in loader:
                 features = features.to(device, non_blocking=True)
                 op_target = op_target.to(device, non_blocking=True)
                 skeleton_target = skeleton_target.to(device, non_blocking=True)
-                
-                with torch.autocast(device_type=device.type, enabled=device.type=='cuda', dtype=torch.float16):
+
+                with torch.autocast(
+                    device_type=device.type,
+                    enabled=device.type == "cuda",
+                    dtype=torch.float16,
+                ):
                     out = model(features)
                     loss = F.binary_cross_entropy_with_logits(
                         out["operator_logits"],
@@ -710,24 +769,24 @@ def _evaluate(
                             out["skeleton_logits"][valid_skeleton],
                             skeleton_target[valid_skeleton],
                         )
-                    
+
                 total_loss += loss.item() * features.shape[0]
                 total_samples += features.shape[0]
                 all_preds.append(torch.sigmoid(out["operator_logits"]).cpu())
                 all_labels.append(op_target.cpu())
                 all_skeleton_logits.append(out["skeleton_logits"].detach().cpu())
                 all_skeleton_targets.append(skeleton_target.detach().cpu())
-                
+
         avg_loss = total_loss / max(total_samples, 1)
 
     all_preds = torch.cat(all_preds)
     all_labels = torch.cat(all_labels)
-    
+
     binary_preds = (all_preds > 0.5).float()
     tp_class = ((binary_preds == 1) & (all_labels == 1)).float().sum(dim=0)
     fp_class = ((binary_preds == 1) & (all_labels == 0)).float().sum(dim=0)
     fn_class = ((binary_preds == 0) & (all_labels == 1)).float().sum(dim=0)
-    
+
     precision = tp_class / (tp_class + fp_class + 1e-10)
     recall = tp_class / (tp_class + fn_class + 1e-10)
     f1 = 2 * precision * recall / (precision + recall + 1e-10)
@@ -736,10 +795,16 @@ def _evaluate(
     fn = fn_class.sum()
     micro_f1 = 2 * tp / (2 * tp + fp + fn + 1e-10)
 
-    skeleton_logits = torch.cat(all_skeleton_logits) if all_skeleton_logits else torch.empty(0, 0)
-    skeleton_targets = torch.cat(all_skeleton_targets) if all_skeleton_targets else torch.empty(0, dtype=torch.long)
+    skeleton_logits = (
+        torch.cat(all_skeleton_logits) if all_skeleton_logits else torch.empty(0, 0)
+    )
+    skeleton_targets = (
+        torch.cat(all_skeleton_targets)
+        if all_skeleton_targets
+        else torch.empty(0, dtype=torch.long)
+    )
     skeleton_metrics = _skeleton_metric_summary(skeleton_logits, skeleton_targets)
-    
+
     return {
         "loss": avg_loss,
         "f1": f1.mean().item(),
@@ -747,7 +812,8 @@ def _evaluate(
         "precision_per_operator": precision.numpy(),
         "recall_per_operator": recall.numpy(),
         "f1_per_operator": f1.numpy(),
-        "skeleton_coverage": skeleton_metrics["skeleton_valid_count"] / max(1, int(all_labels.shape[0])),
+        "skeleton_coverage": skeleton_metrics["skeleton_valid_count"]
+        / max(1, int(all_labels.shape[0])),
         "candidate_recall_after_affine_fit": None,
         "candidate_recall_after_affine_fit_note": (
             "Not computed from precomputed feature datasets; requires raw (x, y) curves."
@@ -757,52 +823,127 @@ def _evaluate(
         **skeleton_metrics,
     }
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Train universal proposer (Phase 1 scaffold)")
+    parser = argparse.ArgumentParser(
+        description="Train universal proposer (Phase 1 scaffold)"
+    )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--n-samples", type=int, default=10000)
     parser.add_argument("--n-points", type=int, default=128)
     parser.add_argument("--hidden", type=int, default=512)
-    parser.add_argument("--out", type=str, default="models/universal_proposer_robust.pt")
+    parser.add_argument(
+        "--out", type=str, default="models/universal_proposer_robust.pt"
+    )
     parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--val-split", type=float, default=0.1, help="Validation split ratio")
-    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience")
-    parser.add_argument("--data", type=str, default="", help="Optional dataset .npz path from generate_curve_data")
-    parser.add_argument("--max-samples", type=int, default=0, help="Optional cap when --data is used")
-    parser.add_argument("--load-into-ram", "--load-into-vram", dest="load_into_ram", action="store_true",
-                        help="Load dataset fully into RAM/VRAM for maximum throughput")
-    parser.add_argument("--compile", action="store_true", help="Use torch.compile (PyTorch 2.0+)")
-    parser.add_argument("--split-policy", type=str, default="auto",
-                        choices=["auto", "row", "formula_group", "family_holdout"],
-                        help="Validation split policy. auto uses formula groups when dataset metadata is present.")
-    parser.add_argument("--heldout-family", type=str, default="",
-                        help="Generator family to hold out when --split-policy=family_holdout")
-    parser.add_argument("--validation-report", type=str, default="",
-                        help="Optional output path for Phase 3 validation report JSON")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for reproducibility")
-    parser.add_argument("--checkpoint-card", type=str, default="",
-                        help="Optional output path for Phase 6 checkpoint card JSON")
-    parser.add_argument("--data-generation-command", type=str, default="",
-                        help="Command used to generate this training dataset, saved in the checkpoint card")
-    parser.add_argument("--baseline-card", type=str, default="",
-                        help="Optional baseline checkpoint card for Phase 6 rollout comparison")
-    parser.add_argument("--rollout-comparison", type=str, default="",
-                        help="Optional output path for Phase 6 rollout comparison JSON")
-    parser.add_argument("--rollout-metric", type=str, default="val_f1",
-                        help="Metric name used for optional baseline comparison")
-    parser.add_argument("--min-relative-improvement", type=float, default=0.0,
-                        help="Minimum relative improvement over the baseline metric for rollout readiness")
-    parser.add_argument("--no-class-weights", action="store_true",
-                        help="Disable inverse-frequency positive weights for operator BCE")
-    parser.add_argument("--class-weight-cap", type=float, default=3.0,
-                        help="Maximum positive class weight for operator BCE")
-    parser.add_argument("--skeleton-min-coverage", type=float, default=0.80,
-                        help="Minimum train-set fixed-vocab skeleton coverage required to train skeleton loss")
-    parser.add_argument("--skeleton-loss-weight", type=float, default=0.2,
-                        help="Skeleton cross-entropy loss weight when coverage gate passes")
+    parser.add_argument(
+        "--val-split", type=float, default=0.1, help="Validation split ratio"
+    )
+    parser.add_argument(
+        "--patience", type=int, default=10, help="Early stopping patience"
+    )
+    parser.add_argument(
+        "--data",
+        type=str,
+        default="",
+        help="Optional dataset .npz path from generate_curve_data",
+    )
+    parser.add_argument(
+        "--max-samples", type=int, default=0, help="Optional cap when --data is used"
+    )
+    parser.add_argument(
+        "--load-into-ram",
+        "--load-into-vram",
+        dest="load_into_ram",
+        action="store_true",
+        help="Load dataset fully into RAM/VRAM for maximum throughput",
+    )
+    parser.add_argument(
+        "--compile", action="store_true", help="Use torch.compile (PyTorch 2.0+)"
+    )
+    parser.add_argument(
+        "--split-policy",
+        type=str,
+        default="auto",
+        choices=["auto", "row", "formula_group", "family_holdout"],
+        help="Validation split policy. auto uses formula groups when dataset metadata is present.",
+    )
+    parser.add_argument(
+        "--heldout-family",
+        type=str,
+        default="",
+        help="Generator family to hold out when --split-policy=family_holdout",
+    )
+    parser.add_argument(
+        "--validation-report",
+        type=str,
+        default="",
+        help="Optional output path for Phase 3 validation report JSON",
+    )
+    parser.add_argument(
+        "--seed", type=int, default=42, help="Random seed for reproducibility"
+    )
+    parser.add_argument(
+        "--checkpoint-card",
+        type=str,
+        default="",
+        help="Optional output path for Phase 6 checkpoint card JSON",
+    )
+    parser.add_argument(
+        "--data-generation-command",
+        type=str,
+        default="",
+        help="Command used to generate this training dataset, saved in the checkpoint card",
+    )
+    parser.add_argument(
+        "--baseline-card",
+        type=str,
+        default="",
+        help="Optional baseline checkpoint card for Phase 6 rollout comparison",
+    )
+    parser.add_argument(
+        "--rollout-comparison",
+        type=str,
+        default="",
+        help="Optional output path for Phase 6 rollout comparison JSON",
+    )
+    parser.add_argument(
+        "--rollout-metric",
+        type=str,
+        default="val_f1",
+        help="Metric name used for optional baseline comparison",
+    )
+    parser.add_argument(
+        "--min-relative-improvement",
+        type=float,
+        default=0.0,
+        help="Minimum relative improvement over the baseline metric for rollout readiness",
+    )
+    parser.add_argument(
+        "--no-class-weights",
+        action="store_true",
+        help="Disable inverse-frequency positive weights for operator BCE",
+    )
+    parser.add_argument(
+        "--class-weight-cap",
+        type=float,
+        default=3.0,
+        help="Maximum positive class weight for operator BCE",
+    )
+    parser.add_argument(
+        "--skeleton-min-coverage",
+        type=float,
+        default=0.80,
+        help="Minimum train-set fixed-vocab skeleton coverage required to train skeleton loss",
+    )
+    parser.add_argument(
+        "--skeleton-loss-weight",
+        type=float,
+        default=0.2,
+        help="Skeleton cross-entropy loss weight when coverage gate passes",
+    )
     args = parser.parse_args()
 
     if args.device == "auto":
@@ -811,22 +952,22 @@ def main():
         device = torch.device(args.device)
 
     # Enable TF32 for better performance on Ampere+ GPUs (as suggested by the warning)
-    if device.type == 'cuda':
-        torch.set_float32_matmul_precision('high')
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
 
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    if device.type == 'cuda':
+    if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
 
     config = UniversalProposerConfig(hidden_dim=args.hidden)
     model = UniversalProposer(config).to(device)
     dataset_metadata = {}
-    
+
     if args.compile and hasattr(torch, "compile"):
         print("Compiling model with torch.compile...")
         try:
-            # Wrap in try-except because torch.compile often fails on Windows 
+            # Wrap in try-except because torch.compile often fails on Windows
             # due to Triton/Inductor environment issues.
             model = torch.compile(model)
         except Exception as e:
@@ -849,8 +990,10 @@ def main():
             features_path = base.with_suffix(".features.dat")
             labels_path = base.with_suffix(".labels.dat")
             if not features_path.exists() or not labels_path.exists():
-                raise FileNotFoundError(f"Could not find .npz or .dat files for {args.data}")
-            
+                raise FileNotFoundError(
+                    f"Could not find .npz or .dat files for {args.data}"
+                )
+
             # Infer sizes
             # We assume features are n_samples x 398 (the new feature dim)
             feature_dim = FEATURE_DIM
@@ -858,23 +1001,35 @@ def main():
             file_size = features_path.stat().st_size
             n_samples = file_size // (feature_dim * 4)
             print(f"Inferred n_samples={n_samples} from {features_path.name}")
-            
-            features = np.memmap(features_path, dtype=np.float32, mode="r", shape=(n_samples, feature_dim))
-            labels = np.memmap(labels_path, dtype=np.float32, mode="r", shape=(n_samples, n_classes))
+
+            features = np.memmap(
+                features_path,
+                dtype=np.float32,
+                mode="r",
+                shape=(n_samples, feature_dim),
+            )
+            labels = np.memmap(
+                labels_path, dtype=np.float32, mode="r", shape=(n_samples, n_classes)
+            )
             formulas = None
             operator_classes = list(OPERATOR_CLASSES.keys())[:n_classes]
             feature_schema = None
             dataset_metadata = {"dataset_path": str(args.data)}
-            
+
         if args.max_samples > 0:
-            features = features[:args.max_samples]
-            labels = labels[:args.max_samples]
+            features = features[: args.max_samples]
+            labels = labels[: args.max_samples]
             if formulas is not None:
-                formulas = formulas[:args.max_samples]
-            for key in ("formula_keys", "generator_families", "template_ids", "labels_match_semantic"):
+                formulas = formulas[: args.max_samples]
+            for key in (
+                "formula_keys",
+                "generator_families",
+                "template_ids",
+                "labels_match_semantic",
+            ):
                 value = dataset_metadata.get(key)
                 if value is not None:
-                    dataset_metadata[key] = np.asarray(value)[:args.max_samples]
+                    dataset_metadata[key] = np.asarray(value)[: args.max_samples]
 
         formula_keys = dataset_metadata.get("formula_keys")
         generator_families = dataset_metadata.get("generator_families")
@@ -883,37 +1038,55 @@ def main():
         split_details = {}
         if split_policy == "family_holdout" or args.heldout_family:
             if generator_families is None:
-                raise ValueError("--split-policy=family_holdout requires generator_families metadata")
+                raise ValueError(
+                    "--split-policy=family_holdout requires generator_families metadata"
+                )
             heldout_family = args.heldout_family
             if not heldout_family:
                 family_counts = {}
                 for family in np.asarray(generator_families, dtype=object).astype(str):
                     family_counts[family] = family_counts.get(family, 0) + 1
                 heldout_family = min(family_counts, key=family_counts.get)
-            train_idx, val_idx, split_details = family_holdout_split(generator_families, heldout_family)
+            train_idx, val_idx, split_details = family_holdout_split(
+                generator_families, heldout_family
+            )
             split_policy = "family_holdout"
         elif split_policy in {"auto", "formula_group"} and formula_keys is not None:
-            train_idx, val_idx, split_details = grouped_train_val_split(formula_keys, args.val_split, args.seed)
+            train_idx, val_idx, split_details = grouped_train_val_split(
+                formula_keys, args.val_split, args.seed
+            )
             split_policy = str(split_details.get("policy", "formula_group"))
         else:
-            train_idx, val_idx = row_train_val_split(len(features), args.val_split, args.seed)
+            train_idx, val_idx = row_train_val_split(
+                len(features), args.val_split, args.seed
+            )
             split_policy = "row"
             split_details = {"policy": "row", "exclusive_groups": False}
-        
+
         print("Computing feature statistics (SymLog + Standardize)...")
         mean, std = compute_feature_stats(features, train_idx)
-        feature_scaler = {'mean': mean, 'std': std}
+        feature_scaler = {"mean": mean, "std": std}
 
         # VRAM loading option
         load_to_vram = args.load_into_ram
-        
+
         train_ds = FormulaReplayDataset(
-            features, labels, train_idx, operator_classes=operator_classes, formulas=formulas, scaler=feature_scaler,
-            device=device if load_to_vram else None
+            features,
+            labels,
+            train_idx,
+            operator_classes=operator_classes,
+            formulas=formulas,
+            scaler=feature_scaler,
+            device=device if load_to_vram else None,
         )
         val_ds = FormulaReplayDataset(
-            features, labels, val_idx, operator_classes=operator_classes, formulas=formulas, scaler=feature_scaler,
-            device=device if load_to_vram else None
+            features,
+            labels,
+            val_idx,
+            operator_classes=operator_classes,
+            formulas=formulas,
+            scaler=feature_scaler,
+            device=device if load_to_vram else None,
         )
         operator_pos_weight = None
         if not args.no_class_weights:
@@ -923,19 +1096,25 @@ def main():
                 operator_classes,
                 cap=args.class_weight_cap,
             ).to(device)
-            print(f"  Operator pos_weight: {operator_pos_weight.detach().cpu().numpy().round(2).tolist()}")
+            print(
+                f"  Operator pos_weight: {operator_pos_weight.detach().cpu().numpy().round(2).tolist()}"
+            )
         skeleton_enabled, skeleton_coverage = skeleton_loss_enabled_from_coverage(
             train_ds,
             min_coverage=args.skeleton_min_coverage,
         )
-        skeleton_loss_weight = float(args.skeleton_loss_weight if skeleton_enabled else 0.0)
+        skeleton_loss_weight = float(
+            args.skeleton_loss_weight if skeleton_enabled else 0.0
+        )
         print(
             "  Skeleton loss: "
             f"{'enabled' if skeleton_enabled else 'disabled'} "
             f"(coverage={skeleton_coverage:.3f}, min={args.skeleton_min_coverage:.3f}, "
             f"weight={skeleton_loss_weight:.3f})"
         )
-        print(f"train_samples={len(train_ds)} val_samples={len(val_ds)} path={args.data}")
+        print(
+            f"train_samples={len(train_ds)} val_samples={len(val_ds)} path={args.data}"
+        )
         validation_report = build_validation_report(
             dataset_path=str(args.data),
             split_policy=split_policy,
@@ -983,32 +1162,48 @@ def main():
                 "must create at least one validation sample."
             )
         # Minimal synthetic dataset fallback
-        train_ds = SyntheticCurveDataset(n_samples=args.n_samples, n_points=args.n_points)
+        train_ds = SyntheticCurveDataset(
+            n_samples=args.n_samples, n_points=args.n_points
+        )
         val_ds = SyntheticCurveDataset(n_samples=n_val, n_points=args.n_points)
         print(f"train_samples={len(train_ds)} val_samples={len(val_ds)}")
-        
+
     import os
     import platform
-    use_cuda = device.type == 'cuda'
-    
+
+    use_cuda = device.type == "cuda"
+
     # On Windows, num_workers > 0 with large datasets often causes pickling errors or deadlocks
     # due to the 'spawn' method. If data is already in VRAM, workers are unnecessary.
-    n_workers = 0 
-    if platform.system() != "Windows" and use_cuda and not getattr(train_ds, "is_on_device", False):
+    n_workers = 0
+    if (
+        platform.system() != "Windows"
+        and use_cuda
+        and not getattr(train_ds, "is_on_device", False)
+    ):
         num_cpus = os.cpu_count() or 4
         n_workers = min(8, max(2, num_cpus - 2))
-    
-    loader_kwargs = {'num_workers': n_workers, 'pin_memory': use_cuda and not getattr(train_ds, "is_on_device", False)}
-    if n_workers > 0:
-        loader_kwargs['prefetch_factor'] = 2
-        loader_kwargs['persistent_workers'] = True
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, **loader_kwargs)
+    loader_kwargs = {
+        "num_workers": n_workers,
+        "pin_memory": use_cuda and not getattr(train_ds, "is_on_device", False),
+    }
+    if n_workers > 0:
+        loader_kwargs["prefetch_factor"] = 2
+        loader_kwargs["persistent_workers"] = True
+
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True, **loader_kwargs
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False, **loader_kwargs
+    )
     opt = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode='max', factor=0.5, patience=5)
-    
-    amp_scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode="max", factor=0.5, patience=5
+    )
+
+    amp_scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1036,7 +1231,7 @@ def main():
                 print("[!] Falling back to eager mode for the rest of training.")
                 if hasattr(model, "_orig_mod"):
                     model = model._orig_mod
-                args.compile = False 
+                args.compile = False
                 train_loss = _train_epoch(
                     model,
                     train_loader,
@@ -1048,7 +1243,7 @@ def main():
                 )
             else:
                 raise e
-        
+
         val_metrics = _evaluate(
             model,
             val_loader,
@@ -1059,7 +1254,7 @@ def main():
         val_loss = val_metrics["loss"]
         val_f1 = val_metrics["f1"]
         selection_metric = select_checkpoint_metric(val_metrics)
-        
+
         scheduler.step(selection_metric)
 
         print(
@@ -1067,7 +1262,7 @@ def main():
             f"Val Loss: {val_loss:.5f} | Val F1: {val_f1:.4f} | "
             f"Val Micro F1: {val_metrics['micro_f1']:.4f} | Select: {selection_metric:.4f}"
         )
-        
+
         if selection_metric > best_selection_metric:
             best_f1 = val_f1
             best_selection_metric = selection_metric
@@ -1120,7 +1315,11 @@ def main():
                     "validation_split_details": dict(split_details),
                     "validation_metrics": best_metrics,
                     "operator_pos_weight": (
-                        operator_pos_weight.detach().cpu().numpy().astype(np.float32).tolist()
+                        operator_pos_weight.detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float32)
+                        .tolist()
                         if operator_pos_weight is not None
                         else None
                     ),
@@ -1129,11 +1328,15 @@ def main():
                 },
                 out_path,
             )
-            print(f"  -> Saved best model (select={selection_metric:.4f}, val_f1={val_f1:.4f})")
+            print(
+                f"  -> Saved best model (select={selection_metric:.4f}, val_f1={val_f1:.4f})"
+            )
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
-                print(f"\nEarly stopping at epoch {epoch} (no improvement for {args.patience} epochs)")
+                print(
+                    f"\nEarly stopping at epoch {epoch} (no improvement for {args.patience} epochs)"
+                )
                 break
 
     checkpoint = torch.load(out_path, weights_only=False)
@@ -1141,7 +1344,9 @@ def main():
     best_checkpoint_metrics.setdefault("val_f1", checkpoint.get("val_f1"))
     best_checkpoint_metrics.setdefault("val_micro_f1", checkpoint.get("val_micro_f1"))
     if validation_report is not None:
-        validation_report["metrics"] = {"best_checkpoint": dict(best_checkpoint_metrics)}
+        validation_report["metrics"] = {
+            "best_checkpoint": dict(best_checkpoint_metrics)
+        }
         report_path = (
             Path(args.validation_report)
             if args.validation_report
@@ -1156,10 +1361,14 @@ def main():
         "split_policy": split_policy,
         "split_details": dict(split_details),
         "metrics": {"best_checkpoint": dict(best_checkpoint_metrics)},
-        "notes": ["Synthetic proposer training run; production rollout requires dataset-backed grouped validation."],
+        "notes": [
+            "Synthetic proposer training run; production rollout requires dataset-backed grouped validation."
+        ],
     }
     checkpoint["labeler_version"] = dataset_metadata.get("labeler_version")
-    checkpoint["data_generation_command"] = args.data_generation_command or "not_provided"
+    checkpoint["data_generation_command"] = (
+        args.data_generation_command or "not_provided"
+    )
     checkpoint_card = build_checkpoint_card(
         model_kind="universal_proposer",
         checkpoint_path=out_path,

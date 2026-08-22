@@ -1,16 +1,16 @@
 """Phase 6.x P1 fixes: S3-1/2, S7-1, S8-1, S9-2, S10-5."""
+
 import sys
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 from glassbox.sr.blackbox_preprocessor import prepare_blackbox_search
+from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 from glassbox.sr.specialist_state import SpecialistVault
 
 
@@ -27,7 +27,9 @@ def test_s3_1_structure_rank_prefers_true_shape():
     assert float(good["mse"]) < float(bad["mse"])
     # Low shape-corr candidate should not export free affine as primary formula.
     if abs(float(bad.get("shape_corr", 0.0))) < 0.97:
-        assert bad.get("exported_affine") is False or bad["formula"] == bad["base_formula"]
+        assert (
+            bad.get("exported_affine") is False or bad["formula"] == bad["base_formula"]
+        )
 
 
 def test_s3_1_scale_recovery_still_exports_affine_when_shape_matches():
@@ -170,14 +172,18 @@ def test_s9_2_budget_not_shrunk_on_poor_r2_high_confidence():
         "prediction_uncertain": False,
         "residual_suspicious": True,
     }
-    budget_bad = est._estimate_compute_budget(X, current_r2=0.40, term_count=3, uncertainty=unc)
+    budget_bad = est._estimate_compute_budget(
+        X, current_r2=0.40, term_count=3, uncertainty=unc
+    )
     unc_clean = {
         "prediction_entropy": 0.05,
         "prediction_margin": 0.5,
         "prediction_uncertain": False,
         "residual_suspicious": False,
     }
-    budget_good = est._estimate_compute_budget(X, current_r2=0.995, term_count=3, uncertainty=unc_clean)
+    budget_good = est._estimate_compute_budget(
+        X, current_r2=0.995, term_count=3, uncertainty=unc_clean
+    )
     # Poor R2 + suspicious residual keeps more budget than easy high-R2 case.
     assert budget_bad >= budget_good
     assert budget_bad >= float(est.min_compute_budget)

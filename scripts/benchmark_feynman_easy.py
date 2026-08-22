@@ -3,7 +3,6 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
-from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -15,16 +14,16 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from classifier_fast_path import run_fast_path
-from glassbox.evolution import detect_dominant_frequency, EvolutionaryONNTrainer
-from glassbox.sr.core.operation_dag import OperationDAG
 
+from glassbox.evolution import EvolutionaryONNTrainer, detect_dominant_frequency
+from glassbox.sr.core.operation_dag import OperationDAG
 
 # AI-Feynman demo mappings from the upstream README/Table 4:
 # example1: I.8.14  -> d = sqrt((x2-x1)^2 + (y2-y1)^2)
 # example2: I.10.7  -> m = m0/sqrt(1-v^2/c^2)
 # example3: I.50.26 -> x = x1*(cos(omega*t)+alpha*cos(omega*t)^2)
 
-DATASETS: List[Dict[str, str]] = [
+DATASETS: list[dict[str, str]] = [
     {
         "name": "example1.txt",
         "formula": "sqrt((x1-x0)^2 + (x3-x2)^2)",  # I.8.14: 2D distance
@@ -58,12 +57,14 @@ def validate_classifier_path(classifier_path: str) -> Path:
         return model_path
 
     models_dir = REPO_ROOT / "models"
-    available: List[str] = []
+    available: list[str] = []
     if models_dir.exists():
         for pattern in ("curve_classifier*.pt",):
             available.extend(sorted(path.name for path in models_dir.glob(pattern)))
 
-    available_text = ", ".join(dict.fromkeys(available)) if available else "none found in models/"
+    available_text = (
+        ", ".join(dict.fromkeys(available)) if available else "none found in models/"
+    )
     raise FileNotFoundError(
         f"Classifier model not found at {model_path}. Available models: {available_text}"
     )
@@ -73,7 +74,9 @@ def download_if_missing(url: str, dest_path: Path) -> bool:
     if dest_path.exists():
         return False
     if not url:
-        raise FileNotFoundError(f"Dataset missing at {dest_path} and no download URL was provided")
+        raise FileNotFoundError(
+            f"Dataset missing at {dest_path} and no download URL was provided"
+        )
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     urllib.request.urlretrieve(url, dest_path)  # nosec - trusted source
     return True
@@ -81,9 +84,9 @@ def download_if_missing(url: str, dest_path: Path) -> bool:
 
 def load_dataset(
     path: Path,
-    max_rows: Optional[int] = None,
-    sample: Optional[int] = None,
-    seed: Optional[int] = None,
+    max_rows: int | None = None,
+    sample: int | None = None,
+    seed: int | None = None,
 ) -> np.ndarray:
     data = np.loadtxt(path, max_rows=max_rows)
     if data.ndim == 1:
@@ -96,15 +99,15 @@ def load_dataset(
 
 
 def run_dataset(
-    dataset: Dict[str, str],
+    dataset: dict[str, str],
     data_dir: Path,
     classifier_path: str,
     precision: int,
-    max_rows: Optional[int],
-    sample: Optional[int],
-    seed: Optional[int],
+    max_rows: int | None,
+    sample: int | None,
+    seed: int | None,
     auto_expand: bool,
-    device: Optional[str],
+    device: str | None,
     exact_match_threads: int,
     exact_match_enabled: bool,
     exact_match_max_basis: int,
@@ -112,7 +115,7 @@ def run_dataset(
     use_evolution_fallback: bool,
     evolution_generations: int,
     evolution_population: int,
-) -> Dict[str, object]:
+) -> dict[str, object]:
     name = dataset["name"]
     url = dataset.get("url", "")
     dest = data_dir / name
@@ -147,7 +150,9 @@ def run_dataset(
                 print(f"FFT warm-start skipped: {fft_err}")
 
         print("\n" + "=" * 72)
-        print(f"DATASET: {name} | rows={x_t.shape[0]} | n_inputs={x_t.shape[1]} | precision={precision}")
+        print(
+            f"DATASET: {name} | rows={x_t.shape[0]} | n_inputs={x_t.shape[1]} | precision={precision}"
+        )
         if dataset.get("formula"):
             print(f"TARGET:  {dataset['formula']}")
         print("=" * 72)
@@ -184,10 +189,16 @@ def run_dataset(
             print(f"FAST PATH: MSE={mse:.6f} | formula={fast_path_formula[:60]}...")
 
         if use_evolution_fallback and mse > mse_threshold:
-            print(f"\nFAST PATH MSE ({mse:.6f}) > threshold ({mse_threshold}), falling back to evolution...")
+            print(
+                f"\nFAST PATH MSE ({mse:.6f}) > threshold ({mse_threshold}), falling back to evolution..."
+            )
 
             n_inputs = x_t.shape[1]
-            resolved_device = device if device and device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+            resolved_device = (
+                device
+                if device and device != "auto"
+                else ("cuda" if torch.cuda.is_available() else "cpu")
+            )
 
             def model_factory():
                 return OperationDAG(
@@ -226,7 +237,9 @@ def run_dataset(
                     "fast_path_mse": mse,
                 }
 
-            print(f"EVOLUTION: no improvement (MSE={evo_mse:.6f}); keeping fast-path result")
+            print(
+                f"EVOLUTION: no improvement (MSE={evo_mse:.6f}); keeping fast-path result"
+            )
             if result is None:
                 return {
                     "name": name,
@@ -386,9 +399,13 @@ def main() -> None:
     # Filter datasets if --dataset specified
     datasets_to_run = DATASETS
     if args.dataset:
-        datasets_to_run = [d for d in DATASETS if args.dataset.lower() in d['name'].lower()]
+        datasets_to_run = [
+            d for d in DATASETS if args.dataset.lower() in d["name"].lower()
+        ]
         if not datasets_to_run:
-            print(f"No dataset matching '{args.dataset}'. Available: {[d['name'] for d in DATASETS]}")
+            print(
+                f"No dataset matching '{args.dataset}'. Available: {[d['name'] for d in DATASETS]}"
+            )
             return
 
     if max_rows is not None and sample is not None and sample >= max_rows:
@@ -428,7 +445,9 @@ def main() -> None:
             print(f"{r['name']}: [skip] {r.get('reason', 'skipped')}")
             continue
         if status == "fast_path_unavailable":
-            print(f"{r['name']}: [fast_path_unavailable] {r.get('reason', 'not_applicable')}")
+            print(
+                f"{r['name']}: [fast_path_unavailable] {r.get('reason', 'not_applicable')}"
+            )
             continue
         if status == "error":
             print(f"{r['name']}: [error] {r.get('reason', 'unknown_error')}")
@@ -442,7 +461,9 @@ def main() -> None:
             extra = f" fast_path_mse={r['fast_path_mse']:.6f}"
         elif "evolution_mse" in r:
             extra = f" evolution_mse={r['evolution_mse']:.6f}"
-        print(f"{r['name']}: [{status}] mse={mse:.6f} time={t:.2f}s formula={f_disp}{extra}")
+        print(
+            f"{r['name']}: [{status}] mse={mse:.6f} time={t:.2f}s formula={f_disp}{extra}"
+        )
 
 
 if __name__ == "__main__":

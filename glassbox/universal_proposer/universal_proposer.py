@@ -7,24 +7,25 @@ decoding and downstream search use the original multivariate `X`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import os
 import re
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 
-from glassbox.sr.fpip_v2 import validate_fpip_v2_payload
 from glassbox.sr.formula_safety import validate_formula_expr
+from glassbox.sr.fpip_v2 import validate_fpip_v2_payload
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-DEFAULT_OPERATOR_VOCAB: List[str] = [
+DEFAULT_OPERATOR_VOCAB: list[str] = [
     "identity",
     "sin",
     "cos",
@@ -35,7 +36,7 @@ DEFAULT_OPERATOR_VOCAB: List[str] = [
     "periodic",
 ]
 
-DEFAULT_UNIVARIATE_SKELETON_VOCAB: List[str] = [
+DEFAULT_UNIVARIATE_SKELETON_VOCAB: list[str] = [
     "x",
     "x^2",
     "sin(x)",
@@ -47,7 +48,7 @@ DEFAULT_UNIVARIATE_SKELETON_VOCAB: List[str] = [
     "x+sin(x)",
 ]
 
-DEFAULT_MULTIVARIATE_SKELETON_VOCAB: List[str] = [
+DEFAULT_MULTIVARIATE_SKELETON_VOCAB: list[str] = [
     "x0",
     "x1",
     "x0^2",
@@ -68,9 +69,11 @@ DEFAULT_MULTIVARIATE_SKELETON_VOCAB: List[str] = [
     "x0*x1+x0+x1",
 ]
 
-DEFAULT_SKELETON_VOCAB: List[str] = list(dict.fromkeys(
-    DEFAULT_UNIVARIATE_SKELETON_VOCAB + DEFAULT_MULTIVARIATE_SKELETON_VOCAB
-))
+DEFAULT_SKELETON_VOCAB: list[str] = list(
+    dict.fromkeys(
+        DEFAULT_UNIVARIATE_SKELETON_VOCAB + DEFAULT_MULTIVARIATE_SKELETON_VOCAB
+    )
+)
 
 UNIVERSAL_PROPOSER_ARCHITECTURE_VERSION = "universal-proposer-glu-v1"
 UNIVERSAL_PROPOSER_MULTIVARIATE_CONTRACT_VERSION = "multivariate-contract-v1"
@@ -114,13 +117,17 @@ class UniversalProposerConfig:
     multivariate_neural_mode: str = UNIVERSAL_PROPOSER_MULTIVARIATE_NEURAL_MODE
     proposer_contract_version: str = UNIVERSAL_PROPOSER_CONTRACT_VERSION
     max_input_vars: int = 4
-    operator_vocab: Optional[List[str]] = None
-    skeleton_vocab: Optional[List[str]] = None
+    operator_vocab: list[str] | None = None
+    skeleton_vocab: list[str] | None = None
 
-    def resolved_operator_vocab(self) -> List[str]:
-        return list(self.operator_vocab) if self.operator_vocab else list(DEFAULT_OPERATOR_VOCAB)
+    def resolved_operator_vocab(self) -> list[str]:
+        return (
+            list(self.operator_vocab)
+            if self.operator_vocab
+            else list(DEFAULT_OPERATOR_VOCAB)
+        )
 
-    def resolved_skeleton_vocab(self) -> List[str]:
+    def resolved_skeleton_vocab(self) -> list[str]:
         if self.skeleton_vocab:
             return list(self.skeleton_vocab)
         if self.supports_multivariate_formulas:
@@ -134,7 +141,7 @@ class UniversalProposer(nn.Module):
     Mathematically synchronized with CurveClassifierGLU to leverage high-level analytical features.
     """
 
-    def __init__(self, config: Optional[UniversalProposerConfig] = None):
+    def __init__(self, config: UniversalProposerConfig | None = None):
         super().__init__()
         self.config = config or UniversalProposerConfig()
         operator_vocab = self.config.resolved_operator_vocab()
@@ -145,7 +152,7 @@ class UniversalProposer(nn.Module):
         # GLU Trunk (Synchronized with Classifier architecture)
         self.fc1 = nn.Linear(n_features, hidden * 2)
         self.bn1 = nn.BatchNorm1d(hidden * 2)
-        
+
         self.fc2 = nn.Linear(hidden, hidden * 2)
         self.bn2 = nn.BatchNorm1d(hidden * 2)
 
@@ -168,7 +175,7 @@ class UniversalProposer(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.1)
 
-    def forward(self, features: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, features: torch.Tensor) -> dict[str, torch.Tensor]:
         """Forward pass using pre-computed high-level features.
 
         Args:
@@ -176,13 +183,13 @@ class UniversalProposer(nn.Module):
         """
         if features.ndim == 1:
             features = features.unsqueeze(0)
-            
+
         # Layer 1 GLU projection
         x = self.fc1(features)
         x = self.bn1(x)
         x = F.glu(x, dim=1)
         x = self.dropout(x)
-        
+
         # Layer 2 GLU composition
         x = self.fc2(x)
         x = self.bn2(x)
@@ -218,11 +225,11 @@ def decode_topk_skeletons(
     skeleton_logits: Sequence[float],
     skeleton_vocab: Sequence[str],
     top_k: int = 5,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Grammar-constrained decode via fixed valid skeleton vocabulary."""
     probs = _safe_softmax(np.asarray(skeleton_logits, dtype=np.float64))
     idx = _topk_indices(probs, top_k)
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for i in idx.tolist():
         out.append(
             {
@@ -234,14 +241,14 @@ def decode_topk_skeletons(
     return out
 
 
-def _safe_formula_eval_multivariate(formula: str, x: np.ndarray) -> Optional[np.ndarray]:
+def _safe_formula_eval_multivariate(formula: str, x: np.ndarray) -> np.ndarray | None:
     x = np.asarray(x, dtype=np.float64)
     if x.ndim == 1:
         x = x.reshape(-1, 1)
     if x.ndim != 2 or x.shape[1] == 0:
         return None
 
-    context: Dict[str, Any] = {
+    context: dict[str, Any] = {
         "np": np,
         "sin": np.sin,
         "cos": np.cos,
@@ -275,8 +282,8 @@ def _safe_formula_eval_multivariate(formula: str, x: np.ndarray) -> Optional[np.
     return y
 
 
-def _formula_operator_tags(formula: str) -> Set[str]:
-    tags: Set[str] = set()
+def _formula_operator_tags(formula: str) -> set[str]:
+    tags: set[str] = set()
     f = formula.lower()
     if "sin(" in f:
         tags.add("sin")
@@ -297,7 +304,7 @@ def _formula_operator_tags(formula: str) -> Set[str]:
     return tags
 
 
-def _build_univariate_grammar_candidates(max_depth: int = 2) -> List[str]:
+def _build_univariate_grammar_candidates(max_depth: int = 2) -> list[str]:
     # Grammar-controlled expression set for Phase 1.
     base = [
         "x",
@@ -349,7 +356,7 @@ def _build_univariate_grammar_candidates(max_depth: int = 2) -> List[str]:
     return base + composed
 
 
-def _safe_formula_eval(formula: str, x: np.ndarray) -> Optional[np.ndarray]:
+def _safe_formula_eval(formula: str, x: np.ndarray) -> np.ndarray | None:
     if np.asarray(x).ndim > 1:
         return _safe_formula_eval_multivariate(formula, x)
     context = {
@@ -394,12 +401,12 @@ def _fit_affine_mse(y_true: np.ndarray, y_basis: np.ndarray) -> float:
 
 
 def grammar_decode_topk_skeletons(
-    operator_priors: Dict[str, float],
+    operator_priors: dict[str, float],
     x: np.ndarray,
     y: np.ndarray,
     top_k: int = 5,
     max_depth: int = 2,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Decode top-k skeletons from a constrained grammar.
 
     Candidate ranking combines:
@@ -411,7 +418,7 @@ def grammar_decode_topk_skeletons(
     x = x.reshape(-1)
     y_var = float(np.var(y)) + 1e-12
 
-    scored: List[Dict[str, Any]] = []
+    scored: list[dict[str, Any]] = []
     for formula in candidates:
         tags = _formula_operator_tags(formula)
         if tags:
@@ -441,12 +448,12 @@ def grammar_decode_topk_skeletons(
     return scored[: max(1, int(top_k))]
 
 
-def _rank_columns_by_target_relevance(x: np.ndarray, y: np.ndarray) -> List[int]:
+def _rank_columns_by_target_relevance(x: np.ndarray, y: np.ndarray) -> list[int]:
     """Order feature columns by |corr| with y (variance fallback). H-13."""
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
     n = int(x.shape[1]) if x.ndim == 2 else 0
-    scores: List[Tuple[float, int]] = []
+    scores: list[tuple[float, int]] = []
     for i in range(n):
         xi = x[:, i]
         mask = np.isfinite(xi) & np.isfinite(y)
@@ -468,20 +475,22 @@ def _rank_columns_by_target_relevance(x: np.ndarray, y: np.ndarray) -> List[int]
 
 
 def grammar_decode_multivariate_skeletons(
-    operator_priors: Dict[str, float],
+    operator_priors: dict[str, float],
     x: np.ndarray,
     y: np.ndarray,
     top_k: int = 5,
     max_rank: int = 2,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Decode multivariate skeletons from a constrained algebraic grammar."""
     x = np.asarray(x, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
     if x.ndim != 2 or x.shape[1] < 2:
-        return grammar_decode_topk_skeletons(operator_priors, x.reshape(-1), y, top_k=top_k, max_depth=2)
+        return grammar_decode_topk_skeletons(
+            operator_priors, x.reshape(-1), y, top_k=top_k, max_depth=2
+        )
 
     y_var = float(np.var(y)) + 1e-12
-    scored: List[Dict[str, Any]] = []
+    scored: list[dict[str, Any]] = []
     feature_names = [f"x{i}" for i in range(x.shape[1])]
     n_features = int(x.shape[1])
     limit = min(n_features, max(2, int(max_rank)))
@@ -532,7 +541,9 @@ def grammar_decode_multivariate_skeletons(
                     fit_score = float(np.exp(-mse / y_var)) if np.isfinite(mse) else 0.0
                 tags = _formula_operator_tags(formula)
                 if tags:
-                    prior_score = float(np.mean([operator_priors.get(t, 1e-6) for t in tags]))
+                    prior_score = float(
+                        np.mean([operator_priors.get(t, 1e-6) for t in tags])
+                    )
                 else:
                     prior_score = 1e-6
                 score = 0.6 * prior_score + 0.4 * fit_score
@@ -546,18 +557,22 @@ def grammar_decode_multivariate_skeletons(
                 )
 
     if not scored:
-        return grammar_decode_topk_skeletons(operator_priors, x[:, 0], y, top_k=top_k, max_depth=2)
+        return grammar_decode_topk_skeletons(
+            operator_priors, x[:, 0], y, top_k=top_k, max_depth=2
+        )
     scored.sort(key=lambda d: (-d["probability"], d["score"]))
     return scored[: max(1, int(top_k))]
 
 
-def _operator_priors(operator_logits: Sequence[float], operator_vocab: Sequence[str]) -> Dict[str, float]:
+def _operator_priors(
+    operator_logits: Sequence[float], operator_vocab: Sequence[str]
+) -> dict[str, float]:
     logits = np.asarray(operator_logits, dtype=np.float64)
     # Use sigmoid for multi-label independent operator probabilities
     probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -100, 100)))
-    
+
     predictions = {str(op): float(p) for op, p in zip(operator_vocab, probs)}
-    
+
     # Mathematical Entailment & Sparsification
     implications = [
         ("sin", "periodic"),
@@ -565,18 +580,18 @@ def _operator_priors(operator_logits: Sequence[float], operator_vocab: Sequence[
         ("exp", "exponential"),
         ("log", "exponential"),
         ("rational", "power"),
-        ("identity", "polynomial")
+        ("identity", "polynomial"),
     ]
-    
+
     for child, parent in implications:
         if child in predictions and parent in predictions:
             predictions[parent] = max(predictions[parent], predictions[child])
-            
+
     # Entropy-based Sparsification: Silence weak guesses
     for op in list(predictions.keys()):
         if predictions[op] < 0.4:
             del predictions[op]
-            
+
     return predictions
 
 
@@ -585,7 +600,7 @@ def _proposer_model_contract(
     is_multivariate: bool,
     n_input_vars: int,
     neural_feature_mode: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if is_multivariate:
         operator_prior_source = (
             "caller_supplied_features"
@@ -625,7 +640,7 @@ def _proposer_model_contract(
     }
 
 
-def _float_or_none(value: Any) -> Optional[float]:
+def _float_or_none(value: Any) -> float | None:
     try:
         if value is None:
             return None
@@ -635,7 +650,7 @@ def _float_or_none(value: Any) -> Optional[float]:
         return None
 
 
-def _skeleton_confidence_reliability(metrics: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _skeleton_confidence_reliability(metrics: dict[str, Any] | None) -> dict[str, Any]:
     metrics = metrics if isinstance(metrics, dict) else {}
     coverage = _float_or_none(metrics.get("skeleton_coverage"))
     top1 = _float_or_none(metrics.get("skeleton_top1_acc"))
@@ -650,9 +665,12 @@ def _skeleton_confidence_reliability(metrics: Optional[Dict[str, Any]]) -> Dict[
         missing.append("skeleton_top5_acc")
 
     reliable = (
-        coverage is not None and coverage >= SKELETON_CONFIDENCE_MIN_COVERAGE
-        and top1 is not None and top1 >= SKELETON_CONFIDENCE_MIN_TOP1_ACC
-        and top5 is not None and top5 >= SKELETON_CONFIDENCE_MIN_TOP5_ACC
+        coverage is not None
+        and coverage >= SKELETON_CONFIDENCE_MIN_COVERAGE
+        and top1 is not None
+        and top1 >= SKELETON_CONFIDENCE_MIN_TOP1_ACC
+        and top5 is not None
+        and top5 >= SKELETON_CONFIDENCE_MIN_TOP5_ACC
     )
     reasons = []
     if coverage is None or coverage < SKELETON_CONFIDENCE_MIN_COVERAGE:
@@ -675,7 +693,7 @@ def _skeleton_confidence_reliability(metrics: Optional[Dict[str, Any]]) -> Dict[
     }
 
 
-def _routing_calibration_status(model: Optional[UniversalProposer]) -> Dict[str, Any]:
+def _routing_calibration_status(model: UniversalProposer | None) -> dict[str, Any]:
     calibration = getattr(model, "routing_calibration", None)
     if isinstance(calibration, dict):
         return dict(calibration)
@@ -688,9 +706,9 @@ def _routing_calibration_status(model: Optional[UniversalProposer]) -> Dict[str,
 
 def _proposer_contract(
     *,
-    skeleton_reliability: Dict[str, Any],
-    routing_calibration: Dict[str, Any],
-) -> Dict[str, Any]:
+    skeleton_reliability: dict[str, Any],
+    routing_calibration: dict[str, Any],
+) -> dict[str, Any]:
     skeleton_role = (
         "validated_confidence_signal"
         if skeleton_reliability.get("reliable")
@@ -709,10 +727,12 @@ def _proposer_contract(
 
 def _uncertainty_from_logits(
     logits: Sequence[float],
-    skeleton_reliability: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    skeleton_reliability: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     probs = _safe_softmax(np.asarray(logits, dtype=np.float64))
-    skeleton_reliability = skeleton_reliability or _skeleton_confidence_reliability(None)
+    skeleton_reliability = skeleton_reliability or _skeleton_confidence_reliability(
+        None
+    )
     if probs.size == 0:
         return {
             "entropy": None,
@@ -721,7 +741,9 @@ def _uncertainty_from_logits(
             "raw_margin": None,
             "confident": False,
             "raw_confident": False,
-            "skeleton_confidence_reliable": bool(skeleton_reliability.get("reliable", False)),
+            "skeleton_confidence_reliable": bool(
+                skeleton_reliability.get("reliable", False)
+            ),
             "confidence_source": "no_skeleton_logits",
             "skeleton_reliability": dict(skeleton_reliability),
         }
@@ -731,7 +753,10 @@ def _uncertainty_from_logits(
     top2 = float(sorted_probs[1]) if sorted_probs.size > 1 else 0.0
     entropy = 0.0
     if sorted_probs.size > 1:
-        entropy = float(-np.sum(sorted_probs * np.log(sorted_probs + 1e-12)) / np.log(sorted_probs.size))
+        entropy = float(
+            -np.sum(sorted_probs * np.log(sorted_probs + 1e-12))
+            / np.log(sorted_probs.size)
+        )
     margin = top1 - top2
     raw_confident = bool(entropy < 0.65 and margin > 0.12)
     reliable = bool(skeleton_reliability.get("reliable", False))
@@ -757,7 +782,7 @@ def _uncertainty_from_logits(
     }
 
 
-def _signal_complexity(x: np.ndarray, y: np.ndarray) -> Dict[str, float]:
+def _signal_complexity(x: np.ndarray, y: np.ndarray) -> dict[str, float]:
     """Cheap curve complexity diagnostics for search planning."""
     x_arr = np.asarray(x, dtype=np.float64)
     x = x_arr[:, 0].reshape(-1) if x_arr.ndim == 2 else x_arr.reshape(-1)
@@ -791,7 +816,9 @@ def _signal_complexity(x: np.ndarray, y: np.ndarray) -> Dict[str, float]:
             return out
         y_scale = float(np.std(y)) + 1e-12
         x_span = float(np.max(x_unique) - np.min(x_unique)) + 1e-12
-        out["roughness"] = float(np.clip(np.mean(np.abs(ddy)) * x_span / y_scale, 0.0, 10.0))
+        out["roughness"] = float(
+            np.clip(np.mean(np.abs(ddy)) * x_span / y_scale, 0.0, 10.0)
+        )
 
         signs = np.sign(dy)
         signs[np.abs(dy) < 1e-10] = 0.0
@@ -805,12 +832,12 @@ def _signal_complexity(x: np.ndarray, y: np.ndarray) -> Dict[str, float]:
 
 def build_search_plan(
     *,
-    operator_priors: Dict[str, float],
-    candidates: Sequence[Dict[str, Any]],
-    uncertainty: Dict[str, Any],
+    operator_priors: dict[str, float],
+    candidates: Sequence[dict[str, Any]],
+    uncertainty: dict[str, Any],
     x: np.ndarray,
     y: np.ndarray,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build an evolution search plan from proposer evidence.
 
     This is intentionally heuristic for now. It gives the proposer a planner
@@ -835,7 +862,11 @@ def build_search_plan(
 
     roughness = float(complexity.get("roughness", 0.0))
     turning_rate = float(complexity.get("turning_rate", 0.0))
-    has_periodic = max(operator_priors.get("periodic", 0.0), operator_priors.get("sin", 0.0), operator_priors.get("cos", 0.0))
+    has_periodic = max(
+        operator_priors.get("periodic", 0.0),
+        operator_priors.get("sin", 0.0),
+        operator_priors.get("cos", 0.0),
+    )
     has_power = operator_priors.get("power", 0.0)
     has_exp = operator_priors.get("exp", 0.0)
     has_log = operator_priors.get("log", 0.0)
@@ -843,7 +874,9 @@ def build_search_plan(
 
     difficulty = 0.0
     difficulty += 0.35 * uncertain
-    difficulty += 0.20 * float(np.clip(np.log10(best_rel_mse + 1e-12) + 6.0, 0.0, 6.0) / 6.0)
+    difficulty += 0.20 * float(
+        np.clip(np.log10(best_rel_mse + 1e-12) + 6.0, 0.0, 6.0) / 6.0
+    )
     difficulty += 0.15 * float(np.clip(roughness / 4.0, 0.0, 1.0))
     difficulty += 0.10 * float(np.clip(turning_rate * 3.0, 0.0, 1.0))
     difficulty += 0.10 * float(max(has_rational, has_exp, has_log))
@@ -873,7 +906,11 @@ def build_search_plan(
     if has_rational > 0.35:
         p_min = -4.0
 
-    max_complexity = int(np.clip(round(10 + 28 * difficulty + 8 * max(has_rational, has_periodic)), 10, 50))
+    max_complexity = int(
+        np.clip(
+            round(10 + 28 * difficulty + 8 * max(has_rational, has_periodic)), 10, 50
+        )
+    )
     seed_budget = int(np.clip(len(candidates) + round(4 + 8 * difficulty), 4, 16))
 
     return {
@@ -889,7 +926,9 @@ def build_search_plan(
         "acceptable_complexity": min(max_complexity, 20),
         "seed_budget": seed_budget,
         "signals": {
-            "best_relative_mse": None if not np.isfinite(best_rel_mse) else float(best_rel_mse),
+            "best_relative_mse": None
+            if not np.isfinite(best_rel_mse)
+            else float(best_rel_mse),
             "uncertainty": float(uncertain),
             "roughness": roughness,
             "turning_rate": turning_rate,
@@ -899,13 +938,13 @@ def build_search_plan(
 
 def build_multivariate_search_plan(
     *,
-    operator_priors: Dict[str, float],
-    candidates: Sequence[Dict[str, Any]],
-    uncertainty: Dict[str, Any],
+    operator_priors: dict[str, float],
+    candidates: Sequence[dict[str, Any]],
+    uncertainty: dict[str, Any],
     x: np.ndarray,
     y: np.ndarray,
-    input_variables: Optional[List[str]] = None,
-) -> Dict[str, Any]:
+    input_variables: list[str] | None = None,
+) -> dict[str, Any]:
     plan = build_search_plan(
         operator_priors=operator_priors,
         candidates=candidates,
@@ -919,12 +958,18 @@ def build_multivariate_search_plan(
         return plan
 
     n_features = int(x_arr.shape[1])
-    input_variables = list(input_variables) if input_variables else [f"x{i}" for i in range(n_features)]
+    input_variables = (
+        list(input_variables)
+        if input_variables
+        else [f"x{i}" for i in range(n_features)]
+    )
     interaction_strength = 0.0
     for term in candidates:
         formula = str(term.get("formula", ""))
         if "*" in formula or "/" in formula or "sqrt((" in formula:
-            interaction_strength = max(interaction_strength, float(term.get("probability", 0.0)))
+            interaction_strength = max(
+                interaction_strength, float(term.get("probability", 0.0))
+            )
 
     plan["supports_multivariate_formulas"] = True
     plan["contract_version"] = UNIVERSAL_PROPOSER_MULTIVARIATE_CONTRACT_VERSION
@@ -936,12 +981,22 @@ def build_multivariate_search_plan(
     plan["input_variables"] = input_variables[: min(len(input_variables), n_features)]
     plan["feature_count"] = n_features
     plan["interaction_strength"] = float(interaction_strength)
-    plan["seed_budget"] = max(int(plan.get("seed_budget", 0)), min(24, 6 + 2 * n_features))
-    plan["generation_multiplier"] = float(plan.get("generation_multiplier", 1.0)) * (1.0 + 0.1 * max(0, n_features - 1))
-    plan["population_multiplier"] = float(plan.get("population_multiplier", 1.0)) * (1.0 + 0.08 * max(0, n_features - 1))
+    plan["seed_budget"] = max(
+        int(plan.get("seed_budget", 0)), min(24, 6 + 2 * n_features)
+    )
+    plan["generation_multiplier"] = float(plan.get("generation_multiplier", 1.0)) * (
+        1.0 + 0.1 * max(0, n_features - 1)
+    )
+    plan["population_multiplier"] = float(plan.get("population_multiplier", 1.0)) * (
+        1.0 + 0.08 * max(0, n_features - 1)
+    )
     if interaction_strength > 0.2:
-        plan["early_stop_max_nodes"] = max(int(plan.get("early_stop_max_nodes", 20)), 24 + 4 * n_features)
-        plan["acceptable_complexity"] = max(int(plan.get("acceptable_complexity", 15)), 12 + 2 * n_features)
+        plan["early_stop_max_nodes"] = max(
+            int(plan.get("early_stop_max_nodes", 20)), 24 + 4 * n_features
+        )
+        plan["acceptable_complexity"] = max(
+            int(plan.get("acceptable_complexity", 15)), 12 + 2 * n_features
+        )
     return plan
 
 
@@ -950,9 +1005,9 @@ def propose_from_xy(
     x: np.ndarray,
     y: np.ndarray,
     top_k: int = 5,
-    device: Optional[str] = None,
-    features: Optional[np.ndarray] = None,
-) -> Dict[str, Any]:
+    device: str | None = None,
+    features: np.ndarray | None = None,
+) -> dict[str, Any]:
     """Run proposer on a single curve and return decoded candidates + priors."""
     x = np.asarray(x)
     y = np.asarray(y)
@@ -974,6 +1029,7 @@ def propose_from_xy(
             extract_all_features,
             extract_all_features_xy,
         )
+
         if not is_multivariate:
             x_univariate = x.reshape(-1)
             features = extract_all_features_xy(x_univariate, y)
@@ -983,7 +1039,7 @@ def propose_from_xy(
             # model phase; runtime candidates still use the multivariate grammar.
             features = extract_all_features(y)
             neural_feature_mode = UNIVERSAL_PROPOSER_MULTIVARIATE_NEURAL_MODE
-    
+
     # Handle dimension mismatch (e.g. model trained with 370 features, codebase extracts 398)
     expected_dim = model.config.n_features
     if len(features) > expected_dim:
@@ -995,10 +1051,14 @@ def propose_from_xy(
     features = np.array(features, dtype=np.float32, copy=True)
     if features.ndim == 1 and features.shape[0] > 192:
         end = min(features.shape[0], expected_dim)
-        features[192:end] = np.sign(features[192:end]) * np.log1p(np.abs(features[192:end]))
+        features[192:end] = np.sign(features[192:end]) * np.log1p(
+            np.abs(features[192:end])
+        )
     elif features.ndim > 1 and features.shape[1] > 192:
         end = min(features.shape[1], expected_dim)
-        features[:, 192:end] = np.sign(features[:, 192:end]) * np.log1p(np.abs(features[:, 192:end]))
+        features[:, 192:end] = np.sign(features[:, 192:end]) * np.log1p(
+            np.abs(features[:, 192:end])
+        )
 
     scaler = getattr(model, "feature_scaler", None)
     if isinstance(scaler, dict) and "mean" in scaler and "std" in scaler:
@@ -1043,7 +1103,9 @@ def propose_from_xy(
 
     # Fallback to direct head decode if grammar decoding unexpectedly returns empty.
     if not candidates:
-        candidates = decode_topk_skeletons(skeleton_logits, model.skeleton_vocab, top_k=top_k)
+        candidates = decode_topk_skeletons(
+            skeleton_logits, model.skeleton_vocab, top_k=top_k
+        )
 
     skeleton_reliability = _skeleton_confidence_reliability(
         getattr(model, "validation_metrics", None)
@@ -1086,7 +1148,9 @@ def propose_from_xy(
         "supports_trained_multivariate_neural_model"
     ]
     if is_multivariate:
-        search_plan["neural_multivariate_support"] = model_contract["neural_multivariate_support"]
+        search_plan["neural_multivariate_support"] = model_contract[
+            "neural_multivariate_support"
+        ]
 
     return {
         "candidate_skeletons": candidates,
@@ -1097,15 +1161,17 @@ def propose_from_xy(
         "model_contract": model_contract,
         "proposer_contract": proposer_contract,
         "neural_feature_mode": neural_feature_mode,
-        "input_variables": [f"x{i}" for i in range(x_for_plan.shape[1])] if x_for_plan.ndim == 2 else ["x"],
+        "input_variables": [f"x{i}" for i in range(x_for_plan.shape[1])]
+        if x_for_plan.ndim == 2
+        else ["x"],
     }
 
 
 def _routing_signal_from_proposer_output(
-    proposer_output: Dict[str, Any],
-    search_plan: Dict[str, Any],
+    proposer_output: dict[str, Any],
+    search_plan: dict[str, Any],
     confident: bool,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     uncertainty = proposer_output.get("sequence_uncertainty", {})
     if not isinstance(uncertainty, dict):
         uncertainty = {}
@@ -1151,10 +1217,10 @@ def _routing_signal_from_proposer_output(
 
 
 def proposer_output_to_fpip_v2(
-    proposer_output: Dict[str, Any],
-    fit_diagnostics: Optional[Dict[str, Any]] = None,
-    interaction_hints: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    proposer_output: dict[str, Any],
+    fit_diagnostics: dict[str, Any] | None = None,
+    interaction_hints: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Map proposer output to FPIP v2 payload shape."""
     fit_diagnostics = fit_diagnostics or {}
     interaction_hints = interaction_hints or {}
@@ -1165,11 +1231,17 @@ def proposer_output_to_fpip_v2(
     confident = bool(uncertainty.get("confident") is True)
     raw_search_plan = proposer_output.get("search_plan", {})
     search_plan = dict(raw_search_plan) if isinstance(raw_search_plan, dict) else {}
-    routing_signal = _routing_signal_from_proposer_output(proposer_output, search_plan, confident)
+    routing_signal = _routing_signal_from_proposer_output(
+        proposer_output, search_plan, confident
+    )
     raw_model_contract = proposer_output.get("model_contract", {})
-    model_contract = dict(raw_model_contract) if isinstance(raw_model_contract, dict) else {}
+    model_contract = (
+        dict(raw_model_contract) if isinstance(raw_model_contract, dict) else {}
+    )
     raw_proposer_contract = proposer_output.get("proposer_contract", {})
-    proposer_contract = dict(raw_proposer_contract) if isinstance(raw_proposer_contract, dict) else {}
+    proposer_contract = (
+        dict(raw_proposer_contract) if isinstance(raw_proposer_contract, dict) else {}
+    )
 
     payload = {
         "schema_version": "fpip.v2",
@@ -1182,7 +1254,9 @@ def proposer_output_to_fpip_v2(
             "raw_margin": uncertainty.get("raw_margin"),
             "raw_confident": uncertainty.get("raw_confident"),
             "confidence_source": uncertainty.get("confidence_source"),
-            "skeleton_confidence_reliable": uncertainty.get("skeleton_confidence_reliable"),
+            "skeleton_confidence_reliable": uncertainty.get(
+                "skeleton_confidence_reliable"
+            ),
         },
         "operator_priors": dict(proposer_output.get("operator_priors", {})),
         "interaction_hints": dict(interaction_hints),
@@ -1234,13 +1308,13 @@ def _load_torch_checkpoint(checkpoint_path: Path):
 
 
 def validate_universal_proposer_checkpoint_metadata(
-    checkpoint: Dict[str, Any],
+    checkpoint: dict[str, Any],
     *,
     strict: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Validate proposer checkpoint metadata with legacy compatibility."""
-    warnings: List[str] = []
-    errors: List[str] = []
+    warnings: list[str] = []
+    errors: list[str] = []
 
     if not isinstance(checkpoint, dict):
         raise ValueError("Checkpoint must be a dictionary")
@@ -1269,9 +1343,8 @@ def validate_universal_proposer_checkpoint_metadata(
     if operator_vocab is not None and not isinstance(operator_vocab, list):
         errors.append("config.operator_vocab must be a list when present")
 
-    architecture_version = (
-        checkpoint.get("architecture_version")
-        or cfg.get("architecture_version")
+    architecture_version = checkpoint.get("architecture_version") or cfg.get(
+        "architecture_version"
     )
     if architecture_version is None:
         architecture_version = "legacy_unversioned"
@@ -1285,7 +1358,9 @@ def validate_universal_proposer_checkpoint_metadata(
         "n_features": n_features,
         "architecture_version": architecture_version,
         "multivariate_neural_mode": str(
-            cfg.get("multivariate_neural_mode", UNIVERSAL_PROPOSER_MULTIVARIATE_NEURAL_MODE)
+            cfg.get(
+                "multivariate_neural_mode", UNIVERSAL_PROPOSER_MULTIVARIATE_NEURAL_MODE
+            )
         ),
         "proposer_contract_version": str(
             checkpoint.get("proposer_contract_version")
@@ -1298,7 +1373,7 @@ def validate_universal_proposer_checkpoint_metadata(
 
 def load_universal_proposer_checkpoint(
     checkpoint_path: str,
-    device: Optional[str] = None,
+    device: str | None = None,
 ) -> UniversalProposer:
     """Load UniversalProposer from checkpoint saved by train_universal_proposer.py."""
     ckpt = _load_torch_checkpoint(Path(checkpoint_path))
@@ -1311,21 +1386,29 @@ def load_universal_proposer_checkpoint(
     skeleton_vocab = cfg_raw.get("skeleton_vocab")
     if skeleton_vocab is None:
         head_weight = state_dict.get("skeleton_head.weight")
-        if head_weight is not None and int(head_weight.shape[0]) == len(DEFAULT_UNIVARIATE_SKELETON_VOCAB):
+        if head_weight is not None and int(head_weight.shape[0]) == len(
+            DEFAULT_UNIVARIATE_SKELETON_VOCAB
+        ):
             skeleton_vocab = list(DEFAULT_UNIVARIATE_SKELETON_VOCAB)
         else:
             skeleton_vocab = list(DEFAULT_SKELETON_VOCAB)
-    
+
     # Map new GLU config (n_features) and handle legacy point_mlp_layers
     config = UniversalProposerConfig(
         hidden_dim=int(cfg_raw.get("hidden_dim", 256)),
         n_features=int(cfg_raw.get("n_features", 370)),
-        supports_multivariate_formulas=bool(cfg_raw.get("supports_multivariate_formulas", True)),
+        supports_multivariate_formulas=bool(
+            cfg_raw.get("supports_multivariate_formulas", True)
+        ),
         multivariate_neural_mode=str(
-            cfg_raw.get("multivariate_neural_mode", UNIVERSAL_PROPOSER_MULTIVARIATE_NEURAL_MODE)
+            cfg_raw.get(
+                "multivariate_neural_mode", UNIVERSAL_PROPOSER_MULTIVARIATE_NEURAL_MODE
+            )
         ),
         proposer_contract_version=str(
-            cfg_raw.get("proposer_contract_version", UNIVERSAL_PROPOSER_CONTRACT_VERSION)
+            cfg_raw.get(
+                "proposer_contract_version", UNIVERSAL_PROPOSER_CONTRACT_VERSION
+            )
         ),
         max_input_vars=int(cfg_raw.get("max_input_vars", 4)),
         operator_vocab=cfg_raw.get("operator_vocab"),
@@ -1336,10 +1419,14 @@ def load_universal_proposer_checkpoint(
     model.architecture_version = metadata_report.get("architecture_version")
     model.proposer_contract_version = metadata_report.get("proposer_contract_version")
     validation_metrics = ckpt.get("validation_metrics")
-    model.validation_metrics = dict(validation_metrics) if isinstance(validation_metrics, dict) else {}
+    model.validation_metrics = (
+        dict(validation_metrics) if isinstance(validation_metrics, dict) else {}
+    )
     routing_calibration = ckpt.get("routing_calibration")
-    model.routing_calibration = dict(routing_calibration) if isinstance(routing_calibration, dict) else None
-    
+    model.routing_calibration = (
+        dict(routing_calibration) if isinstance(routing_calibration, dict) else None
+    )
+
     # Attach scaler for automatic normalization during inference. Some older
     # proposer checkpoints accidentally stored an AMP GradScaler here.
     feature_scaler = ckpt.get("feature_scaler")
@@ -1355,7 +1442,7 @@ def load_universal_proposer_checkpoint(
             "std": np.asarray(feature_scaler["std"], dtype=np.float32),
         }
     model.feature_scaler = feature_scaler
-    
+
     if device is not None:
         model = model.to(torch.device(device))
     model.eval()
@@ -1367,10 +1454,10 @@ def propose_fpip_v2_from_xy(
     x: np.ndarray,
     y: np.ndarray,
     top_k: int = 5,
-    fit_diagnostics: Optional[Dict[str, Any]] = None,
-    interaction_hints: Optional[Dict[str, Any]] = None,
-    device: Optional[str] = None,
-) -> Dict[str, Any]:
+    fit_diagnostics: dict[str, Any] | None = None,
+    interaction_hints: dict[str, Any] | None = None,
+    device: str | None = None,
+) -> dict[str, Any]:
     """Convenience wrapper: proposer inference + FPIP v2 adaptation."""
     out = propose_from_xy(model, x=x, y=y, top_k=top_k, device=device)
     return proposer_output_to_fpip_v2(

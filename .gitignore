@@ -107,3 +107,4 @@ grokking_experiments/
 diffusion/
 scratch/
 .tmp/
+.commandcode/taste/

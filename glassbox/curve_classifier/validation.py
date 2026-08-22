@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Any
 
 import numpy as np
 
@@ -27,14 +28,16 @@ def _json_safe(value: Any) -> Any:
 
 def write_validation_report(path: Path, report: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_json_safe(dict(report)), indent=2, sort_keys=True), encoding="utf-8")
+    path.write_text(
+        json.dumps(_json_safe(dict(report)), indent=2, sort_keys=True), encoding="utf-8"
+    )
 
 
 def default_validation_report_path(checkpoint_path: Path) -> Path:
     return checkpoint_path.with_name(f"{checkpoint_path.stem}.validation.json")
 
 
-def object_array_to_list(raw: Any, limit: int | None = None) -> List[Any] | None:
+def object_array_to_list(raw: Any, limit: int | None = None) -> list[Any] | None:
     if raw is None:
         return None
     if isinstance(raw, np.ndarray):
@@ -62,7 +65,9 @@ def formula_keys_from_metadata_or_formulas(
     return np.asarray([formula_to_key(str(f)) for f in formula_list], dtype=object)
 
 
-def row_train_val_split(n_samples: int, val_ratio: float, seed: int) -> Tuple[np.ndarray, np.ndarray]:
+def row_train_val_split(
+    n_samples: int, val_ratio: float, seed: int
+) -> tuple[np.ndarray, np.ndarray]:
     n_val = int(n_samples * val_ratio)
     if n_val < 1 or n_samples - n_val < 1:
         raise ValueError(
@@ -79,24 +84,28 @@ def grouped_train_val_split(
     groups: Sequence[Any],
     val_ratio: float,
     seed: int,
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     """Split rows by whole-group membership so train/val groups do not overlap."""
     groups_arr = np.asarray(groups, dtype=object)
     n_samples = int(groups_arr.shape[0])
     if n_samples < 2:
         raise ValueError("Need at least two samples for a train/validation split")
 
-    by_group: Dict[str, List[int]] = {}
+    by_group: dict[str, list[int]] = {}
     for idx, group in enumerate(groups_arr.tolist()):
         by_group.setdefault(str(group), []).append(idx)
 
     if len(by_group) < 2:
         train_idx, val_idx = row_train_val_split(n_samples, val_ratio, seed)
-        return train_idx, val_idx, {
-            "policy": "row_fallback_single_group",
-            "group_count": len(by_group),
-            "exclusive_groups": False,
-        }
+        return (
+            train_idx,
+            val_idx,
+            {
+                "policy": "row_fallback_single_group",
+                "group_count": len(by_group),
+                "exclusive_groups": False,
+            },
+        )
 
     target_val = max(1, int(round(n_samples * val_ratio)))
     target_groups = max(1, int(round(len(by_group) * val_ratio)))
@@ -121,37 +130,50 @@ def grouped_train_val_split(
 
     if not val_groups or len(val_groups) == len(group_items):
         train_idx, val_idx = row_train_val_split(n_samples, val_ratio, seed)
-        return train_idx, val_idx, {
-            "policy": "row_fallback_group_balance",
-            "group_count": len(by_group),
-            "exclusive_groups": False,
-        }
+        return (
+            train_idx,
+            val_idx,
+            {
+                "policy": "row_fallback_group_balance",
+                "group_count": len(by_group),
+                "exclusive_groups": False,
+            },
+        )
 
     val_idx = np.asarray(
         [idx for group in val_groups for idx in by_group[group]],
         dtype=np.int64,
     )
     train_idx = np.asarray(
-        [idx for group, members in by_group.items() if group not in val_groups for idx in members],
+        [
+            idx
+            for group, members in by_group.items()
+            if group not in val_groups
+            for idx in members
+        ],
         dtype=np.int64,
     )
     rng.shuffle(train_idx)
     rng.shuffle(val_idx)
 
-    return train_idx, val_idx, {
-        "policy": "formula_group",
-        "group_count": len(by_group),
-        "val_group_count": len(val_groups),
-        "exclusive_groups": True,
-        "target_val_rows": target_val,
-        "target_val_groups": target_groups,
-    }
+    return (
+        train_idx,
+        val_idx,
+        {
+            "policy": "formula_group",
+            "group_count": len(by_group),
+            "val_group_count": len(val_groups),
+            "exclusive_groups": True,
+            "target_val_rows": target_val,
+            "target_val_groups": target_groups,
+        },
+    )
 
 
 def family_holdout_split(
     families: Sequence[Any],
     heldout_family: str,
-) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     families_arr = np.asarray(families, dtype=object).astype(str)
     val_mask = families_arr == str(heldout_family)
     val_idx = np.flatnonzero(val_mask).astype(np.int64)
@@ -161,18 +183,22 @@ def family_holdout_split(
             f"Cannot hold out family {heldout_family!r}: "
             f"train={len(train_idx)} val={len(val_idx)}"
         )
-    return train_idx, val_idx, {
-        "policy": "generator_family_holdout",
-        "heldout_family": str(heldout_family),
-        "exclusive_groups": True,
-    }
+    return (
+        train_idx,
+        val_idx,
+        {
+            "policy": "generator_family_holdout",
+            "heldout_family": str(heldout_family),
+            "exclusive_groups": True,
+        },
+    )
 
 
 def formula_overlap_report(
     formula_keys: Sequence[Any] | None,
     train_idx: Sequence[int],
     val_idx: Sequence[int],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     if formula_keys is None:
         return {"available": False}
     keys = np.asarray(formula_keys, dtype=object).astype(str)
@@ -188,11 +214,14 @@ def formula_overlap_report(
         "overlap_unique_formulas": len(overlap),
         "val_unique_overlap_fraction": len(overlap) / max(1, len(val_keys)),
         "val_rows_with_train_formula": int(val_rows_seen),
-        "val_rows_with_train_formula_fraction": val_rows_seen / max(1, len(val_keys_list)),
+        "val_rows_with_train_formula_fraction": val_rows_seen
+        / max(1, len(val_keys_list)),
     }
 
 
-def value_distribution(values: Sequence[Any] | None, indices: Sequence[int] | None = None) -> Dict[str, int]:
+def value_distribution(
+    values: Sequence[Any] | None, indices: Sequence[int] | None = None
+) -> dict[str, int]:
     if values is None:
         return {}
     arr = np.asarray(values, dtype=object).astype(str)
@@ -202,7 +231,9 @@ def value_distribution(values: Sequence[Any] | None, indices: Sequence[int] | No
     return {str(k): int(v) for k, v in zip(unique.tolist(), counts.tolist())}
 
 
-def label_distribution(labels: np.ndarray, operator_classes: Sequence[str], indices: Sequence[int]) -> Dict[str, int]:
+def label_distribution(
+    labels: np.ndarray, operator_classes: Sequence[str], indices: Sequence[int]
+) -> dict[str, int]:
     subset = np.asarray(labels[np.asarray(indices, dtype=np.int64)], dtype=np.float32)
     counts = subset.sum(axis=0)
     return {
@@ -217,7 +248,7 @@ def multilabel_metric_summary(
     labels: np.ndarray,
     operator_classes: Sequence[str],
     thresholds: np.ndarray | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Compute per-class precision/recall/F1/support from probabilities."""
     probs_arr = np.asarray(probs, dtype=np.float32)
     labels_arr = np.asarray(labels, dtype=np.float32)
@@ -251,12 +282,12 @@ def multilabel_metrics_by_group(
     groups: Sequence[Any] | None,
     operator_classes: Sequence[str],
     min_rows: int = 25,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Compute class metrics per generator family/template group."""
     if groups is None:
         return {}
     groups_arr = np.asarray(groups, dtype=object).astype(str)
-    out: Dict[str, Any] = {}
+    out: dict[str, Any] = {}
     for group in sorted(set(groups_arr.tolist())):
         mask = groups_arr == group
         if int(mask.sum()) < min_rows:
@@ -285,18 +316,20 @@ def build_validation_report(
     split_details: Mapping[str, Any] | None = None,
     metrics: Mapping[str, Any] | None = None,
     notes: Iterable[str] | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     train_idx_arr = np.asarray(train_idx, dtype=np.int64)
     val_idx_arr = np.asarray(val_idx, dtype=np.int64)
-    report: Dict[str, Any] = {
+    report: dict[str, Any] = {
         "schema_version": "validation.phase3.v1",
         "dataset_path": dataset_path,
         "split_policy": split_policy,
         "split_details": dict(split_details or {}),
         "n_samples": int(labels.shape[0]),
-        "train_rows": int(len(train_idx_arr)),
-        "val_rows": int(len(val_idx_arr)),
-        "formula_overlap": formula_overlap_report(formula_keys, train_idx_arr, val_idx_arr),
+        "train_rows": len(train_idx_arr),
+        "val_rows": len(val_idx_arr),
+        "formula_overlap": formula_overlap_report(
+            formula_keys, train_idx_arr, val_idx_arr
+        ),
         "label_distribution": {
             "train": label_distribution(labels, operator_classes, train_idx_arr),
             "val": label_distribution(labels, operator_classes, val_idx_arr),
@@ -315,6 +348,6 @@ def build_validation_report(
     return report
 
 
-def metrics_to_json_dict(metrics: Mapping[str, Any]) -> Dict[str, Any]:
+def metrics_to_json_dict(metrics: Mapping[str, Any]) -> dict[str, Any]:
     excluded = {"preds", "labels", "logits"}
     return {str(k): _json_safe(v) for k, v in metrics.items() if k not in excluded}

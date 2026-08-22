@@ -14,28 +14,25 @@ This is more robust than plain least squares and can help "discover" the right
 coefficients even when structure is imperfect.
 """
 
+import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import LBFGS
-from typing import Optional, Dict, List, Tuple, Callable
-import numpy as np
-import copy
 
 
 class RegularizedBFGS:
     """
     BFGS optimizer with L1/L2 regularization for coefficient fitting.
-    
+
     Loss function:
         L = MSE(y, X @ w) + λ1 * ||w||_1 + λ2 * ||w||_2^2
-    
+
     where:
         - MSE ensures good fit
         - L1 encourages sparsity (zero out unused terms)
         - L2 prevents coefficient explosion
     """
-    
+
     def __init__(
         self,
         l1_weight: float = 0.01,
@@ -44,7 +41,7 @@ class RegularizedBFGS:
         lr: float = 1.0,
         tolerance_grad: float = 1e-7,
         tolerance_change: float = 1e-9,
-        line_search_fn: str = 'strong_wolfe',
+        line_search_fn: str = "strong_wolfe",
     ):
         """
         Args:
@@ -63,33 +60,35 @@ class RegularizedBFGS:
         self.tolerance_grad = tolerance_grad
         self.tolerance_change = tolerance_change
         self.line_search_fn = line_search_fn
-    
+
     def fit(
         self,
         X: torch.Tensor,
         y: torch.Tensor,
-        initial_weights: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, float]:
+        initial_weights: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, float]:
         """
         Fit coefficients using L-BFGS with regularization.
-        
+
         Args:
             X: Feature matrix (n_samples, n_features)
             y: Target vector (n_samples,) or (n_samples, 1)
             initial_weights: Optional initial weights (n_features,)
-        
+
         Returns:
             (weights, final_loss)
         """
         n_features = X.shape[1]
         y = y.squeeze()
-        
+
         # Initialize weights
         if initial_weights is not None:
             weights = initial_weights.clone().detach().requires_grad_(True)
         else:
-            weights = torch.zeros(n_features, dtype=X.dtype, device=X.device, requires_grad=True)
-        
+            weights = torch.zeros(
+                n_features, dtype=X.dtype, device=X.device, requires_grad=True
+            )
+
         # Create optimizer
         optimizer = LBFGS(
             [weights],
@@ -99,26 +98,26 @@ class RegularizedBFGS:
             tolerance_change=self.tolerance_change,
             line_search_fn=self.line_search_fn,
         )
-        
+
         # Optimize
         def closure():
             optimizer.zero_grad()
-            
+
             # Predictions
             pred = X @ weights
-            
+
             # MSE loss
             mse_loss = F.mse_loss(pred, y)
-            
+
             # L1 regularization (sparsity)
             l1_loss = weights.abs().sum()
-            
+
             # L2 regularization (smoothness)
-            l2_loss = (weights ** 2).sum()
-            
+            l2_loss = (weights**2).sum()
+
             # Total loss
             loss = mse_loss + self.l1_weight * l1_loss + self.l2_weight * l2_loss
-            
+
             # S10-4: Guard against NaN/Inf so LBFGS line search is never
             # poisoned by non-finite objective or gradient values.
             if torch.isfinite(loss):
@@ -134,33 +133,33 @@ class RegularizedBFGS:
                 # Return a large but finite fallback so LBFGS can
                 # reject this step gracefully instead of diverging.
                 loss = torch.tensor(1e8, dtype=loss.dtype, device=loss.device)
-            
+
             return loss
-        
+
         try:
             optimizer.step(closure)
         except Exception:
             # BFGS can fail on ill-conditioned problems; keep current weights.
             pass
-        
+
         # Final loss — non-finite → large finite penalty (skip candidate upstream).
         with torch.no_grad():
             pred = X @ weights
             final_mse = F.mse_loss(pred, y).item()
             if not np.isfinite(final_mse):
                 final_mse = 1e8
-        
+
         return weights.detach(), final_mse
 
 
 class MultiStartBFGS:
     """
     Run BFGS from multiple random initializations and keep the best.
-    
+
     This helps escape local minima, especially important when the structure
     from Phase 1 is imperfect.
     """
-    
+
     def __init__(
         self,
         n_starts: int = 5,
@@ -182,33 +181,33 @@ class MultiStartBFGS:
         self.l2_weight = l2_weight
         self.max_iter = max_iter
         self.initialization_scale = initialization_scale
-        
+
         self.bfgs = RegularizedBFGS(
             l1_weight=l1_weight,
             l2_weight=l2_weight,
             max_iter=max_iter,
         )
-    
+
     def fit(
         self,
         X: torch.Tensor,
         y: torch.Tensor,
         verbose: bool = False,
-    ) -> Tuple[torch.Tensor, float, List[Tuple[torch.Tensor, float]]]:
+    ) -> tuple[torch.Tensor, float, list[tuple[torch.Tensor, float]]]:
         """
         Fit using multiple starts and return the best.
-        
+
         Args:
             X: Feature matrix (n_samples, n_features)
             y: Target vector (n_samples,)
             verbose: Print progress
-        
+
         Returns:
             (best_weights, best_loss, all_results)
         """
         n_features = X.shape[1]
         all_results = []
-        
+
         # Try multiple starts
         for start_idx in range(self.n_starts):
             # Random initialization
@@ -217,38 +216,41 @@ class MultiStartBFGS:
                 init_weights = torch.zeros(n_features, dtype=X.dtype, device=X.device)
             else:
                 # Random starts
-                init_weights = torch.randn(n_features, dtype=X.dtype, device=X.device) * self.initialization_scale
-            
+                init_weights = (
+                    torch.randn(n_features, dtype=X.dtype, device=X.device)
+                    * self.initialization_scale
+                )
+
             # Fit
             weights, loss = self.bfgs.fit(X, y, initial_weights=init_weights)
             all_results.append((weights.clone(), loss))
-            
+
             if verbose:
                 print(f"  Start {start_idx + 1}/{self.n_starts}: MSE = {loss:.6f}")
-        
+
         # Find best
         best_weights, best_loss = min(all_results, key=lambda x: x[1])
-        
+
         if verbose:
             print(f"  Best: MSE = {best_loss:.6f}")
-        
+
         return best_weights, best_loss, all_results
 
 
 class IterativeBFGSRefiner:
     """
     Iteratively refine coefficients by alternating BFGS and pruning.
-    
+
     Algorithm:
     1. Fit all coefficients with BFGS
     2. Prune coefficients below threshold
     3. Refit remaining coefficients
     4. Repeat until convergence or max iterations
-    
+
     This can effectively "discover" that certain terms should be zero,
     helping when Phase 1 structure is imperfect.
     """
-    
+
     def __init__(
         self,
         n_iterations: int = 3,
@@ -270,106 +272,112 @@ class IterativeBFGSRefiner:
         self.n_starts_per_iteration = n_starts_per_iteration
         self.l1_weight = l1_weight
         self.l2_weight = l2_weight
-        
+
         self.multistart = MultiStartBFGS(
             n_starts=n_starts_per_iteration,
             l1_weight=l1_weight,
             l2_weight=l2_weight,
         )
-    
+
     def fit(
         self,
         X: torch.Tensor,
         y: torch.Tensor,
-        feature_names: Optional[List[str]] = None,
+        feature_names: list[str] | None = None,
         verbose: bool = False,
-    ) -> Tuple[torch.Tensor, float, List[int]]:
+    ) -> tuple[torch.Tensor, float, list[int]]:
         """
         Iteratively refine coefficients.
-        
+
         Args:
             X: Feature matrix (n_samples, n_features)
             y: Target vector (n_samples,)
             feature_names: Optional names for logging
             verbose: Print progress
-        
+
         Returns:
             (final_weights, final_mse, active_indices)
         """
         n_features = X.shape[1]
         active_mask = torch.ones(n_features, dtype=torch.bool, device=X.device)
-        
+
         best_weights = None
-        best_loss = float('inf')
-        
+        best_loss = float("inf")
+
         for iteration in range(self.n_iterations):
             if verbose:
                 print(f"\n--- Iteration {iteration + 1}/{self.n_iterations} ---")
                 active_count = active_mask.sum().item()
                 print(f"Active features: {active_count}/{n_features}")
-            
+
             # Snapshot the mask BEFORE this iteration's pruning so we can
             # detect true convergence (no change between iterations).
             prev_active_mask = active_mask.clone()
-            
+
             # Get active features
             X_active = X[:, active_mask]
-            
+
             if X_active.shape[1] == 0:
                 if verbose:
                     print("  No active features left, stopping.")
                 break
-            
+
             # Fit active features
             weights_active, loss, _ = self.multistart.fit(X_active, y, verbose=verbose)
-            
+
             # Expand weights to full size
             weights_full = torch.zeros(n_features, dtype=X.dtype, device=X.device)
             weights_full[active_mask] = weights_active
-            
+
             # Track best
             if loss < best_loss:
                 best_loss = loss
                 best_weights = weights_full.clone()
-            
+
             # Prune small coefficients
             abs_weights = weights_active.abs()
             max_weight = abs_weights.max().item()
-            
+
             if max_weight > 0:
                 # Prune based on absolute value
                 prune_mask_active = abs_weights < self.prune_threshold
                 n_pruned = prune_mask_active.sum().item()
-                
+
                 if verbose and n_pruned > 0:
-                    print(f"  Pruning {n_pruned} features with |weight| < {self.prune_threshold}")
+                    print(
+                        f"  Pruning {n_pruned} features with |weight| < {self.prune_threshold}"
+                    )
                     if feature_names is not None:
-                        active_names = [name for name, m in zip(feature_names, active_mask) if m]
-                        for i, (name, w, prune) in enumerate(zip(active_names, weights_active, prune_mask_active)):
+                        active_names = [
+                            name for name, m in zip(feature_names, active_mask) if m
+                        ]
+                        for i, (name, w, prune) in enumerate(
+                            zip(active_names, weights_active, prune_mask_active)
+                        ):
                             if prune:
                                 print(f"    Pruned: {name} (weight={w.item():.4f})")
-                
+
                 # Update active mask
                 # Map prune_mask_active back to full feature space
                 active_indices = torch.where(active_mask)[0]
                 for i, prune in enumerate(prune_mask_active):
                     if prune:
                         active_mask[active_indices[i]] = False
-            
+
             # Stop if active set is unchanged from prior iteration
             if iteration > 0 and torch.all(active_mask == prev_active_mask):
                 if verbose:
                     print("  Converged (no change in active set)")
                 break
-        
+
         # Return best result
         active_indices = torch.where(active_mask)[0].tolist()
-        
+
         if verbose:
-            print(f"\n--- Final Result ---")
+            print("\n--- Final Result ---")
             print(f"Active features: {len(active_indices)}/{n_features}")
             print(f"Final MSE: {best_loss:.6f}")
-        
+
         return best_weights, best_loss, active_indices
 
 
@@ -377,11 +385,12 @@ class IterativeBFGSRefiner:
 # High-level API
 # ============================================================================
 
+
 def fit_coefficients_bfgs(
     X: torch.Tensor,
     y: torch.Tensor,
-    feature_names: Optional[List[str]] = None,
-    method: str = 'iterative',
+    feature_names: list[str] | None = None,
+    method: str = "iterative",
     n_starts: int = 5,
     n_iterations: int = 3,
     l1_weight: float = 0.01,
@@ -389,7 +398,7 @@ def fit_coefficients_bfgs(
     prune_threshold: float = 0.05,
     verbose: bool = False,
     sample_weight=None,
-) -> Tuple[torch.Tensor, float, str]:
+) -> tuple[torch.Tensor, float, str]:
     """
     Fit coefficients using BFGS (high-level API).
 
@@ -409,11 +418,13 @@ def fit_coefficients_bfgs(
     Returns:
         (weights, mse, formula_string)
     """
-    if method == 'iterative':
+    if method == "iterative":
         # Try C++ native backend first
         try:
             import numpy as np
+
             from glassbox.sr.cpp import get_cpp_core
+
             _core = get_cpp_core()
             if _core is None:
                 raise ImportError("C++ core not found")
@@ -425,17 +436,24 @@ def fit_coefficients_bfgs(
                 weights_out, mse = _core.iterative_elastic_net(
                     X.detach().cpu().numpy().astype(np.float64),
                     y.detach().cpu().numpy().astype(np.float64),
-                    l1_weight, l2_weight,
-                    n_starts, n_iterations,
-                    prune_threshold, 1000, sw,
+                    l1_weight,
+                    l2_weight,
+                    n_starts,
+                    n_iterations,
+                    prune_threshold,
+                    1000,
+                    sw,
                 )
             else:
                 weights_out, mse = _core.iterative_elastic_net(
                     X.detach().cpu().numpy().astype(np.float64),
                     y.detach().cpu().numpy().astype(np.float64),
-                    l1_weight, l2_weight,
-                    n_starts, n_iterations,
-                    prune_threshold, 1000
+                    l1_weight,
+                    l2_weight,
+                    n_starts,
+                    n_iterations,
+                    prune_threshold,
+                    1000,
                 )
             weights = torch.tensor(weights_out, dtype=X.dtype, device=X.device)
             active_indices = [i for i, w in enumerate(weights_out) if abs(w) > 0]
@@ -451,15 +469,17 @@ def fit_coefficients_bfgs(
                 l1_weight=l1_weight,
                 l2_weight=l2_weight,
             )
-            weights, mse, active_indices = iterative.fit(X, y, feature_names=feature_names, verbose=verbose)
+            weights, mse, active_indices = iterative.fit(
+                X, y, feature_names=feature_names, verbose=verbose
+            )
 
-    elif method == 'simple':
+    elif method == "simple":
         # Simple BFGS from zero init
         bfgs = RegularizedBFGS(l1_weight=l1_weight, l2_weight=l2_weight)
         weights, mse = bfgs.fit(X, y)
         active_indices = list(range(X.shape[1]))
 
-    elif method == 'multistart':
+    elif method == "multistart":
         # Multi-start BFGS
         multistart = MultiStartBFGS(
             n_starts=n_starts,
@@ -473,39 +493,45 @@ def fit_coefficients_bfgs(
         raise ValueError(f"Unknown method: {method}")
 
     # Build formula string
-    formula = build_formula_from_weights(weights, feature_names, threshold=prune_threshold)
+    formula = build_formula_from_weights(
+        weights, feature_names, threshold=prune_threshold
+    )
 
     return weights, mse, formula
 
+
 def build_formula_from_weights(
     weights: torch.Tensor,
-    feature_names: Optional[List[str]] = None,
+    feature_names: list[str] | None = None,
     threshold: float = 0.01,
     snap_constants: bool = True,
     snap_threshold: float = 0.05,
 ) -> str:
     """
     Build a formula string from weights.
-    
+
     Args:
         weights: Coefficient weights (n_features,)
         feature_names: Feature names (e.g., ['x', 'x²', 'sin(x)'])
         threshold: Only include terms with |weight| > threshold
         snap_constants: If True, snap weights to known constants (π, e, etc.)
         snap_threshold: Threshold for constant snapping (default 5%)
-    
+
     Returns:
         Formula string (e.g., "π*sin(x) + (1/π)*x²")
     """
     # Import constant snapping utilities
     try:
-        from glassbox.sr.operations.meta_ops import snap_to_constant, get_constant_symbol
+        from glassbox.sr.operations.meta_ops import (
+            get_constant_symbol,
+            snap_to_constant,
+        )
     except ImportError:
         snap_constants = False
-    
+
     if feature_names is None:
         feature_names = [f"f{i}" for i in range(len(weights))]
-    
+
     # Build formula
     terms = []
     for i, (w, name) in enumerate(zip(weights, feature_names)):
@@ -516,13 +542,16 @@ def build_formula_from_weights(
                 coef_str = get_constant_symbol(w_val, snap_threshold)
             else:
                 coef_str = None
-            
+
             # Format the term
             if abs(w_val - 1.0) < 0.01:
                 terms.append(name)
             elif abs(w_val + 1.0) < 0.01:
                 terms.append(f"-{name}")
-            elif coef_str is not None and coef_str not in [str(int(round(w_val))), f"{w_val:.4g}"]:
+            elif coef_str is not None and coef_str not in [
+                str(int(round(w_val))),
+                f"{w_val:.4g}",
+            ]:
                 # Use symbolic constant (π, e, etc.)
                 if w_val > 0:
                     terms.append(f"{coef_str}*{name}")
@@ -532,13 +561,13 @@ def build_formula_from_weights(
                 terms.append(f"{w_val:.4f}*{name}")
             else:
                 terms.append(f"({w_val:.4f}*{name})")
-    
+
     formula = " + ".join(terms) if terms else "0"
-    
+
     # Clean up
     formula = formula.replace("+ -", "- ")
     formula = formula.replace("+ (-", "- (")
-    
+
     return formula
 
 
@@ -546,89 +575,94 @@ def build_formula_from_weights(
 # Testing
 # ============================================================================
 
+
 def test_bfgs_basic():
     """Test basic BFGS fitting."""
     print("Testing RegularizedBFGS...")
-    
+
     # Generate synthetic data: y = 2*x1 + 3*x2 + noise
     torch.manual_seed(42)
     n_samples = 100
     X = torch.randn(n_samples, 2)
     true_weights = torch.tensor([2.0, 3.0])
     y = X @ true_weights + torch.randn(n_samples) * 0.1
-    
+
     # Fit
     bfgs = RegularizedBFGS(l1_weight=0.001, l2_weight=0.0001)
     weights, mse = bfgs.fit(X, y)
-    
+
     print(f"True weights: {true_weights}")
     print(f"Fitted weights: {weights}")
     print(f"MSE: {mse:.6f}")
-    
+
     # Check accuracy
     weight_error = (weights - true_weights).abs().max().item()
     assert weight_error < 0.5, f"Weight error too large: {weight_error}"
     assert mse < 0.1, f"MSE too large: {mse}"
-    
+
     print("✓ Basic BFGS test passed\n")
 
 
 def test_multistart():
     """Test multi-start BFGS."""
     print("Testing MultiStartBFGS...")
-    
+
     # Create non-convex problem by adding noisy features
     torch.manual_seed(42)
     n_samples = 100
     X = torch.randn(n_samples, 5)  # 5 features
     true_weights = torch.tensor([2.0, 0.0, 3.0, 0.0, 0.0])  # Only 2 active
     y = X @ true_weights + torch.randn(n_samples) * 0.1
-    
+
     # Fit with multi-start
     multistart = MultiStartBFGS(n_starts=5, l1_weight=0.05)
     weights, mse, all_results = multistart.fit(X, y, verbose=True)
-    
+
     print(f"\nTrue weights: {true_weights}")
     print(f"Best weights: {weights}")
     print(f"Best MSE: {mse:.6f}")
-    
+
     # Check that we found the correct sparse solution
     active_true = (true_weights != 0).float()
     active_fitted = (weights.abs() > 0.1).float()
     sparsity_match = (active_true == active_fitted).float().mean().item()
-    
+
     print(f"Sparsity pattern match: {sparsity_match:.1%}")
     assert sparsity_match >= 0.8, "Should find correct sparsity pattern"
-    
+
     print("✓ Multi-start BFGS test passed\n")
 
 
 def test_iterative():
     """Test iterative refinement."""
     print("Testing IterativeBFGSRefiner...")
-    
+
     # Create problem: y = π*sin(x) + x²/π
     torch.manual_seed(42)
     n_samples = 100
     x = torch.linspace(-3, 3, n_samples).unsqueeze(1)
-    
+
     # Build features: [x, x², x³, sin(x), cos(x)]
     import math
+
     PI = math.pi
-    X = torch.cat([
-        x,
-        x ** 2,
-        x ** 3,
-        torch.sin(x),
-        torch.cos(x),
-    ], dim=1)
-    
-    feature_names = ['x', 'x²', 'x³', 'sin(x)', 'cos(x)']
-    
+    X = torch.cat(
+        [
+            x,
+            x**2,
+            x**3,
+            torch.sin(x),
+            torch.cos(x),
+        ],
+        dim=1,
+    )
+
+    feature_names = ["x", "x²", "x³", "sin(x)", "cos(x)"]
+
     # True formula: π*sin(x) + x²/π
-    true_weights = torch.tensor([0.0, 1/PI, 0.0, PI, 0.0])
+    true_weights = torch.tensor([0.0, 1 / PI, 0.0, PI, 0.0])
     y = X @ true_weights
-    
+
     # Fit with iterative refinement
     refiner = IterativeBFGSRefiner(
         n_iterations=3,
@@ -636,29 +670,31 @@ def test_iterative():
         n_starts_per_iteration=3,
         l1_weight=0.02,
     )
-    
-    weights, mse, active_indices = refiner.fit(X, y, feature_names=feature_names, verbose=True)
-    
-    print(f"\nTrue formula: π*sin(x) + x²/π")
+
+    weights, mse, active_indices = refiner.fit(
+        X, y, feature_names=feature_names, verbose=True
+    )
+
+    print("\nTrue formula: π*sin(x) + x²/π")
     print(f"True weights: {true_weights}")
     print(f"Fitted weights: {weights}")
     print(f"Active indices: {active_indices}")
-    
+
     formula = build_formula_from_weights(weights, feature_names, threshold=0.05)
     print(f"\nDiscovered formula: {formula}")
-    
+
     # Check that we found the right terms
     assert weights[1].abs() > 0.1, "Should find x² term"
     assert weights[3].abs() > 1.0, "Should find sin(x) term"
     assert weights[2].abs() < 0.1, "Should prune x³ term"
-    
+
     print("\n✓ Iterative refinement test passed\n")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     test_bfgs_basic()
     test_multistart()
     test_iterative()
-    print("\n" + "="*50)
+    print("\n" + "=" * 50)
     print("ALL TESTS PASSED!")
-    print("="*50)
+    print("=" * 50)

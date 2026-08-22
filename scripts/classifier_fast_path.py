@@ -7,38 +7,39 @@ skip Phase 1 evolution entirely and directly run regression.
 This can reduce solve time from ~300s to <10s for well-predicted formulas.
 """
 
-import re
 import math
+import re
 import threading
-import importlib
-from functools import lru_cache
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from itertools import permutations
+from typing import Any
+
 import numpy as np
 import torch
-from typing import Any, Dict, List, Tuple, Optional
 
 from glassbox.model_registry import DEFAULT_CURVE_CLASSIFIER_PATH
-from glassbox.sr.operations.meta_ops import get_constant_symbol, normalize_formula_ascii
 from glassbox.sr.fpip_v2 import build_fpip_v2_from_fast_path, validate_fpip_v2_payload
+from glassbox.sr.operations.meta_ops import get_constant_symbol, normalize_formula_ascii
 
 # Thread-safe CUDA warning state
 _warned_no_cuda = False
 _cuda_warning_lock = threading.Lock()
 
 # Pre-compiled regex patterns for performance
-_FREQ_SIN_PATTERN = re.compile(r'sin\(([0-9.]+)\*?x', re.IGNORECASE)
-_FREQ_COS_PATTERN = re.compile(r'cos\(([0-9.]+)\*?x', re.IGNORECASE)
-_POWER_PATTERN = re.compile(r'x\^([0-9.]+)', re.IGNORECASE)
+_FREQ_SIN_PATTERN = re.compile(r"sin\(([0-9.]+)\*?x", re.IGNORECASE)
+_FREQ_COS_PATTERN = re.compile(r"cos\(([0-9.]+)\*?x", re.IGNORECASE)
+_POWER_PATTERN = re.compile(r"x\^([0-9.]+)", re.IGNORECASE)
 
 DEFAULT_EXACT_MATCH_MIN_GPU_WORK = 250_000
 DEFAULT_EXACT_MATCH_MAX_COMBOS = 50_000
 
 
 @lru_cache(maxsize=1)
-def _load_cpp_core() -> Tuple[Optional[Any], Optional[str]]:
+def _load_cpp_core() -> tuple[Any | None, str | None]:
     """Load the optional C++ extension (canonical glassbox.sr.cpp loader)."""
     from glassbox.sr.cpp import load_cpp_core
+
     return load_cpp_core()
 
 
@@ -86,33 +87,38 @@ def _lasso_coordinate_descent_python(
     return coeffs
 
 
-def _with_derived_predictions(predictions: Dict[str, float]) -> Dict[str, float]:
+def _with_derived_predictions(predictions: dict[str, float]) -> dict[str, float]:
     """Return predictions augmented with derived periodic/exponential/polynomial keys."""
     derived = dict(predictions)
-    periodic_prob = max(derived.get('sin', 0.0), derived.get('cos', 0.0))
-    exponential_prob = max(derived.get('exp', 0.0), derived.get('log', 0.0))
-    polynomial_prob = max(derived.get('power', 0.0), derived.get('identity', 0.0))
+    periodic_prob = max(derived.get("sin", 0.0), derived.get("cos", 0.0))
+    exponential_prob = max(derived.get("exp", 0.0), derived.get("log", 0.0))
+    polynomial_prob = max(derived.get("power", 0.0), derived.get("identity", 0.0))
 
-    derived.setdefault('periodic', periodic_prob)
-    derived.setdefault('exponential', exponential_prob)
-    derived.setdefault('polynomial', polynomial_prob)
+    derived.setdefault("periodic", periodic_prob)
+    derived.setdefault("exponential", exponential_prob)
+    derived.setdefault("polynomial", polynomial_prob)
     return derived
 
 
-def _prediction_uncertainty_metrics(predictions: Dict[str, float]) -> Dict[str, float | bool | None]:
+def _prediction_uncertainty_metrics(
+    predictions: dict[str, float],
+) -> dict[str, float | bool | None]:
     """Summarize classifier confidence with entropy and top-1/top-2 margin."""
-    metrics: Dict[str, float | bool | None] = {
-        'prediction_entropy': None,
-        'prediction_margin': None,
-        'prediction_top1': None,
-        'prediction_top2': None,
-        'prediction_uncertain': False,
+    metrics: dict[str, float | bool | None] = {
+        "prediction_entropy": None,
+        "prediction_margin": None,
+        "prediction_top1": None,
+        "prediction_top2": None,
+        "prediction_uncertain": False,
     }
 
     if not predictions:
         return metrics
 
-    probs = np.asarray([float(p) for p in predictions.values() if np.isfinite(p) and p > 0.0], dtype=np.float64)
+    probs = np.asarray(
+        [float(p) for p in predictions.values() if np.isfinite(p) and p > 0.0],
+        dtype=np.float64,
+    )
     if probs.size == 0:
         return metrics
 
@@ -125,16 +131,19 @@ def _prediction_uncertainty_metrics(predictions: Dict[str, float]) -> Dict[str, 
     top1 = float(sorted_probs[0])
     top2 = float(sorted_probs[1]) if sorted_probs.size > 1 else 0.0
     if sorted_probs.size > 1:
-        entropy = float(-np.sum(sorted_probs * np.log(sorted_probs + 1e-12)) / np.log(sorted_probs.size))
+        entropy = float(
+            -np.sum(sorted_probs * np.log(sorted_probs + 1e-12))
+            / np.log(sorted_probs.size)
+        )
     else:
         entropy = 0.0
 
     margin = top1 - top2
-    metrics['prediction_entropy'] = entropy
-    metrics['prediction_margin'] = margin
-    metrics['prediction_top1'] = top1
-    metrics['prediction_top2'] = top2
-    metrics['prediction_uncertain'] = entropy > 0.8 or margin < 0.1
+    metrics["prediction_entropy"] = entropy
+    metrics["prediction_margin"] = margin
+    metrics["prediction_top1"] = top1
+    metrics["prediction_top2"] = top2
+    metrics["prediction_uncertain"] = entropy > 0.8 or margin < 0.1
     return metrics
 
 
@@ -143,14 +152,14 @@ def _display_candidate_score(
     x: np.ndarray,
     y: np.ndarray,
     *,
-    raw_mse: Optional[float] = None,
-    fit_mse: Optional[float] = None,
-    holdout_mse: Optional[float] = None,
-    residual_diagnostics: Optional[Dict[str, Any]] = None,
-    complexity: Optional[int] = None,
-    n_terms: Optional[int] = None,
+    raw_mse: float | None = None,
+    fit_mse: float | None = None,
+    holdout_mse: float | None = None,
+    residual_diagnostics: dict[str, Any] | None = None,
+    complexity: int | None = None,
+    n_terms: int | None = None,
     postprocess: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Score a formula with the shared display-aware governor when available."""
     X = np.asarray(x, dtype=np.float64)
     if X.ndim == 1:
@@ -175,10 +184,25 @@ def _display_candidate_score(
         )
 
     display_mse = raw_mse if raw_mse is not None and np.isfinite(raw_mse) else fit_mse
-    comp = int(complexity) if complexity is not None else max(1, formula.count("+") + formula.count("-") + formula.count("*") + formula.count("/") + 1)
+    comp = (
+        int(complexity)
+        if complexity is not None
+        else max(
+            1,
+            formula.count("+")
+            + formula.count("-")
+            + formula.count("*")
+            + formula.count("/")
+            + 1,
+        )
+    )
     terms = int(n_terms) if n_terms is not None else comp
     risk = min(1.0, 0.05 * formula.count("_signed_power") + 0.012 * max(0, comp - 12))
-    base = float(display_mse) if display_mse is not None and np.isfinite(display_mse) else float("inf")
+    base = (
+        float(display_mse)
+        if display_mse is not None and np.isfinite(display_mse)
+        else float("inf")
+    )
     score = base + 1e-4 * max(0, comp - 8) + 5e-5 * max(0, terms - 6) + 0.01 * risk
     return {
         "formula": formula,
@@ -197,20 +221,20 @@ def _display_candidate_score(
     }
 
 
-def _empty_residual_diagnostics() -> Dict[str, Any]:
+def _empty_residual_diagnostics() -> dict[str, Any]:
     return {
-        'residual_mse': None,
-        'residual_skewness': None,
-        'residual_excess_kurtosis': None,
-        'residual_spectral_peak_ratio': None,
-        'residual_holdout_edge_mse': None,
-        'residual_holdout_core_mse': None,
-        'residual_holdout_ratio': None,
-        'residual_suspicious': False,
+        "residual_mse": None,
+        "residual_skewness": None,
+        "residual_excess_kurtosis": None,
+        "residual_spectral_peak_ratio": None,
+        "residual_holdout_edge_mse": None,
+        "residual_holdout_core_mse": None,
+        "residual_holdout_ratio": None,
+        "residual_suspicious": False,
     }
 
 
-def _normalize_priors(priors: List[float]) -> List[float]:
+def _normalize_priors(priors: list[float]) -> list[float]:
     cleaned = [max(0.0, float(p)) for p in priors]
     total = sum(cleaned)
     if total <= 0.0:
@@ -218,14 +242,16 @@ def _normalize_priors(priors: List[float]) -> List[float]:
     return [p / total for p in cleaned]
 
 
-def _classifier_prior_trust_from_uncertainty(uncertainty: Optional[Dict[str, Any]]) -> float:
+def _classifier_prior_trust_from_uncertainty(
+    uncertainty: dict[str, Any] | None,
+) -> float:
     """Map uncertainty diagnostics to trust in classifier-guided priors in [0, 1]."""
     if not isinstance(uncertainty, dict):
         return 1.0
 
-    entropy = uncertainty.get('prediction_entropy')
-    margin = uncertainty.get('prediction_margin')
-    uncertain_flag = bool(uncertainty.get('prediction_uncertain', False))
+    entropy = uncertainty.get("prediction_entropy")
+    margin = uncertainty.get("prediction_margin")
+    uncertain_flag = bool(uncertainty.get("prediction_uncertain", False))
 
     trust_entropy = 1.0
     if entropy is not None:
@@ -252,7 +278,7 @@ def _classifier_prior_trust_from_uncertainty(uncertainty: Optional[Dict[str, Any
     return float(np.clip(trust, 0.0, 1.0))
 
 
-def _blend_priors_with_uniform(base_priors: List[float], trust: float) -> List[float]:
+def _blend_priors_with_uniform(base_priors: list[float], trust: float) -> list[float]:
     base = _normalize_priors(base_priors)
     t = float(np.clip(trust, 0.0, 1.0))
     uniform = [0.25, 0.25, 0.25, 0.25]
@@ -260,7 +286,7 @@ def _blend_priors_with_uniform(base_priors: List[float], trust: float) -> List[f
     return _normalize_priors(blended)
 
 
-def _resolve_device(device: Optional[str] = None) -> torch.device:
+def _resolve_device(device: str | None = None) -> torch.device:
     """Resolve device string to torch.device, with thread-safe CUDA fallback warning."""
     global _warned_no_cuda
     if device is None or device == "auto":
@@ -292,13 +318,13 @@ def _estimate_exact_match_work(n_samples: int, n_basis: int, max_terms: int) -> 
 
 def _select_exact_match_torch_device(
     backend: str,
-    device: Optional[str],
+    device: str | None,
     estimated_work: int,
     min_gpu_work: int,
-) -> Tuple[Optional[torch.device], Dict[str, Any]]:
+) -> tuple[torch.device | None, dict[str, Any]]:
     """Select the torch device for exact-match search and explain the choice."""
     backend_norm = (backend or "auto").strip().lower()
-    diagnostics: Dict[str, Any] = {
+    diagnostics: dict[str, Any] = {
         "backend_requested": backend_norm,
         "estimated_work": int(estimated_work),
         "min_gpu_work": int(min_gpu_work),
@@ -340,7 +366,7 @@ def _select_exact_match_torch_device(
     return selected, diagnostics
 
 
-def _join_formula_terms(terms: List[str]) -> str:
+def _join_formula_terms(terms: list[str]) -> str:
     """Join symbolic terms and normalize them into ASCII-safe math."""
     filtered_terms = [term for term in terms if term]
     formula = " + ".join(filtered_terms) if filtered_terms else "0"
@@ -349,7 +375,7 @@ def _join_formula_terms(terms: List[str]) -> str:
 
 def _format_affine_formula(base_expr: str, scale: float, offset: float) -> str:
     """Format y ~= offset + scale * base_expr with readable symbolic coefficients."""
-    terms: List[str] = []
+    terms: list[str] = []
 
     if abs(scale) > 1e-10:
         if abs(scale - 1.0) < 0.01:
@@ -366,11 +392,11 @@ def _format_affine_formula(base_expr: str, scale: float, offset: float) -> str:
 
 
 def _candidate_match_tolerance(y: np.ndarray) -> float:
-    scale = max(float(np.var(y)), float(np.mean(y ** 2)), 1.0)
+    scale = max(float(np.var(y)), float(np.mean(y**2)), 1.0)
     return max(1e-10, 1e-8 * scale)
 
 
-def _format_regression_term(name: str, coef: float) -> Optional[str]:
+def _format_regression_term(name: str, coef: float) -> str | None:
     """Format one linear-regression term using the project coefficient snapping rules."""
     if abs(coef) < 1e-6:
         return None
@@ -392,11 +418,11 @@ def _format_regression_term(name: str, coef: float) -> Optional[str]:
 def _find_exact_polynomial_match(
     x: np.ndarray,
     y: np.ndarray,
-    basis_names: List[str],
+    basis_names: list[str],
     *,
     max_degree: int,
-    tolerance: Optional[float] = None,
-) -> Optional[Tuple[str, float, np.ndarray]]:
+    tolerance: float | None = None,
+) -> tuple[str, float, np.ndarray] | None:
     """Recover exact univariate polynomials before mixed bases can overfit them."""
     if x.ndim == 2 and x.shape[1] == 1:
         x_flat = x[:, 0]
@@ -427,7 +453,7 @@ def _find_exact_polynomial_match(
         if not np.isfinite(mse) or mse > exact_tol:
             continue
 
-        terms: List[str] = []
+        terms: list[str] = []
         full_coeffs = np.zeros(len(basis_names), dtype=np.float64)
         for power, coef in enumerate(coeffs):
             if abs(coef) < 1e-8:
@@ -458,7 +484,7 @@ def _find_exact_polynomial_match(
     return None
 
 
-def _evaluate_formula_values(formula: str, x_np: np.ndarray) -> Optional[np.ndarray]:
+def _evaluate_formula_values(formula: str, x_np: np.ndarray) -> np.ndarray | None:
     """Evaluate a formula string on numpy inputs using SymPy/lambdify."""
     if not formula:
         return None
@@ -484,10 +510,11 @@ def _evaluate_formula_values(formula: str, x_np: np.ndarray) -> Optional[np.ndar
             return None
 
         import warnings
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            y_pred = func(*x_columns[:len(free_symbol_names)])
-            
+            y_pred = func(*x_columns[: len(free_symbol_names)])
+
         y_arr = np.asarray(y_pred, dtype=np.float64)
         if y_arr.shape == ():
             y_arr = np.full(x_np.shape[0], float(y_arr), dtype=np.float64)
@@ -506,11 +533,11 @@ def _safe_numpy_power(x, p):
     p = np.asarray(p)
     abs_x = np.abs(x) + 1e-15
     res = np.power(abs_x, p)
-    
+
     # Parity check for even integers
     p_round = np.round(p)
     is_even = (np.abs(p - p_round) < 1e-6) & (p_round.astype(np.int64) % 2 == 0)
-    
+
     if np.isscalar(is_even):
         return res if is_even else np.sign(x) * res
     return np.where(is_even, res, np.sign(x) * res)
@@ -526,7 +553,9 @@ def _safe_numpy_log(x, base=None):
 
 
 @lru_cache(maxsize=256)
-def _compile_formula_evaluator(normalized_formula: str) -> Tuple[Tuple[str, ...], Optional[float], Optional[Any]]:
+def _compile_formula_evaluator(
+    normalized_formula: str,
+) -> tuple[tuple[str, ...], float | None, Any | None]:
     import sympy as sp
     from sympy.parsing.sympy_parser import (
         convert_xor,
@@ -535,7 +564,10 @@ def _compile_formula_evaluator(normalized_formula: str) -> Tuple[Tuple[str, ...]
         standard_transformations,
     )
 
-    transformations = standard_transformations + (convert_xor, implicit_multiplication_application)
+    transformations = standard_transformations + (
+        convert_xor,
+        implicit_multiplication_application,
+    )
     local_dict = {
         "Piecewise": sp.Piecewise,
         "Eq": sp.Eq,
@@ -551,7 +583,12 @@ def _compile_formula_evaluator(normalized_formula: str) -> Tuple[Tuple[str, ...]
         "E": sp.E,
         "e": sp.E,
     }
-    expr = parse_expr(normalized_formula, local_dict=local_dict, transformations=transformations, evaluate=False)
+    expr = parse_expr(
+        normalized_formula,
+        local_dict=local_dict,
+        transformations=transformations,
+        evaluate=False,
+    )
     free_syms = sorted(expr.free_symbols, key=lambda sym: sym.name)
 
     if not free_syms:
@@ -583,8 +620,8 @@ def _compile_formula_evaluator(normalized_formula: str) -> Tuple[Tuple[str, ...]
 def _residual_diagnostics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
-    x_np: Optional[np.ndarray] = None,
-) -> Dict[str, Any]:
+    x_np: np.ndarray | None = None,
+) -> dict[str, Any]:
     """Summarize residual structure for fast-path quality checks."""
     diagnostics = _empty_residual_diagnostics()
 
@@ -604,15 +641,15 @@ def _residual_diagnostics(
     y_true_valid = y_true_arr[mask]
     y_pred_valid = y_pred_arr[mask]
     residual = y_true_valid - y_pred_valid
-    diagnostics['residual_mse'] = float(np.mean(residual ** 2))
-    diagnostics['y_variance'] = float(np.var(y_true_valid))
+    diagnostics["residual_mse"] = float(np.mean(residual**2))
+    diagnostics["y_variance"] = float(np.var(y_true_valid))
 
     centered = residual - residual.mean()
     std = float(np.std(centered))
     if std > 1e-12:
         z = centered / std
-        diagnostics['residual_skewness'] = float(np.mean(z ** 3))
-        diagnostics['residual_excess_kurtosis'] = float(np.mean(z ** 4) - 3.0)
+        diagnostics["residual_skewness"] = float(np.mean(z**3))
+        diagnostics["residual_excess_kurtosis"] = float(np.mean(z**4) - 3.0)
 
     if residual.size >= 8:
         fft_vals = np.fft.rfft(centered)
@@ -620,7 +657,7 @@ def _residual_diagnostics(
         if magnitudes.size > 0:
             peak = float(np.max(magnitudes))
             median = float(np.median(magnitudes)) if np.any(magnitudes) else 0.0
-            diagnostics['residual_spectral_peak_ratio'] = peak / max(median, 1e-12)
+            diagnostics["residual_spectral_peak_ratio"] = peak / max(median, 1e-12)
 
     if x_np is not None:
         try:
@@ -636,32 +673,38 @@ def _residual_diagnostics(
                 if n_total >= 20 and 2 * holdout_n < n_total:
                     edge_idx = np.concatenate([order[:holdout_n], order[-holdout_n:]])
                     core_idx = order[holdout_n:-holdout_n]
-                    edge_mse = float(np.mean((y_true_valid[edge_idx] - y_pred_valid[edge_idx]) ** 2))
-                    core_mse = float(np.mean((y_true_valid[core_idx] - y_pred_valid[core_idx]) ** 2))
-                    diagnostics['residual_holdout_edge_mse'] = edge_mse
-                    diagnostics['residual_holdout_core_mse'] = core_mse
-                    diagnostics['residual_holdout_ratio'] = edge_mse / max(core_mse, 1e-12)
+                    edge_mse = float(
+                        np.mean((y_true_valid[edge_idx] - y_pred_valid[edge_idx]) ** 2)
+                    )
+                    core_mse = float(
+                        np.mean((y_true_valid[core_idx] - y_pred_valid[core_idx]) ** 2)
+                    )
+                    diagnostics["residual_holdout_edge_mse"] = edge_mse
+                    diagnostics["residual_holdout_core_mse"] = core_mse
+                    diagnostics["residual_holdout_ratio"] = edge_mse / max(
+                        core_mse, 1e-12
+                    )
         except Exception:
             pass
 
     suspicious = False
-    if diagnostics['residual_spectral_peak_ratio'] is not None:
-        suspicious = suspicious or diagnostics['residual_spectral_peak_ratio'] > 8.0
-    if diagnostics['residual_holdout_ratio'] is not None:
-        suspicious = suspicious or diagnostics['residual_holdout_ratio'] > 2.0
-    if diagnostics['residual_skewness'] is not None:
-        suspicious = suspicious or abs(diagnostics['residual_skewness']) > 1.0
-    if diagnostics['residual_excess_kurtosis'] is not None:
-        suspicious = suspicious or diagnostics['residual_excess_kurtosis'] > 3.0
+    if diagnostics["residual_spectral_peak_ratio"] is not None:
+        suspicious = suspicious or diagnostics["residual_spectral_peak_ratio"] > 8.0
+    if diagnostics["residual_holdout_ratio"] is not None:
+        suspicious = suspicious or diagnostics["residual_holdout_ratio"] > 2.0
+    if diagnostics["residual_skewness"] is not None:
+        suspicious = suspicious or abs(diagnostics["residual_skewness"]) > 1.0
+    if diagnostics["residual_excess_kurtosis"] is not None:
+        suspicious = suspicious or diagnostics["residual_excess_kurtosis"] > 3.0
 
-    diagnostics['residual_suspicious'] = suspicious
+    diagnostics["residual_suspicious"] = suspicious
     return diagnostics
 
 
 def _maybe_match_easy_multivariate_formula(
     x: np.ndarray,
     y: np.ndarray,
-) -> Optional[Tuple[str, float, Dict[str, Any]]]:
+) -> tuple[str, float, dict[str, Any]] | None:
     """Check a few exact low-complexity multivariate templates before basis expansion."""
     if x.ndim != 2 or x.shape[1] < 2:
         return None
@@ -671,9 +714,11 @@ def _maybe_match_easy_multivariate_formula(
     y_var = max(float(np.var(y)), 1e-12)
     # Robust gate: accept near-exact structure even with a few label outliers
     # (MSE alone is dominated by 3% spikes; use inlier fraction + median residual).
-    best_match: Optional[Tuple[str, float, Dict[str, Any]]] = None
+    best_match: tuple[str, float, dict[str, Any]] | None = None
 
-    def try_candidate(base_expr: str, base_values: np.ndarray, template_name: str) -> None:
+    def try_candidate(
+        base_expr: str, base_values: np.ndarray, template_name: str
+    ) -> None:
         nonlocal best_match
         if not np.all(np.isfinite(base_values)):
             return
@@ -687,15 +732,19 @@ def _maybe_match_easy_multivariate_formula(
         offset, scale = float(coeffs[0]), float(coeffs[1])
         y_pred = X @ coeffs
         resid = y - y_pred
-        mse = float(np.mean(resid ** 2))
+        mse = float(np.mean(resid**2))
         abs_resid = np.abs(resid)
         med = float(np.median(abs_resid))
         # Soft inlier band relative to target scale
-        inlier_band = max(1e-8, 1e-4 * max(float(np.std(y)), 1.0), 3.0 * med if med > 0 else 1e-8)
+        inlier_band = max(
+            1e-8, 1e-4 * max(float(np.std(y)), 1.0), 3.0 * med if med > 0 else 1e-8
+        )
         inlier_frac = float(np.mean(abs_resid <= inlier_band))
         # Accept clean exact OR high-inlier structure under outliers
         clean_ok = mse < tol
-        robust_ok = inlier_frac >= 0.90 and med <= max(1e-8, 1e-3 * max(float(np.std(y)), 1.0))
+        robust_ok = inlier_frac >= 0.90 and med <= max(
+            1e-8, 1e-3 * max(float(np.std(y)), 1.0)
+        )
         if not (clean_ok or robust_ok):
             # One IRLS step: reweight by soft MAD so outliers don't pull scale/offset
             mad = float(np.median(abs_resid)) + 1e-12
@@ -710,32 +759,38 @@ def _maybe_match_easy_multivariate_formula(
             offset, scale = float(coeffs2[0]), float(coeffs2[1])
             y_pred = X @ coeffs2
             resid = y - y_pred
-            mse = float(np.mean(resid ** 2))
+            mse = float(np.mean(resid**2))
             abs_resid = np.abs(resid)
             med = float(np.median(abs_resid))
-            inlier_band = max(1e-8, 1e-4 * max(float(np.std(y)), 1.0), 3.0 * med if med > 0 else 1e-8)
+            inlier_band = max(
+                1e-8, 1e-4 * max(float(np.std(y)), 1.0), 3.0 * med if med > 0 else 1e-8
+            )
             inlier_frac = float(np.mean(abs_resid <= inlier_band))
             clean_ok = mse < tol
-            robust_ok = inlier_frac >= 0.90 and med <= max(1e-8, 1e-3 * max(float(np.std(y)), 1.0))
+            robust_ok = inlier_frac >= 0.90 and med <= max(
+                1e-8, 1e-3 * max(float(np.std(y)), 1.0)
+            )
             if not (clean_ok or robust_ok):
                 return
 
         formula = _format_affine_formula(base_expr, scale, offset)
         details = {
-            'coefficients': np.array([offset, scale]),
-            'basis_names': [base_expr],
-            'n_nonzero': int(abs(offset) > 1e-10) + int(abs(scale) > 1e-10),
-            'exact_match': bool(clean_ok or robust_ok),
-            'template_match': template_name,
-            'template_tolerance': tol,
-            'inlier_fraction': inlier_frac,
-            'median_abs_residual': med,
-            'robust_match': bool(robust_ok and not clean_ok),
-            '_score': (med, mse),
+            "coefficients": np.array([offset, scale]),
+            "basis_names": [base_expr],
+            "n_nonzero": int(abs(offset) > 1e-10) + int(abs(scale) > 1e-10),
+            "exact_match": bool(clean_ok or robust_ok),
+            "template_match": template_name,
+            "template_tolerance": tol,
+            "inlier_fraction": inlier_frac,
+            "median_abs_residual": med,
+            "robust_match": bool(robust_ok and not clean_ok),
+            "_score": (med, mse),
         }
 
         # Prefer lower median residual, then MSE
-        if best_match is None or details['_score'] < (best_match[2] or {}).get('_score', (float('inf'), float('inf'))):
+        if best_match is None or details["_score"] < (best_match[2] or {}).get(
+            "_score", (float("inf"), float("inf"))
+        ):
             best_match = (formula, mse, details)
 
     n_vars = x.shape[1]
@@ -783,7 +838,11 @@ def _maybe_match_easy_multivariate_formula(
                 denom = offset + sq_sum
                 if np.any(np.abs(denom) < 1e-12):
                     continue
-                offset_txt = str(int(offset)) if abs(offset - int(offset)) < 1e-12 else f"{offset:.6g}"
+                offset_txt = (
+                    str(int(offset))
+                    if abs(offset - int(offset)) < 1e-12
+                    else f"{offset:.6g}"
+                )
                 sq_terms = "+".join(f"(x{i}-{center_txt})^2" for i in range(n_vars))
                 try_candidate(
                     f"1/({offset_txt}+{sq_terms})",
@@ -832,7 +891,7 @@ def _maybe_match_easy_multivariate_formula(
         for a, b, c, d in permutations(range(n_vars), 4):
             phase = x[:, b] * x[:, c]
             cosine = np.cos(phase)
-            envelope = x[:, a] * (cosine + x[:, d] * cosine ** 2)
+            envelope = x[:, a] * (cosine + x[:, d] * cosine**2)
             try_candidate(
                 f"x{a}*(cos(x{b}*x{c})+x{d}*cos(x{b}*x{c})^2)",
                 envelope,
@@ -853,10 +912,12 @@ def _format_precise_number(value: float) -> str:
     return f"{value:.12g}"
 
 
-def _format_linear_x_formula(slope: float, intercept: float, *, precise: bool = False) -> str:
+def _format_linear_x_formula(
+    slope: float, intercept: float, *, precise: bool = False
+) -> str:
     """Format slope*x + intercept for direct transform templates."""
     if precise:
-        terms: List[str] = []
+        terms: list[str] = []
         if abs(slope) > 1e-12:
             slope_text = _format_precise_number(abs(slope))
             if abs(abs(slope) - 1.0) < 1e-12:
@@ -869,7 +930,7 @@ def _format_linear_x_formula(slope: float, intercept: float, *, precise: bool = 
             terms.append(f"-{const_text}" if intercept < 0 else const_text)
         return _join_formula_terms(terms)
 
-    terms: List[str] = []
+    terms: list[str] = []
     x_term = _format_regression_term("x", float(slope))
     if x_term:
         terms.append(x_term)
@@ -882,10 +943,10 @@ def _format_linear_x_formula(slope: float, intercept: float, *, precise: bool = 
 def _maybe_match_univariate_transform_template(
     x: np.ndarray,
     y: np.ndarray,
-    predictions: Dict[str, float],
+    predictions: dict[str, float],
     *,
-    tolerance: Optional[float] = None,
-) -> Optional[Tuple[str, float, Dict[str, Any]]]:
+    tolerance: float | None = None,
+) -> tuple[str, float, dict[str, Any]] | None:
     """Recover simple log/exp transform identities before broad sparse bases."""
     if x.ndim == 2:
         if x.shape[1] != 1:
@@ -906,20 +967,24 @@ def _maybe_match_univariate_transform_template(
         return None
 
     derived = _with_derived_predictions(predictions or {})
-    should_try_log = derived.get("log", 0.0) >= 0.25 or derived.get("exponential", 0.0) >= 0.25
-    should_try_exp = derived.get("exp", 0.0) >= 0.25 or derived.get("exponential", 0.0) >= 0.25
+    should_try_log = (
+        derived.get("log", 0.0) >= 0.25 or derived.get("exponential", 0.0) >= 0.25
+    )
+    should_try_exp = (
+        derived.get("exp", 0.0) >= 0.25 or derived.get("exponential", 0.0) >= 0.25
+    )
     if not (should_try_log or should_try_exp):
         return None
 
     tol = tolerance if tolerance is not None else _candidate_match_tolerance(y_flat)
     accept_tol = min(1e-6, max(1e-10, float(tol)))
-    best_match: Optional[Tuple[str, float, Dict[str, Any]]] = None
+    best_match: tuple[str, float, dict[str, Any]] | None = None
 
     def validate_candidate(
         formula: str,
         pred: np.ndarray,
         template_name: str,
-        params: Dict[str, float],
+        params: dict[str, float],
     ) -> None:
         nonlocal best_match
         if not np.all(np.isfinite(pred)):
@@ -955,22 +1020,24 @@ def _maybe_match_univariate_transform_template(
             "template_match": template_name,
             "template_tolerance": accept_tol,
             "candidate_governor": governed,
-            "candidate_formulas": [{
-                "formula": display_formula,
-                "mse": display_mse_f,
-                "score": float(governed.get("score", display_mse_f)),
-                "n_nonzero": n_nonzero,
-                "active_terms": [template_name],
-                "alpha": 0.0,
-                "raw_mse": raw_mse,
-                "display_mse": display_mse_f,
-                "governor": governed,
-            }],
+            "candidate_formulas": [
+                {
+                    "formula": display_formula,
+                    "mse": display_mse_f,
+                    "score": float(governed.get("score", display_mse_f)),
+                    "n_nonzero": n_nonzero,
+                    "active_terms": [template_name],
+                    "alpha": 0.0,
+                    "raw_mse": raw_mse,
+                    "display_mse": display_mse_f,
+                    "governor": governed,
+                }
+            ],
         }
         if best_match is None or display_mse_f < best_match[1]:
             best_match = (display_formula, display_mse_f, details)
 
-    def fit_affine(target: np.ndarray) -> Optional[Tuple[float, float, np.ndarray]]:
+    def fit_affine(target: np.ndarray) -> tuple[float, float, np.ndarray] | None:
         design = np.column_stack([x_flat, np.ones_like(x_flat)])
         try:
             coeffs, _, _, _ = np.linalg.lstsq(design, target, rcond=None)
@@ -1023,7 +1090,9 @@ def _maybe_match_univariate_transform_template(
                 denom = y_sorted[:-2] + y_sorted[2:] - 2.0 * y_sorted[1:-1]
                 valid = np.abs(denom) > 1e-12
                 if np.any(valid):
-                    offsets = (y_sorted[:-2] * y_sorted[2:] - y_sorted[1:-1] ** 2) / denom
+                    offsets = (
+                        y_sorted[:-2] * y_sorted[2:] - y_sorted[1:-1] ** 2
+                    ) / denom
                     offsets = offsets[np.isfinite(offsets) & valid]
                     if offsets.size:
                         offset = float(np.median(offsets))
@@ -1037,9 +1106,13 @@ def _maybe_match_univariate_transform_template(
                                 continue
                             slope, intercept, log_fit = fit
                             pred = offset + sign * np.exp(log_fit)
-                            inner = _format_linear_x_formula(slope, intercept, precise=True)
+                            inner = _format_linear_x_formula(
+                                slope, intercept, precise=True
+                            )
                             offset_text = _format_precise_number(offset)
-                            formula = _join_formula_terms([offset_text, f"{sign_prefix}exp({inner})"])
+                            formula = _join_formula_terms(
+                                [offset_text, f"{sign_prefix}exp({inner})"]
+                            )
                             validate_candidate(
                                 formula,
                                 pred,
@@ -1056,13 +1129,13 @@ def _maybe_match_univariate_transform_template(
 
 
 def _format_linear_combo_formula(
-    names: List[str],
+    names: list[str],
     coeffs: np.ndarray,
     *,
     threshold: float = 1e-8,
 ) -> str:
     """Format intercept + sum(coeff_i * name_i)."""
-    terms: List[str] = []
+    terms: list[str] = []
     coeffs = np.asarray(coeffs, dtype=np.float64).reshape(-1)
     if coeffs.size:
         const_term = _format_regression_term("1", float(coeffs[0]))
@@ -1077,34 +1150,36 @@ def _format_linear_combo_formula(
     return _join_formula_terms(terms)
 
 
-def _univariate_component_library(x_flat: np.ndarray) -> List[Tuple[str, np.ndarray]]:
+def _univariate_component_library(x_flat: np.ndarray) -> list[tuple[str, np.ndarray]]:
     """Small component library for decomposition probes."""
     x_flat = np.asarray(x_flat, dtype=np.float64).reshape(-1)
-    components: List[Tuple[str, np.ndarray]] = [
+    components: list[tuple[str, np.ndarray]] = [
         ("x", x_flat),
-        ("x**2", x_flat ** 2),
-        ("x**3", x_flat ** 3),
+        ("x**2", x_flat**2),
+        ("x**3", x_flat**3),
         ("sin(x)", np.sin(x_flat)),
         ("cos(x)", np.cos(x_flat)),
         ("sin(2*x)", np.sin(2.0 * x_flat)),
         ("cos(2*x)", np.cos(2.0 * x_flat)),
-        ("1/(1+x**2)", 1.0 / (1.0 + x_flat ** 2)),
-        ("x/(1+x**2)", x_flat / (1.0 + x_flat ** 2)),
+        ("1/(1+x**2)", 1.0 / (1.0 + x_flat**2)),
+        ("x/(1+x**2)", x_flat / (1.0 + x_flat**2)),
         ("log(Abs(x)+1)", np.log(np.abs(x_flat) + 1.0)),
         ("sqrt(Abs(x))", np.sqrt(np.abs(x_flat))),
     ]
     if np.nanmax(np.abs(x_flat)) < 20.0:
-        components.extend([
-            ("exp(x)", np.exp(x_flat)),
-            ("exp(-x)", np.exp(-x_flat)),
-        ])
+        components.extend(
+            [
+                ("exp(x)", np.exp(x_flat)),
+                ("exp(-x)", np.exp(-x_flat)),
+            ]
+        )
     if np.all(x_flat + 1.0 > 1e-12):
         components.append(("log(x+1)", np.log(x_flat + 1.0)))
     if np.all(x_flat > 1e-12):
         components.append(("log(x)", np.log(x_flat)))
         components.append(("sqrt(x)", np.sqrt(x_flat)))
 
-    filtered: List[Tuple[str, np.ndarray]] = []
+    filtered: list[tuple[str, np.ndarray]] = []
     seen: set = set()
     for name, values in components:
         arr = np.asarray(values, dtype=np.float64).reshape(-1)
@@ -1120,10 +1195,10 @@ def _univariate_component_library(x_flat: np.ndarray) -> List[Tuple[str, np.ndar
 def build_decomposition_probe_candidates(
     x: np.ndarray,
     y: np.ndarray,
-    predictions: Optional[Dict[str, float]] = None,
+    predictions: dict[str, float] | None = None,
     *,
     max_candidates: int = 8,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Generate cheap additive/product/rational seed candidates.
 
     These probes are intentionally small. They are meant to seed later search
@@ -1153,12 +1228,16 @@ def build_decomposition_probe_candidates(
 
     y_var = max(float(np.var(y_flat)), 1e-12)
     keep_mse = max(1e-8, 0.08 * y_var)
-    candidates: List[Dict[str, Any]] = []
+    candidates: list[dict[str, Any]] = []
 
-    def add_candidate(formula: str, pred: np.ndarray, probe_type: str, active_terms: List[str]) -> None:
+    def add_candidate(
+        formula: str, pred: np.ndarray, probe_type: str, active_terms: list[str]
+    ) -> None:
         if not formula or not np.all(np.isfinite(pred)):
             return
-        raw_mse = float(np.mean((y_flat - np.asarray(pred, dtype=np.float64).reshape(-1)) ** 2))
+        raw_mse = float(
+            np.mean((y_flat - np.asarray(pred, dtype=np.float64).reshape(-1)) ** 2)
+        )
         if not np.isfinite(raw_mse):
             return
         if raw_mse > keep_mse and len(candidates) >= max_candidates:
@@ -1169,7 +1248,9 @@ def build_decomposition_probe_candidates(
             y_flat,
             raw_mse=raw_mse,
             fit_mse=raw_mse,
-            complexity=max(1, len(active_terms) + formula.count("*") + formula.count("/")),
+            complexity=max(
+                1, len(active_terms) + formula.count("*") + formula.count("/")
+            ),
             n_terms=max(1, len(active_terms)),
             postprocess=False,
         )
@@ -1178,21 +1259,25 @@ def build_decomposition_probe_candidates(
             return
         if float(display_mse) > keep_mse and len(candidates) >= max_candidates:
             return
-        candidates.append({
-            "formula": str(governed.get("formula") or formula),
-            "mse": float(display_mse),
-            "score": float(governed.get("score", display_mse)),
-            "n_nonzero": max(1, len(active_terms)),
-            "active_terms": active_terms,
-            "alpha": -2.0,
-            "raw_mse": raw_mse,
-            "display_mse": float(display_mse),
-            "governor": governed,
-            "source": "decomposition_probe",
-            "decomposition_probe_type": probe_type,
-        })
+        candidates.append(
+            {
+                "formula": str(governed.get("formula") or formula),
+                "mse": float(display_mse),
+                "score": float(governed.get("score", display_mse)),
+                "n_nonzero": max(1, len(active_terms)),
+                "active_terms": active_terms,
+                "alpha": -2.0,
+                "raw_mse": raw_mse,
+                "display_mse": float(display_mse),
+                "governor": governed,
+                "source": "decomposition_probe",
+                "decomposition_probe_type": probe_type,
+            }
+        )
 
-    def fit_design(names: List[str], columns: List[np.ndarray], probe_type: str) -> None:
+    def fit_design(
+        names: list[str], columns: list[np.ndarray], probe_type: str
+    ) -> None:
         design = np.column_stack([np.ones_like(y_flat)] + columns)
         try:
             coeffs, _, _, _ = np.linalg.lstsq(design, y_flat, rcond=None)
@@ -1216,7 +1301,7 @@ def build_decomposition_probe_candidates(
             if np.all(np.isfinite(product)) and float(np.std(product)) > 1e-12:
                 fit_design([f"({name_a})*({name_b})"], [product], "multiplicative_pair")
 
-            denom = 1.0 + values_b ** 2
+            denom = 1.0 + values_b**2
             ratio = values_a / denom
             if np.all(np.isfinite(ratio)) and float(np.std(ratio)) > 1e-12:
                 fit_design([f"({name_a})/(1+({name_b})**2)"], [ratio], "rational_pair")
@@ -1224,7 +1309,7 @@ def build_decomposition_probe_candidates(
     if not candidates:
         return []
 
-    deduped: Dict[str, Dict[str, Any]] = {}
+    deduped: dict[str, dict[str, Any]] = {}
     for cand in candidates:
         key = normalize_formula_ascii(str(cand.get("formula", ""))).replace(" ", "")
         current = deduped.get(key)
@@ -1245,7 +1330,7 @@ def build_decomposition_probe_candidates(
             int(c.get("n_nonzero", 999)),
         ),
     )
-    return ranked[:max(1, int(max_candidates))]
+    return ranked[: max(1, int(max_candidates))]
 
 
 def lasso_coordinate_descent(
@@ -1269,7 +1354,7 @@ def lasso_coordinate_descent(
     _core, _ = _load_cpp_core()
     if _core is None or not hasattr(_core, "lasso_coordinate_descent"):
         return _lasso_coordinate_descent_python(X_np, y_np, alpha, max_iter, tol)
-    
+
     # Run fast C++ coordinate descent
     w_list = _core.lasso_coordinate_descent(X_np, y_np, alpha, max_iter, tol)
     return np.array(w_list, dtype=np.float64)
@@ -1278,7 +1363,7 @@ def lasso_coordinate_descent(
 def soft_threshold(x: np.ndarray, threshold: float) -> np.ndarray:
     """
     Vectorized soft thresholding operator for LASSO.
-    
+
     Works with both scalars and arrays.
     """
     return np.sign(x) * np.maximum(np.abs(x) - threshold, 0)
@@ -1286,16 +1371,16 @@ def soft_threshold(x: np.ndarray, threshold: float) -> np.ndarray:
 
 def build_basis_from_predictions(
     x: np.ndarray,
-    predictions: Dict[str, float],
+    predictions: dict[str, float],
     threshold: float = 0.5,
     max_power: int = 6,
-    detected_omegas: Optional[List[float]] = None,
+    detected_omegas: list[float] | None = None,
     universal_basis: bool = True,  # NEW: Always include common terms
-    op_constraints: Optional[Dict[str, bool]] = None,
-) -> Tuple[np.ndarray, List[str]]:
+    op_constraints: dict[str, bool] | None = None,
+) -> tuple[np.ndarray, list[str]]:
     """
     Build regression basis matrix from classifier predictions.
-    
+
     Args:
         x: Input values (N,)
         predictions: Dict mapping operator names to probabilities
@@ -1303,7 +1388,7 @@ def build_basis_from_predictions(
         max_power: Maximum polynomial degree
         detected_omegas: FFT-detected frequencies for sin/cos
         universal_basis: If True, always include polynomial + periodic terms
-        
+
     Returns:
         basis: (N, n_basis) matrix
         names: List of basis function names
@@ -1322,7 +1407,9 @@ def build_basis_from_predictions(
         and float(prediction_uncertainty.get("prediction_entropy") or 0.0) >= 0.80
         and float(prediction_uncertainty.get("prediction_margin") or 1.0) <= 0.10
     )
-    multivariate_blackbox = bool(n_vars > 1 and (universal_basis or low_trust_multivariate))
+    multivariate_blackbox = bool(
+        n_vars > 1 and (universal_basis or low_trust_multivariate)
+    )
     # Multi-var default: compact basis unless classifier is highly confident.
     # Kitchen-sink expansion (triples/ratios) was winning high R2 with complexity 90+.
     high_trust_multivariate = (
@@ -1331,33 +1418,35 @@ def build_basis_from_predictions(
         and float(prediction_uncertainty.get("prediction_entropy") or 1.0) <= 0.45
         and float(prediction_uncertainty.get("prediction_margin") or 0.0) >= 0.25
     )
-    compact_multivariate = bool(n_vars > 1 and (low_trust_multivariate or not high_trust_multivariate))
+    compact_multivariate = bool(
+        n_vars > 1 and (low_trust_multivariate or not high_trust_multivariate)
+    )
     if compact_multivariate:
         max_power = min(int(max_power), 3)
-    
+
     basis_list = []
     names = []
-    
+
     # Always include constant term
     basis_list.append(np.ones(n))
     names.append("1")
-    
+
     # Operator constraints
     constraints = op_constraints or {}
-    allow_power = constraints.get('power', True)
-    allow_periodic = constraints.get('periodic', True)
-    allow_exp = constraints.get('exp', True)
-    allow_log = constraints.get('log', True)
-    allow_arithmetic = constraints.get('arithmetic', True)
+    allow_power = constraints.get("power", True)
+    allow_periodic = constraints.get("periodic", True)
+    allow_exp = constraints.get("exp", True)
+    allow_log = constraints.get("log", True)
+    allow_arithmetic = constraints.get("arithmetic", True)
 
     def var_name(i: int) -> str:
         return "x" if n_vars == 1 else f"x{i}"
 
     # Polynomial terms (always include in universal mode)
     include_polynomial = allow_power and (
-        universal_basis or
-        predictions.get('power', 0) >= threshold or
-        predictions.get('polynomial', 0) >= threshold
+        universal_basis
+        or predictions.get("power", 0) >= threshold
+        or predictions.get("polynomial", 0) >= threshold
     )
 
     if include_polynomial:
@@ -1368,7 +1457,7 @@ def build_basis_from_predictions(
 
             # Integer powers (2, 3, 4)
             for p in range(2, max_power + 1):
-                basis_list.append(xi ** p)
+                basis_list.append(xi**p)
                 names.append(f"{var_name(i)}^{p}")
 
             # Fractional powers are useful in 1D exact recovery, but in
@@ -1376,32 +1465,34 @@ def build_basis_from_predictions(
             if not multivariate_blackbox:
                 xi_safe = np.abs(xi) + 1e-10
                 for p in [0.5, 1.5, 2.5, 0.33, 0.67, 1.33, 2.33]:
-                    basis_list.append(np.sign(xi) * (xi_safe ** p))
+                    basis_list.append(np.sign(xi) * (xi_safe**p))
                     names.append(f"{var_name(i)}^{p}")
-    
+
     # Periodic operations - build comprehensive omega list
     # Always include common frequencies: 1.0, 2.0, 0.5
     omegas = [1.0, 2.0, 0.5]  # Standard frequencies
-    
+
     # If the classifier strongly predicts pi, prioritize pi-based frequencies
-    if predictions.get('const_pi', 0) >= threshold:
+    if predictions.get("const_pi", 0) >= threshold:
         omegas.extend([math.pi, 2 * math.pi])
-        
+
     if detected_omegas:
         for o in detected_omegas[:3]:
             # Add if not too close to existing
             if all(abs(o - existing) > 0.1 for existing in omegas):
                 omegas.append(o)
-    
+
     # Periodic terms (always include in universal mode)
     include_periodic = allow_periodic and (
-        (universal_basis and not multivariate_blackbox) or
-        predictions.get('sin', 0) >= threshold or
-        predictions.get('cos', 0) >= threshold or
-        predictions.get('periodic', 0) >= threshold
+        (universal_basis and not multivariate_blackbox)
+        or predictions.get("sin", 0) >= threshold
+        or predictions.get("cos", 0) >= threshold
+        or predictions.get("periodic", 0) >= threshold
     )
     if multivariate_blackbox and detected_omegas:
-        include_periodic = include_periodic or predictions.get('periodic', 0) >= max(0.55, threshold)
+        include_periodic = include_periodic or predictions.get("periodic", 0) >= max(
+            0.55, threshold
+        )
 
     if include_periodic:
         for i in range(n_vars):
@@ -1419,7 +1510,7 @@ def build_basis_from_predictions(
                     names.append(f"sin({name}/2)")
                 elif abs(omega - math.pi) < 1e-4:
                     names.append(f"sin(pi*{name})")
-                elif abs(omega - 2*math.pi) < 1e-4:
+                elif abs(omega - 2 * math.pi) < 1e-4:
                     names.append(f"sin(2*pi*{name})")
                 else:
                     names.append(f"sin({omega:.2f}*{name})")
@@ -1434,21 +1525,21 @@ def build_basis_from_predictions(
                     names.append(f"cos({name}/2)")
                 elif abs(omega - math.pi) < 1e-4:
                     names.append(f"cos(pi*{name})")
-                elif abs(omega - 2*math.pi) < 1e-4:
+                elif abs(omega - 2 * math.pi) < 1e-4:
                     names.append(f"cos(2*pi*{name})")
                 else:
                     names.append(f"cos({omega:.2f}*{name})")
-    
+
     # Exponential operations (only if predicted OR universal)
     include_exp = allow_exp and (
-        (universal_basis and not multivariate_blackbox) or
-        predictions.get('exp', 0) >= threshold or 
-        predictions.get('exponential', 0) >= threshold
+        (universal_basis and not multivariate_blackbox)
+        or predictions.get("exp", 0) >= threshold
+        or predictions.get("exponential", 0) >= threshold
     )
     if multivariate_blackbox:
         include_exp = include_exp and max(
-            predictions.get('exp', 0),
-            predictions.get('exponential', 0),
+            predictions.get("exp", 0),
+            predictions.get("exponential", 0),
         ) >= max(0.85, threshold + 0.25)
     if include_exp:
         for i in range(n_vars):
@@ -1460,25 +1551,32 @@ def build_basis_from_predictions(
             names.append(f"exp({name})")
             basis_list.append(np.exp(-x_clamp))
             names.append(f"exp(-{name})")
-            basis_list.append(np.exp(-xi**2))
+            basis_list.append(np.exp(-(xi**2)))
             names.append(f"exp(-{name}^2)")
 
             if not multivariate_blackbox:
                 denom = exp_x - 1.0
-                denom = np.where(np.abs(denom) < 1e-6, np.sign(denom + 1e-12) * 1e-6, denom)
+                denom = np.where(
+                    np.abs(denom) < 1e-6, np.sign(denom + 1e-12) * 1e-6, denom
+                )
                 basis_list.append(1.0 / denom)
                 names.append(f"1/(exp({name})-1)")
                 basis_list.append(xi / denom)
                 names.append(f"{name}/(exp({name})-1)")
-                basis_list.append((xi ** 2) / denom)
+                basis_list.append((xi**2) / denom)
                 names.append(f"{name}^2/(exp({name})-1)")
-                basis_list.append((xi ** 3) / denom)
+                basis_list.append((xi**3) / denom)
                 names.append(f"{name}^3/(exp({name})-1)")
-    
+
     # Logarithmic operations (always include in universal mode for Nguyen-7 etc.)
-    include_log = allow_log and ((universal_basis and not multivariate_blackbox) or predictions.get('log', 0) >= threshold)
+    include_log = allow_log and (
+        (universal_basis and not multivariate_blackbox)
+        or predictions.get("log", 0) >= threshold
+    )
     if multivariate_blackbox:
-        include_log = include_log and predictions.get('log', 0) >= max(0.85, threshold + 0.25)
+        include_log = include_log and predictions.get("log", 0) >= max(
+            0.85, threshold + 0.25
+        )
     if include_log:
         for i in range(n_vars):
             xi = x[:, i]
@@ -1488,7 +1586,7 @@ def build_basis_from_predictions(
             names.append(f"log({name}+1)")
             basis_list.append(np.log(x_safe**2 + 1))
             names.append(f"log({name}^2+1)")
-    
+
     # Composition terms (for sin(x²), etc. - covers Nguyen-10)
     if universal_basis and allow_periodic and not multivariate_blackbox:
         for i in range(n_vars):
@@ -1503,8 +1601,10 @@ def build_basis_from_predictions(
             # Avoid division by zero
             x_safe_div = xi.copy()
             mask_zero = np.abs(x_safe_div) < 1e-3
-            x_safe_div[mask_zero] = 1e-3 * np.sign(x_safe_div[mask_zero] + 1e-9) # Keep sign
-            
+            x_safe_div[mask_zero] = 1e-3 * np.sign(
+                x_safe_div[mask_zero] + 1e-9
+            )  # Keep sign
+
             basis_list.append(np.sin(1.0 / x_safe_div))
             names.append(f"sin(1/{name})")
             basis_list.append(np.cos(1.0 / x_safe_div))
@@ -1532,19 +1632,22 @@ def build_basis_from_predictions(
             basis_list.append(1.0 / safe_denom)
             names.append(f"1/(1-{name}^2)")
 
-
-
     # Pairwise interaction terms for multi-input formulas
     if universal_basis and allow_arithmetic and n_vars > 1:
         for i in range(n_vars):
             for j in range(i + 1, n_vars):
                 basis_list.append(x[:, i] * x[:, j])
                 names.append(f"{var_name(i)}*{var_name(j)}")
-    
+
     # Product-ratio terms for physics formulas (e.g., G*m1*m2/r²)
-    if universal_basis and allow_arithmetic and n_vars >= 2 and not compact_multivariate:
+    if (
+        universal_basis
+        and allow_arithmetic
+        and n_vars >= 2
+        and not compact_multivariate
+    ):
         epsilon = 1e-8  # Prevent division by zero
-        
+
         # Triple products: a*b*c
         if n_vars >= 3:
             for i in range(n_vars):
@@ -1552,14 +1655,14 @@ def build_basis_from_predictions(
                     for k in range(j + 1, n_vars):
                         basis_list.append(x[:, i] * x[:, j] * x[:, k])
                         names.append(f"{var_name(i)}*{var_name(j)}*{var_name(k)}")
-        
+
         # Product-ratio terms: a*b/c, a*b/c²
         for i in range(n_vars):
             for j in range(n_vars):
                 if i == j:
                     continue
                 xi, xj = x[:, i], x[:, j]
-                
+
                 # a*b/c for all pairs
                 for k in range(n_vars):
                     if k == i or k == j:
@@ -1569,46 +1672,46 @@ def build_basis_from_predictions(
                     denom = np.abs(xk) + epsilon
                     basis_list.append((xi * xj) / denom)
                     names.append(f"{var_name(i)}*{var_name(j)}/|{var_name(k)}|")
-                    
+
                     # a*b/c² - critical for gravitational/inverse-square laws
                     denom_sq = xk**2 + epsilon
                     basis_list.append((xi * xj) / denom_sq)
                     names.append(f"{var_name(i)}*{var_name(j)}/{var_name(k)}²")
-        
+
         # Ratio terms: a/b, a/b²
         for i in range(n_vars):
             for j in range(n_vars):
                 if i == j:
                     continue
                 xi, xj = x[:, i], x[:, j]
-                
+
                 # a/b
                 denom = np.abs(xj) + epsilon
                 basis_list.append(xi / denom)
                 names.append(f"{var_name(i)}/|{var_name(j)}|")
-                
+
                 # a/b²
                 denom_sq = xj**2 + epsilon
                 basis_list.append(xi / denom_sq)
                 names.append(f"{var_name(i)}/{var_name(j)}²")
-                
+
                 # a²/b
                 basis_list.append((xi**2) / denom)
                 names.append(f"{var_name(i)}²/|{var_name(j)}|")
-        
+
         # Square root ratio terms: sqrt(a)/b, a/sqrt(b) - for relativistic mechanics
         for i in range(n_vars):
             for j in range(n_vars):
                 if i == j:
                     continue
                 xi, xj = x[:, i], x[:, j]
-                
+
                 sqrt_xi = np.sqrt(np.abs(xi) + epsilon)
                 sqrt_xj = np.sqrt(np.abs(xj) + epsilon)
-                
+
                 basis_list.append(sqrt_xi / (np.abs(xj) + epsilon))
                 names.append(f"√|{var_name(i)}|/|{var_name(j)}|")
-                
+
                 basis_list.append(xi / sqrt_xj)
                 names.append(f"{var_name(i)}/√|{var_name(j)}|")
 
@@ -1638,9 +1741,9 @@ def build_basis_from_predictions(
                 names.append(f"{name}^3/({name}^4+{c})")
 
             if allow_periodic and (
-                predictions.get('rational', 0) >= threshold or
-                predictions.get('power', 0) >= threshold or
-                predictions.get('periodic', 0) >= threshold
+                predictions.get("rational", 0) >= threshold
+                or predictions.get("power", 0) >= threshold
+                or predictions.get("periodic", 0) >= threshold
             ):
                 for c in [0.5, 1.0, 2.0]:
                     denom_q = xi**2 + c
@@ -1671,37 +1774,35 @@ def build_basis_from_predictions(
                             names.append(f"e^(-{alpha}*{name})·cos({name})")
                         else:
                             names.append(f"e^(-{alpha}*{name})·cos({omega:.2f}*{name})")
-    
+
     basis = np.column_stack(basis_list)
-    
+
     # CRITICAL: Clamp basis to prevent numerical explosion
     basis = np.clip(basis, -1e6, 1e6)
     basis = np.nan_to_num(basis, nan=0.0, posinf=1e6, neginf=-1e6)
-    
-    return basis, names
-        
 
+    return basis, names
 
 
 def find_exact_symbolic_match(
     basis: np.ndarray,
-    names: List[str],
+    names: list[str],
     y: np.ndarray,
     max_terms: int = 3,
     tolerance: float = 1e-6,
     num_threads: int = 1,
-    device: Optional[str] = None,
+    device: str | None = None,
     exact_match_backend: str = "auto",
     exact_match_min_gpu_work: int = DEFAULT_EXACT_MATCH_MIN_GPU_WORK,
     exact_match_max_combos: int = DEFAULT_EXACT_MATCH_MAX_COMBOS,
-    diagnostics: Optional[Dict[str, Any]] = None,
-) -> Optional[Tuple[str, float, np.ndarray]]:
+    diagnostics: dict[str, Any] | None = None,
+) -> tuple[str, float, np.ndarray] | None:
     """
     Search for exact symbolic matches before falling back to LASSO.
-    
+
     Tries single terms, pairs, and triples of basis functions to find
     exact symbolic solutions (MSE < tolerance).
-    
+
     Args:
         basis: (N, n_basis) matrix
         names: List of basis function names
@@ -1713,19 +1814,19 @@ def find_exact_symbolic_match(
         exact_match_min_gpu_work: Minimum estimated work before auto uses CUDA
         exact_match_max_combos: Maximum pair/triple combinations to search exhaustively
         diagnostics: Optional dict populated with backend selection/fallback details
-        
+
     Returns:
         (formula, mse, coefficients) if exact match found, else None
     """
     import math
     import threading
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     n_basis = basis.shape[1]
     y = y.flatten()
-    
-    def build_formula(indices: List[int], coeffs: np.ndarray) -> Tuple[str, np.ndarray]:
+
+    def build_formula(indices: list[int], coeffs: np.ndarray) -> tuple[str, np.ndarray]:
         from glassbox.sr.operations.meta_ops import get_constant_symbol
+
         terms = []
         full_coeffs = np.zeros(n_basis)
         for idx, c in zip(indices, coeffs):
@@ -1752,7 +1853,7 @@ def find_exact_symbolic_match(
     for i in range(n_basis):
         if names[i] == "1":  # Skip constant-only
             continue
-        
+
         # Try with and without constant
         for include_const in [False, True]:
             if include_const:
@@ -1762,8 +1863,10 @@ def find_exact_symbolic_match(
                     y_pred = X @ coeffs
                     mse = np.mean((y - y_pred) ** 2)
                     if mse < tolerance:
-                        formula = _format_affine_formula(names[i], float(coeffs[1]), float(coeffs[0]))
-                        
+                        formula = _format_affine_formula(
+                            names[i], float(coeffs[1]), float(coeffs[0])
+                        )
+
                         full_coeffs = np.zeros(n_basis)
                         const_idx = names.index("1") if "1" in names else 0
                         full_coeffs[const_idx] = coeffs[0] if include_const else 0
@@ -1772,21 +1875,21 @@ def find_exact_symbolic_match(
                 except (np.linalg.LinAlgError, ValueError):
                     pass
             else:
-                X = basis[:, i:i+1]
+                X = basis[:, i : i + 1]
                 try:
                     coeff, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
                     y_pred = X @ coeff
                     mse = np.mean((y - y_pred) ** 2)
                     if mse < tolerance:
                         formula = _format_affine_formula(names[i], float(coeff[0]), 0.0)
-                        
+
                         full_coeffs = np.zeros(n_basis)
                         full_coeffs[i] = coeff[0]
                         return formula, mse, full_coeffs
                 except (np.linalg.LinAlgError, ValueError):
                     pass
-    
-    def update_diagnostics(values: Dict[str, Any]) -> None:
+
+    def update_diagnostics(values: dict[str, Any]) -> None:
         if diagnostics is not None:
             diagnostics.update(values)
 
@@ -1795,7 +1898,7 @@ def find_exact_symbolic_match(
         *,
         beam_width: int = 32,
         candidate_limit: int = 64,
-    ) -> Optional[Tuple[str, float, np.ndarray]]:
+    ) -> tuple[str, float, np.ndarray] | None:
         y_centered = y - float(np.mean(y))
         y_norm = float(np.linalg.norm(y_centered))
         if y_norm <= 1e-15:
@@ -1813,15 +1916,20 @@ def find_exact_symbolic_match(
             if np.isfinite(score):
                 col_scores.append((score, idx))
         col_scores.sort(reverse=True)
-        ranked = [idx for _, idx in col_scores[:max(1, min(candidate_limit, len(col_scores)))]]
+        ranked = [
+            idx
+            for _, idx in col_scores[: max(1, min(candidate_limit, len(col_scores)))]
+        ]
         if not ranked:
             return None
 
         const_idx = names.index("1") if "1" in names else None
-        beams: List[Tuple[float, Tuple[int, ...], np.ndarray]] = []
-        best: Optional[Tuple[float, Tuple[int, ...], np.ndarray]] = None
+        beams: list[tuple[float, tuple[int, ...], np.ndarray]] = []
+        best: tuple[float, tuple[int, ...], np.ndarray] | None = None
 
-        def fit_support(support: Tuple[int, ...]) -> Optional[Tuple[float, Tuple[int, ...], np.ndarray]]:
+        def fit_support(
+            support: tuple[int, ...],
+        ) -> tuple[float, tuple[int, ...], np.ndarray] | None:
             if not support:
                 return None
             X = basis[:, list(support)]
@@ -1876,26 +1984,32 @@ def find_exact_symbolic_match(
                         best = fit
             if not next_beams:
                 break
-            beams = sorted(next_beams, key=lambda item: (item[0], len(item[1])))[:beam_width]
+            beams = sorted(next_beams, key=lambda item: (item[0], len(item[1])))[
+                :beam_width
+            ]
 
         if best is not None and best[0] < tolerance:
             mse_val, support, coeffs = best
             formula, full_coeffs = build_formula(list(support), coeffs)
-            update_diagnostics({
-                "fallback_reason": "bounded_sparse_beam_match",
-                "beam_width": int(beam_width),
-                "candidate_limit": int(candidate_limit),
-                "support_size": int(len(support)),
-            })
+            update_diagnostics(
+                {
+                    "fallback_reason": "bounded_sparse_beam_match",
+                    "beam_width": int(beam_width),
+                    "candidate_limit": int(candidate_limit),
+                    "support_size": len(support),
+                }
+            )
             return formula, mse_val, full_coeffs
 
         if best is not None:
-            update_diagnostics({
-                "fallback_reason": "bounded_sparse_beam_no_exact_match",
-                "beam_best_mse": float(best[0]),
-                "beam_width": int(beam_width),
-                "candidate_limit": int(candidate_limit),
-            })
+            update_diagnostics(
+                {
+                    "fallback_reason": "bounded_sparse_beam_no_exact_match",
+                    "beam_best_mse": float(best[0]),
+                    "beam_width": int(beam_width),
+                    "candidate_limit": int(candidate_limit),
+                }
+            )
         return None
 
     combo_count = 0
@@ -1903,21 +2017,23 @@ def find_exact_symbolic_match(
         if n_basis >= r:
             combo_count += math.comb(n_basis, r)
     if exact_match_max_combos is not None and combo_count > int(exact_match_max_combos):
-        update_diagnostics({
-            "backend_requested": exact_match_backend,
-            "fallback_reason": "combo_cap_exceeded",
-            "combo_count": int(combo_count),
-            "max_combos": int(exact_match_max_combos),
-            "torch_used": False,
-            "gpu_used": False,
-        })
+        update_diagnostics(
+            {
+                "backend_requested": exact_match_backend,
+                "fallback_reason": "combo_cap_exceeded",
+                "combo_count": int(combo_count),
+                "max_combos": int(exact_match_max_combos),
+                "torch_used": False,
+                "gpu_used": False,
+            }
+        )
         print(
             "  Skipping exhaustive exact-match search "
             f"(combos={combo_count} > cap={int(exact_match_max_combos)})"
         )
         beam_match = bounded_sparse_beam_search(max_terms)
         if beam_match is not None:
-            print(f"  Bounded sparse exact-match search succeeded")
+            print("  Bounded sparse exact-match search succeeded")
             return beam_match
         return None
 
@@ -1932,8 +2048,12 @@ def find_exact_symbolic_match(
 
     if selected_device is not None and max_terms >= 2:
         try:
-            basis_t = torch.as_tensor(np.ascontiguousarray(basis), dtype=torch.float32, device=selected_device)
-            y_t = torch.as_tensor(np.ascontiguousarray(y), dtype=torch.float32, device=selected_device).unsqueeze(1)
+            basis_t = torch.as_tensor(
+                np.ascontiguousarray(basis), dtype=torch.float32, device=selected_device
+            )
+            y_t = torch.as_tensor(
+                np.ascontiguousarray(y), dtype=torch.float32, device=selected_device
+            ).unsqueeze(1)
             N = basis_t.shape[0]
 
             def fast_torch_search(r: int):
@@ -1945,21 +2065,25 @@ def find_exact_symbolic_match(
                 for start in range(0, n_combos, chunk_size):
                     end = min(start + chunk_size, n_combos)
                     chunk_idx = idx_cpu[start:end].to(selected_device)
-                    
-                    X = basis_t[:, chunk_idx] # N x C x r
-                    X = X.permute(1, 0, 2) # C x N x r
+
+                    X = basis_t[:, chunk_idx]  # N x C x r
+                    X = X.permute(1, 0, 2)  # C x N x r
                     y_batch = y_t.expand(end - start, N, 1)
-                    
-                    sol = torch.linalg.lstsq(X, y_batch).solution # C x r x 1
-                    pred = torch.bmm(X, sol) # C x N x 1
-                    mse = torch.mean((y_batch - pred)**2, dim=1).squeeze(-1) # C
-                    
+
+                    sol = torch.linalg.lstsq(X, y_batch).solution  # C x r x 1
+                    pred = torch.bmm(X, sol)  # C x N x 1
+                    mse = torch.mean((y_batch - pred) ** 2, dim=1).squeeze(-1)  # C
+
                     best_mse, best_idx = torch.min(mse, dim=0)
-                    
+
                     if best_mse < tolerance:
                         idx_in_chunk = best_idx.item()
                         real_idx = start + idx_in_chunk
-                        return idx_cpu[real_idx].tolist(), sol[idx_in_chunk].flatten().detach().cpu().numpy(), best_mse.item()
+                        return (
+                            idx_cpu[real_idx].tolist(),
+                            sol[idx_in_chunk].flatten().detach().cpu().numpy(),
+                            best_mse.item(),
+                        )
                 return None
 
             if max_terms >= 2:
@@ -1970,7 +2094,12 @@ def find_exact_symbolic_match(
                     y_pred = basis[:, indices] @ coeffs_arr
                     mse_cpu = float(np.mean((y - y_pred) ** 2))
                     if mse_cpu < tolerance:
-                        update_diagnostics({"match_backend": str(selected_device), "validated_on_cpu": True})
+                        update_diagnostics(
+                            {
+                                "match_backend": str(selected_device),
+                                "validated_on_cpu": True,
+                            }
+                        )
                         formula, full_coeffs = build_formula(indices, coeffs_arr)
                         return formula, mse_cpu, full_coeffs
 
@@ -1982,19 +2111,26 @@ def find_exact_symbolic_match(
                     y_pred = basis[:, indices] @ coeffs_arr
                     mse_cpu = float(np.mean((y - y_pred) ** 2))
                     if mse_cpu < tolerance:
-                        update_diagnostics({"match_backend": str(selected_device), "validated_on_cpu": True})
+                        update_diagnostics(
+                            {
+                                "match_backend": str(selected_device),
+                                "validated_on_cpu": True,
+                            }
+                        )
                         formula, full_coeffs = build_formula(indices, coeffs_arr)
                         return formula, mse_cpu, full_coeffs
-            
+
             return None
         except Exception as e:
             if selected_device.type == "cuda" and torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            update_diagnostics({"fallback_reason": f"torch_search_failed:{type(e).__name__}"})
+            update_diagnostics(
+                {"fallback_reason": f"torch_search_failed:{type(e).__name__}"}
+            )
             print(f"  [PyTorch fast search failed: {e}]")
-            pass # Fall back to numpy implementation on any PyTorch error
-    
-    def chunk_ranges(n: int, chunks: int) -> List[Tuple[int, int]]:
+            # Fall back to numpy implementation on any PyTorch error
+
+    def chunk_ranges(n: int, chunks: int) -> list[tuple[int, int]]:
         if chunks <= 1 or n <= 1:
             return [(0, n)]
         size = max(1, math.ceil(n / chunks))
@@ -2043,7 +2179,10 @@ def find_exact_symbolic_match(
             stop_event = threading.Event()
             ranges = chunk_ranges(n_basis, num_threads)
             with ThreadPoolExecutor(max_workers=num_threads) as executor:
-                futures = [executor.submit(search_pairs_range, start, end, stop_event) for start, end in ranges]
+                futures = [
+                    executor.submit(search_pairs_range, start, end, stop_event)
+                    for start, end in ranges
+                ]
                 for future in as_completed(futures):
                     result = future.result()
                     if result is not None:
@@ -2052,14 +2191,17 @@ def find_exact_symbolic_match(
             result = search_pairs_range(0, n_basis, threading.Event())
             if result is not None:
                 return result
-    
+
     # Try triples of basis functions (including constant)
     if max_terms >= 3:
         if num_threads and num_threads > 1:
             stop_event = threading.Event()
             ranges = chunk_ranges(n_basis, num_threads)
             with ThreadPoolExecutor(max_workers=num_threads) as executor:
-                futures = [executor.submit(search_triples_range, start, end, stop_event) for start, end in ranges]
+                futures = [
+                    executor.submit(search_triples_range, start, end, stop_event)
+                    for start, end in ranges
+                ]
                 for future in as_completed(futures):
                     result = future.result()
                     if result is not None:
@@ -2068,35 +2210,35 @@ def find_exact_symbolic_match(
             result = search_triples_range(0, n_basis, threading.Event())
             if result is not None:
                 return result
-    
+
     return None
 
 
 def fast_path_regression(
     x: np.ndarray,
     y: np.ndarray,
-    predictions: Dict[str, float],
-    detected_omegas: Optional[List[float]] = None,
+    predictions: dict[str, float],
+    detected_omegas: list[float] | None = None,
     sparsity_threshold: float = 0.01,
-    op_constraints: Optional[Dict[str, bool]] = None,
+    op_constraints: dict[str, bool] | None = None,
     universal_basis: bool = True,
     exact_match_threads: int = 1,
     exact_match_enabled: bool = True,
     exact_match_max_basis: int = 150,
     max_power: int = 6,
     holdout_fraction: float = 0.10,
-    device: Optional[str] = None,
+    device: str | None = None,
     exact_match_backend: str = "auto",
     exact_match_min_gpu_work: int = DEFAULT_EXACT_MATCH_MIN_GPU_WORK,
     exact_match_max_combos: int = DEFAULT_EXACT_MATCH_MAX_COMBOS,
     noise_level: float = 0.0,
-) -> Tuple[str, float, Dict]:
+) -> tuple[str, float, dict]:
     """
     Directly solve for coefficients using least squares regression.
-    
+
     IMPROVED: First searches for exact symbolic matches before LASSO.
     Supports out-of-domain holdout scoring for generalization assessment.
-    
+
     Args:
         x: Input values (N,)
         y: Target values (N,)
@@ -2106,7 +2248,7 @@ def fast_path_regression(
         holdout_fraction: Fraction of domain-edge points held out
             for out-of-domain scoring (default 0.10, i.e. 5% each
             from the lowest and highest x-values). Set to 0 to disable.
-        
+
     Returns:
         formula: String representation
         mse: Mean squared error
@@ -2116,13 +2258,13 @@ def fast_path_regression(
         raise ValueError(f"Expected x to be 1D or 2D, got shape {x.shape}")
     y = y.flatten()
     y_variance = float(np.var(y)) if y.size > 0 else 0.0
-    exact_match_diagnostics: Dict[str, Any] = {}
+    exact_match_diagnostics: dict[str, Any] = {}
     # Noise-aware acceptance tolerance for the exact-match reject walls.
     # Under injected noise the true formula still carries residual MSE ~ noise
     # variance, so the clean-data 1e-6 wall wrongly rejects structurally-correct
     # matches. ~2-sigma headroom over noise variance; stays 1e-6 when clean.
     _nl = max(0.0, float(noise_level))
-    exact_accept_tol = max(1e-6, 4.0 * (_nl ** 2) * y_variance) if _nl > 0 else 1e-6
+    exact_accept_tol = max(1e-6, 4.0 * (_nl**2) * y_variance) if _nl > 0 else 1e-6
 
     # ── Out-of-domain holdout: hold back domain-edge points ──
     holdout_mask = None
@@ -2184,10 +2326,11 @@ def fast_path_regression(
         details.setdefault("y_variance", y_variance)
         details.setdefault("holdout_mse", 0.0 if holdout_mask is not None else None)
         return formula, mse, details
-    
+
     # Build basis from predictions (fit subset for holdout; full data for exact-match/evaluation)
     basis_full, names = build_basis_from_predictions(
-        x, predictions, 
+        x,
+        predictions,
         threshold=0.3,  # Lower threshold to include more options
         max_power=max_power,
         detected_omegas=detected_omegas,
@@ -2202,18 +2345,18 @@ def fast_path_regression(
     else:
         basis = basis_full
         basis_holdout = None
-    
+
     print(f"  Fast-path basis: {len(names)} terms")
     print(f"  Terms: {names[:10]}{'...' if len(names) > 10 else ''}")
-    
+
     # STEP 1: Try to find exact symbolic matches FIRST (before LASSO).
     # This prevents mixed bases from winning with approximate exp/rational/fractional
     # terms when the target is an exact polynomial.
     if op_constraints:
-        allow_periodic = op_constraints.get('periodic', True)
-        allow_exp = op_constraints.get('exp', True)
-        allow_log = op_constraints.get('log', True)
-        allow_power = op_constraints.get('power', True)
+        allow_periodic = op_constraints.get("periodic", True)
+        allow_exp = op_constraints.get("exp", True)
+        allow_log = op_constraints.get("log", True)
+        allow_power = op_constraints.get("power", True)
     else:
         allow_periodic = allow_exp = allow_log = allow_power = True
 
@@ -2229,33 +2372,47 @@ def fast_path_regression(
             formula, mse, coeffs = exact_poly_match
             print(f"  Found EXACT polynomial match: {formula} (MSE={mse:.2e})")
             active_idx = np.flatnonzero(np.abs(coeffs) >= sparsity_threshold)
-            return formula, mse, {
-                'coefficients': coeffs,
-                'basis_names': names,
-                'n_nonzero': sum(1 for c in coeffs if abs(c) >= sparsity_threshold),
-                'exact_match': True,
-                'exact_match_diagnostics': {
-                    'backend_requested': exact_match_backend,
-                    'fallback_reason': 'polynomial_shortcut',
-                    'torch_used': False,
-                    'gpu_used': False,
+            return (
+                formula,
+                mse,
+                {
+                    "coefficients": coeffs,
+                    "basis_names": names,
+                    "n_nonzero": sum(1 for c in coeffs if abs(c) >= sparsity_threshold),
+                    "exact_match": True,
+                    "exact_match_diagnostics": {
+                        "backend_requested": exact_match_backend,
+                        "fallback_reason": "polynomial_shortcut",
+                        "torch_used": False,
+                        "gpu_used": False,
+                    },
+                    "candidate_formulas": [
+                        {
+                            "formula": formula,
+                            "mse": float(mse),
+                            "score": float(mse),
+                            "n_nonzero": int(
+                                np.sum(np.abs(coeffs) >= sparsity_threshold)
+                            ),
+                            "active_terms": [names[i] for i in active_idx],
+                            "alpha": 0.0,
+                        }
+                    ],
+                    "y_variance": y_variance,
+                    "holdout_mse": 0.0 if holdout_mask is not None else None,
                 },
-                'candidate_formulas': [{
-                    'formula': formula,
-                    'mse': float(mse),
-                    'score': float(mse),
-                    'n_nonzero': int(np.sum(np.abs(coeffs) >= sparsity_threshold)),
-                    'active_terms': [names[i] for i in active_idx],
-                    'alpha': 0.0,
-                }],
-                'y_variance': y_variance,
-                'holdout_mse': 0.0 if holdout_mask is not None else None,
-            }
+            )
 
     # If only power is allowed, enable 10-term exact match for polynomials
-    exact_max_terms = 10 if (allow_power and not allow_periodic and not allow_exp and not allow_log) else 4
+    exact_max_terms = (
+        10
+        if (allow_power and not allow_periodic and not allow_exp and not allow_log)
+        else 4
+    )
 
-    if exact_match_enabled and (exact_match_max_basis is None or basis.shape[1] <= exact_match_max_basis):
+    if exact_match_enabled and (
+        exact_match_max_basis is None or basis.shape[1] <= exact_match_max_basis
+    ):
         exact_match = find_exact_symbolic_match(
             basis,
             names,
@@ -2278,12 +2435,14 @@ def fast_path_regression(
                 holdout_pred = basis_holdout @ coeffs
                 holdout_mse = float(np.mean((y_holdout - holdout_pred) ** 2))
             if not np.isfinite(full_mse) or full_mse >= exact_accept_tol:
-                exact_match_diagnostics.update({
-                    'rejected_reason': 'full_domain_mse_not_exact',
-                    'fit_mse': float(mse),
-                    'full_mse': full_mse,
-                    'holdout_mse': holdout_mse,
-                })
+                exact_match_diagnostics.update(
+                    {
+                        "rejected_reason": "full_domain_mse_not_exact",
+                        "fit_mse": float(mse),
+                        "full_mse": full_mse,
+                        "holdout_mse": holdout_mse,
+                    }
+                )
                 print(
                     "  Rejected symbolic shortcut: "
                     f"fit MSE={mse:.2e}, full MSE={full_mse:.2e}"
@@ -2301,52 +2460,70 @@ def fast_path_regression(
                     n_terms=n_terms_exact,
                     postprocess=True,
                 )
-                display_mse = governed_exact.get('display_mse')
-                if display_mse is None or not np.isfinite(float(display_mse)) or float(display_mse) >= exact_accept_tol:
-                    exact_match_diagnostics.update({
-                        'rejected_reason': 'display_mse_not_exact',
-                        'fit_mse': float(mse),
-                        'full_mse': full_mse,
-                        'display_mse': display_mse,
-                        'holdout_mse': holdout_mse,
-                    })
+                display_mse = governed_exact.get("display_mse")
+                if (
+                    display_mse is None
+                    or not np.isfinite(float(display_mse))
+                    or float(display_mse) >= exact_accept_tol
+                ):
+                    exact_match_diagnostics.update(
+                        {
+                            "rejected_reason": "display_mse_not_exact",
+                            "fit_mse": float(mse),
+                            "full_mse": full_mse,
+                            "display_mse": display_mse,
+                            "holdout_mse": holdout_mse,
+                        }
+                    )
                     print(
                         "  Rejected symbolic shortcut: "
                         f"raw MSE={full_mse:.2e}, display MSE={display_mse}"
                     )
                 else:
-                    formula = str(governed_exact.get('formula') or formula)
-                    print(f"  Found EXACT symbolic match: {formula} (MSE={float(display_mse):.2e})")
+                    formula = str(governed_exact.get("formula") or formula)
+                    print(
+                        f"  Found EXACT symbolic match: {formula} (MSE={float(display_mse):.2e})"
+                    )
                     active_idx = np.flatnonzero(np.abs(coeffs) >= sparsity_threshold)
-                    return formula, float(display_mse), {
-                        'coefficients': coeffs,
-                        'basis_names': names,
-                        'n_nonzero': n_terms_exact,
-                        'exact_match': True,
-                        'exact_match_diagnostics': exact_match_diagnostics,
-                        'candidate_formulas': [{
-                            'formula': formula,
-                            'mse': float(display_mse),
-                            'score': float(governed_exact.get('score', display_mse)),
-                            'n_nonzero': n_terms_exact,
-                            'active_terms': [names[i] for i in active_idx],
-                            'alpha': 0.0,
-                            'raw_mse': float(full_mse),
-                            'display_mse': float(display_mse),
-                            'governor': governed_exact,
-                        }],
-                        'holdout_mse': holdout_mse,
-                        'candidate_governor': governed_exact,
-                    }
+                    return (
+                        formula,
+                        float(display_mse),
+                        {
+                            "coefficients": coeffs,
+                            "basis_names": names,
+                            "n_nonzero": n_terms_exact,
+                            "exact_match": True,
+                            "exact_match_diagnostics": exact_match_diagnostics,
+                            "candidate_formulas": [
+                                {
+                                    "formula": formula,
+                                    "mse": float(display_mse),
+                                    "score": float(
+                                        governed_exact.get("score", display_mse)
+                                    ),
+                                    "n_nonzero": n_terms_exact,
+                                    "active_terms": [names[i] for i in active_idx],
+                                    "alpha": 0.0,
+                                    "raw_mse": float(full_mse),
+                                    "display_mse": float(display_mse),
+                                    "governor": governed_exact,
+                                }
+                            ],
+                            "holdout_mse": holdout_mse,
+                            "candidate_governor": governed_exact,
+                        },
+                    )
     elif exact_match_enabled:
-        print(f"  Skipping exact-match search (basis={basis.shape[1]} > {exact_match_max_basis})")
+        print(
+            f"  Skipping exact-match search (basis={basis.shape[1]} > {exact_match_max_basis})"
+        )
         exact_match_diagnostics = {
-            'backend_requested': exact_match_backend,
-            'fallback_reason': 'basis_exceeds_exact_match_max',
-            'basis_terms': int(basis.shape[1]),
-            'exact_match_max_basis': int(exact_match_max_basis),
+            "backend_requested": exact_match_backend,
+            "fallback_reason": "basis_exceeds_exact_match_max",
+            "basis_terms": int(basis.shape[1]),
+            "exact_match_max_basis": int(exact_match_max_basis),
         }
-    
+
     # Normalize basis for numerical stability
     basis_std = np.std(basis, axis=0, keepdims=True)
     basis_std[basis_std < 1e-10] = 1.0
@@ -2362,10 +2539,12 @@ def fast_path_regression(
                 terms_local.append(term)
         return _join_formula_terms(terms_local)
 
-    def _candidate_signature(coeffs_arr: np.ndarray) -> Tuple[int, ...]:
+    def _candidate_signature(coeffs_arr: np.ndarray) -> tuple[int, ...]:
         return tuple(np.flatnonzero(np.abs(coeffs_arr) >= sparsity_threshold).tolist())
 
-    def _semantic_prediction_signature(coeffs_arr: np.ndarray) -> Optional[Tuple[int, ...]]:
+    def _semantic_prediction_signature(
+        coeffs_arr: np.ndarray,
+    ) -> tuple[int, ...] | None:
         """Hash a candidate by its sampled prediction curve, not its basis support."""
         try:
             pred = np.asarray(basis_full @ coeffs_arr, dtype=np.float64).reshape(-1)
@@ -2386,7 +2565,7 @@ def fast_path_regression(
         return tuple(np.round(centered * 1e7).astype(np.int64).tolist())
 
     def _update_candidate_pool(
-        pool: Dict[Tuple[int, ...], Dict[str, Any]],
+        pool: dict[tuple[int, ...], dict[str, Any]],
         coeffs_arr: np.ndarray,
         mse_val: float,
         alpha_val: float,
@@ -2412,17 +2591,17 @@ def fast_path_regression(
 
         signature = _candidate_signature(coeffs_arr)
         current = pool.get(signature)
-        if current is None or score_local < current['score']:
+        if current is None or score_local < current["score"]:
             pool[signature] = {
-                'coeffs': coeffs_arr.copy(),
-                'mse': float(mse_val),
-                'n_terms': n_terms_local,
-                'score': score_local,
-                'alpha': alpha_val,
-                'solver_backend': solver_backend,
+                "coeffs": coeffs_arr.copy(),
+                "mse": float(mse_val),
+                "n_terms": n_terms_local,
+                "score": score_local,
+                "alpha": alpha_val,
+                "solver_backend": solver_backend,
             }
 
-    def _holdout_mse_for_best(coeffs_arr: np.ndarray) -> Optional[float]:
+    def _holdout_mse_for_best(coeffs_arr: np.ndarray) -> float | None:
         """Compute holdout MSE for the best candidate's coefficients."""
         if basis_holdout is None or y_holdout is None:
             return None
@@ -2432,16 +2611,16 @@ def fast_path_regression(
             return ho_mse if np.isfinite(ho_mse) else None
         except Exception:
             return None
-    
+
     # Try LASSO with adaptive alpha (coordinate descent)
     best_coeffs = None
-    best_mse = float('inf')
-    best_score = float('inf')  # Complexity-penalized score
-    candidate_pool: Dict[Tuple[int, ...], Dict[str, Any]] = {}
-    
+    best_mse = float("inf")
+    best_score = float("inf")  # Complexity-penalized score
+    candidate_pool: dict[tuple[int, ...], dict[str, Any]] = {}
+
     # Complexity penalty: prefer simpler solutions
     COMPLEXITY_PENALTY = 0.001  # λ in: score = MSE + λ * n_terms
-    
+
     cpp_core, _cpp_reason = _load_cpp_core()
     solver_backends = ["numpy"]
     if cpp_core is not None and hasattr(cpp_core, "lasso_coordinate_descent"):
@@ -2461,7 +2640,9 @@ def fast_path_regression(
 
                 # Check for NaN/Inf in coeffs
                 if not np.all(np.isfinite(coeffs)):
-                    print(f"  Warning: {solver_backend} alpha={alpha} produced non-finite coefficients")
+                    print(
+                        f"  Warning: {solver_backend} alpha={alpha} produced non-finite coefficients"
+                    )
                     continue
 
                 # Unnormalize coefficients
@@ -2499,14 +2680,16 @@ def fast_path_regression(
             except Exception as e:
                 print(f"  Error with {solver_backend} alpha={alpha}: {e}")
                 continue
-    
+
     if best_coeffs is None:
         # Fallback to plain least squares
         try:
             best_coeffs, _, _, _ = np.linalg.lstsq(basis, y_fit, rcond=None)
             y_pred = basis @ best_coeffs
             best_mse = np.mean((y_fit - y_pred) ** 2)
-            best_score = best_mse + COMPLEXITY_PENALTY * np.sum(np.abs(best_coeffs) >= sparsity_threshold)
+            best_score = best_mse + COMPLEXITY_PENALTY * np.sum(
+                np.abs(best_coeffs) >= sparsity_threshold
+            )
             _update_candidate_pool(
                 candidate_pool,
                 best_coeffs,
@@ -2515,12 +2698,12 @@ def fast_path_regression(
                 solver_backend="lstsq_fallback",
             )
         except np.linalg.LinAlgError:
-            return None, float('inf'), {}
+            return None, float("inf"), {}
 
     # IMPORTANT: Refit each candidate with OLS on selected terms only.
     # This recovers exact coefficients while preserving sparse structure.
     for signature, candidate in list(candidate_pool.items()):
-        coeffs_local = candidate['coeffs']
+        coeffs_local = candidate["coeffs"]
         selected_mask = np.abs(coeffs_local) >= sparsity_threshold
         if selected_mask.sum() == 0 or selected_mask.sum() == len(coeffs_local):
             continue
@@ -2530,17 +2713,17 @@ def fast_path_regression(
             y_pred = basis_selected @ refit_coeffs
             refit_mse = float(np.mean((y_fit - y_pred) ** 2))
 
-            if refit_mse <= candidate['mse'] + 0.001:
+            if refit_mse <= candidate["mse"] + 0.001:
                 updated = np.zeros_like(coeffs_local)
                 updated[selected_mask] = refit_coeffs
                 n_terms_local = int(np.sum(np.abs(updated) >= sparsity_threshold))
                 candidate_pool[signature] = {
-                    'coeffs': updated,
-                    'mse': refit_mse,
-                    'n_terms': n_terms_local,
-                    'score': refit_mse + COMPLEXITY_PENALTY * n_terms_local,
-                    'alpha': candidate.get('alpha', -1.0),
-                    'solver_backend': candidate.get('solver_backend', 'auto'),
+                    "coeffs": updated,
+                    "mse": refit_mse,
+                    "n_terms": n_terms_local,
+                    "score": refit_mse + COMPLEXITY_PENALTY * n_terms_local,
+                    "alpha": candidate.get("alpha", -1.0),
+                    "solver_backend": candidate.get("solver_backend", "auto"),
                 }
         except (np.linalg.LinAlgError, ValueError):
             pass
@@ -2554,106 +2737,138 @@ def fast_path_regression(
             solver_backend="best_fallback",
         )
 
-    governed_candidates: List[Dict[str, Any]] = []
+    governed_candidates: list[dict[str, Any]] = []
     for candidate in candidate_pool.values():
-        cand_coeffs = candidate['coeffs']
+        cand_coeffs = candidate["coeffs"]
         cand_formula = _coeffs_to_formula(cand_coeffs)
         cand_pred_full = basis_full @ cand_coeffs
         cand_full_mse = float(np.mean((y - cand_pred_full) ** 2))
         if not np.isfinite(cand_full_mse):
-            cand_full_mse = float(candidate['mse'])
-        cand_holdout = _holdout_mse_for_best(cand_coeffs) if holdout_mask is not None else None
+            cand_full_mse = float(candidate["mse"])
+        cand_holdout = (
+            _holdout_mse_for_best(cand_coeffs) if holdout_mask is not None else None
+        )
         n_terms_local = int(np.sum(np.abs(cand_coeffs) >= sparsity_threshold))
         governed = _display_candidate_score(
             cand_formula,
             x,
             y,
             raw_mse=cand_full_mse,
-            fit_mse=float(candidate['mse']),
+            fit_mse=float(candidate["mse"]),
             holdout_mse=cand_holdout,
             complexity=n_terms_local,
             n_terms=n_terms_local,
         )
-        governed_candidates.append({
-            **candidate,
-            'formula': cand_formula,
-            'full_mse': cand_full_mse,
-            'holdout_mse': cand_holdout,
-            'governor': governed,
-            'governor_score': float(governed.get('score', float('inf'))),
-            'display_mse': governed.get('display_mse'),
-            'display_formula': governed.get('formula') or cand_formula,
-        })
+        governed_candidates.append(
+            {
+                **candidate,
+                "formula": cand_formula,
+                "full_mse": cand_full_mse,
+                "holdout_mse": cand_holdout,
+                "governor": governed,
+                "governor_score": float(governed.get("score", float("inf"))),
+                "display_mse": governed.get("display_mse"),
+                "display_formula": governed.get("formula") or cand_formula,
+            }
+        )
 
     semantic_dedup = {
-        'before': len(governed_candidates),
-        'after': len(governed_candidates),
-        'removed': 0,
-        'enabled': True,
+        "before": len(governed_candidates),
+        "after": len(governed_candidates),
+        "removed": 0,
+        "enabled": True,
     }
     if governed_candidates:
-        semantic_pool: Dict[Tuple[int, ...], Dict[str, Any]] = {}
-        unique_fallback: List[Dict[str, Any]] = []
+        semantic_pool: dict[tuple[int, ...], dict[str, Any]] = {}
+        unique_fallback: list[dict[str, Any]] = []
 
-        def _candidate_rank_key(c: Dict[str, Any]) -> Tuple[float, float, float, float, int]:
+        def _candidate_rank_key(
+            c: dict[str, Any],
+        ) -> tuple[float, float, float, float, int]:
             return (
-                float(c.get('governor_score', float('inf'))),
-                float(c['display_mse']) if c.get('display_mse') is not None else float('inf'),
-                float(c.get('score', float('inf'))),
-                float(c.get('mse', float('inf'))),
-                int(c.get('n_terms', 9999)),
+                float(c.get("governor_score", float("inf"))),
+                float(c["display_mse"])
+                if c.get("display_mse") is not None
+                else float("inf"),
+                float(c.get("score", float("inf"))),
+                float(c.get("mse", float("inf"))),
+                int(c.get("n_terms", 9999)),
             )
 
         for cand in governed_candidates:
-            semantic_signature = _semantic_prediction_signature(cand['coeffs'])
+            semantic_signature = _semantic_prediction_signature(cand["coeffs"])
             if semantic_signature is None:
                 unique_fallback.append(cand)
                 continue
             current = semantic_pool.get(semantic_signature)
-            if current is None or _candidate_rank_key(cand) < _candidate_rank_key(current):
+            if current is None or _candidate_rank_key(cand) < _candidate_rank_key(
+                current
+            ):
                 semantic_pool[semantic_signature] = cand
 
         governed_candidates = list(semantic_pool.values()) + unique_fallback
-        semantic_dedup['after'] = len(governed_candidates)
-        semantic_dedup['removed'] = max(0, semantic_dedup['before'] - semantic_dedup['after'])
+        semantic_dedup["after"] = len(governed_candidates)
+        semantic_dedup["removed"] = max(
+            0, semantic_dedup["before"] - semantic_dedup["after"]
+        )
 
     sorted_candidates = sorted(
         governed_candidates,
         key=lambda c: (
-            c['governor_score'],
-            float(c['display_mse']) if c.get('display_mse') is not None else float('inf'),
-            c['score'],
-            c['mse'],
+            c["governor_score"],
+            float(c["display_mse"])
+            if c.get("display_mse") is not None
+            else float("inf"),
+            c["score"],
+            c["mse"],
         ),
     )
     top_candidates = sorted_candidates[:5]
     best_candidate = top_candidates[0]
 
-    coeffs = best_candidate['coeffs']
-    mse = float(best_candidate.get('display_mse') if best_candidate.get('display_mse') is not None else best_candidate.get('full_mse', best_candidate['mse']))
+    coeffs = best_candidate["coeffs"]
+    mse = float(
+        best_candidate.get("display_mse")
+        if best_candidate.get("display_mse") is not None
+        else best_candidate.get("full_mse", best_candidate["mse"])
+    )
     if not np.isfinite(mse):
-        mse = float(best_candidate.get('full_mse', best_candidate['mse']))
-    formula = str(best_candidate.get('display_formula') or best_candidate.get('formula') or _coeffs_to_formula(coeffs))
+        mse = float(best_candidate.get("full_mse", best_candidate["mse"]))
+    formula = str(
+        best_candidate.get("display_formula")
+        or best_candidate.get("formula")
+        or _coeffs_to_formula(coeffs)
+    )
 
     n_nonzero = int(np.sum(np.abs(coeffs) >= sparsity_threshold))
     exact_match_flag = mse < exact_accept_tol and n_nonzero <= 10
 
     candidate_formulas = []
     for cand in top_candidates:
-        cand_coeffs = cand['coeffs']
+        cand_coeffs = cand["coeffs"]
         active_idx = np.flatnonzero(np.abs(cand_coeffs) >= sparsity_threshold)
-        candidate_formulas.append({
-            'formula': str(cand.get('display_formula') or cand.get('formula') or _coeffs_to_formula(cand_coeffs)),
-            'mse': float(cand.get('display_mse') if cand.get('display_mse') is not None else cand.get('full_mse', cand['mse'])),
-            'score': float(cand.get('governor_score', cand['score'])),
-            'n_nonzero': int(cand['n_terms']),
-            'active_terms': [names[i] for i in active_idx],
-            'alpha': float(cand.get('alpha', -1.0)),
-            'raw_mse': float(cand.get('full_mse', cand['mse'])),
-            'display_mse': cand.get('display_mse'),
-            'governor': cand.get('governor'),
-            'solver_backend': cand.get('solver_backend'),
-        })
+        candidate_formulas.append(
+            {
+                "formula": str(
+                    cand.get("display_formula")
+                    or cand.get("formula")
+                    or _coeffs_to_formula(cand_coeffs)
+                ),
+                "mse": float(
+                    cand.get("display_mse")
+                    if cand.get("display_mse") is not None
+                    else cand.get("full_mse", cand["mse"])
+                ),
+                "score": float(cand.get("governor_score", cand["score"])),
+                "n_nonzero": int(cand["n_terms"]),
+                "active_terms": [names[i] for i in active_idx],
+                "alpha": float(cand.get("alpha", -1.0)),
+                "raw_mse": float(cand.get("full_mse", cand["mse"])),
+                "display_mse": cand.get("display_mse"),
+                "governor": cand.get("governor"),
+                "solver_backend": cand.get("solver_backend"),
+            }
+        )
 
     decomposition_candidates = build_decomposition_probe_candidates(
         x,
@@ -2663,29 +2878,28 @@ def fast_path_regression(
     )
     if decomposition_candidates:
         seen_formula_keys = {
-            normalize_formula_ascii(str(c.get('formula', ''))).replace(" ", "")
+            normalize_formula_ascii(str(c.get("formula", ""))).replace(" ", "")
             for c in candidate_formulas
         }
         for cand in decomposition_candidates:
-            key = normalize_formula_ascii(str(cand.get('formula', ''))).replace(" ", "")
+            key = normalize_formula_ascii(str(cand.get("formula", ""))).replace(" ", "")
             if key and key not in seen_formula_keys:
                 candidate_formulas.append(cand)
                 seen_formula_keys.add(key)
 
         best_decomp = decomposition_candidates[0]
-        best_decomp_mse = float(best_decomp.get('mse', float('inf')))
-        if (
-            np.isfinite(best_decomp_mse)
-            and (
-                best_decomp_mse < max(1e-10, mse * 0.90)
-                or (best_decomp_mse < 1e-8 and not exact_match_flag)
-            )
+        best_decomp_mse = float(best_decomp.get("mse", float("inf")))
+        if np.isfinite(best_decomp_mse) and (
+            best_decomp_mse < max(1e-10, mse * 0.90)
+            or (best_decomp_mse < 1e-8 and not exact_match_flag)
         ):
-            formula = str(best_decomp.get('formula') or formula)
+            formula = str(best_decomp.get("formula") or formula)
             mse = best_decomp_mse
-            exact_match_flag = mse < 1e-6 and int(best_decomp.get('n_nonzero', 99)) <= 10
-            n_nonzero = int(best_decomp.get('n_nonzero', n_nonzero))
-            best_candidate['governor'] = best_decomp.get('governor')
+            exact_match_flag = (
+                mse < 1e-6 and int(best_decomp.get("n_nonzero", 99)) <= 10
+            )
+            n_nonzero = int(best_decomp.get("n_nonzero", n_nonzero))
+            best_candidate["governor"] = best_decomp.get("governor")
 
     template_seed_meta = None
     if multivariate_template_seed is not None:
@@ -2694,15 +2908,18 @@ def fast_path_regression(
         t_details = multivariate_template_seed.get("details") or {}
         if t_formula and np.isfinite(t_mse):
             t_terms = int(t_details.get("n_nonzero", 2) or 2)
-            candidate_formulas.insert(0, {
-                "formula": t_formula,
-                "mse": t_mse,
-                "score": t_mse,
-                "n_nonzero": t_terms,
-                "active_terms": list(t_details.get("basis_names") or [t_formula]),
-                "from_multivar_template": True,
-                "template_match": t_details.get("template_match"),
-            })
+            candidate_formulas.insert(
+                0,
+                {
+                    "formula": t_formula,
+                    "mse": t_mse,
+                    "score": t_mse,
+                    "n_nonzero": t_terms,
+                    "active_terms": list(t_details.get("basis_names") or [t_formula]),
+                    "from_multivar_template": True,
+                    "template_match": t_details.get("template_match"),
+                },
+            )
             template_seed_meta = {
                 "template_match": t_details.get("template_match"),
                 "mse": t_mse,
@@ -2710,57 +2927,71 @@ def fast_path_regression(
                 "selected_as_winner": False,
             }
             # Compete with basis winner under multi-var parsimony (no hard auto-win).
-            basis_score = mse + (2e-2 if x.ndim == 2 and x.shape[1] > 1 else 1e-4) * max(0, n_nonzero - 4)
+            basis_score = mse + (
+                2e-2 if x.ndim == 2 and x.shape[1] > 1 else 1e-4
+            ) * max(0, n_nonzero - 4)
             if x.ndim == 2 and x.shape[1] > 1 and n_nonzero > 8:
                 basis_score += 0.05 * (n_nonzero - 8) ** 2
-            tmpl_score = t_mse + (2e-2 if x.ndim == 2 and x.shape[1] > 1 else 1e-4) * max(0, t_terms - 4)
+            tmpl_score = t_mse + (
+                2e-2 if x.ndim == 2 and x.shape[1] > 1 else 1e-4
+            ) * max(0, t_terms - 4)
             if tmpl_score < basis_score * 0.98:
                 formula = t_formula
                 mse = t_mse
                 n_nonzero = t_terms
-                exact_match_flag = bool(t_details.get("exact_match", t_mse < exact_accept_tol))
+                exact_match_flag = bool(
+                    t_details.get("exact_match", t_mse < exact_accept_tol)
+                )
                 template_seed_meta["selected_as_winner"] = True
 
-    return formula, mse, {
-        'coefficients': coeffs,
-        'basis_names': names,
-        'n_nonzero': n_nonzero,
-        'exact_match': exact_match_flag,
-        'compact_multivariate_basis': bool(
-            x.ndim == 2 and x.shape[1] > 1 and (len(names) <= 80 or n_nonzero <= 8)
-        ),
-        'y_variance': y_variance,
-        'exact_match_diagnostics': exact_match_diagnostics,
-        'candidate_formulas': candidate_formulas,
-        'holdout_mse': best_candidate.get('holdout_mse') if holdout_mask is not None else None,
-        'candidate_governor': best_candidate.get('governor'),
-        'candidate_semantic_dedup': semantic_dedup,
-        'decomposition_probe_candidates': decomposition_candidates,
-        'solver_backends': solver_backends,
-        'winning_solver_backend': best_candidate.get('solver_backend'),
-        'multivar_template_seed': template_seed_meta,
-    }
+    return (
+        formula,
+        mse,
+        {
+            "coefficients": coeffs,
+            "basis_names": names,
+            "n_nonzero": n_nonzero,
+            "exact_match": exact_match_flag,
+            "compact_multivariate_basis": bool(
+                x.ndim == 2 and x.shape[1] > 1 and (len(names) <= 80 or n_nonzero <= 8)
+            ),
+            "y_variance": y_variance,
+            "exact_match_diagnostics": exact_match_diagnostics,
+            "candidate_formulas": candidate_formulas,
+            "holdout_mse": best_candidate.get("holdout_mse")
+            if holdout_mask is not None
+            else None,
+            "candidate_governor": best_candidate.get("governor"),
+            "candidate_semantic_dedup": semantic_dedup,
+            "decomposition_probe_candidates": decomposition_candidates,
+            "solver_backends": solver_backends,
+            "winning_solver_backend": best_candidate.get("solver_backend"),
+            "multivar_template_seed": template_seed_meta,
+        },
+    )
 
 
 def refine_frequencies(
     x: np.ndarray,
     y: np.ndarray,
-    initial_omegas: List[float],
+    initial_omegas: list[float],
     n_steps: int = 100,
     lr: float = 0.1,
-    device: Optional[str] = None,
-    sample_weight: Optional[np.ndarray] = None,
-) -> Tuple[List[float], float]:
+    device: str | None = None,
+    sample_weight: np.ndarray | None = None,
+) -> tuple[list[float], float]:
     """
     Refine frequency parameters using gradient descent.
-    
+
     This handles cases like ω=3.2 where FFT might detect 3.13.
     Optional sample_weight enables WLS / weighted MSE (S5-9).
     """
     _core, reason = _load_cpp_core()
     if _core is None or not hasattr(_core, "refine_frequencies"):
-        raise ImportError(reason or "C++ _core extension does not provide refine_frequencies")
-    
+        raise ImportError(
+            reason or "C++ _core extension does not provide refine_frequencies"
+        )
+
     x_np = np.asarray(x, dtype=np.float64).flatten()
     y_np = np.asarray(y, dtype=np.float64).flatten()
     if sample_weight is not None:
@@ -2772,34 +3003,52 @@ def refine_frequencies(
 def refine_periodic_rational(
     x: np.ndarray,
     y: np.ndarray,
-    omega_inits: List[float],
-    c_inits: List[float],
+    omega_inits: list[float],
+    c_inits: list[float],
     steps: int = 200,
     lr: float = 0.05,
-    device: Optional[str] = None,
-) -> Optional[Dict]:
+    device: str | None = None,
+) -> dict | None:
     """
     Continuous refinement for terms like sin(ωx)/(x^2+c).
     Fits omega and c (positive) with linear coefficients.
     """
-    import torch
     import math
+
+    import torch
+
     resolved_device = _resolve_device(device)
     x_t = torch.tensor(x, dtype=torch.float64, device=resolved_device)
     y_t = torch.tensor(y, dtype=torch.float64, device=resolved_device)
 
     best = None
-    best_mse = float('inf')
+    best_mse = float("inf")
 
     for omega0 in omega_inits:
         for c0 in c_inits:
             # Parameters
-            omega = torch.nn.Parameter(torch.tensor(float(omega0), dtype=torch.float64, device=resolved_device))
-            c_unconstrained = torch.nn.Parameter(torch.tensor(math.log(math.exp(c0) - 1 + 1e-6), dtype=torch.float64, device=resolved_device))
-            a = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float64, device=resolved_device))
-            b = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float64, device=resolved_device))
-            d = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float64, device=resolved_device))
-            e = torch.nn.Parameter(torch.tensor(0.0, dtype=torch.float64, device=resolved_device))
+            omega = torch.nn.Parameter(
+                torch.tensor(float(omega0), dtype=torch.float64, device=resolved_device)
+            )
+            c_unconstrained = torch.nn.Parameter(
+                torch.tensor(
+                    math.log(math.exp(c0) - 1 + 1e-6),
+                    dtype=torch.float64,
+                    device=resolved_device,
+                )
+            )
+            a = torch.nn.Parameter(
+                torch.tensor(0.0, dtype=torch.float64, device=resolved_device)
+            )
+            b = torch.nn.Parameter(
+                torch.tensor(0.0, dtype=torch.float64, device=resolved_device)
+            )
+            d = torch.nn.Parameter(
+                torch.tensor(0.0, dtype=torch.float64, device=resolved_device)
+            )
+            e = torch.nn.Parameter(
+                torch.tensor(0.0, dtype=torch.float64, device=resolved_device)
+            )
 
             params = [omega, c_unconstrained, a, b, d, e]
             opt = torch.optim.Adam(params, lr=lr)
@@ -2809,9 +3058,10 @@ def refine_periodic_rational(
                 c = torch.nn.functional.softplus(c_unconstrained) + 1e-6
                 denom = x_t**2 + c
                 pred = (
-                    a * torch.sin(omega * x_t) / denom +
-                    b * torch.cos(omega * x_t) / denom +
-                    d * x_t + e
+                    a * torch.sin(omega * x_t) / denom
+                    + b * torch.cos(omega * x_t) / denom
+                    + d * x_t
+                    + e
                 )
                 loss = torch.mean((pred - y_t) ** 2)
                 loss.backward()
@@ -2819,25 +3069,39 @@ def refine_periodic_rational(
 
             # Recompute MSE with final parameters
             pred = (
-                a * torch.sin(omega * x_t) / (x_t**2 + torch.nn.functional.softplus(c_unconstrained) + 1e-6) +
-                b * torch.cos(omega * x_t) / (x_t**2 + torch.nn.functional.softplus(c_unconstrained) + 1e-6) +
-                d * x_t + e
+                a
+                * torch.sin(omega * x_t)
+                / (x_t**2 + torch.nn.functional.softplus(c_unconstrained) + 1e-6)
+                + b
+                * torch.cos(omega * x_t)
+                / (x_t**2 + torch.nn.functional.softplus(c_unconstrained) + 1e-6)
+                + d * x_t
+                + e
             )
             mse = float(torch.mean((pred - y_t) ** 2).item())
             if mse < best_mse:
                 best_mse = mse
                 c_val = float(torch.nn.functional.softplus(c_unconstrained).item())
                 omega_val = float(omega.item())
-                coeffs = (float(a.item()), float(b.item()), float(d.item()), float(e.item()))
+                coeffs = (
+                    float(a.item()),
+                    float(b.item()),
+                    float(d.item()),
+                    float(e.item()),
+                )
 
                 # Build formula
                 terms = []
                 a_c, b_c, d_c, e_c = coeffs
                 denom_str = f"(x^2+{c_val:.4g})"
                 if abs(a_c) > 1e-8:
-                    terms.append(f"{get_constant_symbol(a_c, 0.05)}*sin({omega_val:.3g}*x)/{denom_str}")
+                    terms.append(
+                        f"{get_constant_symbol(a_c, 0.05)}*sin({omega_val:.3g}*x)/{denom_str}"
+                    )
                 if abs(b_c) > 1e-8:
-                    terms.append(f"{get_constant_symbol(b_c, 0.05)}*cos({omega_val:.3g}*x)/{denom_str}")
+                    terms.append(
+                        f"{get_constant_symbol(b_c, 0.05)}*cos({omega_val:.3g}*x)/{denom_str}"
+                    )
                 if abs(d_c) > 1e-8:
                     terms.append(f"{get_constant_symbol(d_c, 0.05)}*x")
                 if abs(e_c) > 1e-8:
@@ -2846,19 +3110,21 @@ def refine_periodic_rational(
                 formula = _join_formula_terms(terms)
 
                 best = {
-                    'formula': formula,
-                    'mse': mse,
-                    'details': {
-                        'coefficients': np.array([a_c, b_c, d_c, e_c]),
-                        'basis_names': [
+                    "formula": formula,
+                    "mse": mse,
+                    "details": {
+                        "coefficients": np.array([a_c, b_c, d_c, e_c]),
+                        "basis_names": [
                             f"sin({omega_val:.3g}*x)/(x^2+{c_val:.4g})",
                             f"cos({omega_val:.3g}*x)/(x^2+{c_val:.4g})",
                             "x",
                             "1",
                         ],
-                        'n_nonzero': sum(1 for v in [a_c, b_c, d_c, e_c] if abs(v) > 1e-8),
-                        'exact_match': mse < 1e-6,
-                    }
+                        "n_nonzero": sum(
+                            1 for v in [a_c, b_c, d_c, e_c] if abs(v) > 1e-8
+                        ),
+                        "exact_match": mse < 1e-6,
+                    },
                 }
 
     return best
@@ -2867,12 +3133,12 @@ def refine_periodic_rational(
 def refine_powers(
     x: np.ndarray,
     y: np.ndarray,
-    initial_powers: Optional[List[float]] = None,
-    detected_omegas: Optional[List[float]] = None,
+    initial_powers: list[float] | None = None,
+    detected_omegas: list[float] | None = None,
     n_steps: int = 200,
     lr: float = 0.05,
-    device: Optional[str] = None,
-) -> Tuple[Optional[Dict], float]:
+    device: str | None = None,
+) -> tuple[dict | None, float]:
     """
     Refine power exponent parameters using Eigen VarPro.
 
@@ -2894,7 +3160,9 @@ def refine_powers(
     """
     _core, reason = _load_cpp_core()
     if _core is None or not hasattr(_core, "refine_powers"):
-        raise ImportError(reason or "C++ _core extension does not provide refine_powers")
+        raise ImportError(
+            reason or "C++ _core extension does not provide refine_powers"
+        )
 
     # Ensure 1D inputs
     if x.ndim > 1:
@@ -2908,41 +3176,46 @@ def refine_powers(
     # Filter out x <= 0 for safe power operations
     valid_mask = np.abs(x) > 1e-8
     if valid_mask.sum() < 10:
-        return None, float('inf')
+        return None, float("inf")
     x_valid = np.asarray(x[valid_mask], dtype=np.float64)
     y_valid = np.asarray(y[valid_mask], dtype=np.float64)
 
     best_result = None
-    best_mse = float('inf')
+    best_mse = float("inf")
 
     # Stage 1: Fit powers (and initial omegas if provided)
     stage1_models = []
-    
+
     def _train_power_model(powers_subset):
-        res, mse = _core.refine_powers(x_valid, y_valid, powers_subset, detected_omegas or [], n_steps, lr)
+        res, mse = _core.refine_powers(
+            x_valid, y_valid, powers_subset, detected_omegas or [], n_steps, lr
+        )
         return mse, res, powers_subset
 
     import concurrent.futures
     import multiprocessing
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, multiprocessing.cpu_count())) as executor:
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(8, multiprocessing.cpu_count())
+    ) as executor:
         futures = []
         for n_powers in range(1, min(4, len(initial_powers) + 1)):
             for start_idx in range(max(1, len(initial_powers) - n_powers + 1)):
-                powers_subset = initial_powers[start_idx:start_idx + n_powers]
+                powers_subset = initial_powers[start_idx : start_idx + n_powers]
                 futures.append(executor.submit(_train_power_model, powers_subset))
         for f in concurrent.futures.as_completed(futures):
             stage1_models.append(f.result())
-    
+
     # Sort by MSE and pick best Stage 1 model
     stage1_models.sort(key=lambda x: x[0])
     best_stage1_mse, best_stage1_res, best_powers = stage1_models[0]
-    
+
     final_res = best_stage1_res
     final_mse = best_stage1_mse
     current_omegas = detected_omegas or []
-    
+
     from glassbox.evolution import detect_dominant_frequency
-    
+
     # Check residuals for hidden frequencies
     # We must construct pred_stage1 to get residuals
     # model: c0 + c1*x + sum p_i + sum w_i
@@ -2955,15 +3228,15 @@ def refine_powers(
         abs_pow = np.power(abs_x, p)
         term = (1.0 - is_even) * (sign_x * abs_pow) + is_even * abs_pow
         pred_stage1 += final_res["coeffs"][i] * term
-        
+
     for i, w in enumerate(current_omegas):
-        if 2*i+1 < len(final_res["periodic_coeffs"]):
-            pred_stage1 += final_res["periodic_coeffs"][2*i] * np.sin(w * x_valid)
-            pred_stage1 += final_res["periodic_coeffs"][2*i+1] * np.cos(w * x_valid)
-            
+        if 2 * i + 1 < len(final_res["periodic_coeffs"]):
+            pred_stage1 += final_res["periodic_coeffs"][2 * i] * np.sin(w * x_valid)
+            pred_stage1 += final_res["periodic_coeffs"][2 * i + 1] * np.cos(w * x_valid)
+
     residuals = y_valid - pred_stage1
     res_omegas = detect_dominant_frequency(x_valid, residuals, n_frequencies=2)
-    
+
     new_omegas = []
     for o in res_omegas:
         if o < 0.1:
@@ -2971,10 +3244,12 @@ def refine_powers(
         if any(abs(o - eo) < 0.2 for eo in current_omegas):
             continue
         new_omegas.append(o)
-    
+
     if new_omegas:
         combined_omegas = current_omegas + new_omegas
-        res2, mse2 = _core.refine_powers(x_valid, y_valid, best_powers, combined_omegas, n_steps, lr)
+        res2, mse2 = _core.refine_powers(
+            x_valid, y_valid, best_powers, combined_omegas, n_steps, lr
+        )
         if mse2 < final_mse:
             final_res = res2
             final_mse = mse2
@@ -2994,33 +3269,33 @@ def refine_powers(
     for p, c in zip(refined_powers, refined_coeffs):
         if abs(c) < 1e-3:
             continue
-        
+
         p_snapped = _snap_power(p)
-        
-        if p_snapped == '1':
+
+        if p_snapped == "1":
             c += linear_val
             linear_val = 0.0
-            
+
         coef_str = get_constant_symbol(c, 0.05)
-        if p_snapped == '1':
+        if p_snapped == "1":
             terms.append(f"{coef_str}*x")
         else:
             terms.append(f"{coef_str}*x^{p_snapped}")
-    
+
     # Periodic terms
     if per_coeffs and current_omegas:
         for i, omega in enumerate(current_omegas):
-            if 2*i+1 < len(per_coeffs):
-                sin_c = per_coeffs[2*i]
-                cos_c = per_coeffs[2*i+1]
-                
+            if 2 * i + 1 < len(per_coeffs):
+                sin_c = per_coeffs[2 * i]
+                cos_c = per_coeffs[2 * i + 1]
+
                 if abs(sin_c) > 1e-3:
                     sym = get_constant_symbol(sin_c, 0.05)
                     terms.append(f"{sym}*sin({omega:.3g}*x)")
                 if abs(cos_c) > 1e-3:
                     sym = get_constant_symbol(cos_c, 0.05)
                     terms.append(f"{sym}*cos({omega:.3g}*x)")
-    
+
     if abs(linear_val) > 1e-3:
         terms.append(f"{get_constant_symbol(linear_val, 0.05)}*x")
     if abs(const_val) > 1e-3:
@@ -3029,10 +3304,10 @@ def refine_powers(
     formula = _join_formula_terms(terms)
 
     best_result = {
-        'formula': formula,
-        'powers': refined_powers,
-        'coefficients': refined_coeffs,
-        'mse': best_mse,
+        "formula": formula,
+        "powers": refined_powers,
+        "coefficients": refined_coeffs,
+        "mse": best_mse,
     }
 
     return best_result, best_mse
@@ -3044,9 +3319,20 @@ def _snap_power(p: float, tol: float = 0.08) -> str:
     if abs(p - round(p)) < tol:
         return str(int(round(p)))
     # Common fractions
-    fractions = {0.5: '0.5', 1.5: '1.5', 2.5: '2.5', 3.5: '3.5',
-                 1/3: '1/3', 2/3: '2/3', 4/3: '4/3', 5/3: '5/3',
-                 0.25: '0.25', 0.75: '0.75', 1.25: '1.25', 1.75: '1.75'}
+    fractions = {
+        0.5: "0.5",
+        1.5: "1.5",
+        2.5: "2.5",
+        3.5: "3.5",
+        1 / 3: "1/3",
+        2 / 3: "2/3",
+        4 / 3: "4/3",
+        5 / 3: "5/3",
+        0.25: "0.25",
+        0.75: "0.75",
+        1.25: "1.25",
+        1.75: "1.75",
+    }
     for frac_val, frac_str in fractions.items():
         if abs(p - frac_val) < tol:
             return frac_str
@@ -3056,10 +3342,10 @@ def _snap_power(p: float, tol: float = 0.08) -> str:
 def refine_constants(
     x: np.ndarray,
     y: np.ndarray,
-    detected_omegas: Optional[List[float]] = None,
-    predictions: Optional[Dict[str, float]] = None,
-    device: Optional[str] = None,
-) -> Dict:
+    detected_omegas: list[float] | None = None,
+    predictions: dict[str, float] | None = None,
+    device: str | None = None,
+) -> dict:
     """
     Unified constant refinement: runs both ω and p gradient refinement.
 
@@ -3070,7 +3356,7 @@ def refine_constants(
     # 1. Frequency refinement (if periodic detected)
     has_periodic = False
     if predictions:
-        for key in ['sin', 'cos', 'periodic']:
+        for key in ["sin", "cos", "periodic"]:
             if predictions.get(key, 0) > 0.3:
                 has_periodic = True
                 break
@@ -3080,9 +3366,9 @@ def refine_constants(
             refined_omegas, freq_mse = refine_frequencies(
                 x, y, detected_omegas, n_steps=150, device=device
             )
-            results['frequency'] = {
-                'omegas': refined_omegas,
-                'mse': freq_mse,
+            results["frequency"] = {
+                "omegas": refined_omegas,
+                "mse": freq_mse,
             }
         except ImportError:
             pass
@@ -3090,7 +3376,7 @@ def refine_constants(
     # 2. Power refinement (if power predicted)
     has_power = False
     if predictions:
-        if predictions.get('power', 0) > 0.3 or predictions.get('polynomial', 0) > 0.3:
+        if predictions.get("power", 0) > 0.3 or predictions.get("polynomial", 0) > 0.3:
             has_power = True
 
     if has_power:
@@ -3099,7 +3385,7 @@ def refine_constants(
                 x, y, detected_omegas=detected_omegas, device=device
             )
             if power_result is not None:
-                results['power'] = power_result
+                results["power"] = power_result
         except ImportError:
             pass
 
@@ -3109,12 +3395,12 @@ def refine_constants(
 def fast_path_with_refinement(
     x: np.ndarray,
     y: np.ndarray,
-    predictions: Dict[str, float],
-    detected_omegas: Optional[List[float]] = None,
+    predictions: dict[str, float],
+    detected_omegas: list[float] | None = None,
     refine_steps: int = 100,
-    op_constraints: Optional[Dict[str, bool]] = None,
+    op_constraints: dict[str, bool] | None = None,
     auto_expand: bool = True,
-    device: Optional[str] = None,
+    device: str | None = None,
     exact_match_threads: int = 1,
     exact_match_enabled: bool = True,
     exact_match_max_basis: int = 150,
@@ -3123,10 +3409,10 @@ def fast_path_with_refinement(
     exact_match_min_gpu_work: int = DEFAULT_EXACT_MATCH_MIN_GPU_WORK,
     exact_match_max_combos: int = DEFAULT_EXACT_MATCH_MAX_COMBOS,
     noise_level: float = 0.0,
-) -> Tuple[str, float, Dict]:
+) -> tuple[str, float, dict]:
     """
     Fast-path with optional frequency refinement.
-    
+
     1. Run initial fast-path regression
     2. If MSE is moderate (0.01-0.5), try frequency refinement
     3. Re-run regression with refined frequencies
@@ -3135,19 +3421,19 @@ def fast_path_with_refinement(
     # Stage 2: Optional universal basis expansion when auto_expand is enabled.
     stage_order = [False, True] if auto_expand else [False]
     best_formula = None
-    best_mse = float('inf')
-    best_details: Dict = {}
+    best_mse = float("inf")
+    best_details: dict = {}
     best_universal = True
     n_vars_score = int(x.shape[1]) if getattr(x, "ndim", 1) == 2 else 1
     # Multi-var: much stronger parsimony so kitchen-sink LASSO cannot win on R2 alone.
     complexity_lambda = 2e-2 if n_vars_score > 1 else 1e-4
     max_terms_soft = 8 if n_vars_score > 1 else 12
 
-    def should_accept_candidate(new_mse: float, new_details: Dict) -> bool:
+    def should_accept_candidate(new_mse: float, new_details: dict) -> bool:
         """Guardrail: avoid accepting large MSE regressions for small complexity gains."""
 
-        new_terms = new_details.get('n_nonzero', 0)
-        old_terms = best_details.get('n_nonzero', 0)
+        new_terms = new_details.get("n_nonzero", 0)
+        old_terms = best_details.get("n_nonzero", 0)
 
         # If current fit is already very good, do not accept major relative regressions
         # unless we cross into a materially simpler symbolic regime.
@@ -3155,10 +3441,12 @@ def fast_path_with_refinement(
             if not (new_mse < 1e-6 and new_terms <= 5 and old_terms > 5):
                 return False
 
-        return candidate_score(new_mse, new_details) < candidate_score(best_mse, best_details)
+        return candidate_score(new_mse, new_details) < candidate_score(
+            best_mse, best_details
+        )
 
-    def candidate_score(mse_val: float, details_val: Dict) -> float:
-        n_val = int(details_val.get('n_nonzero', 0) or 0)
+    def candidate_score(mse_val: float, details_val: dict) -> float:
+        n_val = int(details_val.get("n_nonzero", 0) or 0)
         score = mse_val + complexity_lambda * max(0, n_val - 4)
         if n_vars_score > 1 and n_val > max_terms_soft:
             score += 0.05 * (n_val - max_terms_soft) ** 2
@@ -3169,7 +3457,10 @@ def fast_path_with_refinement(
 
     for use_universal in stage_order:
         formula, mse, details = fast_path_regression(
-            x, y, predictions, detected_omegas,
+            x,
+            y,
+            predictions,
+            detected_omegas,
             op_constraints=op_constraints,
             universal_basis=use_universal,
             exact_match_threads=exact_match_threads,
@@ -3189,21 +3480,26 @@ def fast_path_with_refinement(
             best_universal = use_universal
 
         # If exact match or good enough AND simple, return immediately
-        n_current = details.get('n_nonzero', 0)
-        is_exact = details.get('exact_match', False)
+        n_current = details.get("n_nonzero", 0)
+        is_exact = details.get("exact_match", False)
         if (is_exact or mse < 1e-6) and n_current <= 4:
             return formula, mse, details
 
     # If good enough and exact AND simple, return best
-    n_best = best_details.get('n_nonzero', 0)
-    if best_mse < 0.01 and best_details.get('exact_match', False) and best_formula is not None and n_best <= 4:
+    n_best = best_details.get("n_nonzero", 0)
+    if (
+        best_mse < 0.01
+        and best_details.get("exact_match", False)
+        and best_formula is not None
+        and n_best <= 4
+    ):
         return best_formula, best_mse, best_details
-    
+
     # If moderate MSE and periodic terms were used, try refinement
     has_periodic_signal = (
-        predictions.get('periodic', 0.0) >= 0.5 or
-        predictions.get('sin', 0.0) >= 0.5 or
-        predictions.get('cos', 0.0) >= 0.5
+        predictions.get("periodic", 0.0) >= 0.5
+        or predictions.get("sin", 0.0) >= 0.5
+        or predictions.get("cos", 0.0) >= 0.5
     )
     is_univariate_input = x.ndim == 1 or (x.ndim == 2 and x.shape[1] == 1)
     should_try_freq = (
@@ -3221,7 +3517,7 @@ def fast_path_with_refinement(
             )
         except Exception as err:
             print(f"  [Frequency refinement skipped: {err}]")
-            refined_omegas, refined_mse = [], float('inf')
+            refined_omegas, refined_mse = [], float("inf")
 
         if refined_omegas:
             print(f"  Refined frequencies: {[f'{o:.3f}' for o in refined_omegas]}")
@@ -3230,7 +3526,10 @@ def fast_path_with_refinement(
             # Re-run regression with refined omegas
             if refined_mse < best_mse:
                 formula2, mse2, details2 = fast_path_regression(
-                    x, y, predictions, detected_omegas=refined_omegas,
+                    x,
+                    y,
+                    predictions,
+                    detected_omegas=refined_omegas,
                     op_constraints=op_constraints,
                     universal_basis=best_universal,
                     exact_match_threads=exact_match_threads,
@@ -3244,15 +3543,20 @@ def fast_path_with_refinement(
                 )
                 if should_accept_candidate(mse2, details2):
                     return formula2, mse2, details2
-    
+
     # Additional continuous refinement for periodic×rational terms
     if op_constraints:
-        allow_periodic = op_constraints.get('periodic', True)
-        allow_power = op_constraints.get('power', True)
+        allow_periodic = op_constraints.get("periodic", True)
+        allow_power = op_constraints.get("power", True)
     else:
         allow_periodic = allow_power = True
 
-    if (x.ndim == 1 or (x.ndim == 2 and x.shape[1] == 1)) and allow_periodic and allow_power and best_mse > 5e-3:
+    if (
+        (x.ndim == 1 or (x.ndim == 2 and x.shape[1] == 1))
+        and allow_periodic
+        and allow_power
+        and best_mse > 5e-3
+    ):
         # Only trigger refinement for genuinely poor fits (MSE > 5e-3).
         # Previously 1e-4, which caused ~12s of wasted refinement on moderate fits.
         omega_pool = (detected_omegas or []) + [1.0, 2.0, 3.0]
@@ -3263,7 +3567,8 @@ def fast_path_with_refinement(
                 omega_inits.append(o)
 
         refined = refine_periodic_rational(
-            x, y,
+            x,
+            y,
             omega_inits=omega_inits,
             c_inits=[0.5, 1.0],
             steps=100,
@@ -3272,19 +3577,24 @@ def fast_path_with_refinement(
         )
         if refined:
             print(f"  Periodic×Rational refinement MSE: {refined['mse']:.6f}")
-            refined_details = refined.get('details', {})
-            if should_accept_candidate(refined['mse'], refined_details):
-                return refined['formula'], refined['mse'], refined_details
+            refined_details = refined.get("details", {})
+            if should_accept_candidate(refined["mse"], refined_details):
+                return refined["formula"], refined["mse"], refined_details
 
     # Complexity check
-    n_terms = best_details.get('n_nonzero', 0)
+    n_terms = best_details.get("n_nonzero", 0)
     # Power exponent refinement for non-integer powers
     # Trigger if MSE is moderate OR if formula is complex (likely overfitted)
     has_power_signal = (
-        predictions.get('power', 0.0) >= 0.4 or
-        predictions.get('polynomial', 0.0) >= 0.4
+        predictions.get("power", 0.0) >= 0.4
+        or predictions.get("polynomial", 0.0) >= 0.4
     )
-    should_try_power = (x.ndim == 1 or (x.ndim == 2 and x.shape[1] == 1)) and allow_power and has_power_signal and (1e-3 <= best_mse <= 0.2 or n_terms > 8)
+    should_try_power = (
+        (x.ndim == 1 or (x.ndim == 2 and x.shape[1] == 1))
+        and allow_power
+        and has_power_signal
+        and (1e-3 <= best_mse <= 0.2 or n_terms > 8)
+    )
 
     if should_try_power:
         print(f"  Attempting power refinement (MSE={best_mse:.4f}, Terms={n_terms})...")
@@ -3294,40 +3604,48 @@ def fast_path_with_refinement(
             )
         except Exception as err:
             print(f"  [Power refinement skipped: {err}]")
-            power_result, power_mse = None, float('inf')
-        
+            power_result, power_mse = None, float("inf")
+
         if power_result is not None:
             # Acceptance logic:
             # 1. Much better MSE (classic case)
             # 2. Good MSE (< 1e-3) and Much Simpler (prevent overfitting)
-            
+
             is_better_mse = power_mse < best_mse - 1e-4
-            is_good_and_simpler = (power_mse < 1e-3) and (len(power_result['powers']) + 2 < n_terms)
-            
+            is_good_and_simpler = (power_mse < 1e-3) and (
+                len(power_result["powers"]) + 2 < n_terms
+            )
+
             if is_better_mse or is_good_and_simpler:
-                print(f"  Power refinement SUCCESS (MSE: {power_mse:.6f}, Terms: {len(power_result['powers'])})")
+                print(
+                    f"  Power refinement SUCCESS (MSE: {power_mse:.6f}, Terms: {len(power_result['powers'])})"
+                )
                 print(f"  Power formula: {power_result['formula']}")
                 power_details = {
-                    'coefficients': np.array(power_result['coefficients']),
-                    'basis_names': [f"x^{_snap_power(p)}" for p in power_result['powers']],
-                    'n_nonzero': sum(1 for c in power_result['coefficients'] if abs(c) > 1e-8),
-                    'exact_match': power_mse < 1e-6,
+                    "coefficients": np.array(power_result["coefficients"]),
+                    "basis_names": [
+                        f"x^{_snap_power(p)}" for p in power_result["powers"]
+                    ],
+                    "n_nonzero": sum(
+                        1 for c in power_result["coefficients"] if abs(c) > 1e-8
+                    ),
+                    "exact_match": power_mse < 1e-6,
                 }
                 if should_accept_candidate(power_mse, power_details):
-                    return power_result['formula'], power_mse, power_details
+                    return power_result["formula"], power_mse, power_details
 
     return best_formula, best_mse, best_details
 
 
 def should_use_fast_path(
-    predictions: Dict[str, float],
+    predictions: dict[str, float],
     confidence_threshold: float = 0.6,  # Lowered from 0.8 to allow more fast-path usage
     min_operators: int = 1,
     universal_basis: bool = True,
 ) -> bool:
     """
     Decide whether to use fast path based on classifier confidence.
-    
+
     Fast path is used when:
     1. At least one operator predicted with high confidence
     2. The predicted operators are well-covered by our basis
@@ -3340,15 +3658,17 @@ def should_use_fast_path(
         return True
 
     # Get high-confidence predictions
-    high_conf = [name for name, prob in predictions.items() if prob >= confidence_threshold]
-    
+    high_conf = [
+        name for name, prob in predictions.items() if prob >= confidence_threshold
+    ]
+
     # Check if we have enough operators predicted
     if len(high_conf) < min_operators:
         return False
-    
+
     # Check for unsupported operations that would need evolution
     # (Currently none, but could add later)
-    
+
     # Fast path supported
     return True
 
@@ -3357,10 +3677,10 @@ def run_fast_path(
     x: torch.Tensor,
     y: torch.Tensor,
     classifier_path: str = DEFAULT_CURVE_CLASSIFIER_PATH,
-    detected_omegas: Optional[List[float]] = None,
-    op_constraints: Optional[Dict[str, bool]] = None,
+    detected_omegas: list[float] | None = None,
+    op_constraints: dict[str, bool] | None = None,
     auto_expand: bool = True,
-    device: Optional[str] = None,
+    device: str | None = None,
     exact_match_threads: int = 1,
     exact_match_enabled: bool = True,
     exact_match_max_basis: int = 150,
@@ -3373,17 +3693,20 @@ def run_fast_path(
     exact_match_min_gpu_work: int = DEFAULT_EXACT_MATCH_MIN_GPU_WORK,
     exact_match_max_combos: int = DEFAULT_EXACT_MATCH_MAX_COMBOS,
     noise_level: float = 0.0,
-) -> Optional[Dict]:
+) -> dict | None:
     """
     Run the complete fast-path pipeline.
-    
+
     Returns:
         Dict with formula, mse, and timing if successful
         None if fast path not applicable
     """
     import time
+
     try:
-        from glassbox.curve_classifier.curve_classifier_integration import predict_operators
+        from glassbox.curve_classifier.curve_classifier_integration import (
+            predict_operators,
+        )
     except ImportError:
         try:
             from curve_classifier_integration import predict_operators
@@ -3394,28 +3717,33 @@ def run_fast_path(
                 # Last resort: try to find it in the new package relative to root
                 try:
                     import glassbox.curve_classifier.curve_classifier_integration as cci
+
                     predict_operators = cci.predict_operators
                 except ImportError:
-                    print("Warning: predict_operators not found. Fast path will be limited.")
-                    def predict_operators(*args, **kwargs): return {}
-    
+                    print(
+                        "Warning: predict_operators not found. Fast path will be limited."
+                    )
+
+                    def predict_operators(*args, **kwargs):
+                        return {}
+
     start_time = time.time()
-    
+
     # Convert to numpy
-    if hasattr(x, 'cpu'):
+    if hasattr(x, "cpu"):
         x_np = x.cpu().numpy()
     else:
         x_np = x
-    if hasattr(y, 'cpu'):
+    if hasattr(y, "cpu"):
         y_np = y.cpu().numpy().flatten()
     else:
         y_np = y.flatten()
-    
+
     # Get classifier predictions
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("FAST PATH: Classifier-Guided Regression")
-    print("="*60)
-    
+    print("=" * 60)
+
     # Early return for constant signals (e.g. y=5, sin²+cos²=1)
     y_std = np.std(y_np)
     if y_std < 1e-10:
@@ -3429,56 +3757,69 @@ def run_fast_path(
         print(f"  Constant signal detected: y ≈ {const_val}")
         print(f"  Formula: {formula}")
         print("  MSE: 0.000000")
-        print("="*60)
+        print("=" * 60)
         y_pred = np.full_like(y_np, const_val, dtype=np.float64)
         residual_diagnostics = _residual_diagnostics(y_np, y_pred, x_np)
         result = {
-            'formula': formula,
-            'mse': 0.0,
-            'time': elapsed,
-            'details': {'n_nonzero': 1, 'exact_match': True,
-                        'basis_names': ['1'], 'coefficients': np.array([const_val]),
-                        'candidate_formulas': [{
-                            'formula': formula,
-                            'mse': 0.0,
-                            'score': 0.0,
-                            'n_nonzero': 1,
-                            'active_terms': ['1'],
-                            'alpha': 0.0,
-                        }]},
-            'predictions': {'identity': 1.0},
-            'uncertainty': _prediction_uncertainty_metrics({'identity': 1.0}),
-            'residual_diagnostics': residual_diagnostics,
-            'candidate_formulas': [{
-                'formula': formula,
-                'mse': 0.0,
-                'score': 0.0,
-                'n_nonzero': 1,
-                'active_terms': ['1'],
-                'alpha': 0.0,
-            }],
-            'operator_hints': {'operators': set(), 'frequencies': [],
-                               'powers': [], 'has_rational': False,
-                               'has_exp_decay': False, 'active_terms': ['1']},
+            "formula": formula,
+            "mse": 0.0,
+            "time": elapsed,
+            "details": {
+                "n_nonzero": 1,
+                "exact_match": True,
+                "basis_names": ["1"],
+                "coefficients": np.array([const_val]),
+                "candidate_formulas": [
+                    {
+                        "formula": formula,
+                        "mse": 0.0,
+                        "score": 0.0,
+                        "n_nonzero": 1,
+                        "active_terms": ["1"],
+                        "alpha": 0.0,
+                    }
+                ],
+            },
+            "predictions": {"identity": 1.0},
+            "uncertainty": _prediction_uncertainty_metrics({"identity": 1.0}),
+            "residual_diagnostics": residual_diagnostics,
+            "candidate_formulas": [
+                {
+                    "formula": formula,
+                    "mse": 0.0,
+                    "score": 0.0,
+                    "n_nonzero": 1,
+                    "active_terms": ["1"],
+                    "alpha": 0.0,
+                }
+            ],
+            "operator_hints": {
+                "operators": set(),
+                "frequencies": [],
+                "powers": [],
+                "has_rational": False,
+                "has_exp_decay": False,
+                "active_terms": ["1"],
+            },
         }
         fpip_v2 = build_fpip_v2_from_fast_path(
-            formula=result['formula'],
-            mse=result['mse'],
-            candidate_formulas=result.get('candidate_formulas', []),
-            predictions=result.get('predictions', {}),
-            uncertainty=result.get('uncertainty', {}),
-            residual_diagnostics=result.get('residual_diagnostics', {}),
-            operator_hints=result.get('operator_hints', {}),
+            formula=result["formula"],
+            mse=result["mse"],
+            candidate_formulas=result.get("candidate_formulas", []),
+            predictions=result.get("predictions", {}),
+            uncertainty=result.get("uncertainty", {}),
+            residual_diagnostics=result.get("residual_diagnostics", {}),
+            operator_hints=result.get("operator_hints", {}),
             x=x_np,
             y=y_np,
         )
         fpip_ok, fpip_errors = validate_fpip_v2_payload(fpip_v2)
-        result['fpip_v2'] = fpip_v2
-        result['fpip_v2_valid'] = fpip_ok
+        result["fpip_v2"] = fpip_v2
+        result["fpip_v2_valid"] = fpip_ok
         if not fpip_ok:
-            result['fpip_v2_errors'] = fpip_errors
+            result["fpip_v2_errors"] = fpip_errors
         return result
-    
+
     predictions = predict_operators(
         x_np,
         y_np,
@@ -3491,11 +3832,13 @@ def run_fast_path(
         # Do not make classifier failure an applicability failure. The fast path
         # uses a universal basis by default, so conservative polynomial priors
         # are enough to attempt regression and let MSE decide.
-        predictions = {'identity': 1.0, 'power': 1.0, 'polynomial': 1.0}
+        predictions = {"identity": 1.0, "power": 1.0, "polynomial": 1.0}
 
     uncertainty_metrics = _prediction_uncertainty_metrics(predictions or {})
-    
-    print(f"  Predictions: {[(k, f'{v:.2f}') for k, v in sorted(predictions.items(), key=lambda x: -x[1])]}")
+
+    print(
+        f"  Predictions: {[(k, f'{v:.2f}') for k, v in sorted(predictions.items(), key=lambda x: -x[1])]}"
+    )
     print(
         "  Uncertainty: "
         f"entropy={uncertainty_metrics['prediction_entropy']}, "
@@ -3513,16 +3856,22 @@ def run_fast_path(
         auto_expand = False
         exact_match_max_basis = min(int(exact_match_max_basis or 150), 120)
         max_power = min(int(max_power), 3)
-        print("  Low-trust multivariate classifier signal; using compact fast-path basis")
-    
+        print(
+            "  Low-trust multivariate classifier signal; using compact fast-path basis"
+        )
+
     # Check if fast path is applicable (lowered threshold to 0.6 for broader coverage)
-    if not should_use_fast_path(predictions, confidence_threshold=0.6, universal_basis=auto_expand):
+    if not should_use_fast_path(
+        predictions, confidence_threshold=0.6, universal_basis=auto_expand
+    ):
         print("  Classifier confidence too low - falling back to evolution")
         return None
-    
+
     # Run fast path regression with optional frequency refinement
     formula, mse, details = fast_path_with_refinement(
-        x_np, y_np, predictions, 
+        x_np,
+        y_np,
+        predictions,
         detected_omegas=detected_omegas,
         refine_steps=150,  # More steps for better refinement
         op_constraints=op_constraints,
@@ -3540,9 +3889,9 @@ def run_fast_path(
 
     raw_formula = formula
     simplification_info = {
-        'applied': False,
-        'snapped_formula': None,
-        'error': None,
+        "applied": False,
+        "snapped_formula": None,
+        "error": None,
     }
 
     if simplify_formula_output and formula:
@@ -3550,22 +3899,38 @@ def run_fast_path(
             print("  [Post] Running simplify_formula pipeline...")
         try:
             try:
-                from simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+                from simplify_formula import (
+                    SnapConfig,
+                    simplify_onn_formula,
+                    snap_formula_floats,
+                )
             except ImportError:
-                from scripts.simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+                from scripts.simplify_formula import (
+                    SnapConfig,
+                    simplify_onn_formula,
+                    snap_formula_floats,
+                )
 
             formula_len = len(formula)
-            term_estimate = max(1, len([t for t in re.split(r'\s*[+-]\s*', formula) if t.strip()]))
+            term_estimate = max(
+                1, len([t for t in re.split(r"\s*[+-]\s*", formula) if t.strip()])
+            )
             too_complex_for_symbolic = formula_len > 500 or term_estimate > 24
 
-            if too_complex_for_symbolic or not simplification_info.get('exact_match', False):
+            if too_complex_for_symbolic or not simplification_info.get(
+                "exact_match", False
+            ):
                 snapped_formula = snap_formula_floats(
                     formula,
-                    SnapConfig(int_tol=simplification_int_tol, zero_tol=simplification_zero_tol),
+                    SnapConfig(
+                        int_tol=simplification_int_tol, zero_tol=simplification_zero_tol
+                    ),
                 )
                 simplified_formula = snapped_formula
                 if simplification_log:
-                    print(f"  [Post] Formula simplified using fast snap-only mode (no symbolic algebra) to bypass SymPy bottleneck.")
+                    print(
+                        "  [Post] Formula simplified using fast snap-only mode (no symbolic algebra) to bypass SymPy bottleneck."
+                    )
             else:
                 snapped_formula, simplified_expr = simplify_onn_formula(
                     formula,
@@ -3584,102 +3949,117 @@ def run_fast_path(
 
             formula = simplified_formula
             simplification_info = {
-                'applied': True,
-                'snapped_formula': snapped_formula,
-                'error': None,
+                "applied": True,
+                "snapped_formula": snapped_formula,
+                "error": None,
             }
         except Exception as simpl_err:
             simplification_info = {
-                'applied': False,
-                'snapped_formula': None,
-                'error': str(simpl_err),
+                "applied": False,
+                "snapped_formula": None,
+                "error": str(simpl_err),
             }
             if simplification_log:
-                err_text = str(simpl_err).encode("ascii", errors="backslashreplace").decode("ascii")
+                err_text = (
+                    str(simpl_err)
+                    .encode("ascii", errors="backslashreplace")
+                    .decode("ascii")
+                )
                 if len(err_text) > 300:
                     err_text = err_text[:297] + "..."
                 print(f"  [Post] Simplification skipped (error): {err_text}")
-    
+
     elapsed = time.time() - start_time
 
     # Keep a post-processed term estimate while preserving structural sparsity count.
-    final_term_count = max(1, len([t for t in re.split(r'\s*[+-]\s*', formula) if t.strip()])) if formula else 0
-    details['n_nonzero_simplified'] = final_term_count
+    final_term_count = (
+        max(1, len([t for t in re.split(r"\s*[+-]\s*", formula) if t.strip()]))
+        if formula
+        else 0
+    )
+    details["n_nonzero_simplified"] = final_term_count
     y_pred = _evaluate_formula_values(formula, x_np)
-    residual_diagnostics = _residual_diagnostics(y_np, y_pred, x_np) if y_pred is not None else _empty_residual_diagnostics()
-    
+    residual_diagnostics = (
+        _residual_diagnostics(y_np, y_pred, x_np)
+        if y_pred is not None
+        else _empty_residual_diagnostics()
+    )
+
     print(f"\n  Formula: {formula}")
     print(f"  MSE: {mse:.6f}")
-    holdout_mse = details.get('holdout_mse')
+    holdout_mse = details.get("holdout_mse")
     if holdout_mse is not None:
         print(f"  Holdout MSE (domain edges): {holdout_mse:.6f}")
     print(f"  Non-zero terms: {details.get('n_nonzero', 0)}")
-    if residual_diagnostics['residual_suspicious']:
+    if residual_diagnostics["residual_suspicious"]:
         print(
             "  Residual diagnostics: suspicious structure "
             f"(fft_peak_ratio={residual_diagnostics['residual_spectral_peak_ratio']}, "
             f"holdout_ratio={residual_diagnostics['residual_holdout_ratio']})"
         )
     print(f"  Time: {elapsed:.2f}s")
-    print("="*60)
-    
+    print("=" * 60)
+
     # Extract operator hints from the formula for guided evolution
-    operator_hints = extract_operator_hints(formula, details.get('basis_names', []),
-                                            details.get('coefficients', []),
-                                            predictions=predictions)    
+    operator_hints = extract_operator_hints(
+        formula,
+        details.get("basis_names", []),
+        details.get("coefficients", []),
+        predictions=predictions,
+    )
     result = {
-        'formula': formula,
-        'formula_raw': raw_formula,
-        'mse': mse,
-        'time': elapsed,
-        'details': details,
-        'predictions': predictions,
-        'uncertainty': uncertainty_metrics,
-        'residual_diagnostics': residual_diagnostics,
-        'candidate_formulas': details.get('candidate_formulas', []),
-        'simplification': simplification_info,
-        'operator_hints': operator_hints,
+        "formula": formula,
+        "formula_raw": raw_formula,
+        "mse": mse,
+        "time": elapsed,
+        "details": details,
+        "predictions": predictions,
+        "uncertainty": uncertainty_metrics,
+        "residual_diagnostics": residual_diagnostics,
+        "candidate_formulas": details.get("candidate_formulas", []),
+        "simplification": simplification_info,
+        "operator_hints": operator_hints,
     }
 
     fpip_v2 = build_fpip_v2_from_fast_path(
-        formula=result['formula'],
-        mse=result['mse'],
-        candidate_formulas=result.get('candidate_formulas', []),
-        predictions=result.get('predictions', {}),
-        uncertainty=result.get('uncertainty', {}),
-        residual_diagnostics=result.get('residual_diagnostics', {}),
-        operator_hints=result.get('operator_hints', {}),
+        formula=result["formula"],
+        mse=result["mse"],
+        candidate_formulas=result.get("candidate_formulas", []),
+        predictions=result.get("predictions", {}),
+        uncertainty=result.get("uncertainty", {}),
+        residual_diagnostics=result.get("residual_diagnostics", {}),
+        operator_hints=result.get("operator_hints", {}),
         x=x_np,
         y=y_np,
     )
     fpip_ok, fpip_errors = validate_fpip_v2_payload(fpip_v2)
-    result['fpip_v2'] = fpip_v2
-    result['fpip_v2_valid'] = fpip_ok
+    result["fpip_v2"] = fpip_v2
+    result["fpip_v2_valid"] = fpip_ok
     if not fpip_ok:
-        result['fpip_v2_errors'] = fpip_errors
+        result["fpip_v2_errors"] = fpip_errors
 
     return result
 
 
 def extract_operator_hints(
     formula: str,
-    basis_names: List[str],
+    basis_names: list[str],
     coefficients: np.ndarray,
     threshold: float = 0.01,
-    predictions: Dict[str, float] = None,
-) -> Dict[str, Any]:
+    predictions: dict[str, float] = None,
+) -> dict[str, Any]:
     """
     Extract operator hints from a fast-path formula for guided evolution.
-    
+
     Analyzes the formula to determine which operators/structures are needed,
     which can be used to initialize a constrained ONN.
-    
+
     Args:
         formula: The discovered formula string
         basis_names: List of basis function names
         coefficients: Array of coefficients (same length as basis_names)
         threshold: Minimum coefficient magnitude to consider active
-        
+
     Returns:
         Dict with operator hints:
         - 'operators': Set of operator types used (sin, cos, exp, log, power, rational)
@@ -3689,113 +4069,117 @@ def extract_operator_hints(
         - 'active_terms': List of active basis term names
     """
     hints = {
-        'operators': set(),
-        'frequencies': [],
-        'powers': [],
-        'has_rational': False,
-        'has_exp_decay': False,
-        'active_terms': [],
+        "operators": set(),
+        "frequencies": [],
+        "powers": [],
+        "has_rational": False,
+        "has_exp_decay": False,
+        "active_terms": [],
     }
-    
+
     if coefficients is None or len(coefficients) == 0:
         return hints
-    
+
     # Find active terms
     for name, coef in zip(basis_names, coefficients):
         if abs(coef) < threshold:
             continue
-        
-        hints['active_terms'].append(name)
-        
+
+        hints["active_terms"].append(name)
+
         # Detect operator types from basis names
         name_lower = name.lower()
-        
+
         # Periodic operators
-        if 'sin(' in name_lower:
-            hints['operators'].add('sin')
-            hints['operators'].add('periodic')
+        if "sin(" in name_lower:
+            hints["operators"].add("sin")
+            hints["operators"].add("periodic")
             # Extract frequency if present (using precompiled pattern)
             freq_match = _FREQ_SIN_PATTERN.search(name_lower)
             if freq_match:
-                hints['frequencies'].append(float(freq_match.group(1)))
-            elif 'sin(x)' in name_lower or 'sin(x/' in name_lower:
-                hints['frequencies'].append(1.0)
-                
-        if 'cos(' in name_lower:
-            hints['operators'].add('cos')
-            hints['operators'].add('periodic')
+                hints["frequencies"].append(float(freq_match.group(1)))
+            elif "sin(x)" in name_lower or "sin(x/" in name_lower:
+                hints["frequencies"].append(1.0)
+
+        if "cos(" in name_lower:
+            hints["operators"].add("cos")
+            hints["operators"].add("periodic")
             freq_match = _FREQ_COS_PATTERN.search(name_lower)
             if freq_match:
-                hints['frequencies'].append(float(freq_match.group(1)))
-        
+                hints["frequencies"].append(float(freq_match.group(1)))
+
         # Power operators
-        if 'x^' in name_lower:
-            hints['operators'].add('power')
+        if "x^" in name_lower:
+            hints["operators"].add("power")
             power_match = _POWER_PATTERN.search(name_lower)
             if power_match:
-                hints['powers'].append(float(power_match.group(1)))
-        
+                hints["powers"].append(float(power_match.group(1)))
+
         # Exponential
-        if 'exp(' in name_lower or 'e^(' in name_lower or 'e^-' in name_lower:
-            hints['operators'].add('exp')
-            if '-' in name_lower:  # e^(-ax)
-                hints['has_exp_decay'] = True
-        
+        if "exp(" in name_lower or "e^(" in name_lower or "e^-" in name_lower:
+            hints["operators"].add("exp")
+            if "-" in name_lower:  # e^(-ax)
+                hints["has_exp_decay"] = True
+
         # Logarithm
-        if 'log(' in name_lower:
-            hints['operators'].add('log')
-        
+        if "log(" in name_lower:
+            hints["operators"].add("log")
+
         # Rational terms
-        if '/(x' in name_lower or '/(' in name_lower:
-            hints['has_rational'] = True
-            hints['operators'].add('rational')
-            hints['operators'].add('power')  # Rational uses power (inv)
-        
+        if "/(x" in name_lower or "/(" in name_lower:
+            hints["has_rational"] = True
+            hints["operators"].add("rational")
+            hints["operators"].add("power")  # Rational uses power (inv)
+
         # Square root
-        if 'sqrt' in name_lower:
-            hints['operators'].add('sqrt')
-            hints['operators'].add('power')
-            hints['powers'].append(0.5)
-    
+        if "sqrt" in name_lower:
+            hints["operators"].add("sqrt")
+            hints["operators"].add("power")
+            hints["powers"].append(0.5)
+
     # Inject raw classifier predictions to ensure evolution priors aren't blinded by poor basis regression
     if predictions:
-        if predictions.get('sin', 0) > 0.3 or predictions.get('cos', 0) > 0.3 or predictions.get('periodic', 0) > 0.3:
-            hints['operators'].add('periodic')
-        if predictions.get('exp', 0) > 0.3 or predictions.get('exponential', 0) > 0.3:
-            hints['operators'].add('exp')
-        if predictions.get('log', 0) > 0.3:
-            hints['operators'].add('log')
-        if predictions.get('rational', 0) > 0.3:
-            hints['operators'].add('rational')
-            hints['operators'].add('power')
-        if predictions.get('power', 0) > 0.3 or predictions.get('polynomial', 0) > 0.3:
-            hints['operators'].add('power')
+        if (
+            predictions.get("sin", 0) > 0.3
+            or predictions.get("cos", 0) > 0.3
+            or predictions.get("periodic", 0) > 0.3
+        ):
+            hints["operators"].add("periodic")
+        if predictions.get("exp", 0) > 0.3 or predictions.get("exponential", 0) > 0.3:
+            hints["operators"].add("exp")
+        if predictions.get("log", 0) > 0.3:
+            hints["operators"].add("log")
+        if predictions.get("rational", 0) > 0.3:
+            hints["operators"].add("rational")
+            hints["operators"].add("power")
+        if predictions.get("power", 0) > 0.3 or predictions.get("polynomial", 0) > 0.3:
+            hints["operators"].add("power")
 
     # Deduplicate frequencies
-    hints['frequencies'] = list(set(hints['frequencies']))
-    hints['powers'] = list(set(hints['powers']))
-    
+    hints["frequencies"] = list(set(hints["frequencies"]))
+    hints["powers"] = list(set(hints["powers"]))
+
     return hints
 
 
 def create_guided_onn_factory(
-    operator_hints: Dict,
+    operator_hints: dict,
     n_inputs: int = 1,
     n_hidden_layers: int = 2,
     nodes_per_layer: int = 4,
 ):
     """
     Create an ONN model factory that is biased toward specific operators.
-    
+
     This allows evolution to start with a population already inclined
     toward the operators identified by the fast-path.
-    
+
     Args:
         operator_hints: Dict from extract_operator_hints()
         n_inputs: Number of input features
         n_hidden_layers: Number of hidden layers
         nodes_per_layer: Nodes per layer
-        
+
     Returns:
         A factory function that creates operator-biased ONNs
     """
@@ -3803,12 +4187,12 @@ def create_guided_onn_factory(
 
     if operator_hints is None:
         operator_hints = {}
-    
+
     # Determine if we need full ops or simplified
-    needs_exp = 'exp' in operator_hints.get('operators', set())
-    needs_log = 'log' in operator_hints.get('operators', set())
+    needs_exp = "exp" in operator_hints.get("operators", set())
+    needs_log = "log" in operator_hints.get("operators", set())
     use_simplified = not (needs_exp or needs_log)
-    
+
     def factory():
         model = OperationDAG(
             n_inputs=n_inputs,
@@ -3818,22 +4202,22 @@ def create_guided_onn_factory(
             simplified_ops=use_simplified,
             fair_mode=True,
         )
-        
+
         # Bias operation selectors toward detected operators
         bias_onn_toward_operators(model, operator_hints)
-        
+
         return model
-    
+
     return factory
 
 
-def bias_onn_toward_operators(model, operator_hints: Dict, bias_strength: float = 2.0):
+def bias_onn_toward_operators(model, operator_hints: dict, bias_strength: float = 2.0):
     """
     Bias an ONN's operation selectors toward specific operators.
-    
+
     Modifies the model's selector logits to favor the operators
     identified in the fast-path formula.
-    
+
     Args:
         model: OperationDAG model
         operator_hints: Dict with 'operators' set
@@ -3842,14 +4226,14 @@ def bias_onn_toward_operators(model, operator_hints: Dict, bias_strength: float 
     if operator_hints is None:
         operator_hints = {}
 
-    operators = operator_hints.get('operators', set())
-    frequencies = operator_hints.get('frequencies', [])
-    
+    operators = operator_hints.get("operators", set())
+    frequencies = operator_hints.get("frequencies", [])
+
     for layer in model.layers:
         for node in layer.nodes:
             # Access the operation selector
             selector = node.op_selector
-            
+
             # Bias unary operation selection
             # Indices in simplified mode: 0=periodic, 1=power
             # Indices in full mode: 0=periodic, 1=power, 2=exp, 3=log
@@ -3857,41 +4241,40 @@ def bias_onn_toward_operators(model, operator_hints: Dict, bias_strength: float 
                 unary_start = 2
                 unary_end = 2 + selector.n_unary
                 # Bias toward periodic if sin/cos detected
-                if 'periodic' in operators or 'sin' in operators or 'cos' in operators:
+                if "periodic" in operators or "sin" in operators or "cos" in operators:
                     if unary_start < unary_end:
                         selector.logits.data[unary_start + 0] += bias_strength
-                
+
                 # Bias toward power if power/rational detected
-                if 'power' in operators or 'rational' in operators:
+                if "power" in operators or "rational" in operators:
                     if unary_start + 1 < unary_end:
                         selector.logits.data[unary_start + 1] += bias_strength
-                
+
                 # Full mode: exp and log
-                if selector.n_unary >= 3 and 'exp' in operators:
+                if selector.n_unary >= 3 and "exp" in operators:
                     selector.logits.data[unary_start + 2] += bias_strength
-                if selector.n_unary >= 4 and 'log' in operators:
+                if selector.n_unary >= 4 and "log" in operators:
                     selector.logits.data[unary_start + 3] += bias_strength
-                
+
                 # If we have specific frequencies, bias the omega parameter
-                if frequencies and hasattr(node, 'unary_ops'):
+                if frequencies and hasattr(node, "unary_ops"):
                     for op in node.unary_ops:
-                        if hasattr(op, 'omega') and len(frequencies) > 0:
+                        if hasattr(op, "omega") and len(frequencies) > 0:
                             # Set omega to average detected frequency
                             avg_freq = sum(frequencies) / len(frequencies)
                             op.omega.data.fill_(avg_freq)
 
 
 def _build_cpp_seed_graphs(
-    candidate_formulas: Optional[List[Dict]],
+    candidate_formulas: list[dict] | None,
     max_seeds: int = 10,
-) -> List[Dict]:
+) -> list[dict]:
     """Convert fast-path / proposer formula strings into C++ seed graph dicts."""
     if not candidate_formulas:
         return []
     try:
         from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_candidates
     except ImportError:
-        import sys
         from pathlib import Path as _Path
 
         _cpp_dir = _Path(__file__).resolve().parent.parent / "glassbox" / "sr" / "cpp"
@@ -3904,14 +4287,13 @@ def _build_cpp_seed_graphs(
 def _build_signal_seed_graphs(
     x: torch.Tensor,
     y: torch.Tensor,
-    operator_hints: Dict,
+    operator_hints: dict,
     max_seeds: int = 10,
-) -> List[Dict]:
+) -> list[dict]:
     """Build universal separability-aware seed graphs from the observed signal."""
     try:
         from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_signal
     except ImportError:
-        import sys
         from pathlib import Path as _Path
 
         _cpp_dir = _Path(__file__).resolve().parent.parent / "glassbox" / "sr" / "cpp"
@@ -3923,7 +4305,7 @@ def _build_signal_seed_graphs(
 
     x_np = x.cpu().numpy().ravel()
     y_np = y.cpu().numpy().ravel()
-    frequencies = operator_hints.get('frequencies', [])
+    frequencies = operator_hints.get("frequencies", [])
     return build_seed_graphs_from_signal(
         x_np,
         y_np,
@@ -3935,31 +4317,31 @@ def _build_signal_seed_graphs(
 def beam_search_evolution(
     x: torch.Tensor,
     y: torch.Tensor,
-    operator_hints: Dict,
+    operator_hints: dict,
     n_beams: int = 20,
     n_rounds: int = 3,
     keep_fraction: float = 0.2,
     base_pop_size: int = 50,
     base_generations: int = 500,
-    device: str = 'cpu',
-    candidate_formulas: Optional[List[Dict]] = None,
-    confidence: float = 0.5, # New parameter
-    search_plan: Optional[Dict[str, Any]] = None,
-    y_weights: Optional[np.ndarray] = None,
+    device: str = "cpu",
+    candidate_formulas: list[dict] | None = None,
+    confidence: float = 0.5,  # New parameter
+    search_plan: dict[str, Any] | None = None,
+    y_weights: np.ndarray | None = None,
     loss_mode: str = "mse",
-    huber_delta: Optional[float] = None,
+    huber_delta: float | None = None,
     trim_fraction: float = 0.1,
-    input_units: Optional[list] = None,
-    output_units: Optional[list] = None,
+    input_units: list | None = None,
+    output_units: list | None = None,
     dim_penalty_weight: float = 0.1,
-) -> Dict:
+) -> dict:
     """
     Beam search over diverse C++ evolution configurations.
-    
+
     Generates K diverse beams (different op_priors, seed_omegas, graph sizes),
     runs them in parallel via C++ backend, prunes bottom 80%, mutates top 20%,
     and repeats for R rounds.
-    
+
     Args:
         x: Input tensor (N,) or (N,1)
         y: Target tensor (N,) or (N,1)
@@ -3973,11 +4355,12 @@ def beam_search_evolution(
         candidate_formulas: Optional list of top-K fast-path candidates,
             each a dict with at least 'formula', 'mse', 'active_terms'.
             Used for targeted population initialization (elite seeding).
-        
+
     Returns:
         Dict with 'formula', 'mse', 'model', 'time', or None if C++ unavailable
     """
     import time
+
     _core, _ = _load_cpp_core()
     if _core is None or not hasattr(_core, "run_evolution"):
         return None
@@ -3986,40 +4369,40 @@ def beam_search_evolution(
         operator_hints = {}
     if search_plan is None:
         search_plan = {}
-    
+
     start_time = time.time()
-    
+
     # Prepare data for C++
     x_np = x.cpu().numpy().ravel()
     y_np = y.cpu().numpy().ravel()
     X_list = [x_np]
-    
+
     # Extract hints
-    operators = operator_hints.get('operators', set())
-    frequencies = operator_hints.get('frequencies', [])
-    powers = operator_hints.get('powers', [])
-    
-    has_sin = 'sin' in operators or 'periodic' in operators or 'cos' in operators
-    has_power = 'power' in operators
-    has_exp = 'exp' in operators
-    has_log = 'log' in operators
+    operators = operator_hints.get("operators", set())
+    frequencies = operator_hints.get("frequencies", [])
+    powers = operator_hints.get("powers", [])
+
+    has_sin = "sin" in operators or "periodic" in operators or "cos" in operators
+    has_power = "power" in operators
+    has_exp = "exp" in operators
+    has_log = "log" in operators
 
     def _estimate_polynomial_signature(
         x_values: np.ndarray,
         y_values: np.ndarray,
         max_degree: int = 8,
-    ) -> Tuple[bool, int, float]:
+    ) -> tuple[bool, int, float]:
         """Return (is_poly_like, best_degree, relative_mse) from a quick poly fit."""
         if x_values.size < max_degree + 2:
-            return (False, 0, float('inf'))
+            return (False, 0, float("inf"))
         try:
             x_span = float(np.max(x_values) - np.min(x_values))
             x_scaled = (x_values - float(np.mean(x_values))) / max(0.5 * x_span, 1e-8)
             y_var = max(float(np.var(y_values)), 1e-12)
 
             best_degree = 1
-            best_mse = float('inf')
-            mse_by_degree: List[Tuple[int, float]] = []
+            best_mse = float("inf")
+            mse_by_degree: list[tuple[int, float]] = []
             for degree in range(1, max_degree + 1):
                 coeffs = np.polyfit(x_scaled, y_values, degree)
                 pred = np.polyval(coeffs, x_scaled)
@@ -4041,7 +4424,7 @@ def beam_search_evolution(
             is_poly_like = effective_degree >= 2 and relative_mse < 1e-11
             return (is_poly_like, effective_degree, relative_mse)
         except Exception:
-            return (False, 0, float('inf'))
+            return (False, 0, float("inf"))
 
     hinted_max_power = 0.0
     for power in powers:
@@ -4050,7 +4433,9 @@ def beam_search_evolution(
         except Exception:
             continue
 
-    poly_like_data, poly_degree, poly_rel_mse = _estimate_polynomial_signature(x_np, y_np)
+    poly_like_data, poly_degree, poly_rel_mse = _estimate_polynomial_signature(
+        x_np, y_np
+    )
     hint_poly_only = has_power and not (has_sin or has_exp or has_log)
     polynomial_mode = bool(poly_like_data or hint_poly_only or hinted_max_power > 3.0)
 
@@ -4062,7 +4447,9 @@ def beam_search_evolution(
             # Keep one exponent of headroom so x^k can refine without clamping.
             adaptive_p_max = min(8.0, max(4.0, float(math.ceil(target_power + 1.0))))
         elif hint_poly_only and hinted_max_power > 0.0:
-            adaptive_p_max = min(8.0, max(4.0, float(math.ceil(hinted_max_power + 1.0))))
+            adaptive_p_max = min(
+                8.0, max(4.0, float(math.ceil(hinted_max_power + 1.0)))
+            )
 
     if "p_min" in search_plan:
         try:
@@ -4075,8 +4462,11 @@ def beam_search_evolution(
         except (TypeError, ValueError):
             pass
     if adaptive_p_min >= adaptive_p_max:
-        adaptive_p_min, adaptive_p_max = min(adaptive_p_min, adaptive_p_max - 0.5), max(adaptive_p_max, adaptive_p_min + 0.5)
-    
+        adaptive_p_min, adaptive_p_max = (
+            min(adaptive_p_min, adaptive_p_max - 0.5),
+            max(adaptive_p_max, adaptive_p_min + 0.5),
+        )
+
     # Build classifier-guided op_priors base
     # Op order: [Periodic, Power, Exp, Log]
     classifier_priors_raw = [
@@ -4085,57 +4475,67 @@ def beam_search_evolution(
         0.4 if has_exp else 0.05,
         0.2 if has_log else 0.05,
     ]
-    prior_trust = _classifier_prior_trust_from_uncertainty(operator_hints.get('uncertainty'))
+    prior_trust = _classifier_prior_trust_from_uncertainty(
+        operator_hints.get("uncertainty")
+    )
     classifier_priors = _blend_priors_with_uniform(classifier_priors_raw, prior_trust)
-    
+
     # Build diverse frequency sets
     fft_freqs = frequencies[:3] if frequencies else []
     integer_harmonics = [[1, 2, 3], [2, 3, 5], [1, 3, 5], [3, 6, 9]]
     pi_freqs = [3.14159, 6.28318, 1.5708]
-    
+
     # ── Generate initial beam configurations ──
     def make_beam_configs(n: int, round_idx: int = 0):
         configs = []
-        
+
         # If we have high confidence skeletons, we can be much more selective
         # with the beams we run, focusing on the seeds rather than random exploration.
         is_confident_proposer = bool(confidence > 0.8 and candidate_formulas)
 
         def add_config(
-            op_priors_cfg: List[float],
-            seed_omegas_cfg: List[float],
+            op_priors_cfg: list[float],
+            seed_omegas_cfg: list[float],
             pop_size_cfg: int,
             generations_cfg: int,
             label_cfg: str,
             *,
-            binary_op_priors_cfg: Optional[List[float]] = None,
-            allowed_unary_ops_cfg: Optional[List[int]] = None,
-            allowed_binary_ops_cfg: Optional[List[int]] = None,
-            p_min_cfg: Optional[float] = None,
-            p_max_cfg: Optional[float] = None,
+            binary_op_priors_cfg: list[float] | None = None,
+            allowed_unary_ops_cfg: list[int] | None = None,
+            allowed_binary_ops_cfg: list[int] | None = None,
+            p_min_cfg: float | None = None,
+            p_max_cfg: float | None = None,
         ) -> None:
-            configs.append({
-                'op_priors': op_priors_cfg,
-                'seed_omegas': seed_omegas_cfg,
-                'pop_size': max(10, int(pop_size_cfg)),
-                'generations': max(10, int(generations_cfg)),
-                'p_min': adaptive_p_min if p_min_cfg is None else float(p_min_cfg),
-                'p_max': adaptive_p_max if p_max_cfg is None else float(p_max_cfg),
-                'binary_op_priors': list(binary_op_priors_cfg) if binary_op_priors_cfg is not None else None,
-                'allowed_unary_ops': list(allowed_unary_ops_cfg) if allowed_unary_ops_cfg is not None else None,
-                'allowed_binary_ops': list(allowed_binary_ops_cfg) if allowed_binary_ops_cfg is not None else None,
-                'label': label_cfg,
-            })
-        
+            configs.append(
+                {
+                    "op_priors": op_priors_cfg,
+                    "seed_omegas": seed_omegas_cfg,
+                    "pop_size": max(10, int(pop_size_cfg)),
+                    "generations": max(10, int(generations_cfg)),
+                    "p_min": adaptive_p_min if p_min_cfg is None else float(p_min_cfg),
+                    "p_max": adaptive_p_max if p_max_cfg is None else float(p_max_cfg),
+                    "binary_op_priors": list(binary_op_priors_cfg)
+                    if binary_op_priors_cfg is not None
+                    else None,
+                    "allowed_unary_ops": list(allowed_unary_ops_cfg)
+                    if allowed_unary_ops_cfg is not None
+                    else None,
+                    "allowed_binary_ops": list(allowed_binary_ops_cfg)
+                    if allowed_binary_ops_cfg is not None
+                    else None,
+                    "label": label_cfg,
+                }
+            )
+
         # ── Targeted initialization: inject top-K fast-path candidates as elite seeds ──
         if candidate_formulas:
             for ci, cand in enumerate(candidate_formulas[:3]):
-                active_terms = cand.get('active_terms', [])
+                active_terms = cand.get("active_terms", [])
                 cand_priors = list(classifier_priors)
-                has_trig = any('sin' in t or 'cos' in t for t in active_terms)
-                has_poly = any('x^' in t or 'x**' in t for t in active_terms)
-                has_exp_ = any('exp' in t for t in active_terms)
-                has_log_ = any('log' in t for t in active_terms)
+                has_trig = any("sin" in t or "cos" in t for t in active_terms)
+                has_poly = any("x^" in t or "x**" in t for t in active_terms)
+                has_exp_ = any("exp" in t for t in active_terms)
+                has_log_ = any("log" in t for t in active_terms)
                 if has_trig and len(cand_priors) > 0:
                     cand_priors[0] = min(cand_priors[0] * 1.5, 0.6)
                 if has_poly and len(cand_priors) > 1:
@@ -4149,33 +4549,64 @@ def beam_search_evolution(
 
                 cand_omegas = list(fft_freqs)
                 for t in active_terms:
-                    m = re.search(r'(?:sin|cos)\((\d+\.?\d*)\*', t)
+                    m = re.search(r"(?:sin|cos)\((\d+\.?\d*)\*", t)
                     if m:
                         try:
                             cand_omegas.append(float(m.group(1)))
                         except ValueError:
                             pass
 
-                add_config(cand_priors, cand_omegas[:4], base_pop_size, base_generations,
-                           f'candidate-seed-{ci}')
+                add_config(
+                    cand_priors,
+                    cand_omegas[:4],
+                    base_pop_size,
+                    base_generations,
+                    f"candidate-seed-{ci}",
+                )
 
         # Confident proposer: keep skeleton refinement beams, then still add
         # specialist islands (poly/product/rational) instead of early-returning
         # with only 2 exploratory fallbacks.
         if is_confident_proposer and candidate_formulas:
-            add_config(classifier_priors, fft_freqs, base_pop_size, base_generations, 'classifier-guided')
-            add_config([0.25, 0.25, 0.25, 0.25], fft_freqs, base_pop_size, base_generations, 'uniform')
+            add_config(
+                classifier_priors,
+                fft_freqs,
+                base_pop_size,
+                base_generations,
+                "classifier-guided",
+            )
+            add_config(
+                [0.25, 0.25, 0.25, 0.25],
+                fft_freqs,
+                base_pop_size,
+                base_generations,
+                "uniform",
+            )
             # Fall through to specialist islands rather than truncating search.
 
         # 1. Classifier-guided (primary hypothesis)
         if not (is_confident_proposer and candidate_formulas):
-            add_config(classifier_priors, fft_freqs, base_pop_size, base_generations, 'classifier-guided')
-        
+            add_config(
+                classifier_priors,
+                fft_freqs,
+                base_pop_size,
+                base_generations,
+                "classifier-guided",
+            )
+
         # 2. Sin-heavy
-        add_config([0.8, 0.1, 0.05, 0.05], fft_freqs or [1.0, 2.0, 3.0], base_pop_size, base_generations, 'sin-heavy')
-        
+        add_config(
+            [0.8, 0.1, 0.05, 0.05],
+            fft_freqs or [1.0, 2.0, 3.0],
+            base_pop_size,
+            base_generations,
+            "sin-heavy",
+        )
+
         # 3. Power-heavy
-        add_config([0.1, 0.8, 0.05, 0.05], [], base_pop_size, base_generations, 'power-heavy')
+        add_config(
+            [0.1, 0.8, 0.05, 0.05], [], base_pop_size, base_generations, "power-heavy"
+        )
 
         if polynomial_mode and adaptive_p_max > 3.0:
             add_config(
@@ -4183,14 +4614,14 @@ def beam_search_evolution(
                 [],
                 base_pop_size,
                 int(base_generations * 1.4),
-                'poly-high-power',
+                "poly-high-power",
             )
             add_config(
                 [0.02, 0.95, 0.02, 0.01],
                 [],
                 max(18, base_pop_size // 2),
                 int(base_generations * 2.0),
-                'poly-depth',
+                "poly-depth",
             )
 
         # Pure IntPow polynomial lane: [Periodic, Power, IntPow, Exp, Log]
@@ -4203,25 +4634,45 @@ def beam_search_evolution(
                 [],
                 max(20, base_pop_size),
                 int(base_generations * 1.5),
-                'poly-intpow-only',
+                "poly-intpow-only",
                 allowed_unary_ops_cfg=[2],  # UnaryOp::IntPow only
                 allowed_binary_ops_cfg=[0],  # Arithmetic only (no Division)
                 p_min_cfg=1.0,
                 p_max_cfg=float(poly_deg + 1),
             )
-        
+
         # 4. Exp-heavy
-        add_config([0.05, 0.1, 0.8, 0.05], [], base_pop_size, base_generations, 'exp-heavy')
-        
+        add_config(
+            [0.05, 0.1, 0.8, 0.05], [], base_pop_size, base_generations, "exp-heavy"
+        )
+
         # 5. Uniform exploration
         if not (is_confident_proposer and candidate_formulas):
-            add_config([0.25, 0.25, 0.25, 0.25], fft_freqs, base_pop_size, base_generations, 'uniform')
-        
+            add_config(
+                [0.25, 0.25, 0.25, 0.25],
+                fft_freqs,
+                base_pop_size,
+                base_generations,
+                "uniform",
+            )
+
         # 6. Sin+Power combo (common case like x^2 + sin(x))
-        add_config([0.45, 0.45, 0.05, 0.05], fft_freqs or [1.0, 2.0], base_pop_size, base_generations, 'sin+power')
-        
+        add_config(
+            [0.45, 0.45, 0.05, 0.05],
+            fft_freqs or [1.0, 2.0],
+            base_pop_size,
+            base_generations,
+            "sin+power",
+        )
+
         # 7. Exp+Sin combo (damped oscillation)
-        add_config([0.4, 0.1, 0.4, 0.1], fft_freqs or [1.0, 3.0], base_pop_size, base_generations, 'exp+sin')
+        add_config(
+            [0.4, 0.1, 0.4, 0.1],
+            fft_freqs or [1.0, 3.0],
+            base_pop_size,
+            base_generations,
+            "exp+sin",
+        )
 
         # 7b. Product island — favors multiply binary path (x^2*sin(x) class)
         if has_power and has_sin:
@@ -4230,8 +4681,12 @@ def beam_search_evolution(
                 fft_freqs or [1.0, 2.0],
                 base_pop_size,
                 base_generations,
-                'product-island',
-                binary_op_priors_cfg=[0.85, 0.05, 0.10],  # Arithmetic-heavy (multiply mode)
+                "product-island",
+                binary_op_priors_cfg=[
+                    0.85,
+                    0.05,
+                    0.10,
+                ],  # Arithmetic-heavy (multiply mode)
                 allowed_binary_ops_cfg=[0],  # Arithmetic only
             )
         elif has_sin or has_power:
@@ -4240,15 +4695,15 @@ def beam_search_evolution(
                 fft_freqs or [1.0],
                 base_pop_size,
                 base_generations,
-                'product-island',
+                "product-island",
                 binary_op_priors_cfg=[0.80, 0.10, 0.10],
             )
 
         # 7c. Rational island — Division-heavy (x^3/(1+x^4) class)
         has_rational_hint = bool(
-            operator_hints.get('has_rational')
-            or 'rational' in operators
-            or 'division' in operators
+            operator_hints.get("has_rational")
+            or "rational" in operators
+            or "division" in operators
         )
         if has_rational_hint or has_power:
             add_config(
@@ -4256,11 +4711,11 @@ def beam_search_evolution(
                 [],
                 base_pop_size,
                 int(base_generations * 1.2),
-                'rational-island',
+                "rational-island",
                 binary_op_priors_cfg=[0.25, 0.60, 0.15],  # Division-heavy
                 allowed_binary_ops_cfg=[0, 1],  # Arithmetic + Division
             )
-        
+
         # 8-11. Integer harmonic frequency variants
         for i, harmonics in enumerate(integer_harmonics):
             add_config(
@@ -4268,21 +4723,39 @@ def beam_search_evolution(
                 [float(h) for h in harmonics],
                 base_pop_size,
                 base_generations // 2,
-                f'harmonics-{harmonics}',
+                f"harmonics-{harmonics}",
             )
-        
+
         # 12. Pi-based frequencies
-        add_config(classifier_priors, pi_freqs, base_pop_size, base_generations // 2, 'pi-freqs')
-        
+        add_config(
+            classifier_priors,
+            pi_freqs,
+            base_pop_size,
+            base_generations // 2,
+            "pi-freqs",
+        )
+
         # 13. No priors (pure uniform random)
-        add_config([], [], base_pop_size, base_generations, 'no-priors')
-        
+        add_config([], [], base_pop_size, base_generations, "no-priors")
+
         # 14. Large population, fewer gens (breadth-first)
-        add_config(classifier_priors, fft_freqs, base_pop_size * 2, base_generations // 3, 'breadth-first')
-        
+        add_config(
+            classifier_priors,
+            fft_freqs,
+            base_pop_size * 2,
+            base_generations // 3,
+            "breadth-first",
+        )
+
         # 15. Small population, more gens (depth-first)
-        add_config(classifier_priors, fft_freqs, max(15, base_pop_size // 3), base_generations * 2, 'depth-first')
-        
+        add_config(
+            classifier_priors,
+            fft_freqs,
+            max(15, base_pop_size // 3),
+            base_generations * 2,
+            "depth-first",
+        )
+
         # 16-20. Random perturbations of classifier priors
         rng = np.random.RandomState(42 + round_idx)
         while len(configs) < n:
@@ -4290,82 +4763,90 @@ def beam_search_evolution(
             blended = [0.5 * c + 0.5 * n_ for c, n_ in zip(classifier_priors, noise)]
             total_b = sum(blended)
             blended = [b / total_b for b in blended]
-            
+
             # Random omega selection
             all_omegas = fft_freqs + [1.0, 2.0, 3.0, 4.0, 5.0, 3.14]
             n_pick = rng.randint(1, min(4, len(all_omegas) + 1))
             picked = list(rng.choice(all_omegas, size=n_pick, replace=False))
-            
-            add_config(blended, picked, base_pop_size, base_generations, f'random-{len(configs)}')
-        
+
+            add_config(
+                blended,
+                picked,
+                base_pop_size,
+                base_generations,
+                f"random-{len(configs)}",
+            )
+
         return configs[:n]
-    
+
     def run_single_beam(config):
         """Run one C++ evolution beam. Returns (mse, result_dict, config)."""
         try:
             result = _core.run_evolution(
                 X_list=X_list,
                 y=y_np,
-                pop_size=config['pop_size'],
-                generations=config['generations'],
+                pop_size=config["pop_size"],
+                generations=config["generations"],
                 early_stop_mse=1e-10,
-                seed_omegas=config['seed_omegas'],
-                op_priors=config['op_priors'],
-                p_min=float(config.get('p_min', -2.0)),
-                p_max=float(config.get('p_max', 3.0)),
-                num_threads=config.get('num_threads', -1),
+                seed_omegas=config["seed_omegas"],
+                op_priors=config["op_priors"],
+                p_min=float(config.get("p_min", -2.0)),
+                p_max=float(config.get("p_max", 3.0)),
+                num_threads=config.get("num_threads", -1),
             )
-            raw_mse = result['best_mse']
-            formula_str = result.get('formula', '0')
-            
+            raw_mse = result["best_mse"]
+            formula_str = result.get("formula", "0")
+
             # Defer expensive SymPy parsing until after the parallel phase
-            result['raw_mse'] = raw_mse
-            result['best_mse'] = raw_mse
+            result["raw_mse"] = raw_mse
+            result["best_mse"] = raw_mse
             return (raw_mse, result, config)
         except Exception:
-            return (float('inf'), None, config)
-    
+            return (float("inf"), None, config)
+
     def mutate_config(config, rng):
         """Create a mutated variant of a winning beam config."""
         new = dict(config)
-        new['label'] = f"mut-{config['label']}"
-        
+        new["label"] = f"mut-{config['label']}"
+
         # Perturb op_priors by ±20%
-        if config['op_priors']:
-            priors = list(config['op_priors'])
+        if config["op_priors"]:
+            priors = list(config["op_priors"])
             noise = rng.uniform(0.8, 1.2, size=len(priors))
             priors = [max(0.01, p * n) for p, n in zip(priors, noise)]
             total_p = sum(priors)
-            new['op_priors'] = [p / total_p for p in priors]
-        
+            new["op_priors"] = [p / total_p for p in priors]
+
         # Randomly add/remove a frequency
-        omegas = list(config.get('seed_omegas', []))
+        omegas = list(config.get("seed_omegas", []))
         if rng.random() < 0.5 and len(omegas) > 1:
             omegas.pop(rng.randint(0, len(omegas)))
         elif rng.random() < 0.5:
             # Add a nearby frequency
             new_omega = rng.choice([1, 2, 3, 4, 5, 6, 3.14, 6.28])
             omegas.append(float(new_omega))
-        new['seed_omegas'] = omegas
-        
+        new["seed_omegas"] = omegas
+
         # Slight generation/pop variation
         if rng.random() < 0.3:
-            new['generations'] = int(config['generations'] * rng.uniform(0.7, 1.5))
+            new["generations"] = int(config["generations"] * rng.uniform(0.7, 1.5))
         if rng.random() < 0.3:
-            new['pop_size'] = max(15, int(config['pop_size'] * rng.uniform(0.7, 1.3)))
+            new["pop_size"] = max(15, int(config["pop_size"] * rng.uniform(0.7, 1.3)))
 
         if polynomial_mode and rng.random() < 0.4:
-            p_max = float(new.get('p_max', adaptive_p_max))
+            p_max = float(new.get("p_max", adaptive_p_max))
             p_max += float(rng.choice([-1.0, 0.0, 1.0]))
-            new['p_max'] = float(np.clip(p_max, 3.0, 8.0))
-            new['p_min'] = min(float(new.get('p_min', adaptive_p_min)), new['p_max'] - 0.5)
-        
+            new["p_max"] = float(np.clip(p_max, 3.0, 8.0))
+            new["p_min"] = min(
+                float(new.get("p_min", adaptive_p_min)), new["p_max"] - 0.5
+            )
+
         return new
-    
+
     # ── Main beam search loop ──
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("BEAM SEARCH EVOLUTION")
-    print("="*60)
+    print("=" * 60)
     print(f"  Beams per round: {n_beams}")
     print(f"  Rounds: {n_rounds}")
     print(f"  Confidence: {confidence:.2f}")
@@ -4378,21 +4859,21 @@ def beam_search_evolution(
             f"  Polynomial mode: on (deg={poly_degree}, rel={poly_rel_mse:.2e}, "
             f"target_p={max(float(poly_degree), hinted_max_power)})"
         )
-    
+
     # 1. Get initial configs
     configs = make_beam_configs(n=n_beams, round_idx=0)
-    
-    best_overall_mse = float('inf')
+
+    best_overall_mse = float("inf")
     best_overall_result = None
     best_overall_config = None
     rng = np.random.RandomState(123)
-    
+
     # 1. Get initial configs
     configs = make_beam_configs(n=n_beams, round_idx=0)
 
     # 2. Extract multi-priors and multi-seed-omegas (+ optional binary/unary masks)
-    multi_op_priors = [cfg.get('op_priors', []) for cfg in configs]
-    multi_seed_omegas = [cfg.get('seed_omegas', []) for cfg in configs]
+    multi_op_priors = [cfg.get("op_priors", []) for cfg in configs]
+    multi_seed_omegas = [cfg.get("seed_omegas", []) for cfg in configs]
     multi_binary_op_priors = []
     multi_allowed_unary_ops = []
     multi_allowed_binary_ops = []
@@ -4427,7 +4908,7 @@ def beam_search_evolution(
     total_pop_size = base_pop_size * n_beams
     total_generations = base_generations * max(1, n_rounds)
 
-    print(f"  Launching Native Diverse Island Model:")
+    print("  Launching Native Diverse Island Model:")
     print(f"  - Islands: {n_beams}")
     print(f"  - Total Population: {total_pop_size}")
     print(f"  - Generations: {total_generations}")
@@ -4438,6 +4919,7 @@ def beam_search_evolution(
         )
 
     import multiprocessing
+
     max_physical_threads = multiprocessing.cpu_count()
 
     # Seed first fraction of each island population from proposer / fast-path skeletons.
@@ -4525,7 +5007,9 @@ def beam_search_evolution(
         if timeout_seconds is not None:
             evolution_kwargs["timeout_seconds"] = timeout_seconds
         if y_weights is not None:
-            w = np.ascontiguousarray(np.asarray(y_weights, dtype=np.float64).reshape(-1))
+            w = np.ascontiguousarray(
+                np.asarray(y_weights, dtype=np.float64).reshape(-1)
+            )
             if w.shape[0] == y_np.shape[0]:
                 evolution_kwargs["y_weights"] = w
         mode = str(loss_mode or "mse").strip().lower()
@@ -4564,25 +5048,38 @@ def beam_search_evolution(
         print(f"  \u274c Native Island Search failed: {e}")
         return None
 
-    best_overall_mse = result.get('best_mse', float('inf'))
+    best_overall_mse = result.get("best_mse", float("inf"))
     best_overall_result = result
-    best_overall_config = configs[0] # Default, as they were merged
+    best_overall_config = configs[0]  # Default, as they were merged
 
-    elapsed = time.time() - start_time    
+    elapsed = time.time() - start_time
     if best_overall_result is None:
         print("  \u274c Beam search failed (no valid results)")
         return None
-        
+
     # [Optimized] Run SymPy ONLY ONCE on the absolute global winner
-    formula_str = best_overall_result.get('formula', '0')
+    formula_str = best_overall_result.get("formula", "0")
     display_mse = best_overall_mse
     try:
-        import sympy as sp
-        from sympy.parsing.sympy_parser import parse_expr, standard_transformations, convert_xor, implicit_multiplication_application
+        from sympy.parsing.sympy_parser import (
+            convert_xor,
+            implicit_multiplication_application,
+            parse_expr,
+            standard_transformations,
+        )
+
         try:
-            from simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+            from simplify_formula import (
+                SnapConfig,
+                simplify_onn_formula,
+                snap_formula_floats,
+            )
         except ImportError:
-            from scripts.simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+            from scripts.simplify_formula import (
+                SnapConfig,
+                simplify_onn_formula,
+                snap_formula_floats,
+            )
 
         sympy_unsafe = "Piecewise(" in formula_str or "Eq(" in formula_str
         if sympy_unsafe:
@@ -4593,28 +5090,40 @@ def beam_search_evolution(
         else:
             try:
                 import warnings
+
                 with warnings.catch_warnings():
                     try:
                         from sympy.utilities.exceptions import SymPyDeprecationWarning
                     except Exception:
                         SymPyDeprecationWarning = DeprecationWarning
                     warnings.filterwarnings("ignore", category=SymPyDeprecationWarning)
-                    warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"sympy\..*")
-                    warnings.filterwarnings("ignore", message=r"\s*Using non-Expr arguments in Mul.*")
+                    warnings.filterwarnings(
+                        "ignore", category=DeprecationWarning, module=r"sympy\..*"
+                    )
+                    warnings.filterwarnings(
+                        "ignore", message=r"\s*Using non-Expr arguments in Mul.*"
+                    )
                     sp_expr = simplify_onn_formula(formula_str)[1]
             except Exception:
-                transformations = standard_transformations + (convert_xor, implicit_multiplication_application)
-                snapped = snap_formula_floats(formula_str, SnapConfig(int_tol=1e-5, zero_tol=1e-8))
-                sp_expr = parse_expr(snapped, transformations=transformations, evaluate=False)
+                transformations = standard_transformations + (
+                    convert_xor,
+                    implicit_multiplication_application,
+                )
+                snapped = snap_formula_floats(
+                    formula_str, SnapConfig(int_tol=1e-5, zero_tol=1e-8)
+                )
+                sp_expr = parse_expr(
+                    snapped, transformations=transformations, evaluate=False
+                )
             formula_str = str(sp_expr)
 
         y_pred = _evaluate_formula_values(formula_str, x_np)
         if y_pred is None:
-            display_mse = float('inf')
+            display_mse = float("inf")
         else:
-            display_mse = float(np.mean((y_pred - y_np)**2))
+            display_mse = float(np.mean((y_pred - y_np) ** 2))
         if not np.isfinite(display_mse):
-            display_mse = float('inf')
+            display_mse = float("inf")
     except Exception:
         display_mse = best_overall_mse
 
@@ -4646,67 +5155,68 @@ def beam_search_evolution(
         exactness_diag = {"attempted": False, "accepted": False, "reason": "exception"}
 
     drift_penalty = abs(best_overall_mse - display_mse) / max(best_overall_mse, 1e-12)
-    best_overall_result['display_mse'] = display_mse
-    best_overall_result['drift_penalty'] = drift_penalty
-    best_overall_result['formula'] = formula_str
+    best_overall_result["display_mse"] = display_mse
+    best_overall_result["drift_penalty"] = drift_penalty
+    best_overall_result["formula"] = formula_str
     if exactness_diag is not None:
-        best_overall_result['exactness_pass'] = exactness_diag
+        best_overall_result["exactness_pass"] = exactness_diag
 
     # Build CppGraphModule from best result
     formula = formula_str
-    
+
     try:
         from glassbox.sr.cpp.export_pytorch import CppGraphModule
+
         model = CppGraphModule(best_overall_result).to(device)
     except Exception:
         model = None
-    
+
     print(f"\n  Best formula: {formula}")
     print(f"  Display MSE: {display_mse:.2e}")
     print(f"  Raw MSE: {best_overall_mse:.2e} (engine internal)")
-    drift = best_overall_result.get('drift_penalty', 0.0)
+    drift = best_overall_result.get("drift_penalty", 0.0)
     print(f"  Drift Penalty: {drift:.2f}")
     print(f"  Best config: {best_overall_config['label']}")
     print(f"  Total beam search time: {elapsed:.2f}s")
-    print("="*60)
-    
+    print("=" * 60)
+
     return {
-        'formula': formula,
-        'mse': display_mse,
-        'raw_mse': best_overall_mse,
-        'display_mse': display_mse,
-        'model': model,
-        'time': elapsed,
-        'config': best_overall_config,
-        'cpp_ast': best_overall_result,
+        "formula": formula,
+        "mse": display_mse,
+        "raw_mse": best_overall_mse,
+        "display_mse": display_mse,
+        "model": model,
+        "time": elapsed,
+        "config": best_overall_config,
+        "cpp_ast": best_overall_result,
     }
 
 
 def run_guided_evolution(
     x: torch.Tensor,
     y: torch.Tensor,
-    operator_hints: Dict,
+    operator_hints: dict,
     generations: int = 20,
     population_size: int = 20,
-    device: str = 'cpu',
-    visualizer = None,
-    candidate_formulas: Optional[List[Dict]] = None,
+    device: str = "cpu",
+    visualizer=None,
+    candidate_formulas: list[dict] | None = None,
     confidence: float = 0.5,
-    search_plan: Optional[Dict[str, Any]] = None,
-    y_weights: Optional[np.ndarray] = None,
+    search_plan: dict[str, Any] | None = None,
+    y_weights: np.ndarray | None = None,
     loss_mode: str = "mse",
-    huber_delta: Optional[float] = None,
+    huber_delta: float | None = None,
     trim_fraction: float = 0.1,
-    input_units: Optional[list] = None,
-    output_units: Optional[list] = None,
+    input_units: list | None = None,
+    output_units: list | None = None,
     dim_penalty_weight: float = 0.1,
-) -> Dict:
+) -> dict:
     """
     Run evolution guided by fast-path operator hints.
-    
+
     Primary strategy: beam search over diverse C++ evolution configs.
     Fallback: single PyTorch EvolutionaryONNTrainer run.
-    
+
     Args:
         x: Input tensor
         y: Target tensor
@@ -4715,7 +5225,7 @@ def run_guided_evolution(
         population_size: Population size
         device: Device to run on
         visualizer: Optional visualizer
-        
+
     Returns:
         Dict with evolved formula, mse, and timing
     """
@@ -4725,7 +5235,7 @@ def run_guided_evolution(
         operator_hints = {}
     if search_plan is None:
         search_plan = {}
-    
+
     # ── Primary: Beam Search (fast C++ path) ──
     # Adjust beams and rounds based on requested generations and confidence
     n_beams = 10 if generations >= 100 else max(3, generations // 10)
@@ -4740,7 +5250,7 @@ def run_guided_evolution(
             n_rounds = max(1, int(search_plan["n_rounds"]))
         except (TypeError, ValueError):
             pass
-    
+
     base_pop = population_size
     base_gens = generations
 
@@ -4772,7 +5282,8 @@ def run_guided_evolution(
         )
 
     beam_result = beam_search_evolution(
-        x, y,
+        x,
+        y,
         operator_hints,
         n_beams=n_beams,
         n_rounds=n_rounds,
@@ -4791,24 +5302,24 @@ def run_guided_evolution(
         output_units=output_units,
         dim_penalty_weight=dim_penalty_weight,
     )
-    
-    if beam_result is not None and beam_result['mse'] < float('inf'):
+
+    if beam_result is not None and beam_result["mse"] < float("inf"):
         return beam_result
-    
+
     # ── Fallback: Single PyTorch ONN evolution ──
     print("\n⚠️ Beam search unavailable, falling back to single PyTorch evolution...")
-    
+
     from glassbox.evolution import EvolutionaryONNTrainer, finalize_model_coefficients
-    
-    print("\n" + "="*60)
+
+    print("\n" + "=" * 60)
     print("GUIDED EVOLUTION: Operator-Constrained Search (PyTorch)")
-    print("="*60)
+    print("=" * 60)
     print(f"  Active operators: {operator_hints.get('operators', set())}")
     print(f"  Detected frequencies: {operator_hints.get('frequencies', [])}")
     print(f"  Active terms: {operator_hints.get('active_terms', [])[:5]}...")
-    
+
     start_time = time.time()
-    
+
     # Create operator-biased model factory
     factory = create_guided_onn_factory(
         operator_hints,
@@ -4816,7 +5327,7 @@ def run_guided_evolution(
         n_hidden_layers=2,
         nodes_per_layer=4,
     )
-    
+
     # Create trainer with smaller population (faster, since we have hints)
     trainer = EvolutionaryONNTrainer(
         model_factory=factory,
@@ -4834,35 +5345,37 @@ def run_guided_evolution(
         nested_bfgs_every=5,
         nested_bfgs_steps=20,
     )
-    
+
     # Initialize and evolve
     trainer.initialize_population()
     results = trainer.train(x, y, generations=generations, print_every=5)
-    
+
     # Finalize best model
     if trainer.best_ever:
         final_model = trainer.best_ever.model
         final_mse, final_formula = finalize_model_coefficients(
-            final_model, x, y,
+            final_model,
+            x,
+            y,
             refine_internal_constants=True,
         )
-    elif results and 'model' in results:
-        final_model = results['model']
-        final_mse = results.get('final_mse', float('inf'))
-        final_formula = results.get('formula', 'Unknown')
+    elif results and "model" in results:
+        final_model = results["model"]
+        final_mse = results.get("final_mse", float("inf"))
+        final_formula = results.get("formula", "Unknown")
     else:
         return None
-    
+
     elapsed = time.time() - start_time
-    
+
     print(f"\n  Evolved Formula: {final_formula}")
     print(f"  Final MSE: {final_mse:.6f}")
     print(f"  Evolution Time: {elapsed:.2f}s")
-    print("="*60)
-    
+    print("=" * 60)
+
     return {
-        'formula': final_formula,
-        'mse': final_mse,
-        'time': elapsed,
-        'model': final_model,
+        "formula": final_formula,
+        "mse": final_mse,
+        "time": elapsed,
+        "model": final_model,
     }

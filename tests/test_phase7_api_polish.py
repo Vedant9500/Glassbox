@@ -1,5 +1,5 @@
 """Phase 7: API polish (S1-11 export, S5-14 implicit mul / power print, S6-2 knobs)."""
-import inspect
+
 import sys
 from pathlib import Path
 
@@ -15,7 +15,8 @@ from glassbox.sr.cpp import get_cpp_core
 
 _core = get_cpp_core()
 CPP_AVAILABLE = _core is not None and (
-    hasattr(_core, "formula_to_seed_graph") or hasattr(_core, "formula_to_seed_graph_cpp")
+    hasattr(_core, "formula_to_seed_graph")
+    or hasattr(_core, "formula_to_seed_graph_cpp")
 )
 
 requires_cpp = pytest.mark.skipif(not CPP_AVAILABLE, reason="C++ _core not built")
@@ -34,7 +35,7 @@ def _snap(formula: str, n_features: int = 1) -> str:
 
 
 def test_s1_11_glassbox_regressor_exported():
-    from glassbox.sr import GlassboxRegressor, FPIPv2, FPIPv2Payload
+    from glassbox.sr import FPIPv2, FPIPv2Payload, GlassboxRegressor
 
     assert GlassboxRegressor is not None
     assert FPIPv2Payload is FPIPv2

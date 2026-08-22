@@ -1,4 +1,5 @@
 """Phase 7 routing calibration + Phase 8 release-gate smoke tests."""
+
 from __future__ import annotations
 
 import sys
@@ -14,8 +15,8 @@ if str(REPO / "scripts") not in sys.path:
     sys.path.insert(0, str(REPO / "scripts"))
 
 from glassbox.sr.sklearn_wrapper import (
-    GlassboxRegressor,
     _NOISE_BAND_THRESHOLDS,
+    GlassboxRegressor,
     _estimate_outlier_fraction,
     _noise_band_from_diagnostics,
     _residual_lag1_autocorr,
@@ -47,27 +48,33 @@ def test_outlier_fraction_and_noise_band():
     r[-10:] = 50.0
     frac = _estimate_outlier_fraction(r)
     assert frac >= 0.05
-    band = _noise_band_from_diagnostics({
-        "outlier_fraction": 0.2,
-        "validation_gap": 0.3,
-        "residual_autocorr": 0.5,
-        "ess_ratio": 0.4,
-    })
+    band = _noise_band_from_diagnostics(
+        {
+            "outlier_fraction": 0.2,
+            "validation_gap": 0.3,
+            "residual_autocorr": 0.5,
+            "ess_ratio": 0.4,
+        }
+    )
     assert band in ("medium", "high")
     assert _noise_band_from_diagnostics({}) == "clean"
     # Phase E+: residual RMS / signal-scale outlier channels.
-    assert _noise_band_from_diagnostics({
-        "residual_rms_ratio": 0.10,
-        "outlier_fraction": 0.0,
-        "validation_gap": 0.0,
-        "residual_autocorr": 0.0,
-        "ess_ratio": 1.0,
-    }) in ("low", "medium", "high")
-    assert _noise_band_from_diagnostics({
-        "signal_outlier_fraction": 0.03,
-        "outlier_fraction": 0.0,
-        "residual_rms_ratio": 0.45,
-    }) in ("medium", "high")
+    assert _noise_band_from_diagnostics(
+        {
+            "residual_rms_ratio": 0.10,
+            "outlier_fraction": 0.0,
+            "validation_gap": 0.0,
+            "residual_autocorr": 0.0,
+            "ess_ratio": 1.0,
+        }
+    ) in ("low", "medium", "high")
+    assert _noise_band_from_diagnostics(
+        {
+            "signal_outlier_fraction": 0.03,
+            "outlier_fraction": 0.0,
+            "residual_rms_ratio": 0.45,
+        }
+    ) in ("medium", "high")
 
 
 def test_runtime_noise_diagnostics_and_plan_calibrate():
@@ -106,12 +113,20 @@ def test_runtime_noise_diagnostics_and_plan_calibrate():
     plan_clean = est._derive_blackbox_search_plan(
         _State(),
         noise_diagnostics=diag_clean,
-        candidate_screening={"best_validation_r2": 0.99, "candidate_count": 4, "family_count": 2},
+        candidate_screening={
+            "best_validation_r2": 0.99,
+            "candidate_count": 4,
+            "family_count": 2,
+        },
     )
     plan_noisy = est._derive_blackbox_search_plan(
         _State(),
         noise_diagnostics=diag_noisy,
-        candidate_screening={"best_validation_r2": 0.99, "candidate_count": 4, "family_count": 2},
+        candidate_screening={
+            "best_validation_r2": 0.99,
+            "candidate_count": 4,
+            "family_count": 2,
+        },
     )
     assert plan_noisy["noise_band"] != "clean" or plan_noisy["noise_pressure"] >= 0.0
     # High/medium noise should not shrink acceptance bar below clean without cause;
@@ -232,7 +247,10 @@ def test_release_gate_robust_trimmed_recovers_linear():
 
 
 def test_benchmark_ablation_presets_exist():
-    from scripts.benchmark_noise import ABLATION_PRESETS, DEFAULT_BLACKBOX_RELEASE_ABLATIONS
+    from scripts.benchmark_noise import (
+        ABLATION_PRESETS,
+        DEFAULT_BLACKBOX_RELEASE_ABLATIONS,
+    )
 
     for key in (
         "full",
@@ -329,16 +347,64 @@ def test_phase_e_ablation_table_from_rows(tmp_path):
 
     rows_by_ablation = {
         "full": [
-            _row("Vladislavleva-4", "clean", clean_r2=1.0, accept=True, exact=True, complexity=12, ablation="full"),
-            _row("Vladislavleva-4", "outliers_3pct", clean_r2=0.95, accept=True, exact=False, complexity=18, ablation="full"),
+            _row(
+                "Vladislavleva-4",
+                "clean",
+                clean_r2=1.0,
+                accept=True,
+                exact=True,
+                complexity=12,
+                ablation="full",
+            ),
+            _row(
+                "Vladislavleva-4",
+                "outliers_3pct",
+                clean_r2=0.95,
+                accept=True,
+                exact=False,
+                complexity=18,
+                ablation="full",
+            ),
         ],
         "no_weights": [
-            _row("Vladislavleva-4", "clean", clean_r2=1.0, accept=True, exact=True, complexity=12, ablation="no_weights"),
-            _row("Vladislavleva-4", "outliers_3pct", clean_r2=0.70, accept=False, exact=False, complexity=40, ablation="no_weights"),
+            _row(
+                "Vladislavleva-4",
+                "clean",
+                clean_r2=1.0,
+                accept=True,
+                exact=True,
+                complexity=12,
+                ablation="no_weights",
+            ),
+            _row(
+                "Vladislavleva-4",
+                "outliers_3pct",
+                clean_r2=0.70,
+                accept=False,
+                exact=False,
+                complexity=40,
+                ablation="no_weights",
+            ),
         ],
         "no_robust_loss": [
-            _row("Vladislavleva-4", "clean", clean_r2=1.0, accept=True, exact=True, complexity=12, ablation="no_robust_loss"),
-            _row("Vladislavleva-4", "outliers_3pct", clean_r2=0.80, accept=True, exact=False, complexity=25, ablation="no_robust_loss"),
+            _row(
+                "Vladislavleva-4",
+                "clean",
+                clean_r2=1.0,
+                accept=True,
+                exact=True,
+                complexity=12,
+                ablation="no_robust_loss",
+            ),
+            _row(
+                "Vladislavleva-4",
+                "outliers_3pct",
+                clean_r2=0.80,
+                accept=True,
+                exact=False,
+                complexity=25,
+                ablation="no_robust_loss",
+            ),
         ],
     }
     table = build_ablation_table(rows_by_ablation, baseline="full")
@@ -427,6 +493,10 @@ def test_phase_e_blackbox_outliers_ci_smoke():
     pred = np.asarray(est.predict(X), dtype=np.float64)
     clean_r2 = 1.0 - float(np.mean((pred - y_clean) ** 2) / (np.var(y_clean) + 1e-15))
     # Soft gate: clean recovery should remain useful under block outliers.
-    assert clean_r2 > 0.5, f"clean recovery too weak under blackbox outliers: {clean_r2}"
+    assert clean_r2 > 0.5, (
+        f"clean recovery too weak under blackbox outliers: {clean_r2}"
+    )
     # Protocol-facing fields exist for release artifacts.
-    assert "ranking_sample_weight_mode" in diag or getattr(est, "sample_weight_provided_", False)
+    assert "ranking_sample_weight_mode" in diag or getattr(
+        est, "sample_weight_provided_", False
+    )

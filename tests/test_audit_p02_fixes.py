@@ -1,13 +1,13 @@
 import numpy as np
-import pytest
-from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
 from glassbox.sr.cpp import get_cpp_core
+from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
 
 def test_p02_island_reproduction_and_nsga_parity():
     """Verify island model (num_islands=8) and single pop (num_islands=1) parity and NSGA non-fallthrough."""
     _core = get_cpp_core()
-    
+
     np.random.seed(42)
     X = np.linspace(-2.0, 2.0, 50).reshape(-1, 1)
     y = 2.5 * X[:, 0] ** 2 + 1.2 * np.sin(X[:, 0])

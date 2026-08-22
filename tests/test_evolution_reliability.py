@@ -3,7 +3,7 @@
 import math
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 import glassbox.evolution as evo
 
@@ -50,7 +50,9 @@ def test_nonfinite_nested_refine_uses_fallback(monkeypatch):
     trainer = _make_trainer(nested_bfgs=True)
     fallback_calls = {"count": 0}
 
-    monkeypatch.setattr(evo, "quick_refine_internal", lambda *args, **kwargs: float("nan"))
+    monkeypatch.setattr(
+        evo, "quick_refine_internal", lambda *args, **kwargs: float("nan")
+    )
 
     def _fallback_refine(*args, **kwargs):
         fallback_calls["count"] += 1
@@ -58,7 +60,9 @@ def test_nonfinite_nested_refine_uses_fallback(monkeypatch):
 
     monkeypatch.setattr(evo, "refine_constants", _fallback_refine)
     monkeypatch.setattr(evo, "calculate_complexity", lambda model: 1.0)
-    monkeypatch.setattr(evo, "coefficient_sparsity_loss", lambda model: torch.tensor(0.0))
+    monkeypatch.setattr(
+        evo, "coefficient_sparsity_loss", lambda model: torch.tensor(0.0)
+    )
     monkeypatch.setattr(evo, "progressive_round_loss", lambda model: torch.tensor(0.0))
 
     x = torch.linspace(-1.0, 1.0, 32).unsqueeze(-1)
@@ -74,8 +78,12 @@ def test_nonfinite_penalty_terms_do_not_poison_fitness(monkeypatch):
     trainer = _make_trainer(nested_bfgs=False)
 
     monkeypatch.setattr(evo, "calculate_complexity", lambda model: 1.0)
-    monkeypatch.setattr(evo, "coefficient_sparsity_loss", lambda model: torch.tensor(float("nan")))
-    monkeypatch.setattr(evo, "progressive_round_loss", lambda model: torch.tensor(float("inf")))
+    monkeypatch.setattr(
+        evo, "coefficient_sparsity_loss", lambda model: torch.tensor(float("nan"))
+    )
+    monkeypatch.setattr(
+        evo, "progressive_round_loss", lambda model: torch.tensor(float("inf"))
+    )
 
     x = torch.linspace(-1.0, 1.0, 32).unsqueeze(-1)
     y = x.squeeze() ** 2
@@ -108,8 +116,12 @@ def test_gradient_informed_mutation_protects_sensitive_logits(monkeypatch):
         sensitivity_bias=1.0,
     )
 
-    high_delta = torch.sum(torch.abs(mutant.model.high_logit - individual.model.high_logit)).item()
-    low_delta = torch.sum(torch.abs(mutant.model.low_logit - individual.model.low_logit)).item()
+    high_delta = torch.sum(
+        torch.abs(mutant.model.high_logit - individual.model.high_logit)
+    ).item()
+    low_delta = torch.sum(
+        torch.abs(mutant.model.low_logit - individual.model.low_logit)
+    ).item()
 
     assert high_delta == 0.0
     assert low_delta > 0.0

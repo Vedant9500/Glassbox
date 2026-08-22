@@ -1,4 +1,5 @@
 """Tier A open-P2 fixes: E8/N7/S3-3/S3-4/S3-5/S7-2/S8-2 regression coverage."""
+
 import sys
 from pathlib import Path
 
@@ -9,13 +10,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from glassbox.sr.sklearn_wrapper import GlassboxRegressor, _mad_scale
 from glassbox.sr.blackbox_preprocessor import (
-    remap_reduced_formula_to_original,
-    remap_original_formula_to_reduced,
     formula_from_search_to_original_space,
     prepare_blackbox_search,
+    remap_original_formula_to_reduced,
+    remap_reduced_formula_to_original,
 )
+from glassbox.sr.sklearn_wrapper import GlassboxRegressor, _mad_scale
 from glassbox.sr.specialist_state import SpecialistVault
 
 cpp_dir = REPO_ROOT / "glassbox" / "sr" / "cpp"
@@ -28,6 +29,7 @@ requires_cpp = pytest.mark.skipif(not CPP_AVAILABLE, reason="C++ _core not built
 
 
 # ── S3-3: user noise protocol activates guards ──────────────────────────────
+
 
 def test_s3_3_user_weights_enable_noise_guard():
     est = GlassboxRegressor(random_state=0)
@@ -57,6 +59,7 @@ def test_s3_3_clean_mse_path_guards_off():
 
 # ── S3-4: residual acceptance bar under noise ───────────────────────────────
 
+
 def test_s3_4_residual_rejects_tiny_weighted_gain(monkeypatch):
     """Under weights, a residual term with <1.5% weighted val gain is rejected."""
     rng = np.random.default_rng(0)
@@ -84,13 +87,21 @@ def test_s3_4_residual_rejects_tiny_weighted_gain(monkeypatch):
     monkeypatch.setattr(
         est,
         "_build_residual_mini_search_candidates",
-        lambda *a, **k: [{"formula": tiny, "source": "unit", "complexity": 2, "risk_score": 0.0}],
+        lambda *a, **k: [
+            {"formula": tiny, "source": "unit", "complexity": 2, "risk_score": 0.0}
+        ],
     )
     monkeypatch.setattr(
         est,
         "_refine_candidate_formulas",
         lambda cands, *a, **k: [
-            {"formula": tiny, "source": "unit", "complexity": 2, "risk_score": 0.0, "validation_r2": 0.01}
+            {
+                "formula": tiny,
+                "source": "unit",
+                "complexity": 2,
+                "risk_score": 0.0,
+                "validation_r2": 0.01,
+            }
         ],
     )
 
@@ -99,10 +110,13 @@ def test_s3_4_residual_rejects_tiny_weighted_gain(monkeypatch):
     assert out is None or out == base or (isinstance(out, str) and tiny not in out)
     guard = getattr(est, "_residual_stage_guard_", {}) or {}
     # Either rejected as no improvement or never accepted.
-    assert guard.get("accepted") in (False, None) or guard.get("residual_rejected_as_noise")
+    assert guard.get("accepted") in (False, None) or guard.get(
+        "residual_rejected_as_noise"
+    )
 
 
 # ── S3-5: snap fidelity helper ──────────────────────────────────────────────
+
 
 def test_s3_5_snap_with_fidelity_rejects_bad_snap():
     est = GlassboxRegressor(random_state=0)
@@ -132,6 +146,7 @@ def test_s3_5_snap_with_fidelity_accepts_near_integer():
 
 # ── S7-2: OOB remap → neutral constant ──────────────────────────────────────
 
+
 def test_s7_2_oob_local_index_maps_to_zero():
     # selected has 3 features (local x0,x1,x2); x5 is OOB local
     mapped = remap_reduced_formula_to_original("x0 + x5", [3, 5, 7])
@@ -157,11 +172,14 @@ def test_s7_2_standardized_oob_expands_to_zero():
     # Force an OOB local index past selected
     oob_local = len(state.selected_features) + 3
     formula = formula_from_search_to_original_space(f"x0 + x{oob_local}", state)
-    assert "+0" in formula.replace(" ", "") or "+ 0" in formula or formula.endswith("+0)")
+    assert (
+        "+0" in formula.replace(" ", "") or "+ 0" in formula or formula.endswith("+0)")
+    )
     assert f"x{oob_local}" not in formula
 
 
 # ── S8-2: composition cap ───────────────────────────────────────────────────
+
 
 def _eval_formula(formula, X):
     """Simple eval matching test_specialist_state for vault unit tests."""
@@ -190,9 +208,24 @@ def test_s8_2_composition_cap_at_most_four():
     vault = SpecialistVault(max_entries=8)
     vault.add_candidates(
         [
-            {"formula": "x0", "validation_r2": 0.5, "validation_mse": 0.5, "source": "outer"},
-            {"formula": "x1", "validation_r2": 0.5, "validation_mse": 0.5, "source": "inner"},
-            {"formula": "0.5*x0", "validation_r2": 0.3, "validation_mse": 0.7, "source": "c"},
+            {
+                "formula": "x0",
+                "validation_r2": 0.5,
+                "validation_mse": 0.5,
+                "source": "outer",
+            },
+            {
+                "formula": "x1",
+                "validation_r2": 0.5,
+                "validation_mse": 0.5,
+                "source": "inner",
+            },
+            {
+                "formula": "0.5*x0",
+                "validation_r2": 0.3,
+                "validation_mse": 0.7,
+                "source": "c",
+            },
         ],
         X,
         y,
@@ -227,8 +260,18 @@ def test_s8_2_composition_rejects_over_complexity():
     # Admit specialists with normal complexity, then propose with inflated cx.
     vault.add_candidates(
         [
-            {"formula": "x0", "validation_r2": 0.5, "validation_mse": 0.5, "source": "a"},
-            {"formula": "x1", "validation_r2": 0.5, "validation_mse": 0.5, "source": "b"},
+            {
+                "formula": "x0",
+                "validation_r2": 0.5,
+                "validation_mse": 0.5,
+                "source": "a",
+            },
+            {
+                "formula": "x1",
+                "validation_r2": 0.5,
+                "validation_mse": 0.5,
+                "source": "b",
+            },
         ],
         X,
         y,
@@ -250,6 +293,7 @@ def test_s8_2_composition_rejects_over_complexity():
 
 
 # ── N7: C++ weighted MAD scale parity with Python ───────────────────────────
+
 
 @requires_cpp
 def test_n7_cpp_huber_with_weights_runs():

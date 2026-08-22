@@ -1,4 +1,5 @@
 """Phase 6 audit checks: S6 seed-graph plumbing + basic FPIP validation."""
+
 import sys
 from pathlib import Path
 
@@ -94,8 +95,8 @@ def test_s10_fpip_v2_validator_rejects_bad_payload():
 
 def test_s7_remap_roundtrip_indices():
     from glassbox.sr.blackbox_preprocessor import (
-        remap_reduced_formula_to_original,
         remap_original_formula_to_reduced,
+        remap_reduced_formula_to_original,
     )
 
     selected = [2, 5, 7]

@@ -5,8 +5,8 @@ The audit flagged ~175 bare ``except Exception`` sites in
 adds a ``swallowed_errors_`` diagnostics counter and typed exceptions at pure
 conversion/import fallback sites so soft-fail paths stay observable post-fit.
 """
+
 import numpy as np
-import pytest
 
 from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
@@ -54,7 +54,7 @@ def test_record_swallowed_error_initialises_missing_dict():
 # Type-narrowed fallbacks
 # ---------------------------------------------------------------------------
 def test_conversion_helpers_use_typed_exceptions():
-    from glassbox.sr.sklearn_wrapper import _clamp_int, _clamp_float, _finite_float
+    from glassbox.sr.sklearn_wrapper import _clamp_float, _clamp_int, _finite_float
 
     # String garbage still falls back to default (no behaviour change).
     assert _clamp_int("not-a-number", default=5, lo=0, hi=10) == 5
@@ -103,7 +103,9 @@ def test_scoring_hot_path_records_eval_failure():
 
     inf_plain = est._plain_unweighted_mse("x9 + 1", X, y)
     assert not np.isfinite(inf_plain)
-    assert est.swallowed_errors_.get("plain_unweighted_mse.eval", {}).get("count", 0) >= 1
+    assert (
+        est.swallowed_errors_.get("plain_unweighted_mse.eval", {}).get("count", 0) >= 1
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +118,7 @@ def test_final_selection_bare_pass_sites_instrumented():
     call so a future refactor cannot silently revert them to bare ``pass``.
     """
     import pathlib
+    import re
 
     src = pathlib.Path("glassbox/sr/sklearn_wrapper.py").read_text()
     expected_sites = {
@@ -130,7 +133,9 @@ def test_final_selection_bare_pass_sites_instrumented():
         "final_guard.recompute_mse",
     }
     for site in expected_sites:
-        assert f'_record_swallowed_error("{site}"' in src, f"missing wiring for {site}"
+        # Whitespace-tolerant: the call may be line-wrapped by formatters.
+        pattern = rf'_record_swallowed_error\(\s*"{re.escape(site)}"'
+        assert re.search(pattern, src), f"missing wiring for {site}"
 
 
 def test_finalize_summary_empty_and_populated():
@@ -141,7 +146,9 @@ def test_finalize_summary_empty_and_populated():
     assert est.swallowed_errors_summary_ == {"total": 0, "sites": {}}
     assert est.blackbox_diagnostics_["swallowed_errors"] == {"total": 0, "sites": {}}
 
-    est.swallowed_errors_ = {"scoring.eval": {"count": 2, "types": {"ValueError": 2}, "last": "x"}}
+    est.swallowed_errors_ = {
+        "scoring.eval": {"count": 2, "types": {"ValueError": 2}, "last": "x"}
+    }
     est._finalize_swallowed_errors_summary()
     assert est.swallowed_errors_summary_["total"] == 2
     assert est.swallowed_errors_summary_["sites"] == est.swallowed_errors_

@@ -16,8 +16,15 @@ def test_fpip_v2_builder_and_validator():
             {"formula": "cos(x)", "mse": 0.1, "score": 0.2},
         ],
         predictions={"sin": 0.8, "cos": 0.2},
-        uncertainty={"prediction_entropy": 0.2, "prediction_margin": 0.6, "prediction_uncertain": False},
-        residual_diagnostics={"residual_suspicious": False, "residual_spectral_peak_ratio": 0.1},
+        uncertainty={
+            "prediction_entropy": 0.2,
+            "prediction_margin": 0.6,
+            "prediction_uncertain": False,
+        },
+        residual_diagnostics={
+            "residual_suspicious": False,
+            "residual_spectral_peak_ratio": 0.1,
+        },
         operator_hints={"operators": {"sin", "periodic"}, "frequencies": [1.0]},
         x=x,
         y=y,
@@ -29,7 +36,9 @@ def test_fpip_v2_builder_and_validator():
     assert payload["schema_version"] == "fpip.v2"
     assert len(payload["candidate_skeletons"]) == 2
     assert all(c.get("probability") is not None for c in payload["candidate_skeletons"])
-    assert abs(sum(c["probability"] for c in payload["candidate_skeletons"]) - 1.0) < 1e-9
+    assert (
+        abs(sum(c["probability"] for c in payload["candidate_skeletons"]) - 1.0) < 1e-9
+    )
     assert payload["search_plan"]
     assert payload["search_plan"].get("seed_budget", 0) >= 4
 

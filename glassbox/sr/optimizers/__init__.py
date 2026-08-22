@@ -6,29 +6,29 @@ This module contains optimization algorithms and strategies.
 
 # Import all public names from bfgs_optimizer
 from .bfgs_optimizer import (
-    RegularizedBFGS,
-    MultiStartBFGS,
     IterativeBFGSRefiner,
-    fit_coefficients_bfgs,
+    MultiStartBFGS,
+    RegularizedBFGS,
     build_formula_from_weights,
+    fit_coefficients_bfgs,
 )
 
 # Import all public names from hybrid_optimizer
 from .hybrid_optimizer import (
-    LBFGSConstantOptimizer,
     EvolutionaryOptimizer,
-    HybridOptimizer,
     GradientGuidedEvolution,
+    HybridOptimizer,
+    LBFGSConstantOptimizer,
 )
 
 __all__ = [
-    'RegularizedBFGS',
-    'MultiStartBFGS',
-    'IterativeBFGSRefiner',
-    'fit_coefficients_bfgs',
-    'build_formula_from_weights',
-    'LBFGSConstantOptimizer',
-    'EvolutionaryOptimizer',
-    'HybridOptimizer',
-    'GradientGuidedEvolution',
+    "EvolutionaryOptimizer",
+    "GradientGuidedEvolution",
+    "HybridOptimizer",
+    "IterativeBFGSRefiner",
+    "LBFGSConstantOptimizer",
+    "MultiStartBFGS",
+    "RegularizedBFGS",
+    "build_formula_from_weights",
+    "fit_coefficients_bfgs",
 ]

@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any
 
 import numpy as np
 
 from glassbox.sr.formula_safety import validate_formula_expr
 
 
-def _clean_float(value: Any) -> Optional[float]:
+def _clean_float(value: Any) -> float | None:
     if value is None:
         return None
     try:
@@ -28,7 +29,7 @@ class SpecialistSegment:
     axis_max: float
     indices: np.ndarray = field(repr=False)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "segment_index": int(self.segment_index),
             "n_samples": int(self.n_samples),
@@ -46,7 +47,7 @@ class SpecialistSegmentScore:
     axis_min: float
     axis_max: float
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "segment_index": int(self.segment_index),
             "n_samples": int(self.n_samples),
@@ -61,17 +62,17 @@ class SpecialistSegmentScore:
 class SpecialistCandidate:
     formula: str
     source: str
-    validation_r2: Optional[float]
-    validation_mse: Optional[float]
+    validation_r2: float | None
+    validation_mse: float | None
     complexity: int
     family_signature: str
-    segment_scores: List[SpecialistSegmentScore]
-    best_segment: Dict[str, Any]
-    worst_segment: Dict[str, Any]
+    segment_scores: list[SpecialistSegmentScore]
+    best_segment: dict[str, Any]
+    worst_segment: dict[str, Any]
     residual_vector: np.ndarray = field(repr=False)
-    hot_spot_segment_scores: List[SpecialistSegmentScore] = field(default_factory=list)
+    hot_spot_segment_scores: list[SpecialistSegmentScore] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "formula": str(self.formula)[:160],
             "source": self.source,
@@ -82,7 +83,9 @@ class SpecialistCandidate:
             "best_segment": dict(self.best_segment),
             "worst_segment": dict(self.worst_segment),
             "segment_scores": [segment.to_dict() for segment in self.segment_scores],
-            "hot_spot_segment_scores": [segment.to_dict() for segment in self.hot_spot_segment_scores],
+            "hot_spot_segment_scores": [
+                segment.to_dict() for segment in self.hot_spot_segment_scores
+            ],
         }
 
 
@@ -100,7 +103,7 @@ class SpecialistPairScore:
     residual_correlation: float
     complementarity_score: float
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "formula_a": str(self.formula_a)[:160],
             "formula_b": str(self.formula_b)[:160],
@@ -120,28 +123,30 @@ class SpecialistPairScore:
 class SpecialistState:
     enabled: bool
     segment_axis: str
-    segments: List[SpecialistSegment]
-    candidates: List[SpecialistCandidate]
-    top_pairs: List[SpecialistPairScore]
-    hot_spot_segments: List[SpecialistSegment] = field(default_factory=list)
-    hot_spot_base_formula: Optional[str] = None
+    segments: list[SpecialistSegment]
+    candidates: list[SpecialistCandidate]
+    top_pairs: list[SpecialistPairScore]
+    hot_spot_segments: list[SpecialistSegment] = field(default_factory=list)
+    hot_spot_base_formula: str | None = None
 
     @property
     def candidate_count(self) -> int:
-        return int(len(self.candidates))
+        return len(self.candidates)
 
     @property
     def segment_count(self) -> int:
-        return int(len(self.segments))
+        return len(self.segments)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "enabled": bool(self.enabled),
             "candidate_count": self.candidate_count,
             "segment_axis": self.segment_axis,
             "segment_count": self.segment_count,
             "segments": [segment.to_dict() for segment in self.segments],
-            "hot_spot_segments": [segment.to_dict() for segment in self.hot_spot_segments],
+            "hot_spot_segments": [
+                segment.to_dict() for segment in self.hot_spot_segments
+            ],
             "hot_spot_base_formula": self.hot_spot_base_formula,
             "top_candidates": [candidate.to_dict() for candidate in self.candidates],
             "top_pairs": [pair.to_dict() for pair in self.top_pairs],
@@ -160,7 +165,7 @@ class SpecialistCompositionProposal:
     family_b: str
     complementarity_score: float
 
-    def to_candidate_dict(self) -> Dict[str, Any]:
+    def to_candidate_dict(self) -> dict[str, Any]:
         return {
             "formula": self.formula,
             "source": "specialist_composition",
@@ -180,18 +185,18 @@ class SpecialistCompositionProposal:
 class SpecialistVaultEntry:
     formula: str
     source: str
-    validation_r2: Optional[float]
-    validation_mse: Optional[float]
+    validation_r2: float | None
+    validation_mse: float | None
     complexity: int
     family_signature: str
-    segment_scores: List[Dict[str, Any]]
+    segment_scores: list[dict[str, Any]]
     residual_vector: np.ndarray = field(repr=False)
     prediction_vector: np.ndarray = field(repr=False)
     run_index: int = 0
     last_improved_run: int = 0
-    residual_relevance: Optional[float] = None
+    residual_relevance: float | None = None
 
-    def to_candidate_dict(self, *, source: str = "specialist_vault") -> Dict[str, Any]:
+    def to_candidate_dict(self, *, source: str = "specialist_vault") -> dict[str, Any]:
         return {
             "formula": self.formula,
             "source": source,
@@ -205,7 +210,7 @@ class SpecialistVaultEntry:
             "specialist_vault_residual_relevance": self.residual_relevance,
         }
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "formula": str(self.formula)[:160],
             "source": self.source,
@@ -225,7 +230,7 @@ class SpecialistVault:
     max_entries: int = 8
     max_stale_runs: int = 3
     corr_threshold: float = 0.98
-    entries: List[SpecialistVaultEntry] = field(default_factory=list)
+    entries: list[SpecialistVaultEntry] = field(default_factory=list)
     added_count: int = 0
     rejected_duplicate_count: int = 0
     evicted_count: int = 0
@@ -271,10 +276,18 @@ class SpecialistVault:
         score = abs(cls._prediction_corr(pred_arr, -res_arr))
         return float(score) if np.isfinite(score) else 0.0
 
-    def _rank_entry_key(self, entry: "SpecialistVaultEntry") -> tuple:
+    def _rank_entry_key(self, entry: SpecialistVaultEntry) -> tuple:
         """Vault retention order: better MSE, then higher residual relevance, then simpler."""
-        mse = float("inf") if entry.validation_mse is None else float(entry.validation_mse)
-        relevance = float(entry.residual_relevance) if entry.residual_relevance is not None else 0.0
+        mse = (
+            float("inf")
+            if entry.validation_mse is None
+            else float(entry.validation_mse)
+        )
+        relevance = (
+            float(entry.residual_relevance)
+            if entry.residual_relevance is not None
+            else 0.0
+        )
         if not np.isfinite(relevance):
             relevance = 0.0
         return (
@@ -306,7 +319,7 @@ class SpecialistVault:
         complexity_fn: Callable[[str], int],
         family_signature_fn: Callable[[str], str],
         run_index: int,
-        current_best_formula: Optional[str] = None,
+        current_best_formula: str | None = None,
         max_new: int = 3,
     ) -> int:
         if not candidate_formulas:
@@ -319,7 +332,7 @@ class SpecialistVault:
         existing_keys = {self._formula_key(entry.formula) for entry in self.entries}
         y_var = max(float(np.var(y_arr)), 1e-15)
 
-        scored: List[tuple[float, Dict[str, Any], np.ndarray, np.ndarray, float]] = []
+        scored: list[tuple[float, dict[str, Any], np.ndarray, np.ndarray, float]] = []
         for candidate in list(candidate_formulas):
             formula = str((candidate or {}).get("formula", "")).strip()
             if not formula:
@@ -328,22 +341,30 @@ class SpecialistVault:
             if key == current_best_key or key in existing_keys:
                 continue
             try:
-                pred = np.asarray(evaluate_formula(formula, X_arr), dtype=np.float64).reshape(-1)
+                pred = np.asarray(
+                    evaluate_formula(formula, X_arr), dtype=np.float64
+                ).reshape(-1)
             except Exception:
                 continue
             if pred.shape != y_arr.shape or not np.all(np.isfinite(pred)):
                 continue
-            if any(abs(self._prediction_corr(pred, entry.prediction_vector)) >= self.corr_threshold for entry in self.entries):
+            if any(
+                abs(self._prediction_corr(pred, entry.prediction_vector))
+                >= self.corr_threshold
+                for entry in self.entries
+            ):
                 self.rejected_duplicate_count += 1
                 continue
             residual = pred - y_arr
             mse = _clean_float((candidate or {}).get("validation_mse"))
             if mse is None:
-                mse = float(np.mean(residual ** 2))
+                mse = float(np.mean(residual**2))
             r2 = _clean_float((candidate or {}).get("validation_r2"))
             if r2 is None:
                 r2 = float(1.0 - mse / y_var)
-            complexity = int((candidate or {}).get("complexity") or complexity_fn(formula))
+            complexity = int(
+                (candidate or {}).get("complexity") or complexity_fn(formula)
+            )
             # S8-1: admission gate — reject bloated / overfit / weak-holdout specialists
             # so vault memory is less easily poisoned by noisy false positives.
             n_pts = int(y_arr.shape[0])
@@ -364,7 +385,11 @@ class SpecialistVault:
                 fit_mse = float(np.mean((p_fit - y_fit) ** 2))
                 hold_r2 = float(1.0 - hold_mse / var_val)
                 fit_r2 = float(1.0 - fit_mse / var_fit)
-                gap = float(fit_r2 - hold_r2) if np.isfinite(fit_r2) and np.isfinite(hold_r2) else 0.0
+                gap = (
+                    float(fit_r2 - hold_r2)
+                    if np.isfinite(fit_r2) and np.isfinite(hold_r2)
+                    else 0.0
+                )
             else:
                 hold_r2 = float(r2) if r2 is not None else -1.0
                 gap = 0.0
@@ -378,11 +403,7 @@ class SpecialistVault:
                 continue
             # H-22: residual_relevance boosts specialists useful for residual composition
             relevance = self.residual_relevance_score(pred, residual)
-            rank = (
-                -float(hold_r2)
-                + 0.002 * float(complexity)
-                - 0.08 * float(relevance)
-            )
+            rank = -float(hold_r2) + 0.002 * float(complexity) - 0.08 * float(relevance)
             scored.append((rank, candidate, pred, residual, relevance))
 
         scored.sort(key=lambda item: item[0])
@@ -395,7 +416,11 @@ class SpecialistVault:
             key = self._formula_key(formula)
             if key in existing_keys:
                 continue
-            if any(abs(self._prediction_corr(pred, entry.prediction_vector)) >= self.corr_threshold for entry in self.entries):
+            if any(
+                abs(self._prediction_corr(pred, entry.prediction_vector))
+                >= self.corr_threshold
+                for entry in self.entries
+            ):
                 self.rejected_duplicate_count += 1
                 continue
             segment_scores = []
@@ -404,7 +429,7 @@ class SpecialistVault:
                     segment_scores.append(dict(segment))
             mse = _clean_float((candidate or {}).get("validation_mse"))
             if mse is None:
-                mse = float(np.mean(residual ** 2))
+                mse = float(np.mean(residual**2))
             r2 = _clean_float((candidate or {}).get("validation_r2"))
             if r2 is None:
                 r2 = float(1.0 - mse / y_var)
@@ -413,8 +438,13 @@ class SpecialistVault:
                 source=str((candidate or {}).get("source") or "candidate"),
                 validation_r2=r2,
                 validation_mse=mse,
-                complexity=int((candidate or {}).get("complexity") or complexity_fn(formula)),
-                family_signature=str((candidate or {}).get("family_signature") or family_signature_fn(formula)),
+                complexity=int(
+                    (candidate or {}).get("complexity") or complexity_fn(formula)
+                ),
+                family_signature=str(
+                    (candidate or {}).get("family_signature")
+                    or family_signature_fn(formula)
+                ),
                 segment_scores=segment_scores,
                 residual_vector=np.asarray(residual, dtype=np.float64),
                 prediction_vector=np.asarray(pred, dtype=np.float64),
@@ -449,7 +479,9 @@ class SpecialistVault:
         y_var = max(float(np.var(y_arr)), 1e-15)
         for entry in self.entries:
             try:
-                pred = np.asarray(evaluate_formula(entry.formula, X_arr), dtype=np.float64).reshape(-1)
+                pred = np.asarray(
+                    evaluate_formula(entry.formula, X_arr), dtype=np.float64
+                ).reshape(-1)
             except Exception:
                 entry.residual_relevance = None
                 continue
@@ -461,14 +493,14 @@ class SpecialistVault:
             entry.residual_vector = residual
             entry.residual_relevance = self.residual_relevance_score(pred, residual)
             # Keep validation metrics in sync with current target for ranking
-            mse = float(np.mean(residual ** 2))
+            mse = float(np.mean(residual**2))
             if np.isfinite(mse):
                 entry.validation_mse = mse
                 entry.validation_r2 = float(1.0 - mse / y_var)
         # H-22: re-rank vault after residual relevance is refreshed
         self._sort_entries()
 
-    def candidate_dicts(self) -> List[Dict[str, Any]]:
+    def candidate_dicts(self) -> list[dict[str, Any]]:
         # Entries are kept sorted by _sort_entries (MSE, residual_relevance, complexity)
         return [entry.to_candidate_dict() for entry in self.entries]
 
@@ -480,10 +512,10 @@ class SpecialistVault:
         evaluate_formula: Callable[[str, Any], Any],
         complexity_fn: Callable[[str], int],
         family_signature_fn: Callable[[str], str],
-        current_best_candidate: Optional[Dict[str, Any]] = None,
+        current_best_candidate: dict[str, Any] | None = None,
         max_candidates: int = 4,
-        max_complexity: Optional[int] = None,
-    ) -> List[Dict[str, Any]]:
+        max_complexity: int | None = None,
+    ) -> list[dict[str, Any]]:
         """Propose specialist compositions with a hard complexity/count cap (S8-2).
 
         Defaults: at most 4 proposals (was 6); drop candidates whose complexity
@@ -536,9 +568,9 @@ class SpecialistVault:
         self.composition_count += len(out)
         return out
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
-            "entry_count": int(len(self.entries)),
+            "entry_count": len(self.entries),
             "max_entries": int(self.max_entries),
             "added_count": int(self.added_count),
             "rejected_duplicate_count": int(self.rejected_duplicate_count),
@@ -553,7 +585,7 @@ def build_specialist_segment_slices(
     *,
     max_segments: int = 4,
     min_segment_size: int = 8,
-) -> Optional[tuple[str, List[SpecialistSegment]]]:
+) -> tuple[str, list[SpecialistSegment]] | None:
     """Build coarse contiguous diagnostic segments over the current search space."""
     X_arr = np.asarray(X, dtype=np.float64)
     n = int(X_arr.shape[0])
@@ -568,7 +600,9 @@ def build_specialist_segment_slices(
         axis_name = "x0"
     else:
         centered = X_arr - np.nanmedian(X_arr, axis=0, keepdims=True)
-        axis_values = np.linalg.norm(np.where(np.isfinite(centered), centered, 0.0), axis=1)
+        axis_values = np.linalg.norm(
+            np.where(np.isfinite(centered), centered, 0.0), axis=1
+        )
         axis_name = "radius"
 
     axis_values = np.where(np.isfinite(axis_values), axis_values, 0.0)
@@ -577,11 +611,15 @@ def build_specialist_segment_slices(
     if n_segments < 2:
         return None
 
-    raw_slices = [chunk for chunk in np.array_split(order, n_segments) if int(len(chunk)) >= int(min_segment_size)]
+    raw_slices = [
+        chunk
+        for chunk in np.array_split(order, n_segments)
+        if len(chunk) >= int(min_segment_size)
+    ]
     if len(raw_slices) < 2:
         return None
 
-    segments: List[SpecialistSegment] = []
+    segments: list[SpecialistSegment] = []
     for idx, chunk in enumerate(raw_slices):
         idx_arr = np.asarray(chunk, dtype=int)
         if idx_arr.size == 0:
@@ -607,7 +645,7 @@ def build_hot_spot_segments(
     *,
     max_segments: int = 6,
     min_segment_size: int = 8,
-) -> List[SpecialistSegment]:
+) -> list[SpecialistSegment]:
     """Build hot-spot driven and curvature-aware segments for diagnostic screening."""
     X_arr = np.asarray(X, dtype=np.float64)
     n = int(X_arr.shape[0])
@@ -620,7 +658,9 @@ def build_hot_spot_segments(
         axis_values = np.asarray(X_arr[:, 0], dtype=np.float64)
     else:
         centered = X_arr - np.nanmedian(X_arr, axis=0, keepdims=True)
-        axis_values = np.linalg.norm(np.where(np.isfinite(centered), centered, 0.0), axis=1)
+        axis_values = np.linalg.norm(
+            np.where(np.isfinite(centered), centered, 0.0), axis=1
+        )
 
     axis_values = np.where(np.isfinite(axis_values), axis_values, 0.0)
     order = np.argsort(axis_values, kind="mergesort")
@@ -675,9 +715,9 @@ def build_hot_spot_segments(
 
     inflection_candidates = []
     for k in range(1, len(d2)):
-        if d2[k] * d2[k-1] < 0:
+        if d2[k] * d2[k - 1] < 0:
             idx_in_sorted = k + 1
-            score = abs(d2[k] - d2[k-1])
+            score = abs(d2[k] - d2[k - 1])
             inflection_candidates.append((idx_in_sorted, score))
 
     inflection_candidates.sort(key=lambda x: -x[1])
@@ -694,7 +734,7 @@ def build_hot_spot_segments(
 
     curvature_segments = []
     for idx in range(len(splits) - 1):
-        i, j = splits[idx], splits[idx+1]
+        i, j = splits[idx], splits[idx + 1]
         idx_arr = order[i:j]
         curvature_segments.append(
             SpecialistSegment(
@@ -721,7 +761,7 @@ def build_hot_spot_segments(
     return all_hs_segments[:max_segments]
 
 
-def infer_specialist_source(candidate: Dict[str, Any]) -> str:
+def infer_specialist_source(candidate: dict[str, Any]) -> str:
     """Normalize the source tag for a candidate formula."""
     if not isinstance(candidate, dict):
         return "candidate"
@@ -751,7 +791,7 @@ def compute_specialist_state(
     family_signature_fn: Callable[[str], str],
     max_candidates: int = 6,
     max_pairs: int = 5,
-) -> Optional[SpecialistState]:
+) -> SpecialistState | None:
     """Summarize coarse segment behavior and pair complementarity for top candidates."""
     if not candidate_formulas:
         return None
@@ -798,14 +838,18 @@ def compute_specialist_state(
             continue
 
         residual = pred - y_arr
-        segment_scores: List[SpecialistSegmentScore] = []
+        segment_scores: list[SpecialistSegmentScore] = []
         for segment in segments:
             idx = segment.indices
             y_seg = y_arr[idx]
             pred_seg = pred[idx]
             mse = float(np.mean((pred_seg - y_seg) ** 2))
             y_var = float(np.var(y_seg))
-            r2 = 1.0 if y_var < 1e-15 and mse < 1e-15 else (0.0 if y_var < 1e-15 else 1.0 - mse / y_var)
+            r2 = (
+                1.0
+                if y_var < 1e-15 and mse < 1e-15
+                else (0.0 if y_var < 1e-15 else 1.0 - mse / y_var)
+            )
             segment_scores.append(
                 SpecialistSegmentScore(
                     segment_index=int(segment.segment_index),
@@ -820,25 +864,29 @@ def compute_specialist_state(
         best_segment = max(segment_scores, key=lambda item: (item.r2, -item.mse))
         worst_segment = min(segment_scores, key=lambda item: (item.r2, item.mse))
 
-        temp_candidates.append({
-            "formula": formula,
-            "candidate": candidate,
-            "pred": pred,
-            "residual": residual,
-            "segment_scores": segment_scores,
-            "best_segment": best_segment,
-            "worst_segment": worst_segment,
-        })
+        temp_candidates.append(
+            {
+                "formula": formula,
+                "candidate": candidate,
+                "pred": pred,
+                "residual": residual,
+                "segment_scores": segment_scores,
+                "best_segment": best_segment,
+                "worst_segment": worst_segment,
+            }
+        )
 
     if not temp_candidates:
         return None
 
-    def _candidate_rank(item: Dict[str, Any]) -> tuple:
+    def _candidate_rank(item: dict[str, Any]) -> tuple:
         candidate = item.get("candidate") or {}
         val_mse = _clean_float(candidate.get("validation_mse"))
         val_r2 = _clean_float(candidate.get("validation_r2"))
         if val_mse is None:
-            val_mse = float(np.mean(np.asarray(item["residual"], dtype=np.float64) ** 2))
+            val_mse = float(
+                np.mean(np.asarray(item["residual"], dtype=np.float64) ** 2)
+            )
         if val_r2 is None:
             val_r2 = -float("inf")
         return (float(val_mse), -float(val_r2))
@@ -856,21 +904,25 @@ def compute_specialist_state(
     )
 
     # Now build SpecialistCandidate objects
-    candidates: List[SpecialistCandidate] = []
+    candidates: list[SpecialistCandidate] = []
     for tc in temp_candidates:
         pred = tc["pred"]
         formula = tc["formula"]
         candidate = tc["candidate"]
 
         # Compute scores on hot_spot_segments
-        hs_segment_scores: List[SpecialistSegmentScore] = []
+        hs_segment_scores: list[SpecialistSegmentScore] = []
         for hs_seg in hot_spot_segments:
             idx = hs_seg.indices
             y_seg = y_arr[idx]
             pred_seg = pred[idx]
             mse = float(np.mean((pred_seg - y_seg) ** 2))
             y_var = float(np.var(y_seg))
-            r2 = 1.0 if y_var < 1e-15 and mse < 1e-15 else (0.0 if y_var < 1e-15 else 1.0 - mse / y_var)
+            r2 = (
+                1.0
+                if y_var < 1e-15 and mse < 1e-15
+                else (0.0 if y_var < 1e-15 else 1.0 - mse / y_var)
+            )
             hs_segment_scores.append(
                 SpecialistSegmentScore(
                     segment_index=int(hs_seg.segment_index),
@@ -888,7 +940,9 @@ def compute_specialist_state(
                 source=infer_specialist_source(candidate),
                 validation_r2=_clean_float((candidate or {}).get("validation_r2")),
                 validation_mse=_clean_float((candidate or {}).get("validation_mse")),
-                complexity=int((candidate or {}).get("complexity") or complexity_fn(formula)),
+                complexity=int(
+                    (candidate or {}).get("complexity") or complexity_fn(formula)
+                ),
                 family_signature=str(family_signature_fn(formula)),
                 segment_scores=tc["segment_scores"],
                 best_segment={
@@ -904,11 +958,15 @@ def compute_specialist_state(
             )
         )
     best_candidate_for_hot_spots = next(
-        (candidate for candidate in candidates if candidate.formula == best_formula_for_hot_spots),
+        (
+            candidate
+            for candidate in candidates
+            if candidate.formula == best_formula_for_hot_spots
+        ),
         candidates[0],
     )
 
-    pair_scores: List[SpecialistPairScore] = []
+    pair_scores: list[SpecialistPairScore] = []
     for left_idx in range(len(candidates)):
         for right_idx in range(left_idx + 1, len(candidates)):
             left = candidates[left_idx]
@@ -929,16 +987,27 @@ def compute_specialist_state(
                     right_wins += 1
                 else:
                     winner = -1
-                if prev_winner is not None and winner != -1 and prev_winner != -1 and winner != prev_winner:
+                if (
+                    prev_winner is not None
+                    and winner != -1
+                    and prev_winner != -1
+                    and winner != prev_winner
+                ):
                     segment_switches += 1
                 if winner != -1:
                     prev_winner = winner
                 denom = max(seg_l.mse, seg_r.mse, 1e-12)
                 segment_margin_sum += abs(seg_l.mse - seg_r.mse) / denom
 
-            split_score = min(left_wins, right_wins) / max(1.0, float(len(left.segment_scores)))
-            switch_score = segment_switches / max(1.0, float(len(left.segment_scores) - 1))
-            margin_score = segment_margin_sum / max(1.0, float(len(left.segment_scores)))
+            split_score = min(left_wins, right_wins) / max(
+                1.0, float(len(left.segment_scores))
+            )
+            switch_score = segment_switches / max(
+                1.0, float(len(left.segment_scores) - 1)
+            )
+            margin_score = segment_margin_sum / max(
+                1.0, float(len(left.segment_scores))
+            )
 
             # Residual correlation
             residual_corr = 0.0
@@ -954,14 +1023,16 @@ def compute_specialist_state(
                     residual_corr = 0.0
             residual_disagreement = 1.0 - abs(float(np.clip(residual_corr, -1.0, 1.0)))
 
-            comp_std = float(np.clip(
-                0.45 * split_score
-                + 0.20 * switch_score
-                + 0.20 * min(1.0, margin_score)
-                + 0.15 * residual_disagreement,
-                0.0,
-                1.0,
-            ))
+            comp_std = float(
+                np.clip(
+                    0.45 * split_score
+                    + 0.20 * switch_score
+                    + 0.20 * min(1.0, margin_score)
+                    + 0.15 * residual_disagreement,
+                    0.0,
+                    1.0,
+                )
+            )
 
             # Hot-spot segment complementarity
             comp_hs = 0.0
@@ -972,7 +1043,9 @@ def compute_specialist_state(
             hs_segment_margin_sum = 0.0
 
             if len(hot_spot_segments) >= 2:
-                for seg_l, seg_r in zip(left.hot_spot_segment_scores, right.hot_spot_segment_scores):
+                for seg_l, seg_r in zip(
+                    left.hot_spot_segment_scores, right.hot_spot_segment_scores
+                ):
                     if seg_l.mse + 1e-12 < seg_r.mse:
                         winner = 0
                         hs_left_wins += 1
@@ -981,32 +1054,51 @@ def compute_specialist_state(
                         hs_right_wins += 1
                     else:
                         winner = -1
-                    if hs_prev_winner is not None and winner != -1 and hs_prev_winner != -1 and winner != hs_prev_winner:
+                    if (
+                        hs_prev_winner is not None
+                        and winner != -1
+                        and hs_prev_winner != -1
+                        and winner != hs_prev_winner
+                    ):
                         hs_segment_switches += 1
                     if winner != -1:
                         hs_prev_winner = winner
                     denom = max(seg_l.mse, seg_r.mse, 1e-12)
                     hs_segment_margin_sum += abs(seg_l.mse - seg_r.mse) / denom
 
-                hs_split_score = min(hs_left_wins, hs_right_wins) / max(1.0, float(len(hot_spot_segments)))
-                hs_switch_score = hs_segment_switches / max(1.0, float(len(hot_spot_segments) - 1))
-                hs_margin_score = hs_segment_margin_sum / max(1.0, float(len(hot_spot_segments)))
+                hs_split_score = min(hs_left_wins, hs_right_wins) / max(
+                    1.0, float(len(hot_spot_segments))
+                )
+                hs_switch_score = hs_segment_switches / max(
+                    1.0, float(len(hot_spot_segments) - 1)
+                )
+                hs_margin_score = hs_segment_margin_sum / max(
+                    1.0, float(len(hot_spot_segments))
+                )
 
-                comp_hs = float(np.clip(
-                    0.45 * hs_split_score
-                    + 0.20 * hs_switch_score
-                    + 0.20 * min(1.0, hs_margin_score)
-                    + 0.15 * residual_disagreement,
-                    0.0,
-                    1.0,
-                ))
+                comp_hs = float(
+                    np.clip(
+                        0.45 * hs_split_score
+                        + 0.20 * hs_switch_score
+                        + 0.20 * min(1.0, hs_margin_score)
+                        + 0.15 * residual_disagreement,
+                        0.0,
+                        1.0,
+                    )
+                )
 
             # Excel-on-hot-spot bonus
             hs_excel_bonus = 0.0
-            total_best_mse = float(np.mean(best_candidate_for_hot_spots.residual_vector ** 2))
+            total_best_mse = float(
+                np.mean(best_candidate_for_hot_spots.residual_vector**2)
+            )
             if total_best_mse >= 1e-12 and len(hot_spot_segments) > 0:
-                for seg_idx, (seg_l, seg_r) in enumerate(zip(left.hot_spot_segment_scores, right.hot_spot_segment_scores)):
-                    seg_best = best_candidate_for_hot_spots.hot_spot_segment_scores[seg_idx]
+                for seg_idx, (seg_l, seg_r) in enumerate(
+                    zip(left.hot_spot_segment_scores, right.hot_spot_segment_scores)
+                ):
+                    seg_best = best_candidate_for_hot_spots.hot_spot_segment_scores[
+                        seg_idx
+                    ]
                     if seg_best.mse > 1.2 * total_best_mse:
                         if min(seg_l.mse, seg_r.mse) < 0.7 * seg_best.mse:
                             hs_excel_bonus += 0.10
@@ -1059,30 +1151,32 @@ def compute_specialist_state(
 def nest_formulas(f: str, g: str) -> str:
     """Replace variable (e.g. x0, x1, x) in f with (g)."""
     import re
+
     return re.sub(r"\bx\d*\b", f"({g})", f)
 
 
-def _dedupe_append(forms: List[tuple[str, str]], operator: str, formula: str) -> None:
+def _dedupe_append(forms: list[tuple[str, str]], operator: str, formula: str) -> None:
     key = (operator, "".join(str(formula).lower().split()))
-    if key not in {(_op, "".join(str(_formula).lower().split())) for _op, _formula in forms}:
+    if key not in {
+        (_op, "".join(str(_formula).lower().split())) for _op, _formula in forms
+    }:
         forms.append((operator, formula))
 
 
 def propose_specialist_compositions(
-    state: Optional[SpecialistState],
+    state: SpecialistState | None,
     X: Any = None,
     y: Any = None,
     *,
-    evaluate_formula: Optional[Callable[[str, Any], Any]] = None,
+    evaluate_formula: Callable[[str, Any], Any] | None = None,
     max_pairs: int = 3,
     min_complementarity: float = 0.30,
-) -> List[SpecialistCompositionProposal]:
+) -> list[SpecialistCompositionProposal]:
     """Generate a tiny set of composition proposals from the best specialist pairs."""
     if state is None or not state.enabled:
         return []
 
-    import re
-    proposals: List[SpecialistCompositionProposal] = []
+    proposals: list[SpecialistCompositionProposal] = []
     seen = set()
 
     # Simple local eval helper if evaluate_formula is not provided
@@ -1104,7 +1198,9 @@ def propose_specialist_compositions(
         cleaned_expr = str(expr_str).replace("^", "**")
         # R-02: gate the eval with the AST allowlist before it runs.
         validate_formula_expr(cleaned_expr, context.keys())
-        return np.asarray(eval(cleaned_expr, {"__builtins__": None}, context), dtype=np.float64)
+        return np.asarray(
+            eval(cleaned_expr, {"__builtins__": None}, context), dtype=np.float64
+        )
 
     eval_fn = evaluate_formula if evaluate_formula is not None else _local_eval
 
@@ -1127,7 +1223,7 @@ def propose_specialist_compositions(
             pred_f = left.residual_vector + y_arr
             pred_g = right.residual_vector + y_arr
 
-        forms: List[tuple[str, str]] = []
+        forms: list[tuple[str, str]] = []
         _dedupe_append(forms, "add", f"(({pair.formula_a})+({pair.formula_b}))")
         _dedupe_append(forms, "mul", f"(({pair.formula_a})*({pair.formula_b}))")
 
@@ -1142,11 +1238,14 @@ def propose_specialist_compositions(
             _dedupe_append(forms, "div", f"(({pair.formula_b})/({pair.formula_a}))")
 
         # 2. Nested: f(g)
-        def _maybe_add_nested(outer_formula: str, inner_formula: str, outer_family: str, inner_pred: Optional[np.ndarray]) -> None:
+        def _maybe_add_nested(
+            outer_formula: str,
+            inner_formula: str,
+            outer_family: str,
+            inner_pred: np.ndarray | None,
+        ) -> None:
             # H-21: family may be multi-token ("exp+sin") or legacy single-token ("sin")
-            family_tokens = {
-                t for t in str(outer_family or "").split("+") if t
-            }
+            family_tokens = {t for t in str(outer_family or "").split("+") if t}
             nestable = family_tokens & {"sin", "cos", "exp", "log"}
             if not nestable:
                 return
@@ -1170,34 +1269,68 @@ def propose_specialist_compositions(
             denom = np.sum(diff**2)
             alpha = np.sum(diff * (y_arr - pred_g)) / denom if denom > 1e-9 else 0.5
             if 0.05 < float(alpha) < 0.95:
-                forms.append(("affine", f"(({alpha:.6g})*({pair.formula_a})) + (((1.0 - {alpha:.6g}))*({pair.formula_b}))"))
+                forms.append(
+                    (
+                        "affine",
+                        f"(({alpha:.6g})*({pair.formula_a})) + (((1.0 - {alpha:.6g}))*({pair.formula_b}))",
+                    )
+                )
         else:
-            forms.append(("affine", f"((0.5)*({pair.formula_a})) + (((1.0 - 0.5))*({pair.formula_b}))"))
+            forms.append(
+                (
+                    "affine",
+                    f"((0.5)*({pair.formula_a})) + (((1.0 - 0.5))*({pair.formula_b}))",
+                )
+            )
 
         # 4. Damped product: f * exp(-beta * g^2)
-        def _maybe_add_damped(base_formula: str, damp_formula: str, base_pred: np.ndarray, damp_pred: np.ndarray) -> None:
+        def _maybe_add_damped(
+            base_formula: str,
+            damp_formula: str,
+            base_pred: np.ndarray,
+            damp_pred: np.ndarray,
+        ) -> None:
             betas = np.logspace(-3, 2, 15)
             best_beta = 0.1
-            best_mse = float('inf')
+            best_mse = float("inf")
             for b in betas:
                 pred_hs = base_pred * np.exp(-b * (damp_pred**2))
-                mse = np.mean((pred_hs - y_arr)**2)
+                mse = np.mean((pred_hs - y_arr) ** 2)
                 if mse < best_mse:
                     best_mse = mse
                     best_beta = b
             final_damp = np.exp(-best_beta * (damp_pred**2))
             if np.mean(final_damp < 1e-3) <= 0.5:
-                _dedupe_append(forms, "damped_product", f"(({base_formula}) * exp((-{best_beta:.6g}) * (({damp_formula})**2)))")
+                _dedupe_append(
+                    forms,
+                    "damped_product",
+                    f"(({base_formula}) * exp((-{best_beta:.6g}) * (({damp_formula})**2)))",
+                )
 
         if y is not None and pred_f is not None and pred_g is not None:
             _maybe_add_damped(pair.formula_a, pair.formula_b, pred_f, pred_g)
             _maybe_add_damped(pair.formula_b, pair.formula_a, pred_g, pred_f)
         else:
-            forms.append(("damped_product", f"(({pair.formula_a}) * exp((-1.0) * (({pair.formula_b})**2)))"))
-            forms.append(("damped_product", f"(({pair.formula_b}) * exp((-1.0) * (({pair.formula_a})**2)))"))
+            forms.append(
+                (
+                    "damped_product",
+                    f"(({pair.formula_a}) * exp((-1.0) * (({pair.formula_b})**2)))",
+                )
+            )
+            forms.append(
+                (
+                    "damped_product",
+                    f"(({pair.formula_b}) * exp((-1.0) * (({pair.formula_a})**2)))",
+                )
+            )
 
         # 5. Sigmoid gate: f * sig + g * (1 - sig)
-        if y is not None and X is not None and pred_f is not None and pred_g is not None:
+        if (
+            y is not None
+            and X is not None
+            and pred_f is not None
+            and pred_g is not None
+        ):
             X_arr = np.asarray(X, dtype=np.float64)
             if X_arr.ndim != 2 or X_arr.shape[1] == 0:
                 t = np.arange(len(y_arr), dtype=np.float64)
@@ -1205,7 +1338,9 @@ def propose_specialist_compositions(
                 t = np.asarray(X_arr[:, 0], dtype=np.float64)
             else:
                 centered = X_arr - np.nanmedian(X_arr, axis=0, keepdims=True)
-                t = np.linalg.norm(np.where(np.isfinite(centered), centered, 0.0), axis=1)
+                t = np.linalg.norm(
+                    np.where(np.isfinite(centered), centered, 0.0), axis=1
+                )
 
             if X_arr.shape[1] == 1:
                 gate_var = "x0"
@@ -1223,14 +1358,14 @@ def propose_specialist_compositions(
             k_candidates = [-10.0, -5.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 5.0, 10.0]
 
             best_k, best_c = 1.0, np.median(t)
-            best_mse = float('inf')
+            best_mse = float("inf")
             for c_val in c_candidates:
                 for k_val in k_candidates:
                     arg = -k_val * (t - c_val)
                     arg = np.clip(arg, -50.0, 50.0)
                     sig = 1.0 / (1.0 + np.exp(arg))
                     pred_hs = pred_f * sig + pred_g * (1.0 - sig)
-                    mse = np.mean((pred_hs - y_arr)**2)
+                    mse = np.mean((pred_hs - y_arr) ** 2)
                     if mse < best_mse:
                         best_mse = mse
                         best_k = k_val
@@ -1241,9 +1376,19 @@ def propose_specialist_compositions(
                 float(np.mean((pred_g - y_arr) ** 2)),
             )
             if best_mse + 1e-12 < parent_best_mse:
-                forms.append(("sigmoid_gate", f"(({pair.formula_a}) * (1.0 / (1.0 + exp((-{best_k:.6g}) * ({gate_var} - ({best_c:.6g})))))) + (({pair.formula_b}) * (1.0 - (1.0 / (1.0 + exp((-{best_k:.6g}) * ({gate_var} - ({best_c:.6g})))))))"))
+                forms.append(
+                    (
+                        "sigmoid_gate",
+                        f"(({pair.formula_a}) * (1.0 / (1.0 + exp((-{best_k:.6g}) * ({gate_var} - ({best_c:.6g})))))) + (({pair.formula_b}) * (1.0 - (1.0 / (1.0 + exp((-{best_k:.6g}) * ({gate_var} - ({best_c:.6g})))))))",
+                    )
+                )
         else:
-            forms.append(("sigmoid_gate", f"(({pair.formula_a}) * (1.0 / (1.0 + exp((-1.0) * (x0 - (0.0)))))) + (({pair.formula_b}) * (1.0 - (1.0 / (1.0 + exp((-1.0) * (x0 - (0.0)))))))"))
+            forms.append(
+                (
+                    "sigmoid_gate",
+                    f"(({pair.formula_a}) * (1.0 / (1.0 + exp((-1.0) * (x0 - (0.0)))))) + (({pair.formula_b}) * (1.0 - (1.0 / (1.0 + exp((-1.0) * (x0 - (0.0)))))))",
+                )
+            )
 
         # Grade templates by training MSE and complexity
         candidate_templates = []
@@ -1252,12 +1397,14 @@ def propose_specialist_compositions(
                 try:
                     pred_comp = eval_fn(formula, X_arr)
                     pred_comp = np.asarray(pred_comp, dtype=np.float64).reshape(-1)
-                    if pred_comp.shape == y_arr.shape and np.all(np.isfinite(pred_comp)):
-                        mse_val = np.mean((pred_comp - y_arr)**2)
+                    if pred_comp.shape == y_arr.shape and np.all(
+                        np.isfinite(pred_comp)
+                    ):
+                        mse_val = np.mean((pred_comp - y_arr) ** 2)
                     else:
-                        mse_val = float('inf')
+                        mse_val = float("inf")
                 except Exception:
-                    mse_val = float('inf')
+                    mse_val = float("inf")
             else:
                 mse_val = 0.0
 
@@ -1295,7 +1442,9 @@ def propose_specialist_compositions(
             candidate_templates.append((operator, formula, mse_val, total_comp))
 
         # Filter out invalid
-        candidate_templates = [ct for ct in candidate_templates if ct[2] != float('inf')]
+        candidate_templates = [
+            ct for ct in candidate_templates if ct[2] != float("inf")
+        ]
         # Preserve operator diversity before validation. MSE still breaks ties within each template family.
         priority = {
             "nested": 0,
@@ -1313,7 +1462,9 @@ def propose_specialist_compositions(
         for legacy_op in ("add", "mul"):
             legacy_candidates = [ct for ct in candidate_templates if ct[0] == legacy_op]
             if legacy_candidates:
-                selected_templates.append(min(legacy_candidates, key=lambda ct: (ct[2], ct[3])))
+                selected_templates.append(
+                    min(legacy_candidates, key=lambda ct: (ct[2], ct[3]))
+                )
                 selected_ops.add(legacy_op)
         for ct in candidate_templates:
             if ct[0] in selected_ops:

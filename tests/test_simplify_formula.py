@@ -40,7 +40,9 @@ def test_double_angle_identity():
 
 def test_float_snapping_then_simplification():
     """Near-integer coefficients should snap and simplify deterministically."""
-    _, simplified = simplify_onn_formula("0.999999999*x + 1.000000001*x + 0.0000000001*y")
+    _, simplified = simplify_onn_formula(
+        "0.999999999*x + 1.000000001*x + 0.0000000001*y"
+    )
     x = sp.Symbol("x")
     assert _equivalent(simplified, 2 * x)
 

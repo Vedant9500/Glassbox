@@ -1,5 +1,6 @@
 import numpy as np
 
+import glassbox.universal_proposer.universal_proposer as up
 from glassbox.universal_proposer import (
     UNIVERSAL_PROPOSER_ROLE,
     UniversalProposer,
@@ -7,7 +8,6 @@ from glassbox.universal_proposer import (
     propose_from_xy,
     proposer_output_to_fpip_v2,
 )
-import glassbox.universal_proposer.universal_proposer as up
 
 
 def _minimal_proposer_output(sequence_uncertainty, best_relative_mse):

@@ -33,10 +33,11 @@ import os
 import sys
 import time
 import warnings
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any
 
 import numpy as np
 
@@ -58,6 +59,7 @@ def _rsl():
     global rsl
     if rsl is None:
         from scripts import run_srbench_local as _mod
+
         rsl = _mod
     return rsl
 
@@ -101,12 +103,10 @@ def add_gaussian_noise(
     )
 
 
-def add_pink_noise(
-    y: np.ndarray, rms_fraction: float, *, seed: int = 0
-) -> np.ndarray:
+def add_pink_noise(y: np.ndarray, rms_fraction: float, *, seed: int = 0) -> np.ndarray:
     """Correlated 1/f (pink) noise; std = ``rms_fraction * noise_amplitude_scale(y)``."""
     rng = _require_rng(seed)
-    n = int(len(y))
+    n = len(y)
     white = rng.standard_normal(n)
     fft_white = np.fft.rfft(white)
     freqs = np.fft.rfftfreq(n, d=1.0)
@@ -148,7 +148,7 @@ def add_outlier_noise(
     """Corrupt ``fraction`` of points with spikes ~``magnitude_stds`` of signal scale."""
     rng = _require_rng(seed)
     arr = np.asarray(y, dtype=np.float64).copy()
-    n = int(len(arr))
+    n = len(arr)
     n_outliers = max(1, int(round(n * float(fraction))))
     indices = rng.choice(n, size=n_outliers, replace=False)
     scale = noise_amplitude_scale(arr)
@@ -162,7 +162,7 @@ def add_outlier_noise(
 # Each tier: (tier_name, noise_type, level, builder)
 # level is RMS-fraction for gaussian/pink, fraction-of-points for outliers,
 # n_levels for quantization. clean has level 0.0.
-NOISE_TIERS: List[Dict[str, Any]] = [
+NOISE_TIERS: list[dict[str, Any]] = [
     {"name": "clean", "noise_type": "clean", "noise_level": 0.0},
     {"name": "gaussian_0.1pct", "noise_type": "gaussian", "noise_level": 0.001},
     {"name": "gaussian_1pct", "noise_type": "gaussian", "noise_level": 0.01},
@@ -173,9 +173,7 @@ NOISE_TIERS: List[Dict[str, Any]] = [
 ]
 
 
-def apply_noise_tier(
-    y: np.ndarray, tier: Dict[str, Any], *, seed: int
-) -> np.ndarray:
+def apply_noise_tier(y: np.ndarray, tier: dict[str, Any], *, seed: int) -> np.ndarray:
     """Apply a single tier deterministically. Clean tier returns y unchanged."""
     y = np.asarray(y, dtype=np.float64)
     ntype = str(tier.get("noise_type", "clean"))
@@ -212,14 +210,14 @@ def make_seeded_train_test_split(
     return X_sel[:n_train], X_sel[n_train:], y_sel[:n_train], y_sel[n_train:]
 
 
-def generate_ground_truth_data(problem: Tuple, n_samples: int = 500, seed: int = 42):
+def generate_ground_truth_data(problem: tuple, n_samples: int = 500, seed: int = 42):
     """Generate (X, y, formula_str) for a problem tuple without importing Glassbox."""
     name, fn, n_features, x_ranges, formula_str = problem
     rng = np.random.RandomState(int(seed))
-    ranges = x_ranges if len(x_ranges) == n_features else list(x_ranges) * int(n_features)
-    X = np.column_stack([
-        rng.uniform(lo, hi, size=int(n_samples)) for lo, hi in ranges
-    ])
+    ranges = (
+        x_ranges if len(x_ranges) == n_features else list(x_ranges) * int(n_features)
+    )
+    X = np.column_stack([rng.uniform(lo, hi, size=int(n_samples)) for lo, hi in ranges])
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         y = fn(X)
@@ -230,7 +228,7 @@ def generate_ground_truth_data(problem: Tuple, n_samples: int = 500, seed: int =
 
 
 # Built-in catalogue for protocol baseline / smoke without torch.
-BUILTIN_PROBLEMS: Dict[str, Tuple] = {
+BUILTIN_PROBLEMS: dict[str, tuple] = {
     "Poly-x2": (
         "Poly-x2",
         lambda X: X[:, 0] ** 2,
@@ -314,14 +312,15 @@ def _sample_weight_mode(estimator: Any) -> str:
         if getattr(estimator, "sample_weight_provided_", False):
             return "auto_soft_mad"
         return "auto_huber"
-    if getattr(estimator, "sample_weight_provided_", False) and getattr(
-        estimator, "sample_weight_", None
-    ) is not None:
+    if (
+        getattr(estimator, "sample_weight_provided_", False)
+        and getattr(estimator, "sample_weight_", None) is not None
+    ):
         return "provided"
     return "none"
 
 
-def _blackbox_diag_fields(estimator: Any, n_features: int) -> Dict[str, Any]:
+def _blackbox_diag_fields(estimator: Any, n_features: int) -> dict[str, Any]:
     """Extract blackbox / noise-routing fields for protocol rows (Phase A)."""
     diag = getattr(estimator, "blackbox_diagnostics_", None)
     if not isinstance(diag, dict):
@@ -329,29 +328,44 @@ def _blackbox_diag_fields(estimator: Any, n_features: int) -> Dict[str, Any]:
     selected = diag.get("selected_features")
     if not isinstance(selected, list):
         selected = []
-    runtime = diag.get("runtime_noise") if isinstance(diag.get("runtime_noise"), dict) else {}
+    runtime = (
+        diag.get("runtime_noise") if isinstance(diag.get("runtime_noise"), dict) else {}
+    )
     plan = getattr(estimator, "blackbox_search_plan_", None)
     if not isinstance(plan, dict):
-        plan = diag.get("search_plan") if isinstance(diag.get("search_plan"), dict) else {}
+        plan = (
+            diag.get("search_plan") if isinstance(diag.get("search_plan"), dict) else {}
+        )
     noise_band = runtime.get("noise_band") or plan.get("noise_band")
     noise_pressure = plan.get("noise_pressure")
     if noise_pressure is None and isinstance(plan.get("noise_routing"), dict):
         noise_pressure = plan.get("noise_routing", {}).get("noise_pressure")
-    enabled = bool(diag.get("enabled")) if "enabled" in diag else bool(selected) and int(n_features) > 1
+    enabled = (
+        bool(diag.get("enabled"))
+        if "enabled" in diag
+        else bool(selected) and int(n_features) > 1
+    )
     return {
         "n_features": int(n_features),
         "blackbox_enabled": enabled,
-        "blackbox_reason": str(diag.get("reason") or ("unknown" if enabled else "disabled_or_low_dimensional")),
+        "blackbox_reason": str(
+            diag.get("reason")
+            or ("unknown" if enabled else "disabled_or_low_dimensional")
+        ),
         "selected_features": [int(i) for i in selected],
         "n_selected_features": int(diag.get("n_selected_features") or len(selected)),
-        "feature_selection_uncertain": bool(diag.get("feature_selection_uncertain", False)),
-        "ranking_sample_weight_mode": str(diag.get("ranking_sample_weight_mode") or "none"),
+        "feature_selection_uncertain": bool(
+            diag.get("feature_selection_uncertain", False)
+        ),
+        "ranking_sample_weight_mode": str(
+            diag.get("ranking_sample_weight_mode") or "none"
+        ),
         "noise_band": str(noise_band) if noise_band is not None else None,
         "noise_pressure": _to_json_float(noise_pressure),
     }
 
 
-def _empty_blackbox_fields(n_features: int = 0) -> Dict[str, Any]:
+def _empty_blackbox_fields(n_features: int = 0) -> dict[str, Any]:
     return {
         "n_features": int(n_features),
         "blackbox_enabled": False,
@@ -366,8 +380,8 @@ def _empty_blackbox_fields(n_features: int = 0) -> Dict[str, Any]:
 
 
 def _false_confidence(
-    *, train_r2: Optional[float], test_r2: Optional[float], threshold: float = 0.95
-) -> Optional[bool]:
+    *, train_r2: float | None, test_r2: float | None, threshold: float = 0.95
+) -> bool | None:
     """True when train looks great but test collapses (the false-confidence case)."""
     if train_r2 is None or test_r2 is None:
         return None
@@ -390,11 +404,11 @@ def _seed_graphs_used(estimator: Any) -> int:
 # Protocol runner
 # ---------------------------------------------------------------------------
 def default_parallel_config(
-    n_jobs: Optional[int] = None,
-    omp_num_threads: Optional[int] = None,
+    n_jobs: int | None = None,
+    omp_num_threads: int | None = None,
     *,
-    cpu_count: Optional[int] = None,
-) -> Tuple[int, int]:
+    cpu_count: int | None = None,
+) -> tuple[int, int]:
     """Choose outer workers × per-worker OpenMP threads for protocol cells.
 
     Goal: ``workers * OMP_NUM_THREADS ≈ logical CPUs`` without massive
@@ -408,9 +422,7 @@ def default_parallel_config(
     cpus = max(1, cpus)
     if n_jobs is None or int(n_jobs) <= 0:
         # Prefer a few fat outer jobs over many tiny ones.
-        if cpus >= 16:
-            jobs = 4
-        elif cpus >= 8:
+        if cpus >= 16 or cpus >= 8:
             jobs = 4
         elif cpus >= 4:
             jobs = 2
@@ -455,7 +467,7 @@ def _silence_stdio(enabled: bool = True):
                 yield
 
 
-def _cell_status(row: Dict[str, Any], *, acceptable_r2: float) -> str:
+def _cell_status(row: dict[str, Any], *, acceptable_r2: float) -> str:
     if row.get("error"):
         return "ERR"
     if row.get("exact_match"):
@@ -496,8 +508,8 @@ class _ProtocolDashboard:
         self.low = 0
         self.err = 0
         self.started = time.time()
-        self.current: Optional[str] = None
-        self.last_line: Optional[str] = None
+        self.current: str | None = None
+        self.last_line: str | None = None
         self._use_tty = bool(getattr(sys.stdout, "isatty", lambda: False)())
         if self.enabled and self.total > 0:
             self._render(prefix="START")
@@ -509,7 +521,7 @@ class _ProtocolDashboard:
         filled = int(round(frac * width))
         return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
 
-    def _render(self, *, prefix: str = "RUN", last: Optional[str] = None) -> None:
+    def _render(self, *, prefix: str = "RUN", last: str | None = None) -> None:
         if not self.enabled:
             return
         elapsed = time.time() - self.started
@@ -534,7 +546,7 @@ class _ProtocolDashboard:
         # Compact: overwrite a 2-line dashboard on TTYs; else one line per update.
         if self._use_tty and self.last_line is not None:
             # Move up 2 lines and clear them.
-            sys.stdout.write("[2A[2K[1B[2K[1A")
+            sys.stdout.write("\x1b[2A\x1b[2K\x1b[1B\x1b[2K\x1b[1A")
         print(line)
         print(task)
         sys.stdout.flush()
@@ -549,10 +561,10 @@ class _ProtocolDashboard:
 
     def finish_cell(
         self,
-        row: Dict[str, Any],
+        row: dict[str, Any],
         *,
         acceptable_r2: float,
-        next_cell: Optional[str] = None,
+        next_cell: str | None = None,
     ) -> None:
         status = _cell_status(row, acceptable_r2=acceptable_r2)
         if status == "OK":
@@ -564,9 +576,7 @@ class _ProtocolDashboard:
         else:
             self.low += 1
         self.done += 1
-        last = (
-            f"{row.get('problem')}/{row.get('tier')}/s{row.get('seed')} → {status}"
-        )
+        last = f"{row.get('problem')}/{row.get('tier')}/s{row.get('seed')} → {status}"
         if next_cell is not None:
             self.current = next_cell
         elif self.done >= self.total:
@@ -585,18 +595,20 @@ class _ProtocolDashboard:
         self._render(prefix="RUN ")
 
 
-def _format_protocol_progress(row: Dict[str, Any], *, acceptable_r2: float) -> str:
-    ok = "OK" if row.get("exact_match") else (
-        "MID" if (row.get("test_r2") or 0.0) > acceptable_r2 else "LOW"
+def _format_protocol_progress(row: dict[str, Any], *, acceptable_r2: float) -> str:
+    ok = (
+        "OK"
+        if row.get("exact_match")
+        else ("MID" if (row.get("test_r2") or 0.0) > acceptable_r2 else "LOW")
     )
     return (
-        f"  {str(row.get('problem')):24s} {str(row.get('tier')):18s} "
+        f"  {row.get('problem')!s:24s} {row.get('tier')!s:18s} "
         f"seed={int(row.get('seed') or 0):4d} "
         f"R2_test={row.get('test_r2')}  exact={row.get('exact_match')}  {ok}"
     )
 
 
-def _run_protocol_job(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _run_protocol_job(payload: dict[str, Any]) -> dict[str, Any]:
     """Spawn-safe worker: rebuild estimator + problem, run one protocol cell.
 
     Problem tuples contain lambdas (not picklable), so jobs pass problem names
@@ -635,10 +647,10 @@ def _run_protocol_job(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def run_noise_protocol(
     estimator_factory,
-    problems: Sequence[Tuple],
+    problems: Sequence[tuple],
     *,
-    tiers: Optional[Sequence[Dict[str, Any]]] = None,
-    seeds: Optional[Iterable[int]] = None,
+    tiers: Sequence[dict[str, Any]] | None = None,
+    seeds: Iterable[int] | None = None,
     n_samples: int = 300,
     train_fraction: float = 0.8,
     verbose: bool = True,
@@ -646,9 +658,9 @@ def run_noise_protocol(
     silence_fit: bool = True,
     acceptable_r2: float = 0.9,
     n_jobs: int = 1,
-    omp_num_threads: Optional[int] = None,
-    factory_kwargs: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
+    omp_num_threads: int | None = None,
+    factory_kwargs: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Run problem x tier x seed sweep and collect Phase 0 report rows.
 
     ``estimator_factory`` is a zero-arg callable returning a fresh unfitted
@@ -670,7 +682,9 @@ def run_noise_protocol(
     falls back to sequential execution with a warning.
     """
     tiers = list(tiers) if tiers is not None else list(NOISE_TIERS)
-    seeds = [int(s) for s in (list(seeds) if seeds is not None else [11, 23, 47, 89, 137])]
+    seeds = [
+        int(s) for s in (list(seeds) if seeds is not None else [11, 23, 47, 89, 137])
+    ]
     jobs, omp = default_parallel_config(n_jobs=n_jobs, omp_num_threads=omp_num_threads)
 
     use_pool = jobs > 1 and factory_kwargs is not None
@@ -689,7 +703,7 @@ def run_noise_protocol(
     if not use_pool:
         if omp_num_threads is not None and int(omp_num_threads) > 0:
             _set_worker_thread_env(int(omp_num_threads))
-        rows: List[Dict[str, Any]] = []
+        rows: list[dict[str, Any]] = []
         for problem in problems:
             name = problem[0]
             for tier in tiers:
@@ -714,7 +728,7 @@ def run_noise_protocol(
         return rows
 
     # Process-pool path: one independent cell per job.
-    payloads: List[Dict[str, Any]] = []
+    payloads: list[dict[str, Any]] = []
     for problem in problems:
         name = str(problem[0])
         for tier in tiers:
@@ -735,7 +749,7 @@ def run_noise_protocol(
 
     dash.note_parallel_start(int(jobs), int(omp))
 
-    rows_out: List[Optional[Dict[str, Any]]] = [None] * len(payloads)
+    rows_out: list[dict[str, Any] | None] = [None] * len(payloads)
     # Track in-flight labels for the dashboard (best-effort).
     pending_labels = {
         i: f"{p['problem_name']} / {p['tier'].get('name')} / seed={p['seed']}"
@@ -762,7 +776,7 @@ def run_noise_protocol(
                 # show one remaining / still-pending cell as "current"
                 next_label = next(iter(pending_labels.values()))
                 if len(pending_labels) > 1:
-                    next_label = f"{next_label} (+{len(pending_labels)-1} pending)"
+                    next_label = f"{next_label} (+{len(pending_labels) - 1} pending)"
             dash.finish_cell(row, acceptable_r2=acceptable_r2, next_cell=next_label)
 
     rows = [r for r in rows_out if r is not None]
@@ -772,14 +786,14 @@ def run_noise_protocol(
 
 def _run_single(
     estimator_factory,
-    problem: Tuple,
-    tier: Dict[str, Any],
+    problem: tuple,
+    tier: dict[str, Any],
     seed: int,
     *,
     n_samples: int,
     train_fraction: float,
     acceptable_r2: float,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     name, fn, n_features, x_ranges, formula_str = problem
     X_clean, y_clean, true_formula = generate_ground_truth_data(
         problem, n_samples=n_samples, seed=seed
@@ -824,7 +838,7 @@ def _run_single(
         ]
     )
     y_sel_noisy = apply_noise_tier(y_sel, tier, seed=seed)
-    n_train = int(len(y_train_clean))
+    n_train = len(y_train_clean)
     y_train = y_sel_noisy[:n_train]
     y_test = y_sel_noisy[n_train:]
 
@@ -877,7 +891,9 @@ def _run_single(
         if np.all(np.isfinite(y_pred_test))
         else None
     )
-    display_mse = bc.evaluate_formula_mse_on_X(formula, X_test, y_test) if formula else None
+    display_mse = (
+        bc.evaluate_formula_mse_on_X(formula, X_test, y_test) if formula else None
+    )
     if display_mse is None or not math.isfinite(float(display_mse)):
         display_mse = raw_mse
 
@@ -885,7 +901,15 @@ def _run_single(
     # separate fidelity holdout. Clean columns below are the recovery signal.
     holdout_mse = raw_mse
     clean_test_mse = (
-        float(np.mean((np.asarray(y_pred_test, dtype=np.float64) - np.asarray(y_test_clean, dtype=np.float64)) ** 2))
+        float(
+            np.mean(
+                (
+                    np.asarray(y_pred_test, dtype=np.float64)
+                    - np.asarray(y_test_clean, dtype=np.float64)
+                )
+                ** 2
+            )
+        )
         if np.all(np.isfinite(y_pred_test))
         else None
     )
@@ -919,7 +943,9 @@ def _run_single(
         "holdout_mse": _to_json_float(holdout_mse),
         "clean_test_mse": _to_json_float(clean_test_mse),
         "clean_test_r2": _to_json_float(clean_test_r2),
-        "clean_full_mse": _to_json_float(full_clean_mse if math.isfinite(full_clean_mse) else None),
+        "clean_full_mse": _to_json_float(
+            full_clean_mse if math.isfinite(full_clean_mse) else None
+        ),
         "formula_complexity": _complexity(formula),
         "false_confidence": _false_confidence(train_r2=train_r2, test_r2=test_r2),
         "false_confidence_vs_clean": _false_confidence(
@@ -938,8 +964,7 @@ def _run_single(
     return row
 
 
-
-def _safe_r2(y_true: np.ndarray, y_pred: np.ndarray) -> Optional[float]:
+def _safe_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float | None:
     y_true = np.asarray(y_true, dtype=np.float64)
     y_pred = np.asarray(y_pred, dtype=np.float64)
     if y_true.shape != y_pred.shape or not np.all(np.isfinite(y_pred)):
@@ -950,7 +975,7 @@ def _safe_r2(y_true: np.ndarray, y_pred: np.ndarray) -> Optional[float]:
     return float(1.0 - np.mean((y_pred - y_true) ** 2) / var)
 
 
-def _to_json_float(value) -> Optional[float]:
+def _to_json_float(value) -> float | None:
     if value is None:
         return None
     try:
@@ -992,7 +1017,7 @@ REQUIRED_COLUMNS = (
 )
 
 
-def assert_row_contract(rows: Sequence[Dict[str, Any]]) -> None:
+def assert_row_contract(rows: Sequence[dict[str, Any]]) -> None:
     """Every row must expose the Phase 0 report columns."""
     for row in rows:
         missing = [c for c in REQUIRED_COLUMNS if c not in row]
@@ -1001,42 +1026,64 @@ def assert_row_contract(rows: Sequence[Dict[str, Any]]) -> None:
 
 
 def summarize_noise_protocol(
-    rows: Sequence[Dict[str, Any]], *, acceptable_r2: float = 0.9
-) -> Dict[str, Any]:
+    rows: Sequence[dict[str, Any]], *, acceptable_r2: float = 0.9
+) -> dict[str, Any]:
     """Per (problem, tier) rollup + clean-vs-noisy delta table."""
     assert_row_contract(rows)
-    by_key: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in rows:
         by_key.setdefault((row["problem"], row["tier"]), []).append(row)
 
-    cells: List[Dict[str, Any]] = []
+    cells: list[dict[str, Any]] = []
     for (problem, tier), runs in by_key.items():
         valid = [r for r in runs if r.get("test_r2") is not None]
         r2s = [float(r["test_r2"]) for r in valid]
-        exact_rate = float(np.mean([1.0 if r.get("exact_match") else 0.0 for r in runs]))
-        fc_rate = float(np.mean(
-            [1.0 if r.get("false_confidence") else 0.0 for r in runs if r.get("false_confidence") is not None]
-        )) if any(r.get("false_confidence") is not None for r in runs) else None
-        clean_r2s = [float(r["clean_test_r2"]) for r in runs if r.get("clean_test_r2") is not None]
-        acceptable_rate = float(np.mean([1.0 if r.get("acceptable_clean") else 0.0 for r in runs]))
-        cells.append({
-            "problem": problem,
-            "tier": tier,
-            "n_runs": len(runs),
-            "median_test_r2": float(np.median(r2s)) if r2s else None,
-            "median_clean_test_r2": float(np.median(clean_r2s)) if clean_r2s else None,
-            "exact_match_rate": exact_rate,
-            "acceptable_clean_rate": acceptable_rate,
-            "false_confidence_rate": fc_rate,
-            "median_raw_mse": _median_key(valid, "raw_mse"),
-            "median_display_mse": _median_key(valid, "display_mse"),
-            "median_clean_test_mse": _median_key(runs, "clean_test_mse"),
-            "median_formula_complexity": _median_key(valid, "formula_complexity"),
-        })
+        exact_rate = float(
+            np.mean([1.0 if r.get("exact_match") else 0.0 for r in runs])
+        )
+        fc_rate = (
+            float(
+                np.mean(
+                    [
+                        1.0 if r.get("false_confidence") else 0.0
+                        for r in runs
+                        if r.get("false_confidence") is not None
+                    ]
+                )
+            )
+            if any(r.get("false_confidence") is not None for r in runs)
+            else None
+        )
+        clean_r2s = [
+            float(r["clean_test_r2"])
+            for r in runs
+            if r.get("clean_test_r2") is not None
+        ]
+        acceptable_rate = float(
+            np.mean([1.0 if r.get("acceptable_clean") else 0.0 for r in runs])
+        )
+        cells.append(
+            {
+                "problem": problem,
+                "tier": tier,
+                "n_runs": len(runs),
+                "median_test_r2": float(np.median(r2s)) if r2s else None,
+                "median_clean_test_r2": float(np.median(clean_r2s))
+                if clean_r2s
+                else None,
+                "exact_match_rate": exact_rate,
+                "acceptable_clean_rate": acceptable_rate,
+                "false_confidence_rate": fc_rate,
+                "median_raw_mse": _median_key(valid, "raw_mse"),
+                "median_display_mse": _median_key(valid, "display_mse"),
+                "median_clean_test_mse": _median_key(runs, "clean_test_mse"),
+                "median_formula_complexity": _median_key(valid, "formula_complexity"),
+            }
+        )
 
     # Delta table: noisy tier vs clean, per problem.
-    deltas: List[Dict[str, Any]] = []
-    by_problem: Dict[str, List[Dict[str, Any]]] = {}
+    deltas: list[dict[str, Any]] = []
+    by_problem: dict[str, list[dict[str, Any]]] = {}
     for cell in cells:
         by_problem.setdefault(cell["problem"], []).append(cell)
     for problem, pcells in by_problem.items():
@@ -1053,15 +1100,19 @@ def summarize_noise_protocol(
                 if clean_med is not None and cell_med is not None
                 else None
             )
-            deltas.append({
-                "problem": problem,
-                "tier": cell["tier"],
-                "r2_delta_vs_clean": float(cell["median_test_r2"]) - float(clean["median_test_r2"]),
-                "clean_r2_delta_vs_clean_tier": clean_r2_delta,
-                "exact_rate_delta_vs_clean": cell["exact_match_rate"] - clean["exact_match_rate"],
-                "acceptable_clean_rate": cell.get("acceptable_clean_rate"),
-                "false_confidence_rate": cell["false_confidence_rate"],
-            })
+            deltas.append(
+                {
+                    "problem": problem,
+                    "tier": cell["tier"],
+                    "r2_delta_vs_clean": float(cell["median_test_r2"])
+                    - float(clean["median_test_r2"]),
+                    "clean_r2_delta_vs_clean_tier": clean_r2_delta,
+                    "exact_rate_delta_vs_clean": cell["exact_match_rate"]
+                    - clean["exact_match_rate"],
+                    "acceptable_clean_rate": cell.get("acceptable_clean_rate"),
+                    "false_confidence_rate": cell["false_confidence_rate"],
+                }
+            )
 
     return {
         "cells": cells,
@@ -1071,20 +1122,22 @@ def summarize_noise_protocol(
     }
 
 
-def _median_key(runs: Sequence[Dict[str, Any]], key: str) -> Optional[float]:
+def _median_key(runs: Sequence[dict[str, Any]], key: str) -> float | None:
     vals = [float(r[key]) for r in runs if r.get(key) is not None]
     return float(np.median(vals)) if vals else None
 
 
-def to_markdown(summary: Dict[str, Any]) -> str:
+def to_markdown(summary: dict[str, Any]) -> str:
     """Render the per-tier median table as Markdown for the baseline report."""
     lines = [
         "| Problem | Tier | n | R2noisy | R2clean | Exact | Accept | FalseConf | RawMSE | CleanMSE | Complexity |",
         "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for cell in summary["cells"]:
+
         def fmt(v, prec=4):
             return "-" if v is None else f"{float(v):.{prec}g}"
+
         lines.append(
             f"| {cell['problem']} | {cell['tier']} | {cell['n_runs']} | "
             f"{fmt(cell['median_test_r2'])} | {fmt(cell.get('median_clean_test_r2'))} | "
@@ -1096,7 +1149,7 @@ def to_markdown(summary: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def write_report(rows, summary, output_dir) -> Dict[str, Path]:
+def write_report(rows, summary, output_dir) -> dict[str, Path]:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     rows_path = output_dir / "noise_protocol_rows.json"
@@ -1132,7 +1185,7 @@ def write_report(rows, summary, output_dir) -> Dict[str, Path]:
 # ---------------------------------------------------------------------------
 # Default ablations for blackbox × noise release comparisons. Keep budgets
 # identical across these; only estimator knobs change.
-DEFAULT_BLACKBOX_RELEASE_ABLATIONS: Tuple[str, ...] = (
+DEFAULT_BLACKBOX_RELEASE_ABLATIONS: tuple[str, ...] = (
     "full",
     "no_weights",
     "no_robust_loss",
@@ -1140,10 +1193,10 @@ DEFAULT_BLACKBOX_RELEASE_ABLATIONS: Tuple[str, ...] = (
 
 
 def build_ablation_table(
-    rows_by_ablation: Dict[str, Sequence[Dict[str, Any]]],
+    rows_by_ablation: dict[str, Sequence[dict[str, Any]]],
     *,
     baseline: str = "full",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Compare multi-var noise protocol ablations for release notes.
 
     ``rows_by_ablation`` maps ablation name -> protocol rows (same problems /
@@ -1157,7 +1210,7 @@ def build_ablation_table(
             f"baseline ablation {baseline!r} missing; have {sorted(rows_by_ablation)}"
         )
 
-    summaries: Dict[str, Dict[str, Any]] = {}
+    summaries: dict[str, dict[str, Any]] = {}
     for name, rows in rows_by_ablation.items():
         summary = summarize_noise_protocol(rows)
         summary["ablation"] = str(name)
@@ -1167,7 +1220,7 @@ def build_ablation_table(
     baseline_cells = {
         (c["problem"], c["tier"]): c for c in summaries[baseline]["cells"]
     }
-    comparison_rows: List[Dict[str, Any]] = []
+    comparison_rows: list[dict[str, Any]] = []
     for name, summary in summaries.items():
         for cell in summary["cells"]:
             key = (cell["problem"], cell["tier"])
@@ -1202,32 +1255,35 @@ def build_ablation_table(
             comparison_rows.append(row)
 
     # Aggregate headline: mean Accept/R2clean on non-clean tiers per ablation.
-    headlines: List[Dict[str, Any]] = []
+    headlines: list[dict[str, Any]] = []
     for name, summary in summaries.items():
         noisy_cells = [c for c in summary["cells"] if c.get("tier") != "clean"]
         if not noisy_cells:
             noisy_cells = list(summary["cells"])
+
         def _mean_key(cells, key):
             vals = [float(c[key]) for c in cells if c.get(key) is not None]
             return float(np.mean(vals)) if vals else None
 
-        headlines.append({
-            "ablation": name,
-            "n_cells": len(summary["cells"]),
-            "mean_clean_test_r2_noisy_tiers": _mean_key(
-                noisy_cells, "median_clean_test_r2"
-            ),
-            "mean_acceptable_clean_rate_noisy_tiers": _mean_key(
-                noisy_cells, "acceptable_clean_rate"
-            ),
-            "mean_exact_match_rate_noisy_tiers": _mean_key(
-                noisy_cells, "exact_match_rate"
-            ),
-            "mean_formula_complexity_noisy_tiers": _mean_key(
-                noisy_cells, "median_formula_complexity"
-            ),
-            "is_baseline": name == baseline,
-        })
+        headlines.append(
+            {
+                "ablation": name,
+                "n_cells": len(summary["cells"]),
+                "mean_clean_test_r2_noisy_tiers": _mean_key(
+                    noisy_cells, "median_clean_test_r2"
+                ),
+                "mean_acceptable_clean_rate_noisy_tiers": _mean_key(
+                    noisy_cells, "acceptable_clean_rate"
+                ),
+                "mean_exact_match_rate_noisy_tiers": _mean_key(
+                    noisy_cells, "exact_match_rate"
+                ),
+                "mean_formula_complexity_noisy_tiers": _mean_key(
+                    noisy_cells, "median_formula_complexity"
+                ),
+                "is_baseline": name == baseline,
+            }
+        )
 
     # Ensure baseline is first, then attach deltas.
     headlines.sort(key=lambda h: (0 if h["ablation"] == baseline else 1, h["ablation"]))
@@ -1258,7 +1314,7 @@ def build_ablation_table(
     }
 
 
-def ablation_table_to_markdown(table: Dict[str, Any]) -> str:
+def ablation_table_to_markdown(table: dict[str, Any]) -> str:
     """Render Phase E multi-var ablation headlines + per-cell deltas as Markdown."""
     baseline = table.get("baseline", "full")
     lines = [
@@ -1307,9 +1363,7 @@ def ablation_table_to_markdown(table: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def write_ablation_report(
-    table: Dict[str, Any], output_dir
-) -> Dict[str, Path]:
+def write_ablation_report(table: dict[str, Any], output_dir) -> dict[str, Path]:
     """Write multi-var ablation JSON + Markdown for release notes."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1327,34 +1381,39 @@ def write_ablation_report(
 # ---------------------------------------------------------------------------
 # Default seed set for publishable multi-var blackbox × noise claims.
 # Seed 11 is the locked single-seed lock; 7/23/42 expand variance coverage.
-DEFAULT_PUBLISH_SEEDS: Tuple[int, ...] = (11, 7, 23, 42)
-DEFAULT_PUBLISH_TIERS: Tuple[str, ...] = ("clean", "outliers_3pct")
+DEFAULT_PUBLISH_SEEDS: tuple[int, ...] = (11, 7, 23, 42)
+DEFAULT_PUBLISH_TIERS: tuple[str, ...] = ("clean", "outliers_3pct")
 
 
 def build_publish_table(
-    rows: Sequence[Dict[str, Any]],
+    rows: Sequence[dict[str, Any]],
     *,
-    seeds: Optional[Sequence[int]] = None,
+    seeds: Sequence[int] | None = None,
     min_seeds: int = 2,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build a multi-seed publishable recovery table from protocol rows.
 
     Clean-recovery first: Exact / Accept / R2clean rates with per-seed
     visibility. Suitable for release notes — never use noisy-label R² alone.
     """
     assert_row_contract(rows)
-    seed_list = [int(s) for s in (seeds if seeds is not None else sorted({
-        int(r["seed"]) for r in rows if r.get("seed") is not None
-    }))]
+    seed_list = [
+        int(s)
+        for s in (
+            seeds
+            if seeds is not None
+            else sorted({int(r["seed"]) for r in rows if r.get("seed") is not None})
+        )
+    ]
     if not seed_list:
         seed_list = list(DEFAULT_PUBLISH_SEEDS)
 
     summary = summarize_noise_protocol(rows)
-    by_key: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in rows:
         by_key.setdefault((row["problem"], row["tier"]), []).append(row)
 
-    cells: List[Dict[str, Any]] = []
+    cells: list[dict[str, Any]] = []
     for (problem, tier), runs in sorted(by_key.items()):
         seed_exact = {}
         seed_accept = {}
@@ -1374,26 +1433,32 @@ def build_publish_table(
             for r in runs
             if r.get("clean_test_r2") is not None
         ]
-        cells.append({
-            "problem": problem,
-            "tier": tier,
-            "n_runs": len(runs),
-            "n_seeds": n_seeds,
-            "seeds": sorted({int(r["seed"]) for r in runs}),
-            "exact_match_rate": float(np.mean([1.0 if r.get("exact_match") else 0.0 for r in runs])),
-            "acceptable_clean_rate": float(
-                np.mean([1.0 if r.get("acceptable_clean") else 0.0 for r in runs])
-            ),
-            "median_clean_test_r2": float(np.median(clean_r2s)) if clean_r2s else None,
-            "mean_clean_test_r2": float(np.mean(clean_r2s)) if clean_r2s else None,
-            "seed_exact": seed_exact,
-            "seed_accept": seed_accept,
-            "seed_r2clean": seed_r2clean,
-            "seed_formula": seed_formula,
-            "median_formula_complexity": _median_key(runs, "formula_complexity"),
-            "median_clean_full_mse": _median_key(runs, "clean_full_mse"),
-            "publishable_seed_coverage": bool(n_seeds >= int(min_seeds)),
-        })
+        cells.append(
+            {
+                "problem": problem,
+                "tier": tier,
+                "n_runs": len(runs),
+                "n_seeds": n_seeds,
+                "seeds": sorted({int(r["seed"]) for r in runs}),
+                "exact_match_rate": float(
+                    np.mean([1.0 if r.get("exact_match") else 0.0 for r in runs])
+                ),
+                "acceptable_clean_rate": float(
+                    np.mean([1.0 if r.get("acceptable_clean") else 0.0 for r in runs])
+                ),
+                "median_clean_test_r2": float(np.median(clean_r2s))
+                if clean_r2s
+                else None,
+                "mean_clean_test_r2": float(np.mean(clean_r2s)) if clean_r2s else None,
+                "seed_exact": seed_exact,
+                "seed_accept": seed_accept,
+                "seed_r2clean": seed_r2clean,
+                "seed_formula": seed_formula,
+                "median_formula_complexity": _median_key(runs, "formula_complexity"),
+                "median_clean_full_mse": _median_key(runs, "clean_full_mse"),
+                "publishable_seed_coverage": bool(n_seeds >= int(min_seeds)),
+            }
+        )
 
     # Headline: clean tiers vs outlier tiers across all multi-var problems.
     clean_cells = [c for c in cells if c["tier"] == "clean"]
@@ -1409,14 +1474,22 @@ def build_publish_table(
         "clean": {
             "n_cells": len(clean_cells),
             "mean_exact_match_rate": _mean_cells(clean_cells, "exact_match_rate"),
-            "mean_acceptable_clean_rate": _mean_cells(clean_cells, "acceptable_clean_rate"),
-            "mean_median_clean_test_r2": _mean_cells(clean_cells, "median_clean_test_r2"),
+            "mean_acceptable_clean_rate": _mean_cells(
+                clean_cells, "acceptable_clean_rate"
+            ),
+            "mean_median_clean_test_r2": _mean_cells(
+                clean_cells, "median_clean_test_r2"
+            ),
         },
         "outliers": {
             "n_cells": len(outlier_cells),
             "mean_exact_match_rate": _mean_cells(outlier_cells, "exact_match_rate"),
-            "mean_acceptable_clean_rate": _mean_cells(outlier_cells, "acceptable_clean_rate"),
-            "mean_median_clean_test_r2": _mean_cells(outlier_cells, "median_clean_test_r2"),
+            "mean_acceptable_clean_rate": _mean_cells(
+                outlier_cells, "acceptable_clean_rate"
+            ),
+            "mean_median_clean_test_r2": _mean_cells(
+                outlier_cells, "median_clean_test_r2"
+            ),
         },
     }
 
@@ -1439,7 +1512,7 @@ def build_publish_table(
     }
 
 
-def publish_table_to_markdown(table: Dict[str, Any]) -> str:
+def publish_table_to_markdown(table: dict[str, Any]) -> str:
     """Render multi-seed publishable recovery table as Markdown for release notes."""
     seeds = table.get("seeds") or []
     lines = [
@@ -1493,11 +1566,9 @@ def publish_table_to_markdown(table: Dict[str, Any]) -> str:
         ]
     )
     # Build seed columns from observed seeds in cells
-    obs_seeds = sorted({
-        int(s)
-        for cell in table.get("cells", [])
-        for s in (cell.get("seeds") or [])
-    })
+    obs_seeds = sorted(
+        {int(s) for cell in table.get("cells", []) for s in (cell.get("seeds") or [])}
+    )
     if obs_seeds:
         header = "| Problem | Tier | " + " | ".join(f"s{s}" for s in obs_seeds) + " |"
         sep = "|---|---|" + "|".join(["---:" for _ in obs_seeds]) + "|"
@@ -1524,9 +1595,7 @@ def publish_table_to_markdown(table: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def write_publish_report(
-    table: Dict[str, Any], output_dir
-) -> Dict[str, Path]:
+def write_publish_report(table: dict[str, Any], output_dir) -> dict[str, Path]:
     """Write multi-seed publish JSON + Markdown for release freeze."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1547,7 +1616,6 @@ def _json_default(obj):
     if isinstance(obj, np.ndarray):
         return obj.tolist()
     return str(obj)
-
 
 
 # ---------------------------------------------------------------------------
@@ -1572,7 +1640,7 @@ DEFAULT_BLACKBOX_PROBLEMS = (
 )
 
 
-def _select_problems(names: Optional[Sequence[str]] = None):
+def _select_problems(names: Sequence[str] | None = None):
     """Pick ground-truth problems by name (default: easy multi-tier baseline set).
 
     Built-in problems are available without torch. Additional names fall back to
@@ -1599,7 +1667,7 @@ def _select_problems(names: Optional[Sequence[str]] = None):
 
 # Named ablations for release-gate comparisons (Phase 8).
 # Each mutates GlassboxRegressor kwargs; budgets must stay comparable.
-ABLATION_PRESETS: Dict[str, Dict[str, Any]] = {
+ABLATION_PRESETS: dict[str, dict[str, Any]] = {
     "full": {},
     # Disable user weights AND auto soft-MAD / robust path so evolution stays unweighted.
     "no_weights": {
@@ -1626,7 +1694,7 @@ def _default_estimator_factory(
     multi_start_runs: int = 1,
     allow_stub: bool = False,
     ablation: str = "full",
-    extra_params: Optional[Dict[str, Any]] = None,
+    extra_params: dict[str, Any] | None = None,
     blackbox_protocol: bool = False,
 ):
     try:
@@ -1647,6 +1715,7 @@ def _default_estimator_factory(
         ablation_params.update(extra_params)
 
     if GlassboxRegressor is not None:
+
         def factory():
             kwargs = dict(
                 random_state=0,
@@ -1677,6 +1746,7 @@ def _default_estimator_factory(
 
                 est.fit = _fit_no_weight  # type: ignore[method-assign]
             return est
+
         return factory
 
     # Minimal mean predictor for tooling smoke when Glassbox/torch is absent.
@@ -1711,7 +1781,7 @@ def _default_estimator_factory(
     return factory
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """Run the deterministic multi-tier noise protocol and write baseline artifacts."""
     import argparse
     from datetime import datetime
@@ -1900,7 +1970,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     problems = _select_problems(problem_names)
 
-    def _annotate_rows(rows, ablation_name: str) -> List[Dict[str, Any]]:
+    def _annotate_rows(rows, ablation_name: str) -> list[dict[str, Any]]:
         annotated = []
         for row in rows:
             r = dict(row)
@@ -1913,7 +1983,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             annotated.append(r)
         return annotated
 
-    def _budget_dict() -> Dict[str, Any]:
+    def _budget_dict() -> dict[str, Any]:
         return {
             "generations": int(generations),
             "population_size": int(pop),
@@ -1924,7 +1994,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "omp_num_threads": int(omp_threads),
         }
 
-    def _factory_kwargs(ablation_name: str) -> Dict[str, Any]:
+    def _factory_kwargs(ablation_name: str) -> dict[str, Any]:
         return {
             "generations": int(generations),
             "population_size": int(pop),
@@ -1974,8 +2044,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             )
             print(f"Blackbox protocol: {bool(args.blackbox)}")
 
-        rows_by_ablation: Dict[str, List[Dict[str, Any]]] = {}
-        all_rows: List[Dict[str, Any]] = []
+        rows_by_ablation: dict[str, list[dict[str, Any]]] = {}
+        all_rows: list[dict[str, Any]] = []
         for abl in ablation_names:
             try:
                 factory = _default_estimator_factory(**_factory_kwargs(abl))
@@ -2089,7 +2159,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     summary["budget"] = _budget_dict()
     failed = [r for r in rows if r.get("error")]
     summary["failed_seeds"] = [
-        {"problem": r.get("problem"), "tier": r.get("tier"), "seed": r.get("seed"), "error": r.get("error")}
+        {
+            "problem": r.get("problem"),
+            "tier": r.get("tier"),
+            "seed": r.get("seed"),
+            "error": r.get("error"),
+        }
         for r in failed
     ]
     summary["n_failed_seeds"] = len(failed)

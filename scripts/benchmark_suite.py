@@ -8,7 +8,7 @@ formulas of increasing complexity, organized into 8 difficulty tiers.
 Usage:
   python scripts/benchmark_suite.py                                            # Full suite (fast-path only)
   python scripts/benchmark_suite.py --tier 1                                   # Only tier 1
-  python scripts/benchmark_suite.py --specialist-regressor --specialist-full   # Use specialist regressor for all tiers with fast-path 
+  python scripts/benchmark_suite.py --specialist-regressor --specialist-full   # Use specialist regressor for all tiers with fast-path
   python scripts/benchmark_suite.py --evolution-only                           # Guided evolution only (skip fast-path)
   python scripts/benchmark_suite.py --classifier-model models/v3.pt            # Custom model
   python scripts/benchmark_suite.py --output-dir results/                      # Custom output dir
@@ -35,25 +35,27 @@ import re
 import subprocess
 import sys
 import time
-import warnings
 import traceback
+import warnings
 
 # Fix UnicodeEncodeError on Windows
-if sys.platform == 'win32':
-    import io
-    if hasattr(sys.stdout, 'reconfigure'):
-        sys.stdout.reconfigure(encoding='utf-8')
+if sys.platform == "win32":
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     else:
         # Fallback for older python versions
         import codecs
-        sys.stdout = codecs.getwriter('utf-8')(sys.stdout.detach())
 
+        sys.stdout = codecs.getwriter("utf-8")(sys.stdout.detach())
+
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 import numpy as np
 import torch
+
 try:
     from sympy.utilities.exceptions import SymPyDeprecationWarning
 except Exception:  # pragma: no cover - SymPy warning class may be absent
@@ -69,11 +71,14 @@ _REPO_ROOT = _SCRIPT_DIR.parent
 sys.path.insert(0, str(_REPO_ROOT))
 sys.path.insert(0, str(_SCRIPT_DIR))
 
-import classifier_fast_path as cfp  # noqa: E402
-from scripts import benchmark_common as bc  # noqa: E402
-from classifier_fast_path import run_fast_path, run_guided_evolution  # noqa: E402
-from glassbox.evolution import detect_dominant_frequency  # noqa: E402
-from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_signal  # noqa: E402
+import classifier_fast_path as cfp
+from classifier_fast_path import run_fast_path, run_guided_evolution
+
+from glassbox.evolution import detect_dominant_frequency
+from glassbox.sr.cpp.seed_graph_builder import (
+    build_seed_graphs_from_signal,
+)
+from scripts import benchmark_common as bc
 
 
 def _finite_float(value: Any, default: float) -> float:
@@ -93,12 +98,12 @@ def _finite_int(value: Any, default: int) -> int:
 
 
 def _planned_guided_budget(
-    search_plan: Dict[str, Any],
+    search_plan: dict[str, Any],
     base_generations: int,
     base_population: int,
     *,
     trust_plan: bool,
-) -> Tuple[int, int, Dict[str, Any]]:
+) -> tuple[int, int, dict[str, Any]]:
     """Translate proposer search_plan metadata into guided-evolution kwargs."""
     gen_mult = _finite_float(search_plan.get("generation_multiplier"), 1.0)
     pop_mult = _finite_float(search_plan.get("population_multiplier"), 1.0)
@@ -116,18 +121,22 @@ def _planned_guided_budget(
         generations = max(1, int(round(base_generations * gen_mult)))
         population = max(1, int(round(base_population * pop_mult)))
     else:
-        generations = int(np.clip(
-            round(base_generations * gen_mult),
-            20,
-            max(20, base_generations * 4),
-        ))
-        population = int(np.clip(
-            round(base_population * pop_mult),
-            20,
-            max(20, base_population * 3),
-        ))
+        generations = int(
+            np.clip(
+                round(base_generations * gen_mult),
+                20,
+                max(20, base_generations * 4),
+            )
+        )
+        population = int(
+            np.clip(
+                round(base_population * pop_mult),
+                20,
+                max(20, base_population * 3),
+            )
+        )
 
-    guided_plan: Dict[str, Any] = {}
+    guided_plan: dict[str, Any] = {}
     # Always forward a per-formula deterministic seed when present.
     if "random_seed" in search_plan and search_plan.get("random_seed") is not None:
         guided_plan["random_seed"] = int(search_plan["random_seed"])
@@ -135,13 +144,17 @@ def _planned_guided_budget(
         if "n_beams" in search_plan:
             guided_plan["n_beams"] = max(1, _finite_int(search_plan.get("n_beams"), 1))
         if "n_rounds" in search_plan:
-            guided_plan["n_rounds"] = max(1, _finite_int(search_plan.get("n_rounds"), 1))
+            guided_plan["n_rounds"] = max(
+                1, _finite_int(search_plan.get("n_rounds"), 1)
+            )
         if "p_min" in search_plan:
             guided_plan["p_min"] = _finite_float(search_plan.get("p_min"), -2.0)
         if "p_max" in search_plan:
             guided_plan["p_max"] = _finite_float(search_plan.get("p_max"), 3.0)
         if "seed_budget" in search_plan:
-            guided_plan["seed_budget"] = max(0, _finite_int(search_plan.get("seed_budget"), 0))
+            guided_plan["seed_budget"] = max(
+                0, _finite_int(search_plan.get("seed_budget"), 0)
+            )
         if "acceptable_complexity" in search_plan:
             guided_plan["acceptable_complexity"] = max(
                 1, _finite_int(search_plan.get("acceptable_complexity"), 15)
@@ -165,254 +178,255 @@ def _planned_guided_budget(
 # x_range is (x_min, x_max); negative log/sqrt domains handled via auto-shrink
 
 TIER_1_TRIVIAL = [
-    ("5",                        "Constant 5",               (-5, 5)),
-    ("x",                        "Identity",                 (-5, 5)),
-    ("-x",                       "Negation",                 (-5, 5)),
-    ("2*x",                      "Linear 2x",                (-5, 5)),
-    ("0.5*x",                    "Linear 0.5x",              (-5, 5)),
-    ("x+1",                      "Linear x+1",               (-5, 5)),
-    ("3*x-2",                    "Linear 3x-2",              (-5, 5)),
-    ("x^2",                      "x²",                       (-5, 5)),
-    ("x^3",                      "x³",                       (-5, 5)),
-    ("x^4",                      "x⁴",                       (-5, 5)),
-    ("-x^2",                     "−x²",                      (-5, 5)),
-    ("2*x^2",                    "2x²",                      (-3, 3)),
-    ("x^2+1",                    "x²+1",                     (-5, 5)),
-    ("x^3-x",                    "x³−x",                     (-3, 3)),
-    ("x^2-1",                    "x²−1",                     (-5, 5)),
-    ("0.5*x^2+x",               "½x²+x",                    (-5, 5)),
-    ("-3*x+7",                   "−3x+7",                    (-5, 5)),
-    ("x^2+x+1",                 "x²+x+1",                   (-5, 5)),
-    ("2*x^3",                    "2x³",                      (-3, 3)),
-    ("x^4-x^2",                 "x⁴−x²",                    (-3, 3)),
-    ("x^2/2",                    "x²/2",                     (-5, 5)),
-    ("x^5",                      "x⁵",                       (-2, 2)),
-    ("10",                       "Constant 10",              (-5, 5)),
-    ("pi*x",                     "πx",                       (-3, 3)),
-    ("x/3",                      "x/3",                      (-5, 5)),
-    ("e",                        "Constant e",               (-5, 5)),
-    ("pi",                       "Constant π",               (-5, 5)),
-    ("2.0",                      "Constant 2.0",             (-5, 5)),
-    ("0.5",                      "Constant 0.5",             (-5, 5)),
-    ("e*x",                      "Linear e·x",               (-3, 3)),
+    ("5", "Constant 5", (-5, 5)),
+    ("x", "Identity", (-5, 5)),
+    ("-x", "Negation", (-5, 5)),
+    ("2*x", "Linear 2x", (-5, 5)),
+    ("0.5*x", "Linear 0.5x", (-5, 5)),
+    ("x+1", "Linear x+1", (-5, 5)),
+    ("3*x-2", "Linear 3x-2", (-5, 5)),
+    ("x^2", "x²", (-5, 5)),
+    ("x^3", "x³", (-5, 5)),
+    ("x^4", "x⁴", (-5, 5)),
+    ("-x^2", "−x²", (-5, 5)),
+    ("2*x^2", "2x²", (-3, 3)),
+    ("x^2+1", "x²+1", (-5, 5)),
+    ("x^3-x", "x³−x", (-3, 3)),
+    ("x^2-1", "x²−1", (-5, 5)),
+    ("0.5*x^2+x", "½x²+x", (-5, 5)),
+    ("-3*x+7", "−3x+7", (-5, 5)),
+    ("x^2+x+1", "x²+x+1", (-5, 5)),
+    ("2*x^3", "2x³", (-3, 3)),
+    ("x^4-x^2", "x⁴−x²", (-3, 3)),
+    ("x^2/2", "x²/2", (-5, 5)),
+    ("x^5", "x⁵", (-2, 2)),
+    ("10", "Constant 10", (-5, 5)),
+    ("pi*x", "πx", (-3, 3)),
+    ("x/3", "x/3", (-5, 5)),
+    ("e", "Constant e", (-5, 5)),
+    ("pi", "Constant π", (-5, 5)),
+    ("2.0", "Constant 2.0", (-5, 5)),
+    ("0.5", "Constant 0.5", (-5, 5)),
+    ("e*x", "Linear e·x", (-3, 3)),
 ]
 
 TIER_2_SIMPLE_POLY = [
-    ("x^3+x^2+x",               "Nguyen-1: x³+x²+x",       (-3, 3)),
-    ("x^4+x^3+x^2+x",           "Nguyen-2: x⁴+x³+x²+x",   (-3, 3)),
-    ("x^5+x^4+x^3+x^2+x",      "Nguyen-3: x⁵+x⁴+x³+x²+x", (-2, 2)),
-    ("x^6+x^5+x^4+x^3+x^2+x",  "Nguyen-4: deg-6 poly",     (-2, 2)),
-    ("3*x^3+2*x^2+x",           "3x³+2x²+x",               (-3, 3)),
-    ("x^4-2*x^2+1",             "(x²−1)²",                  (-3, 3)),
-    ("x^3+3*x^2+3*x+1",         "(x+1)³",                   (-3, 3)),
-    ("x^4+4*x^3+6*x^2+4*x+1",   "(x+1)⁴",                   (-2, 2)),
-    ("x^2-2*x+1",               "(x−1)²",                   (-5, 5)),
-    ("4*x^3-3*x",               "Chebyshev T₃",             (-1, 1)),
-    ("8*x^4-8*x^2+1",           "Chebyshev T₄",             (-1, 1)),
-    ("16*x^5-20*x^3+5*x",       "Chebyshev T₅",             (-1, 1)),
-    ("x^2+2*x-3",               "Quadratic roots ±1,−3",    (-5, 5)),
-    ("x^3-6*x^2+11*x-6",        "Cubic roots 1,2,3",        (-1, 5)),
-    ("-x^4+x^2",                "−x⁴+x²",                  (-3, 3)),
-    ("x^2*x",                   "x³ (product form)",        (-3, 3)),
-    ("(x+2)*(x-1)",             "x²+x−2",                   (-3, 3)),
-    ("x*(x-1)*(x+1)",           "x³−x",                     (-3, 3)),
-    ("0.1*x^5-0.5*x^3+x",       "Odd polynomial",           (-2, 2)),
-    ("x^6-1",                    "x⁶−1",                     (-2, 2)),
-    ("x^3/3-x",                 "x³/3−x",                   (-3, 3)),
-    ("x^4/4-x^2/2",             "x⁴/4−x²/2",               (-3, 3)),
-    ("2*x^2-5*x+2",             "Quadratic 2x²−5x+2",      (-5, 5)),
-    ("x*(x+1)*(x+2)",           "Rising factorial",          (-3, 3)),
-    ("(x^2+1)*(x-1)",           "Cubic factored",            (-3, 3)),
+    ("x^3+x^2+x", "Nguyen-1: x³+x²+x", (-3, 3)),
+    ("x^4+x^3+x^2+x", "Nguyen-2: x⁴+x³+x²+x", (-3, 3)),
+    ("x^5+x^4+x^3+x^2+x", "Nguyen-3: x⁵+x⁴+x³+x²+x", (-2, 2)),
+    ("x^6+x^5+x^4+x^3+x^2+x", "Nguyen-4: deg-6 poly", (-2, 2)),
+    ("3*x^3+2*x^2+x", "3x³+2x²+x", (-3, 3)),
+    ("x^4-2*x^2+1", "(x²−1)²", (-3, 3)),
+    ("x^3+3*x^2+3*x+1", "(x+1)³", (-3, 3)),
+    ("x^4+4*x^3+6*x^2+4*x+1", "(x+1)⁴", (-2, 2)),
+    ("x^2-2*x+1", "(x−1)²", (-5, 5)),
+    ("4*x^3-3*x", "Chebyshev T₃", (-1, 1)),
+    ("8*x^4-8*x^2+1", "Chebyshev T₄", (-1, 1)),
+    ("16*x^5-20*x^3+5*x", "Chebyshev T₅", (-1, 1)),
+    ("x^2+2*x-3", "Quadratic roots ±1,−3", (-5, 5)),
+    ("x^3-6*x^2+11*x-6", "Cubic roots 1,2,3", (-1, 5)),
+    ("-x^4+x^2", "−x⁴+x²", (-3, 3)),
+    ("x^2*x", "x³ (product form)", (-3, 3)),
+    ("(x+2)*(x-1)", "x²+x−2", (-3, 3)),
+    ("x*(x-1)*(x+1)", "x³−x", (-3, 3)),
+    ("0.1*x^5-0.5*x^3+x", "Odd polynomial", (-2, 2)),
+    ("x^6-1", "x⁶−1", (-2, 2)),
+    ("x^3/3-x", "x³/3−x", (-3, 3)),
+    ("x^4/4-x^2/2", "x⁴/4−x²/2", (-3, 3)),
+    ("2*x^2-5*x+2", "Quadratic 2x²−5x+2", (-5, 5)),
+    ("x*(x+1)*(x+2)", "Rising factorial", (-3, 3)),
+    ("(x^2+1)*(x-1)", "Cubic factored", (-3, 3)),
 ]
 
 TIER_3_BASIC_TRANSCENDENTAL = [
-    ("sin(x)",                   "sin(x)",                   (-6, 6)),
-    ("cos(x)",                   "cos(x)",                   (-6, 6)),
-    ("sin(2*x)",                 "sin(2x)",                  (-6, 6)),
-    ("cos(2*x)",                 "cos(2x)",                  (-6, 6)),
-    ("sin(x/2)",                 "sin(x/2)",                 (-6, 6)),
-    ("2*sin(x)",                 "2sin(x)",                  (-6, 6)),
-    ("sin(x)+1",                 "sin(x)+1",                 (-6, 6)),
-    ("-cos(x)",                  "−cos(x)",                  (-6, 6)),
-    ("3*cos(x)-1",               "3cos(x)−1",                (-6, 6)),
-    ("exp(x)",                   "eˣ",                       (-3, 3)),
-    ("exp(-x)",                  "e⁻ˣ",                      (-3, 3)),
-    ("exp(-x^2)",                "Gaussian e⁻ˣ²",            (-3, 3)),
-    ("log(x+1)",                 "log(x+1)",                 (0.01, 5)),
-    ("log(x^2+1)",               "log(x²+1)",                (-5, 5)),
-    ("exp(x)-1",                 "eˣ−1",                     (-3, 3)),
-    ("exp(-x)-1",                "e⁻ˣ−1",                    (-3, 3)),
-    ("2*exp(-x)",                "2e⁻ˣ",                     (-3, 3)),
-    ("sin(pi*x)",                "sin(πx)",                  (-2, 2)),
-    ("cos(pi*x)",                "cos(πx)",                  (-2, 2)),
-    ("exp(x/2)",                 "e^(x/2)",                  (-4, 4)),
-    ("log(2*x+1)",               "log(2x+1)",                (0.01, 5)),
-    ("sin(3*x)",                 "sin(3x)",                  (-6, 6)),
-    ("cos(3*x)",                 "cos(3x)",                  (-6, 6)),
-    ("exp(-2*x)",                "e⁻²ˣ",                     (-2, 4)),
-    ("sqrt(x)",                  "√x",                       (0.01, 10)),
+    ("sin(x)", "sin(x)", (-6, 6)),
+    ("cos(x)", "cos(x)", (-6, 6)),
+    ("sin(2*x)", "sin(2x)", (-6, 6)),
+    ("cos(2*x)", "cos(2x)", (-6, 6)),
+    ("sin(x/2)", "sin(x/2)", (-6, 6)),
+    ("2*sin(x)", "2sin(x)", (-6, 6)),
+    ("sin(x)+1", "sin(x)+1", (-6, 6)),
+    ("-cos(x)", "−cos(x)", (-6, 6)),
+    ("3*cos(x)-1", "3cos(x)−1", (-6, 6)),
+    ("exp(x)", "eˣ", (-3, 3)),
+    ("exp(-x)", "e⁻ˣ", (-3, 3)),
+    ("exp(-x^2)", "Gaussian e⁻ˣ²", (-3, 3)),
+    ("log(x+1)", "log(x+1)", (0.01, 5)),
+    ("log(x^2+1)", "log(x²+1)", (-5, 5)),
+    ("exp(x)-1", "eˣ−1", (-3, 3)),
+    ("exp(-x)-1", "e⁻ˣ−1", (-3, 3)),
+    ("2*exp(-x)", "2e⁻ˣ", (-3, 3)),
+    ("sin(pi*x)", "sin(πx)", (-2, 2)),
+    ("cos(pi*x)", "cos(πx)", (-2, 2)),
+    ("exp(x/2)", "e^(x/2)", (-4, 4)),
+    ("log(2*x+1)", "log(2x+1)", (0.01, 5)),
+    ("sin(3*x)", "sin(3x)", (-6, 6)),
+    ("cos(3*x)", "cos(3x)", (-6, 6)),
+    ("exp(-2*x)", "e⁻²ˣ", (-2, 4)),
+    ("sqrt(x)", "√x", (0.01, 10)),
 ]
 
 TIER_4_NGUYEN = [
     # Nguyen benchmark suite (standard SR benchmark)
-    ("x^3+x^2+x",               "Nguyen-1",                 (-1, 1)),
-    ("x^4+x^3+x^2+x",           "Nguyen-2",                 (-1, 1)),
-    ("x^5+x^4+x^3+x^2+x",      "Nguyen-3",                 (-1, 1)),
-    ("x^6+x^5+x^4+x^3+x^2+x",  "Nguyen-4",                 (-1, 1)),
-    ("sin(x^2)*cos(x)-1",        "Nguyen-5",                 (-1, 1)),
-    ("sin(x)+sin(x+x^2)",        "Nguyen-6",                 (-1, 1)),
-    ("log(x+1)+log(x^2+1)",      "Nguyen-7",                 (0.01, 2)),
-    ("sqrt(x)",                  "Nguyen-8",                  (0.01, 4)),
+    ("x^3+x^2+x", "Nguyen-1", (-1, 1)),
+    ("x^4+x^3+x^2+x", "Nguyen-2", (-1, 1)),
+    ("x^5+x^4+x^3+x^2+x", "Nguyen-3", (-1, 1)),
+    ("x^6+x^5+x^4+x^3+x^2+x", "Nguyen-4", (-1, 1)),
+    ("sin(x^2)*cos(x)-1", "Nguyen-5", (-1, 1)),
+    ("sin(x)+sin(x+x^2)", "Nguyen-6", (-1, 1)),
+    ("log(x+1)+log(x^2+1)", "Nguyen-7", (0.01, 2)),
+    ("sqrt(x)", "Nguyen-8", (0.01, 4)),
     # Nguyen-9: sin(x) + sin(x^2)
-    ("sin(x)+sin(x^2)",          "Nguyen-9",                 (-3, 3)),
+    ("sin(x)+sin(x^2)", "Nguyen-9", (-3, 3)),
     # Nguyen-10: 2*sin(x)*cos(x) = sin(2x)
-    ("2*sin(x)*cos(x)",          "Nguyen-10",                (-3, 3)),
+    ("2*sin(x)*cos(x)", "Nguyen-10", (-3, 3)),
     # Additional Nguyen-like
-    ("x^3+x",                    "Nguyen-like: x³+x",        (-3, 3)),
-    ("x^4-x",                    "Nguyen-like: x⁴−x",        (-2, 2)),
-    ("sin(x)*cos(x)",            "sin·cos identity",         (-6, 6)),
-    ("sin(x)^2",                 "sin²(x)",                  (-6, 6)),
-    ("cos(x)^2",                 "cos²(x)",                  (-6, 6)),
-    ("sin(x)^2+cos(x)^2",        "Pythagorean identity",     (-6, 6)),
-    ("sin(x)^2-cos(x)^2",        "−cos(2x)",                 (-6, 6)),
-    ("x*sin(x)",                 "x·sin(x)",                 (-6, 6)),
-    ("x*cos(x)",                 "x·cos(x)",                 (-6, 6)),
-    ("x^2*sin(x)",               "x²·sin(x)",               (-4, 4)),
+    ("x^3+x", "Nguyen-like: x³+x", (-3, 3)),
+    ("x^4-x", "Nguyen-like: x⁴−x", (-2, 2)),
+    ("sin(x)*cos(x)", "sin·cos identity", (-6, 6)),
+    ("sin(x)^2", "sin²(x)", (-6, 6)),
+    ("cos(x)^2", "cos²(x)", (-6, 6)),
+    ("sin(x)^2+cos(x)^2", "Pythagorean identity", (-6, 6)),
+    ("sin(x)^2-cos(x)^2", "−cos(2x)", (-6, 6)),
+    ("x*sin(x)", "x·sin(x)", (-6, 6)),
+    ("x*cos(x)", "x·cos(x)", (-6, 6)),
+    ("x^2*sin(x)", "x²·sin(x)", (-4, 4)),
     # Keijzer benchmarks
-    ("0.3*x*sin(2*pi*x)",        "Keijzer-4",                (-3, 3)),
+    ("0.3*x*sin(2*pi*x)", "Keijzer-4", (-3, 3)),
     ("x^3*exp(-x)*cos(x)*sin(x)*(sin(x)^2*cos(x)-1)", "Keijzer-complex", (-2, 2)),
     # R (Rational/Polynomial mix)
-    ("x^2+x+1",                  "R1: x²+x+1",               (-3, 3)),
-    ("x^4+x^3+x^2+x+1",         "R2: deg-4+constant",        (-2, 2)),
-    ("2*x^3-3*x^2+x",            "R3: factorable cubic",      (-2, 3)),
+    ("x^2+x+1", "R1: x²+x+1", (-3, 3)),
+    ("x^4+x^3+x^2+x+1", "R2: deg-4+constant", (-2, 2)),
+    ("2*x^3-3*x^2+x", "R3: factorable cubic", (-2, 3)),
 ]
 
 TIER_5_SUMS_AND_PRODUCTS = [
-    ("sin(x)+x^2",               "sin(x)+x²",                (-5, 5)),
-    ("cos(x)+x^2",               "cos(x)+x²",                (-5, 5)),
-    ("sin(x)+cos(x)",            "sin(x)+cos(x)",             (-6, 6)),
-    ("sin(x)+sin(2*x)",          "sin(x)+sin(2x)",           (-6, 6)),
-    ("sin(x)+sin(3*x)",          "sin(x)+sin(3x)",           (-6, 6)),
-    ("cos(x)+cos(2*x)",          "cos(x)+cos(2x)",           (-6, 6)),
-    ("cos(x)+cos(3*x)",          "cos(x)+cos(3x)",           (-6, 6)),
-    ("sin(x)-cos(x)",            "sin(x)−cos(x)",            (-6, 6)),
-    ("sin(x)+x",                 "sin(x)+x",                 (-5, 5)),
-    ("cos(x)+x",                 "cos(x)+x",                 (-5, 5)),
-    ("x^2+exp(-x)",              "x²+e⁻ˣ",                  (-3, 3)),
-    ("x+exp(-x)",                "x+e⁻ˣ",                   (-3, 3)),
-    ("sin(x)+exp(-x)",           "sin(x)+e⁻ˣ",              (-3, 3)),
-    ("x^2+log(x+1)",             "x²+log(x+1)",             (0.01, 5)),
-    ("x^3+sin(x)",               "x³+sin(x)",                (-3, 3)),
-    ("x*sin(x)",                 "x·sin(x)",                 (-6, 6)),
-    ("x*exp(-x)",                "x·e⁻ˣ",                   (-2, 5)),
-    ("x^2+sin(x)+1",             "x²+sin(x)+1",             (-5, 5)),
-    ("exp(-x)+exp(-2*x)",        "e⁻ˣ+e⁻²ˣ",               (-1, 5)),
-    ("sin(x)*sin(2*x)",          "sin(x)·sin(2x)",           (-6, 6)),
-    ("sin(x)+cos(2*x)+x",        "Mixed trig+linear",        (-5, 5)),
-    ("x^2-sin(x)",               "x²−sin(x)",               (-5, 5)),
-    ("2*sin(x)+3*cos(x)",        "2sin(x)+3cos(x)",          (-6, 6)),
-    ("sin(x)^3",                 "sin³(x)",                  (-6, 6)),
-    ("cos(x)+sin(2*x)+x^2",      "cos+sin2+x²",             (-4, 4)),
+    ("sin(x)+x^2", "sin(x)+x²", (-5, 5)),
+    ("cos(x)+x^2", "cos(x)+x²", (-5, 5)),
+    ("sin(x)+cos(x)", "sin(x)+cos(x)", (-6, 6)),
+    ("sin(x)+sin(2*x)", "sin(x)+sin(2x)", (-6, 6)),
+    ("sin(x)+sin(3*x)", "sin(x)+sin(3x)", (-6, 6)),
+    ("cos(x)+cos(2*x)", "cos(x)+cos(2x)", (-6, 6)),
+    ("cos(x)+cos(3*x)", "cos(x)+cos(3x)", (-6, 6)),
+    ("sin(x)-cos(x)", "sin(x)−cos(x)", (-6, 6)),
+    ("sin(x)+x", "sin(x)+x", (-5, 5)),
+    ("cos(x)+x", "cos(x)+x", (-5, 5)),
+    ("x^2+exp(-x)", "x²+e⁻ˣ", (-3, 3)),
+    ("x+exp(-x)", "x+e⁻ˣ", (-3, 3)),
+    ("sin(x)+exp(-x)", "sin(x)+e⁻ˣ", (-3, 3)),
+    ("x^2+log(x+1)", "x²+log(x+1)", (0.01, 5)),
+    ("x^3+sin(x)", "x³+sin(x)", (-3, 3)),
+    ("x*sin(x)", "x·sin(x)", (-6, 6)),
+    ("x*exp(-x)", "x·e⁻ˣ", (-2, 5)),
+    ("x^2+sin(x)+1", "x²+sin(x)+1", (-5, 5)),
+    ("exp(-x)+exp(-2*x)", "e⁻ˣ+e⁻²ˣ", (-1, 5)),
+    ("sin(x)*sin(2*x)", "sin(x)·sin(2x)", (-6, 6)),
+    ("sin(x)+cos(2*x)+x", "Mixed trig+linear", (-5, 5)),
+    ("x^2-sin(x)", "x²−sin(x)", (-5, 5)),
+    ("2*sin(x)+3*cos(x)", "2sin(x)+3cos(x)", (-6, 6)),
+    ("sin(x)^3", "sin³(x)", (-6, 6)),
+    ("cos(x)+sin(2*x)+x^2", "cos+sin2+x²", (-4, 4)),
 ]
 
 TIER_6_RATIONAL_AND_NESTED = [
-    ("1/(1+x^2)",                "Witch of Agnesi",          (-5, 5)),
-    ("x/(1+x^2)",               "x/(1+x²)",                (-5, 5)),
-    ("1/(1+exp(-x))",            "Sigmoid σ(x)",              (-6, 6)),
-    ("x/(1+abs(x))",             "SoftSign",                 (-5, 5)),
-    ("sin(x^2)",                 "sin(x²)",                  (-3, 3)),
-    ("cos(x^2)",                 "cos(x²)",                  (-3, 3)),
-    ("exp(-x^2)",                "Gaussian",                 (-3, 3)),
-    ("x*exp(-x^2)",              "x·Gaussian",               (-3, 3)),
-    ("sin(exp(x))",              "sin(eˣ)",                  (-2, 2)),
-    ("exp(sin(x))",              "exp(sin(x))",              (-3, 3)),
-    ("log(1+x^2)",               "log(1+x²)",                (-5, 5)),
-    ("log(1+exp(x))",            "Softplus",                 (-3, 3)),
-    ("sqrt(1+x^2)",              "√(1+x²)",                  (-5, 5)),
-    ("1/(x^2+0.5)",              "Lorentzian",               (-5, 5)),
-    ("x^2/(1+x^2)",              "x²/(1+x²)",               (-5, 5)),
-    ("sin(x)/x",                 "Sinc (unnormalized)",       (0.1, 10)),
-    ("(1-x^2)/(1+x^2)",          "Rational symmetric",       (-3, 3)),
-    ("x^3/(1+x^4)",              "Rational odd",             (-3, 3)),
-    ("exp(-abs(x))",             "Laplacian",                (-5, 5)),
-    ("x/(exp(x)-1)",             "Planck-like",              (0.1, 5)),
-    ("sin(pi*x)/(pi*x)",         "Sinc (normalized)",         (0.1, 5)),
-    ("1/sqrt(1+x^2)",            "Inv-√(1+x²)",              (-5, 5)),
-    ("exp(-x)*sin(x)",           "Damped sine",              (0, 10)),
-    ("exp(-x)*cos(x)",           "Damped cosine",            (0, 10)),
-    ("x^2*exp(-x)",              "x²·e⁻ˣ",                  (0, 8)),
+    ("1/(1+x^2)", "Witch of Agnesi", (-5, 5)),
+    ("x/(1+x^2)", "x/(1+x²)", (-5, 5)),
+    ("1/(1+exp(-x))", "Sigmoid σ(x)", (-6, 6)),
+    ("x/(1+abs(x))", "SoftSign", (-5, 5)),
+    ("sin(x^2)", "sin(x²)", (-3, 3)),
+    ("cos(x^2)", "cos(x²)", (-3, 3)),
+    ("exp(-x^2)", "Gaussian", (-3, 3)),
+    ("x*exp(-x^2)", "x·Gaussian", (-3, 3)),
+    ("sin(exp(x))", "sin(eˣ)", (-2, 2)),
+    ("exp(sin(x))", "exp(sin(x))", (-3, 3)),
+    ("log(1+x^2)", "log(1+x²)", (-5, 5)),
+    ("log(1+exp(x))", "Softplus", (-3, 3)),
+    ("sqrt(1+x^2)", "√(1+x²)", (-5, 5)),
+    ("1/(x^2+0.5)", "Lorentzian", (-5, 5)),
+    ("x^2/(1+x^2)", "x²/(1+x²)", (-5, 5)),
+    ("sin(x)/x", "Sinc (unnormalized)", (0.1, 10)),
+    ("(1-x^2)/(1+x^2)", "Rational symmetric", (-3, 3)),
+    ("x^3/(1+x^4)", "Rational odd", (-3, 3)),
+    ("exp(-abs(x))", "Laplacian", (-5, 5)),
+    ("x/(exp(x)-1)", "Planck-like", (0.1, 5)),
+    ("sin(pi*x)/(pi*x)", "Sinc (normalized)", (0.1, 5)),
+    ("1/sqrt(1+x^2)", "Inv-√(1+x²)", (-5, 5)),
+    ("exp(-x)*sin(x)", "Damped sine", (0, 10)),
+    ("exp(-x)*cos(x)", "Damped cosine", (0, 10)),
+    ("x^2*exp(-x)", "x²·e⁻ˣ", (0, 8)),
 ]
 
 TIER_7_HARD_COMPOSITIONS = [
-    ("x^2*exp(-x)*sin(x)",       "x²·e⁻ˣ·sin(x)",           (0, 8)),
-    ("sin(x)*cos(2*x)+x",        "sin·cos2+x",               (-5, 5)),
-    ("exp(-x^2)*sin(3*x)",       "Gauss·sin(3x)",            (-3, 3)),
-    ("sin(x+sin(x))",            "sin(x+sin(x))",            (-3, 3)),
-    ("x*log(x+1)",               "x·log(x+1)",               (0.01, 5)),
-    ("exp(-x)*sin(2*x)",         "Damped sin(2x)",           (0, 10)),
-    ("sin(x)/(1+x^2)",           "sin/(1+x²)",               (-5, 5)),
-    ("cos(x)/(1+x^2)",           "cos/(1+x²)",               (-5, 5)),
-    ("x^2*sin(1/x)",             "x²·sin(1/x)",              (0.1, 5)),
-    ("exp(sin(x))*cos(x)",       "exp(sin)·cos",             (-3, 3)),
-    ("sin(x)*exp(-x^2/2)",       "sin·Gaussian",             (-4, 4)),
-    ("log(1+sin(x)^2)",          "log(1+sin²)",              (-3, 3)),
-    ("x*exp(-abs(x))*sin(x)",    "x·Lap·sin",                (-5, 5)),
-    ("sin(x^2)+cos(x)",          "sin(x²)+cos(x)",           (-3, 3)),
-    ("(sin(x)+cos(x))^2",        "1+sin(2x)",                (-6, 6)),
-    ("exp(-x)*x^3",              "x³·e⁻ˣ",                  (0, 8)),
-    ("sin(x)*sin(3*x)*sin(5*x)", "Triple sine product",      (-3, 3)),
-    ("sqrt(abs(sin(x)))",        "√|sin(x)|",                (-6, 6)),
-    ("x^2/(exp(x)-1)",           "Bose-like",                (0.1, 5)),
-    ("exp(-x^2/2)*cos(5*x)",     "Gabor wavelet",            (-3, 3)),
-    ("sin(x)+sin(2*x)+sin(3*x)", "Fourier 3-term",           (-6, 6)),
-    ("cos(x)+cos(2*x)+cos(3*x)", "Cosine 3-term",            (-6, 6)),
-    ("x*sin(x)*cos(x)",          "x·sin·cos",                (-5, 5)),
-    ("sin(x)*log(x+1)",          "sin·log",                   (0.01, 5)),
-    ("exp(-x)*(x^2-2*x+1)",      "e⁻ˣ·(x−1)²",             (0, 8)),
+    ("x^2*exp(-x)*sin(x)", "x²·e⁻ˣ·sin(x)", (0, 8)),
+    ("sin(x)*cos(2*x)+x", "sin·cos2+x", (-5, 5)),
+    ("exp(-x^2)*sin(3*x)", "Gauss·sin(3x)", (-3, 3)),
+    ("sin(x+sin(x))", "sin(x+sin(x))", (-3, 3)),
+    ("x*log(x+1)", "x·log(x+1)", (0.01, 5)),
+    ("exp(-x)*sin(2*x)", "Damped sin(2x)", (0, 10)),
+    ("sin(x)/(1+x^2)", "sin/(1+x²)", (-5, 5)),
+    ("cos(x)/(1+x^2)", "cos/(1+x²)", (-5, 5)),
+    ("x^2*sin(1/x)", "x²·sin(1/x)", (0.1, 5)),
+    ("exp(sin(x))*cos(x)", "exp(sin)·cos", (-3, 3)),
+    ("sin(x)*exp(-x^2/2)", "sin·Gaussian", (-4, 4)),
+    ("log(1+sin(x)^2)", "log(1+sin²)", (-3, 3)),
+    ("x*exp(-abs(x))*sin(x)", "x·Lap·sin", (-5, 5)),
+    ("sin(x^2)+cos(x)", "sin(x²)+cos(x)", (-3, 3)),
+    ("(sin(x)+cos(x))^2", "1+sin(2x)", (-6, 6)),
+    ("exp(-x)*x^3", "x³·e⁻ˣ", (0, 8)),
+    ("sin(x)*sin(3*x)*sin(5*x)", "Triple sine product", (-3, 3)),
+    ("sqrt(abs(sin(x)))", "√|sin(x)|", (-6, 6)),
+    ("x^2/(exp(x)-1)", "Bose-like", (0.1, 5)),
+    ("exp(-x^2/2)*cos(5*x)", "Gabor wavelet", (-3, 3)),
+    ("sin(x)+sin(2*x)+sin(3*x)", "Fourier 3-term", (-6, 6)),
+    ("cos(x)+cos(2*x)+cos(3*x)", "Cosine 3-term", (-6, 6)),
+    ("x*sin(x)*cos(x)", "x·sin·cos", (-5, 5)),
+    ("sin(x)*log(x+1)", "sin·log", (0.01, 5)),
+    ("exp(-x)*(x^2-2*x+1)", "e⁻ˣ·(x−1)²", (0, 8)),
 ]
 
 TIER_8_FRONTIER = [
-    ("sin(cos(x))",              "sin(cos(x))",              (-3, 3)),
-    ("cos(sin(x))",              "cos(sin(x))",              (-3, 3)),
-    ("sin(x*cos(x))",            "sin(x·cos(x))",            (-3, 3)),
-    ("log(1+sin(x))",            "log(1+sin(x))",            (-1, 1)),
-    ("exp(-x)*sin(x)^2",         "e⁻ˣ·sin²(x)",             (0, 10)),
-    ("sin(exp(-x))",             "sin(e⁻ˣ)",                (-1, 4)),
-    ("x^2*exp(-x)*cos(3*x)",     "x²·e⁻ˣ·cos(3x)",         (0, 8)),
-    ("1/(1+exp(-x))-0.5",        "Centered sigmoid",         (-6, 6)),
-    ("sin(x^2)*exp(-x)",         "sin(x²)·e⁻ˣ",            (0, 6)),
-    ("log(x)*sin(x)",            "log(x)·sin(x)",            (0.1, 10)),
-    ("sqrt(abs(x))*sin(x)",      "√|x|·sin(x)",             (-5, 5)),
-    ("exp(-x^2)*sin(x^2)",       "Gauss·sin(x²)",            (-3, 3)),
-    ("sin(x)/sqrt(1+x^2)",       "sin/√(1+x²)",              (-5, 5)),
-    ("x/(1+x^4)",               "x/(1+x⁴)",                (-3, 3)),
-    ("exp(-abs(x))*cos(2*x)",    "Laplace·cos(2x)",          (-5, 5)),
-    ("sin(x+exp(-x))",           "sin(x+e⁻ˣ)",              (-2, 4)),
-    ("cos(x^2)*sin(x)",          "cos(x²)·sin(x)",           (-3, 3)),
-    ("(sin(x)+x)/(1+x^2)",       "(sin+x)/(1+x²)",           (-5, 5)),
-    ("exp(-x)*(sin(x)+cos(x))",  "e⁻ˣ·(sin+cos)",           (0, 10)),
-    ("x^2*sin(x)/(1+x^2)",       "x²sin/(1+x²)",            (-5, 5)),
-    ("log(1+x^2)*sin(x)",        "log(1+x²)·sin",           (-5, 5)),
-    ("sin(x)*cos(x)*exp(-x^2)",  "sin·cos·Gauss",            (-3, 3)),
-    ("exp(-x)*sin(x)*cos(2*x)",  "Damped modulated",         (0, 10)),
-    ("(x^2-1)*exp(-x^2/2)",      "Hermite-like",             (-4, 4)),
-    ("sin(pi*x)*exp(-x^2)",      "sin(πx)·Gauss",            (-3, 3)),
+    ("sin(cos(x))", "sin(cos(x))", (-3, 3)),
+    ("cos(sin(x))", "cos(sin(x))", (-3, 3)),
+    ("sin(x*cos(x))", "sin(x·cos(x))", (-3, 3)),
+    ("log(1+sin(x))", "log(1+sin(x))", (-1, 1)),
+    ("exp(-x)*sin(x)^2", "e⁻ˣ·sin²(x)", (0, 10)),
+    ("sin(exp(-x))", "sin(e⁻ˣ)", (-1, 4)),
+    ("x^2*exp(-x)*cos(3*x)", "x²·e⁻ˣ·cos(3x)", (0, 8)),
+    ("1/(1+exp(-x))-0.5", "Centered sigmoid", (-6, 6)),
+    ("sin(x^2)*exp(-x)", "sin(x²)·e⁻ˣ", (0, 6)),
+    ("log(x)*sin(x)", "log(x)·sin(x)", (0.1, 10)),
+    ("sqrt(abs(x))*sin(x)", "√|x|·sin(x)", (-5, 5)),
+    ("exp(-x^2)*sin(x^2)", "Gauss·sin(x²)", (-3, 3)),
+    ("sin(x)/sqrt(1+x^2)", "sin/√(1+x²)", (-5, 5)),
+    ("x/(1+x^4)", "x/(1+x⁴)", (-3, 3)),
+    ("exp(-abs(x))*cos(2*x)", "Laplace·cos(2x)", (-5, 5)),
+    ("sin(x+exp(-x))", "sin(x+e⁻ˣ)", (-2, 4)),
+    ("cos(x^2)*sin(x)", "cos(x²)·sin(x)", (-3, 3)),
+    ("(sin(x)+x)/(1+x^2)", "(sin+x)/(1+x²)", (-5, 5)),
+    ("exp(-x)*(sin(x)+cos(x))", "e⁻ˣ·(sin+cos)", (0, 10)),
+    ("x^2*sin(x)/(1+x^2)", "x²sin/(1+x²)", (-5, 5)),
+    ("log(1+x^2)*sin(x)", "log(1+x²)·sin", (-5, 5)),
+    ("sin(x)*cos(x)*exp(-x^2)", "sin·cos·Gauss", (-3, 3)),
+    ("exp(-x)*sin(x)*cos(2*x)", "Damped modulated", (0, 10)),
+    ("(x^2-1)*exp(-x^2/2)", "Hermite-like", (-4, 4)),
+    ("sin(pi*x)*exp(-x^2)", "sin(πx)·Gauss", (-3, 3)),
 ]
 
 ALL_TIERS = {
-    1: ("Trivial",                TIER_1_TRIVIAL),
-    2: ("Simple Polynomial",      TIER_2_SIMPLE_POLY),
-    3: ("Basic Transcendental",   TIER_3_BASIC_TRANSCENDENTAL),
-    4: ("Nguyen Suite",           TIER_4_NGUYEN),
-    5: ("Sums & Products",        TIER_5_SUMS_AND_PRODUCTS),
-    6: ("Rational & Nested",      TIER_6_RATIONAL_AND_NESTED),
-    7: ("Hard Compositions",      TIER_7_HARD_COMPOSITIONS),
-    8: ("Frontier",               TIER_8_FRONTIER),
+    1: ("Trivial", TIER_1_TRIVIAL),
+    2: ("Simple Polynomial", TIER_2_SIMPLE_POLY),
+    3: ("Basic Transcendental", TIER_3_BASIC_TRANSCENDENTAL),
+    4: ("Nguyen Suite", TIER_4_NGUYEN),
+    5: ("Sums & Products", TIER_5_SUMS_AND_PRODUCTS),
+    6: ("Rational & Nested", TIER_6_RATIONAL_AND_NESTED),
+    7: ("Hard Compositions", TIER_7_HARD_COMPOSITIONS),
+    8: ("Frontier", TIER_8_FRONTIER),
 }
 
 # ---------------------------------------------------------------------------
 # Formula evaluator (reused from sr_tester.py logic)
 # ---------------------------------------------------------------------------
+
 
 def _safe_numpy_power(x, p):
     """Safe power matching C++ signed power logic."""
@@ -445,14 +459,17 @@ def _parse_formula(formula_str: str) -> Callable[[np.ndarray], np.ndarray]:
         parse_expr,
         standard_transformations,
     )
-    
+
     # Normalize unicode and common variants
     formula = _normalize_formula_text(formula_str).strip()
     # Handle C++ |x| notation
-    formula = re.sub(r'\|([^|]+)\|', r'abs(\1)', formula)
-    
+    formula = re.sub(r"\|([^|]+)\|", r"abs(\1)", formula)
+
     try:
-        transformations = standard_transformations + (convert_xor, implicit_multiplication_application)        
+        transformations = standard_transformations + (
+            convert_xor,
+            implicit_multiplication_application,
+        )
         local_dict = {
             "Piecewise": sp.Piecewise,
             "Eq": sp.Eq,
@@ -468,50 +485,64 @@ def _parse_formula(formula_str: str) -> Callable[[np.ndarray], np.ndarray]:
             "E": sp.E,
             "e": sp.E,
         }
-        expr = parse_expr(formula, local_dict=local_dict, transformations=transformations, evaluate=False)     
+        expr = parse_expr(
+            formula,
+            local_dict=local_dict,
+            transformations=transformations,
+            evaluate=False,
+        )
         free_syms = sorted(expr.free_symbols, key=lambda sym: sym.name)
         # Inject safe power into lambdify
         modules = [
-            {"pow": _safe_numpy_power, "Pow": _safe_numpy_power, "log": _safe_numpy_log},
+            {
+                "pow": _safe_numpy_power,
+                "Pow": _safe_numpy_power,
+                "log": _safe_numpy_log,
+            },
             "numpy",
         ]
         func = sp.lambdify(free_syms, expr, modules=modules)
-        
+
         def fn(x_in: np.ndarray) -> np.ndarray:
             if x_in.ndim == 1:
                 cols = [x_in]
             else:
                 cols = [x_in[:, i] for i in range(x_in.shape[1])]
-            
+
             # Match columns to symbols
             args = []
             for sym in free_syms:
                 # Expect symbols like x, x0, x1...
-                if sym.name == 'x':
+                if sym.name == "x":
                     args.append(cols[0])
-                elif sym.name.startswith('x') and sym.name[1:].isdigit():
+                elif sym.name.startswith("x") and sym.name[1:].isdigit():
                     idx = int(sym.name[1:])
-                    args.append(cols[idx] if idx < len(cols) else np.zeros_like(cols[0]))
+                    args.append(
+                        cols[idx] if idx < len(cols) else np.zeros_like(cols[0])
+                    )
                 else:
                     args.append(np.zeros_like(cols[0]))
-            
+
             if not args and not free_syms:
                 # Constant expression
                 val = float(expr.evalf())
                 return np.full_like(x_in if x_in.ndim == 1 else x_in[:, 0], val)
-                
+
             import warnings
+
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
                 res = func(*args)
             return np.asarray(res, dtype=np.float64).reshape(-1)
-            
+
         return fn
     except Exception as e:
         err_msg = str(e)
+
         # Fallback to a very basic eval if sympy fails (unlikely)
         def fallback_fn(x: np.ndarray) -> np.ndarray:
             raise ValueError(f"SymPy parse failed for '{formula_str}': {err_msg}")
+
         return fallback_fn
 
 
@@ -529,7 +560,7 @@ def _noise_level_for_preset(preset: str) -> float:
     return (cfg or {}).get("noise_level", 0.0) if cfg else 0.0
 
 
-NOISE_PRESETS: Dict[str, Optional[Dict[str, Any]]] = {
+NOISE_PRESETS: dict[str, dict[str, Any] | None] = {
     "none": None,
     "low": {"noise_type": "gaussian", "noise_level": 0.001},
     "medium": {"noise_type": "gaussian", "noise_level": 0.01},
@@ -538,7 +569,9 @@ NOISE_PRESETS: Dict[str, Optional[Dict[str, Any]]] = {
 }
 
 
-def _apply_noise_to_y(y: np.ndarray, noise_cfg: Optional[Dict[str, Any]], *, seed: int) -> np.ndarray:
+def _apply_noise_to_y(
+    y: np.ndarray, noise_cfg: dict[str, Any] | None, *, seed: int
+) -> np.ndarray:
     """Inject noise into a clean target vector using benchmark_noise generators."""
     if not noise_cfg:
         return y
@@ -556,7 +589,9 @@ def _apply_noise_to_y(y: np.ndarray, noise_cfg: Optional[Dict[str, Any]], *, see
             scale = y_abs if y_abs > 1e-12 else 1.0
         else:
             scale = y_std
-        return arr + rng.normal(0.0, float(noise_cfg.get("noise_level", 0.0)) * scale, size=arr.shape)
+        return arr + rng.normal(
+            0.0, float(noise_cfg.get("noise_level", 0.0)) * scale, size=arr.shape
+        )
     return bn.apply_noise_tier(y, noise_cfg, seed=int(seed))
 
 
@@ -565,9 +600,9 @@ def _generate_data(
     x_min: float = -5.0,
     x_max: float = 5.0,
     n_samples: int = 300,
-    noise_cfg: Optional[Dict[str, Any]] = None,
+    noise_cfg: dict[str, Any] | None = None,
     noise_seed: int = 0,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     """Generate (x, y) data from a formula string, optionally adding noise."""
     fn = _parse_formula(formula_str)
     x = np.linspace(x_min, x_max, n_samples)
@@ -581,16 +616,18 @@ def _generate_data(
     y = y[mask]
 
     if noise_cfg:
-        y = _apply_noise_to_y(np.asarray(y, dtype=np.float64), noise_cfg, seed=int(noise_seed))
+        y = _apply_noise_to_y(
+            np.asarray(y, dtype=np.float64), noise_cfg, seed=int(noise_seed)
+        )
     return x, y
 
 
 def _build_universal_evolution_seed_graphs(
     x_values: np.ndarray,
     y_values: np.ndarray,
-    detected_omegas: Optional[List[float]],
+    detected_omegas: list[float] | None,
     max_seeds: int = 12,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Build data-driven generic seed graphs for the pure C++ search path."""
     return build_seed_graphs_from_signal(
         x_values,
@@ -604,6 +641,7 @@ def _build_universal_evolution_seed_graphs(
 # Scoring
 # ---------------------------------------------------------------------------
 
+
 def _count_terms(formula: str) -> int:
     """Rough count of additive terms in a formula string."""
     if not formula:
@@ -612,11 +650,11 @@ def _count_terms(formula: str) -> int:
     depth = 0
     terms = 1
     for ch in formula:
-        if ch in '(':
+        if ch in "(":
             depth += 1
-        elif ch in ')':
+        elif ch in ")":
             depth -= 1
-        elif ch in '+-' and depth == 0:
+        elif ch in "+-" and depth == 0:
             terms += 1
     return terms
 
@@ -626,21 +664,22 @@ def _normalize_formula_text(formula: str) -> str:
     if not formula:
         return formula
     formula = (
-        formula
-        .replace('²', '^2')
-        .replace('³', '^3')
-        .replace('·', '*')
-        .replace('⋅', '*')
-        .replace('×', '*')
-        .replace('π', 'pi')
-        .replace('√', 'sqrt')
-        .replace('φ', 'phi')
-        .replace('ω', 'omega')
+        formula.replace("²", "^2")
+        .replace("³", "^3")
+        .replace("·", "*")
+        .replace("⋅", "*")
+        .replace("×", "*")
+        .replace("π", "pi")
+        .replace("√", "sqrt")
+        .replace("φ", "phi")
+        .replace("ω", "omega")
     )
     return re.sub(r"\s+", "", formula)
 
 
-def _simplify_formula_native(formula: str, int_tol: float, zero_tol: float) -> Optional[str]:
+def _simplify_formula_native(
+    formula: str, int_tol: float, zero_tol: float
+) -> str | None:
     """Simplify with the native C++ Phase-1 simplifier, if available."""
     try:
         cpp_dir = _REPO_ROOT / "glassbox" / "sr" / "cpp"
@@ -649,7 +688,6 @@ def _simplify_formula_native(formula: str, int_tol: float, zero_tol: float) -> O
         _core = get_cpp_core()
 
         if _core is None:
-
             raise ImportError("C++ _core unavailable")
 
         simplified = _core.simplify_formula(
@@ -670,7 +708,7 @@ def _simplify_formula_native(formula: str, int_tol: float, zero_tol: float) -> O
 
 def _postprocess_formula(formula: str) -> str:
     """Apply the same simplify_formula pipeline used by fast-path outputs.
-    
+
     Uses wider snap tolerances than the fast-path because evolution-produced
     formulas have Ridge regression noise on coefficients (e.g. 0.9975 → 1.0).
     """
@@ -687,20 +725,30 @@ def _postprocess_formula(formula: str) -> str:
 
     try:
         try:
-            from simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+            from simplify_formula import (
+                SnapConfig,
+                simplify_onn_formula,
+                snap_formula_floats,
+            )
         except ImportError:
-            from scripts.simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+            from scripts.simplify_formula import (
+                SnapConfig,
+                simplify_onn_formula,
+                snap_formula_floats,
+            )
 
         formula_len = len(normalized)
-        term_estimate = max(1, len([t for t in re.split(r'\s*[+-]\s*', normalized) if t.strip()]))
+        term_estimate = max(
+            1, len([t for t in re.split(r"\s*[+-]\s*", normalized) if t.strip()])
+        )
         too_complex_for_symbolic = formula_len > 500 or term_estimate > 24
         sympy_unsafe = "Piecewise(" in normalized or "Eq(" in normalized
 
         # Evolution formulas need wider tolerances than fast-path:
         # Ridge regression produces coefficients like 0.9975 instead of 1.0
         # and small spurious bias terms like 0.0001924 instead of 0.0
-        evo_int_tol = 0.05    # snap 7.955 → 8, 2.04 → 2, etc.
-        evo_zero_tol = 1e-3   # snap 0.0001924 → 0
+        evo_int_tol = 0.05  # snap 7.955 → 8, 2.04 → 2, etc.
+        evo_zero_tol = 1e-3  # snap 0.0001924 → 0
 
         if too_complex_for_symbolic or sympy_unsafe:
             return snap_formula_floats(
@@ -710,8 +758,12 @@ def _postprocess_formula(formula: str) -> str:
 
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=SymPyDeprecationWarning)
-            warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"sympy\..*")
-            warnings.filterwarnings("ignore", message=r"\s*Using non-Expr arguments in Mul.*")
+            warnings.filterwarnings(
+                "ignore", category=DeprecationWarning, module=r"sympy\..*"
+            )
+            warnings.filterwarnings(
+                "ignore", message=r"\s*Using non-Expr arguments in Mul.*"
+            )
             _, simplified_expr = simplify_onn_formula(
                 normalized,
                 int_tol=evo_int_tol,
@@ -723,7 +775,7 @@ def _postprocess_formula(formula: str) -> str:
         return normalized
 
 
-def _evaluate_formula_mse(formula: str, x: np.ndarray, y: np.ndarray) -> Optional[float]:
+def _evaluate_formula_mse(formula: str, x: np.ndarray, y: np.ndarray) -> float | None:
     """Evaluate displayed formula against ground truth data and return MSE."""
     if not formula:
         return None
@@ -769,7 +821,9 @@ _postprocess_formula = bc.postprocess_formula
 _evaluate_formula_mse = bc.evaluate_formula_mse
 
 
-def _postprocess_formula_for_benchmark(formula: str, x: np.ndarray, y: np.ndarray) -> Tuple[str, Dict[str, Any]]:
+def _postprocess_formula_for_benchmark(
+    formula: str, x: np.ndarray, y: np.ndarray
+) -> tuple[str, dict[str, Any]]:
     return bc.postprocess_formula_with_fidelity_guard(
         formula,
         np.asarray(x, dtype=np.float64).reshape(-1, 1),
@@ -777,14 +831,16 @@ def _postprocess_formula_for_benchmark(formula: str, x: np.ndarray, y: np.ndarra
     )
 
 
-def _select_score_mse(mse_display: Optional[float]) -> Optional[float]:
+def _select_score_mse(mse_display: float | None) -> float | None:
     """Choose MSE for scoring: use displayed-formula MSE only."""
     if mse_display is not None and math.isfinite(mse_display):
         return float(mse_display)
     return None
 
 
-def _mse_divergence_stats(mse_display: Optional[float], mse_raw: Optional[float]) -> Dict[str, Any]:
+def _mse_divergence_stats(
+    mse_display: float | None, mse_raw: float | None
+) -> dict[str, Any]:
     """Return absolute/relative raw-vs-display MSE divergence diagnostics."""
     out = {
         "mse_divergence_abs": None,
@@ -809,7 +865,7 @@ def _mse_divergence_stats(mse_display: Optional[float], mse_raw: Optional[float]
     return out
 
 
-def _display_eval_details(formula: str, x: np.ndarray, y: np.ndarray) -> Dict[str, Any]:
+def _display_eval_details(formula: str, x: np.ndarray, y: np.ndarray) -> dict[str, Any]:
     """Evaluate a displayed formula and return MSE plus parser diagnostics."""
     X = np.asarray(x, dtype=np.float64).reshape(-1, 1)
     y_pred, diagnostics = bc.evaluate_formula(formula, X, return_diagnostics=True)
@@ -820,7 +876,7 @@ def _display_eval_details(formula: str, x: np.ndarray, y: np.ndarray) -> Dict[st
 
 
 def _record_display_eval_failure(
-    result: Dict[str, Any],
+    result: dict[str, Any],
     formula: str,
     x: np.ndarray,
     y: np.ndarray,
@@ -852,14 +908,16 @@ def set_noise_aware_exact_tol(noise_level: float, y_var: float) -> None:
     """
     global _NOISE_AWARE_EXACT_TOL, _NOISE_LEVEL
     _NOISE_LEVEL = max(0.0, float(noise_level or 0.0))
-    _NOISE_AWARE_EXACT_TOL = max(1e-6, 4.0 * (_NOISE_LEVEL ** 2) * float(y_var)) if _NOISE_LEVEL > 0 else 1e-6
+    _NOISE_AWARE_EXACT_TOL = (
+        max(1e-6, 4.0 * (_NOISE_LEVEL**2) * float(y_var)) if _NOISE_LEVEL > 0 else 1e-6
+    )
 
 
 def update_noise_aware_y_var(y_var: float) -> None:
     """Recompute the EXACT threshold for the current target's variance."""
     global _NOISE_AWARE_EXACT_TOL
     if _NOISE_LEVEL > 0:
-        _NOISE_AWARE_EXACT_TOL = max(1e-6, 4.0 * (_NOISE_LEVEL ** 2) * float(y_var))
+        _NOISE_AWARE_EXACT_TOL = max(1e-6, 4.0 * (_NOISE_LEVEL**2) * float(y_var))
     else:
         _NOISE_AWARE_EXACT_TOL = 1e-6
 
@@ -882,16 +940,16 @@ def _guided_evolution_decision(
     *,
     evolution_only: bool,
     with_evolution: bool,
-    fp_result: Optional[Dict[str, Any]],
-    mse: Optional[float],
+    fp_result: dict[str, Any] | None,
+    mse: float | None,
     n_terms: int,
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """Decide whether guided evolution should run and return a short reason.
-    
+
     ADAPTIVE ROUTING: Instead of hardcoded entropy/margin thresholds that
     break when the classifier is retrained, we use relative fit quality
     (MSE normalized by signal variance) as the primary decision signal.
-    
+
     This makes the decision robust to classifier architecture changes,
     retraining, or feature modifications.
     """
@@ -918,24 +976,24 @@ def _guided_evolution_decision(
     details = fp_result.get("details", {})
     if isinstance(details, dict):
         y_var = details.get("y_variance")
-    
+
     # Fallback: estimate from residual diagnostics
     if y_var is None:
         residual = fp_result.get("residual_diagnostics", {})
         if isinstance(residual, dict):
             y_var = residual.get("y_variance")
-    
+
     if y_var is not None and y_var > 1e-10:
         relative_error = mse / y_var
         # Fast-path explains >99.999% of variance → skip evolution
         if relative_error < 1e-5 and n_terms <= 10:
             return False, "fast_path_high_r2"
-    
+
     # ── Tier 3: Absolute MSE quality gate ──
     # Near-exact fit with reasonable complexity → skip
     if mse < 1e-7 and n_terms <= 6:
         return False, "fast_path_confident_exact"
-    
+
     # Good fit (MSE < 1e-6) with reasonable complexity → skip
     if mse < 1e-6 and n_terms <= 10:
         return False, "fast_path_good_fit"
@@ -957,8 +1015,7 @@ def _guided_evolution_decision(
     return False, "fast_path_confident"
 
 
-
-def _safe_r2_np(y_true, y_pred) -> Optional[float]:
+def _safe_r2_np(y_true, y_pred) -> float | None:
     """Unweighted R2; None when prediction is invalid."""
     y_true = np.asarray(y_true, dtype=np.float64).reshape(-1)
     y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
@@ -971,13 +1028,13 @@ def _safe_r2_np(y_true, y_pred) -> Optional[float]:
 
 
 def _attach_clean_target_metrics(
-    result: Dict[str, Any],
+    result: dict[str, Any],
     x: np.ndarray,
     y_clean: np.ndarray,
     *,
     exact_tol: float = 1e-6,
     acceptable_r2: float = 0.99,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Attach clean-target recovery metrics (independent of noisy EXACT band).
 
     Suite ``score`` / ``mse`` may use noisy labels under ``--noise``. Clean
@@ -1010,10 +1067,14 @@ def _attach_clean_target_metrics(
     )
 
     result["mse_clean"] = (
-        float(mse_clean) if mse_clean is not None and math.isfinite(float(mse_clean)) else None
+        float(mse_clean)
+        if mse_clean is not None and math.isfinite(float(mse_clean))
+        else None
     )
     result["r2_clean"] = (
-        float(r2_clean) if r2_clean is not None and math.isfinite(float(r2_clean)) else None
+        float(r2_clean)
+        if r2_clean is not None and math.isfinite(float(r2_clean))
+        else None
     )
     result["recovery_exact"] = recovery_exact
     result["recovery_acceptable"] = recovery_acceptable
@@ -1025,9 +1086,9 @@ def _generate_xy_with_optional_noise(
     x_min: float,
     x_max: float,
     n_samples: int,
-    noise_cfg: Optional[Dict[str, Any]] = None,
+    noise_cfg: dict[str, Any] | None = None,
     noise_seed: int = 0,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return ``(x, y_fit, y_clean)``. ``y_fit`` equals ``y_clean`` when no noise."""
     x_np, y_clean = _generate_data(formula_str, x_min, x_max, n_samples)
     y_clean = np.asarray(y_clean, dtype=np.float64).reshape(-1)
@@ -1035,40 +1096,49 @@ def _generate_xy_with_optional_noise(
         y_fit = _apply_noise_to_y(y_clean, noise_cfg, seed=int(noise_seed))
     else:
         y_fit = y_clean
-    return np.asarray(x_np, dtype=np.float64), np.asarray(y_fit, dtype=np.float64), y_clean
+    return (
+        np.asarray(x_np, dtype=np.float64),
+        np.asarray(y_fit, dtype=np.float64),
+        y_clean,
+    )
 
 
 SCORE_SYMBOLS = {
-    "EXACT":  "[PASS]",
+    "EXACT": "[PASS]",
     "APPROX": "[APPROX]",
-    "LOOSE":  "[LOOSE]",
-    "FAIL":   "[FAIL]",
+    "LOOSE": "[LOOSE]",
+    "FAIL": "[FAIL]",
 }
 
 _SCORE_POINTS = {"FAIL": 0, "LOOSE": 1, "APPROX": 2, "EXACT": 3}
 
 
 _PROPOSER_CACHE = {}
+
+
 def _get_proposer(path: str, device: str):
     if path not in _PROPOSER_CACHE:
         from glassbox.universal_proposer import load_universal_proposer_checkpoint
+
         _PROPOSER_CACHE[path] = load_universal_proposer_checkpoint(path, device=device)
     return _PROPOSER_CACHE[path]
+
 
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
+
 def run_formula(
     formula_str: str,
-    x_range: Tuple[float, float],
+    x_range: tuple[float, float],
     classifier_path: str,
     n_samples: int = 300,
-    device: Optional[str] = None,
+    device: str | None = None,
     timeout: float = 60.0,
     with_evolution: bool = False,
     evolution_only: bool = False,
-    proposer_path: Optional[str] = None,
+    proposer_path: str | None = None,
     disable_proposer: bool = False,
     evolution_generations: int = 150,
     evolution_population: int = 50,
@@ -1076,9 +1146,9 @@ def run_formula(
     exact_match_backend: str = "auto",
     exact_match_min_gpu_work: int = 250_000,
     exact_match_max_combos: int = 50_000,
-    noise_cfg: Optional[Dict[str, Any]] = None,
+    noise_cfg: dict[str, Any] | None = None,
     noise_seed: int = 0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Run fast-path and/or guided evolution on a single formula."""
     x_min, x_max = x_range
     result = {
@@ -1118,8 +1188,12 @@ def run_formula(
     try:
         # Generate data (keep clean labels for recovery; fit on optional noise)
         x_np, y_np, y_clean = _generate_xy_with_optional_noise(
-            formula_str, x_min, x_max, n_samples,
-            noise_cfg=noise_cfg, noise_seed=noise_seed,
+            formula_str,
+            x_min,
+            x_max,
+            n_samples,
+            noise_cfg=noise_cfg,
+            noise_seed=noise_seed,
         )
 
         # Early return for constant targets. This avoids evolution-only
@@ -1137,14 +1211,18 @@ def run_formula(
             result["mse_raw"] = 0.0
             result["engine_raw_mse"] = 0.0
             result["formula_before_postprocess_mse"] = guard.get("postprocess_raw_mse")
-            result["formula_after_postprocess_mse"] = guard.get("postprocess_processed_mse")
+            result["formula_after_postprocess_mse"] = guard.get(
+                "postprocess_processed_mse"
+            )
             result["mse_display"] = 0.0
             result["mse"] = 0.0
             result["score_mse"] = 0.0
             result["winning_stage"] = "constant_shortcut"
             result["time"] = 0.0
             result["n_terms"] = _count_terms(formula)
-            result["uncertainty"] = cfp._prediction_uncertainty_metrics({'identity': 1.0})
+            result["uncertainty"] = cfp._prediction_uncertainty_metrics(
+                {"identity": 1.0}
+            )
             y_pred = cfp._evaluate_formula_values(formula, x_np)
             result["residual_diagnostics"] = (
                 cfp._residual_diagnostics(y_np, y_pred, x_np)
@@ -1152,20 +1230,22 @@ def run_formula(
                 else None
             )
             result["exact_match_diagnostics"] = {
-                    "backend_requested": exact_match_backend,
-                    "fallback_reason": "constant_shortcut",
-                    "max_combos": int(exact_match_max_combos),
-                    "torch_used": False,
-                    "gpu_used": False,
+                "backend_requested": exact_match_backend,
+                "fallback_reason": "constant_shortcut",
+                "max_combos": int(exact_match_max_combos),
+                "torch_used": False,
+                "gpu_used": False,
+            }
+            result["candidate_formulas"] = [
+                {
+                    "formula": formula,
+                    "mse": 0.0,
+                    "score": 0.0,
+                    "n_nonzero": result["n_terms"],
+                    "active_terms": ["1"],
+                    "alpha": 0.0,
                 }
-            result["candidate_formulas"] = [{
-                "formula": formula,
-                "mse": 0.0,
-                "score": 0.0,
-                "n_nonzero": result["n_terms"],
-                "active_terms": ["1"],
-                "alpha": 0.0,
-            }]
+            ]
             result["score"] = score_result(0.0, formula)
             _attach_clean_target_metrics(result, x_np, y_clean)
             return result
@@ -1188,7 +1268,8 @@ def run_formula(
         if not evolution_only:
             t0 = time.time()
             fp_result = run_fast_path(
-                x_2d, y_2d,
+                x_2d,
+                y_2d,
                 classifier_path=classifier_path,
                 detected_omegas=detected_omegas,
                 op_constraints=None,
@@ -1201,7 +1282,9 @@ def run_formula(
                 exact_match_min_gpu_work=exact_match_min_gpu_work,
                 exact_match_max_combos=exact_match_max_combos,
                 simplify_formula_output=False,
-                noise_level=(noise_cfg or {}).get("noise_level", 0.0) if noise_cfg else 0.0,
+                noise_level=(noise_cfg or {}).get("noise_level", 0.0)
+                if noise_cfg
+                else 0.0,
             )
             elapsed = time.time() - t0
 
@@ -1210,35 +1293,53 @@ def run_formula(
                 result["time"] = elapsed
             else:
                 fp_formula = fp_result.get("formula", "")
-                result["formula_discovered"], result["postprocess_guard"] = _postprocess_formula_for_benchmark(
-                    fp_formula,
-                    x_np,
-                    y_np,
+                result["formula_discovered"], result["postprocess_guard"] = (
+                    _postprocess_formula_for_benchmark(
+                        fp_formula,
+                        x_np,
+                        y_np,
+                    )
                 )
                 result["mse_raw"] = fp_result.get("mse", float("inf"))
                 result["engine_raw_mse"] = fp_result.get("mse", float("inf"))
-                result["formula_before_postprocess_mse"] = result["postprocess_guard"].get("postprocess_raw_mse")
-                result["formula_after_postprocess_mse"] = result["postprocess_guard"].get("postprocess_processed_mse")
-                display_details = _display_eval_details(result["formula_discovered"], x_np, y_np)
+                result["formula_before_postprocess_mse"] = result[
+                    "postprocess_guard"
+                ].get("postprocess_raw_mse")
+                result["formula_after_postprocess_mse"] = result[
+                    "postprocess_guard"
+                ].get("postprocess_processed_mse")
+                display_details = _display_eval_details(
+                    result["formula_discovered"], x_np, y_np
+                )
                 result["mse_display"] = display_details["mse"]
                 result["display_eval_diagnostics"] = display_details["diagnostics"]
                 result["mse"] = _select_score_mse(result["mse_display"])
                 result["score_mse"] = result["mse"]
-                result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
+                result.update(
+                    _mse_divergence_stats(result["mse_display"], result["mse_raw"])
+                )
                 result["uncertainty"] = fp_result.get("uncertainty")
                 result["candidate_formulas"] = fp_result.get("candidate_formulas")
-                result["fast_path_candidate_formulas"] = fp_result.get("candidate_formulas")
+                result["fast_path_candidate_formulas"] = fp_result.get(
+                    "candidate_formulas"
+                )
                 result["winning_stage"] = "fast_path"
                 if result["formula_discovered"] and result["mse_display"] is None:
-                    result["formula_before_display_error"] = result["formula_discovered"]
+                    result["formula_before_display_error"] = result[
+                        "formula_discovered"
+                    ]
                     if result["error"] is None:
                         result["error"] = "formula_eval_failed"
                 result["time"] = elapsed
                 str_term_count = _count_terms(result["formula_discovered"])
-                details = fp_result.get("details", {}) if isinstance(fp_result, dict) else {}
+                details = (
+                    fp_result.get("details", {}) if isinstance(fp_result, dict) else {}
+                )
                 structural_terms = details.get("n_nonzero", 0)
                 simplified_terms = details.get("n_nonzero_simplified", 0)
-                result["exact_match_diagnostics"] = details.get("exact_match_diagnostics")
+                result["exact_match_diagnostics"] = details.get(
+                    "exact_match_diagnostics"
+                )
                 result["n_terms"] = max(
                     int(str_term_count),
                     int(structural_terms) if structural_terms is not None else 0,
@@ -1251,8 +1352,12 @@ def run_formula(
         # Guided Evolution (latest path with beam search)
         # -----------------------------------------------------------------
         # Ensure we have y_variance for the adaptive decision
-        if fp_result and "details" in fp_result and "y_variance" not in fp_result["details"]:
-             fp_result["details"]["y_variance"] = float(np.var(y_np))
+        if (
+            fp_result
+            and "details" in fp_result
+            and "y_variance" not in fp_result["details"]
+        ):
+            fp_result["details"]["y_variance"] = float(np.var(y_np))
 
         should_run_guided, guided_reason = _guided_evolution_decision(
             evolution_only=evolution_only,
@@ -1264,11 +1369,15 @@ def run_formula(
 
         if should_run_guided:
             if evolution_only:
-                print("\n  [Evolution Only] Skipping fast-path. Running guided evolution (beam search)...")
+                print(
+                    "\n  [Evolution Only] Skipping fast-path. Running guided evolution (beam search)..."
+                )
             elif fp_result is None:
-                print("\n  [Latest Path] Fast-path not applicable. Running guided evolution (beam search)...")
+                print(
+                    "\n  [Latest Path] Fast-path not applicable. Running guided evolution (beam search)..."
+                )
             else:
-                mse_str = f"{result['mse']:.2e}" if result['mse'] is not None else "N/A"
+                mse_str = f"{result['mse']:.2e}" if result["mse"] is not None else "N/A"
                 print(
                     f"\n  [Latest Path] Fast-path candidate (MSE={mse_str}, reason={guided_reason}). "
                     "Running guided evolution (beam search)..."
@@ -1279,18 +1388,28 @@ def run_formula(
             operator_hints = fp_result.get("operator_hints", {}) if fp_result else {}
             operator_hints = dict(operator_hints) if operator_hints else {}
             operator_hints["operators"] = set(operator_hints.get("operators", set()))
-            operator_hints["frequencies"] = list(operator_hints.get("frequencies", detected_omegas or []))
+            operator_hints["frequencies"] = list(
+                operator_hints.get("frequencies", detected_omegas or [])
+            )
             operator_hints["powers"] = list(operator_hints.get("powers", []))
-            operator_hints["has_rational"] = bool(operator_hints.get("has_rational", False))
-            operator_hints["has_exp_decay"] = bool(operator_hints.get("has_exp_decay", False))
-            operator_hints["active_terms"] = list(operator_hints.get("active_terms", []))
-            operator_hints["uncertainty"] = fp_result.get("uncertainty") if fp_result else None
+            operator_hints["has_rational"] = bool(
+                operator_hints.get("has_rational", False)
+            )
+            operator_hints["has_exp_decay"] = bool(
+                operator_hints.get("has_exp_decay", False)
+            )
+            operator_hints["active_terms"] = list(
+                operator_hints.get("active_terms", [])
+            )
+            operator_hints["uncertainty"] = (
+                fp_result.get("uncertainty") if fp_result else None
+            )
 
             candidate_formulas = None
             proposer_confidence = 0.5
             dynamic_gens = int(max(20, evolution_generations))
             dynamic_pop = int(max(20, evolution_population))
-            guided_plan: Dict[str, Any] = {}
+            guided_plan: dict[str, Any] = {}
             # Per-formula deterministic C++ seed (same target + range → same seed).
             try:
                 guided_plan["random_seed"] = bc.formula_benchmark_seed(
@@ -1301,10 +1420,11 @@ def run_formula(
                 )
             except Exception:
                 pass
-            
+
             if not disable_proposer and proposer_path:
                 try:
                     from glassbox.universal_proposer import propose_fpip_v2_from_xy
+
                     model = _get_proposer(proposer_path, device)
                     payload = propose_fpip_v2_from_xy(
                         model, x=x_np, y=y_np, top_k=5, device=device
@@ -1314,13 +1434,13 @@ def run_formula(
                         search_plan = payload.get("search_plan", {})
                         if not isinstance(search_plan, dict):
                             search_plan = {}
-                        
+
                         # Calculate mathematical difficulty [0.0, 1.0]
                         entropy = float(seq_unc.get("entropy") or 0.0)
                         margin = float(seq_unc.get("margin") or 0.0)
                         difficulty = np.clip((entropy / 1.5) + (1.0 - margin), 0.0, 1.0)
                         proposer_confidence = float(np.clip(1.0 - difficulty, 0.0, 1.0))
-                        
+
                         formula_seed = guided_plan.get("random_seed")
                         dynamic_gens, dynamic_pop, guided_plan = _planned_guided_budget(
                             search_plan,
@@ -1328,77 +1448,110 @@ def run_formula(
                             evolution_population,
                             trust_plan=trust_proposer_plan,
                         )
-                        if formula_seed is not None and "random_seed" not in guided_plan:
+                        if (
+                            formula_seed is not None
+                            and "random_seed" not in guided_plan
+                        ):
                             guided_plan["random_seed"] = formula_seed
-                        
+
                         proposer_priors = payload.get("operator_priors", {})
                         if proposer_priors:
                             for op, prob in proposer_priors.items():
                                 if prob > 0.15:
                                     operator_hints["operators"].add(op)
                         proposer_skeletons = payload.get("candidate_skeletons", [])
-                        result["proposer_candidate_formulas"] = list(proposer_skeletons or [])
+                        result["proposer_candidate_formulas"] = list(
+                            proposer_skeletons or []
+                        )
                         candidate_formulas = []
                         if fp_result and fp_result.get("formula"):
-                            candidate_formulas.append({
-                                "formula": fp_result["formula"],
-                                "mse": fp_result.get("mse", float("inf")),
-                                "from_fast_path": True,
-                            })
+                            candidate_formulas.append(
+                                {
+                                    "formula": fp_result["formula"],
+                                    "mse": fp_result.get("mse", float("inf")),
+                                    "from_fast_path": True,
+                                }
+                            )
                         for cand in proposer_skeletons:
                             f_str = cand.get("formula", "")
                             if f_str:
-                                active = [t.strip() for t in f_str.replace("-", "+").split("+") if t.strip()]
-                                candidate_formulas.append({
-                                    "formula": f_str,
-                                    "mse": cand.get("mse", float("inf")),
-                                    "score": cand.get("score", 0.0),
-                                    "active_terms": active,
-                                    "from_proposer": True
-                                })
+                                active = [
+                                    t.strip()
+                                    for t in f_str.replace("-", "+").split("+")
+                                    if t.strip()
+                                ]
+                                candidate_formulas.append(
+                                    {
+                                        "formula": f_str,
+                                        "mse": cand.get("mse", float("inf")),
+                                        "score": cand.get("score", 0.0),
+                                        "active_terms": active,
+                                        "from_proposer": True,
+                                    }
+                                )
                         if candidate_formulas:
                             finite_candidate_mses = [
                                 float(c.get("mse"))
                                 for c in candidate_formulas
-                                if c.get("mse") is not None and math.isfinite(float(c.get("mse")))
+                                if c.get("mse") is not None
+                                and math.isfinite(float(c.get("mse")))
                             ]
-                            best_candidate_mse = min(finite_candidate_mses) if finite_candidate_mses else float("inf")
-                            baseline_for_conf = result["mse"] if result["mse"] is not None else float("inf")
-                            plan_signals = search_plan.get("signals", {}) if isinstance(search_plan, dict) else {}
+                            best_candidate_mse = (
+                                min(finite_candidate_mses)
+                                if finite_candidate_mses
+                                else float("inf")
+                            )
+                            baseline_for_conf = (
+                                result["mse"]
+                                if result["mse"] is not None
+                                else float("inf")
+                            )
+                            plan_signals = (
+                                search_plan.get("signals", {})
+                                if isinstance(search_plan, dict)
+                                else {}
+                            )
                             best_rel_mse = plan_signals.get("best_relative_mse")
                             rel_confident = (
                                 best_rel_mse is not None
                                 and math.isfinite(float(best_rel_mse))
                                 and float(best_rel_mse) < 1e-4
                             )
-                            if (
-                                seq_unc.get("confident") is True
-                                and (
-                                    best_candidate_mse <= baseline_for_conf * 1.05
-                                    or rel_confident
-                                )
+                            if seq_unc.get("confident") is True and (
+                                best_candidate_mse <= baseline_for_conf * 1.05
+                                or rel_confident
                             ):
                                 proposer_confidence = max(proposer_confidence, 0.9)
-                            print(f"\n  [Universal Proposer] Active FPIPv2 metadata injected!")
+                            print(
+                                "\n  [Universal Proposer] Active FPIPv2 metadata injected!"
+                            )
                             strategy = search_plan.get("strategy", "legacy")
-                            planned_difficulty = search_plan.get("difficulty", difficulty)
-                            planner_mode = "trusted" if trust_proposer_plan else "bounded"
+                            planned_difficulty = search_plan.get(
+                                "difficulty", difficulty
+                            )
+                            planner_mode = (
+                                "trusted" if trust_proposer_plan else "bounded"
+                            )
                             print(
                                 f"  [Universal Proposer] Strategy: {strategy} ({planner_mode}) "
                                 f"difficulty={float(planned_difficulty):.2f} -> "
                                 f"Budget: {dynamic_gens} gens, {dynamic_pop} pop"
                             )
                             if guided_plan:
-                                print(f"  [Universal Proposer] Search plan: {guided_plan}")
+                                print(
+                                    f"  [Universal Proposer] Search plan: {guided_plan}"
+                                )
                 except Exception as e:
                     print(f"\n  [Universal Proposer] Warning: execution failed: {e}")
 
             if candidate_formulas is None and fp_result and fp_result.get("formula"):
-                candidate_formulas = [{
-                    "formula": fp_result["formula"],
-                    "mse": fp_result.get("mse", float("inf")),
-                    "from_fast_path": True,
-                }]
+                candidate_formulas = [
+                    {
+                        "formula": fp_result["formula"],
+                        "mse": fp_result.get("mse", float("inf")),
+                        "from_fast_path": True,
+                    }
+                ]
 
             if fp_result:
                 fp_seed_candidates = list(fp_result.get("candidate_formulas") or [])
@@ -1428,7 +1581,10 @@ def run_formula(
             t1 = time.time()
             try:
                 guided_plan = dict(guided_plan or {})
-                remaining_timeout = max(1, int(float(timeout) - float(t1 - (t0 if "t0" in locals() else t1))))
+                remaining_timeout = max(
+                    1,
+                    int(float(timeout) - float(t1 - (t0 if "t0" in locals() else t1))),
+                )
                 guided_plan.setdefault("timeout_seconds", remaining_timeout)
                 guided_result = run_guided_evolution(
                     x_2d,
@@ -1453,31 +1609,62 @@ def run_formula(
                         x_np,
                         y_np,
                     )
-                    guided_mse_raw = guided_result.get("raw_mse", guided_result.get("mse", float("inf")))
-                    guided_display_details = _display_eval_details(guided_formula, x_np, y_np)
+                    guided_mse_raw = guided_result.get(
+                        "raw_mse", guided_result.get("mse", float("inf"))
+                    )
+                    guided_display_details = _display_eval_details(
+                        guided_formula, x_np, y_np
+                    )
                     guided_mse_display = guided_display_details["mse"]
                     guided_mse_score = _select_score_mse(guided_mse_display)
                     guided_mse_for_compare = (
-                        guided_mse_score if guided_mse_score is not None else float("inf")
+                        guided_mse_score
+                        if guided_mse_score is not None
+                        else float("inf")
                     )
-                    baseline_mse = result["mse"] if result["mse"] is not None else float("inf")
+                    baseline_mse = (
+                        result["mse"] if result["mse"] is not None else float("inf")
+                    )
 
-                    if evolution_only or fp_result is None or guided_mse_for_compare < baseline_mse:
+                    if (
+                        evolution_only
+                        or fp_result is None
+                        or guided_mse_for_compare < baseline_mse
+                    ):
                         result["formula_discovered"] = guided_formula
                         result["mse_raw"] = guided_mse_raw
                         result["engine_raw_mse"] = guided_mse_raw
-                        result["formula_before_postprocess_mse"] = guided_guard.get("postprocess_raw_mse")
-                        result["formula_after_postprocess_mse"] = guided_guard.get("postprocess_processed_mse")
+                        result["formula_before_postprocess_mse"] = guided_guard.get(
+                            "postprocess_raw_mse"
+                        )
+                        result["formula_after_postprocess_mse"] = guided_guard.get(
+                            "postprocess_processed_mse"
+                        )
                         result["mse_display"] = guided_mse_display
                         result["mse"] = guided_mse_for_compare
                         result["score_mse"] = result["mse"]
-                        result["display_eval_diagnostics"] = guided_display_details["diagnostics"]
-                        result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
-                        result["uncertainty"] = fp_result.get("uncertainty") if fp_result else None
-                        result["candidate_formulas"] = result["evolution_seed_candidates"]
+                        result["display_eval_diagnostics"] = guided_display_details[
+                            "diagnostics"
+                        ]
+                        result.update(
+                            _mse_divergence_stats(
+                                result["mse_display"], result["mse_raw"]
+                            )
+                        )
+                        result["uncertainty"] = (
+                            fp_result.get("uncertainty") if fp_result else None
+                        )
+                        result["candidate_formulas"] = result[
+                            "evolution_seed_candidates"
+                        ]
                         result["winning_stage"] = "guided_evolution"
-                        if result["formula_discovered"] and result["mse_display"] is None:
-                            result["formula_before_display_error"] = result["formula_discovered"]
+                        if (
+                            result["formula_discovered"]
+                            and result["mse_display"] is None
+                        ):
+                            result["formula_before_display_error"] = result[
+                                "formula_discovered"
+                            ]
                             result["error"] = "formula_eval_failed"
                         else:
                             result["error"] = None
@@ -1492,12 +1679,16 @@ def run_formula(
 
         if result["formula_discovered"]:
             if result["mse_display"] is None:
-                display_details = _display_eval_details(result["formula_discovered"], x_np, y_np)
+                display_details = _display_eval_details(
+                    result["formula_discovered"], x_np, y_np
+                )
                 result["mse_display"] = display_details["mse"]
                 result["display_eval_diagnostics"] = display_details["diagnostics"]
             result["mse"] = _select_score_mse(result["mse_display"])
             result["score_mse"] = result["mse"]
-            result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
+            result.update(
+                _mse_divergence_stats(result["mse_display"], result["mse_raw"])
+            )
             y_pred = cfp._evaluate_formula_values(result["formula_discovered"], x_np)
             result["residual_diagnostics"] = (
                 cfp._residual_diagnostics(y_np, y_pred, x_np)
@@ -1511,7 +1702,9 @@ def run_formula(
 
     except Exception as e:
         result["error"] = str(e)
-        import traceback; traceback.print_exc()
+        import traceback
+
+        traceback.print_exc()
         result["time"] = 0.0
 
     # Score (noisy-fit band) + clean-target recovery metrics
@@ -1527,19 +1720,18 @@ def run_formula(
 
 def run_formula_cpp_evolution(
     formula_str: str,
-    x_range: Tuple[float, float],
+    x_range: tuple[float, float],
     n_samples: int = 300,
     pop_size: int = 100,
     generations: int = 1000,
-    device: Optional[str] = None,
-    timeout: Optional[float] = None,
-    noise_cfg: Optional[Dict[str, Any]] = None,
+    device: str | None = None,
+    timeout: float | None = None,
+    noise_cfg: dict[str, Any] | None = None,
     noise_seed: int = 0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Run pure C++ evolution on a single formula (no classifier fast-path)."""
-    import sys
     from pathlib import Path
-    
+
     x_min, x_max = x_range
     result = {
         "formula_target": formula_str,
@@ -1567,24 +1759,27 @@ def run_formula_cpp_evolution(
         "mse_divergence_rel": None,
         "mse_divergence_flag": False,
     }
-    
+
     try:
         # Import C++ backend
-        cpp_dir = Path(__file__).resolve().parent.parent / 'glassbox' / 'sr' / 'cpp'
+        cpp_dir = Path(__file__).resolve().parent.parent / "glassbox" / "sr" / "cpp"
         from glassbox.sr.cpp import get_cpp_core
 
         _core = get_cpp_core()
 
         if _core is None:
-
             raise ImportError("C++ _core unavailable")
-        
+
         # Generate data (keep clean labels for recovery; fit on optional noise)
         x_np, y_np, y_clean = _generate_xy_with_optional_noise(
-            formula_str, x_min, x_max, n_samples,
-            noise_cfg=noise_cfg, noise_seed=noise_seed,
+            formula_str,
+            x_min,
+            x_max,
+            n_samples,
+            noise_cfg=noise_cfg,
+            noise_seed=noise_seed,
         )
-        
+
         # Early return for constant signals (evolution can't find pure constants)
         y_std = np.std(y_np)
         if y_std < 1e-10:
@@ -1600,7 +1795,9 @@ def run_formula_cpp_evolution(
             result["mse_raw"] = 0.0
             result["engine_raw_mse"] = 0.0
             result["formula_before_postprocess_mse"] = guard.get("postprocess_raw_mse")
-            result["formula_after_postprocess_mse"] = guard.get("postprocess_processed_mse")
+            result["formula_after_postprocess_mse"] = guard.get(
+                "postprocess_processed_mse"
+            )
             result["mse_display"] = 0.0
             result["mse"] = 0.0
             result["score_mse"] = 0.0
@@ -1619,9 +1816,9 @@ def run_formula_cpp_evolution(
             result["score"] = score_result(0.0, formula)
             _attach_clean_target_metrics(result, x_np, y_clean)
             return result
-        
+
         X_list = [x_np]
-        
+
         # FFT frequency detection
         x_t = torch.tensor(x_np, dtype=torch.float32).reshape(-1, 1)
         y_t = torch.tensor(y_np, dtype=torch.float32).reshape(-1, 1)
@@ -1638,11 +1835,14 @@ def run_formula_cpp_evolution(
             detected_omegas,
             max_seeds=12,
         )
-        
+
         # Run pure C++ evolution (deterministic per formula+range when possible)
         try:
             cpp_seed = bc.formula_benchmark_seed(
-                formula_str, x_range, base_seed=int(noise_seed or 0), n_samples=n_samples
+                formula_str,
+                x_range,
+                base_seed=int(noise_seed or 0),
+                n_samples=n_samples,
             )
         except Exception:
             cpp_seed = -1
@@ -1660,17 +1860,25 @@ def run_formula_cpp_evolution(
             evo_kwargs["random_seed"] = int(cpp_seed)
         cpp_result = _core.run_evolution(**evo_kwargs)
         elapsed = time.time() - t0
-        
-        result["formula_discovered"], result["postprocess_guard"] = _postprocess_formula_for_benchmark(
-            cpp_result.get("formula", ""),
-            x_np,
-            y_np,
+
+        result["formula_discovered"], result["postprocess_guard"] = (
+            _postprocess_formula_for_benchmark(
+                cpp_result.get("formula", ""),
+                x_np,
+                y_np,
+            )
         )
         result["mse_raw"] = cpp_result.get("best_mse", float("inf"))
         result["engine_raw_mse"] = cpp_result.get("best_mse", float("inf"))
-        result["formula_before_postprocess_mse"] = result["postprocess_guard"].get("postprocess_raw_mse")
-        result["formula_after_postprocess_mse"] = result["postprocess_guard"].get("postprocess_processed_mse")
-        display_details = _display_eval_details(result["formula_discovered"], x_np, y_np)
+        result["formula_before_postprocess_mse"] = result["postprocess_guard"].get(
+            "postprocess_raw_mse"
+        )
+        result["formula_after_postprocess_mse"] = result["postprocess_guard"].get(
+            "postprocess_processed_mse"
+        )
+        display_details = _display_eval_details(
+            result["formula_discovered"], x_np, y_np
+        )
         result["mse_display"] = display_details["mse"]
         result["display_eval_diagnostics"] = display_details["diagnostics"]
         result["mse"] = _select_score_mse(result["mse_display"])
@@ -1691,15 +1899,17 @@ def run_formula_cpp_evolution(
         if timeout is not None and elapsed > float(timeout):
             result["error"] = f"timeout_exceeded after {elapsed:.1f}s"
             result["score"] = "FAIL"
-        
+
     except ImportError as e:
         result["error"] = f"C++ backend not available: {e}"
         result["time"] = 0.0
     except Exception as e:
         result["error"] = str(e)
-        import traceback; traceback.print_exc()
+        import traceback
+
+        traceback.print_exc()
         result["time"] = 0.0
-    
+
     result["score_mse"] = result["mse"]
     if result.get("error") and "timeout" in str(result.get("error")).lower():
         result["score"] = "FAIL"
@@ -1712,11 +1922,11 @@ def run_formula_cpp_evolution(
 
 def run_formula_specialist_regressor(
     formula_str: str,
-    x_range: Tuple[float, float],
+    x_range: tuple[float, float],
     classifier_path: str,
-    proposer_path: Optional[str],
+    proposer_path: str | None,
     n_samples: int = 300,
-    device: Optional[str] = None,
+    device: str | None = None,
     timeout: float = 60.0,
     population_size: int = 50,
     generations: int = 150,
@@ -1729,15 +1939,21 @@ def run_formula_specialist_regressor(
     exact_match_backend: str = "auto",
     exact_match_min_gpu_work: int = 250_000,
     exact_match_max_combos: int = 50_000,
-    noise_cfg: Optional[Dict[str, Any]] = None,
+    noise_cfg: dict[str, Any] | None = None,
     noise_seed: int = 0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Run the sklearn regressor path so specialist composition/boosting is measurable."""
     x_min, x_max = x_range
     diagnostics_enabled = bool(specialist_enabled and specialist_diagnostics)
-    composition_enabled = bool(specialist_enabled and specialist_composition and diagnostics_enabled)
-    residual_enabled = bool(specialist_enabled and specialist_residual and composition_enabled)
-    vault_enabled = bool(specialist_enabled and specialist_vault and composition_enabled)
+    composition_enabled = bool(
+        specialist_enabled and specialist_composition and diagnostics_enabled
+    )
+    residual_enabled = bool(
+        specialist_enabled and specialist_residual and composition_enabled
+    )
+    vault_enabled = bool(
+        specialist_enabled and specialist_vault and composition_enabled
+    )
     inception_enabled = bool(specialist_enabled and specialist_inception)
     result = {
         "formula_target": formula_str,
@@ -1767,7 +1983,9 @@ def run_formula_specialist_regressor(
         "mse_divergence_rel": None,
         "mse_divergence_flag": False,
         "exact_match_diagnostics": None,
-        "benchmark_path": "specialist_regressor" if specialist_enabled else "regressor_baseline",
+        "benchmark_path": "specialist_regressor"
+        if specialist_enabled
+        else "regressor_baseline",
         "specialist_enabled": bool(specialist_enabled),
         "specialist_phase_config": {
             "diagnostics": diagnostics_enabled,
@@ -1799,8 +2017,12 @@ def run_formula_specialist_regressor(
         from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
         x_np, y_np, y_clean = _generate_xy_with_optional_noise(
-            formula_str, x_min, x_max, n_samples,
-            noise_cfg=noise_cfg, noise_seed=noise_seed,
+            formula_str,
+            x_min,
+            x_max,
+            n_samples,
+            noise_cfg=noise_cfg,
+            noise_seed=noise_seed,
         )
         X = np.asarray(x_np, dtype=np.float64).reshape(-1, 1)
         y = np.asarray(y_np, dtype=np.float64).reshape(-1)
@@ -1808,14 +2030,20 @@ def run_formula_specialist_regressor(
         y_std = np.std(y)
         if y_std < 1e-10:
             const_val = float(np.mean(y))
-            formula = str(int(round(const_val))) if abs(const_val - round(const_val)) < 1e-6 else f"{const_val:.6g}"
+            formula = (
+                str(int(round(const_val)))
+                if abs(const_val - round(const_val)) < 1e-6
+                else f"{const_val:.6g}"
+            )
             formula, guard = _postprocess_formula_for_benchmark(formula, x_np, y_np)
             result["formula_discovered"] = formula
             result["postprocess_guard"] = guard
             result["mse_raw"] = 0.0
             result["engine_raw_mse"] = 0.0
             result["formula_before_postprocess_mse"] = guard.get("postprocess_raw_mse")
-            result["formula_after_postprocess_mse"] = guard.get("postprocess_processed_mse")
+            result["formula_after_postprocess_mse"] = guard.get(
+                "postprocess_processed_mse"
+            )
             result["mse_display"] = 0.0
             result["mse"] = 0.0
             result["score_mse"] = 0.0
@@ -1837,7 +2065,8 @@ def run_formula_specialist_regressor(
             generations=max(20, int(generations)),
             timeout=max(1, int(timeout)),
             classifier_path=classifier_path,
-            universal_proposer_path=proposer_path or "models/universal_proposer_multi.pt",
+            universal_proposer_path=proposer_path
+            or "models/universal_proposer_multi.pt",
             use_universal_proposer=bool(proposer_path),
             universal_proposer_shadow_mode=False,
             universal_proposer_log_routing=False,
@@ -1863,7 +2092,9 @@ def run_formula_specialist_regressor(
         reg.fit(X, y)
         elapsed = time.time() - t0
 
-        formula, guard = _postprocess_formula_for_benchmark(reg.get_formula(), x_np, y_np)
+        formula, guard = _postprocess_formula_for_benchmark(
+            reg.get_formula(), x_np, y_np
+        )
         result["formula_discovered"] = formula
         result["postprocess_guard"] = guard
         result["mse_raw"] = _finite_float(getattr(reg, "best_mse_", None), float("inf"))
@@ -1890,7 +2121,9 @@ def run_formula_specialist_regressor(
             result["error"] = "formula_eval_failed"
 
         result.update(bc.specialist_metadata_from_estimator(reg))
-        result["exact_match_diagnostics"] = getattr(reg, "fast_path_exact_match_diagnostics_", None)
+        result["exact_match_diagnostics"] = getattr(
+            reg, "fast_path_exact_match_diagnostics_", None
+        )
 
     except Exception as e:
         result["error"] = str(e)
@@ -1904,7 +2137,9 @@ def run_formula_specialist_regressor(
     return result
 
 
-def _timeout_result(formula_str: str, x_range: Tuple[float, float], elapsed: float, error: str) -> Dict[str, Any]:
+def _timeout_result(
+    formula_str: str, x_range: tuple[float, float], elapsed: float, error: str
+) -> dict[str, Any]:
     return {
         "formula_target": formula_str,
         "x_range": list(x_range),
@@ -1939,9 +2174,9 @@ def _benchmark_worker_cli(input_path: str, output_path: str) -> int:
 
 def run_benchmark_call_with_timeout(
     function_name: str,
-    kwargs: Dict[str, Any],
-    timeout_seconds: Optional[float],
-) -> Dict[str, Any]:
+    kwargs: dict[str, Any],
+    timeout_seconds: float | None,
+) -> dict[str, Any]:
     """Run a benchmark formula call in a child process with hard wall-clock timeout."""
     timeout_seconds = float(timeout_seconds or 0.0)
     if timeout_seconds <= 0:
@@ -1954,7 +2189,11 @@ def run_benchmark_call_with_timeout(
     output_path = worker_dir / f"{unique}.out.pkl"
     t0 = time.time()
     with open(input_path, "wb") as fh:
-        pickle.dump({"function": function_name, "kwargs": kwargs}, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        pickle.dump(
+            {"function": function_name, "kwargs": kwargs},
+            fh,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
     try:
         cmd = [
             sys.executable,
@@ -1963,7 +2202,11 @@ def run_benchmark_call_with_timeout(
             str(input_path),
             str(output_path),
         ]
-        completed = subprocess.run(cmd, cwd=str(Path(__file__).resolve().parent.parent), timeout=timeout_seconds)
+        completed = subprocess.run(
+            cmd,
+            cwd=str(Path(__file__).resolve().parent.parent),
+            timeout=timeout_seconds,
+        )
         elapsed = time.time() - t0
         if completed.returncode != 0:
             return _timeout_result(
@@ -1990,7 +2233,12 @@ def run_benchmark_call_with_timeout(
             return result
 
         error = payload.get("error", "worker error")
-        return _timeout_result(kwargs.get("formula_str", ""), kwargs.get("x_range", (0.0, 0.0)), elapsed, error)
+        return _timeout_result(
+            kwargs.get("formula_str", ""),
+            kwargs.get("x_range", (0.0, 0.0)),
+            elapsed,
+            error,
+        )
     except subprocess.TimeoutExpired:
         elapsed = time.time() - t0
         return _timeout_result(
@@ -2013,16 +2261,23 @@ def run_benchmark_call_with_timeout(
 # Report generation
 # ---------------------------------------------------------------------------
 
-def _tier_summary(tier_results: List[Dict]) -> Dict[str, int]:
+
+def _tier_summary(tier_results: list[dict]) -> dict[str, int]:
     """Count scores in a tier."""
-    counts = {"EXACT": 0, "APPROX": 0, "LOOSE": 0, "FAIL": 0, "total": len(tier_results)}
+    counts = {
+        "EXACT": 0,
+        "APPROX": 0,
+        "LOOSE": 0,
+        "FAIL": 0,
+        "total": len(tier_results),
+    }
     for r in tier_results:
         s = r.get("score", "FAIL")
         counts[s] = counts.get(s, 0) + 1
     return counts
 
 
-def print_summary(all_results: Dict[int, List[Dict]]) -> None:
+def print_summary(all_results: dict[int, list[dict]]) -> None:
     """Print a console summary table."""
     print("\n" + "=" * 90)
     print("GLASSBOX SR BENCHMARK RESULTS")
@@ -2060,15 +2315,15 @@ def print_summary(all_results: Dict[int, List[Dict]]) -> None:
     max_points = grand["total"] * 3
     weighted_pct = (total_points / max_points * 100) if max_points > 0 else 0
     print(f"\nWeighted Score: {total_points}/{max_points} ({weighted_pct:.1f}%)")
-    print(f"  Scoring: EXACT=3pts, APPROX=2pts, LOOSE=1pt, FAIL=0pts\n")
+    print("  Scoring: EXACT=3pts, APPROX=2pts, LOOSE=1pt, FAIL=0pts\n")
 
 
 def generate_markdown_report(
-    all_results: Dict[int, List[Dict]],
+    all_results: dict[int, list[dict]],
     output_path: Path,
     classifier_path: str,
     total_time: float,
-    metadata: Optional[Dict[str, Any]] = None,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     """Write a detailed Markdown report."""
     lines = []
@@ -2090,14 +2345,20 @@ def generate_markdown_report(
                 "(see `noise_handling_audit.md`).\n"
             )
         lines.append(f"**Python ABI**: `{metadata.get('python_abi', '')}`\n")
-        lines.append(f"**C++ core**: `{metadata.get('cpp_core_status', {}).get('status', 'unknown')}`\n")
+        lines.append(
+            f"**C++ core**: `{metadata.get('cpp_core_status', {}).get('status', 'unknown')}`\n"
+        )
         if metadata.get("seed") is not None:
             lines.append(f"**Seed**: `{metadata.get('seed')}`\n")
 
     # Overall summary table
     lines.append("\n## Summary\n")
-    lines.append("| Tier | Name | Total | ✅ Exact | 🟡 Approx | 🟠 Loose | ❌ Fail | Exact % |")
-    lines.append("|------|------|-------|---------|----------|---------|--------|---------|")
+    lines.append(
+        "| Tier | Name | Total | ✅ Exact | 🟡 Approx | 🟠 Loose | ❌ Fail | Exact % |"
+    )
+    lines.append(
+        "|------|------|-------|---------|----------|---------|--------|---------|"
+    )
 
     grand = {"EXACT": 0, "APPROX": 0, "LOOSE": 0, "FAIL": 0, "total": 0}
     for tier_num in sorted(all_results.keys()):
@@ -2122,8 +2383,12 @@ def generate_markdown_report(
         tier_name = ALL_TIERS[tier_num][0]
         results = all_results[tier_num]
         lines.append(f"\n## Tier {tier_num}: {tier_name}\n")
-        lines.append("| # | Score | Target | Discovered | MSE(score) | MSE(raw) | MSE(display) | CleanMSE | R2clean | Recov | Drift | Stage | Time | Terms |")
-        lines.append("|---|-------|--------|------------|------------|----------|--------------|----------|---------|-------|-------|-------|------|-------|")
+        lines.append(
+            "| # | Score | Target | Discovered | MSE(score) | MSE(raw) | MSE(display) | CleanMSE | R2clean | Recov | Drift | Stage | Time | Terms |"
+        )
+        lines.append(
+            "|---|-------|--------|------------|------------|----------|--------------|----------|---------|-------|-------|-------|------|-------|"
+        )
 
         for i, r in enumerate(results, 1):
             sym = SCORE_SYMBOLS.get(r["score"], "?")
@@ -2131,20 +2396,34 @@ def generate_markdown_report(
             disc = r.get("formula_discovered", "")
             if len(disc) > 50:
                 disc = disc[:47] + "..."
-            mse_s = f"{r['mse']:.2e}" if r["mse"] is not None and math.isfinite(r["mse"]) else "—"
+            mse_s = (
+                f"{r['mse']:.2e}"
+                if r["mse"] is not None and math.isfinite(r["mse"])
+                else "—"
+            )
             mse_raw = r.get("mse_raw")
-            mse_raw_s = f"{mse_raw:.2e}" if mse_raw is not None and math.isfinite(mse_raw) else "—"
+            mse_raw_s = (
+                f"{mse_raw:.2e}"
+                if mse_raw is not None and math.isfinite(mse_raw)
+                else "—"
+            )
             mse_display = r.get("mse_display")
             mse_display_s = (
-                f"{mse_display:.2e}" if mse_display is not None and math.isfinite(mse_display) else "—"
+                f"{mse_display:.2e}"
+                if mse_display is not None and math.isfinite(mse_display)
+                else "—"
             )
             mse_clean = r.get("mse_clean")
             mse_clean_s = (
-                f"{mse_clean:.2e}" if mse_clean is not None and math.isfinite(mse_clean) else "—"
+                f"{mse_clean:.2e}"
+                if mse_clean is not None and math.isfinite(mse_clean)
+                else "—"
             )
             r2_clean = r.get("r2_clean")
             r2_clean_s = (
-                f"{r2_clean:.3f}" if r2_clean is not None and math.isfinite(r2_clean) else "—"
+                f"{r2_clean:.3f}"
+                if r2_clean is not None and math.isfinite(r2_clean)
+                else "—"
             )
             if r.get("recovery_exact"):
                 recov_s = "exact"
@@ -2179,11 +2458,11 @@ def generate_markdown_report(
 
 
 def save_json_results(
-    all_results: Dict[int, List[Dict]],
+    all_results: dict[int, list[dict]],
     output_path: Path,
     classifier_path: str,
     total_time: float,
-    metadata: Optional[Dict[str, Any]] = None,
+    metadata: dict[str, Any] | None = None,
 ) -> None:
     """Save full results to JSON."""
     data = {
@@ -2213,16 +2492,19 @@ def save_json_results(
     data["weighted_score"] = {
         "points": total_points,
         "max_points": max_points,
-        "percentage": round(total_points / max_points * 100, 1) if max_points > 0 else 0,
+        "percentage": round(total_points / max_points * 100, 1)
+        if max_points > 0
+        else 0,
     }
 
     output_path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
 
 
-def _cpp_core_status() -> Dict[str, Any]:
+def _cpp_core_status() -> dict[str, Any]:
     from glassbox.sr.cpp import load_cpp_core
+
     core, reason = load_cpp_core()
-    built_extensions: List[str] = []
+    built_extensions: list[str] = []
     try:
         cpp_dir = _REPO_ROOT / "glassbox" / "sr" / "cpp"
         built_extensions = sorted(p.name for p in cpp_dir.glob("_core.*"))
@@ -2235,7 +2517,7 @@ def _cpp_core_status() -> Dict[str, Any]:
     }
 
 
-def _collect_report_diagnostics(all_results: Dict[int, List[Dict]]) -> Dict[str, int]:
+def _collect_report_diagnostics(all_results: dict[int, list[dict]]) -> dict[str, int]:
     diagnostics = {
         "exact_match_combo_cap_count": 0,
         "bounded_sparse_beam_count": 0,
@@ -2248,11 +2530,18 @@ def _collect_report_diagnostics(all_results: Dict[int, List[Dict]]) -> Dict[str,
             exact_diag = result.get("exact_match_diagnostics")
             if isinstance(exact_diag, dict):
                 if exact_diag.get("combo_count", 0) and exact_diag.get("max_combos", 0):
-                    if exact_diag.get("combo_count", 0) > exact_diag.get("max_combos", 0):
+                    if exact_diag.get("combo_count", 0) > exact_diag.get(
+                        "max_combos", 0
+                    ):
                         diagnostics["exact_match_combo_cap_count"] += 1
-                if str(exact_diag.get("fallback_reason", "")).startswith("bounded_sparse_beam"):
+                if str(exact_diag.get("fallback_reason", "")).startswith(
+                    "bounded_sparse_beam"
+                ):
                     diagnostics["bounded_sparse_beam_count"] += 1
-            if result.get("display_eval_diagnostics") and result.get("mse_display") is None:
+            if (
+                result.get("display_eval_diagnostics")
+                and result.get("mse_display") is None
+            ):
                 diagnostics["display_eval_failure_count"] += 1
             if result.get("mse_divergence_flag"):
                 diagnostics["mse_divergence_flag_count"] += 1
@@ -2271,10 +2560,10 @@ def _build_run_metadata(
     *,
     device: str,
     mode: str,
-    tiers_to_run: List[int],
+    tiers_to_run: list[int],
     total_formulas: int,
-    all_results: Optional[Dict[int, List[Dict]]] = None,
-) -> Dict[str, Any]:
+    all_results: dict[int, list[dict]] | None = None,
+) -> dict[str, Any]:
     metadata = {
         "mode": mode,
         "device": device,
@@ -2313,8 +2602,8 @@ def _build_run_metadata(
     return metadata
 
 
-def _flatten_json_report_results(report: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    flattened: Dict[str, Dict[str, Any]] = {}
+def _flatten_json_report_results(report: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    flattened: dict[str, dict[str, Any]] = {}
     tiers = report.get("tiers", {})
     if not isinstance(tiers, dict):
         return flattened
@@ -2324,17 +2613,23 @@ def _flatten_json_report_results(report: Dict[str, Any]) -> Dict[str, Dict[str, 
         for result in tier_payload.get("results", []) or []:
             if not isinstance(result, dict):
                 continue
-            key = str(result.get("formula_target") or result.get("human_name") or "").strip()
+            key = str(
+                result.get("formula_target") or result.get("human_name") or ""
+            ).strip()
             if key:
                 flattened[key] = result
     return flattened
 
 
-def _flatten_current_results(all_results: Dict[int, List[Dict]]) -> Dict[str, Dict[str, Any]]:
-    flattened: Dict[str, Dict[str, Any]] = {}
+def _flatten_current_results(
+    all_results: dict[int, list[dict]],
+) -> dict[str, dict[str, Any]]:
+    flattened: dict[str, dict[str, Any]] = {}
     for results in all_results.values():
         for result in results:
-            key = str(result.get("formula_target") or result.get("human_name") or "").strip()
+            key = str(
+                result.get("formula_target") or result.get("human_name") or ""
+            ).strip()
             if key:
                 flattened[key] = result
     return flattened
@@ -2342,12 +2637,12 @@ def _flatten_current_results(all_results: Dict[int, List[Dict]]) -> Dict[str, Di
 
 def compare_benchmark_results(
     previous_report_path: Path,
-    current_results: Dict[int, List[Dict]],
-) -> Dict[str, Any]:
+    current_results: dict[int, list[dict]],
+) -> dict[str, Any]:
     previous_report = json.loads(previous_report_path.read_text(encoding="utf-8"))
     previous = _flatten_json_report_results(previous_report)
     current = _flatten_current_results(current_results)
-    transitions: List[Dict[str, Any]] = []
+    transitions: list[dict[str, Any]] = []
     summary = {
         "previous_only": 0,
         "current_only": 0,
@@ -2361,12 +2656,14 @@ def compare_benchmark_results(
         prev = previous.get(key)
         if prev is None:
             summary["current_only"] += 1
-            transitions.append({
-                "formula": key,
-                "previous_score": None,
-                "current_score": cur.get("score"),
-                "direction": "new",
-            })
+            transitions.append(
+                {
+                    "formula": key,
+                    "previous_score": None,
+                    "current_score": cur.get("score"),
+                    "direction": "new",
+                }
+            )
             continue
 
         prev_score = str(prev.get("score", "FAIL"))
@@ -2392,33 +2689,44 @@ def compare_benchmark_results(
             if prev_mse is None or cur_mse is None:
                 mse_changed = prev_mse != cur_mse
             else:
-                mse_changed = not math.isclose(float(prev_mse), float(cur_mse), rel_tol=1e-9, abs_tol=1e-12)
+                mse_changed = not math.isclose(
+                    float(prev_mse), float(cur_mse), rel_tol=1e-9, abs_tol=1e-12
+                )
         except Exception:
             mse_changed = prev_mse != cur_mse
         formula_changed = prev_formula != cur_formula
-        if direction != "same" or prev_score != cur_score or mse_changed or formula_changed:
+        if (
+            direction != "same"
+            or prev_score != cur_score
+            or mse_changed
+            or formula_changed
+        ):
             summary["changed"] += 1
-        transitions.append({
-            "formula": key,
-            "previous_score": prev_score,
-            "current_score": cur_score,
-            "direction": direction,
-            "previous_mse": prev_mse,
-            "current_mse": cur_mse,
-            "previous_formula": prev_formula,
-            "current_formula": cur_formula,
-            "mse_changed": mse_changed,
-            "formula_changed": formula_changed,
-        })
+        transitions.append(
+            {
+                "formula": key,
+                "previous_score": prev_score,
+                "current_score": cur_score,
+                "direction": direction,
+                "previous_mse": prev_mse,
+                "current_mse": cur_mse,
+                "previous_formula": prev_formula,
+                "current_formula": cur_formula,
+                "mse_changed": mse_changed,
+                "formula_changed": formula_changed,
+            }
+        )
 
     for key in sorted(set(previous) - set(current)):
         summary["previous_only"] += 1
-        transitions.append({
-            "formula": key,
-            "previous_score": previous[key].get("score"),
-            "current_score": None,
-            "direction": "missing",
-        })
+        transitions.append(
+            {
+                "formula": key,
+                "previous_score": previous[key].get("score"),
+                "current_score": None,
+                "direction": "missing",
+            }
+        )
 
     return {
         "previous_report": str(previous_report_path),
@@ -2430,6 +2738,7 @@ def compare_benchmark_results(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -2446,78 +2755,105 @@ Examples:
         """,
     )
     parser.add_argument(
-        "--classifier-model", type=str, default="models/curve_classifier_multi.pt",
+        "--classifier-model",
+        type=str,
+        default="models/curve_classifier_multi.pt",
         help="Path to the curve classifier model (default: models/curve_classifier_multi.pt)",
     )
     parser.add_argument(
-        "--proposer-model", type=str, default="models/universal_proposer_multi.pt",
+        "--proposer-model",
+        type=str,
+        default="models/universal_proposer_multi.pt",
         help="Path to the universal neural proposer model (default: models/universal_proposer_multi.pt)",
     )
     parser.add_argument(
-        "--disable-proposer", action="store_true",
+        "--disable-proposer",
+        action="store_true",
         help="Disable the neural proposer and rely purely on legacy classifier hints",
     )
     parser.add_argument(
-        "--trust-proposer-plan", action="store_true",
+        "--trust-proposer-plan",
+        action="store_true",
         help=(
             "Let the universal proposer control guided-evolution budget and search-plan "
             "knobs instead of applying benchmark clamps"
         ),
     )
     parser.add_argument(
-        "--with-evolution", action="store_true",
+        "--with-evolution",
+        action="store_true",
         help="Run latest guided evolution (beam-search path) when fast-path is not exact",
     )
     parser.add_argument(
-        "--evolution-only", action="store_true",
+        "--evolution-only",
+        action="store_true",
         help="Skip fast-path and run latest guided evolution (beam-search path) for every formula",
     )
     parser.add_argument(
-        "--specialist-regressor", action="store_true",
+        "--specialist-regressor",
+        action="store_true",
         help="Run formulas through GlassboxRegressor so specialist composition/boosting is measured",
     )
     parser.add_argument(
-        "--specialist-baseline", action="store_true",
+        "--specialist-baseline",
+        action="store_true",
         help="With --specialist-regressor, disable specialist screening/composition/residual stages for A/B comparison",
     )
     parser.add_argument(
-        "--disable-specialist-diagnostics", action="store_true",
+        "--disable-specialist-diagnostics",
+        action="store_true",
         help="With --specialist-regressor, skip specialist pair/segment diagnostics",
     )
     parser.add_argument(
-        "--disable-specialist-composition", action="store_true",
+        "--disable-specialist-composition",
+        action="store_true",
         help="With --specialist-regressor, keep diagnostics but skip specialist composition proposals",
     )
     parser.add_argument(
-        "--enable-specialist-residual", action="store_true",
+        "--enable-specialist-residual",
+        action="store_true",
         help="With --specialist-regressor, enable the residual symbolic stage for accepted compositions",
     )
     parser.add_argument(
-        "--disable-specialist-vault", action="store_true",
+        "--disable-specialist-vault",
+        action="store_true",
         help="With --specialist-regressor, disable cross-run specialist vault memory",
     )
     parser.add_argument(
-        "--enable-specialist-inception", action="store_true",
+        "--enable-specialist-inception",
+        action="store_true",
         help="With --specialist-regressor, enable inception/subexpression reuse",
     )
     parser.add_argument(
-        "--specialist-full", action="store_true",
+        "--specialist-full",
+        action="store_true",
         help="With --specialist-regressor, enable all specialist phases including residual and inception",
     )
     parser.add_argument(
-        "--tier", type=int, action="append", default=None, dest="tiers",
+        "--tier",
+        type=int,
+        action="append",
+        default=None,
+        dest="tiers",
         help="Run only specific tier(s). Can be repeated: --tier 1 --tier 2",
     )
     parser.add_argument(
-        "--output-dir", type=str, default="results",
+        "--output-dir",
+        type=str,
+        default="results",
         help="Directory for JSON and Markdown reports (default: results/)",
     )
     parser.add_argument(
-        "--n-samples", type=int, default=300,
+        "--n-samples",
+        type=int,
+        default=300,
         help="Number of data points per formula (default: 300)",
     )
     parser.add_argument(
-        "--device", type=str, default="auto", choices=["auto", "cpu", "cuda"],
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
         help="Device for classifier inference (default: auto)",
     )
     parser.add_argument(
@@ -2543,51 +2879,72 @@ Examples:
         help="Maximum pair/triple exact-match combinations before falling back to sparse search (default: 50000)",
     )
     parser.add_argument(
-        "--timeout", type=float, default=60.0,
+        "--timeout",
+        type=float,
+        default=60.0,
         help="Engine timeout budget per formula in seconds (default: 60)",
     )
     parser.add_argument(
-        "--hard-timeout", action="store_true",
+        "--hard-timeout",
+        action="store_true",
         help="Run each formula in a subprocess and enforce --timeout as a hard wall-clock limit",
     )
     parser.add_argument(
-        "--quiet", action="store_true",
+        "--quiet",
+        action="store_true",
         help="Suppress per-formula output, only show summary",
     )
     parser.add_argument(
-        "--formula", type=str, default=None,
+        "--formula",
+        type=str,
+        default=None,
         help="Run a single formula by searching all tiers (e.g., --formula 'sin(x)')",
     )
     parser.add_argument(
-        "--cpp-evolution-only", action="store_true",
+        "--cpp-evolution-only",
+        action="store_true",
         help="Skip classifier fast-path; use pure C++ evolution for every formula",
     )
     parser.add_argument(
-        "--pop-size", type=int, default=100,
+        "--pop-size",
+        type=int,
+        default=100,
         help="Population size for C++ evolution (default: 100, used with --cpp-evolution-only)",
     )
     parser.add_argument(
-        "--generations", type=int, default=1000,
+        "--generations",
+        type=int,
+        default=1000,
         help="Generations for C++ evolution (default: 1000, used with --cpp-evolution-only)",
     )
     parser.add_argument(
-        "--guided-generations", type=int, default=150,
+        "--guided-generations",
+        type=int,
+        default=150,
         help="Generations for guided evolution in --with-evolution/--evolution-only mode (default: 150)",
     )
     parser.add_argument(
-        "--guided-pop-size", type=int, default=50,
+        "--guided-pop-size",
+        type=int,
+        default=50,
         help="Population per island for guided evolution in --with-evolution/--evolution-only mode (default: 50)",
     )
     parser.add_argument(
-        "--runs", type=int, default=1,
+        "--runs",
+        type=int,
+        default=1,
         help="Number of times to run each formula. Returns best result. (default: 1)",
     )
     parser.add_argument(
-        "--seed", type=int, default=None,
+        "--seed",
+        type=int,
+        default=None,
         help="Set Python, NumPy, and Torch random seeds for repeatable benchmark runs",
     )
     parser.add_argument(
-        "--noise", type=str, default="none",
+        "--noise",
+        type=str,
+        default="none",
         choices=list(NOISE_PRESETS.keys()),
         help=(
             "Inject noise into the (otherwise clean) benchmark targets so "
@@ -2597,18 +2954,31 @@ Examples:
         ),
     )
     parser.add_argument(
-        "--noise-seed", type=int, default=0,
+        "--noise-seed",
+        type=int,
+        default=0,
         help="Seed for --noise injection so runs are reproducible (default: 0).",
     )
     parser.add_argument(
-        "--compare-to", type=str, default=None,
+        "--compare-to",
+        type=str,
+        default=None,
         help="Compare this run against a prior benchmark JSON report",
     )
     args = parser.parse_args()
 
-    exclusive_modes = sum(bool(v) for v in (args.cpp_evolution_only, args.evolution_only, args.specialist_regressor))
+    exclusive_modes = sum(
+        bool(v)
+        for v in (
+            args.cpp_evolution_only,
+            args.evolution_only,
+            args.specialist_regressor,
+        )
+    )
     if exclusive_modes > 1:
-        print("Error: --cpp-evolution-only, --evolution-only, and --specialist-regressor are mutually exclusive.")
+        print(
+            "Error: --cpp-evolution-only, --evolution-only, and --specialist-regressor are mutually exclusive."
+        )
         sys.exit(1)
     if args.specialist_baseline and not args.specialist_regressor:
         print("Error: --specialist-baseline requires --specialist-regressor.")
@@ -2626,10 +2996,14 @@ Examples:
         sys.exit(1)
 
     specialist_diagnostics = not args.disable_specialist_diagnostics
-    specialist_composition = specialist_diagnostics and not args.disable_specialist_composition
+    specialist_composition = (
+        specialist_diagnostics and not args.disable_specialist_composition
+    )
     specialist_residual = bool(args.enable_specialist_residual or args.specialist_full)
     specialist_vault = not args.disable_specialist_vault
-    specialist_inception = bool(args.enable_specialist_inception or args.specialist_full)
+    specialist_inception = bool(
+        args.enable_specialist_inception or args.specialist_full
+    )
     if args.specialist_full:
         specialist_diagnostics = True
         specialist_composition = True
@@ -2713,7 +3087,11 @@ Examples:
     if args.cpp_evolution_only:
         mode_str = "Pure C++ Evolution (No Classifier/Proposer)"
     elif args.specialist_regressor:
-        mode_str = "GlassboxRegressor Specialist" if not args.specialist_baseline else "GlassboxRegressor Baseline"
+        mode_str = (
+            "GlassboxRegressor Specialist"
+            if not args.specialist_baseline
+            else "GlassboxRegressor Baseline"
+        )
     elif args.evolution_only:
         mode_str = "Guided Evolution Only (latest path)"
     else:
@@ -2726,19 +3104,24 @@ Examples:
         print("  Strategy:    guided beam-search evolution")
     elif args.specialist_regressor:
         print("  Strategy:    sklearn regressor path")
-        print(f"  Specialist:  {'disabled baseline' if args.specialist_baseline else 'enabled'}")
+        print(
+            f"  Specialist:  {'disabled baseline' if args.specialist_baseline else 'enabled'}"
+        )
         if not args.specialist_baseline:
-            phase_txt = ", ".join(
-                name
-                for name, enabled in (
-                    ("diagnostics", specialist_diagnostics),
-                    ("composition", specialist_composition),
-                    ("residual", specialist_residual),
-                    ("vault", specialist_vault),
-                    ("inception", specialist_inception),
+            phase_txt = (
+                ", ".join(
+                    name
+                    for name, enabled in (
+                        ("diagnostics", specialist_diagnostics),
+                        ("composition", specialist_composition),
+                        ("residual", specialist_residual),
+                        ("vault", specialist_vault),
+                        ("inception", specialist_inception),
+                    )
+                    if enabled
                 )
-                if enabled
-            ) or "none"
+                or "none"
+            )
             print(f"  Phases:      {phase_txt}")
     else:
         print(f"  Classifier:  {args.classifier_model}")
@@ -2761,7 +3144,7 @@ Examples:
         nl = noise_cfg.get("noise_level", 0.0)
         print(f"  Noise:       {args.noise} ({nt}, level={nl}, seed={noise_seed})")
     else:
-        print(f"  Noise:       none (clean)")
+        print("  Noise:       none (clean)")
     if args.seed is not None:
         print(f"  Seed:        {args.seed}")
     if compare_to_path is not None:
@@ -2769,7 +3152,7 @@ Examples:
     print("=" * 90)
 
     # Run benchmark
-    all_results: Dict[int, List[Dict]] = {}
+    all_results: dict[int, list[dict]] = {}
     formula_idx = 0
     t_start = time.time()
 
@@ -2786,21 +3169,34 @@ Examples:
             # structurally-correct formulas under noise are scored EXACT.
             try:
                 _probe_x, _probe_y = _generate_data(
-                    formula_str, x_range[0], x_range[1], args.n_samples,
+                    formula_str,
+                    x_range[0],
+                    x_range[1],
+                    args.n_samples,
                 )
-                update_noise_aware_y_var(float(np.var(_probe_y)) if _probe_y.size else 1.0)
+                update_noise_aware_y_var(
+                    float(np.var(_probe_y)) if _probe_y.size else 1.0
+                )
             except Exception:
                 pass
 
             if not args.quiet:
                 try:
-                    print(f"  [{formula_idx}/{total_formulas}] {human_name:<30} ", end="", flush=True)
+                    print(
+                        f"  [{formula_idx}/{total_formulas}] {human_name:<30} ",
+                        end="",
+                        flush=True,
+                    )
                 except UnicodeEncodeError:
-                    human_name = human_name.encode('ascii', 'ignore').decode('ascii')
-                    print(f"  [{formula_idx}/{total_formulas}] {human_name:<30} ", end="", flush=True)
+                    human_name = human_name.encode("ascii", "ignore").decode("ascii")
+                    print(
+                        f"  [{formula_idx}/{total_formulas}] {human_name:<30} ",
+                        end="",
+                        flush=True,
+                    )
 
             best_result = None
-            
+
             for _ in range(args.runs):
                 if args.cpp_evolution_only:
                     call_name = "run_formula_cpp_evolution"
@@ -2821,7 +3217,9 @@ Examples:
                         "formula_str": formula_str,
                         "x_range": x_range,
                         "classifier_path": args.classifier_model,
-                        "proposer_path": None if args.disable_proposer else args.proposer_model,
+                        "proposer_path": None
+                        if args.disable_proposer
+                        else args.proposer_model,
                         "n_samples": args.n_samples,
                         "device": device,
                         "timeout": args.timeout,
@@ -2862,10 +3260,12 @@ Examples:
                         "noise_seed": noise_seed,
                     }
                 if args.hard_timeout:
-                    result = run_benchmark_call_with_timeout(call_name, call_kwargs, args.timeout)
+                    result = run_benchmark_call_with_timeout(
+                        call_name, call_kwargs, args.timeout
+                    )
                 else:
                     result = globals()[call_name](**call_kwargs)
-                
+
                 # Keep the best result based on displayed MSE (or just any valid MSE if best_result is None)
                 if best_result is None:
                     best_result = result
@@ -2873,29 +3273,39 @@ Examples:
                     # Compare MSE
                     best_mse = best_result.get("mse")
                     curr_mse = result.get("mse")
-                    if best_mse is None or math.isnan(best_mse):
+                    if (
+                        best_mse is None
+                        or math.isnan(best_mse)
+                        or curr_mse is not None
+                        and not math.isnan(curr_mse)
+                        and curr_mse < best_mse
+                    ):
                         best_result = result
-                    elif curr_mse is not None and not math.isnan(curr_mse) and curr_mse < best_mse:
-                        best_result = result
-                        
+
             result = best_result
             result["human_name"] = human_name
             tier_results.append(result)
 
             if not args.quiet:
                 sym = SCORE_SYMBOLS.get(result["score"], "?")
-                mse_s = f"MSE={result['mse']:.2e}" if result["mse"] is not None and math.isfinite(result["mse"]) else "N/A     "
+                mse_s = (
+                    f"MSE={result['mse']:.2e}"
+                    if result["mse"] is not None and math.isfinite(result["mse"])
+                    else "N/A     "
+                )
                 mse_raw = result.get("mse_raw")
                 if (
-                    mse_raw is not None and
-                    math.isfinite(mse_raw) and
-                    result["mse"] is not None and
-                    math.isfinite(result["mse"])
+                    mse_raw is not None
+                    and math.isfinite(mse_raw)
+                    and result["mse"] is not None
+                    and math.isfinite(result["mse"])
                 ):
                     drift = abs(math.log10((mse_raw + 1e-30) / (result["mse"] + 1e-30)))
                     if drift > 1.0:
                         mse_s = f"{mse_s} (raw={mse_raw:.2e})"
-                time_s = f"{result['time']:.2f}s" if result["time"] is not None else "—    "
+                time_s = (
+                    f"{result['time']:.2f}s" if result["time"] is not None else "—    "
+                )
                 disc = result.get("formula_discovered", "")
                 if len(disc) > 40:
                     disc = disc[:37] + "..."
@@ -2906,7 +3316,9 @@ Examples:
         # Print tier subtotal
         s = _tier_summary(tier_results)
         pct = (s["EXACT"] / s["total"] * 100) if s["total"] > 0 else 0
-        print(f"  -- Tier {tier_num} subtotal: {s['EXACT']}/{s['total']} exact ({pct:.0f}%)")
+        print(
+            f"  -- Tier {tier_num} subtotal: {s['EXACT']}/{s['total']} exact ({pct:.0f}%)"
+        )
 
     total_time = time.time() - t_start
 
@@ -2925,17 +3337,23 @@ Examples:
     )
 
     json_path = output_dir / f"benchmark_{ts}.json"
-    save_json_results(all_results, json_path, args.classifier_model, total_time, metadata=metadata)
+    save_json_results(
+        all_results, json_path, args.classifier_model, total_time, metadata=metadata
+    )
     print(f"JSON report: {json_path}")
 
     md_path = output_dir / f"benchmark_{ts}.md"
-    generate_markdown_report(all_results, md_path, args.classifier_model, total_time, metadata=metadata)
+    generate_markdown_report(
+        all_results, md_path, args.classifier_model, total_time, metadata=metadata
+    )
     print(f"Markdown report: {md_path}")
 
     if compare_to_path is not None:
         comparison = compare_benchmark_results(compare_to_path, all_results)
         compare_path = output_dir / f"benchmark_compare_{ts}.json"
-        compare_path.write_text(json.dumps(comparison, indent=2, default=str), encoding="utf-8")
+        compare_path.write_text(
+            json.dumps(comparison, indent=2, default=str), encoding="utf-8"
+        )
         summary = comparison["summary"]
         print(
             "Comparison: "
@@ -2946,10 +3364,14 @@ Examples:
 
     # Also save a "latest" copy for easy access
     json_latest = output_dir / "benchmark_latest.json"
-    save_json_results(all_results, json_latest, args.classifier_model, total_time, metadata=metadata)
+    save_json_results(
+        all_results, json_latest, args.classifier_model, total_time, metadata=metadata
+    )
 
     md_latest = output_dir / "benchmark_latest.md"
-    generate_markdown_report(all_results, md_latest, args.classifier_model, total_time, metadata=metadata)
+    generate_markdown_report(
+        all_results, md_latest, args.classifier_model, total_time, metadata=metadata
+    )
     print(f"Latest links: {json_latest}, {md_latest}")
 
     print(f"\nTotal time: {total_time:.1f}s")

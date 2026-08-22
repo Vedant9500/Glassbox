@@ -5,16 +5,16 @@ from __future__ import annotations
 import math
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from glassbox.evolution import evolution as evo
 from glassbox.sr import phased_regression as pr
 from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
-
 # ---------------------------------------------------------------------------
 # H-19 — BFGS import path + unary index map
 # ---------------------------------------------------------------------------
+
 
 def test_h19_bfgs_import_available():
     assert pr.BFGS_AVAILABLE is True
@@ -46,6 +46,7 @@ def test_h19_unary_op_kind_fallback_without_names():
 # ---------------------------------------------------------------------------
 # H-20 — refine runs in eval mode (BN / discrete selection parity with fitness)
 # ---------------------------------------------------------------------------
+
 
 def test_h20_refine_constants_leaves_model_in_eval():
     class _M(nn.Module):
@@ -114,6 +115,7 @@ def test_h20_refine_and_fitness_same_mode(monkeypatch):
 # H-21 — multi-token family signature
 # ---------------------------------------------------------------------------
 
+
 def _regressor():
     return object.__new__(GlassboxRegressor)
 
@@ -164,4 +166,4 @@ def test_h21_nest_eligibility_accepts_multi_token_outer():
     assert "exp" in nestable
     assert "sin" in nestable
     # legacy single still works
-    assert ({"sin"} & {"sin", "cos", "exp", "log"})
+    assert {"sin"} & {"sin", "cos", "exp", "log"}

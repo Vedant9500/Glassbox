@@ -4,17 +4,24 @@ Build C++ IndividualGraph seed dicts from formula strings.
 Used to inject fast-path / proposer skeletons into evolution initialization
 (seed_graphs_py on _core.run_evolution).
 """
+
 from __future__ import annotations
 
-import re
-from typing import Any, Dict, List, Optional, Tuple
-
 import math
+import re
+from typing import Any
+
 import numpy as np
+import sympy as sp
+from sympy.parsing.sympy_parser import (
+    convert_xor,
+    implicit_multiplication_application,
+    parse_expr,
+    standard_transformations,
+)
 
 from glassbox.sr.cpp import get_cpp_core
 from glassbox.sr.cpp.graph_enums import (
-    BINARY_AGGREGATION,
     BINARY_ARITHMETIC,
     BINARY_DIVISION,
     TYPE_BINARY,
@@ -27,14 +34,6 @@ from glassbox.sr.cpp.graph_enums import (
     UNARY_LOG,
     UNARY_PERIODIC,
     UNARY_POWER,
-)
-
-import sympy as sp
-from sympy.parsing.sympy_parser import (
-    convert_xor,
-    implicit_multiplication_application,
-    parse_expr,
-    standard_transformations,
 )
 
 _TRANSFORMATIONS = standard_transformations + (
@@ -58,7 +57,9 @@ _LOCAL_DICT = {
 }
 
 
-def _cpp_seed_graph_from_formula(formula: str, x_name: str = "x") -> Optional[Dict[str, Any]]:
+def _cpp_seed_graph_from_formula(
+    formula: str, x_name: str = "x"
+) -> dict[str, Any] | None:
     _core = get_cpp_core()
     if _core is None or not hasattr(_core, "formula_to_seed_graph"):
         return None
@@ -73,7 +74,7 @@ def _cpp_seed_graph_from_formula(formula: str, x_name: str = "x") -> Optional[Di
         return None
 
 
-def _multi_feature_formula_to_seed_graph(formula: str) -> Optional[Dict[str, Any]]:
+def _multi_feature_formula_to_seed_graph(formula: str) -> dict[str, Any] | None:
     expr = _parse_formula_expr(formula)
     if expr is None:
         return None
@@ -97,10 +98,7 @@ def _multi_feature_formula_to_seed_graph(formula: str) -> Optional[Dict[str, Any
         return None
 
     mapped_expr = sp.expand(expr)
-    lookup = {
-        str(sym): (0 if str(sym) == "x" else int(str(sym)[1:]))
-        for sym in free
-    }
+    lookup = {str(sym): (0 if str(sym) == "x" else int(str(sym)[1:])) for sym in free}
     builder = _GraphBuilder(sp.Symbol("x"), feature_lookup=lookup)
     root = builder.build(mapped_expr)
     if root is None:
@@ -115,7 +113,7 @@ def _normalize_formula_text(formula: str) -> str:
     return text
 
 
-def _parse_formula_expr(formula: str) -> Optional[sp.Expr]:
+def _parse_formula_expr(formula: str) -> sp.Expr | None:
     text = _normalize_formula_text(formula)
     if not text:
         return None
@@ -135,7 +133,7 @@ def _parse_formula_expr(formula: str) -> Optional[sp.Expr]:
     return sp.expand(expr)
 
 
-def _default_node(**overrides: Any) -> Dict[str, Any]:
+def _default_node(**overrides: Any) -> dict[str, Any]:
     node = {
         "type": TYPE_CONSTANT,
         "feature_idx": 0,
@@ -159,15 +157,17 @@ def _default_node(**overrides: Any) -> Dict[str, Any]:
 class _GraphBuilder:
     """Incremental AST → C++ graph (additive output layer)."""
 
-    def __init__(self, x_sym: sp.Symbol, feature_lookup: Optional[Dict[str, int]] = None) -> None:
+    def __init__(
+        self, x_sym: sp.Symbol, feature_lookup: dict[str, int] | None = None
+    ) -> None:
         self.x_sym = x_sym
         self.feature_lookup = dict(feature_lookup or {})
-        self.nodes: List[Dict[str, Any]] = []
-        self.output_weights: List[float] = []
+        self.nodes: list[dict[str, Any]] = []
+        self.output_weights: list[float] = []
         self.output_bias = 0.0
-        self.input_nodes: Dict[int, int] = {}
+        self.input_nodes: dict[int, int] = {}
 
-    def _append(self, node: Dict[str, Any]) -> int:
+    def _append(self, node: dict[str, Any]) -> int:
         idx = len(self.nodes)
         self.nodes.append(node)
         self.output_weights.append(0.0)
@@ -215,7 +215,7 @@ class _GraphBuilder:
         self.output_weights[right] = 0.0
         return idx
 
-    def _linear_in_x(self, expr: sp.Expr) -> Optional[Tuple[float, float]]:
+    def _linear_in_x(self, expr: sp.Expr) -> tuple[float, float] | None:
         """Return (omega, phi) for expr ≈ omega*x + phi, else None."""
         if expr == self.x_sym:
             return 1.0, 0.0
@@ -247,7 +247,7 @@ class _GraphBuilder:
             return omega, phi
         return None
 
-    def _feature_index_for_symbol(self, expr: sp.Expr) -> Optional[int]:
+    def _feature_index_for_symbol(self, expr: sp.Expr) -> int | None:
         if not isinstance(expr, sp.Symbol):
             return None
         name = str(expr)
@@ -259,7 +259,7 @@ class _GraphBuilder:
             return int(name[1:])
         return None
 
-    def _linear_in_any_feature(self, expr: sp.Expr) -> Optional[Tuple[int, float, float]]:
+    def _linear_in_any_feature(self, expr: sp.Expr) -> tuple[int, float, float] | None:
         """Return (feature_idx, omega, phi) for expr ~= omega*x_i + phi."""
         feature_idx = self._feature_index_for_symbol(expr)
         if feature_idx is not None:
@@ -302,13 +302,11 @@ class _GraphBuilder:
             return feature_idx, omega, phi
         return None
 
-    def build(self, expr: sp.Expr) -> Optional[int]:
+    def build(self, expr: sp.Expr) -> int | None:
         expr = sp.expand(expr)
 
         if expr.is_Number or isinstance(expr, (sp.Integer, sp.Float, sp.Rational)):
-            idx = self._append(
-                _default_node(type=TYPE_CONSTANT, value=float(expr))
-            )
+            idx = self._append(_default_node(type=TYPE_CONSTANT, value=float(expr)))
             return idx
 
         if expr == self.x_sym:
@@ -326,12 +324,16 @@ class _GraphBuilder:
 
         if isinstance(expr, sp.Mul):
             coeff = 1.0
-            numer: List[sp.Expr] = []
-            denom: List[sp.Expr] = []
+            numer: list[sp.Expr] = []
+            denom: list[sp.Expr] = []
             for factor in expr.args:
                 if factor.is_Number:
                     coeff *= float(factor)
-                elif isinstance(factor, sp.Pow) and factor.exp.is_Number and float(factor.exp) < 0:
+                elif (
+                    isinstance(factor, sp.Pow)
+                    and factor.exp.is_Number
+                    and float(factor.exp) < 0
+                ):
                     denom.append(factor.base)
                 else:
                     numer.append(factor)
@@ -350,7 +352,7 @@ class _GraphBuilder:
             if not numer:
                 return self._append(_default_node(type=TYPE_CONSTANT, value=coeff))
 
-            built: List[int] = []
+            built: list[int] = []
             for part in numer:
                 child = self.build(part)
                 if child is None:
@@ -364,7 +366,7 @@ class _GraphBuilder:
             return prod
 
         if isinstance(expr, sp.Add):
-            term_nodes: List[Tuple[int, float]] = []
+            term_nodes: list[tuple[int, float]] = []
             for term in expr.args:
                 if term.is_Number:
                     self.output_bias += float(term)
@@ -443,7 +445,13 @@ class _GraphBuilder:
                 )
             )
             mag_idx = self._append(
-                _default_node(type=TYPE_UNARY, unary_op=UNARY_EXP, omega=1.0, phi=0.0, left_child=mul_idx)
+                _default_node(
+                    type=TYPE_UNARY,
+                    unary_op=UNARY_EXP,
+                    omega=1.0,
+                    phi=0.0,
+                    left_child=mul_idx,
+                )
             )
             abs_idx = self._append(
                 _default_node(type=TYPE_UNARY, unary_op=UNARY_ABS, left_child=base_idx)
@@ -474,7 +482,9 @@ class _GraphBuilder:
                 return None
             feature_idx, omega, phi = lin
             if feature_idx < 0:
-                return self._append(_default_node(type=TYPE_CONSTANT, value=math.sin(float(phi))))
+                return self._append(
+                    _default_node(type=TYPE_CONSTANT, value=math.sin(float(phi)))
+                )
             return self._append(
                 _default_node(
                     type=TYPE_UNARY,
@@ -493,7 +503,9 @@ class _GraphBuilder:
                 return None
             feature_idx, omega, phi = lin
             if feature_idx < 0:
-                return self._append(_default_node(type=TYPE_CONSTANT, value=math.cos(float(phi))))
+                return self._append(
+                    _default_node(type=TYPE_CONSTANT, value=math.cos(float(phi)))
+                )
             return self._append(
                 _default_node(
                     type=TYPE_UNARY,
@@ -511,7 +523,9 @@ class _GraphBuilder:
             if lin is not None:
                 feature_idx, omega, phi = lin
                 if feature_idx < 0:
-                    return self._append(_default_node(type=TYPE_CONSTANT, value=math.exp(float(phi))))
+                    return self._append(
+                        _default_node(type=TYPE_CONSTANT, value=math.exp(float(phi)))
+                    )
                 return self._append(
                     _default_node(
                         type=TYPE_UNARY,
@@ -576,7 +590,7 @@ class _GraphBuilder:
 
         return None
 
-    def to_graph_dict(self, root_idx: int) -> Dict[str, Any]:
+    def to_graph_dict(self, root_idx: int) -> dict[str, Any]:
         # build() sets weights for sums/products; only default single-node graphs.
         if abs(self.output_weights[root_idx]) < 1e-12:
             self._set_root_weight(root_idx, 1.0)
@@ -587,7 +601,7 @@ class _GraphBuilder:
         }
 
 
-def formula_to_seed_graph(formula: str, x_name: str = "x") -> Optional[Dict[str, Any]]:
+def formula_to_seed_graph(formula: str, x_name: str = "x") -> dict[str, Any] | None:
     """Parse a formula string into a C++-compatible seed graph dict."""
     cpp_graph = _cpp_seed_graph_from_formula(formula, x_name=x_name)
     if cpp_graph is not None:
@@ -619,11 +633,11 @@ def formula_to_seed_graph(formula: str, x_name: str = "x") -> Optional[Dict[str,
 
 
 def build_seed_graphs_from_formulas(
-    formulas: List[str],
+    formulas: list[str],
     max_seeds: int = 8,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Build up to max_seeds unique seed graphs from formula strings."""
-    graphs: List[Dict[str, Any]] = []
+    graphs: list[dict[str, Any]] = []
     seen: set = set()
 
     for formula in formulas:
@@ -646,9 +660,9 @@ def build_seed_graphs_from_formulas(
 
 
 def build_seed_graphs_from_candidates(
-    candidate_formulas: Optional[List[Dict[str, Any]]],
+    candidate_formulas: list[dict[str, Any]] | None,
     max_seeds: int = 10,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Extract formulas from fast-path / proposer candidate dicts and build seeds."""
     if not candidate_formulas:
         return []
@@ -657,7 +671,10 @@ def build_seed_graphs_from_candidates(
     composed_cands = []
     standard_cands = []
     for c in candidate_formulas:
-        if c.get("from_specialist_composition") or c.get("source") == "specialist_composition":
+        if (
+            c.get("from_specialist_composition")
+            or c.get("source") == "specialist_composition"
+        ):
             composed_cands.append(c)
         else:
             standard_cands.append(c)
@@ -679,7 +696,7 @@ def build_seed_graphs_from_candidates(
     combined = selected_composed + selected_standard
     combined.sort(key=lambda c: float(c.get("mse", float("inf")) or float("inf")))
 
-    ordered: List[str] = []
+    ordered: list[str] = []
     seen: set = set()
 
     def _add(formula: str) -> None:
@@ -709,7 +726,7 @@ def _estimate_polynomial_signature(
     x_values: np.ndarray,
     y_values: np.ndarray,
     max_degree: int = 6,
-) -> Tuple[bool, int, float]:
+) -> tuple[bool, int, float]:
     """Detect whether the signal is well-approximated by a low-degree polynomial."""
     if x_values.size < max_degree + 2 or y_values.size < max_degree + 2:
         return False, 0, float("inf")
@@ -735,7 +752,7 @@ def _estimate_polynomial_signature(
         return False, 0, float("inf")
 
 
-def _evaluate_formula_signal(formula: str, x_values: np.ndarray) -> Optional[np.ndarray]:
+def _evaluate_formula_signal(formula: str, x_values: np.ndarray) -> np.ndarray | None:
     expr = _parse_formula_expr(formula)
     if expr is None:
         return None
@@ -781,9 +798,9 @@ def _affine_fit_mse(pred: np.ndarray, target: np.ndarray) -> float:
 def discover_seed_formulas_from_signal(
     x_values: Any,
     y_values: Any,
-    detected_omegas: Optional[List[float]] = None,
+    detected_omegas: list[float] | None = None,
     max_seeds: int = 12,
-) -> List[str]:
+) -> list[str]:
     """Discover universal module/product seed formulas from the observed signal."""
     x = _safe_array(x_values)
     y = _safe_array(y_values)
@@ -798,8 +815,8 @@ def discover_seed_formulas_from_signal(
 
     poly_like, degree, _ = _estimate_polynomial_signature(x, y)
 
-    def _dedupe(items: List[str]) -> List[str]:
-        ordered: List[str] = []
+    def _dedupe(items: list[str]) -> list[str]:
+        ordered: list[str] = []
         seen: set = set()
         for item in items:
             text = str(item or "").strip()
@@ -842,7 +859,7 @@ def discover_seed_formulas_from_signal(
     decay_terms = _dedupe(decay_terms)
     periodic_terms = _dedupe(periodic_terms)
 
-    candidate_formulas: List[str] = []
+    candidate_formulas: list[str] = []
 
     def _add(formula: str) -> None:
         text = str(formula or "").strip()
@@ -866,7 +883,7 @@ def discover_seed_formulas_from_signal(
         for decay in decay_terms:
             _add(f"{decay}*{periodic}")
 
-    scored: List[Tuple[float, int, str]] = []
+    scored: list[tuple[float, int, str]] = []
     y_var = max(float(np.var(y)), 1e-12)
     for formula in _dedupe(candidate_formulas):
         pred = _evaluate_formula_signal(formula, x)
@@ -886,7 +903,7 @@ def discover_seed_formulas_from_signal(
         scored.append((rel_mse, complexity + bonus, formula))
 
     scored.sort(key=lambda item: (item[0], item[1], item[2]))
-    ordered: List[str] = []
+    ordered: list[str] = []
     seen: set = set()
     for _, _, formula in scored:
         key = re.sub(r"\s+", "", formula.lower())
@@ -902,9 +919,9 @@ def discover_seed_formulas_from_signal(
 def build_seed_graphs_from_signal(
     x_values: Any,
     y_values: Any,
-    detected_omegas: Optional[List[float]] = None,
+    detected_omegas: list[float] | None = None,
     max_seeds: int = 12,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Build universal separability-aware seed graphs from the observed signal."""
     formulas = discover_seed_formulas_from_signal(
         x_values,

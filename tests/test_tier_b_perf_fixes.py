@@ -1,21 +1,21 @@
 """Tier B performance fixes: refine skip, ranking cost, screening caps, dual-path skip."""
+
 import sys
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 from glassbox.sr.blackbox_preprocessor import (
     _ranking_subsample,
     _tree_importance_scores,
     compute_blackbox_feature_ranking,
     prepare_blackbox_search,
 )
+from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
 
 def test_s3_6_refine_skips_when_near_exact():
@@ -80,7 +80,9 @@ def test_s7_3_feature_ranking_still_selects_signal():
 
 
 def test_s8_4_skips_composition_when_existing_strong():
-    est = GlassboxRegressor(random_state=0, enable_specialist_composition_screening=True)
+    est = GlassboxRegressor(
+        random_state=0, enable_specialist_composition_screening=True
+    )
     est.n_features_in_ = 1
     est.blackbox_diagnostics_ = {}
     x = np.linspace(-1, 1, 40)
@@ -113,12 +115,37 @@ def test_s8_4_screening_caps_max_candidates():
     X = x.reshape(-1, 1)
     y = np.sin(x)
     cands = [
-        {"formula": "sin(x0)", "validation_mse": 0.01, "validation_r2": 0.98, "complexity": 2},
+        {
+            "formula": "sin(x0)",
+            "validation_mse": 0.01,
+            "validation_r2": 0.98,
+            "complexity": 2,
+        },
         {"formula": "x0", "validation_mse": 0.5, "validation_r2": 0.3, "complexity": 1},
-        {"formula": "x0**2", "validation_mse": 0.8, "validation_r2": 0.1, "complexity": 2},
-        {"formula": "cos(x0)", "validation_mse": 0.9, "validation_r2": 0.05, "complexity": 2},
-        {"formula": "exp(x0)", "validation_mse": 1.0, "validation_r2": 0.0, "complexity": 2},
-        {"formula": "x0**3", "validation_mse": 1.1, "validation_r2": -0.1, "complexity": 2},
+        {
+            "formula": "x0**2",
+            "validation_mse": 0.8,
+            "validation_r2": 0.1,
+            "complexity": 2,
+        },
+        {
+            "formula": "cos(x0)",
+            "validation_mse": 0.9,
+            "validation_r2": 0.05,
+            "complexity": 2,
+        },
+        {
+            "formula": "exp(x0)",
+            "validation_mse": 1.0,
+            "validation_r2": 0.0,
+            "complexity": 2,
+        },
+        {
+            "formula": "x0**3",
+            "validation_mse": 1.1,
+            "validation_r2": -0.1,
+            "complexity": 2,
+        },
     ]
     diag = est._compute_specialist_screening_diagnostics(
         cands, X, y, max_candidates=6, max_pairs=5
@@ -156,8 +183,8 @@ def test_s9_4_proposer_skips_on_high_confidence_fast_path():
 
 def test_s9_3_feature_cache_hits():
     from glassbox.curve_classifier.curve_classifier_integration import (
-        _extract_features_xy_cached,
         _cached_curve_features,
+        _extract_features_xy_cached,
     )
 
     x = np.linspace(-2, 2, 64)

@@ -7,6 +7,7 @@ Restricting builtins still permits attribute-traversal / subscript escapes
 (e.g. ``x.__class__.__mro__[1].__subclasses__()``).  The fix gates every
 formula ``eval`` with an AST allowlist (``glassbox/sr/formula_safety.py``).
 """
+
 import numpy as np
 import pytest
 
@@ -16,11 +17,26 @@ from glassbox.sr.formula_safety import (
 )
 from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
-
 _ALLOWED = {
-    "np", "log", "sin", "cos", "exp", "sqrt", "abs", "Abs", "sign",
-    "_signed_power", "pi", "E", "e", "x", "x0", "x1", "x2",
+    "np",
+    "log",
+    "sin",
+    "cos",
+    "exp",
+    "sqrt",
+    "abs",
+    "Abs",
+    "sign",
+    "_signed_power",
+    "pi",
+    "E",
+    "e",
+    "x",
+    "x0",
+    "x1",
+    "x2",
 }
+
 
 # ---------------------------------------------------------------------------
 # Shared AST-allowlist gate
@@ -161,7 +177,9 @@ def test_universal_proposer_eval_rejects_injection():
 
 
 def test_universal_proposer_multivariate_eval_rejects_injection():
-    from glassbox.universal_proposer.universal_proposer import _safe_formula_eval_multivariate
+    from glassbox.universal_proposer.universal_proposer import (
+        _safe_formula_eval_multivariate,
+    )
 
     X = np.column_stack([np.linspace(-2.0, 2.0, 31), np.linspace(0.0, 3.0, 31)])
     assert _safe_formula_eval_multivariate("x0.__class__", X) is None
@@ -202,8 +220,18 @@ def test_specialist_local_eval_path_still_works():
     X = np.column_stack([x, np.sin(x)])
     y = np.where(x < 0.0, x * x, np.sin(2.0 * x))
     candidates = [
-        {"formula": "x0^2", "validation_r2": 0.2, "validation_mse": 1.0, "source": "poly"},
-        {"formula": "sin(2*x0)", "validation_r2": 0.3, "validation_mse": 0.9, "source": "periodic"},
+        {
+            "formula": "x0^2",
+            "validation_r2": 0.2,
+            "validation_mse": 1.0,
+            "source": "poly",
+        },
+        {
+            "formula": "sin(2*x0)",
+            "validation_r2": 0.3,
+            "validation_mse": 0.9,
+            "source": "periodic",
+        },
     ]
     state = compute_specialist_state(
         candidates,
@@ -211,7 +239,9 @@ def test_specialist_local_eval_path_still_works():
         y,
         evaluate_formula=_eval_formula,
         complexity_fn=lambda formula: len(str(formula)),
-        family_signature_fn=lambda formula: "periodic" if "sin" in str(formula) else "poly",
+        family_signature_fn=lambda formula: (
+            "periodic" if "sin" in str(formula) else "poly"
+        ),
         max_candidates=4,
         max_pairs=2,
     )

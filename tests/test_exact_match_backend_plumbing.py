@@ -44,8 +44,16 @@ def test_benchmark_run_formula_passes_exact_match_backend(monkeypatch):
 
     monkeypatch.setattr(bs, "run_fast_path", _fake_run_fast_path)
     monkeypatch.setattr(bs, "detect_dominant_frequency", lambda *args, **kwargs: None)
-    monkeypatch.setattr(bs, "_display_eval_details", lambda *args, **kwargs: {"mse": 0.0, "diagnostics": {"ok": True}})
-    monkeypatch.setattr(bs, "_postprocess_formula_for_benchmark", lambda formula, *args, **kwargs: (formula, {}))
+    monkeypatch.setattr(
+        bs,
+        "_display_eval_details",
+        lambda *args, **kwargs: {"mse": 0.0, "diagnostics": {"ok": True}},
+    )
+    monkeypatch.setattr(
+        bs,
+        "_postprocess_formula_for_benchmark",
+        lambda formula, *args, **kwargs: (formula, {}),
+    )
 
     result = bs.run_formula(
         formula_str="x",
@@ -94,9 +102,21 @@ def test_specialist_benchmark_passes_exact_match_backend(monkeypatch):
     import glassbox.sr.sklearn_wrapper as sw
 
     monkeypatch.setattr(sw, "GlassboxRegressor", FakeRegressor)
-    monkeypatch.setattr(bs, "_display_eval_details", lambda *args, **kwargs: {"mse": 0.0, "diagnostics": {"ok": True}})
-    monkeypatch.setattr(bs, "_postprocess_formula_for_benchmark", lambda formula, *args, **kwargs: (formula, {}))
-    monkeypatch.setattr(bs.cfp, "_evaluate_formula_values", lambda formula, x: np.asarray(x, dtype=float).reshape(-1))
+    monkeypatch.setattr(
+        bs,
+        "_display_eval_details",
+        lambda *args, **kwargs: {"mse": 0.0, "diagnostics": {"ok": True}},
+    )
+    monkeypatch.setattr(
+        bs,
+        "_postprocess_formula_for_benchmark",
+        lambda formula, *args, **kwargs: (formula, {}),
+    )
+    monkeypatch.setattr(
+        bs.cfp,
+        "_evaluate_formula_values",
+        lambda formula, x: np.asarray(x, dtype=float).reshape(-1),
+    )
 
     result = bs.run_formula_specialist_regressor(
         formula_str="x",

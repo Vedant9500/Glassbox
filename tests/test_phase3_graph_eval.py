@@ -1,4 +1,5 @@
 """Phase 3: graph/eval/refine harden (S5-5, S5-6, S5-8, S5-11, S5-12)."""
+
 import sys
 from pathlib import Path
 
@@ -97,7 +98,12 @@ def test_s5_12_simplify_uses_live_temperature():
     assert out is not None
     # Aggregation / simple forms still simplify
     out2 = _simplify("abs(x0)")
-    assert "abs" in out2.lower() or out2.replace(" ", "") in {"x0", "x", "abs(x0)", "abs(x)"}
+    assert "abs" in out2.lower() or out2.replace(" ", "") in {
+        "x0",
+        "x",
+        "abs(x0)",
+        "abs(x)",
+    }
 
 
 @requires_cpp

@@ -1,6 +1,7 @@
 import sys
-import numpy as np
 from pathlib import Path
+
+import numpy as np
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -51,8 +52,12 @@ def test_cpp_float_snapping():
 def test_cpp_unary_minus_precedence():
     x = np.linspace(-3.0, 3.0, 101)
     expr = _core.simplify_formula_cpp("exp(-x^2)")
-    y_pred = eval(expr.replace("^", "**"), {"__builtins__": None}, {"x": x, "exp": np.exp, "abs": np.abs, "sign": np.sign})
-    y_true = np.exp(-(x ** 2))
+    y_pred = eval(
+        expr.replace("^", "**"),
+        {"__builtins__": None},
+        {"x": x, "exp": np.exp, "abs": np.abs, "sign": np.sign},
+    )
+    y_true = np.exp(-(x**2))
     assert np.mean((y_pred - y_true) ** 2) < 1e-12
 
 
@@ -61,7 +66,9 @@ def test_cpp_noise_reduction():
     np.random.seed(42)
     X = np.random.uniform(-3, 3, size=(100, 2))
     y = 2.0 * X[:, 0] + 1.5 * X[:, 1] + np.random.normal(0, 0.01, size=100)
-    reduced = _core.reduce_formula_noise_cpp("2.0*x0 + 1.5*x1 + 0.1*sin(x0)", [X[:, 0], X[:, 1]], y)
+    reduced = _core.reduce_formula_noise_cpp(
+        "2.0*x0 + 1.5*x1 + 0.1*sin(x0)", [X[:, 0], X[:, 1]], y
+    )
     assert "sin" not in reduced
     assert "x0" in reduced
     assert "x1" in reduced
@@ -88,13 +95,15 @@ def test_cpp_abs_scores_against_absolute_target():
     x = np.linspace(-2.0, 2.0, 101)
     X = x.reshape(-1, 1)
     y = np.abs(x)
-    score = dict(_core.score_formula_candidates(
-        ["abs(x0)"],
-        np.ascontiguousarray(X, dtype=np.float64),
-        np.ascontiguousarray(y, dtype=np.float64),
-        np.ascontiguousarray(X, dtype=np.float64),
-        np.ascontiguousarray(y, dtype=np.float64),
-    )[0])
+    score = dict(
+        _core.score_formula_candidates(
+            ["abs(x0)"],
+            np.ascontiguousarray(X, dtype=np.float64),
+            np.ascontiguousarray(y, dtype=np.float64),
+            np.ascontiguousarray(X, dtype=np.float64),
+            np.ascontiguousarray(y, dtype=np.float64),
+        )[0]
+    )
     assert score["ok"] is True
     assert score["mse"] < 1e-12
     assert abs(score["scale"] - 1.0) < 1e-6
@@ -118,13 +127,15 @@ def test_cpp_variable_power_and_printer_fidelity():
     x1 = np.linspace(0.5, 1.5, 60)
     X = np.column_stack([x0, x1])
     y = np.sign(x0) * np.abs(x0) ** x1
-    score = dict(_core.score_formula_candidates(
-        ["x0^x1"],
-        np.ascontiguousarray(X, dtype=np.float64),
-        np.ascontiguousarray(y, dtype=np.float64),
-        np.ascontiguousarray(X, dtype=np.float64),
-        np.ascontiguousarray(y, dtype=np.float64),
-    )[0])
+    score = dict(
+        _core.score_formula_candidates(
+            ["x0^x1"],
+            np.ascontiguousarray(X, dtype=np.float64),
+            np.ascontiguousarray(y, dtype=np.float64),
+            np.ascontiguousarray(X, dtype=np.float64),
+            np.ascontiguousarray(y, dtype=np.float64),
+        )[0]
+    )
     assert score["ok"] is True
     assert score["mse"] < 1e-10
 
@@ -141,12 +152,14 @@ def test_cpp_protected_division_print_matches_eval():
     X = np.column_stack([x0, x1])
     # Graph Division semantics ≈ x0/x1 away from zero.
     y = x0 / x1
-    score = dict(_core.score_formula_candidates(
-        ["x0/x1"],
-        np.ascontiguousarray(X, dtype=np.float64),
-        np.ascontiguousarray(y, dtype=np.float64),
-        np.ascontiguousarray(X, dtype=np.float64),
-        np.ascontiguousarray(y, dtype=np.float64),
-    )[0])
+    score = dict(
+        _core.score_formula_candidates(
+            ["x0/x1"],
+            np.ascontiguousarray(X, dtype=np.float64),
+            np.ascontiguousarray(y, dtype=np.float64),
+            np.ascontiguousarray(X, dtype=np.float64),
+            np.ascontiguousarray(y, dtype=np.float64),
+        )[0]
+    )
     assert score["ok"] is True
     assert score["mse"] < 1e-8

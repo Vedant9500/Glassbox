@@ -706,7 +706,9 @@ inline std::string format_node_to_string(
                     return "exp(" + exp_arg + ")";
                 }
                 case UnaryOp::Log:
-                    return "log(|" + child_str + "|)";
+                    // C-14: emit the engine's protected form (eval.h Log case:
+                    // (|x|+1e-6).log) so display-string eval cannot hit log(0).
+                    return "log(abs(" + child_str + ") + 1e-6)";
                 case UnaryOp::Abs:
                     return "abs(" + child_str + ")";
             }

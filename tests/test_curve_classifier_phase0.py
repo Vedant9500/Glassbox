@@ -1,16 +1,16 @@
-from pathlib import Path
 import importlib
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
+from glassbox.curve_classifier import curve_classifier_integration as cci
+from glassbox.curve_classifier import models as classifier_models
 from glassbox.curve_classifier.generate_curve_data import (
     FEATURE_DIM,
     extract_all_features_xy,
 )
-from glassbox.curve_classifier import curve_classifier_integration as cci
-from glassbox.curve_classifier import models as classifier_models
 from glassbox.universal_proposer import (
     UniversalProposer,
     UniversalProposerConfig,
@@ -32,7 +32,9 @@ def test_univariate_xy_features_are_row_order_invariant():
 
 
 def test_shared_classifier_classes_are_bound_across_training_and_inference():
-    train_mod = importlib.import_module("glassbox.curve_classifier.train_curve_classifier")
+    train_mod = importlib.import_module(
+        "glassbox.curve_classifier.train_curve_classifier"
+    )
 
     assert train_mod.CurveClassifierGLU is classifier_models.CurveClassifierGLU
     assert train_mod.CurveClassifierMLP is classifier_models.CurveClassifierMLP
@@ -46,7 +48,9 @@ def test_shared_classifier_classes_are_bound_across_training_and_inference():
 
 
 def test_eql_outputs_match_training_and_inference_names():
-    train_mod = importlib.import_module("glassbox.curve_classifier.train_curve_classifier")
+    train_mod = importlib.import_module(
+        "glassbox.curve_classifier.train_curve_classifier"
+    )
     torch.manual_seed(7)
     train_layer = train_mod.EQLLayer(in_features=10, out_features=13)
     infer_layer = cci.EQLLayer(in_features=10, out_features=13)
@@ -106,7 +110,9 @@ def test_classifier_checkpoint_prediction_is_row_order_invariant_if_available():
 
     device = cci._resolve_device("cpu")
     model = cci.load_classifier(str(model_path), device="cpu")
-    cache_key = cci._make_cache_key(str(cci._resolve_model_path(str(model_path))), device)
+    cache_key = cci._make_cache_key(
+        str(cci._resolve_model_path(str(model_path))), device
+    )
     metadata = cci._cached_metadata_by_device[cache_key]
 
     def _probs(x_values, y_values):
@@ -134,7 +140,9 @@ def test_universal_proposer_univariate_output_is_row_order_invariant():
     assert [c["formula"] for c in sorted_out["candidate_skeletons"]] == [
         c["formula"] for c in shuffled_out["candidate_skeletons"]
     ]
-    assert sorted_out["operator_priors"].keys() == shuffled_out["operator_priors"].keys()
+    assert (
+        sorted_out["operator_priors"].keys() == shuffled_out["operator_priors"].keys()
+    )
     for key in sorted_out["operator_priors"]:
         assert sorted_out["operator_priors"][key] == pytest.approx(
             shuffled_out["operator_priors"][key],

@@ -9,31 +9,30 @@ Tests the three new/modified feature extraction components:
 Also validates dimensional consistency and edge cases.
 """
 
-import numpy as np
-import pytest
 import sys
 from pathlib import Path
+
+import numpy as np
+import pytest
 
 # Ensure scripts directory is on path
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from glassbox.curve_classifier.generate_curve_data import (
-    extract_all_features,
-    extract_raw_features,
-    extract_fft_features,
-    extract_fft_phase_features,
-    extract_derivative_features,
-    extract_stat_features,
-    extract_curvature_features,
-    _smooth_signal,
     FEATURE_DIM,
     FEATURE_SCHEMA,
+    _smooth_signal,
+    extract_all_features,
+    extract_derivative_features,
+    extract_fft_features,
+    extract_fft_phase_features,
+    extract_raw_features,
 )
-
 
 # =============================================================================
 # 1. Dimension Check
 # =============================================================================
+
 
 class TestDimensions:
     """Verify extract_all_features returns exactly FEATURE_DIM floats, no NaN/Inf."""
@@ -48,17 +47,21 @@ class TestDimensions:
         assert ranges[0][0] == 0, "Schema must start at 0"
         for i in range(1, len(ranges)):
             assert ranges[i][0] == ranges[i - 1][1], (
-                f"Gap/overlap between {list(FEATURE_SCHEMA.keys())[i-1]} and {list(FEATURE_SCHEMA.keys())[i]}"
+                f"Gap/overlap between {list(FEATURE_SCHEMA.keys())[i - 1]} and {list(FEATURE_SCHEMA.keys())[i]}"
             )
         assert ranges[-1][1] == FEATURE_DIM, "Schema must end at FEATURE_DIM"
 
-    @pytest.mark.parametrize("signal_fn", [
-        lambda x: np.sin(x),
-        lambda x: x ** 2,
-        lambda x: np.exp(-x ** 2),
-        lambda x: np.ones_like(x) * 3.0,
-        lambda x: 1.0 / (1.0 + x ** 2),
-    ], ids=["sin", "quadratic", "gaussian", "constant", "lorentzian"])
+    @pytest.mark.parametrize(
+        "signal_fn",
+        [
+            lambda x: np.sin(x),
+            lambda x: x**2,
+            lambda x: np.exp(-(x**2)),
+            lambda x: np.ones_like(x) * 3.0,
+            lambda x: 1.0 / (1.0 + x**2),
+        ],
+        ids=["sin", "quadratic", "gaussian", "constant", "lorentzian"],
+    )
     def test_extract_all_features_shape(self, signal_fn):
         """extract_all_features should return exactly FEATURE_DIM floats."""
         x = np.linspace(-5, 5, 256)
@@ -66,11 +69,15 @@ class TestDimensions:
         features = extract_all_features(y)
         assert features.shape == (FEATURE_DIM,)
 
-    @pytest.mark.parametrize("signal_fn", [
-        lambda x: np.sin(x),
-        lambda x: x ** 2 + np.random.randn(len(x)) * 0.01,
-        lambda x: np.exp(x),
-    ], ids=["sin", "noisy_quadratic", "exp"])
+    @pytest.mark.parametrize(
+        "signal_fn",
+        [
+            lambda x: np.sin(x),
+            lambda x: x**2 + np.random.randn(len(x)) * 0.01,
+            lambda x: np.exp(x),
+        ],
+        ids=["sin", "noisy_quadratic", "exp"],
+    )
     def test_no_nan_or_inf(self, signal_fn):
         """No NaN or Inf values should appear in features."""
         x = np.linspace(-5, 5, 256)
@@ -83,6 +90,7 @@ class TestDimensions:
 # =============================================================================
 # 2. FFT Phase Discrimination
 # =============================================================================
+
 
 class TestFFTPhase:
     """Phase features should discriminate signals with similar magnitude spectra."""
@@ -102,7 +110,7 @@ class TestFFTPhase:
 
     def test_additive_vs_multiplicative_discrimination(self):
         """sin(x)+sin(3x) and sin(x)*sin(3x) should have distinct phase features.
-        
+
         These signals have similar FFT magnitude spectra (both have energy at
         frequency 1 and 3) but fundamentally different phase relationships.
         """
@@ -132,15 +140,18 @@ class TestFFTPhase:
         x = np.linspace(0, 2 * np.pi * 5, 256)
         y = np.sin(x)
         phases = extract_fft_phase_features(y)
-        
+
         # Most bins should be zeroed out (only the dominant frequency bin is non-zero)
         n_nonzero = np.count_nonzero(phases)
-        assert n_nonzero < 10, f"Too many non-zero phase bins for pure sine: {n_nonzero}"
+        assert n_nonzero < 10, (
+            f"Too many non-zero phase bins for pure sine: {n_nonzero}"
+        )
 
 
 # =============================================================================
 # 3. Smooth Derivative Features
 # =============================================================================
+
 
 class TestSmoothDerivatives:
     """Savitzky-Golay smoothing should produce less noisy derivatives."""
@@ -153,7 +164,7 @@ class TestSmoothDerivatives:
 
     def test_smooth_derivatives_less_noisy(self):
         """Derivatives of noisy signal should be smoother with smoothing enabled.
-        
+
         The variance of second differences (a proxy for "jitter") should be
         lower when pre-smoothing is applied.
         """
@@ -169,9 +180,7 @@ class TestSmoothDerivatives:
         # Compare with raw diff (no smoothing)
         dy_raw = np.diff(y_noisy)
         dy_raw_resampled = np.interp(
-            np.linspace(0, 1, 64),
-            np.linspace(0, 1, len(dy_raw)),
-            dy_raw
+            np.linspace(0, 1, 64), np.linspace(0, 1, len(dy_raw)), dy_raw
         )
         dy_max = np.abs(dy_raw_resampled).max()
         if dy_max > 1e-10:
@@ -197,6 +206,7 @@ class TestSmoothDerivatives:
 # 4. Curvature-Aware Resampling
 # =============================================================================
 
+
 class TestCurvatureResampling:
     """Curvature-aware resampling should concentrate points near high-curvature regions."""
 
@@ -215,13 +225,13 @@ class TestCurvatureResampling:
 
     def test_curvature_concentration(self):
         """For 1/(1+x²), resampled points should cluster more densely near x=0.
-        
+
         The function 1/(1+x²) has high curvature near x=0 and is nearly flat
         at the tails. Curvature-aware resampling should place more sample
         points in the high-curvature region.
         """
         x = np.linspace(-5, 5, 256)
-        y = 1.0 / (1.0 + x ** 2)
+        y = 1.0 / (1.0 + x**2)
 
         # Extract curvature-aware features
         raw_curvature = extract_raw_features(y, curvature_alpha=5.0)
@@ -255,7 +265,7 @@ class TestCurvatureResampling:
         y = np.sin(x)
 
         raw_a0 = extract_raw_features(y, curvature_alpha=0.0)
-        
+
         # Manually do uniform resampling + normalization
         x_old = np.linspace(0, 1, len(y))
         x_new = np.linspace(0, 1, 128)
@@ -270,6 +280,7 @@ class TestCurvatureResampling:
 # =============================================================================
 # 5. Edge Cases
 # =============================================================================
+
 
 class TestEdgeCases:
     """Edge cases: constant signal, very short signal, extreme values."""

@@ -1,7 +1,7 @@
 """Phase 5: performance & defaults (S1-9/O1, S1-7/O2-O3, E6)."""
+
 import sys
 from pathlib import Path
-from unittest import mock
 
 import numpy as np
 import pytest
@@ -12,9 +12,8 @@ for p in (REPO, CPP_DIR):
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
 
-from glassbox.sr.sklearn_wrapper import GlassboxRegressor
-
 from glassbox.sr.cpp import CPP_AVAILABLE, get_cpp_core
+from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
 _core = get_cpp_core()
 

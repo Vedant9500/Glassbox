@@ -12,7 +12,6 @@ The fix: a single ``optimizer.step()`` per offspring with
 """
 
 import torch
-import pytest
 
 from glassbox.sr.optimizers import EvolutionaryOptimizer, LBFGSConstantOptimizer
 

@@ -1,6 +1,8 @@
-import numpy as np
 from pathlib import Path
 
+import numpy as np
+
+from glassbox.curve_classifier.generate_curve_data import FEATURE_DIM
 from glassbox.universal_proposer import (
     UniversalProposer,
     UniversalProposerConfig,
@@ -10,7 +12,6 @@ from glassbox.universal_proposer import (
     proposer_output_to_fpip_v2,
 )
 from scripts.train_universal_proposer import FormulaReplayDataset
-from glassbox.curve_classifier.generate_curve_data import FEATURE_DIM
 
 
 def test_universal_proposer_returns_topk_candidates():
@@ -26,14 +27,19 @@ def test_universal_proposer_returns_topk_candidates():
     assert len(out["operator_priors"]) > 0
     assert "sequence_uncertainty" in out
     assert "search_plan" in out
-    assert out["search_plan"]["strategy"] in {"refine_seed", "focused", "balanced", "exploratory"}
+    assert out["search_plan"]["strategy"] in {
+        "refine_seed",
+        "focused",
+        "balanced",
+        "exploratory",
+    }
     assert out["search_plan"]["population_multiplier"] > 0
 
 
 def test_proposer_output_maps_to_valid_fpip_v2():
     model = UniversalProposer(UniversalProposerConfig(hidden_dim=32))
     x = np.linspace(-1.0, 1.0, 64, dtype=np.float32)
-    y = (x ** 2).astype(np.float32)
+    y = (x**2).astype(np.float32)
 
     out = propose_from_xy(model, x, y, top_k=3)
     payload = proposer_output_to_fpip_v2(out, fit_diagnostics={"mse": 0.1})

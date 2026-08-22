@@ -3,12 +3,12 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from glassbox.curve_classifier.curve_classifier_integration import predict_operators
 from glassbox.curve_classifier.generate_curve_data import (
     FEATURE_DIM,
     extract_all_features_xy,
     prepare_univariate_curve_xy,
 )
-from glassbox.curve_classifier.curve_classifier_integration import predict_operators
 from glassbox.universal_proposer import (
     UniversalProposer,
     UniversalProposerConfig,
@@ -44,10 +44,10 @@ def test_extract_all_features_xy_is_invariant_to_duplicate_row_expansion():
 def test_prepare_univariate_curve_xy_handles_nonuniform_sampling():
     rng = np.random.default_rng(123)
     x_irregular = np.sort(rng.uniform(-4.0, 4.0, size=600))
-    y_irregular = np.sin(x_irregular) + 0.05 * x_irregular ** 2
+    y_irregular = np.sin(x_irregular) + 0.05 * x_irregular**2
 
     x_grid, y_grid = prepare_univariate_curve_xy(x_irregular, y_irregular, n_points=256)
-    y_expected = np.sin(x_grid) + 0.05 * x_grid ** 2
+    y_expected = np.sin(x_grid) + 0.05 * x_grid**2
 
     assert np.all(np.diff(x_grid) > 0.0)
     np.testing.assert_allclose(y_grid, y_expected, atol=0.015, rtol=0.015)
@@ -62,8 +62,12 @@ def test_public_predict_operators_is_row_order_invariant_if_checkpoint_available
     y = np.sin(x) + 0.1 * x
     perm = np.random.default_rng(456).permutation(len(x))
 
-    sorted_preds = predict_operators(x, y, model_path=str(model_path), threshold=0.1, device="cpu")
-    shuffled_preds = predict_operators(x[perm], y[perm], model_path=str(model_path), threshold=0.1, device="cpu")
+    sorted_preds = predict_operators(
+        x, y, model_path=str(model_path), threshold=0.1, device="cpu"
+    )
+    shuffled_preds = predict_operators(
+        x[perm], y[perm], model_path=str(model_path), threshold=0.1, device="cpu"
+    )
 
     assert sorted_preds.keys() == shuffled_preds.keys()
     for key in sorted_preds:
@@ -81,7 +85,9 @@ def test_public_proposer_fpip_output_is_row_order_invariant():
 
     assert sorted_payload["valid"] is True
     assert shuffled_payload["valid"] is True
-    assert sorted_payload["operator_priors"] == pytest.approx(shuffled_payload["operator_priors"], abs=1e-6)
+    assert sorted_payload["operator_priors"] == pytest.approx(
+        shuffled_payload["operator_priors"], abs=1e-6
+    )
     assert [c["formula"] for c in sorted_payload["candidate_skeletons"]] == [
         c["formula"] for c in shuffled_payload["candidate_skeletons"]
     ]

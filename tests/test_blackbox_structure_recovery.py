@@ -1,4 +1,5 @@
 """P0 multi-var structure recovery: templates + seed skeletons."""
+
 from __future__ import annotations
 
 import sys
@@ -58,7 +59,9 @@ def test_search_space_structure_seeds_exist():
     joined = " ".join(seeds)
     assert any("x0^4" in s or "x0**4" in s or "x0^2" in s or "x0+0" in s for s in seeds)
     assert "1.1/(1.1+" in joined or "5.1/(5.1+" in joined or "1/(1+" in joined
-    assert any("/x" in s and "^2" in s for s in seeds) or any("x0*x1" in s for s in seeds)
+    assert any("/x" in s and "^2" in s for s in seeds) or any(
+        "x0*x1" in s for s in seeds
+    )
 
 
 def test_structure_probe_is_seed_only_not_auto_win():
@@ -129,7 +132,9 @@ def test_original_space_free_const_exact_under_outliers():
         state.standardized = False
         winner = est._fit_original_space_structure_winner(X, y, state)
         assert winner is not None and winner.get("formula")
-        formula, _ = est._polish_original_space_structure_formula(winner["formula"], X, y)
+        formula, _ = est._polish_original_space_structure_formula(
+            winner["formula"], X, y
+        )
         pred = est._safe_eval_formula_array(formula, X)
         return float(np.mean((np.asarray(pred) - y_clean) ** 2)), formula
 

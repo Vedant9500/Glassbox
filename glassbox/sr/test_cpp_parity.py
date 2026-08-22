@@ -11,14 +11,14 @@ Run with:
     python glassbox/sr/test_cpp_parity.py      (direct execution still works)
 """
 
-import numpy as np
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 # Ensure the built C++ extension can be found
-cpp_dir = Path(__file__).parent / 'cpp'
+cpp_dir = Path(__file__).parent / "cpp"
 
 # ── Import guard ────────────────────────────────────────────────────────
 from glassbox.sr.cpp import CPP_AVAILABLE, get_cpp_core
@@ -32,6 +32,7 @@ requires_cpp = pytest.mark.skipif(
 
 # ── Shared fixtures ─────────────────────────────────────────────────────
 
+
 @pytest.fixture
 def simple_data():
     """y = 2.0 * x^2 + sin(3.0 * x)"""
@@ -44,6 +45,7 @@ def simple_data():
 
 # ── Tests ────────────────────────────────────────────────────────────────
 
+
 @requires_cpp
 def test_core_import():
     """_core should import and expose run_evolution."""
@@ -54,7 +56,9 @@ def test_core_import():
 def test_basic_execution(simple_data):
     """run_evolution should execute and return a dict with expected keys."""
     X_list, y = simple_data
-    result = _core.run_evolution(X_list, y, pop_size=10, generations=5, early_stop_mse=1e-8)
+    result = _core.run_evolution(
+        X_list, y, pop_size=10, generations=5, early_stop_mse=1e-8
+    )
 
     assert isinstance(result, dict), "Result should be a dict"
     assert "formula" in result, "Result missing 'formula' key"
@@ -134,8 +138,10 @@ def test_seed_omegas(simple_data):
     """run_evolution should accept seed_omegas without crashing."""
     X_list, y = simple_data
     result = _core.run_evolution(
-        X_list, y,
-        pop_size=10, generations=5,
+        X_list,
+        y,
+        pop_size=10,
+        generations=5,
         early_stop_mse=1e-8,
         seed_omegas=[3.0, 5.0, 7.0],
     )
@@ -150,8 +156,10 @@ def test_timeout_parameter(simple_data):
     """run_evolution should respect timeout_seconds without crashing."""
     X_list, y = simple_data
     result = _core.run_evolution(
-        X_list, y,
-        pop_size=10, generations=500,
+        X_list,
+        y,
+        pop_size=10,
+        generations=500,
         early_stop_mse=1e-12,
         timeout_seconds=2,
     )
@@ -165,7 +173,8 @@ def test_island_run_reports_thread_split(simple_data):
     """Island-mode results expose the outer/inner OpenMP split for diagnostics."""
     X_list, y = simple_data
     result = _core.run_evolution(
-        X_list, y,
+        X_list,
+        y,
         pop_size=12,
         generations=2,
         early_stop_mse=1e-12,
@@ -206,7 +215,8 @@ def test_oversized_seed_graphs_are_skipped(simple_data):
     }
 
     result = _core.run_evolution(
-        X_list, y,
+        X_list,
+        y,
         pop_size=12,
         generations=2,
         early_stop_mse=1e-12,
@@ -223,8 +233,10 @@ def test_random_seed_determinism(simple_data):
     """Two runs with the same random_seed should produce identical results."""
     X_list, y = simple_data
     kwargs = dict(
-        X_list=X_list, y=y,
-        pop_size=10, generations=10,
+        X_list=X_list,
+        y=y,
+        pop_size=10,
+        generations=10,
         early_stop_mse=1e-12,
         random_seed=12345,
     )
@@ -246,18 +258,28 @@ def test_result_schema(simple_data):
     """Verify the full result dict schema from the C++ backend."""
     X_list, y = simple_data
     result = _core.run_evolution(
-        X_list, y,
-        pop_size=10, generations=5,
+        X_list,
+        y,
+        pop_size=10,
+        generations=5,
         early_stop_mse=1e-8,
         random_seed=42,
     )
 
     expected_keys = [
-        "best_mse", "penalized_fitness", "formula",
-        "nodes", "output_weights", "output_bias",
-        "evolution_wall_time_sec", "random_seed", "openmp_threads",
-        "time_to_first_exact_sec", "generation_to_first_exact",
-        "time_to_first_acceptable_sec", "generation_to_first_acceptable",
+        "best_mse",
+        "penalized_fitness",
+        "formula",
+        "nodes",
+        "output_weights",
+        "output_bias",
+        "evolution_wall_time_sec",
+        "random_seed",
+        "openmp_threads",
+        "time_to_first_exact_sec",
+        "generation_to_first_exact",
+        "time_to_first_acceptable_sec",
+        "generation_to_first_acceptable",
     ]
     for key in expected_keys:
         assert key in result, f"Result missing expected key: '{key}'"
@@ -270,8 +292,10 @@ def test_result_schema(simple_data):
 def test_arithmetic_gate_can_canonicalize_products():
     """Binary arithmetic should support clean multiply-mode structure."""
     X = np.linspace(-2, 2, 64)
-    y = (X ** 2) * np.sin(X)
-    result = _core.run_evolution([X], y, pop_size=12, generations=8, early_stop_mse=1e-8, random_seed=7)
+    y = (X**2) * np.sin(X)
+    result = _core.run_evolution(
+        [X], y, pop_size=12, generations=8, early_stop_mse=1e-8, random_seed=7
+    )
     assert isinstance(result["formula"], str)
     assert np.isfinite(result["best_mse"])
 
@@ -287,7 +311,12 @@ def test_weighted_evolution_uniform_matches_unweighted():
         X_list, y, pop_size=20, generations=15, early_stop_mse=1e-12, random_seed=11
     )
     weighted = _core.run_evolution(
-        X_list, y, pop_size=20, generations=15, early_stop_mse=1e-12, random_seed=11,
+        X_list,
+        y,
+        pop_size=20,
+        generations=15,
+        early_stop_mse=1e-12,
+        random_seed=11,
         y_weights=np.ones_like(y),
     )
     assert "best_weighted_mse" in weighted
@@ -311,16 +340,26 @@ def test_weighted_evolution_downweights_outliers_changes_choice():
     w[40:55] = 1e-6
 
     unweighted = _core.run_evolution(
-        [x], y,
-        pop_size=40, generations=40, early_stop_mse=1e-12,
-        random_seed=42, timeout_seconds=30,
-        p_min=-1.0, p_max=3.0,
+        [x],
+        y,
+        pop_size=40,
+        generations=40,
+        early_stop_mse=1e-12,
+        random_seed=42,
+        timeout_seconds=30,
+        p_min=-1.0,
+        p_max=3.0,
     )
     weighted = _core.run_evolution(
-        [x], y,
-        pop_size=40, generations=40, early_stop_mse=1e-12,
-        random_seed=42, timeout_seconds=30,
-        p_min=-1.0, p_max=3.0,
+        [x],
+        y,
+        pop_size=40,
+        generations=40,
+        early_stop_mse=1e-12,
+        random_seed=42,
+        timeout_seconds=30,
+        p_min=-1.0,
+        p_max=3.0,
         y_weights=w,
     )
     assert weighted["weighted"] is True
@@ -334,8 +373,17 @@ def test_weighted_evolution_downweights_outliers_changes_choice():
             return float("inf")
         try:
             # Lightweight eval via numpy with x0 alias
-            local = {"x0": x, "x": x, "sin": np.sin, "cos": np.cos, "exp": np.exp,
-                     "log": np.log, "sqrt": np.sqrt, "abs": np.abs, "pi": np.pi}
+            local = {
+                "x0": x,
+                "x": x,
+                "sin": np.sin,
+                "cos": np.cos,
+                "exp": np.exp,
+                "log": np.log,
+                "sqrt": np.sqrt,
+                "abs": np.abs,
+                "pi": np.pi,
+            }
             pred = eval(f.replace("^", "**"), {"__builtins__": {}}, local)
             pred = np.asarray(pred, dtype=np.float64).reshape(-1)
             if pred.shape != y_true.shape or not np.all(np.isfinite(pred)):
@@ -356,7 +404,11 @@ def test_weighted_evolution_rejects_bad_weight_length():
     y = 2.0 * x
     with pytest.raises(Exception):
         _core.run_evolution(
-            [x], y, pop_size=5, generations=2, early_stop_mse=1e-8,
+            [x],
+            y,
+            pop_size=5,
+            generations=2,
+            early_stop_mse=1e-8,
             y_weights=np.ones(30),
         )
 
@@ -371,12 +423,24 @@ def test_huber_irls_improves_clean_recovery_vs_mse():
     X_list = [x.astype(np.float64)]
 
     mse_res = _core.run_evolution(
-        X_list, y, pop_size=50, generations=50, early_stop_mse=1e-12,
-        random_seed=11, num_islands=4, loss_mode="mse",
+        X_list,
+        y,
+        pop_size=50,
+        generations=50,
+        early_stop_mse=1e-12,
+        random_seed=11,
+        num_islands=4,
+        loss_mode="mse",
     )
     hub_res = _core.run_evolution(
-        X_list, y, pop_size=50, generations=50, early_stop_mse=1e-12,
-        random_seed=11, num_islands=4, loss_mode="huber",
+        X_list,
+        y,
+        pop_size=50,
+        generations=50,
+        early_stop_mse=1e-12,
+        random_seed=11,
+        num_islands=4,
+        loss_mode="huber",
     )
 
     def clean_mse(res):
@@ -388,6 +452,7 @@ def test_huber_irls_improves_clean_recovery_vs_mse():
         # fallback via simple poly-ish eval is fragile; use numpy vectorized where possible
         try:
             from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
             est = GlassboxRegressor()
             est.n_features_in_ = 1
             p = est._safe_eval_formula_array(f, x.reshape(-1, 1))
@@ -401,7 +466,11 @@ def test_huber_irls_improves_clean_recovery_vs_mse():
     assert np.isfinite(hub_res.get("search_loss", float("inf")))
     assert hub_res.get("loss_mode") == "huber"
     # Soft assert: either better clean recovery or much lower search_loss than noisy MSE
-    assert c_hub < c_mse * 1.25 or float(hub_res.get("search_loss", 1e9)) < float(mse_res.get("best_mse", 0)) * 0.5
+    assert (
+        c_hub < c_mse * 1.25
+        or float(hub_res.get("search_loss", 1e9))
+        < float(mse_res.get("best_mse", 0)) * 0.5
+    )
 
 
 def test_huber_loss_mode_exposed_and_runs():
@@ -412,10 +481,15 @@ def test_huber_loss_mode_exposed_and_runs():
     y = y.copy()
     y[10:15] += 30.0
     result = _core.run_evolution(
-        [x], y,
-        pop_size=15, generations=10, early_stop_mse=1e-12,
-        random_seed=3, timeout_seconds=15,
-        loss_mode="huber", huber_delta=1.0,
+        [x],
+        y,
+        pop_size=15,
+        generations=10,
+        early_stop_mse=1e-12,
+        random_seed=3,
+        timeout_seconds=15,
+        loss_mode="huber",
+        huber_delta=1.0,
     )
     assert result.get("loss_mode") == "huber"
     assert "search_loss" in result
@@ -426,14 +500,19 @@ def test_huber_loss_mode_exposed_and_runs():
 @requires_cpp
 def test_trimmed_mse_loss_mode_runs():
     x = np.linspace(-2, 2, 50)
-    y = x ** 2
+    y = x**2
     y = y.copy()
     y[0] = 1e3
     result = _core.run_evolution(
-        [x], y,
-        pop_size=12, generations=8, early_stop_mse=1e-12,
-        random_seed=5, timeout_seconds=10,
-        loss_mode="trimmed_mse", trim_fraction=0.1,
+        [x],
+        y,
+        pop_size=12,
+        generations=8,
+        early_stop_mse=1e-12,
+        random_seed=5,
+        timeout_seconds=10,
+        loss_mode="trimmed_mse",
+        trim_fraction=0.1,
     )
     assert result.get("loss_mode") == "trimmed_mse"
     assert np.isfinite(result["best_mse"])
@@ -444,8 +523,10 @@ def test_trimmed_mse_loss_mode_runs():
 if __name__ == "__main__":
     if not CPP_AVAILABLE:
         print("❌ Failed to import _core")
-        print("Please build the C++ extension first using "
-              "`python setup.py build_ext --inplace` in the cpp directory.")
+        print(
+            "Please build the C++ extension first using "
+            "`python setup.py build_ext --inplace` in the cpp directory."
+        )
         sys.exit(1)
 
     print("✅ Successfully imported _core")
@@ -456,13 +537,21 @@ if __name__ == "__main__":
     y = 2.0 * (X[:, 0] ** 2) + np.sin(3.0 * X[:, 0])
 
     print("\n--- Test 1: Basic execution ---")
-    res1 = _core.run_evolution(X_list, y, pop_size=10, generations=5, early_stop_mse=1e-8)
+    res1 = _core.run_evolution(
+        X_list, y, pop_size=10, generations=5, early_stop_mse=1e-8
+    )
     print("Formula:", res1["formula"])
     print("MSE:", res1["best_mse"])
 
     print("\n--- Test 2: Seed Omegas ---")
-    res2 = _core.run_evolution(X_list, y, pop_size=10, generations=5,
-                               early_stop_mse=1e-8, seed_omegas=[3.0, 5.0, 7.0])
+    res2 = _core.run_evolution(
+        X_list,
+        y,
+        pop_size=10,
+        generations=5,
+        early_stop_mse=1e-8,
+        seed_omegas=[3.0, 5.0, 7.0],
+    )
     print("Formula:", res2["formula"])
     print("MSE:", res2["best_mse"])
 

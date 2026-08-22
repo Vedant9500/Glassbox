@@ -1,5 +1,6 @@
-import numpy as np
 from pathlib import Path
+
+import numpy as np
 
 from glassbox.curve_classifier.generate_curve_data import (
     FEATURE_DIM,
@@ -17,11 +18,7 @@ from glassbox.curve_classifier.generate_curve_data import (
 
 
 def _active_ops(labels):
-    return {
-        name
-        for name, idx in OPERATOR_CLASSES.items()
-        if float(labels[idx]) > 0.5
-    }
+    return {name for name, idx in OPERATOR_CLASSES.items() if float(labels[idx]) > 0.5}
 
 
 def test_semantic_labeler_suppresses_unary_argument_identity():
@@ -33,10 +30,18 @@ def test_semantic_labeler_suppresses_unary_argument_identity():
 
 
 def test_semantic_labeler_filters_domain_guard_wrappers():
-    assert derive_semantic_operators_from_formula("np.sqrt(np.abs(x) + 0.01)") == {"power"}
+    assert derive_semantic_operators_from_formula("np.sqrt(np.abs(x) + 0.01)") == {
+        "power"
+    }
     assert derive_semantic_operators_from_formula("np.log(np.abs(x) + 1)") == {"log"}
-    assert derive_semantic_operators_from_formula("1 / (x**2 + 0.1)") == {"power", "rational"}
-    assert derive_semantic_operators_from_formula("(np.abs(x) + 0.01) ** -0.5") == {"power", "rational"}
+    assert derive_semantic_operators_from_formula("1 / (x**2 + 0.1)") == {
+        "power",
+        "rational",
+    }
+    assert derive_semantic_operators_from_formula("(np.abs(x) + 0.01) ** -0.5") == {
+        "power",
+        "rational",
+    }
 
 
 def test_semantic_labeler_keeps_affine_structure_inside_function_arguments():
@@ -47,14 +52,22 @@ def test_semantic_labeler_keeps_affine_structure_inside_function_arguments():
 
 def test_semantic_labeler_treats_addition_as_two_dependent_terms():
     assert derive_semantic_operators_from_formula("x + 1") == {"identity"}
-    assert derive_semantic_operators_from_formula("np.sin(x) + x") == {"identity", "sin", "addition"}
+    assert derive_semantic_operators_from_formula("np.sin(x) + x") == {
+        "identity",
+        "sin",
+        "addition",
+    }
     assert derive_semantic_operators_from_formula("np.sinh(x)") == {"exp"}
 
 
 def test_operators_to_labels_defaults_to_semantic_when_formula_is_available():
     semantic = operators_to_labels({"identity", "sin"}, formula="np.sin(x)")
-    syntax = operators_to_labels({"identity", "sin"}, formula="np.sin(x)", label_mode="syntax")
-    provided = operators_to_labels({"identity", "sin"}, formula="np.sin(x)", label_mode="provided")
+    syntax = operators_to_labels(
+        {"identity", "sin"}, formula="np.sin(x)", label_mode="syntax"
+    )
+    provided = operators_to_labels(
+        {"identity", "sin"}, formula="np.sin(x)", label_mode="provided"
+    )
 
     assert _active_ops(semantic) == {"sin"}
     assert _active_ops(syntax) == {"identity", "sin"}
@@ -104,15 +117,19 @@ def test_generate_dataset_can_return_phase2_generation_metadata():
         assert row_meta["formula_key"] == formula_to_key(formula)
         assert row_meta["generator_family"] in {"simple", "template"}
         assert row_meta["template_id"] >= 0
-        assert tuple(row_meta["semantic_operators"]) == tuple(sorted(_active_ops(row_labels)))
+        assert tuple(row_meta["semantic_operators"]) == tuple(
+            sorted(_active_ops(row_labels))
+        )
 
 
 def test_save_dataset_embeds_phase2_audit_metadata():
     formulas = ["np.sin(x)", "np.sqrt(np.abs(x) + 0.01)"]
-    labels = np.vstack([
-        operators_to_labels({"identity", "sin"}, formula=formulas[0]),
-        operators_to_labels({"identity", "power", "addition"}, formula=formulas[1]),
-    ])
+    labels = np.vstack(
+        [
+            operators_to_labels({"identity", "sin"}, formula=formulas[0]),
+            operators_to_labels({"identity", "power", "addition"}, formula=formulas[1]),
+        ]
+    )
     features = np.zeros((2, FEATURE_DIM), dtype=np.float32)
     generation_metadata = [
         {
@@ -120,8 +137,12 @@ def test_save_dataset_embeds_phase2_audit_metadata():
             "generator_family": "simple",
             "template_id": 10,
             "provided_operators": ("identity", "sin"),
-            "syntax_operators": tuple(sorted(derive_operators_from_formula(formulas[0]))),
-            "semantic_operators": tuple(sorted(derive_semantic_operators_from_formula(formulas[0]))),
+            "syntax_operators": tuple(
+                sorted(derive_operators_from_formula(formulas[0]))
+            ),
+            "semantic_operators": tuple(
+                sorted(derive_semantic_operators_from_formula(formulas[0]))
+            ),
             "labeler_version": SEMANTIC_LABELER_VERSION,
         },
         {
@@ -129,15 +150,21 @@ def test_save_dataset_embeds_phase2_audit_metadata():
             "generator_family": "simple",
             "template_id": 11,
             "provided_operators": ("addition", "identity", "power"),
-            "syntax_operators": tuple(sorted(derive_operators_from_formula(formulas[1]))),
-            "semantic_operators": tuple(sorted(derive_semantic_operators_from_formula(formulas[1]))),
+            "syntax_operators": tuple(
+                sorted(derive_operators_from_formula(formulas[1]))
+            ),
+            "semantic_operators": tuple(
+                sorted(derive_semantic_operators_from_formula(formulas[1]))
+            ),
             "labeler_version": SEMANTIC_LABELER_VERSION,
         },
     ]
 
     out = Path("scratch") / "pytest_phase2_dataset.npz"
     out.parent.mkdir(parents=True, exist_ok=True)
-    save_dataset(out, features, labels, formulas, generation_metadata=generation_metadata)
+    save_dataset(
+        out, features, labels, formulas, generation_metadata=generation_metadata
+    )
 
     data = np.load(out, allow_pickle=True)
     assert str(data["labeler_version"]) == SEMANTIC_LABELER_VERSION

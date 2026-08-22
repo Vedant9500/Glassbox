@@ -1,10 +1,10 @@
 """Phase 4: sklearn orchestration contract (S1-4, S1-5, S1-8, S1-10, S1-13)."""
+
 import sys
 import threading
 from pathlib import Path
 
 import numpy as np
-import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
@@ -61,9 +61,7 @@ def test_s1_13_residual_not_gated_by_guided_evolution():
     X = np.linspace(-1, 1, 40).reshape(-1, 1)
     y = X[:, 0] ** 2
     # Perfect base => residual flat; proves we passed the enable gate (not guided-evo).
-    out = est._stage_residual_symbolic_fit_impl(
-        X, y, "x**2", _allow_recursion=True
-    )
+    out = est._stage_residual_symbolic_fit_impl(X, y, "x**2", _allow_recursion=True)
     guard = getattr(est, "_residual_stage_guard_", {}) or {}
     assert guard.get("enabled") is True
     assert guard.get("reason") != "disabled_or_not_allowed"

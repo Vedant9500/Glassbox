@@ -13,8 +13,13 @@ from glassbox.curve_classifier.rollout import (
 def _validation_report(split_policy="formula_group", val_f1=0.8):
     return {
         "split_policy": split_policy,
-        "split_details": {"policy": split_policy, "exclusive_groups": split_policy != "row"},
-        "metrics": {"best_checkpoint": {"val_f1": val_f1, "val_micro_f1": val_f1 + 0.01}},
+        "split_details": {
+            "policy": split_policy,
+            "exclusive_groups": split_policy != "row",
+        },
+        "metrics": {
+            "best_checkpoint": {"val_f1": val_f1, "val_micro_f1": val_f1 + 0.01}
+        },
         "formula_overlap": {"available": True, "overlap_unique_formulas": 0},
     }
 
@@ -67,7 +72,9 @@ def test_rollout_comparison_blocks_without_baseline_and_passes_when_candidate_wi
     )
 
     missing_baseline = build_rollout_comparison(candidate_card=candidate)
-    comparison = build_rollout_comparison(candidate_card=candidate, baseline_card=baseline)
+    comparison = build_rollout_comparison(
+        candidate_card=candidate, baseline_card=baseline
+    )
 
     assert missing_baseline["schema_version"] == ROLLOUT_COMPARISON_SCHEMA_VERSION
     assert missing_baseline["recommendation"] == "needs_baseline_comparison"
@@ -89,7 +96,9 @@ def test_rollout_comparison_blocks_row_split_even_if_metric_improves():
         checkpoint_metadata={"feature_dim": 398},
     )
 
-    comparison = build_rollout_comparison(candidate_card=candidate, baseline_card=baseline)
+    comparison = build_rollout_comparison(
+        candidate_card=candidate, baseline_card=baseline
+    )
 
     assert comparison["beats_baseline"] is True
     assert comparison["gates"]["grouped_or_family_validation_reported"] is False
@@ -100,4 +109,6 @@ def test_default_phase6_paths_are_next_to_checkpoint():
     checkpoint = Path("models/example.pt")
 
     assert default_checkpoint_card_path(checkpoint) == Path("models/example.card.json")
-    assert default_rollout_comparison_path(checkpoint) == Path("models/example.rollout.json")
+    assert default_rollout_comparison_path(checkpoint) == Path(
+        "models/example.rollout.json"
+    )

@@ -4,7 +4,6 @@ Covers the public surface in ``scripts/benchmark_noise.py``:
 noise-generator determinism + level sanity, the report-column contract, and a
 tiny end-to-end protocol run on one problem x one tier x one seed.
 """
-import math
 
 import numpy as np
 import pytest
@@ -44,12 +43,18 @@ def test_clean_tier_is_noop():
 def test_gaussian_levels_match_target_rms():
     rng = np.random.RandomState(0)
     y = rng.uniform(-1, 1, size=4000)
-    for tier_name, target in (("gaussian_0.1pct", 0.001), ("gaussian_1pct", 0.01), ("gaussian_10pct", 0.10)):
+    for tier_name, target in (
+        ("gaussian_0.1pct", 0.001),
+        ("gaussian_1pct", 0.01),
+        ("gaussian_10pct", 0.10),
+    ):
         tier = next(t for t in bn.NOISE_TIERS if t["name"] == tier_name)
         yn = bn.apply_noise_tier(y, tier, seed=3)
         rms = float(np.std(yn - y)) / (float(np.std(y)) + 1e-12)
         # Generous tolerance (small-sample jitter) but order-of-magnitude must hold.
-        assert abs(rms - target) < target * 0.5, f"{tier_name}: rms={rms} target={target}"
+        assert abs(rms - target) < target * 0.5, (
+            f"{tier_name}: rms={rms} target={target}"
+        )
 
 
 def test_outlier_tier_only_touches_a_few_points():
@@ -121,13 +126,16 @@ def _toy_problem():
 
 
 def test_protocol_run_emits_contract_rows():
-    from scripts import run_srbench_local as rsl
 
     def factory():
         from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
         return GlassboxRegressor(
-            random_state=1, generations=15, multi_start_runs=1,
-            population_size=40, timeout=20,
+            random_state=1,
+            generations=15,
+            multi_start_runs=1,
+            population_size=40,
+            timeout=20,
         )
 
     clean_tier = [bn.NOISE_TIERS[0]]
@@ -154,13 +162,16 @@ def test_protocol_run_emits_contract_rows():
 
 
 def test_summary_delta_table_keys():
-    from scripts import run_srbench_local as rsl
 
     def factory():
         from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+
         return GlassboxRegressor(
-            random_state=1, generations=10, multi_start_runs=1,
-            population_size=30, timeout=15,
+            random_state=1,
+            generations=10,
+            multi_start_runs=1,
+            population_size=30,
+            timeout=15,
         )
 
     tiers = [bn.NOISE_TIERS[0], bn.NOISE_TIERS[3]]  # clean + gaussian 10%
@@ -181,9 +192,18 @@ def test_summary_delta_table_keys():
 
 def test_write_report_creates_files(tmp_path):
     rows = [{col: None for col in bn.REQUIRED_COLUMNS}]
-    rows[0].update({"problem": "p", "tier": "clean", "seed": 1,
-                    "test_r2": 0.9, "exact_match": False, "true_formula": "x",
-                    "discovered_formula": "x", "error": None})
+    rows[0].update(
+        {
+            "problem": "p",
+            "tier": "clean",
+            "seed": 1,
+            "test_r2": 0.9,
+            "exact_match": False,
+            "true_formula": "x",
+            "discovered_formula": "x",
+            "error": None,
+        }
+    )
     summary = bn.summarize_noise_protocol(rows)
     paths = bn.write_report(rows, summary, tmp_path)
     assert all(p.exists() for p in paths.values())
@@ -205,22 +225,24 @@ def test_clean_vs_noisy_metrics_diverge_under_noise():
 
 def test_markdown_includes_clean_columns():
     rows = [{col: None for col in bn.REQUIRED_COLUMNS}]
-    rows[0].update({
-        "problem": "p",
-        "tier": "clean",
-        "seed": 1,
-        "test_r2": 0.9,
-        "clean_test_r2": 0.95,
-        "exact_match": True,
-        "acceptable_clean": True,
-        "true_formula": "x",
-        "discovered_formula": "x",
-        "error": None,
-        "raw_mse": 0.01,
-        "display_mse": 0.01,
-        "clean_test_mse": 0.0,
-        "formula_complexity": 1,
-    })
+    rows[0].update(
+        {
+            "problem": "p",
+            "tier": "clean",
+            "seed": 1,
+            "test_r2": 0.9,
+            "clean_test_r2": 0.95,
+            "exact_match": True,
+            "acceptable_clean": True,
+            "true_formula": "x",
+            "discovered_formula": "x",
+            "error": None,
+            "raw_mse": 0.01,
+            "display_mse": 0.01,
+            "clean_test_mse": 0.0,
+            "formula_complexity": 1,
+        }
+    )
     summary = bn.summarize_noise_protocol(rows)
     md = bn.to_markdown(summary)
     assert "R2clean" in md
@@ -320,26 +342,29 @@ def test_select_blackbox_problems_are_multivariate():
 
 def test_build_ablation_table_release_keys(tmp_path):
     """Phase E: ablation table compares full vs no_weights on multi-var rows."""
+
     def _mk(problem, tier, ablation, clean_r2, accept):
         row = {c: None for c in bn.REQUIRED_COLUMNS}
-        row.update({
-            "problem": problem,
-            "tier": tier,
-            "seed": 11,
-            "test_r2": clean_r2,
-            "clean_test_r2": clean_r2,
-            "exact_match": clean_r2 > 0.99,
-            "acceptable_clean": accept,
-            "false_confidence": False,
-            "raw_mse": 0.2,
-            "display_mse": 0.2,
-            "clean_test_mse": max(0.0, 1.0 - clean_r2),
-            "formula_complexity": 10 if ablation == "full" else 30,
-            "error": None,
-            "ablation": ablation,
-            "blackbox_enabled": True,
-            "n_features": 5,
-        })
+        row.update(
+            {
+                "problem": problem,
+                "tier": tier,
+                "seed": 11,
+                "test_r2": clean_r2,
+                "clean_test_r2": clean_r2,
+                "exact_match": clean_r2 > 0.99,
+                "acceptable_clean": accept,
+                "false_confidence": False,
+                "raw_mse": 0.2,
+                "display_mse": 0.2,
+                "clean_test_mse": max(0.0, 1.0 - clean_r2),
+                "formula_complexity": 10 if ablation == "full" else 30,
+                "error": None,
+                "ablation": ablation,
+                "blackbox_enabled": True,
+                "n_features": 5,
+            }
+        )
         return row
 
     rows_by = {
@@ -365,33 +390,38 @@ def test_build_ablation_table_release_keys(tmp_path):
 
 def test_build_publish_table_multi_seed(tmp_path):
     """Phase E+: multi-seed publish table exposes Exact matrix + coverage."""
+
     def _mk(problem, tier, seed, exact, accept, r2=1.0):
         row = {c: None for c in bn.REQUIRED_COLUMNS}
-        row.update({
-            "problem": problem,
-            "tier": tier,
-            "seed": seed,
-            "test_r2": r2,
-            "clean_test_r2": r2,
-            "clean_full_mse": 1e-9 if exact else 0.05,
-            "exact_match": exact,
-            "acceptable_clean": accept,
-            "false_confidence": False,
-            "raw_mse": 0.1,
-            "display_mse": 0.1,
-            "clean_test_mse": max(0.0, 1.0 - r2),
-            "formula_complexity": 12,
-            "formula": "10/(5+(x0-3)^2+(x1-3)^2)",
-            "error": None,
-            "blackbox_enabled": True,
-            "n_features": 5,
-        })
+        row.update(
+            {
+                "problem": problem,
+                "tier": tier,
+                "seed": seed,
+                "test_r2": r2,
+                "clean_test_r2": r2,
+                "clean_full_mse": 1e-9 if exact else 0.05,
+                "exact_match": exact,
+                "acceptable_clean": accept,
+                "false_confidence": False,
+                "raw_mse": 0.1,
+                "display_mse": 0.1,
+                "clean_test_mse": max(0.0, 1.0 - r2),
+                "formula_complexity": 12,
+                "formula": "10/(5+(x0-3)^2+(x1-3)^2)",
+                "error": None,
+                "blackbox_enabled": True,
+                "n_features": 5,
+            }
+        )
         return row
 
     rows = []
     for seed in (11, 7, 23):
         rows.append(_mk("Vladislavleva-4", "clean", seed, True, True, 1.0))
-        rows.append(_mk("Vladislavleva-4", "outliers_3pct", seed, seed != 7, True, 0.99))
+        rows.append(
+            _mk("Vladislavleva-4", "outliers_3pct", seed, seed != 7, True, 0.99)
+        )
         rows.append(_mk("Pagie-1", "clean", seed, True, True, 1.0))
         rows.append(_mk("Pagie-1", "outliers_3pct", seed, False, True, 0.95))
 
@@ -434,6 +464,7 @@ def test_main_smoke_writes_protocol_artifacts(tmp_path, monkeypatch):
 
     Uses a tiny fake estimator so this does not require the C++ backend.
     """
+
     class _FakeEst:
         def __init__(self, **kwargs):
             self.params = kwargs
@@ -455,6 +486,7 @@ def test_main_smoke_writes_protocol_artifacts(tmp_path, monkeypatch):
     def fake_factory(**kwargs):
         def factory():
             return _FakeEst(**kwargs)
+
         return factory
 
     monkeypatch.setattr(
@@ -462,11 +494,14 @@ def test_main_smoke_writes_protocol_artifacts(tmp_path, monkeypatch):
         "_default_estimator_factory",
         lambda **kw: fake_factory(**kw),
     )
-    rc = bn.main([
-        "--smoke",
-        "--output-dir", str(tmp_path / "out"),
-        "--quiet",
-    ])
+    rc = bn.main(
+        [
+            "--smoke",
+            "--output-dir",
+            str(tmp_path / "out"),
+            "--quiet",
+        ]
+    )
     assert rc == 0
     out = tmp_path / "out"
     assert (out / "noise_protocol_rows.json").exists()

@@ -8,7 +8,6 @@ the GLASSBOX_ALLOW_PICKLE_CHECKPOINT=1 environment variable.
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 import numpy as np
@@ -79,6 +78,7 @@ def _clear_env(monkeypatch):
 # Universal proposer loader
 # ---------------------------------------------------------------------------
 
+
 def test_up_weights_only_checkpoint_loads_without_env(tmp_path: Path):
     models_dir = _make_trusted_layout(tmp_path)
     ckpt = _write_weights_only_checkpoint(models_dir / "safe.pt")
@@ -101,7 +101,9 @@ def test_up_pickle_checkpoint_allowed_with_env(tmp_path: Path, monkeypatch):
     assert "model_state_dict" in loaded
 
 
-def test_up_pickle_checkpoint_outside_trusted_dir_refused_even_with_env(tmp_path: Path, monkeypatch):
+def test_up_pickle_checkpoint_outside_trusted_dir_refused_even_with_env(
+    tmp_path: Path, monkeypatch
+):
     _make_trusted_layout(tmp_path)
     ckpt = _write_pickle_backed_checkpoint(tmp_path / "outside" / "legacy.pt")
     monkeypatch.setenv("GLASSBOX_ALLOW_PICKLE_CHECKPOINT", "1")
@@ -112,6 +114,7 @@ def test_up_pickle_checkpoint_outside_trusted_dir_refused_even_with_env(tmp_path
 # ---------------------------------------------------------------------------
 # Curve classifier loader
 # ---------------------------------------------------------------------------
+
 
 def test_cci_weights_only_checkpoint_loads_without_env(tmp_path: Path):
     models_dir = _make_trusted_layout(tmp_path)
@@ -135,7 +138,9 @@ def test_cci_pickle_checkpoint_allowed_with_env(tmp_path: Path, monkeypatch):
     assert "model_state_dict" in loaded
 
 
-def test_cci_pickle_checkpoint_outside_trusted_dir_refused_even_with_env(tmp_path: Path, monkeypatch):
+def test_cci_pickle_checkpoint_outside_trusted_dir_refused_even_with_env(
+    tmp_path: Path, monkeypatch
+):
     _make_trusted_layout(tmp_path)
     ckpt = _write_pickle_backed_checkpoint(tmp_path / "outside" / "legacy.pt")
     monkeypatch.setenv("GLASSBOX_ALLOW_PICKLE_CHECKPOINT", "1")

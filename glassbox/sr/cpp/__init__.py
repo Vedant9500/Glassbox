@@ -12,11 +12,12 @@ import importlib.util
 import inspect
 import logging
 import sys
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable, Optional, Sequence, Tuple
+from typing import Any, Optional, Tuple
 
-from glassbox.sr.cpp.graph_enums import *  # noqa: F401,F403
+from glassbox.sr.cpp.graph_enums import *
 from glassbox.sr.cpp.graph_enums import __all__ as _ENUM_ALL
 
 __all__ = [
@@ -33,8 +34,8 @@ __all__ = [
 _LOG = logging.getLogger(__name__)
 
 _CPP_DIR = Path(__file__).resolve().parent
-_core_module: Optional[ModuleType] = None
-_load_error: Optional[str] = None
+_core_module: ModuleType | None = None
+_load_error: str | None = None
 _loaded = False
 
 
@@ -43,7 +44,7 @@ def cpp_dir() -> Path:
     return _CPP_DIR
 
 
-def load_cpp_core() -> Tuple[Optional[ModuleType], Optional[str]]:
+def load_cpp_core() -> tuple[ModuleType | None, str | None]:
     """Load the native ``_core`` extension with ABI-aware diagnostics.
 
     Returns ``(module, None)`` on success, or ``(None, reason)`` on failure.
@@ -144,7 +145,7 @@ def load_cpp_core() -> Tuple[Optional[ModuleType], Optional[str]]:
     return None, reason
 
 
-def get_cpp_core() -> Optional[ModuleType]:
+def get_cpp_core() -> ModuleType | None:
     """Return the loaded extension module, or None if unavailable."""
     mod, _ = load_cpp_core()
     return mod
@@ -161,9 +162,9 @@ def require_cpp_core() -> ModuleType:
 def call_with_optional_kwargs(
     func: Callable[..., Any],
     *args: Any,
-    optional_kwargs: Optional[dict] = None,
-    required_kwargs: Optional[dict] = None,
-    log: Optional[logging.Logger] = None,
+    optional_kwargs: dict | None = None,
+    required_kwargs: dict | None = None,
+    log: logging.Logger | None = None,
 ) -> Any:
     """Call ``func`` dropping kwargs not accepted by its signature (P6-003).
 

@@ -1,13 +1,13 @@
 import numpy as np
 
+from glassbox.sr.cpp import seed_graph_builder
+from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_candidates
 from glassbox.sr.specialist_state import (
     SpecialistVault,
     build_specialist_segment_slices,
     compute_specialist_state,
     propose_specialist_compositions,
 )
-from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_candidates
-import glassbox.sr.cpp.seed_graph_builder as seed_graph_builder
 
 
 def _eval_formula(formula, X):
@@ -46,9 +46,24 @@ def test_compute_specialist_state_returns_candidates_and_pairs():
     X = np.column_stack([x, np.sin(x), np.cos(x)])
     y = np.where(x < 0.0, x * x, np.sin(2.0 * x))
     candidates = [
-        {"formula": "x0^2", "validation_r2": 0.2, "validation_mse": 1.0, "source": "poly"},
-        {"formula": "sin(2*x0)", "validation_r2": 0.3, "validation_mse": 0.9, "source": "periodic"},
-        {"formula": "x0*sin(x0)", "validation_r2": 0.4, "validation_mse": 0.8, "source": "product"},
+        {
+            "formula": "x0^2",
+            "validation_r2": 0.2,
+            "validation_mse": 1.0,
+            "source": "poly",
+        },
+        {
+            "formula": "sin(2*x0)",
+            "validation_r2": 0.3,
+            "validation_mse": 0.9,
+            "source": "periodic",
+        },
+        {
+            "formula": "x0*sin(x0)",
+            "validation_r2": 0.4,
+            "validation_mse": 0.8,
+            "source": "product",
+        },
     ]
 
     state = compute_specialist_state(
@@ -57,7 +72,9 @@ def test_compute_specialist_state_returns_candidates_and_pairs():
         y,
         evaluate_formula=_eval_formula,
         complexity_fn=lambda formula: len(str(formula)),
-        family_signature_fn=lambda formula: "periodic" if "sin" in str(formula) else "poly",
+        family_signature_fn=lambda formula: (
+            "periodic" if "sin" in str(formula) else "poly"
+        ),
         max_candidates=6,
         max_pairs=5,
     )
@@ -79,8 +96,18 @@ def test_propose_specialist_compositions_emits_add_and_mul_forms():
     X = np.column_stack([x, np.sin(x), np.cos(x)])
     y = np.where(x < 0.0, x * x, np.sin(2.0 * x))
     candidates = [
-        {"formula": "x0^2", "validation_r2": 0.2, "validation_mse": 1.0, "source": "poly"},
-        {"formula": "sin(2*x0)", "validation_r2": 0.3, "validation_mse": 0.9, "source": "periodic"},
+        {
+            "formula": "x0^2",
+            "validation_r2": 0.2,
+            "validation_mse": 1.0,
+            "source": "poly",
+        },
+        {
+            "formula": "sin(2*x0)",
+            "validation_r2": 0.3,
+            "validation_mse": 0.9,
+            "source": "periodic",
+        },
     ]
 
     state = compute_specialist_state(
@@ -89,11 +116,15 @@ def test_propose_specialist_compositions_emits_add_and_mul_forms():
         y,
         evaluate_formula=_eval_formula,
         complexity_fn=lambda formula: len(str(formula)),
-        family_signature_fn=lambda formula: "periodic" if "sin" in str(formula) else "poly",
+        family_signature_fn=lambda formula: (
+            "periodic" if "sin" in str(formula) else "poly"
+        ),
         max_candidates=4,
         max_pairs=3,
     )
-    proposals = propose_specialist_compositions(state, max_pairs=3, min_complementarity=0.0)
+    proposals = propose_specialist_compositions(
+        state, max_pairs=3, min_complementarity=0.0
+    )
 
     operators = {proposal.operator for proposal in proposals}
     assert "add" in operators
@@ -102,7 +133,12 @@ def test_propose_specialist_compositions_emits_add_and_mul_forms():
 
 def test_build_seed_graphs_does_not_let_composed_seeds_dominate():
     candidate_formulas = [
-        {"formula": f"x0 * {i}", "mse": 0.01 * i, "source": "specialist_composition", "from_specialist_composition": True}
+        {
+            "formula": f"x0 * {i}",
+            "mse": 0.01 * i,
+            "source": "specialist_composition",
+            "from_specialist_composition": True,
+        }
         for i in range(1, 6)
     ] + [
         {"formula": f"x0 + {i}", "mse": 0.5 + 0.1 * i, "source": "candidate_screening"}
@@ -119,7 +155,9 @@ def test_build_seed_graphs_enforces_composed_seed_cap(monkeypatch):
         captured["formulas"] = list(formulas)
         return [{"formula": formula} for formula in formulas[:max_seeds]]
 
-    monkeypatch.setattr(seed_graph_builder, "build_seed_graphs_from_formulas", fake_build)
+    monkeypatch.setattr(
+        seed_graph_builder, "build_seed_graphs_from_formulas", fake_build
+    )
     candidate_formulas = [
         {"formula": f"comp_{i}", "mse": float(i), "from_specialist_composition": True}
         for i in range(10)
@@ -137,6 +175,7 @@ def test_build_seed_graphs_enforces_composed_seed_cap(monkeypatch):
 
 def test_build_hot_spot_segments_and_compute_specialist_state_phase5():
     from glassbox.sr.specialist_state import build_hot_spot_segments
+
     x = np.linspace(-3.0, 3.0, 100)
     X = x.reshape(-1, 1)
 
@@ -144,7 +183,9 @@ def test_build_hot_spot_segments_and_compute_specialist_state_phase5():
     best_residual = np.zeros_like(x)
     best_residual[45:55] = 10.0
 
-    hs_segs = build_hot_spot_segments(X, best_residual, max_segments=6, min_segment_size=8)
+    hs_segs = build_hot_spot_segments(
+        X, best_residual, max_segments=6, min_segment_size=8
+    )
     assert len(hs_segs) >= 1
     has_concentrated = any(8 <= seg.n_samples <= 10 for seg in hs_segs)
     assert has_concentrated
@@ -152,8 +193,18 @@ def test_build_hot_spot_segments_and_compute_specialist_state_phase5():
     # Test compute_specialist_state populates fields
     y = best_residual
     candidates = [
-        {"formula": "0*x0", "validation_r2": 0.0, "validation_mse": np.mean(y**2), "source": "candidate_screening"},
-        {"formula": "1+0*x0", "validation_r2": 0.0, "validation_mse": np.mean((y-1)**2), "source": "candidate_screening"}
+        {
+            "formula": "0*x0",
+            "validation_r2": 0.0,
+            "validation_mse": np.mean(y**2),
+            "source": "candidate_screening",
+        },
+        {
+            "formula": "1+0*x0",
+            "validation_r2": 0.0,
+            "validation_mse": np.mean((y - 1) ** 2),
+            "source": "candidate_screening",
+        },
     ]
     state = compute_specialist_state(
         candidates,
@@ -163,7 +214,7 @@ def test_build_hot_spot_segments_and_compute_specialist_state_phase5():
         complexity_fn=lambda formula: 1,
         family_signature_fn=lambda formula: "constant",
         max_candidates=2,
-        max_pairs=1
+        max_pairs=1,
     )
     assert state is not None
     assert len(state.hot_spot_segments) >= 1
@@ -176,8 +227,18 @@ def test_hot_spot_segments_use_best_metric_candidate_as_base():
     X = x.reshape(-1, 1)
     y = x
     candidates = [
-        {"formula": "0*x0", "validation_r2": -1.0, "validation_mse": 100.0, "source": "bad"},
-        {"formula": "x0", "validation_r2": 1.0, "validation_mse": 0.0, "source": "good"},
+        {
+            "formula": "0*x0",
+            "validation_r2": -1.0,
+            "validation_mse": 100.0,
+            "source": "bad",
+        },
+        {
+            "formula": "x0",
+            "validation_r2": 1.0,
+            "validation_mse": 0.0,
+            "source": "good",
+        },
     ]
 
     state = compute_specialist_state(
@@ -202,8 +263,18 @@ def test_propose_specialist_compositions_expanded_templates_phase6():
     y = np.sin(x + 1.0)
 
     candidates = [
-        {"formula": "sin(x0)", "validation_r2": 0.8, "validation_mse": 0.01, "source": "candidate_screening"},
-        {"formula": "x0+1.0", "validation_r2": 0.8, "validation_mse": 0.01, "source": "candidate_screening"}
+        {
+            "formula": "sin(x0)",
+            "validation_r2": 0.8,
+            "validation_mse": 0.01,
+            "source": "candidate_screening",
+        },
+        {
+            "formula": "x0+1.0",
+            "validation_r2": 0.8,
+            "validation_mse": 0.01,
+            "source": "candidate_screening",
+        },
     ]
 
     state = compute_specialist_state(
@@ -214,7 +285,7 @@ def test_propose_specialist_compositions_expanded_templates_phase6():
         complexity_fn=lambda formula: 1,
         family_signature_fn=lambda formula: "sin" if "sin" in str(formula) else "poly",
         max_candidates=2,
-        max_pairs=1
+        max_pairs=1,
     )
 
     assert state is not None
@@ -225,7 +296,7 @@ def test_propose_specialist_compositions_expanded_templates_phase6():
         y,
         evaluate_formula=_eval_formula,
         max_pairs=1,
-        min_complementarity=0.0
+        min_complementarity=0.0,
     )
 
     operators = {proposal.operator for proposal in proposals}
@@ -237,8 +308,18 @@ def test_propose_specialist_compositions_handles_reversed_nested_parent():
     X = x.reshape(-1, 1)
     y = np.sin(x + 1.0)
     candidates = [
-        {"formula": "x0+1.0", "validation_r2": 0.4, "validation_mse": 0.2, "source": "inner"},
-        {"formula": "sin(x0)", "validation_r2": 0.4, "validation_mse": 0.2, "source": "outer"},
+        {
+            "formula": "x0+1.0",
+            "validation_r2": 0.4,
+            "validation_mse": 0.2,
+            "source": "inner",
+        },
+        {
+            "formula": "sin(x0)",
+            "validation_r2": 0.4,
+            "validation_mse": 0.2,
+            "source": "outer",
+        },
     ]
 
     state = compute_specialist_state(
@@ -345,9 +426,19 @@ def test_specialist_vault_dedupes_by_prediction_correlation_and_caps_entries():
     vault = SpecialistVault(max_entries=2, corr_threshold=0.98)
     candidates = [
         {"formula": "x0", "validation_r2": 0.5, "validation_mse": 0.5, "source": "a"},
-        {"formula": "x0+0", "validation_r2": 0.5, "validation_mse": 0.5, "source": "dup"},
+        {
+            "formula": "x0+0",
+            "validation_r2": 0.5,
+            "validation_mse": 0.5,
+            "source": "dup",
+        },
         {"formula": "x1", "validation_r2": 0.5, "validation_mse": 0.5, "source": "b"},
-        {"formula": "0.1*x0", "validation_r2": 0.1, "validation_mse": 0.9, "source": "c"},
+        {
+            "formula": "0.1*x0",
+            "validation_r2": 0.1,
+            "validation_mse": 0.9,
+            "source": "c",
+        },
     ]
 
     added = vault.add_candidates(
@@ -377,8 +468,18 @@ def test_specialist_vault_proposes_capped_composition_candidates():
     vault = SpecialistVault(max_entries=8)
     vault.add_candidates(
         [
-            {"formula": "x0", "validation_r2": 0.5, "validation_mse": 0.5, "source": "outer"},
-            {"formula": "x1", "validation_r2": 0.5, "validation_mse": 0.5, "source": "inner"},
+            {
+                "formula": "x0",
+                "validation_r2": 0.5,
+                "validation_mse": 0.5,
+                "source": "outer",
+            },
+            {
+                "formula": "x1",
+                "validation_r2": 0.5,
+                "validation_mse": 0.5,
+                "source": "inner",
+            },
         ],
         X,
         y,
@@ -413,7 +514,7 @@ def test_specialist_vault_proposes_capped_composition_candidates():
 
 def test_m01_permuted_index_holdout():
     """M-01: SpecialistVault holdout uses deterministic permuted indices rather than deterministic tail.
-    
+
     When y is ordered (e.g. sorted domain [-2, 2]), the tail slice y[-n_val:] has low variance (~0.09),
     so tail noise causes tail holdout R2 to plummet below 0.25 (rejecting the candidate).
     Permuted holdout samples uniformly across the domain (variance ~1.25), keeping holdout R2 high.
@@ -449,9 +550,24 @@ def test_compute_specialist_state_ranks_before_slice():
     y = np.where(x < 0.0, x * x, np.sin(2.0 * x))
     # Best formula placed LAST in input order; weaker ones first.
     candidates = [
-        {"formula": "sin(x0)", "validation_r2": 0.2, "validation_mse": 5.0, "source": "weak"},
-        {"formula": "cos(x0)", "validation_r2": 0.1, "validation_mse": 6.0, "source": "weaker"},
-        {"formula": "x0^2", "validation_r2": 0.9, "validation_mse": 0.1, "source": "best"},
+        {
+            "formula": "sin(x0)",
+            "validation_r2": 0.2,
+            "validation_mse": 5.0,
+            "source": "weak",
+        },
+        {
+            "formula": "cos(x0)",
+            "validation_r2": 0.1,
+            "validation_mse": 6.0,
+            "source": "weaker",
+        },
+        {
+            "formula": "x0^2",
+            "validation_r2": 0.9,
+            "validation_mse": 0.1,
+            "source": "best",
+        },
     ]
 
     state = compute_specialist_state(
@@ -460,7 +576,9 @@ def test_compute_specialist_state_ranks_before_slice():
         y,
         evaluate_formula=_eval_formula,
         complexity_fn=lambda formula: len(str(formula)),
-        family_signature_fn=lambda formula: "periodic" if "sin" in str(formula) else "poly",
+        family_signature_fn=lambda formula: (
+            "periodic" if "sin" in str(formula) else "poly"
+        ),
         max_candidates=2,
         max_pairs=3,
     )
@@ -468,5 +586,3 @@ def test_compute_specialist_state_ranks_before_slice():
     assert state is not None
     formula_best = state.hot_spot_base_formula
     assert formula_best == "x0^2"
-
-

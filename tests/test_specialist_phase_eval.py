@@ -1,6 +1,7 @@
-from scripts import specialist_phase_eval as spe
 import numpy as np
+
 from glassbox.sr.sklearn_wrapper import GlassboxRegressor
+from scripts import specialist_phase_eval as spe
 
 
 def test_phase0_harness_returns_summary_and_cases():
@@ -101,7 +102,7 @@ def test_targeted_specialist_probes_prioritize_envelope_carrier_products():
     reg = GlassboxRegressor()
     x = np.linspace(-2.0, 2.0, 160)
     X = x.reshape(-1, 1)
-    y = np.exp(-(x ** 2)) * np.sin(3.0 * x)
+    y = np.exp(-(x**2)) * np.sin(3.0 * x)
 
     probes = reg._targeted_specialist_probe_formulas(X, y, max_formulas=12)
 
@@ -111,7 +112,9 @@ def test_targeted_specialist_probes_prioritize_envelope_carrier_products():
 
 def test_univariate_specialist_candidate_pool_includes_targeted_probes():
     class ProbeRegressor(GlassboxRegressor):
-        def _refine_candidate_formulas(self, candidate_formulas, X, y, *, max_candidates=12):
+        def _refine_candidate_formulas(
+            self, candidate_formulas, X, y, *, max_candidates=12
+        ):
             return list(candidate_formulas)[:max_candidates]
 
     reg = ProbeRegressor()
@@ -128,12 +131,17 @@ def test_univariate_specialist_candidate_pool_includes_targeted_probes():
         max_candidates=80,
     )
 
-    assert any(candidate.get("from_targeted_specialist_probe") for candidate in candidates)
-    assert any(candidate.get("source") == "envelope_carrier_probe" for candidate in candidates)
+    assert any(
+        candidate.get("from_targeted_specialist_probe") for candidate in candidates
+    )
+    assert any(
+        candidate.get("source") == "envelope_carrier_probe" for candidate in candidates
+    )
 
 
 def test_cpp_batch_candidate_scoring_matches_affine_fit_when_available():
     from glassbox.sr.cpp import get_cpp_core
+
     _core = get_cpp_core()
     if _core is None or not hasattr(_core, "score_formula_candidates"):
         return
@@ -256,10 +264,14 @@ def test_phase9_harness_returns_summary_and_cases():
 
 def test_residual_boosting_records_attempt_and_improvement():
     class ProbeRegressor(GlassboxRegressor):
-        def _stage_residual_symbolic_fit(self, X, y, base_formula, *, _allow_recursion=False):
+        def _stage_residual_symbolic_fit(
+            self, X, y, base_formula, *, _allow_recursion=False
+        ):
             return "sin(x0)"
 
-        def _refine_candidate_formulas(self, candidate_formulas, X, y, *, max_candidates=12):
+        def _refine_candidate_formulas(
+            self, candidate_formulas, X, y, *, max_candidates=12
+        ):
             return list(candidate_formulas)[:max_candidates]
 
     x = np.linspace(-2.0, 2.0, 80)
@@ -288,7 +300,7 @@ def test_residual_symbolic_fit_uses_bounded_mini_search_without_recursing():
 
     x = np.linspace(-2.0, 2.0, 96)
     X = x.reshape(-1, 1)
-    y = x + x ** 2
+    y = x + x**2
     reg = NoRecursiveRegressor(
         use_guided_evolution=True,
         enable_residual_stage=True,
@@ -314,10 +326,24 @@ def test_residual_symbolic_fit_uses_bounded_mini_search_without_recursing():
 
 def test_univariate_fit_runs_specialist_candidate_screening(monkeypatch):
     class ProbeRegressor(GlassboxRegressor):
-        def _build_univariate_specialist_candidate_formulas(self, best_formula, best_mse, proposer_payload, X, y, *, max_candidates):
+        def _build_univariate_specialist_candidate_formulas(
+            self, best_formula, best_mse, proposer_payload, X, y, *, max_candidates
+        ):
             return [
-                {"formula": "x0", "validation_r2": 0.5, "validation_mse": 0.1, "mse": 0.1, "complexity": 1},
-                {"formula": "sin(x0)", "validation_r2": 0.6, "validation_mse": 0.08, "mse": 0.08, "complexity": 2},
+                {
+                    "formula": "x0",
+                    "validation_r2": 0.5,
+                    "validation_mse": 0.1,
+                    "mse": 0.1,
+                    "complexity": 1,
+                },
+                {
+                    "formula": "sin(x0)",
+                    "validation_r2": 0.6,
+                    "validation_mse": 0.08,
+                    "mse": 0.08,
+                    "complexity": 2,
+                },
             ]
 
         def _run_residual_boosting(self, X, y, base_formula):

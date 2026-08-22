@@ -5,10 +5,8 @@ from __future__ import annotations
 import ast
 import math
 import re
-import sys
 import warnings
 from pathlib import Path
-from typing import Any, Dict, Optional
 
 import numpy as np
 
@@ -112,8 +110,7 @@ def discover_official_ground_truth_problems(data_dir):
                 if dataset_dir.name.startswith(("strogatz_", "feynman_"))
                 else path.stem
             )
-            if name.endswith(".tsv"):
-                name = name[:-4]
+            name = name.removesuffix(".tsv")
             candidates.append(
                 {
                     "kind": "file",
@@ -208,11 +205,19 @@ def apply_canonical_rewrites(formula):
                 and len(node.left.args) == 1
             )
 
-        def visit_BinOp(self, node):  # noqa: N802 - ast API name
+        def visit_BinOp(self, node):
             node = self.generic_visit(node)
-            if isinstance(node.op, ast.Pow) and isinstance(node.left, ast.Name) and node.left.id in {"E", "e"}:
+            if (
+                isinstance(node.op, ast.Pow)
+                and isinstance(node.left, ast.Name)
+                and node.left.id in {"E", "e"}
+            ):
                 return ast.copy_location(
-                    ast.Call(func=ast.Name(id="exp", ctx=ast.Load()), args=[node.right], keywords=[]),
+                    ast.Call(
+                        func=ast.Name(id="exp", ctx=ast.Load()),
+                        args=[node.right],
+                        keywords=[],
+                    ),
                     node,
                 )
             if isinstance(node.op, ast.Add):
@@ -220,13 +225,25 @@ def apply_canonical_rewrites(formula):
                 right_cos = self._is_func_square(node.right, "cos")
                 left_cos = self._is_func_square(node.left, "cos")
                 right_sin = self._is_func_square(node.right, "sin")
-                if left_sin and right_cos and self._same(node.left.left.args[0], node.right.left.args[0]):
+                if (
+                    left_sin
+                    and right_cos
+                    and self._same(node.left.left.args[0], node.right.left.args[0])
+                ):
                     return ast.copy_location(ast.Constant(value=1), node)
-                if left_cos and right_sin and self._same(node.left.left.args[0], node.right.left.args[0]):
+                if (
+                    left_cos
+                    and right_sin
+                    and self._same(node.left.left.args[0], node.right.left.args[0])
+                ):
                     return ast.copy_location(ast.Constant(value=1), node)
-            if isinstance(node.op, ast.Mult) and ast.dump(node.left) == ast.dump(node.right):
+            if isinstance(node.op, ast.Mult) and ast.dump(node.left) == ast.dump(
+                node.right
+            ):
                 return ast.copy_location(
-                    ast.BinOp(left=node.left, op=ast.Pow(), right=ast.Constant(value=2)),
+                    ast.BinOp(
+                        left=node.left, op=ast.Pow(), right=ast.Constant(value=2)
+                    ),
                     node,
                 )
             if isinstance(node.op, ast.Mult):
@@ -255,7 +272,7 @@ def apply_canonical_rewrites(formula):
                     return ast.copy_location(replacement, node)
             return node
 
-        def visit_Call(self, node):  # noqa: N802 - ast API name
+        def visit_Call(self, node):
             node = self.generic_visit(node)
             if (
                 isinstance(node.func, ast.Name)
@@ -300,12 +317,14 @@ def protect_fractional_powers(formula):
         return text
 
     class _FractionalPowerProtector(ast.NodeTransformer):
-        def visit_BinOp(self, node):  # noqa: N802 - ast API name
+        def visit_BinOp(self, node):
             node = self.generic_visit(node)
             if not isinstance(node.op, ast.Pow):
                 return node
             exponent = None
-            if isinstance(node.right, ast.Constant) and isinstance(node.right.value, (int, float)):
+            if isinstance(node.right, ast.Constant) and isinstance(
+                node.right.value, (int, float)
+            ):
                 exponent = float(node.right.value)
             elif (
                 isinstance(node.right, ast.UnaryOp)
@@ -339,7 +358,9 @@ def _extract_power_exponent(node):
     """Return float exponent if *node* is a numeric power, else None."""
     if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.Pow):
         return None
-    if isinstance(node.right, ast.Constant) and isinstance(node.right.value, (int, float)):
+    if isinstance(node.right, ast.Constant) and isinstance(
+        node.right.value, (int, float)
+    ):
         return float(node.right.value)
     if (
         isinstance(node.right, ast.UnaryOp)
@@ -365,7 +386,7 @@ def round_powers_to_integers(formula, *, max_power=8, tol=0.25):
     tol = float(tol)
 
     class _IntegerPowerRounder(ast.NodeTransformer):
-        def visit_BinOp(self, node):  # noqa: N802
+        def visit_BinOp(self, node):
             node = self.generic_visit(node)
             exponent = _extract_power_exponent(node)
             if exponent is None:
@@ -376,7 +397,9 @@ def round_powers_to_integers(formula, *, max_power=8, tol=0.25):
             if abs(exponent - nearest) > tol and abs(exponent - nearest) > 1e-10:
                 return node
             return ast.copy_location(
-                ast.BinOp(left=node.left, op=ast.Pow(), right=ast.Constant(value=nearest)),
+                ast.BinOp(
+                    left=node.left, op=ast.Pow(), right=ast.Constant(value=nearest)
+                ),
                 node,
             )
 
@@ -480,9 +503,19 @@ def run_exactness_pass(
         except Exception:
             return float("inf")
 
-    base_display = float(display_mse) if display_mse is not None and np.isfinite(display_mse) else _mse(text)
-    base_raw = float(raw_mse) if raw_mse is not None and np.isfinite(raw_mse) else base_display
-    baseline = min(base_display, base_raw) if np.isfinite(base_display) or np.isfinite(base_raw) else float("inf")
+    base_display = (
+        float(display_mse)
+        if display_mse is not None and np.isfinite(display_mse)
+        else _mse(text)
+    )
+    base_raw = (
+        float(raw_mse) if raw_mse is not None and np.isfinite(raw_mse) else base_display
+    )
+    baseline = (
+        min(base_display, base_raw)
+        if np.isfinite(base_display) or np.isfinite(base_raw)
+        else float("inf")
+    )
     diagnostics["baseline_mse"] = float(baseline) if np.isfinite(baseline) else None
 
     # Eligibility: strong raw fit but display not exact, or large raw↔display
@@ -542,7 +575,6 @@ def simplify_formula_native(formula, int_tol=0.05, zero_tol=1e-3):
         _core = get_cpp_core()
 
         if _core is None:
-
             raise ImportError("C++ _core unavailable")
 
         if hasattr(_core, "simplify_formula"):
@@ -590,12 +622,22 @@ def postprocess_formula(
 
     try:
         try:
-            from simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+            from simplify_formula import (
+                SnapConfig,
+                simplify_onn_formula,
+                snap_formula_floats,
+            )
         except ImportError:
-            from scripts.simplify_formula import simplify_onn_formula, SnapConfig, snap_formula_floats
+            from scripts.simplify_formula import (
+                SnapConfig,
+                simplify_onn_formula,
+                snap_formula_floats,
+            )
 
         formula_len = len(normalized)
-        term_estimate = max(1, len([t for t in re.split(r"\s*[+-]\s*", normalized) if t.strip()]))
+        term_estimate = max(
+            1, len([t for t in re.split(r"\s*[+-]\s*", normalized) if t.strip()])
+        )
         nonlinear_families = sum(
             1
             for pattern in (
@@ -614,7 +656,9 @@ def postprocess_formula(
             or term_estimate > 24
             or (term_estimate > 10 and nonlinear_families >= 3)
         )
-        sympy_unsafe = helper_unsafe or "Piecewise(" in normalized or "Eq(" in normalized
+        sympy_unsafe = (
+            helper_unsafe or "Piecewise(" in normalized or "Eq(" in normalized
+        )
 
         if too_complex_for_symbolic or sympy_unsafe:
             snapped = snap_formula_floats(
@@ -630,8 +674,12 @@ def postprocess_formula(
 
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=SymPyDeprecationWarning)
-            warnings.filterwarnings("ignore", category=DeprecationWarning, module=r"sympy\..*")
-            warnings.filterwarnings("ignore", message=r"\s*Using non-Expr arguments in Mul.*")
+            warnings.filterwarnings(
+                "ignore", category=DeprecationWarning, module=r"sympy\..*"
+            )
+            warnings.filterwarnings(
+                "ignore", message=r"\s*Using non-Expr arguments in Mul.*"
+            )
             _, simplified_expr = simplify_onn_formula(
                 normalized,
                 int_tol=evo_int_tol,
@@ -711,7 +759,9 @@ def evaluate_formula(formula_str, X, *, return_diagnostics=False):
         power_val = float(power)
         with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
             if power_val < 0:
-                return np.sign(base_arr) / ((np.abs(base_arr) + 1e-12) ** abs(power_val))
+                return np.sign(base_arr) / (
+                    (np.abs(base_arr) + 1e-12) ** abs(power_val)
+                )
             return np.sign(base_arr) * (np.abs(base_arr) ** power_val)
 
     def _safe_exp(x):
@@ -741,6 +791,7 @@ def evaluate_formula(formula_str, X, *, return_diagnostics=False):
         with np.errstate(divide="raise", invalid="raise", over="raise", under="ignore"):
             # R-02: gate the eval with the AST allowlist before it runs.
             from glassbox.sr.formula_safety import validate_formula_expr
+
             validate_formula_expr(formula, context.keys())
             y_pred = eval(formula, {"__builtins__": None}, context)
         if isinstance(y_pred, (int, float)):
@@ -831,7 +882,11 @@ def formula_complexity_score(formula) -> int:
     if not text:
         return 0
     operator_count = sum(text.count(op) for op in ("+", "-", "*", "/", "**", "^"))
-    function_count = len(re.findall(r"\b(?:sin|cos|exp|log|sqrt|abs|Abs|_signed_power|Piecewise)\s*\(", text))
+    function_count = len(
+        re.findall(
+            r"\b(?:sin|cos|exp|log|sqrt|abs|Abs|_signed_power|Piecewise)\s*\(", text
+        )
+    )
     protected_power_count = text.count("_signed_power")
     return max(1, operator_count + 2 * function_count + protected_power_count + 1)
 
@@ -882,16 +937,23 @@ def score_display_candidate(
 
     original_formula = str(formula or "")
     if postprocess:
-        display_formula, guard = postprocess_formula_with_fidelity_guard(original_formula, X_arr, y_arr)
+        display_formula, guard = postprocess_formula_with_fidelity_guard(
+            original_formula, X_arr, y_arr
+        )
     else:
-        display_formula, guard = original_formula, {
-            "postprocess_guard_triggered": False,
-            "postprocess_raw_mse": evaluate_formula_mse_on_X(original_formula, X_arr, y_arr),
-            "postprocess_processed_mse": None,
-            "postprocess_fallback_mse": None,
-            "postprocess_guard_reason": None,
-            "postprocess_processed_eval_diagnostics": None,
-        }
+        display_formula, guard = (
+            original_formula,
+            {
+                "postprocess_guard_triggered": False,
+                "postprocess_raw_mse": evaluate_formula_mse_on_X(
+                    original_formula, X_arr, y_arr
+                ),
+                "postprocess_processed_mse": None,
+                "postprocess_fallback_mse": None,
+                "postprocess_guard_reason": None,
+                "postprocess_processed_eval_diagnostics": None,
+            },
+        )
 
     display_mse = evaluate_formula_mse_on_X(display_formula, X_arr, y_arr)
     raw_val = None
@@ -906,11 +968,28 @@ def score_display_candidate(
             raw_val = candidate_f
             break
 
-    comp = formula_complexity_score(display_formula) if complexity is None else int(complexity)
-    terms = int(n_terms) if n_terms is not None else max(1, len([t for t in re.split(r"\s*[+-]\s*", str(display_formula)) if t.strip()]))
+    comp = (
+        formula_complexity_score(display_formula)
+        if complexity is None
+        else int(complexity)
+    )
+    terms = (
+        int(n_terms)
+        if n_terms is not None
+        else max(
+            1,
+            len(
+                [t for t in re.split(r"\s*[+-]\s*", str(display_formula)) if t.strip()]
+            ),
+        )
+    )
     risk = formula_family_risk_score(display_formula, complexity=comp)
 
-    base = display_mse if display_mse is not None and math.isfinite(display_mse) else float("inf")
+    base = (
+        display_mse
+        if display_mse is not None and math.isfinite(display_mse)
+        else float("inf")
+    )
     holdout_gap = 0.0
     holdout_val = None
     if holdout_mse is not None:
@@ -918,7 +997,11 @@ def score_display_candidate(
             holdout_val = float(holdout_mse)
         except (TypeError, ValueError):
             holdout_val = None
-        if holdout_val is not None and math.isfinite(holdout_val) and math.isfinite(base):
+        if (
+            holdout_val is not None
+            and math.isfinite(holdout_val)
+            and math.isfinite(base)
+        ):
             holdout_gap = max(0.0, holdout_val - base)
 
     drift_rel = None
@@ -930,7 +1013,9 @@ def score_display_candidate(
     residual_penalty = 0.0
     residual_suspicious = False
     if isinstance(residual_diagnostics, dict):
-        residual_suspicious = bool(residual_diagnostics.get("residual_suspicious", False))
+        residual_suspicious = bool(
+            residual_diagnostics.get("residual_suspicious", False)
+        )
         if residual_suspicious and math.isfinite(base):
             residual_penalty = 0.05 * max(base, 1e-12)
 
@@ -973,10 +1058,14 @@ def postprocess_formula_with_fidelity_guard(
     absolute_slack=1e-9,
 ):
     """Postprocess a formula, but keep the original if cleanup worsens benchmark fit."""
-    processed = postprocess_formula(formula, fraction_tol=0.01, max_fraction_denominator=12)
+    processed = postprocess_formula(
+        formula, fraction_tol=0.01, max_fraction_denominator=12
+    )
     raw_mse = evaluate_formula_mse_on_X(formula, X, y)
     processed_mse = evaluate_formula_mse_on_X(processed, X, y)
-    fallback = protect_fractional_powers(normalize_formula_text(formula).replace("^", "**"))
+    fallback = protect_fractional_powers(
+        normalize_formula_text(formula).replace("^", "**")
+    )
     fallback_mse = evaluate_formula_mse_on_X(fallback, X, y)
 
     if processed_mse is None:
@@ -1004,7 +1093,9 @@ def postprocess_formula_with_fidelity_guard(
         }
 
     if raw_mse is not None:
-        allowed = raw_mse * (1.0 + max(0.0, float(relative_slack))) + max(0.0, float(absolute_slack))
+        allowed = raw_mse * (1.0 + max(0.0, float(relative_slack))) + max(
+            0.0, float(absolute_slack)
+        )
         if processed_mse > allowed:
             if fallback_mse is not None and fallback_mse <= processed_mse:
                 return fallback, {
@@ -1068,7 +1159,9 @@ def compute_stability_stats(values, *, higher_is_better=True):
     if arr.size >= 10:
         worst_count = max(1, int(np.ceil(arr.size * 0.1)))
         sorted_arr = np.sort(arr)
-        worst = sorted_arr[:worst_count] if higher_is_better else sorted_arr[-worst_count:]
+        worst = (
+            sorted_arr[:worst_count] if higher_is_better else sorted_arr[-worst_count:]
+        )
         worst_decile = float(np.mean(worst))
     else:
         worst_decile = float(np.min(arr) if higher_is_better else np.max(arr))
@@ -1102,7 +1195,9 @@ def classify_failure_taxonomy(true_formula, discovered_formula, r2, mse):
         if true_max >= 3 and disc_max < true_max:
             return "missing_high_order_terms"
 
-    if ("sin(" in true_f or "cos(" in true_f) and not ("sin(" in disc_f or "cos(" in disc_f):
+    if ("sin(" in true_f or "cos(" in true_f) and not (
+        "sin(" in disc_f or "cos(" in disc_f
+    ):
         return "periodic_structure_missing"
 
     if r2 is not None and r2 >= 0.8:
@@ -1142,7 +1237,9 @@ def summarize_time_to_discovery(
 
     return {
         "time_to_first_exact": (min(times_exact) if times_exact else None),
-        "time_to_first_acceptable": (min(times_acceptable) if times_acceptable else None),
+        "time_to_first_acceptable": (
+            min(times_acceptable) if times_acceptable else None
+        ),
     }
 
 
@@ -1161,8 +1258,16 @@ def summarize_seed_runs(seed_runs):
         }
 
     r2_vals = [run["r2"] for run in valid if np.isfinite(run["r2"])]
-    mse_vals = [run["mse"] for run in valid if run.get("mse") is not None and np.isfinite(run["mse"])]
-    time_vals = [run["time"] for run in valid if run.get("time") is not None and np.isfinite(run["time"])]
+    mse_vals = [
+        run["mse"]
+        for run in valid
+        if run.get("mse") is not None and np.isfinite(run["mse"])
+    ]
+    time_vals = [
+        run["time"]
+        for run in valid
+        if run.get("time") is not None and np.isfinite(run["time"])
+    ]
     exact_binary = [1.0 if run.get("exact_match") else 0.0 for run in valid]
 
     return {
@@ -1201,33 +1306,57 @@ def apply_run_budget(est_params, timeout_budget):
     budget = int(max(1, round(float(timeout_budget))))
     params["timeout"] = budget
     params["max_compute_budget"] = budget
-    params["min_compute_budget"] = min(int(params.get("min_compute_budget", 10) or 10), budget)
+    params["min_compute_budget"] = min(
+        int(params.get("min_compute_budget", 10) or 10), budget
+    )
     return params
 
 
 def specialist_metadata_from_estimator(estimator):
     """Extract specialist/composition/boosting diagnostics from a GlassboxRegressor."""
     diagnostics = getattr(estimator, "blackbox_diagnostics_", {}) or {}
-    candidate_screening = diagnostics.get("candidate_screening", {}) if isinstance(diagnostics, dict) else {}
+    candidate_screening = (
+        diagnostics.get("candidate_screening", {})
+        if isinstance(diagnostics, dict)
+        else {}
+    )
     return {
         "specialist_track": getattr(estimator, "specialist_track_", None),
         "has_composed_seeds": bool(getattr(estimator, "has_composed_seeds_", False)),
-        "composition_candidates_accepted": bool(getattr(estimator, "composition_candidates_accepted_", False)),
-        "composition_candidate_count": int(getattr(estimator, "composition_candidate_count_", 0) or 0),
-        "composition_seeded_evolution": bool(getattr(estimator, "composition_seeded_evolution_", False)),
-        "composition_won_final_selection": bool(getattr(estimator, "composition_won_final_selection_", False)),
-        "composition_improved_mse": bool(getattr(estimator, "composition_improved_mse_", False)),
+        "composition_candidates_accepted": bool(
+            getattr(estimator, "composition_candidates_accepted_", False)
+        ),
+        "composition_candidate_count": int(
+            getattr(estimator, "composition_candidate_count_", 0) or 0
+        ),
+        "composition_seeded_evolution": bool(
+            getattr(estimator, "composition_seeded_evolution_", False)
+        ),
+        "composition_won_final_selection": bool(
+            getattr(estimator, "composition_won_final_selection_", False)
+        ),
+        "composition_improved_mse": bool(
+            getattr(estimator, "composition_improved_mse_", False)
+        ),
         "boosting_attempted": bool(getattr(estimator, "boosting_attempted_", False)),
         "boosting_improved": bool(getattr(estimator, "boosting_improved_", False)),
         "boosting_stage_count": len(getattr(estimator, "boosting_stages_", []) or []),
         "boosting_diagnostics": getattr(estimator, "boosting_diagnostics_", None),
         "residual_stage_guard": getattr(estimator, "_residual_stage_guard_", None),
-        "final_formula_selection": getattr(estimator, "final_formula_selection_diagnostics_", None),
+        "final_formula_selection": getattr(
+            estimator, "final_formula_selection_diagnostics_", None
+        ),
         "phase_timings": dict(getattr(estimator, "phase_timings_", {}) or {}),
-        "exact_match_diagnostics": getattr(estimator, "fast_path_exact_match_diagnostics_", None),
+        "exact_match_diagnostics": getattr(
+            estimator, "fast_path_exact_match_diagnostics_", None
+        ),
         "formula_eval_count": int(getattr(estimator, "formula_eval_count_", 0) or 0),
-        "formula_eval_cache_hits": int(getattr(estimator, "formula_eval_cache_hits_", 0) or 0),
-        "formula_eval_cache_size": len(getattr(estimator, "_formula_eval_cache_", {}) or {}),
+        "formula_eval_cache_hits": int(
+            getattr(estimator, "formula_eval_cache_hits_", 0) or 0
+        ),
+        "formula_eval_cache_size": len(
+            getattr(estimator, "_formula_eval_cache_", {}) or {}
+        ),
         "specialist_vault": (
             getattr(estimator, "specialist_vault_", None).to_dict()
             if getattr(estimator, "specialist_vault_", None) is not None

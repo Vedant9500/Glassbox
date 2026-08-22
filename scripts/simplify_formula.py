@@ -11,13 +11,13 @@ Example:
 
 from __future__ import annotations
 
-import ast
 import argparse
+import ast
 import math
 import re
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Callable, Dict, Iterable, Optional, Set
 
 import sympy as sp
 from sympy.parsing.sympy_parser import (
@@ -70,8 +70,7 @@ def _normalize_formula_syntax(formula: str) -> str:
 
     # Normalize common unicode/operator glyphs emitted by pretty-printing.
     normalized = (
-        normalized
-        .replace("·", "*")
+        normalized.replace("·", "*")
         .replace("⋅", "*")
         .replace("•", "*")
         .replace("×", "*")
@@ -102,7 +101,9 @@ def _normalize_formula_syntax(formula: str) -> str:
         "log₂(e)": "(log(E, 2))",
         "log₁₀(e)": "(log(E, 10))",
     }
-    for src, dst in sorted(constant_replacements.items(), key=lambda kv: len(kv[0]), reverse=True):
+    for src, dst in sorted(
+        constant_replacements.items(), key=lambda kv: len(kv[0]), reverse=True
+    ):
         normalized = normalized.replace(src, dst)
 
     # Replace remaining pi glyphs and ln alias.
@@ -138,8 +139,14 @@ def _snap_float(value: float, cfg: SnapConfig) -> float | int:
     if math.isclose(value, nearest_int, rel_tol=0.0, abs_tol=cfg.int_tol + 1e-12):
         return int(nearest_int)
 
-    if cfg.fraction_tol > 0.0 and math.isfinite(value) and cfg.max_fraction_denominator >= 2:
-        nearest_fraction = Fraction(value).limit_denominator(cfg.max_fraction_denominator)
+    if (
+        cfg.fraction_tol > 0.0
+        and math.isfinite(value)
+        and cfg.max_fraction_denominator >= 2
+    ):
+        nearest_fraction = Fraction(value).limit_denominator(
+            cfg.max_fraction_denominator
+        )
         if nearest_fraction.denominator > 1 and math.isclose(
             value,
             float(nearest_fraction),
@@ -220,12 +227,18 @@ def snap_formula_floats(raw_formula: str, cfg: SnapConfig) -> str:
             replacements = {}
             for atom in expr.atoms(sp.Float):
                 snapped = _snap_float(float(atom), cfg)
-                replacements[atom] = sp.Integer(snapped) if isinstance(snapped, int) else sp.Float(snapped)
+                replacements[atom] = (
+                    sp.Integer(snapped)
+                    if isinstance(snapped, int)
+                    else sp.Float(snapped)
+                )
             if replacements:
                 expr = expr.xreplace(replacements)
             return str(expr)
         except Exception as exc:
-            raise ValueError(f"Invalid formula syntax for AST parsing: {raw_formula}") from exc
+            raise ValueError(
+                f"Invalid formula syntax for AST parsing: {raw_formula}"
+            ) from exc
 
     transformed = FloatSnapTransformer(cfg).visit(parsed)
     ast.fix_missing_locations(transformed)
@@ -234,7 +247,7 @@ def snap_formula_floats(raw_formula: str, cfg: SnapConfig) -> str:
     return ast.unparse(transformed)
 
 
-def _discover_symbols(expr_text: str) -> Set[str]:
+def _discover_symbols(expr_text: str) -> set[str]:
     """Infer variable names in the expression (excluding known function names)."""
     tokens = set(re.findall(r"\b[A-Za-z_]\w*\b", expr_text))
     reserved = {
@@ -260,9 +273,9 @@ def _discover_symbols(expr_text: str) -> Set[str]:
     return {name for name in tokens if name not in reserved}
 
 
-def _build_local_dict(expr_text: str) -> Dict[str, object]:
+def _build_local_dict(expr_text: str) -> dict[str, object]:
     """Build a parse dictionary with symbols and allowed math functions."""
-    locals_dict: Dict[str, object] = {
+    locals_dict: dict[str, object] = {
         "sin": sp.sin,
         "cos": sp.cos,
         "tan": sp.tan,
@@ -309,7 +322,7 @@ def _expr_score(expr: sp.Expr) -> tuple[int, int]:
 def _safe_expr_transform(
     transform: Callable[[sp.Expr], sp.Expr],
     expr: sp.Expr,
-) -> Optional[sp.Expr]:
+) -> sp.Expr | None:
     """Run a symbolic transform and safely return None on failure."""
     try:
         candidate = transform(expr)
@@ -328,7 +341,7 @@ def _safe_expr_transform(
 def _dedupe_exprs(candidates: Iterable[sp.Expr]) -> list[sp.Expr]:
     """Deduplicate symbolic candidates while preserving order."""
     unique: list[sp.Expr] = []
-    seen: Set[str] = set()
+    seen: set[str] = set()
     for candidate in candidates:
         key = _expr_key(candidate)
         if key in seen:
@@ -343,7 +356,9 @@ def _nsimplify_with_constants(expr: sp.Expr) -> sp.Expr:
     return sp.nsimplify(expr, constants=_NSIMPLIFY_CONSTANTS, rational=True)
 
 
-def _iter_simplification_candidates(expr: sp.Expr, cfg: SimplifyPassConfig) -> list[sp.Expr]:
+def _iter_simplification_candidates(
+    expr: sp.Expr, cfg: SimplifyPassConfig
+) -> list[sp.Expr]:
     """Generate candidate expressions for a single simplification pass."""
     transforms: list[Callable[[sp.Expr], sp.Expr]] = [
         sp.simplify,
@@ -390,7 +405,7 @@ def _run_exact_multi_pass(expr: sp.Expr, cfg: SimplifyPassConfig) -> sp.Expr:
     return current
 
 
-def _extract_numeric_linear_frequency(arg: sp.Expr, symbol: sp.Symbol) -> Optional[float]:
+def _extract_numeric_linear_frequency(arg: sp.Expr, symbol: sp.Symbol) -> float | None:
     """Extract |d(arg)/d(symbol)| when arg is linear in symbol, else None."""
     try:
         if not sp.diff(arg, symbol, 2).equals(0):
@@ -408,7 +423,9 @@ def _extract_numeric_linear_frequency(arg: sp.Expr, symbol: sp.Symbol) -> Option
         return None
 
 
-def _extract_trig_term_signature(term: sp.Expr, symbol: sp.Symbol) -> Optional[tuple[float, float]]:
+def _extract_trig_term_signature(
+    term: sp.Expr, symbol: sp.Symbol
+) -> tuple[float, float] | None:
     """Extract (amplitude, frequency) from coeff*sin(a*x+b) or coeff*cos(a*x+b)."""
     coeff, remainder = term.as_coeff_Mul()
     if remainder.func not in (sp.sin, sp.cos):
@@ -444,8 +461,8 @@ def _collapse_dominant_trig_mode(expr: sp.Expr, cfg: SimplifyPassConfig) -> sp.E
     symbol = symbols[0]
     terms = list(sp.Add.make_args(sp.expand(expr)))
 
-    grouped_terms: Dict[float, list[sp.Expr]] = {}
-    grouped_weight: Dict[float, float] = {}
+    grouped_terms: dict[float, list[sp.Expr]] = {}
+    grouped_weight: dict[float, float] = {}
     non_trig_terms: list[sp.Expr] = []
 
     for term in terms:
@@ -457,7 +474,9 @@ def _collapse_dominant_trig_mode(expr: sp.Expr, cfg: SimplifyPassConfig) -> sp.E
         amplitude, frequency = signature
         frequency_key = round(frequency, 4)
         grouped_terms.setdefault(frequency_key, []).append(term)
-        grouped_weight[frequency_key] = grouped_weight.get(frequency_key, 0.0) + amplitude
+        grouped_weight[frequency_key] = (
+            grouped_weight.get(frequency_key, 0.0) + amplitude
+        )
 
     if not grouped_weight:
         return expr
@@ -626,7 +645,9 @@ def main() -> None:
     )
 
     args = parser.parse_args()
-    raw_formula = args.formula if args.formula is not None else input("Raw formula: ").strip()
+    raw_formula = (
+        args.formula if args.formula is not None else input("Raw formula: ").strip()
+    )
 
     if not raw_formula:
         raise ValueError("Formula cannot be empty.")

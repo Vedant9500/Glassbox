@@ -7,9 +7,9 @@ from scripts import classifier_fast_path as cfp
 
 def _basis_data():
     x = np.linspace(-2.0, 2.0, 96, dtype=np.float64)
-    basis = np.column_stack([np.ones_like(x), x, x ** 2, np.sin(x)])
+    basis = np.column_stack([np.ones_like(x), x, x**2, np.sin(x)])
     names = ["1", "x", "x^2", "sin(x)"]
-    y = 2.0 * x - 1.5 * x ** 2
+    y = 2.0 * x - 1.5 * x**2
     return basis, names, y
 
 
@@ -78,7 +78,7 @@ def test_exact_match_uses_bounded_fallback_after_large_combination_skip():
     x = np.linspace(-1.0, 1.0, 64, dtype=np.float64)
     basis = np.column_stack([x ** (i % 7 + 1) + 0.001 * i for i in range(110)])
     names = [f"b{i}" for i in range(basis.shape[1])]
-    y = x + x ** 2
+    y = x + x**2
     diagnostics = {}
 
     result = cfp.find_exact_symbolic_match(

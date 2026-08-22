@@ -36,7 +36,9 @@ def test_postprocess_formula_fidelity_guard_rejects_worse_cleanup():
     assert processed != guarded
     assert diagnostics["postprocess_guard_triggered"] is True
     assert diagnostics["postprocess_guard_reason"] == "processed_formula_worse"
-    assert bc.evaluate_formula_mse_on_X(guarded, X, y) < bc.evaluate_formula_mse_on_X(processed, X, y)
+    assert bc.evaluate_formula_mse_on_X(guarded, X, y) < bc.evaluate_formula_mse_on_X(
+        processed, X, y
+    )
 
 
 def test_postprocess_formula_fidelity_guard_accepts_better_fraction_snap():
@@ -167,15 +169,22 @@ def test_postprocess_formula_guard_rejects_domain_unsafe_raw_eval_failure():
     X = np.linspace(-2.0, -0.1, 80).reshape(-1, 1)
     y = X[:, 0]
 
-    guarded, diagnostics = bc.postprocess_formula_with_fidelity_guard("exp(log(x))", X, y)
+    guarded, diagnostics = bc.postprocess_formula_with_fidelity_guard(
+        "exp(log(x))", X, y
+    )
 
     assert guarded.replace(" ", "") == "exp(log(x))"
     assert diagnostics["postprocess_guard_triggered"] is True
-    assert diagnostics["postprocess_guard_reason"] == "raw_formula_eval_failed_after_rewrite"
+    assert (
+        diagnostics["postprocess_guard_reason"]
+        == "raw_formula_eval_failed_after_rewrite"
+    )
 
 
 def test_evaluate_formula_accepts_1d_and_list_inputs():
-    y_pred, diagnostics = bc.evaluate_formula("x + 1", [1, 2, 3], return_diagnostics=True)
+    y_pred, diagnostics = bc.evaluate_formula(
+        "x + 1", [1, 2, 3], return_diagnostics=True
+    )
 
     assert diagnostics["ok"] is True
     assert np.allclose(y_pred, [2, 3, 4])
@@ -183,7 +192,12 @@ def test_evaluate_formula_accepts_1d_and_list_inputs():
 
 def test_compute_stability_stats_worst_decile_respects_metric_direction():
     assert bc.compute_stability_stats([0.1, 0.5, 0.9])["worst_decile"] == 0.1
-    assert bc.compute_stability_stats([0.001, 0.1, 10.0], higher_is_better=False)["worst_decile"] == 10.0
+    assert (
+        bc.compute_stability_stats([0.001, 0.1, 10.0], higher_is_better=False)[
+            "worst_decile"
+        ]
+        == 10.0
+    )
 
 
 def test_evaluate_formula_protects_log_abs_zero_endpoint():

@@ -7,9 +7,8 @@ the same forward pass in both paths.
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-
+from torch import nn
 
 CURVE_CLASSIFIER_ARCHITECTURE_VERSION = "curve-classifier-shared-v1"
 
@@ -26,28 +25,34 @@ class CurveClassifierMLP(nn.Module):
         layers = []
         combined_dim = n_features + eql_out_dim
 
-        layers.extend([
-            nn.Linear(combined_dim, hidden),
-            nn.BatchNorm1d(hidden),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-        ])
-
-        for _ in range(6):
-            layers.extend([
-                nn.Linear(hidden, hidden),
+        layers.extend(
+            [
+                nn.Linear(combined_dim, hidden),
                 nn.BatchNorm1d(hidden),
                 nn.ReLU(),
                 nn.Dropout(0.2),
-            ])
+            ]
+        )
 
-        layers.extend([
-            nn.Linear(hidden, hidden // 2),
-            nn.BatchNorm1d(hidden // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden // 2, n_classes),
-        ])
+        for _ in range(6):
+            layers.extend(
+                [
+                    nn.Linear(hidden, hidden),
+                    nn.BatchNorm1d(hidden),
+                    nn.ReLU(),
+                    nn.Dropout(0.2),
+                ]
+            )
+
+        layers.extend(
+            [
+                nn.Linear(hidden, hidden // 2),
+                nn.BatchNorm1d(hidden // 2),
+                nn.ReLU(),
+                nn.Dropout(0.1),
+                nn.Linear(hidden // 2, n_classes),
+            ]
+        )
 
         self.net = nn.Sequential(*layers)
         self._init_weights()
@@ -109,8 +114,8 @@ class CurveClassifierCNN(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def forward(self, x):
-        raw_curve = x[:, :self.curve_dim]
-        other_features = x[:, self.curve_dim:]
+        raw_curve = x[:, : self.curve_dim]
+        other_features = x[:, self.curve_dim :]
 
         raw_curve = raw_curve.unsqueeze(1)
         conv_out = self.conv(raw_curve).flatten(1)
@@ -137,9 +142,13 @@ class SemanticFeatureAttention(nn.Module):
 
         self.n_tokens = 8
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.token_type_embed = nn.Parameter(torch.randn(1, self.n_tokens, embed_dim) * 0.02)
+        self.token_type_embed = nn.Parameter(
+            torch.randn(1, self.n_tokens, embed_dim) * 0.02
+        )
 
-        self.attention = nn.MultiheadAttention(embed_dim=embed_dim, num_heads=4, batch_first=True)
+        self.attention = nn.MultiheadAttention(
+            embed_dim=embed_dim, num_heads=4, batch_first=True
+        )
         self.norm1 = nn.LayerNorm(embed_dim)
         self.norm2 = nn.LayerNorm(embed_dim)
         self.ffn = nn.Sequential(
@@ -175,16 +184,19 @@ class SemanticFeatureAttention(nn.Module):
         else:
             invars = torch.zeros(b, 32, device=x.device, dtype=x.dtype)
 
-        tokens = torch.cat([
-            self.cls_token.expand(b, -1, -1),
-            self.proj_raw(raw).unsqueeze(1),
-            self.proj_fft(fft).unsqueeze(1),
-            self.proj_fft_phase(fft_phase).unsqueeze(1),
-            self.proj_deriv(deriv).unsqueeze(1),
-            self.proj_stats(stats).unsqueeze(1),
-            self.proj_curv(curv).unsqueeze(1),
-            self.proj_invars(invars).unsqueeze(1),
-        ], dim=1)
+        tokens = torch.cat(
+            [
+                self.cls_token.expand(b, -1, -1),
+                self.proj_raw(raw).unsqueeze(1),
+                self.proj_fft(fft).unsqueeze(1),
+                self.proj_fft_phase(fft_phase).unsqueeze(1),
+                self.proj_deriv(deriv).unsqueeze(1),
+                self.proj_stats(stats).unsqueeze(1),
+                self.proj_curv(curv).unsqueeze(1),
+                self.proj_invars(invars).unsqueeze(1),
+            ],
+            dim=1,
+        )
 
         tokens = self.dropout(tokens + self.token_type_embed)
         attn_out, _ = self.attention(tokens, tokens, tokens)
@@ -214,7 +226,11 @@ class EQLLayer(nn.Module):
         out = []
         start_idx = 0
         for i in range(self.n_funcs):
-            end_idx = start_idx + self.features_per_func + (self.rem_features if i == 0 else 0)
+            end_idx = (
+                start_idx
+                + self.features_per_func
+                + (self.rem_features if i == 0 else 0)
+            )
             chunk = z[:, start_idx:end_idx]
 
             if i == 0:
@@ -286,9 +302,9 @@ class CurveClassifierGLU(nn.Module):
 
 __all__ = [
     "CURVE_CLASSIFIER_ARCHITECTURE_VERSION",
-    "CurveClassifierMLP",
     "CurveClassifierCNN",
-    "SemanticFeatureAttention",
-    "EQLLayer",
     "CurveClassifierGLU",
+    "CurveClassifierMLP",
+    "EQLLayer",
+    "SemanticFeatureAttention",
 ]

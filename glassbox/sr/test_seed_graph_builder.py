@@ -1,4 +1,5 @@
 """Tests for formula → C++ seed graph conversion."""
+
 import pytest
 
 from glassbox.sr.cpp import CPP_AVAILABLE, get_cpp_core
@@ -92,7 +93,8 @@ def test_sin_node_uses_input_child() -> None:
     graph = formula_to_seed_graph("sin(x)")
     assert graph is not None
     sin_nodes = [
-        n for n in graph["nodes"]
+        n
+        for n in graph["nodes"]
         if n.get("type") == 2 and n.get("unary_op") == UNARY_PERIODIC
     ]
     assert sin_nodes
@@ -113,9 +115,14 @@ def test_signal_seed_discovery_prefers_module_forms() -> None:
 
     x = np.linspace(-2, 2, 128)
     y = (x**2) * np.sin(x)
-    formulas = discover_seed_formulas_from_signal(x, y, detected_omegas=[1.0], max_seeds=8)
+    formulas = discover_seed_formulas_from_signal(
+        x, y, detected_omegas=[1.0], max_seeds=8
+    )
     assert formulas
-    assert any("x^2*sin" in f.replace(" ", "") or "x**2*sin" in f.replace(" ", "") for f in formulas)
+    assert any(
+        "x^2*sin" in f.replace(" ", "") or "x**2*sin" in f.replace(" ", "")
+        for f in formulas
+    )
 
 
 def test_signal_seed_graphs_build() -> None:
@@ -134,7 +141,8 @@ def test_multivariate_formula_to_seed_graph_builds(monkeypatch):
     assert graph is not None
     assert graph["nodes"]
     periodic_nodes = [
-        n for n in graph["nodes"]
+        n
+        for n in graph["nodes"]
         if n.get("type") == TYPE_UNARY and n.get("unary_op") == UNARY_PERIODIC
     ]
     assert periodic_nodes

@@ -1,4 +1,5 @@
 """Phase 0 correctness: S1-1, S1-2, S1-3, N2, E1, E2."""
+
 import sys
 from pathlib import Path
 
@@ -90,9 +91,9 @@ def test_n2_clean_structures_low_diffuse_ratio():
     X = x.reshape(-1, 1)
 
     ratio_sin, _ = _estimate_diffuse_noise_ratio(X, np.sin(2 * np.pi * x))
-    ratio_exp, _ = _estimate_diffuse_noise_ratio(X, np.exp(-(x ** 2)))
-    ratio_rat, _ = _estimate_diffuse_noise_ratio(X, 1.0 / (1.0 + x ** 2))
-    ratio_poly, _ = _estimate_diffuse_noise_ratio(X, 0.5 * x ** 2 - 0.3 * x + 0.1)
+    ratio_exp, _ = _estimate_diffuse_noise_ratio(X, np.exp(-(x**2)))
+    ratio_rat, _ = _estimate_diffuse_noise_ratio(X, 1.0 / (1.0 + x**2))
+    ratio_poly, _ = _estimate_diffuse_noise_ratio(X, 0.5 * x**2 - 0.3 * x + 0.1)
 
     # Threshold used in fit is ~0.02 for auto-Huber.
     assert ratio_sin < 0.02, ratio_sin
@@ -101,7 +102,7 @@ def test_n2_clean_structures_low_diffuse_ratio():
     assert ratio_poly < 0.02, ratio_poly
 
     # Noisy poly should still look diffuse.
-    y_noisy = 0.5 * x ** 2 + 0.25 * rng.normal(size=x.shape[0])
+    y_noisy = 0.5 * x**2 + 0.25 * rng.normal(size=x.shape[0])
     ratio_noisy, _ = _estimate_diffuse_noise_ratio(X, y_noisy)
     assert ratio_noisy > 0.05, ratio_noisy
 
@@ -122,8 +123,12 @@ def test_e1_islands_diverge_under_fixed_seed():
         migration_interval=100,
     )
     r_multi = _core.run_evolution(X_list, y.astype(np.float64), num_islands=4, **common)
-    r_multi_b = _core.run_evolution(X_list, y.astype(np.float64), num_islands=4, **common)
-    r_single = _core.run_evolution(X_list, y.astype(np.float64), num_islands=1, **common)
+    r_multi_b = _core.run_evolution(
+        X_list, y.astype(np.float64), num_islands=4, **common
+    )
+    r_single = _core.run_evolution(
+        X_list, y.astype(np.float64), num_islands=1, **common
+    )
     # Deterministic under fixed seed
     assert r_multi.get("formula") == r_multi_b.get("formula")
     assert np.isfinite(float(r_multi.get("best_mse", np.nan)))

@@ -1,8 +1,7 @@
 """Tier C polish: API/docs, bindings, classifier fail-open, FPIP, import surface."""
-import inspect
+
 import sys
 from pathlib import Path
-from unittest import mock
 
 import numpy as np
 import pytest
@@ -11,12 +10,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from glassbox.sr.sklearn_wrapper import GlassboxRegressor, _validate_sample_weight
 from glassbox.sr.fpip_v2 import (
     build_fpip_v2_from_fast_path,
     validate_fpip_v2_payload,
 )
-
+from glassbox.sr.sklearn_wrapper import GlassboxRegressor, _validate_sample_weight
 
 # --- N8: sample_weight docstring / empty handling ---
 
@@ -112,7 +110,9 @@ def test_n9_multi_feature_blackbox_off_skips_auto_soft():
     est.fit(X, y)
     applied = getattr(est, "_blackbox_noise_robust_applied_", {}) or {}
     # Auto should not activate when multi-feature + blackbox off.
-    assert applied.get("active") is not True or applied.get("reason") != "soft_mad_weights"
+    assert (
+        applied.get("active") is not True or applied.get("reason") != "soft_mad_weights"
+    )
 
 
 # --- S10-1: FPIP validation on fast-path builder ---
@@ -143,14 +143,14 @@ def test_s10_1_invalid_payload_flagged():
 
 
 def test_s10_2_glassbox_regressor_exported():
-    import glassbox.sr as sr
+    from glassbox import sr
 
     assert hasattr(sr, "GlassboxRegressor")
     assert sr.GlassboxRegressor is GlassboxRegressor
 
 
 def test_s10_2_lazy_optimizer_import():
-    import glassbox.sr as sr
+    from glassbox import sr
 
     # Lazy attribute should resolve without eager import at package load.
     cls = sr.RegularizedBFGS
@@ -197,6 +197,7 @@ def test_s9_5_tiny_n_device_is_cpu():
 def test_s6_1_core_defaults_aligned():
     try:
         from glassbox.sr.cpp import get_cpp_core
+
         _core = get_cpp_core()
     except ImportError:
         pytest.skip("_core not built")
@@ -237,6 +238,7 @@ def test_s10_3_simplify_doc_mentions_cpp():
 
 def test_s10_4_bfgs_handles_nonfinite_gracefully():
     import torch
+
     from glassbox.sr.optimizers.bfgs_optimizer import RegularizedBFGS
 
     opt = RegularizedBFGS(max_iter=5)

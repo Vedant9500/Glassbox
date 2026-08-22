@@ -70,7 +70,8 @@ def main():
     # ------------------------------------------------------------------
     section("B) Phase 3 weighted C++ evolution (block outliers)")
     from glassbox.sr.cpp import require_cpp_core
-_core = require_cpp_core()
+
+    _core = require_cpp_core()
 
     x = np.linspace(-3, 3, 120)
     y_clean = 2.0 * x + 1.0

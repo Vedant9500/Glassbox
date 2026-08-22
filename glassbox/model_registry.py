@@ -1,8 +1,7 @@
 """Shared model artifact defaults and resolution helpers."""
 
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
-
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -16,7 +15,9 @@ PYTORCH_CLASSIFIER_FALLBACKS = (
 )
 
 
-def iter_curve_classifier_candidates(model_path: str = DEFAULT_CURVE_CLASSIFIER_PATH) -> Iterable[Path]:
+def iter_curve_classifier_candidates(
+    model_path: str = DEFAULT_CURVE_CLASSIFIER_PATH,
+) -> Iterable[Path]:
     """Yield classifier artifact candidates in canonical fallback order."""
     requested = Path(model_path)
     yield requested
@@ -37,7 +38,9 @@ def _existing_path(candidate: Path) -> Path | None:
     return None
 
 
-def resolve_curve_classifier_path(model_path: str = DEFAULT_CURVE_CLASSIFIER_PATH) -> Path:
+def resolve_curve_classifier_path(
+    model_path: str = DEFAULT_CURVE_CLASSIFIER_PATH,
+) -> Path:
     """Resolve a classifier checkpoint path with the shared fallback order."""
     for candidate in iter_curve_classifier_candidates(model_path):
         resolved = _existing_path(candidate)

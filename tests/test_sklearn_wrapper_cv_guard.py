@@ -3,8 +3,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 from glassbox.sr.blackbox_preprocessor import prepare_blackbox_search
+from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
 
 def test_cv_skip_guard_passes_for_stable_formula(monkeypatch):
@@ -69,7 +69,9 @@ def test_formula_cleanup_guard_rejects_worse_simplification(monkeypatch):
     est.n_features_in_ = 1
     est.blackbox_diagnostics_ = {}
 
-    monkeypatch.setattr(est, "_reduce_formula_noise", lambda formula, X_in, y_in: formula)
+    monkeypatch.setattr(
+        est, "_reduce_formula_noise", lambda formula, X_in, y_in: formula
+    )
     monkeypatch.setattr(est, "_simplify_formula", lambda formula: "0")
 
     cleaned = est._cleanup_formula_with_fidelity_guard("sin(x)", X, y, stage="unit")
@@ -88,7 +90,9 @@ def test_formula_cleanup_guard_accepts_equivalent_cleanup(monkeypatch):
     est.n_features_in_ = 1
     est.blackbox_diagnostics_ = {}
 
-    monkeypatch.setattr(est, "_reduce_formula_noise", lambda formula, X_in, y_in: formula)
+    monkeypatch.setattr(
+        est, "_reduce_formula_noise", lambda formula, X_in, y_in: formula
+    )
     monkeypatch.setattr(est, "_simplify_formula", lambda formula: "sin(x0)")
 
     cleaned = est._cleanup_formula_with_fidelity_guard("sin(x)", X, y, stage="unit")
@@ -103,18 +107,23 @@ def test_actionable_specialist_candidate_pool_is_retained_without_composition():
     est.early_stop_mse = 1e-12
     est.evolution_skip_r2 = 0.999
 
-    candidates = [{
-        "formula": "exp(-2*x0)",
-        "mse": 0.0,
-        "validation_mse": 0.0,
-        "validation_r2": 1.0,
-    }]
+    candidates = [
+        {
+            "formula": "exp(-2*x0)",
+            "mse": 0.0,
+            "validation_mse": 0.0,
+            "validation_r2": 1.0,
+        }
+    ]
 
-    assert est._candidate_pool_has_actionable_fit(
-        candidates,
-        incumbent_mse=0.1,
-        search_plan={"candidate_acceptance_r2": 0.985},
-    ) is True
+    assert (
+        est._candidate_pool_has_actionable_fit(
+            candidates,
+            incumbent_mse=0.1,
+            search_plan={"candidate_acceptance_r2": 0.985},
+        )
+        is True
+    )
 
 
 def test_universal_proposer_dual_path_handles_multivariate_input(monkeypatch):
@@ -137,7 +146,9 @@ def test_universal_proposer_dual_path_handles_multivariate_input(monkeypatch):
             "routing_signal": {"recommend_guided_evolution": False},
         }
 
-    monkeypatch.setattr(up, "load_universal_proposer_checkpoint", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        up, "load_universal_proposer_checkpoint", lambda *args, **kwargs: object()
+    )
     monkeypatch.setattr(up, "propose_fpip_v2_from_xy", fake_propose)
 
     est = GlassboxRegressor(
@@ -170,7 +181,9 @@ def test_universal_proposer_dual_path_handles_missing_checkpoint():
     )
     est._resolve_universal_proposer_path = lambda: "models/does_not_exist.pt"
 
-    payload, force = est._run_universal_proposer_dual_path(X, y, fast_path_result={"mse": 0.1})
+    payload, force = est._run_universal_proposer_dual_path(
+        X, y, fast_path_result={"mse": 0.1}
+    )
 
     assert payload is None
     assert force is False
@@ -227,7 +240,6 @@ def test_guided_evolution_receives_remaining_timeout(monkeypatch):
 
 
 def test_exact_fast_path_skips_specialist_phases(monkeypatch):
-    import glassbox.sr.sklearn_wrapper as sw
 
     def _fake_fast_path(*args, **kwargs):
         return {
@@ -263,7 +275,9 @@ def test_exact_fast_path_skips_specialist_phases(monkeypatch):
     def _fail_specialist(*args, **kwargs):
         raise AssertionError("specialist phases should not run after exact fast-path")
 
-    monkeypatch.setattr(est, "_build_univariate_specialist_candidate_formulas", _fail_specialist)
+    monkeypatch.setattr(
+        est, "_build_univariate_specialist_candidate_formulas", _fail_specialist
+    )
     monkeypatch.setattr(est, "_run_specialist_candidate_screening", _fail_specialist)
     monkeypatch.setattr(est, "_run_residual_boosting", _fail_specialist)
     monkeypatch.setattr(est, "_run_inception_reuse", _fail_specialist)
@@ -271,13 +285,14 @@ def test_exact_fast_path_skips_specialist_phases(monkeypatch):
     est.fit(X, y)
 
     assert est.fast_path_exact_skip_ is True
-    assert est.blackbox_diagnostics_.get("specialist_skipped_reason") == "fast_path_exact"
+    assert (
+        est.blackbox_diagnostics_.get("specialist_skipped_reason") == "fast_path_exact"
+    )
     assert est.best_mse_ < 1e-12
     assert est.get_formula()
 
 
 def test_exact_fast_path_skip_overrides_evolution_routing(monkeypatch):
-    import glassbox.sr.sklearn_wrapper as sw
 
     formula = "+".join(["x0"] * 12)
 
@@ -310,12 +325,16 @@ def test_exact_fast_path_skip_overrides_evolution_routing(monkeypatch):
         enable_inception_reuse=True,
         random_state=0,
     )
-    monkeypatch.setattr(est, "_run_universal_proposer_dual_path", lambda *args, **kwargs: (None, True))
+    monkeypatch.setattr(
+        est, "_run_universal_proposer_dual_path", lambda *args, **kwargs: (None, True)
+    )
 
     def _fail_specialist(*args, **kwargs):
         raise AssertionError("specialist phases should not run after exact fast-path")
 
-    monkeypatch.setattr(est, "_build_univariate_specialist_candidate_formulas", _fail_specialist)
+    monkeypatch.setattr(
+        est, "_build_univariate_specialist_candidate_formulas", _fail_specialist
+    )
     monkeypatch.setattr(est, "_run_specialist_candidate_screening", _fail_specialist)
     monkeypatch.setattr(est, "_run_residual_boosting", _fail_specialist)
     monkeypatch.setattr(est, "_run_inception_reuse", _fail_specialist)
@@ -341,19 +360,29 @@ def test_specialist_screening_skips_residual_when_candidate_is_exact(monkeypatch
     est.blackbox_diagnostics_ = {}
 
     def _screening(candidates, X_arg, y_arg, **kwargs):
-        return {"top_candidates": [{"formula": "cos(pi*x0)", "validation_mse": 0.0, "validation_r2": 1.0}]}
+        return {
+            "top_candidates": [
+                {"formula": "cos(pi*x0)", "validation_mse": 0.0, "validation_r2": 1.0}
+            ]
+        }
 
     def _compose(*args, **kwargs):
-        raise AssertionError("composition should not run when an exact candidate is already present")
+        raise AssertionError(
+            "composition should not run when an exact candidate is already present"
+        )
 
     def _residual(*args, **kwargs):
-        raise AssertionError("residual fit should not run when an exact candidate is already present")
+        raise AssertionError(
+            "residual fit should not run when an exact candidate is already present"
+        )
 
     monkeypatch.setattr(est, "_compute_specialist_screening_diagnostics", _screening)
     monkeypatch.setattr(est, "_compose_specialist_candidates", _compose)
     monkeypatch.setattr(est, "_stage_residual_symbolic_fit", _residual)
 
-    candidates = [{"formula": "cos(pi*x0)", "validation_mse": 0.0, "validation_r2": 1.0}]
+    candidates = [
+        {"formula": "cos(pi*x0)", "validation_mse": 0.0, "validation_r2": 1.0}
+    ]
     returned = est._run_specialist_candidate_screening(
         candidates,
         X,
@@ -515,7 +544,12 @@ def test_multivariate_blackbox_cpp_seeds_use_reduced_indices(monkeypatch):
             captured["generations"] = kwargs.get("generations")
             captured["acceptable_complexity"] = kwargs.get("acceptable_complexity")
             captured["early_stop_max_nodes"] = kwargs.get("early_stop_max_nodes")
-            return {"best_mse": 0.0, "formula": "x0*x1", "nodes": [], "output_weights": []}
+            return {
+                "best_mse": 0.0,
+                "formula": "x0*x1",
+                "nodes": [],
+                "output_weights": [],
+            }
 
         @staticmethod
         def reduce_formula_noise(formula, X_list, y):
@@ -530,7 +564,11 @@ def test_multivariate_blackbox_cpp_seeds_use_reduced_indices(monkeypatch):
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
     monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
-    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(run_fast_path=_fake_fast_path),
+    )
     # Keep evolution path live so seed_graphs / search-plan kwargs are exercised.
     monkeypatch.setattr(
         sw.GlassboxRegressor,
@@ -570,8 +608,14 @@ def test_multivariate_blackbox_cpp_seeds_use_reduced_indices(monkeypatch):
     assert est.blackbox_diagnostics_["search_plan"] == est.blackbox_search_plan_
     assert captured["pop_size"] >= est.population_size
     assert captured["generations"] >= est.generations
-    assert captured["acceptable_complexity"] == est.blackbox_search_plan_["acceptable_complexity"]
-    assert captured["early_stop_max_nodes"] == est.blackbox_search_plan_["early_stop_max_nodes"]
+    assert (
+        captured["acceptable_complexity"]
+        == est.blackbox_search_plan_["acceptable_complexity"]
+    )
+    assert (
+        captured["early_stop_max_nodes"]
+        == est.blackbox_search_plan_["early_stop_max_nodes"]
+    )
 
 
 def test_blackbox_refined_candidate_can_skip_cpp(monkeypatch):
@@ -602,7 +646,11 @@ def test_blackbox_refined_candidate_can_skip_cpp(monkeypatch):
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
     monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
-    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(run_fast_path=_fake_fast_path),
+    )
 
     rng = np.random.RandomState(17)
     X = rng.randn(120, 2)
@@ -651,7 +699,11 @@ def test_blackbox_basis_model_skips_cpp_on_additive_signal(monkeypatch):
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
     monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
-    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(run_fast_path=_fake_fast_path),
+    )
 
     rng = np.random.RandomState(23)
     X = rng.randn(140, 3)
@@ -705,7 +757,11 @@ def test_blackbox_demotes_unstable_fast_path_incumbent(monkeypatch):
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
     monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
-    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(run_fast_path=_fake_fast_path),
+    )
 
     rng = np.random.RandomState(61)
     X = rng.randn(160, 2)
@@ -747,7 +803,9 @@ def test_blackbox_candidate_screening_handles_none_validation_values():
     assert isinstance(hints, dict)
 
 
-def test_univariate_specialist_candidate_pool_preserves_decomposition_seeds(monkeypatch):
+def test_univariate_specialist_candidate_pool_preserves_decomposition_seeds(
+    monkeypatch,
+):
     x = np.linspace(-2.0, 2.0, 80)
     X = x.reshape(-1, 1)
     y = np.sin(x) * np.cos(x) + 0.25 * x
@@ -764,10 +822,20 @@ def test_univariate_specialist_candidate_pool_preserves_decomposition_seeds(monk
         "details": {},
     }
 
-    monkeypatch.setattr(est, "_targeted_specialist_probe_formulas", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        est, "_targeted_specialist_probe_formulas", lambda *args, **kwargs: []
+    )
     monkeypatch.setattr(est, "_build_blackbox_formula_pool", lambda *args, **kwargs: [])
-    monkeypatch.setattr(est, "_refine_candidate_formulas", lambda candidates, *args, **kwargs: candidates)
-    monkeypatch.setattr(est, "_prune_blackbox_candidate_formulas", lambda candidates, **kwargs: candidates)
+    monkeypatch.setattr(
+        est,
+        "_refine_candidate_formulas",
+        lambda candidates, *args, **kwargs: candidates,
+    )
+    monkeypatch.setattr(
+        est,
+        "_prune_blackbox_candidate_formulas",
+        lambda candidates, **kwargs: candidates,
+    )
 
     candidates = est._build_univariate_specialist_candidate_formulas(
         "x",
@@ -807,7 +875,12 @@ def test_blackbox_high_uncertainty_disables_universal_fast_path(monkeypatch):
     class _FakeCore:
         @staticmethod
         def run_evolution(**kwargs):
-            return {"best_mse": 10.0, "formula": "x0+x1", "nodes": [], "output_weights": []}
+            return {
+                "best_mse": 10.0,
+                "formula": "x0+x1",
+                "nodes": [],
+                "output_weights": [],
+            }
 
         @staticmethod
         def reduce_formula_noise(formula, X_list, y):
@@ -843,7 +916,11 @@ def test_blackbox_high_uncertainty_disables_universal_fast_path(monkeypatch):
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
     monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
-    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(run_fast_path=_fake_fast_path),
+    )
 
     rng = np.random.RandomState(73)
     X = rng.randn(120, 3)
@@ -976,9 +1053,11 @@ def test_blackbox_unary_policy_is_conservative_under_low_trust():
         interaction_terms=["x0*x1"],
     )
 
-    allowed_unary, multi_unary, allowed_binary, multi_binary = est._derive_blackbox_unary_policy(
-        state,
-        {"operators": {"periodic"}, "has_rational": False},
+    allowed_unary, multi_unary, allowed_binary, multi_binary = (
+        est._derive_blackbox_unary_policy(
+            state,
+            {"operators": {"periodic"}, "has_rational": False},
+        )
     )
 
     assert allowed_unary == []
@@ -1002,8 +1081,15 @@ def test_blackbox_cpp_receives_binary_priors(monkeypatch):
             captured["allowed_binary_ops"] = kwargs.get("allowed_binary_ops")
             captured["multi_allowed_unary_ops"] = kwargs.get("multi_allowed_unary_ops")
             captured["multi_binary_op_priors"] = kwargs.get("multi_binary_op_priors")
-            captured["multi_allowed_binary_ops"] = kwargs.get("multi_allowed_binary_ops")
-            return {"best_mse": 10.0, "formula": "x0+x1", "nodes": [], "output_weights": []}
+            captured["multi_allowed_binary_ops"] = kwargs.get(
+                "multi_allowed_binary_ops"
+            )
+            return {
+                "best_mse": 10.0,
+                "formula": "x0+x1",
+                "nodes": [],
+                "output_weights": [],
+            }
 
         @staticmethod
         def reduce_formula_noise(formula, X_list, y):
@@ -1032,9 +1118,21 @@ def test_blackbox_cpp_receives_binary_priors(monkeypatch):
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
     monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
-    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
-    monkeypatch.setattr(sw.GlassboxRegressor, "_refine_candidate_formulas", lambda self, *args, **kwargs: [])
-    monkeypatch.setattr(sw.GlassboxRegressor, "_fit_blackbox_basis_model", lambda self, *args, **kwargs: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(run_fast_path=_fake_fast_path),
+    )
+    monkeypatch.setattr(
+        sw.GlassboxRegressor,
+        "_refine_candidate_formulas",
+        lambda self, *args, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        sw.GlassboxRegressor,
+        "_fit_blackbox_basis_model",
+        lambda self, *args, **kwargs: None,
+    )
     monkeypatch.setattr(
         sw.GlassboxRegressor,
         "_fit_blackbox_engineered_basis_model",
@@ -1097,7 +1195,11 @@ def test_blackbox_candidate_screening_exports_interaction_operator_hints(monkeyp
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
     monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
-    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(run_fast_path=_fake_fast_path),
+    )
 
     rng = np.random.RandomState(41)
     X = rng.randn(150, 3)
@@ -1153,7 +1255,11 @@ def test_blackbox_candidate_screening_exports_specialist_pair_diagnostics(monkey
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
     monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
-    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(run_fast_path=_fake_fast_path),
+    )
 
     rng = np.random.RandomState(53)
     x = np.linspace(-3.0, 3.0, 160)
@@ -1208,7 +1314,11 @@ def test_blackbox_candidate_screening_can_disable_specialist_diagnostics(monkeyp
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
     monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
-    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(run_fast_path=_fake_fast_path),
+    )
 
     rng = np.random.RandomState(59)
     X = rng.randn(150, 3)
@@ -1256,7 +1366,11 @@ def test_blackbox_candidate_screening_can_accept_specialist_compositions(monkeyp
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
     monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
-    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(run_fast_path=_fake_fast_path),
+    )
 
     x = np.linspace(-3.0, 3.0, 180)
     X = np.column_stack([x, np.sin(2.0 * x), np.cos(2.0 * x)])
@@ -1306,7 +1420,11 @@ def test_blackbox_candidate_pool_can_skip_cpp_from_interaction_formula(monkeypat
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
     monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
-    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(run_fast_path=_fake_fast_path),
+    )
 
     rng = np.random.RandomState(43)
     X = rng.randn(180, 3)
@@ -1344,7 +1462,12 @@ def test_evolution_result_is_selected_via_direct_formula_evaluation(monkeypatch)
     class _FakeCore:
         @staticmethod
         def run_evolution(**kwargs):
-            return {"best_mse": 100.0, "formula": "x0+x1", "nodes": [], "output_weights": []}
+            return {
+                "best_mse": 100.0,
+                "formula": "x0+x1",
+                "nodes": [],
+                "output_weights": [],
+            }
 
         @staticmethod
         def reduce_formula_noise(formula, X_list, y):
@@ -1363,7 +1486,11 @@ def test_evolution_result_is_selected_via_direct_formula_evaluation(monkeypatch)
 
     monkeypatch.setattr(sw, "CPP_AVAILABLE", True)
     monkeypatch.setattr(sw, "get_cpp_core", lambda: _FakeCore)
-    monkeypatch.setitem(sys.modules, "classifier_fast_path", SimpleNamespace(run_fast_path=_fake_fast_path))
+    monkeypatch.setitem(
+        sys.modules,
+        "classifier_fast_path",
+        SimpleNamespace(run_fast_path=_fake_fast_path),
+    )
 
     rng = np.random.RandomState(31)
     X = rng.randn(80, 2)
@@ -1435,17 +1562,25 @@ def test_cleanup_guard_rejects_display_mse_regression(monkeypatch):
     est = GlassboxRegressor(random_state=61)
     est.blackbox_diagnostics_ = {}
 
-    monkeypatch.setattr(est, "_reduce_formula_noise", lambda formula, X_in, y_in: "display_bad")
+    monkeypatch.setattr(
+        est, "_reduce_formula_noise", lambda formula, X_in, y_in: "display_bad"
+    )
     monkeypatch.setattr(est, "_simplify_formula", lambda formula: formula)
     monkeypatch.setattr(
         est,
         "_formula_mse",
-        lambda formula, X_in, y_in, **kwargs: {"display_good": 1e-4, "display_bad": 1e-5}.get(formula, float("inf")),
+        lambda formula, X_in, y_in, **kwargs: {
+            "display_good": 1e-4,
+            "display_bad": 1e-5,
+        }.get(formula, float("inf")),
     )
     monkeypatch.setattr(
         est,
         "_display_formula_mse",
-        lambda formula, X_in, y_in, **kwargs: {"display_good": 1e-4, "display_bad": 1e-1}.get(formula, float("inf")),
+        lambda formula, X_in, y_in, **kwargs: {
+            "display_good": 1e-4,
+            "display_bad": 1e-1,
+        }.get(formula, float("inf")),
     )
 
     selected = est._cleanup_formula_with_fidelity_guard("display_good", X, y)
@@ -1464,15 +1599,23 @@ def test_final_formula_selection_prefers_display_score(monkeypatch):
     monkeypatch.setattr(
         est,
         "_formula_mse",
-        lambda formula, X_in, y_in, **kwargs: {"incumbent": 1e-4, "challenger": 1e-6}.get(formula, float("inf")),
+        lambda formula, X_in, y_in, **kwargs: {
+            "incumbent": 1e-4,
+            "challenger": 1e-6,
+        }.get(formula, float("inf")),
     )
     monkeypatch.setattr(
         est,
         "_display_formula_mse",
-        lambda formula, X_in, y_in, **kwargs: {"incumbent": 1e-4, "challenger": 1e-1}.get(formula, float("inf")),
+        lambda formula, X_in, y_in, **kwargs: {
+            "incumbent": 1e-4,
+            "challenger": 1e-1,
+        }.get(formula, float("inf")),
     )
 
-    formula, mse, source = est._select_final_formula("incumbent", 1e-4, "challenger", 1e-6, X, y)
+    formula, mse, source = est._select_final_formula(
+        "incumbent", 1e-4, "challenger", 1e-6, X, y
+    )
 
     assert formula == "incumbent"
     assert mse == 1e-4

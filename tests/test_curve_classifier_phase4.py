@@ -52,7 +52,10 @@ def test_proposer_multivariate_payload_exposes_heuristic_neural_contract():
     assert out["model_contract"]["neural_multivariate_support"] == "heuristic"
     assert out["model_contract"]["supports_trained_multivariate_neural_model"] is False
     assert out["search_plan"]["neural_multivariate_support"] == "heuristic"
-    assert out["search_plan"]["operator_prior_source"] == "one_dimensional_y_projection_features"
+    assert (
+        out["search_plan"]["operator_prior_source"]
+        == "one_dimensional_y_projection_features"
+    )
     assert payload["model_contract"] == out["model_contract"]
     assert payload["search_plan"]["model_contract"] == out["model_contract"]
 
@@ -67,4 +70,7 @@ def test_proposer_univariate_payload_exposes_canonical_neural_contract():
     assert out["supports_multivariate_formulas"] is False
     assert out["neural_feature_mode"] == UNIVERSAL_PROPOSER_UNIVARIATE_NEURAL_MODE
     assert out["model_contract"]["input_mode"] == "univariate"
-    assert out["search_plan"]["operator_prior_source"] == "canonicalized_univariate_xy_features"
+    assert (
+        out["search_plan"]["operator_prior_source"]
+        == "canonicalized_univariate_xy_features"
+    )

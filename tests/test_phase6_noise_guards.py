@@ -1,4 +1,5 @@
 """Phase 6: noise-aware cleanup, weighted Pareto, residual guards."""
+
 import sys
 from pathlib import Path
 
@@ -9,7 +10,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from glassbox.sr.sklearn_wrapper import GlassboxRegressor, _mad_scale, _weighted_mse
+from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
 cpp_dir = REPO_ROOT / "glassbox" / "sr" / "cpp"
 
@@ -47,7 +48,9 @@ def test_cleanup_records_reject_reason_and_slack(monkeypatch):
     est.n_features_in_ = 1
     est.blackbox_diagnostics_ = {}
 
-    monkeypatch.setattr(est, "_reduce_formula_noise", lambda formula, X_in, y_in: formula)
+    monkeypatch.setattr(
+        est, "_reduce_formula_noise", lambda formula, X_in, y_in: formula
+    )
     monkeypatch.setattr(est, "_simplify_formula", lambda formula: "0")
 
     cleaned = est._cleanup_formula_with_fidelity_guard("sin(x)", X, y, stage="unit")
@@ -99,7 +102,9 @@ def test_residual_stage_rejects_when_unweighted_worsens(monkeypatch):
     # Non-flat residual so residual stage does not early-exit.
     y = np.sin(x) + 0.3 * x
 
-    est = GlassboxRegressor(random_state=11, enable_residual_stage=True, use_guided_evolution=True)
+    est = GlassboxRegressor(
+        random_state=11, enable_residual_stage=True, use_guided_evolution=True
+    )
     est.n_features_in_ = 1
     est.blackbox_diagnostics_ = {}
 
@@ -107,13 +112,21 @@ def test_residual_stage_rejects_when_unweighted_worsens(monkeypatch):
     monkeypatch.setattr(
         est,
         "_build_residual_mini_search_candidates",
-        lambda *a, **k: [{"formula": "100*sin(20*x0)", "source": "noise", "complexity": 6}],
+        lambda *a, **k: [
+            {"formula": "100*sin(20*x0)", "source": "noise", "complexity": 6}
+        ],
     )
     monkeypatch.setattr(
         est,
         "_refine_candidate_formulas",
         lambda pool, X_in, y_in, max_candidates=6: [
-            {"formula": "100*sin(20*x0)", "source": "noise", "complexity": 6, "risk_score": 0.8, "validation_r2": 0.1}
+            {
+                "formula": "100*sin(20*x0)",
+                "source": "noise",
+                "complexity": 6,
+                "risk_score": 0.8,
+                "validation_r2": 0.1,
+            }
         ],
     )
 
@@ -121,7 +134,10 @@ def test_residual_stage_rejects_when_unweighted_worsens(monkeypatch):
     assert out is None
     guard = est._residual_stage_guard_
     assert guard.get("accepted") is False
-    assert guard.get("residual_rejected_as_noise") is True or guard.get("reason") == "no_holdout_improvement"
+    assert (
+        guard.get("residual_rejected_as_noise") is True
+        or guard.get("reason") == "no_holdout_improvement"
+    )
     assert est.blackbox_diagnostics_.get("residual_rejected_as_noise") is True
 
 
@@ -131,7 +147,9 @@ def test_residual_stage_accepts_real_structure_improvement(monkeypatch):
     # Base misses a linear term
     y = np.sin(x) + 0.5 * x
 
-    est = GlassboxRegressor(random_state=12, enable_residual_stage=True, use_guided_evolution=True)
+    est = GlassboxRegressor(
+        random_state=12, enable_residual_stage=True, use_guided_evolution=True
+    )
     est.n_features_in_ = 1
     est.blackbox_diagnostics_ = {}
 

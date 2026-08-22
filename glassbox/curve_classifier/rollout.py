@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Mapping, Sequence
+from typing import Any
 
 import numpy as np
-
 
 CHECKPOINT_CARD_SCHEMA_VERSION = "checkpoint_card.phase6.v1"
 ROLLOUT_COMPARISON_SCHEMA_VERSION = "rollout_comparison.phase6.v1"
@@ -66,42 +66,64 @@ def default_rollout_comparison_path(checkpoint_path: Path) -> Path:
     return checkpoint_path.with_name(f"{checkpoint_path.stem}.rollout.json")
 
 
-def load_json_report(path: Path) -> Dict[str, Any]:
+def load_json_report(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
 def write_checkpoint_card(path: Path, card: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_json_safe(dict(card)), indent=2, sort_keys=True), encoding="utf-8")
+    path.write_text(
+        json.dumps(_json_safe(dict(card)), indent=2, sort_keys=True), encoding="utf-8"
+    )
 
 
 def write_rollout_comparison(path: Path, comparison: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(_json_safe(dict(comparison)), indent=2, sort_keys=True), encoding="utf-8")
+    path.write_text(
+        json.dumps(_json_safe(dict(comparison)), indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
-def _validation_uses_grouped_release_metric(validation_report: Mapping[str, Any]) -> bool:
+def _validation_uses_grouped_release_metric(
+    validation_report: Mapping[str, Any],
+) -> bool:
     split_policy = str(validation_report.get("split_policy", ""))
     split_details = validation_report.get("split_details", {})
-    detail_policy = str(split_details.get("policy", "")) if isinstance(split_details, Mapping) else ""
-    return split_policy in GROUPED_RELEASE_POLICIES or detail_policy in GROUPED_RELEASE_POLICIES
+    detail_policy = (
+        str(split_details.get("policy", ""))
+        if isinstance(split_details, Mapping)
+        else ""
+    )
+    return (
+        split_policy in GROUPED_RELEASE_POLICIES
+        or detail_policy in GROUPED_RELEASE_POLICIES
+    )
 
 
-def _checkpoint_calibration_summary(model_kind: str, checkpoint_metadata: Mapping[str, Any]) -> Dict[str, Any]:
+def _checkpoint_calibration_summary(
+    model_kind: str, checkpoint_metadata: Mapping[str, Any]
+) -> dict[str, Any]:
     if model_kind == "curve_classifier":
         return {
             "thresholds_saved": checkpoint_metadata.get("thresholds") is not None,
             "temperature_saved": checkpoint_metadata.get("temperature") is not None,
-            "isotonic_calibration_saved": bool(checkpoint_metadata.get("isotonic_calibration")),
+            "isotonic_calibration_saved": bool(
+                checkpoint_metadata.get("isotonic_calibration")
+            ),
         }
     if model_kind == "universal_proposer":
         calibration = checkpoint_metadata.get("routing_calibration")
         return {
-            "routing_calibration": dict(calibration) if isinstance(calibration, Mapping) else {
+            "routing_calibration": dict(calibration)
+            if isinstance(calibration, Mapping)
+            else {
                 "status": "uncalibrated",
                 "requires": "downstream_candidate_success_benchmark",
             },
-            "skeleton_validation_metrics_saved": bool(checkpoint_metadata.get("validation_metrics")),
+            "skeleton_validation_metrics_saved": bool(
+                checkpoint_metadata.get("validation_metrics")
+            ),
         }
     return {}
 
@@ -118,22 +140,36 @@ def build_checkpoint_card(
     runtime_contract: Mapping[str, Any] | None = None,
     row_order_stress: Mapping[str, Any] | None = None,
     runtime_fallback: Mapping[str, Any] | None = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     checkpoint_metadata = checkpoint_metadata or {}
     validation_report = validation_report or {}
     metrics = dict(validation_report.get("metrics") or {})
-    split_policy = str(validation_report.get("split_policy", checkpoint_metadata.get("validation_split_policy", "")))
-    split_details = dict(validation_report.get("split_details") or checkpoint_metadata.get("validation_split_details") or {})
+    split_policy = str(
+        validation_report.get(
+            "split_policy", checkpoint_metadata.get("validation_split_policy", "")
+        )
+    )
+    split_details = dict(
+        validation_report.get("split_details")
+        or checkpoint_metadata.get("validation_split_details")
+        or {}
+    )
     grouped_release_metric = _validation_uses_grouped_release_metric(validation_report)
 
-    row_order_stress = dict(row_order_stress or {
-        "passed": True,
-        "source": "phase1_univariate_row_order_regression_tests",
-    })
-    runtime_fallback = dict(runtime_fallback or {
-        "passed": True,
-        "source": "checkpoint_metadata_validators_and_runtime_wrapper_fallbacks",
-    })
+    row_order_stress = dict(
+        row_order_stress
+        or {
+            "passed": True,
+            "source": "phase1_univariate_row_order_regression_tests",
+        }
+    )
+    runtime_fallback = dict(
+        runtime_fallback
+        or {
+            "passed": True,
+            "source": "checkpoint_metadata_validators_and_runtime_wrapper_fallbacks",
+        }
+    )
     unsupported = list(known_unsupported_cases or DEFAULT_KNOWN_UNSUPPORTED_CASES)
 
     release_gates = {
@@ -156,7 +192,8 @@ def build_checkpoint_card(
             or "not_recorded"
         ),
         "feature_schema": checkpoint_metadata.get("feature_schema"),
-        "feature_dim": checkpoint_metadata.get("feature_dim") or _nested_get(checkpoint_metadata, ("config", "n_features")),
+        "feature_dim": checkpoint_metadata.get("feature_dim")
+        or _nested_get(checkpoint_metadata, ("config", "n_features")),
         "validation": {
             "split_policy": split_policy,
             "split_details": split_details,
@@ -165,7 +202,9 @@ def build_checkpoint_card(
             "formula_overlap": dict(validation_report.get("formula_overlap") or {}),
             "validation_report_path": checkpoint_metadata.get("validation_report_path"),
         },
-        "calibration": _checkpoint_calibration_summary(str(model_kind), checkpoint_metadata),
+        "calibration": _checkpoint_calibration_summary(
+            str(model_kind), checkpoint_metadata
+        ),
         "runtime_contract": dict(runtime_contract or {}),
         "row_order_stress": row_order_stress,
         "runtime_fallback": runtime_fallback,
@@ -186,12 +225,24 @@ def build_rollout_comparison(
     baseline_card: Mapping[str, Any] | None = None,
     metric_name: str = "val_f1",
     min_relative_improvement: float = 0.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     candidate_metric = _best_validation_metric(candidate_card, metric_name)
-    baseline_metric = _best_validation_metric(baseline_card or {}, metric_name) if baseline_card else None
-    grouped_ok = bool(_nested_get(candidate_card, ("release_gates", "grouped_or_family_validation_reported")))
-    row_order_ok = bool(_nested_get(candidate_card, ("release_gates", "row_order_stress_passed")))
-    fallback_ok = bool(_nested_get(candidate_card, ("release_gates", "runtime_fallback_passed")))
+    baseline_metric = (
+        _best_validation_metric(baseline_card or {}, metric_name)
+        if baseline_card
+        else None
+    )
+    grouped_ok = bool(
+        _nested_get(
+            candidate_card, ("release_gates", "grouped_or_family_validation_reported")
+        )
+    )
+    row_order_ok = bool(
+        _nested_get(candidate_card, ("release_gates", "row_order_stress_passed"))
+    )
+    fallback_ok = bool(
+        _nested_get(candidate_card, ("release_gates", "runtime_fallback_passed"))
+    )
 
     beats_baseline = None
     required_metric = None

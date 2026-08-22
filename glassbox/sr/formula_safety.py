@@ -13,7 +13,7 @@ expression language the system actually produces can be evaluated.
 from __future__ import annotations
 
 import ast
-from typing import Iterable, Set
+from collections.abc import Iterable
 
 # Node types a formula expression may contain.  Deliberately excludes
 # attribute chains, subscripts, comprehensions, lambdas, imports, statements,
@@ -42,7 +42,7 @@ _ALLOWED_NODE_TYPES: tuple = (
 )
 
 # Function/constant attributes allowed directly on the trusted ``np`` module.
-_NP_ALLOWED_ATTRS: Set[str] = {
+_NP_ALLOWED_ATTRS: set[str] = {
     "sin",
     "cos",
     "exp",

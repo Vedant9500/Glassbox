@@ -5,25 +5,25 @@ This module contains meta-operations and operation-related utilities.
 """
 
 from glassbox.sr.operations.meta_ops import (
-    MetaPeriodic,
-    MetaPower,
-    MetaArithmetic,
     MetaAggregation,
+    MetaArithmetic,
     MetaExp,
     MetaLog,
+    MetaPeriodic,
+    MetaPower,
     get_constant_symbol,
     normalize_formula_ascii,
     safe_numpy_power,
 )
 
 __all__ = [
-    'MetaPeriodic',
-    'MetaPower',
-    'MetaArithmetic',
-    'MetaAggregation',
-    'MetaExp',
-    'MetaLog',
-    'get_constant_symbol',
-    'normalize_formula_ascii',
-    'safe_numpy_power',
+    "MetaAggregation",
+    "MetaArithmetic",
+    "MetaExp",
+    "MetaLog",
+    "MetaPeriodic",
+    "MetaPower",
+    "get_constant_symbol",
+    "normalize_formula_ascii",
+    "safe_numpy_power",
 ]

@@ -200,10 +200,12 @@ from glassbox.sr.core.operation_dag import OperationDAG
 from glassbox.evolution import train_onn_evolutionary
 
 x = torch.linspace(-3, 3, 300).reshape(-1, 1)
-y = x ** 2
+y = x**2
+
 
 def make_model():
     return OperationDAG(n_inputs=1, n_hidden_layers=1, nodes_per_layer=4)
+
 
 result = train_onn_evolutionary(make_model, x, y, population_size=15, generations=30)
 print(result["formula"])

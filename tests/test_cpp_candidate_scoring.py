@@ -1,11 +1,9 @@
-import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 
 from glassbox.sr.sklearn_wrapper import GlassboxRegressor
-
 
 CPP_DIR = Path(__file__).resolve().parents[1] / "glassbox" / "sr" / "cpp"
 
@@ -57,7 +55,10 @@ def test_cpp_candidate_scorer_rejects_out_of_range_feature_reference():
     score = _score_one("x1", X, y)
 
     assert score["ok"] is False
-    assert "feature" in str(score["error"]).lower() or "symbol" in str(score["error"]).lower()
+    assert (
+        "feature" in str(score["error"]).lower()
+        or "symbol" in str(score["error"]).lower()
+    )
 
 
 @requires_cpp_scorer
@@ -77,7 +78,9 @@ def test_refine_candidate_formulas_does_not_keep_invalid_cpp_candidates():
         max_candidates=4,
     )
 
-    formulas = [str(item.get("base_formula") or item.get("formula")) for item in refined]
+    formulas = [
+        str(item.get("base_formula") or item.get("formula")) for item in refined
+    ]
     # OOB feature refs are hard-rejected by the graph scorer.
     assert "x1" not in formulas
     # Soft graph division is finite at 0 (search-safe): 1/(x0-x0) becomes a
@@ -102,7 +105,6 @@ def test_cpp_candidate_scorer_graph_signed_sqrt_matches_search_domain():
     assert abs(score["scale"] - 1.0) < 1e-3
 
 
-
 @requires_cpp_scorer
 def test_cpp_candidate_scorer_weighted_affine_matches_unweighted_when_uniform():
     x = np.linspace(-2.0, 2.0, 100)
@@ -111,22 +113,26 @@ def test_cpp_candidate_scorer_weighted_affine_matches_unweighted_when_uniform():
     split = 75
     Xf, yf = X[:split], y[:split]
     Xv, yv = X[split:], y[split:]
-    base = dict(_core.score_formula_candidates(
-        ["sin(3*x0)"],
-        np.ascontiguousarray(Xf, dtype=np.float64),
-        np.ascontiguousarray(yf, dtype=np.float64),
-        np.ascontiguousarray(Xv, dtype=np.float64),
-        np.ascontiguousarray(yv, dtype=np.float64),
-    )[0])
-    weighted = dict(_core.score_formula_candidates(
-        ["sin(3*x0)"],
-        np.ascontiguousarray(Xf, dtype=np.float64),
-        np.ascontiguousarray(yf, dtype=np.float64),
-        np.ascontiguousarray(Xv, dtype=np.float64),
-        np.ascontiguousarray(yv, dtype=np.float64),
-        fit_weights=np.ones(split),
-        val_weights=np.ones(len(y) - split),
-    )[0])
+    base = dict(
+        _core.score_formula_candidates(
+            ["sin(3*x0)"],
+            np.ascontiguousarray(Xf, dtype=np.float64),
+            np.ascontiguousarray(yf, dtype=np.float64),
+            np.ascontiguousarray(Xv, dtype=np.float64),
+            np.ascontiguousarray(yv, dtype=np.float64),
+        )[0]
+    )
+    weighted = dict(
+        _core.score_formula_candidates(
+            ["sin(3*x0)"],
+            np.ascontiguousarray(Xf, dtype=np.float64),
+            np.ascontiguousarray(yf, dtype=np.float64),
+            np.ascontiguousarray(Xv, dtype=np.float64),
+            np.ascontiguousarray(yv, dtype=np.float64),
+            fit_weights=np.ones(split),
+            val_weights=np.ones(len(y) - split),
+        )[0]
+    )
     assert base["ok"] and weighted["ok"]
     assert abs(base["scale"] - weighted["scale"]) < 1e-9
     assert abs(base["bias"] - weighted["bias"]) < 1e-9
@@ -154,22 +160,26 @@ def test_cpp_candidate_scorer_weighted_downweights_outliers():
     w_fit[50:60] = 1e-6  # nearly drop outliers
     w_val = np.ones(len(y) - split)
 
-    unweighted = dict(_core.score_formula_candidates(
-        ["x0"],
-        np.ascontiguousarray(Xf, dtype=np.float64),
-        np.ascontiguousarray(yf, dtype=np.float64),
-        np.ascontiguousarray(Xv, dtype=np.float64),
-        np.ascontiguousarray(yv, dtype=np.float64),
-    )[0])
-    weighted = dict(_core.score_formula_candidates(
-        ["x0"],
-        np.ascontiguousarray(Xf, dtype=np.float64),
-        np.ascontiguousarray(yf, dtype=np.float64),
-        np.ascontiguousarray(Xv, dtype=np.float64),
-        np.ascontiguousarray(yv, dtype=np.float64),
-        fit_weights=w_fit,
-        val_weights=w_val,
-    )[0])
+    unweighted = dict(
+        _core.score_formula_candidates(
+            ["x0"],
+            np.ascontiguousarray(Xf, dtype=np.float64),
+            np.ascontiguousarray(yf, dtype=np.float64),
+            np.ascontiguousarray(Xv, dtype=np.float64),
+            np.ascontiguousarray(yv, dtype=np.float64),
+        )[0]
+    )
+    weighted = dict(
+        _core.score_formula_candidates(
+            ["x0"],
+            np.ascontiguousarray(Xf, dtype=np.float64),
+            np.ascontiguousarray(yf, dtype=np.float64),
+            np.ascontiguousarray(Xv, dtype=np.float64),
+            np.ascontiguousarray(yv, dtype=np.float64),
+            fit_weights=w_fit,
+            val_weights=w_val,
+        )[0]
+    )
     assert unweighted["ok"] and weighted["ok"]
     # Weighted affine should be closer to true scale=2, bias=1
     assert abs(weighted["scale"] - 2.0) < abs(unweighted["scale"] - 2.0)

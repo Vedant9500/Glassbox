@@ -5,7 +5,7 @@
 **Supersedes:** first-pass audit text and the interim verification pass (formerly split across two files) — merged here as the sole report  
 **Scope:** Entire active tree (`glassbox/`, `scripts/`, `tests/`, `docs/`, C++ under `glassbox/sr/cpp/`); Eigen vendored, `.tmp/`, `results/`, local `models/` weights out of scope for product bugs  
 **Method:** Multi-pass static analysis + cross-module verification + secondary cascade + full re-verification of every prior finding against current sources  
-**Code modified:** H-01…H-22 fixed (C++ core, sklearn wrapper, blackbox, universal proposer, curve classifier, train paths, ONN tau/elite/BN, phased regression, family signatures, specialist vault ranking); M-04/M-05/L-01 fixed; R-01 fixed (swallowed-error diagnostics counter + typed fallbacks); R-02/R-12 fixed (AST-allowlist gate for formula `eval`); R-03 fixed (env-gated pickle checkpoint fallback + weights-only artifacts); report marks them **FIXED**
+**Code modified:** H-01…H-22 fixed (C++ core, sklearn wrapper, blackbox, universal proposer, curve classifier, train paths, ONN tau/elite/BN, phased regression, family signatures, specialist vault ranking); M-04/M-05/L-01 fixed; R-01 fixed (swallowed-error diagnostics counter + typed fallbacks); R-02/R-12 fixed (AST-allowlist gate for formula `eval`); R-03 fixed (env-gated pickle checkpoint fallback + weights-only artifacts); **C-01/C-01′ fixed (raw-vs-fill eval split; scoring rejects non-finite predictions), C-14 fixed (display Log emits engine ε-protection)**; report marks them **FIXED**
 
 This document is the **only** audit report to maintain. It combines:
 
@@ -72,7 +72,7 @@ The older **ONN Python evolution path** (`glassbox/evolution/evolution.py` + `sr
 
 ### 1.3 Top residual production risks (ordered)
 
-1. **Non-finite → 0 scoring** (C-01 + C-01′ + C-14 log display) can crown domain-failing formulas.
+1. ~~**Non-finite → 0 scoring** (C-01 + C-01′ + C-14 log display) can crown domain-failing formulas.~~ **FIXED** — raw-vs-fill eval split; scoring rejects non-finite; display Log ε-protected.
 2. **`predict` silent zeros** (C-02) hide fit/feature errors from sklearn users.
 3. **Adaptive budget uncapped by `timeout`** (C-03) — default `timeout=120`, `max_compute_budget=300`.
 4. **Multivariate benchmark 1D collapse** (C-04 + C-04′ helper).
@@ -100,38 +100,19 @@ The older **ONN Python evolution path** (`glassbox/evolution/evolution.py` + `sr
 ### 2.1 Critical findings (C-01 … C-13)
 
 #### C-01 — Non-finite formula predictions coerced to 0  
-**Verdict: CONFIRMED**  
+**Verdict: FIXED**  
 **Severity: CRITICAL**  
-**Evidence:** `sklearn_wrapper.py:6916`  
-```python
-out = np.where(np.isfinite(y_pred), y_pred, 0.0)
-```
-Called from `_safe_eval_formula_array` (`:6832`), which feeds `_formula_mse`, `_plain_unweighted_mse`, `_display_formula_mse`, vault/composition scoring, and `predict`.
+**Evidence:** `sklearn_wrapper.py` `_safe_eval_formula_array` historically zero-filled (`np.where(np.isfinite(y_pred), y_pred, 0.0)`) and fed every scoring path.
 
-**Root cause stands.** Domain failures become perfect near-zero predictors on zero-centered targets.
-
-**Fix (unchanged intent, sharpened):**
-- Scoring path: preserve raw non-finites; reject via domain-failure rate / `inf` MSE.
-- `predict` path: optional fill policy, separate from search scoring.
-- Reuse `_formula_domain_failure_rate` (`:6927+`).
+**Fix landed:** evaluator split into `_eval_formula_raw` (non-finites preserved; cache stores raw values) + `_safe_eval_formula_array` (predict-only fill policy, non-finite → 0). Search scoring (`_formula_mse`) and display/protocol MSE (`_plain_unweighted_mse`) now evaluate raw and reject non-finite predictions with `inf`. Regression tests: `tests/test_audit_c01_scoring_split.py` (mutation-checked: reverting the raw-eval line makes them fail with the historical `0.0` score).
 
 ---
 
 #### C-01′ — Zero-fill makes `_formula_mse` finite-check dead  
-**Verdict: CONFIRMED (cascade)**  
+**Verdict: FIXED (with C-01)**  
 **Severity: HIGH → treat as part of P0 with C-01**  
-**Evidence:**  
-- Zero-fill at `:6916`  
-- Guard at `:3800–3827`:
-```python
-pred = self._safe_eval_formula_array(text, X)
-...
-if not np.all(np.isfinite(pred)):
-    return float("inf")
-```
-After zero-fill, the guard never fires. `_plain_unweighted_mse` finite **mask** is similarly inert (all values “finite”).
 
-Specialist vault (`specialist_state.py:298–302` region) and composition paths that call the same evaluator inherit the poison.
+**Fix landed:** the finite guard in `_formula_mse` is live again — raw predictions reach it, so any non-finite prediction returns `inf`; `_plain_unweighted_mse` rejects non-finite preds outright and masks only non-finite *targets* (data quality, not formula domain failure). Note for follow-up: specialist vault/composition helpers still call the fill-policy evaluator; the final accept gate (`_final_formula_score` → display MSE) now rejects domain failures, so broken candidates can no longer be crowned, but vault-side heuristics could be migrated to the raw evaluator in a later pass.
 
 ---
 
@@ -394,13 +375,13 @@ Matches `x`, `x0`, `x1`, … So `nest_formulas("sin(x0)+x1", "x0**2")` → `sin(
 ### 3.1 Mathematical & symbolic integrity
 
 #### C-14 — Display `log` drops engine ε-protection  
+**Verdict: FIXED**  
 **Severity: CRITICAL (cascade with C-01)**  
-**File:** `eval.h:622` vs eval impl `:246–248`  
-- Engine: `(abs(x) + 1e-6).log()`  
-- Display string: `log(|child|)`  
-At zeros / tiny values, Python display eval → `-inf` → C-01 zero-fill → false fitness. Same family as soft-div display honesty, but **directly corrupts selection**.
+**File:** `eval.h` formatter vs eval impl  
+- Engine: `(abs(x) + 1e-6).log()` (clamped ±1e6)  
+- Display string historically: `log(|child|)` → external/plain-numpy evaluation returned `-inf` at zeros.
 
-**Fix:** Emit `log(abs(x)+1e-6)` (or shared protected-log helper) in formatter; keep C-01 fix as backstop.
+**Fix landed:** formatter emits `log(abs(child) + 1e-6)`, matching engine numerics at domain edges; `_core.so` rebuilt. Regression tests in `tests/test_audit_c01_scoring_split.py` assert the emitted string is ε-protected and that plain-numpy evaluation of the display string equals engine values at x=0.
 
 ---
 
@@ -517,7 +498,7 @@ Key = `(n, mean/std moments, dot, n_points)` over 32 samples — different formu
 
 | Priority | ID(s) | Action | Files (lines) | Effort | Suggested test |
 |----------|-------|--------|---------------|--------|----------------|
-| P0.1 | C-01, C-01′, C-14 | Split safe-eval into raw vs fill; scoring uses raw; reject non-finite; fix log formatter ε | `sklearn_wrapper.py:6832–6916,3800+`; `eval.h:622` | S | `log(x)` on x∈(0,1] with zeros present must not beat true model via zero-fill |
+| P0.1 | C-01, C-01′, C-14 | **DONE** Raw-vs-fill eval split; scoring uses raw + rejects non-finite; display Log ε-protection | `sklearn_wrapper.py` (`_eval_formula_raw` / `_safe_eval_formula_array`, `_formula_mse`, `_plain_unweighted_mse`); `eval.h` Log formatter | S | `tests/test_audit_c01_scoring_split.py`: `log`/div domain failures score `inf`; true model beats broken; predict fill preserved |
 | P0.2 | C-02 | Feature check + no silent zeros | `sklearn_wrapper.py:10029–10043` | S | wrong `n_features` raises |
 | P0.3 | C-03, C-03′ | `budget = min(budget, self.timeout)` after clip; assert C++ timeouts ≤ remaining | `sklearn_wrapper.py:1318,8818+` | S | `timeout=30, adaptive=True` never schedules >30s |
 | P0.4 | C-04, C-04′ | Stop `reshape(-1,1)` in suite; route multi-var through `evaluate_formula_mse_on_X` | `benchmark_suite.py:772–777`; `benchmark_common.py:776` | S | `x0+x1` finite MSE on 2-col data |
@@ -641,7 +622,9 @@ def nest_formulas(f: str, g: str, *, primary: str = "x0") -> str:
 ### 5.4 C-03 budget cap
 
 ```python
-budget = float(np.clip(budget, float(self.min_compute_budget), float(self.max_compute_budget)))
+budget = float(
+    np.clip(budget, float(self.min_compute_budget), float(self.max_compute_budget))
+)
 return float(min(budget, float(max(1, self.timeout))))
 ```
 

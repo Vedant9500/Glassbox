@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
-import torch.nn as nn
+from torch import nn
 
 from glassbox.curve_classifier import curve_classifier_integration as cci
 from glassbox.evolution import evolution as evo
@@ -16,10 +16,10 @@ from glassbox.sr.hard_concrete import (
 )
 from glassbox.sr.operations.meta_ops import MetaAggregation
 
-
 # ---------------------------------------------------------------------------
 # H-16 — derive n_features from weights when model_config is incomplete
 # ---------------------------------------------------------------------------
+
 
 def _clear_classifier_caches():
     cci._cached_classifier_by_device.clear()
@@ -30,7 +30,9 @@ def _clear_classifier_caches():
 def test_h16_cnn_n_features_from_other_mlp_without_config(tmp_path: Path):
     """Legacy CNN checkpoint missing model_config.n_features still reconstructs correctly."""
     n_features, curve_dim, n_classes = 398, 128, 5
-    model = cci.CurveClassifierCNN(n_classes=n_classes, n_features=n_features, curve_dim=curve_dim)
+    model = cci.CurveClassifierCNN(
+        n_classes=n_classes, n_features=n_features, curve_dim=curve_dim
+    )
     path = tmp_path / "cnn_legacy.pt"
     torch.save(
         {
@@ -43,7 +45,9 @@ def test_h16_cnn_n_features_from_other_mlp_without_config(tmp_path: Path):
         path,
     )
     _clear_classifier_caches()
-    loaded = cci._load_pytorch_classifier(path, torch.device("cpu"), cache_key="h16-cnn")
+    loaded = cci._load_pytorch_classifier(
+        path, torch.device("cpu"), cache_key="h16-cnn"
+    )
     assert isinstance(loaded, cci.CurveClassifierCNN)
     # other_mlp input width = n_features - curve_dim
     assert loaded.other_mlp[0].in_features == n_features - curve_dim
@@ -57,7 +61,9 @@ def test_h16_cnn_n_features_from_other_mlp_without_config(tmp_path: Path):
 def test_h16_glu_n_features_from_eql_not_fc1(tmp_path: Path):
     """GLU must use eql.linear in_features, not fc1 combined width."""
     n_features, n_classes, hidden = 398, 7, 64
-    model = cci.CurveClassifierGLU(n_features=n_features, n_classes=n_classes, hidden=hidden)
+    model = cci.CurveClassifierGLU(
+        n_features=n_features, n_classes=n_classes, hidden=hidden
+    )
     path = tmp_path / "glu_legacy.pt"
     torch.save(
         {
@@ -69,11 +75,16 @@ def test_h16_glu_n_features_from_eql_not_fc1(tmp_path: Path):
         path,
     )
     _clear_classifier_caches()
-    loaded = cci._load_pytorch_classifier(path, torch.device("cpu"), cache_key="h16-glu")
+    loaded = cci._load_pytorch_classifier(
+        path, torch.device("cpu"), cache_key="h16-glu"
+    )
     assert isinstance(loaded, cci.CurveClassifierGLU)
     assert loaded.eql.linear.in_features == n_features
     # Old bug: fc1.weight.shape[1] is combined_dim (1280 for default), not 398
-    assert loaded.fc1.in_features != n_features or loaded.eql.linear.in_features == n_features
+    assert (
+        loaded.fc1.in_features != n_features
+        or loaded.eql.linear.in_features == n_features
+    )
     x = torch.randn(2, n_features)
     with torch.no_grad():
         out = loaded(x)
@@ -82,7 +93,9 @@ def test_h16_glu_n_features_from_eql_not_fc1(tmp_path: Path):
 
 def test_h16_mlp_n_features_from_eql(tmp_path: Path):
     n_features, n_classes, hidden = 200, 4, 32
-    model = cci.CurveClassifierMLP(n_features=n_features, n_classes=n_classes, hidden=hidden)
+    model = cci.CurveClassifierMLP(
+        n_features=n_features, n_classes=n_classes, hidden=hidden
+    )
     path = tmp_path / "mlp_legacy.pt"
     torch.save(
         {
@@ -94,7 +107,9 @@ def test_h16_mlp_n_features_from_eql(tmp_path: Path):
         path,
     )
     _clear_classifier_caches()
-    loaded = cci._load_pytorch_classifier(path, torch.device("cpu"), cache_key="h16-mlp")
+    loaded = cci._load_pytorch_classifier(
+        path, torch.device("cpu"), cache_key="h16-mlp"
+    )
     assert loaded.eql.linear.in_features == n_features
     x = torch.randn(3, n_features)
     with torch.no_grad():
@@ -126,6 +141,7 @@ def test_h16_resolve_cnn_from_other_mlp():
 # ---------------------------------------------------------------------------
 # H-17 — set_model_tau must not overwrite MetaAggregation.tau
 # ---------------------------------------------------------------------------
+
 
 class _TauHost(nn.Module):
     def __init__(self):
@@ -174,6 +190,7 @@ def test_h17_set_model_tau_does_not_call_meta_set_tau():
 # H-18 — elite skip cleared after tau change
 # ---------------------------------------------------------------------------
 
+
 def test_h18_elite_reevaluated_when_tau_changes(monkeypatch):
     class _Dummy(nn.Module):
         def __init__(self):
@@ -213,14 +230,18 @@ def test_h18_elite_reevaluated_when_tau_changes(monkeypatch):
     def _counting_eval(*args, **kwargs):
         eval_count["n"] += 1
         # Capture whether elite flag was cleared before evaluation
-        elite_flags.append([bool(getattr(i, "_is_elite", False)) for i in trainer.population])
+        elite_flags.append(
+            [bool(getattr(i, "_is_elite", False)) for i in trainer.population]
+        )
         return original_eval(*args, **kwargs)
 
     elite_flags: list = []
     monkeypatch.setattr(trainer, "evaluate_fitness", _counting_eval)
     monkeypatch.setattr(evo, "refine_constants", lambda *a, **k: 0.0)
     monkeypatch.setattr(evo, "calculate_complexity", lambda model: 1.0)
-    monkeypatch.setattr(evo, "coefficient_sparsity_loss", lambda model: torch.tensor(0.0))
+    monkeypatch.setattr(
+        evo, "coefficient_sparsity_loss", lambda model: torch.tensor(0.0)
+    )
     monkeypatch.setattr(evo, "progressive_round_loss", lambda model: torch.tensor(0.0))
 
     # Simulate one generation of the train loop's tau + clear logic
@@ -245,6 +266,7 @@ def test_h18_elite_reevaluated_when_tau_changes(monkeypatch):
 
 def test_h18_elite_skip_preserved_when_tau_unchanged():
     """When tau is stable, elite skip remains a valid optimization."""
+
     class _Dummy(nn.Module):
         def __init__(self):
             super().__init__()

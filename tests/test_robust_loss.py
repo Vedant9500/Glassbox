@@ -61,11 +61,15 @@ def test_robust_loss_respects_sample_weight():
     w = np.array([1.0, 1.0, 1.0, 0.0])
     # Zero weight on outlier → near-zero mse
     assert _robust_loss(pred, target, "mse", sample_weight=w) == pytest.approx(0.0)
-    assert _robust_loss(pred, target, "huber", sample_weight=w, delta=1.0) == pytest.approx(0.0)
+    assert _robust_loss(
+        pred, target, "huber", sample_weight=w, delta=1.0
+    ) == pytest.approx(0.0)
 
 
 def test_estimator_default_loss_is_mse():
-    est = GlassboxRegressor(random_state=0, generations=5, population_size=10, timeout=5)
+    est = GlassboxRegressor(
+        random_state=0, generations=5, population_size=10, timeout=5
+    )
     assert est.loss_mode == "mse"
 
 

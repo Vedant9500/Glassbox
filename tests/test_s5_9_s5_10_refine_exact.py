@@ -1,4 +1,5 @@
 """S5-9 weighted specialist refine + S5-10 protected exact division."""
+
 import sys
 from pathlib import Path
 
@@ -30,9 +31,7 @@ def test_s5_9_refine_frequencies_accepts_sample_weight():
     w = np.ones_like(y)
     w[-8:] = 0.01  # downweight outliers
 
-    omegas_u, mse_u = _core.refine_frequencies(
-        x, y_noisy, [2.0], steps=40, lr=0.05
-    )
+    omegas_u, mse_u = _core.refine_frequencies(x, y_noisy, [2.0], steps=40, lr=0.05)
     omegas_w, mse_w = _core.refine_frequencies(
         x, y_noisy, [2.0], steps=40, lr=0.05, sample_weight=w
     )
@@ -101,5 +100,9 @@ def test_s5_10_graph_score_div_formula_ok():
     )
     assert len(scores) >= 1
     # Best structure should score finite
-    ok_any = any(s.get("ok", False) or np.isfinite(float(s.get("validation_mse", s.get("val_mse", np.nan)))) for s in scores)
+    ok_any = any(
+        s.get("ok", False)
+        or np.isfinite(float(s.get("validation_mse", s.get("val_mse", np.nan))))
+        for s in scores
+    )
     assert ok_any
