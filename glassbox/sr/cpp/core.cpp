@@ -267,6 +267,10 @@ static py::list score_formula_candidates_cpp(
         sr::ScopedArithmeticTemperature scoped_temp(100.0);
         #pragma omp parallel for schedule(dynamic)
         for (int idx = 0; idx < static_cast<int>(formulas.size()); ++idx) {
+            // H-06: reused OMP pool threads keep TLS from earlier engine runs;
+            // re-apply the scoring temperature in every worker body so results
+            // do not depend on which tests/engines ran before on this thread.
+            sr::set_arithmetic_temperature(100.0);
             CandidateScore score;
             score.formula = formulas[idx];
             score.weighted = use_fit_w || use_val_w;

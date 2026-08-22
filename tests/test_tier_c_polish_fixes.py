@@ -74,7 +74,10 @@ def test_n10_no_user_weight_flag_false():
         generations=2,
         population_size=8,
         num_islands=1,
-        timeout=5,
+        # Generous wall-clock budget: this pin checks a flag, not speed. A tight
+        # timeout trips H-10's fail-closed path when CI machines are loaded.
+        timeout=60,
+        adaptive_compute_budget=False,
         use_fast_path=False,
         blackbox_mode=False,
         enable_residual_stage=False,

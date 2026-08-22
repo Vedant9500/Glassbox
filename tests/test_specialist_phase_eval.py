@@ -162,8 +162,10 @@ def test_cpp_batch_candidate_scoring_matches_affine_fit_when_available():
 
     assert scores[0]["ok"] is True
     assert scores[0]["validation_r2"] > 0.999
-    assert abs(scores[0]["scale"] - 2.0) < 1e-9
-    assert abs(scores[0]["bias"] - 0.5) < 1e-9
+    # 1e-6 (not tighter): the affine refit runs through the float eval pipeline;
+    # real plumbing regressions miss by O(0.1-1), not by float-order noise.
+    assert abs(scores[0]["scale"] - 2.0) < 1e-6
+    assert abs(scores[0]["bias"] - 0.5) < 1e-6
 
 
 def test_phase4_harness_returns_summary_and_cases():

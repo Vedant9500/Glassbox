@@ -198,7 +198,10 @@ def test_release_gate_weighted_outlier_recovery():
     y = y_clean.copy()
     y[-10:] += 35.0
     w = np.ones(100)
-    w[-10:] = 0.01
+    # Fully exclude the known-bad block (canonical sample_weight semantics).
+    # A small-but-nonzero weight makes the weighted objective itself prefer
+    # edge-bending fits over the true line, so exclusion must be exact.
+    w[-10:] = 0.0
     res = _core.run_evolution(
         [x.astype(np.float64)],
         y,
