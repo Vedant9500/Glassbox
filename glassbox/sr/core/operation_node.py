@@ -682,6 +682,17 @@ class OperationNodeSimple(nn.Module):
         """Get routing as [slot1_source, slot2_source]."""
         return self.route_logits.argmax(dim=-1).tolist()
 
+    def snap_to_discrete(self):
+        """Snap sub-operations to discrete equivalents (mirrors OperationNode).
+
+        §3.13 companion: the documented
+        ``snap_to_discrete().compile_for_inference()`` chain requires this on
+        both node classes.
+        """
+        for op in (self.power, self.periodic, self.arithmetic):
+            if hasattr(op, "snap_to_discrete"):
+                op.snap_to_discrete()
+
     def l0_regularization(self) -> torch.Tensor:
         """Return 0 for simple nodes (no Hard Concrete selection)."""
         return torch.tensor(0.0)

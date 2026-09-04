@@ -3197,6 +3197,33 @@ Examples:
 
             best_result = None
 
+            def _best_result_key(result):
+                # §3.29: rank by displayed-aware score with uniform finite
+                # rejection, then complexity, then stable formula text —
+                # never legacy mse alone (a smaller engine mse must not beat
+                # better displayed-formula fidelity).
+                mse = result.get("score_mse", result.get("mse"))
+                try:
+                    finite = mse is not None and math.isfinite(float(mse))
+                except (TypeError, ValueError):
+                    finite = False
+                complexity = result.get("formula_complexity")
+                try:
+                    complexity = int(complexity)
+                except (TypeError, ValueError):
+                    complexity = 10**9
+                formula = (
+                    result.get("discovered_formula")
+                    or result.get("formula")
+                    or ""
+                )
+                return (
+                    0 if finite else 1,
+                    float(mse) if finite else float("inf"),
+                    complexity,
+                    str(formula),
+                )
+
             for _ in range(args.runs):
                 if args.cpp_evolution_only:
                     call_name = "run_formula_cpp_evolution"
@@ -3266,21 +3293,12 @@ Examples:
                 else:
                     result = globals()[call_name](**call_kwargs)
 
-                # Keep the best result based on displayed MSE (or just any valid MSE if best_result is None)
-                if best_result is None:
+                # Keep the best result by displayed-aware score with finite
+                # rejection (§3.29), not legacy mse alone.
+                if best_result is None or _best_result_key(
+                    result
+                ) < _best_result_key(best_result):
                     best_result = result
-                else:
-                    # Compare MSE
-                    best_mse = best_result.get("mse")
-                    curr_mse = result.get("mse")
-                    if (
-                        best_mse is None
-                        or math.isnan(best_mse)
-                        or curr_mse is not None
-                        and not math.isnan(curr_mse)
-                        and curr_mse < best_mse
-                    ):
-                        best_result = result
 
             result = best_result
             result["human_name"] = human_name

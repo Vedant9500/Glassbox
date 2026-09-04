@@ -68,6 +68,38 @@ inline bool is_trig_sq(const IndividualGraph& graph, int idx, const std::vector<
     return false;
 }
 
+// §3.110: x-x=0 and x/x=1 identities must not rely on 64-bit structural-hash
+// equality alone (no avalanche finalization, collision not measured).
+// Children are topologically ordered (child < parent), so plain recursion
+// terminates. Bit-exact double comparison is correct here: snapped values
+// are already canonicalized, so identical structure means identical payload.
+inline bool structurally_equal(const IndividualGraph& graph, int a, int b) {
+    const int n = static_cast<int>(graph.nodes.size());
+    if (a == b) return true;
+    if (a < 0 || b < 0 || a >= n || b >= n) return false;
+    const OpNode& na = graph.nodes[static_cast<size_t>(a)];
+    const OpNode& nb = graph.nodes[static_cast<size_t>(b)];
+    if (na.type != nb.type) return false;
+    if (na.type == NodeType::Input)
+        return na.feature_idx == nb.feature_idx;
+    if (na.type == NodeType::Constant)
+        return na.value == nb.value;
+    if (na.type == NodeType::Unary) {
+        // Compare only unary-relevant payload (M-161: stale op fields may
+        // linger on nodes; they must not veto structural equality).
+        if (na.unary_op != nb.unary_op || na.p != nb.p ||
+            na.omega != nb.omega || na.phi != nb.phi ||
+            na.amplitude != nb.amplitude)
+            return false;
+        return structurally_equal(graph, na.left_child, nb.left_child);
+    }
+    if (na.binary_op != nb.binary_op || na.beta != nb.beta ||
+        na.gamma != nb.gamma || na.tau != nb.tau)
+        return false;
+    return structurally_equal(graph, na.left_child, nb.left_child) &&
+           structurally_equal(graph, na.right_child, nb.right_child);
+}
+
 inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<int>& redirect, const std::vector<uint64_t>& node_hashes, double int_tol, double zero_tol) {
     OpNode& node = graph.nodes[i];
     
@@ -94,7 +126,7 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
                     double abs_v = std::abs(v) + 1e-10;
                     double sign_v = (v >= 0) ? 1.0 : -1.0;
                     double p_round = std::round(node.p);
-                    bool is_even = (std::abs(node.p - p_round) < 1e-6) && (static_cast<long long>(p_round) % 2 == 0);
+                    bool is_even = (std::abs(node.p - p_round) < 1e-9) && (static_cast<long long>(p_round) % 2 == 0);
                     double abs_pow = std::pow(abs_v, node.p);
                     res = is_even ? abs_pow : sign_v * abs_pow;
                     break;
@@ -102,7 +134,9 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
                 case UnaryOp::IntPow: res = std::pow(v, std::clamp(static_cast<int>(std::round(node.p)), 2, 6)); break;
                 case UnaryOp::Exp:
                     // H-02: match eval clamp; bare exp can yield Inf.
-                    res = std::exp(std::clamp(node.omega * v + node.phi, -50.0, 50.0));
+                    // §3.112: arg clamp ±500 (not ±50) to match exact path,
+                    // then output clamp like live eval.
+                    res = std::exp(std::clamp(node.omega * v + node.phi, -500.0, 500.0));
                     res = std::clamp(res, -1e6, 1e6);
                     break;
                 case UnaryOp::Log: res = std::log(std::abs(v) + 1e-6); break;
@@ -230,6 +264,10 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
         }
         
         // Algebraic identities
+        // §3.110: constant identities use snapping tolerances, not exact
+        // equality — graph constants are not always run through snap_val.
+        auto is_zero = [&](double v) { return std::abs(v) <= zero_tol; };
+        auto is_one = [&](double v) { return std::abs(v - 1.0) <= int_tol; };
         if (node.binary_op == BinaryOp::Arithmetic) {
             auto w = arithmetic_soft_weights(node);
             // §3.111: live eval blends all branches; identity rewrite must
@@ -240,9 +278,9 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
             
             if (max_w >= kNearDiscrete) {
                 if (max_w == w[0]) { // Add
-                    if (left.type == NodeType::Constant && left.value == 0.0) {
+                    if (left.type == NodeType::Constant && is_zero(left.value)) {
                         redirect[i] = node.right_child;
-                    } else if (right.type == NodeType::Constant && right.value == 0.0) {
+                    } else if (right.type == NodeType::Constant && is_zero(right.value)) {
                         redirect[i] = node.left_child;
                     } else {
                         // Check for sin^2(A) + cos^2(A) = 1
@@ -257,26 +295,26 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
                         }
                     }
                 } else if (max_w == w[3]) { // Sub
-                    if (right.type == NodeType::Constant && right.value == 0.0) {
+                    if (right.type == NodeType::Constant && is_zero(right.value)) {
                         redirect[i] = node.left_child;
                     } else if (node.left_child == node.right_child) { // same index or same hash
                         node.type = NodeType::Constant;
                         node.value = 0.0;
                     } else if (node.left_child >= 0 && node.right_child >= 0 &&
-                               node.left_child < static_cast<int>(node_hashes.size()) &&
-                               node.right_child < static_cast<int>(node_hashes.size()) &&
-                               node_hashes[node.left_child] == node_hashes[node.right_child]) {
+                               node.left_child < static_cast<int>(graph.nodes.size()) &&
+                               node.right_child < static_cast<int>(graph.nodes.size()) &&
+                               structurally_equal(graph, node.left_child, node.right_child)) {
                         node.type = NodeType::Constant;
                         node.value = 0.0;
                     }
                 } else if (max_w == w[1]) { // Mul
-                    if ((left.type == NodeType::Constant && left.value == 0.0) ||
-                        (right.type == NodeType::Constant && right.value == 0.0)) {
+                    if ((left.type == NodeType::Constant && is_zero(left.value)) ||
+                        (right.type == NodeType::Constant && is_zero(right.value))) {
                         node.type = NodeType::Constant;
                         node.value = 0.0;
-                    } else if (left.type == NodeType::Constant && left.value == 1.0) {
+                    } else if (left.type == NodeType::Constant && is_one(left.value)) {
                         redirect[i] = node.right_child;
-                    } else if (right.type == NodeType::Constant && right.value == 1.0) {
+                    } else if (right.type == NodeType::Constant && is_one(right.value)) {
                         redirect[i] = node.left_child;
                     } else if (node.left_child >= 0 && node.right_child >= 0 &&
                                node.left_child < static_cast<int>(node_hashes.size()) &&
@@ -292,16 +330,16 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
                 }
             }
         } else if (node.binary_op == BinaryOp::Division) {
-            if (left.type == NodeType::Constant && left.value == 0.0) {
+            if (left.type == NodeType::Constant && is_zero(left.value)) {
                 node.type = NodeType::Constant;
                 node.value = 0.0;
-            } else if (right.type == NodeType::Constant && right.value == 1.0) {
+            } else if (right.type == NodeType::Constant && is_one(right.value)) {
                 redirect[i] = node.left_child;
             } else if (node.left_child >= 0 && node.right_child >= 0 &&
-                       node.left_child < static_cast<int>(node_hashes.size()) &&
-                       node.right_child < static_cast<int>(node_hashes.size()) &&
+                       node.left_child < static_cast<int>(graph.nodes.size()) &&
+                       node.right_child < static_cast<int>(graph.nodes.size()) &&
                        (node.left_child == node.right_child ||
-                        node_hashes[node.left_child] == node_hashes[node.right_child])) {
+                        structurally_equal(graph, node.left_child, node.right_child))) {
                 node.type = NodeType::Constant;
                 node.value = 1.0;
             }

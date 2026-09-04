@@ -397,22 +397,33 @@ class HardConcreteOperationSelector(nn.Module):
             # FairDARTS: Independent sigmoids - no normalization
             # Each op has its own gate that doesn't compete with others
             # This prevents "unfair advantage" where one op crowds out others
-            # The weights can all be high or all be low independently
+            # The weights can all be high or all be low independently.
+            # NOTE (§3.10): raw gates can be all-zero (no active op); callers
+            # must handle the inactive combination explicitly rather than
+            # treating it as a valid discrete structure.
             pass  # Keep raw Hard Concrete values
         elif hard and self.training and self.normalize_gates:
             # Straight-through one-hot per group: use argmax in forward
             # but keep soft gradients for backprop.   This closes the
-            # train/infer discretization gap — inference also uses
+            # train/inference discretization gap — inference also uses
             # one-hot argmax, so training now sees the same structure.
-            def _straight_through_onehot(w):
-                idx = w.argmax()
+            # §3.10: argmax over EXPECTED gate probabilities (sigmoid of
+            # logits), not over stochastic samples. Argmaxing samples lets
+            # sampling noise pick the winner while gradients treat that
+            # accidental winner as the target.
+            def _straight_through_onehot(w, logits):
+                probs = torch.sigmoid(logits)
+                idx = probs.argmax()
                 oh = torch.zeros_like(w)
                 oh[idx] = 1.0
-                return w + (oh - w).detach()
+                return probs + (oh - probs).detach()
 
-            type_weights = _straight_through_onehot(type_weights)
-            unary_weights = _straight_through_onehot(unary_weights)
-            binary_weights = _straight_through_onehot(binary_weights)
+            type_weights = _straight_through_onehot(
+                type_weights, self.logits[: self._type_end])
+            unary_weights = _straight_through_onehot(
+                unary_weights, self.logits[self._type_end : self._unary_end])
+            binary_weights = _straight_through_onehot(
+                binary_weights, self.logits[self._unary_end :])
 
         return type_weights, unary_weights, binary_weights
 

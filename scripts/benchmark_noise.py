@@ -805,6 +805,7 @@ def _run_single(
             "sample_weight_mode": "none",
             "raw_mse": None,
             "display_mse": None,
+            "display_mse_source": "bad_data",
             "holdout_mse": None,
             "clean_test_mse": None,
             "clean_test_r2": None,
@@ -857,6 +858,7 @@ def _run_single(
             "sample_weight_mode": "none",
             "raw_mse": None,
             "display_mse": None,
+            "display_mse_source": "fit_failed",
             "holdout_mse": None,
             "clean_test_mse": None,
             "clean_test_r2": None,
@@ -894,8 +896,14 @@ def _run_single(
     display_mse = (
         bc.evaluate_formula_mse_on_X(formula, X_test, y_test) if formula else None
     )
+    # §3.58: record whether display_mse was genuinely evaluated or silently
+    # substituted with the protected estimator's raw MSE, so rollup medians
+    # mixing raw/display provenance can be disentangled downstream.
     if display_mse is None or not math.isfinite(float(display_mse)):
         display_mse = raw_mse
+        display_mse_source = "raw_mse_fallback"
+    else:
+        display_mse_source = "evaluated_formula"
 
     # Holdout currently mirrors the noisy test split; Phase 6 may add a
     # separate fidelity holdout. Clean columns below are the recovery signal.
@@ -940,6 +948,7 @@ def _run_single(
         "sample_weight_mode": _sample_weight_mode(est),
         "raw_mse": _to_json_float(raw_mse),
         "display_mse": _to_json_float(display_mse),
+        "display_mse_source": display_mse_source,
         "holdout_mse": _to_json_float(holdout_mse),
         "clean_test_mse": _to_json_float(clean_test_mse),
         "clean_test_r2": _to_json_float(clean_test_r2),

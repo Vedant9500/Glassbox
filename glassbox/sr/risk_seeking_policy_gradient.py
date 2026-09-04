@@ -78,10 +78,14 @@ class GradientMonitor:
         old_mean = np.mean(old_losses)
         new_mean = np.mean(new_losses)
 
-        # Stuck if improvement is too small (either direction counts as stuck)
-        improvement = abs(old_mean - new_mean)
-
-        return improvement < self.stuck_threshold
+        # §3.17: directional, scale-relative stuck test. The old
+        # abs(old-new) test could not distinguish steady improvement from a
+        # plateau: any window whose total change fell below the absolute
+        # threshold read "stuck", and worsening read identically to
+        # improving. Stuck now means "not improving enough relative to scale".
+        scale = max(1.0, abs(float(old_mean)))
+        improvement = float(old_mean) - float(new_mean)  # >0 getting better
+        return improvement < self.stuck_threshold * scale
 
     def is_exploding(self) -> bool:
         """Check if gradients are exploding."""

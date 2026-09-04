@@ -18,6 +18,19 @@ import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+# §3.11: SymLog column range derived from the shared feature schema instead
+# of repeated 192:398 literals (schema drift would silently desync data
+# loading from training statistics). Falls back to literals if the schema
+# module is unavailable.
+try:
+    from glassbox.curve_classifier.generate_curve_data import FEATURE_SCHEMA as _FEATURE_SCHEMA
+
+    SYMLOG_START = int(_FEATURE_SCHEMA["deriv"][0])
+    SYMLOG_END = int(_FEATURE_SCHEMA["invariants"][1])
+except Exception:
+    SYMLOG_START = 192
+    SYMLOG_END = 398
+
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -488,8 +501,11 @@ class IndexedFeatureDataset(Dataset):
             x_sliced = np.asarray(features[self.indices], dtype=np.float32)
 
             # Apply SymLog compression selectively to non-raw/fft features
-            x_sliced[:, 192:398] = np.sign(x_sliced[:, 192:398]) * np.log1p(
-                np.abs(x_sliced[:, 192:398])
+            if x_sliced.shape[1] < SYMLOG_END:
+                raise ValueError(
+                    f"feature width {x_sliced.shape[1]} < SYMLOG_END {SYMLOG_END}")
+            x_sliced[:, SYMLOG_START:SYMLOG_END] = np.sign(x_sliced[:, SYMLOG_START:SYMLOG_END]) * np.log1p(
+                np.abs(x_sliced[:, SYMLOG_START:SYMLOG_END])
             )
             if self.scaler is not None:
                 x_sliced = (x_sliced - self.scaler["mean"]) / (
@@ -524,7 +540,10 @@ class IndexedFeatureDataset(Dataset):
         x = np.array(self.features[sample_idx], dtype=np.float32, copy=True)
 
         # Apply SymLog compression selectively to non-raw/fft features
-        x[192:398] = np.sign(x[192:398]) * np.log1p(np.abs(x[192:398]))
+        if x.shape[0] < SYMLOG_END:
+            raise ValueError(
+                f"feature width {x.shape[0]} < SYMLOG_END {SYMLOG_END}")
+        x[SYMLOG_START:SYMLOG_END] = np.sign(x[SYMLOG_START:SYMLOG_END]) * np.log1p(np.abs(x[SYMLOG_START:SYMLOG_END]))
 
         if self.scaler is not None:
             x = (x - self.scaler["mean"]) / (self.scaler["std"] + 1e-8)
@@ -552,8 +571,11 @@ def compute_feature_stats(
         batch = np.asarray(features[batch_idx], dtype=np.float64)
 
         # Apply SymLog compression selectively to non-raw/fft features
-        batch[:, 192:398] = np.sign(batch[:, 192:398]) * np.log1p(
-            np.abs(batch[:, 192:398])
+        if batch.shape[1] < SYMLOG_END:
+            raise ValueError(
+                f"feature width {batch.shape[1]} < SYMLOG_END {SYMLOG_END}")
+        batch[:, SYMLOG_START:SYMLOG_END] = np.sign(batch[:, SYMLOG_START:SYMLOG_END]) * np.log1p(
+            np.abs(batch[:, SYMLOG_START:SYMLOG_END])
         )
 
         sum_x += batch.sum(axis=0)

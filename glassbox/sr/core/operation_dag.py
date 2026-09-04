@@ -515,6 +515,25 @@ class OperationDAG(nn.Module):
         for layer_idx, layer in enumerate(self.layers):
             layer_ops = []
             for node in layer.nodes:
+                # §3.13: simple nodes expose op_logits/get_routing — not
+                # op_selector or nested router.router. Branch before touching
+                # the full-node API so compile works for both node classes.
+                if isinstance(node, OperationNodeSimple):
+                    idx = node.op_logits.argmax().item()
+                    ops = [node.power, node.periodic, node.arithmetic]
+                    layer_ops.append(
+                        {
+                            "op": ops[idx],
+                            "op_type": "binary" if idx == 2 else "unary",
+                            "routing": node.get_routing(),
+                            "edge_weights": node.edge_weights.detach().clone(),
+                            "output_scale": torch.ones(
+                                1, device=node.op_logits.device
+                            ),
+                            "output_norm": None,
+                        }
+                    )
+                    continue
                 # Get deterministic selection
                 selection = node.op_selector.get_selected()
 

@@ -670,6 +670,10 @@ class StructureConfidenceTracker:
             self.refinement_failures += 1
             self.confidence *= 0.5  # Halve confidence
             self.generations_stable = 0
+            # §3.91: always consume the tracking state, even on failure.
+            # Otherwise a repeated end_refinement_tracking call penalizes the
+            # same failed refinement twice.
+            self.refinement_mse_before = None
             return False
 
         self.refinement_mse_before = None
@@ -2561,6 +2565,11 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                         # Clone explorer and add slight variation
                         migrant = best_explorer.clone()
                         migrant.is_explorer = False
+                        # §3.88: migrants are new individuals — never inherit an
+                        # elite evaluation skip (Tier-3 keeps stale fitness for
+                        # flagged elites; migrant fitness must be remeasured
+                        # in the main population next generation).
+                        migrant._is_elite = False
                         # Replace worst individual
                         self.population[-(i + 1)] = migrant
 
@@ -2958,8 +2967,15 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
             except Exception as e:
                 print(f"⚠️ CppGraphModule failed ({e}), using dummy model")
                 dummy_model = self.model_factory().to(self.device)
-                self.best_ever = Individual(dummy_model, fitness=result["best_mse"])
-                self.best_ever.raw_mse = result["best_mse"]
+                # §3.42: a dummy stand-in must never masquerade as the trained
+                # champion — its fitness is unknown, not the engine's best MSE.
+                self.best_ever = Individual(dummy_model, fitness=float("inf"))
+                self.best_ever.raw_mse = float("inf")
+                self.best_ever.is_explorer = False
+                try:
+                    self.best_ever.bridge_fallback = "cpp_module_failed"
+                except Exception:
+                    pass
 
             # We return early. The PyTorch loop is deprecated by the C++ core.
 
@@ -2995,8 +3011,14 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                     y_pred = fn(*[x_np[:, i] for i in range(n_features)])
 
                 y_pred = np.asarray(y_pred, dtype=np.float64).reshape(y_np.shape)
-                mask = np.isfinite(y_pred) & np.isfinite(y_np)
-                if mask.sum() >= 10:
+                # §3.41: strict C++ parity — ANY non-finite displayed
+                # prediction is a domain failure, not an invitation to score
+                # the finite subset (same divergence as FC-2). Report the
+                # failure via display_mse=None instead of a masked score.
+                finite_pred = np.isfinite(y_pred)
+                finite_tgt = np.isfinite(y_np)
+                mask = finite_pred & finite_tgt
+                if bool(np.all(finite_pred)) and mask.sum() >= 10:
                     candidate = float(np.mean((y_pred[mask] - y_np[mask]) ** 2))
                     if math.isfinite(candidate):
                         display_mse = candidate

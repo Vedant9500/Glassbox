@@ -1097,7 +1097,16 @@ def postprocess_formula_with_fidelity_guard(
             0.0, float(absolute_slack)
         )
         if processed_mse > allowed:
-            if fallback_mse is not None and fallback_mse <= processed_mse:
+            # §3.55: the guard promises to keep the original if cleanup
+            # worsens fit. The old code returned fallback whenever it beat
+            # the (already rejected) processed form — even when fallback was
+            # worse than raw. Raw is the ceiling: only a fallback that is
+            # within allowance AND no worse than raw may replace it.
+            if (
+                fallback_mse is not None
+                and fallback_mse <= allowed
+                and fallback_mse <= raw_mse
+            ):
                 return fallback, {
                     "postprocess_guard_triggered": True,
                     "postprocess_raw_mse": raw_mse,
@@ -1106,6 +1115,14 @@ def postprocess_formula_with_fidelity_guard(
                     "postprocess_guard_reason": "processed_formula_worse",
                     "postprocess_processed_eval_diagnostics": None,
                 }
+            return formula, {
+                "postprocess_guard_triggered": True,
+                "postprocess_raw_mse": raw_mse,
+                "postprocess_processed_mse": processed_mse,
+                "postprocess_fallback_mse": fallback_mse,
+                "postprocess_guard_reason": "processed_formula_worse",
+                "postprocess_processed_eval_diagnostics": None,
+            }
 
     return processed, {
         "postprocess_guard_triggered": False,
@@ -1212,14 +1229,30 @@ def summarize_time_to_discovery(
     acceptable_r2=0.9,
     complexity_cap=20,
     exact_key="exact_match",
+    legacy_whole_run_time=False,
 ):
-    """Compute time to first exact and first acceptable formula across seeded runs."""
+    """Compute time to first exact and first acceptable formula across seeded runs.
+
+    §3.56: prefers per-run discovery timestamps (``time_to_first_exact_sec``
+    and ``time_to_first_acceptable_sec``) over whole-run ``time``. Whole-run
+    duration measures runs that ended exact, not when the champion was found.
+    ``time`` is used only when discovery fields are absent, or always when
+    ``legacy_whole_run_time=True``.
+    """
     times_exact = []
     times_acceptable = []
     for run in seed_runs:
-        t = run.get("time")
-        if t is None or not np.isfinite(t):
-            continue
+        t_whole = run.get("time")
+        if legacy_whole_run_time:
+            t_exact = t_whole
+            t_accept = t_whole
+        else:
+            t_exact = run.get("time_to_first_exact_sec")
+            if t_exact is None:
+                t_exact = t_whole
+            t_accept = run.get("time_to_first_acceptable_sec")
+            if t_accept is None:
+                t_accept = t_whole
         is_exact = bool(run.get(exact_key, False))
         r2 = run.get("r2")
         size = run.get("model_size")
@@ -1230,10 +1263,10 @@ def summarize_time_to_discovery(
             and size is not None
             and size <= complexity_cap
         )
-        if is_exact:
-            times_exact.append(float(t))
-        if is_acceptable:
-            times_acceptable.append(float(t))
+        if is_exact and t_exact is not None and np.isfinite(t_exact):
+            times_exact.append(float(t_exact))
+        if is_acceptable and t_accept is not None and np.isfinite(t_accept):
+            times_acceptable.append(float(t_accept))
 
     return {
         "time_to_first_exact": (min(times_exact) if times_exact else None),

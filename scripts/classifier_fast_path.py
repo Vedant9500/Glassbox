@@ -523,20 +523,43 @@ def _evaluate_formula_values(formula: str, x_np: np.ndarray) -> np.ndarray | Non
         return None
 
 
+def _shortcut_holdout_mse(formula, x_holdout, y_holdout, holdout_mask):
+    """§3.37: evaluate (not fabricate) holdout MSE for symbolic shortcuts.
+
+    Returns the measured holdout MSE, or None when holdout is disabled or
+    the shortcut formula does not evaluate there. Never reports 0.0 without
+    evaluating.
+    """
+    if holdout_mask is None or x_holdout is None or y_holdout is None:
+        return None
+    try:
+        pred = _evaluate_formula_values(formula, np.asarray(x_holdout))
+        if pred is None:
+            return None
+        pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+        yh = np.asarray(y_holdout, dtype=np.float64).reshape(-1)
+        if pred.shape != yh.shape or not np.all(np.isfinite(pred)):
+            return None
+        return float(np.mean((pred - yh) ** 2))
+    except Exception:
+        return None
+
+
 def _safe_numpy_power(x, p):
     """
     Safe power function matching C++ power_sign_blend logic.
     Supports fractional powers of negative numbers via signed power: sign(x) * |x|^p.
     If p is an even integer, returns |x|^p (parity-preserving).
+    §3.1 canonical: parity tol 1e-9 + eps 1e-10 (matches eval.h).
     """
     x = np.asarray(x)
     p = np.asarray(p)
-    abs_x = np.abs(x) + 1e-15
+    abs_x = np.abs(x) + 1e-10
     res = np.power(abs_x, p)
 
     # Parity check for even integers
     p_round = np.round(p)
-    is_even = (np.abs(p - p_round) < 1e-6) & (p_round.astype(np.int64) % 2 == 0)
+    is_even = (np.abs(p - p_round) < 1e-9) & (p_round.astype(np.int64) % 2 == 0)
 
     if np.isscalar(is_even):
         return res if is_even else np.sign(x) * res
@@ -1862,14 +1885,28 @@ def find_exact_symbolic_match(
                     coeffs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
                     y_pred = X @ coeffs
                     mse = np.mean((y - y_pred) ** 2)
-                    if mse < tolerance:
+                    if mse < tolerance and np.all(np.isfinite(coeffs)):
                         formula = _format_affine_formula(
                             names[i], float(coeffs[1]), float(coeffs[0])
                         )
 
                         full_coeffs = np.zeros(n_basis)
-                        const_idx = names.index("1") if "1" in names else 0
-                        full_coeffs[const_idx] = coeffs[0] if include_const else 0
+                        # §3.153: never write the intercept into basis 0 when no
+                        # constant basis exists (that corrupts an unrelated
+                        # coefficient). If the intercept is representable,
+                        # store it; if it is negligible, accept with zeros;
+                        # otherwise this trial cannot be represented — skip it.
+                        if "1" in names:
+                            full_coeffs[names.index("1")] = coeffs[0]
+                        elif abs(float(coeffs[0])) > max(1e-8, float(tolerance)):
+                            update_diagnostics(
+                                {
+                                    "single_term_const_skipped": True,
+                                    "single_term_const_value": float(coeffs[0]),
+                                    "single_term_basis": names[i],
+                                }
+                            )
+                            continue
                         full_coeffs[i] = coeffs[1] if include_const else coeffs[0]
                         return formula, mse, full_coeffs
                 except (np.linalg.LinAlgError, ValueError):
@@ -1880,7 +1917,7 @@ def find_exact_symbolic_match(
                     coeff, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
                     y_pred = X @ coeff
                     mse = np.mean((y - y_pred) ** 2)
-                    if mse < tolerance:
+                    if mse < tolerance and np.all(np.isfinite(coeff)):
                         formula = _format_affine_formula(names[i], float(coeff[0]), 0.0)
 
                         full_coeffs = np.zeros(n_basis)
@@ -1941,7 +1978,12 @@ def find_exact_symbolic_match(
             mse_val = float(np.mean((y - pred) ** 2))
             if not np.isfinite(mse_val):
                 return None
-            return mse_val, support, np.asarray(coeffs, dtype=np.float64)
+            # §3.150: reject non-finite coefficients explicitly instead of
+            # relying on the recomputed MSE to go NaN downstream.
+            coeffs = np.asarray(coeffs, dtype=np.float64)
+            if not np.all(np.isfinite(coeffs)):
+                return None
+            return mse_val, support, coeffs
 
         initial_supports = []
         for idx in ranked:
@@ -2183,10 +2225,20 @@ def find_exact_symbolic_match(
                     executor.submit(search_pairs_range, start, end, stop_event)
                     for start, end in ranges
                 ]
-                for future in as_completed(futures):
-                    result = future.result()
-                    if result is not None:
-                        return result
+                try:
+                    for future in as_completed(futures):
+                        result = future.result()
+                        if result is not None:
+                            stop_event.set()
+                            return result
+                finally:
+                    # §3.152: signal + cancel queued chunks on early return
+                    # instead of waiting out every submitted range at exit.
+                    stop_event.set()
+                    try:
+                        executor.shutdown(wait=True, cancel_futures=True)
+                    except TypeError:
+                        pass
         else:
             result = search_pairs_range(0, n_basis, threading.Event())
             if result is not None:
@@ -2202,10 +2254,19 @@ def find_exact_symbolic_match(
                     executor.submit(search_triples_range, start, end, stop_event)
                     for start, end in ranges
                 ]
-                for future in as_completed(futures):
-                    result = future.result()
-                    if result is not None:
-                        return result
+                try:
+                    for future in as_completed(futures):
+                        result = future.result()
+                        if result is not None:
+                            stop_event.set()
+                            return result
+                finally:
+                    # §3.152: same early-exit cancellation as pairs above.
+                    stop_event.set()
+                    try:
+                        executor.shutdown(wait=True, cancel_futures=True)
+                    except TypeError:
+                        pass
         else:
             result = search_triples_range(0, n_basis, threading.Event())
             if result is not None:
@@ -2324,7 +2385,11 @@ def fast_path_regression(
         formula, mse, details = transform_match
         print(f"  Direct transform template match: {details['template_match']}")
         details.setdefault("y_variance", y_variance)
-        details.setdefault("holdout_mse", 0.0 if holdout_mask is not None else None)
+        # §3.37: measure holdout; do not claim 0.0 without evaluating.
+        details.setdefault(
+            "holdout_mse",
+            _shortcut_holdout_mse(formula, x_holdout, y_holdout, holdout_mask),
+        )
         return formula, mse, details
 
     # Build basis from predictions (fit subset for holdout; full data for exact-match/evaluation)
@@ -2399,7 +2464,9 @@ def fast_path_regression(
                         }
                     ],
                     "y_variance": y_variance,
-                    "holdout_mse": 0.0 if holdout_mask is not None else None,
+                    "holdout_mse": _shortcut_holdout_mse(
+                        formula, x_holdout, y_holdout, holdout_mask
+                    ),
                 },
             )
 
@@ -5124,8 +5191,13 @@ def beam_search_evolution(
             display_mse = float(np.mean((y_pred - y_np) ** 2))
         if not np.isfinite(display_mse):
             display_mse = float("inf")
+        display_mse_source = "evaluated_formula"
     except Exception:
-        display_mse = best_overall_mse
+        # §3.40: never report engine-internal MSE as the DISPLAYED formula's
+        # MSE. If the display string cannot be evaluated, its display MSE is
+        # unknown (inf), not best_overall_mse.
+        display_mse = float("inf")
+        display_mse_source = "evaluation_failed"
 
     # Post-search exactness pass: integer powers + identity rewrites when
     # raw fit is strong but display form is still approximate.
@@ -5156,6 +5228,7 @@ def beam_search_evolution(
 
     drift_penalty = abs(best_overall_mse - display_mse) / max(best_overall_mse, 1e-12)
     best_overall_result["display_mse"] = display_mse
+    best_overall_result["display_mse_source"] = display_mse_source
     best_overall_result["drift_penalty"] = drift_penalty
     best_overall_result["formula"] = formula_str
     if exactness_diag is not None:
@@ -5185,6 +5258,7 @@ def beam_search_evolution(
         "mse": display_mse,
         "raw_mse": best_overall_mse,
         "display_mse": display_mse,
+        "display_mse_source": display_mse_source,
         "model": model,
         "time": elapsed,
         "config": best_overall_config,

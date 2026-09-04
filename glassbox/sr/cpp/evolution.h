@@ -472,6 +472,19 @@ public:
                                 });
         front.erase(last, front.end());
 
+        // §3.104: export only finite-MSE individuals. Non-finite (inf/NaN)
+        // models can hold rank 0 on complexity/age alone (see §3.102 guard
+        // for selection); they must not appear in the reported
+        // MSE/complexity Pareto front. NaN in particular is never dominated
+        // by plain comparisons and would otherwise leak into the export.
+        {
+            std::vector<IndividualGraph> finite_front;
+            for (auto& ind : front) {
+                if (std::isfinite(ind.raw_mse)) finite_front.push_back(ind);
+            }
+            if (!finite_front.empty()) front.swap(finite_front);
+        }
+
         // 2-objective domination filter (MSE + complexity only).
         // Internal NSGA-II uses 3 objectives (including age) for selection,
         // but the reported Pareto front should be clean on user-visible axes.
@@ -781,15 +794,24 @@ private:
     }
 
     // Weighted median of vals using optional per-point weights (same length).
-    // Falls back to unweighted middle element when weights are absent/mismatched.
+    // Falls back to unweighted median when weights are absent/mismatched.
+    // §3.133: unweighted fallback averages the two middle values for even n
+    // (NumPy convention); the old lower-median pick ([1,2,3,4] -> 3 vs 2.5)
+    // silently disagreed with every NumPy-side statistic.
+    static double unweighted_median_of(std::vector<double>& vals) {
+        if (vals.empty()) return 0.0;
+        std::sort(vals.begin(), vals.end());
+        const size_t n = vals.size();
+        if (n % 2 == 1) return vals[n / 2];
+        return 0.5 * (vals[n / 2 - 1] + vals[n / 2]);
+    }
     static double weighted_median_of(std::vector<double>& vals,
                                      const Eigen::ArrayXd* weights,
                                      const std::vector<int>* weight_idx) {
         if (vals.empty()) return 0.0;
         if (weights == nullptr || weight_idx == nullptr ||
             weight_idx->size() != vals.size()) {
-            std::sort(vals.begin(), vals.end());
-            return vals[vals.size() / 2];
+            return unweighted_median_of(vals);
         }
         std::vector<size_t> order(vals.size());
         for (size_t i = 0; i < order.size(); ++i) order[i] = i;
@@ -804,8 +826,7 @@ private:
             total += w;
         }
         if (!(total > 0.0)) {
-            std::sort(vals.begin(), vals.end());
-            return vals[vals.size() / 2];
+            return unweighted_median_of(vals);
         }
         double half = 0.5 * total;
         double cum = 0.0;
@@ -923,20 +944,38 @@ private:
         if (config_.loss_mode == LossMode::TrimmedMse) {
             Eigen::ArrayXd sq = resid.square();
             double frac = std::clamp(config_.trim_fraction, 0.0, 0.45);
-            int keep = std::max(1, static_cast<int>(std::llround(n * (1.0 - frac))));
             std::vector<int> order(static_cast<size_t>(n));
             for (int i = 0; i < n; ++i) order[static_cast<size_t>(i)] = i;
-            std::partial_sort(order.begin(), order.begin() + keep, order.end(),
-                [&](int a, int b) { return sq(a) < sq(b); });
+            // §3.135: trim by WEIGHT MASS, not by fixed residual count. The
+            // old code kept round(n*(1-frac)) rows even with sample weights,
+            // so zero-weight rows consumed the keep budget while heavy rows
+            // could be trimmed. Unweighted path keeps the count behavior.
             if (has_y_weights_ && y_weights_.size() == n) {
+                std::sort(order.begin(), order.end(),
+                    [&](int a, int b) { return sq(a) < sq(b); });
+                double w_total = 0.0;
+                for (int i = 0; i < n; ++i) {
+                    double w = y_weights_(i);
+                    if (std::isfinite(w) && w > 0.0) w_total += w;
+                }
+                if (!(w_total > 0.0)) {
+                    return std::numeric_limits<double>::infinity();
+                }
+                const double keep_mass = w_total * (1.0 - frac);
                 double num = 0.0, den = 0.0;
-                for (int k = 0; k < keep; ++k) {
+                for (int k = 0; k < n; ++k) {
                     int i = order[static_cast<size_t>(k)];
-                    num += y_weights_(i) * sq(i);
-                    den += y_weights_(i);
+                    double w = y_weights_(i);
+                    if (!std::isfinite(w) || w <= 0.0) continue;
+                    if (den + w > keep_mass && den > 0.0) break;
+                    num += w * sq(i);
+                    den += w;
                 }
                 return (den > 0.0) ? (num / den) : std::numeric_limits<double>::infinity();
             }
+            int keep = std::max(1, static_cast<int>(std::llround(n * (1.0 - frac))));
+            std::partial_sort(order.begin(), order.begin() + keep, order.end(),
+                [&](int a, int b) { return sq(a) < sq(b); });
             double acc = 0.0;
             for (int k = 0; k < keep; ++k) acc += sq(order[static_cast<size_t>(k)]);
             return acc / static_cast<double>(keep);
@@ -2302,7 +2341,11 @@ private:
             if (mean_w > 0.0 && std::isfinite(mean_w)) cur_w /= mean_w;
             Eigen::VectorXd w_next;
             if (!ridge_solve(cur_w, w_next)) break;
+            // §3.137: stop when the IRLS fixed point settles instead of
+            // always running the full fixed iteration budget.
+            double w_change = (w_next - w).cwiseAbs().maxCoeff();
             w = w_next;
+            if (std::isfinite(w_change) && w_change < 1e-10) break;
         }
         
         // Coefficient pruning: zero out weak weights
@@ -2793,6 +2836,10 @@ private:
                     
                     int pidx = ai * 3 + pi;
                     J.col(pidx) = dAw - correction;
+                    // §3.410: same finite sanitization as the FD branch —
+                    // clamped node outputs times large log terms can still
+                    // yield non-finite entries that would poison H/g_grad.
+                    if (!J.col(pidx).allFinite()) J.col(pidx).setZero();
                 }
             }
 
@@ -4111,13 +4158,35 @@ private:
                         right_u = node_units[node.right_child];
 
                     if (node.binary_op == BinaryOp::Arithmetic) {
-                        if (node.beta < 1.5) {
-                            // Addition: units must match, result = same
+                        // §3.105: soft Arithmetic blends +,-,*,soft-div; the old
+                        // beta<1.5 test lumped every non-add blend into
+                        // multiplication and left divide unrepresentable.
+                        // Propagate units of the NEAREST discrete mode under
+                        // the same distance metric as arithmetic_soft_weights.
+                        // 0=add 1=mul 2=div 3=sub.
+                        const double d_add = (node.beta - 1.0) * (node.beta - 1.0) + (node.gamma - 1.0) * (node.gamma - 1.0);
+                        const double d_mul = (node.beta - 2.0) * (node.beta - 2.0) + (node.gamma - 1.0) * (node.gamma - 1.0);
+                        const double d_div = (node.beta - 2.0) * (node.beta - 2.0) + (node.gamma + 1.0) * (node.gamma + 1.0);
+                        const double d_sub = (node.beta - 1.0) * (node.beta - 1.0) + (node.gamma + 1.0) * (node.gamma + 1.0);
+                        int mode = 0;
+                        double best = d_add;
+                        if (d_mul < best) { best = d_mul; mode = 1; }
+                        if (d_div < best) { best = d_div; mode = 2; }
+                        if (d_sub < best) { best = d_sub; mode = 3; }
+                        if (mode == 0 || mode == 3) {
+                            // Addition/subtraction: units must match, result = same
                             node_units[i] = left_u;
-                        } else {
+                        } else if (mode == 1) {
                             // Multiplication: add exponents
                             for (int d = 0; d < n_dims; ++d)
                                 node_units[i][d] = left_u[d] + right_u[d];
+                        } else {
+                            // Soft-division x/sqrt(1+y^2): units of x minus
+                            // units of a dimensionless-bounded scale; to first
+                            // order this is division-like. Represent as
+                            // left - right (exact for the hard-div limit).
+                            for (int d = 0; d < n_dims; ++d)
+                                node_units[i][d] = left_u[d] - right_u[d];
                         }
                     } else if (node.binary_op == BinaryOp::Division) {
                         // Division: subtract exponents
@@ -4136,33 +4205,57 @@ private:
         for (int i = 0; i < n_nodes; ++i) {
             const auto& node = graph.nodes[i];
             if (node.type == NodeType::Unary && node.unary_op != UnaryOp::Power && node.unary_op != UnaryOp::IntPow && node.unary_op != UnaryOp::Abs) {
-                // sin/exp/log argument must be dimensionless
+                // sin/exp/log argument must be dimensionless.
+                // §3.106 note: omega/phi carry no unit metadata in this
+                // representation (treated as dimensionless tuning constants),
+                // so enforcement is via the child's units: any dimensioned
+                // argument is penalized regardless of omega/phi values.
                 if (node.left_child >= 0 && node.left_child < n_nodes) {
                     for (int d = 0; d < n_dims; ++d)
                         penalty += node_units[node.left_child][d] * node_units[node.left_child][d];
                 }
             }
-            if (node.type == NodeType::Binary && node.binary_op == BinaryOp::Arithmetic && node.beta < 1.5) {
-                // Addition: left and right units must match
-                if (node.left_child >= 0 && node.right_child >= 0 &&
-                    node.left_child < n_nodes && node.right_child < n_nodes) {
-                    for (int d = 0; d < n_dims; ++d) {
-                        double diff = node_units[node.left_child][d] - node_units[node.right_child][d];
-                        penalty += diff * diff;
+            if (node.type == NodeType::Binary && node.binary_op == BinaryOp::Arithmetic) {
+                // Addition/subtraction: left and right units must match.
+                // §3.105: cover the sub-like blend corner too, matching the
+                // nearest-mode propagation above (old code checked add only).
+                const double d_add = (node.beta - 1.0) * (node.beta - 1.0) + (node.gamma - 1.0) * (node.gamma - 1.0);
+                const double d_sub = (node.beta - 1.0) * (node.beta - 1.0) + (node.gamma + 1.0) * (node.gamma + 1.0);
+                const double d_mul = (node.beta - 2.0) * (node.beta - 2.0) + (node.gamma - 1.0) * (node.gamma - 1.0);
+                const double d_div = (node.beta - 2.0) * (node.beta - 2.0) + (node.gamma + 1.0) * (node.gamma + 1.0);
+                const double m = std::min(std::min(d_add, d_sub), std::min(d_mul, d_div));
+                const bool is_add_sub = (m == d_add) || (m == d_sub);
+                if (is_add_sub) {
+                    if (node.left_child >= 0 && node.right_child >= 0 &&
+                        node.left_child < n_nodes && node.right_child < n_nodes) {
+                        for (int d = 0; d < n_dims; ++d) {
+                            double diff = node_units[node.left_child][d] - node_units[node.right_child][d];
+                            penalty += diff * diff;
+                        }
                     }
                 }
             }
         }
 
-        // Output unit check: compare weighted sum units against target
+        // Output unit check: every term contributing to the weighted sum must
+        // carry the target units. §3.107: use the same kOutputWeightActive
+        // threshold as evaluation (the old 1e-4 let sub-threshold-but-live
+        // terms escape), and check the bias too (dimensionless constant —
+        // penalized whenever the target has units).
         if (!config_.output_units.empty()) {
             // Check each active node's units against output units
             for (int i = 0; i < n_nodes && i < static_cast<int>(graph.output_weights.size()); ++i) {
-                if (std::abs(graph.output_weights[i]) > 1e-4) {
+                if (std::abs(graph.output_weights[i]) > kOutputWeightActive) {
                     for (int d = 0; d < n_dims && d < static_cast<int>(config_.output_units.size()); ++d) {
                         double diff = node_units[i][d] - config_.output_units[d];
                         penalty += diff * diff;
                     }
+                }
+            }
+            if (std::abs(graph.output_bias) > kOutputWeightActive) {
+                for (int d = 0; d < n_dims && d < static_cast<int>(config_.output_units.size()); ++d) {
+                    double diff = config_.output_units[d];
+                    penalty += diff * diff;
                 }
             }
         }

@@ -479,7 +479,21 @@ class _GraphBuilder:
             (arg,) = expr.args
             lin = self._linear_in_any_feature(sp.expand(arg))
             if lin is None:
-                return None
+                # §3.121: same generic fallback as exp/log — build the inner
+                # argument as a subgraph instead of dropping the seed.
+                inner = self.build(arg)
+                if inner is None:
+                    return None
+                return self._append(
+                    _default_node(
+                        type=TYPE_UNARY,
+                        unary_op=UNARY_PERIODIC,
+                        omega=1.0,
+                        phi=0.0,
+                        amplitude=1.0,
+                        left_child=inner,
+                    )
+                )
             feature_idx, omega, phi = lin
             if feature_idx < 0:
                 return self._append(
@@ -500,7 +514,21 @@ class _GraphBuilder:
             (arg,) = expr.args
             lin = self._linear_in_any_feature(sp.expand(arg))
             if lin is None:
-                return None
+                # §3.121: same generic fallback as exp/log (cos = sin phase
+                # shift, matching the phi + pi/2 convention below).
+                inner = self.build(arg)
+                if inner is None:
+                    return None
+                return self._append(
+                    _default_node(
+                        type=TYPE_UNARY,
+                        unary_op=UNARY_PERIODIC,
+                        omega=1.0,
+                        phi=math.pi / 2.0,
+                        amplitude=1.0,
+                        left_child=inner,
+                    )
+                )
             feature_idx, omega, phi = lin
             if feature_idx < 0:
                 return self._append(

@@ -1022,18 +1022,31 @@ def _robust_loss(
         frac = float(trim_fraction)
         frac = min(max(frac, 0.0), 0.45)
         n = int(sq.size)
-        keep = max(1, int(round(n * (1.0 - frac))))
         if w is None:
+            keep = max(1, int(round(n * (1.0 - frac))))
             order = np.argsort(sq)
             return float(np.mean(sq[order[:keep]]))
-        # Soft trim: zero the largest residuals by weight mass
+        # §3.135: trim by WEIGHT MASS, not fixed residual count. The old code
+        # kept round(n*(1-frac)) rows ("by weight mass" in comment only), so
+        # zero-weight rows consumed the keep budget. Sort ascending and
+        # accumulate until (1-frac) of total weight is kept.
         order = np.argsort(sq)
-        kept_idx = order[:keep]
-        ww = w[kept_idx]
-        total = float(np.sum(ww))
-        if total <= 0:
+        w_total = float(np.sum(w))
+        keep_mass = w_total * (1.0 - frac)
+        kept = []
+        acc_w = 0.0
+        for idx in order:
+            wi = float(w[int(idx)])
+            if not np.isfinite(wi) or wi <= 0.0:
+                continue
+            if acc_w + wi > keep_mass and acc_w > 0.0:
+                break
+            kept.append(int(idx))
+            acc_w += wi
+        if acc_w <= 0:
             return float("inf")
-        return float(np.sum(ww * sq[kept_idx]) / total)
+        kept_arr = np.asarray(kept, dtype=np.int64)
+        return float(np.sum(w[kept_arr] * sq[kept_arr]) / acc_w)
 
     # student_t
     s = float(delta) if delta is not None and float(delta) > 0 else _mad_scale(resid, w)
@@ -1190,6 +1203,30 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.multi_start_auto_escalate = multi_start_auto_escalate
         self.multi_start_escalate_max = multi_start_escalate_max
         self.adaptive_compute_budget = adaptive_compute_budget
+        # §3.142: eager cross-field validation — a minimum above the maximum
+        # would otherwise silently collapse every budget to max_compute_budget
+        # inside np.clip. Fail fast with the offending values.
+        try:
+            _min_b = float(min_compute_budget)
+            _max_b = float(max_compute_budget)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "min_compute_budget and max_compute_budget must be numeric"
+            )
+        if (
+            not np.isfinite(_min_b)
+            or not np.isfinite(_max_b)
+            or _min_b <= 0
+            or _max_b <= 0
+        ):
+            raise ValueError(
+                "min_compute_budget and max_compute_budget must be finite and positive"
+            )
+        if _min_b > _max_b:
+            raise ValueError(
+                f"min_compute_budget ({_min_b}) must not exceed "
+                f"max_compute_budget ({_max_b})"
+            )
         self.min_compute_budget = min_compute_budget
         self.max_compute_budget = max_compute_budget
         self.cv_skip_guard_enabled = cv_skip_guard_enabled
@@ -2768,16 +2805,25 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             try:
                 with ThreadPoolExecutor(max_workers=n_workers) as pool:
                     futures = [pool.submit(_eval_one_skeleton, sk) for sk in rest]
-                    for fut in as_completed(futures):
+                    try:
+                        for fut in as_completed(futures):
+                            try:
+                                _consider(fut.result())
+                            except Exception:
+                                pass
+                            if (
+                                best is not None
+                                and float(best.get("inlier_mse", 1.0)) < 1e-8
+                            ):
+                                break
+                    finally:
+                        # §3.12: breaking out of as_completed still waits for
+                        # every queued future at `with` exit. Cancel work that
+                        # never started (tolerant of Python <3.9 runtimes).
                         try:
-                            _consider(fut.result())
-                        except Exception:
+                            pool.shutdown(wait=True, cancel_futures=True)
+                        except TypeError:
                             pass
-                        if (
-                            best is not None
-                            and float(best.get("inlier_mse", 1.0)) < 1e-8
-                        ):
-                            break
             except Exception:
                 for skel in rest:
                     _consider(_eval_one_skeleton(skel))

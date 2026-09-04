@@ -322,10 +322,14 @@ inline FreqResult refine_frequencies_cpp(
             grads[i] = (mse_fwd - mse_bwd) / (2 * eps);
         }
         
-        // Update omegas
+        // Update omegas with projected gradient descent (§3.98): the FD
+        // gradient is evaluated at the pre-clamp value, so project the step
+        // onto omega >= 0.01 rather than bare-clamping afterwards. Skip
+        // non-finite FD gradients instead of stepping on NaN.
         for (int i = 0; i < k; ++i) {
-            omegas[i] -= lr * grads[i];
-            if (omegas[i] < 0.01) omegas[i] = 0.01; // constrain positive
+            if (!std::isfinite(grads[i])) continue;
+            double trial = omegas[i] - lr * grads[i];
+            omegas[i] = std::max(trial, 0.01); // project onto feasible set
         }
     }
     
@@ -415,7 +419,10 @@ inline PowerResult refine_powers_model_cpp(
             grads[i] = (mse_fwd - mse_bwd) / (2 * eps);
         }
         
+        // Projected bounds + finite-gradient guard (§3.98/§3.139): NaN powers
+        // or non-finite FD probes must not step the search into NaN.
         for (int i = 0; i < num_p; ++i) {
+            if (!std::isfinite(grads[i])) continue;
             powers[i] -= lr * grads[i];
             if (powers[i] < -2.0) powers[i] = -2.0;
             if (powers[i] > 5.0) powers[i] = 5.0;
@@ -525,9 +532,10 @@ inline PeriodicRationalResult refine_periodic_rational_cpp(
         }
         double grad_c = (c_fwd - c_bwd) / (2 * eps);
         
-        omega -= lr * grad_omega;
-        c_val -= lr * grad_c;
-        if (c_val < 1e-6) c_val = 1e-6;
+        // Finite-gradient guard + projection (§3.98): skip NaN FD probes;
+        // c_val stays strictly positive (denominator safety).
+        if (std::isfinite(grad_omega)) omega -= lr * grad_omega;
+        if (std::isfinite(grad_c)) c_val = std::max(c_val - lr * grad_c, 1e-6);
     }
     return best;
 }
