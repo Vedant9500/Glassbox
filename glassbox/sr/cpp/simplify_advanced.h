@@ -137,22 +137,36 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
             } else if (node.p == 1.0) {
                 redirect[i] = node.left_child;
             } else if (child.type == NodeType::Unary && (child.unary_op == UnaryOp::Power || child.unary_op == UnaryOp::IntPow)) {
-                // (x^a)^b = x^(a*b)
-                node.p = snap_val(node.p * child.p, int_tol, zero_tol);
-                node.left_child = child.left_child;
+                // §3.108: (x^a)^b = x^(a*b) changes signed-power domain
+                // semantics for fractional b over negative x (exact gives
+                // (x^0.5)^2=|x|^2-like at x=-4 while x^1 is -4). Collapse
+                // only when domain-safe: both near-integers, or outer
+                // integer (IntPow path is exact integer pow).
+                const double pa = child.p;
+                const double pb = node.p;
+                const bool a_int = std::abs(pa - std::round(pa)) < 1e-9;
+                const bool b_int = std::abs(pb - std::round(pb)) < 1e-9;
+                const bool outer_intpow = (node.unary_op == UnaryOp::IntPow);
+                if (a_int || b_int || outer_intpow) {
+                    // (x^a)^b = x^(a*b)
+                    node.p = snap_val(node.p * child.p, int_tol, zero_tol);
+                    node.left_child = child.left_child;
+                }
             }
         } else if (node.unary_op == UnaryOp::Exp) {
             node.omega = snap_val(node.omega, int_tol, zero_tol);
             node.phi = snap_val(node.phi, int_tol, zero_tol);
             if (node.omega == 0.0) {
                 node.type = NodeType::Constant;
-                // H-02: clamp exp(phi) fold like live eval.
-                double folded = std::exp(std::clamp(node.phi, -50.0, 50.0));
+                // H-02: clamp exp(phi) fold like live eval (§3.7/§3.112:
+                // arg ±500 then output ±1e6, not early ±50 saturation).
+                double folded = std::exp(std::clamp(node.phi, -500.0, 500.0));
                 if (!std::isfinite(folded)) folded = 0.0;
                 folded = std::clamp(folded, -1e6, 1e6);
                 node.value = snap_val(folded, int_tol, zero_tol);
             } else if (child.type == NodeType::Unary && child.unary_op == UnaryOp::Log && std::abs(node.omega - 1.0) < 1e-4 && std::abs(node.phi) < 1e-4) {
-                // exp(log(|y|)) = |y|
+                // §3.109: exp(log(|y|)) = |y| holds only because Log eval
+                // uses log(|y|+eps); omega/phi generality already gated above.
                 node.unary_op = UnaryOp::Abs;
                 node.left_child = child.left_child;
             }
@@ -161,7 +175,9 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
                 node.type = NodeType::Constant;
                 node.value = snap_val(std::log(std::abs(child.value) + 1e-6), int_tol, zero_tol);
             } else if (child.type == NodeType::Unary && child.unary_op == UnaryOp::Exp && std::abs(child.omega - 1.0) < 1e-4 && std::abs(child.phi) < 1e-4) {
-                // log(exp(y)) = y
+                // §3.109: log(exp(y)) = y valid only for omega~1, phi~0
+                // (gated above); exp output is positive so log(|.|) is safe.
+                // No epsilon/range collapse beyond the existing gate.
                 redirect[i] = child.left_child;
             }
         } else if (node.unary_op == UnaryOp::Abs) {
@@ -216,7 +232,10 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
         // Algebraic identities
         if (node.binary_op == BinaryOp::Arithmetic) {
             auto w = arithmetic_soft_weights(node);
-            constexpr double kNearDiscrete = 0.95;
+            // §3.111: live eval blends all branches; identity rewrite must
+            // only fire when near-discrete. 0.99 (not 0.95) avoids
+            // contradicting live soft evaluation.
+            constexpr double kNearDiscrete = 0.99;
             double max_w = std::max({w[0], w[1], w[2], w[3]});
             
             if (max_w >= kNearDiscrete) {

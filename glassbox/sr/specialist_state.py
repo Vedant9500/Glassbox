@@ -1345,14 +1345,25 @@ def propose_specialist_compositions(
             if X_arr.shape[1] == 1:
                 gate_var = "x0"
             else:
+                # §3.20: finite-mask correlation. Raw corrcoef on NaN columns
+                # returns NaN (+RuntimeWarning) and falls back to x0 silently.
                 best_corr = -1.0
-                best_feat = 0
+                best_feat = -1
                 for i in range(X_arr.shape[1]):
-                    corr = abs(float(np.corrcoef(X_arr[:, i], t)[0, 1]))
+                    finite_i = np.isfinite(X_arr[:, i]) & np.isfinite(t)
+                    if int(finite_i.sum()) < 3:
+                        continue
+                    if float(np.std(X_arr[finite_i, i])) <= 1e-12:
+                        continue
+                    with np.errstate(all="ignore"):
+                        corr = abs(float(np.corrcoef(X_arr[finite_i, i], t[finite_i])[0, 1]))
                     if np.isfinite(corr) and corr > best_corr:
                         best_corr = corr
                         best_feat = i
-                gate_var = f"x{best_feat}"
+                if best_feat < 0:
+                    gate_var = "x0"
+                else:
+                    gate_var = f"x{best_feat}"
 
             c_candidates = np.percentile(t, [20, 30, 40, 50, 60, 70, 80])
             k_candidates = [-10.0, -5.0, -2.0, -1.0, -0.5, 0.5, 1.0, 2.0, 5.0, 10.0]

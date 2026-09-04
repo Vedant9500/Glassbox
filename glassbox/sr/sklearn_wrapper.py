@@ -11876,6 +11876,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         check_is_fitted(self, attributes=["formula_"])
         X = check_array(X)
 
+        # §3.22: enforce sklearn feature-width contract instead of silently
+        # evaluating missing variables and returning a fabricated zero vector.
+        expected = getattr(self, "n_features_in_", None)
+        if expected is not None and X.shape[1] != int(expected):
+            raise ValueError(
+                f"X has {X.shape[1]} features, but GlassboxRegressor was fitted "
+                f"with {int(expected)} features"
+            )
+
         try:
             return self._safe_eval_formula_array(self.formula_, X)
         except Exception as e:

@@ -33,15 +33,16 @@ def safe_numpy_power(x, p):
     Safe power function matching C++ power_sign_blend logic.
     Supports fractional powers of negative numbers via signed power: sign(x) * |x|^p.
     If p is an even integer, returns |x|^p (parity-preserving).
+    §3.1 canonical: parity tol 1e-9 + eps 1e-10 (matches eval.h).
     """
     x = np.asarray(x)
     p = np.asarray(p)
-    abs_x = np.abs(x) + 1e-15
+    abs_x = np.abs(x) + 1e-10
     res = np.power(abs_x, p)
 
     # Parity check for even integers
     p_round = np.round(p)
-    is_even = (np.abs(p - p_round) < 1e-6) & (p_round.astype(np.int64) % 2 == 0)
+    is_even = (np.abs(p - p_round) < 1e-9) & (p_round.astype(np.int64) % 2 == 0)
 
     if np.isscalar(is_even):
         return res if is_even else np.sign(x) * res
@@ -387,7 +388,17 @@ class MetaPower(nn.Module):
             self.register_buffer("p", torch.tensor(init_p))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply parametric power function."""
+        """Apply parametric power function.
+
+        §3.2 note: `p` gradients contain a parity-projection term from
+        `0.5*(1+cos(pi*p))` unrelated to `|x|^p ln|x|` magnitude, and the
+        `x`-gradient at 0 is eps-controlled (finite only via `self.eps`
+        for `p<1` where the true derivative is unbounded). Forward-only
+        clamp does not constrain `self.p` itself; call `clip_param_()`
+        after each optimizer step. Snap/export projects to discrete
+        parity (see `snap_to_discrete`), which is intentionally
+        non-differentiable.
+        """
         # Clamp p to valid range
         p = torch.clamp(self.p, self.p_min, self.p_max)
 
@@ -445,6 +456,11 @@ class MetaPower(nn.Module):
             nearest = min(snap_points, key=lambda sp: abs(p - sp))
             if abs(p - nearest) < threshold:
                 self.p.fill_(nearest)
+
+    def clip_param_(self) -> None:
+        """§3.2: project stored p into [p_min, p_max] after optimizer steps."""
+        with torch.no_grad():
+            self.p.copy_(torch.clamp(self.p, self.p_min, self.p_max))
 
 
 class MetaArithmetic(nn.Module):
@@ -660,8 +676,14 @@ class MetaAggregation(nn.Module):
             self.tau.abs() < 0.01, torch.sign(self.tau + 1e-8) * 0.01, self.tau
         )
 
-        # Softmax weighted aggregation (approaches max as tau->0+, min as tau->0-)
-        weights = F.softmax(x / tau, dim=dim)
+        # §3.6: true signed behavior — tau>0 soft-max, tau<0 soft-min
+        # via aggregate -max(-x) with |tau|. Negative-tau softmax weights
+        # alone still yield a convex combination, not a min.
+        if float(self.tau.detach().cpu()) < 0.0:
+            neg_tau = torch.clamp(tau.abs(), min=0.01)
+            weights = F.softmax(-x / neg_tau, dim=dim)
+        else:
+            weights = F.softmax(x / tau, dim=dim)
         result = (weights * x).sum(dim=dim)
 
         # Scale factor (allows sum when scale = n_elements)
@@ -680,6 +702,9 @@ class MetaAggregation(nn.Module):
         tau = self.tau.item()
         scale = self.scale.item()
 
+        # §3.6: negative tau denotes min; small positive tau denotes max.
+        if tau < -threshold:
+            return "min"
         if tau < threshold:
             return "max"
         elif tau > 5.0 and abs(scale - 1.0) < threshold:

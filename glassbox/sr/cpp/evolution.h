@@ -10,6 +10,7 @@
 #include <cmath>
 #include <fstream>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <string>
 #include <unordered_set>
@@ -28,6 +29,37 @@ enum class LossMode {
     TrimmedMse = 2,
     StudentT = 3,
 };
+
+// FC-1: process-global OpenMP active-level state must not be mutated
+// concurrently from GIL-released threads. Serialize configuration with a
+// process-wide mutex and restore via RAII (exception-safe).
+inline std::mutex& island_openmp_state_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+#if defined(_OPENMP)
+class MaxActiveLevelsGuard {
+public:
+    explicit MaxActiveLevelsGuard(int desired) : locked_(false), previous_(1) {
+        island_openmp_state_mutex().lock();
+        locked_ = true;
+        previous_ = omp_get_max_active_levels();
+        omp_set_max_active_levels(desired);
+    }
+    ~MaxActiveLevelsGuard() {
+        if (locked_) {
+            omp_set_max_active_levels(previous_);
+            island_openmp_state_mutex().unlock();
+        }
+    }
+    MaxActiveLevelsGuard(const MaxActiveLevelsGuard&) = delete;
+    MaxActiveLevelsGuard& operator=(const MaxActiveLevelsGuard&) = delete;
+private:
+    bool locked_;
+    int previous_;
+};
+#endif
 
 // Configuration for evolution
 struct EvolutionConfig {
@@ -200,23 +232,23 @@ public:
                       const std::vector<Eigen::ArrayXd>& new_cache) {
         if (changed_indices.empty()) return;
 
+        // §3.4: update all changed design-matrix columns first, then
+        // recompute cross terms together. Row-by-row updates using a
+        // partially refreshed A_ can leave G_ inconsistent with A^T W A
+        // when several nonlinear-descendant columns change at once.
         for (int idx : changed_indices) {
-            // 1. Update Design Matrix
-            A_.col(idx) = new_cache[idx].matrix();
-
-            // 2. Update Gramian Row and Column
-            if (use_weights_) {
-                Eigen::VectorXd wA = (w_ * A_.col(idx).array()).matrix();
-                Eigen::VectorXd new_row = A_.transpose() * wA;
-                G_.row(idx) = new_row;
-                G_.col(idx) = new_row;
-                c_(idx) = (w_ * A_.col(idx).array() * y_).sum();
-            } else {
-                Eigen::VectorXd new_row = A_.col(idx).transpose() * A_;
-                G_.row(idx) = new_row;
-                G_.col(idx) = new_row;
-                c_(idx) = A_.col(idx).dot(y_.matrix());
-            }
+            if (idx < 0 || idx >= n_features_) continue;
+            if (idx >= static_cast<int>(new_cache.size())) continue;
+            if (new_cache[static_cast<size_t>(idx)].size() != n_samples_) continue;
+            A_.col(idx) = new_cache[static_cast<size_t>(idx)].matrix();
+        }
+        if (use_weights_) {
+            Eigen::MatrixXd WA = w_.matrix().asDiagonal() * A_;
+            G_ = A_.transpose() * WA;
+            c_ = A_.transpose() * (w_ * y_).matrix();
+        } else {
+            G_ = A_.transpose() * A_;
+            c_ = A_.transpose() * y_.matrix();
         }
     }
 
@@ -543,7 +575,11 @@ public:
         // small to avoid oversubscription.
         // E7: do NOT call omp_set_num_threads inside parallel regions (process-wide
         // race). Budget inner eval via config.eval_num_threads + num_threads clause.
-        int requested_threads = std::max(1, omp_get_max_threads());
+        // FC-1: prefer per-engine eval_num_threads over process-global
+        // omp_get_max_threads() so concurrent runs do not observe each other.
+        int requested_threads = (config_.eval_num_threads > 0)
+            ? config_.eval_num_threads
+            : std::max(1, omp_get_max_threads());
         int outer_threads = std::min(config_.num_islands, requested_threads);
         int inner_threads = std::max(1, requested_threads / std::max(1, outer_threads));
         last_island_outer_threads_ = outer_threads;
@@ -554,8 +590,8 @@ public:
         }
 #if defined(_OPENMP)
         // Prefer active levels over deprecated omp_set_nested when available.
-        int previous_max_active_levels = omp_get_max_active_levels();
-        omp_set_max_active_levels(2);
+        // RAII + process mutex: exception-safe and race-free (FC-1/M-323).
+        MaxActiveLevelsGuard active_levels_guard(2);
 #endif
         std::atomic<bool> init_timed_out(false);
         #pragma omp parallel for schedule(dynamic) num_threads(outer_threads)
@@ -626,9 +662,8 @@ public:
 
             if (config_.use_early_stop && should_stop) break;
         }
-#if defined(_OPENMP)
-        omp_set_max_active_levels(previous_max_active_levels);
-#endif
+        // MaxActiveLevelsGuard destructor restores previous levels here
+        // (exception-safe; replaces manual omp_set_max_active_levels restore).
 
         // Collect the best overall across all islands and run cleanup
         for (auto& island : islands) {
@@ -2363,6 +2398,44 @@ private:
         return out;
     }
 
+    // §3.3: analytical LM Jacobian multiplies the local node derivative by
+    // the direct output weight wi, omitting downstream nonlinear ancestors.
+    // Detect whether any *other* reachable op node transitively consumes
+    // node_idx; when true the chain term is missing and FD is required.
+    bool has_nonlinear_downstream(const IndividualGraph& g, int node_idx,
+                                  const std::vector<char>& reachable) const {
+        const int n = static_cast<int>(g.nodes.size());
+        if (node_idx < 0 || node_idx >= n) return false;
+        for (int j = 0; j < n; ++j) {
+            if (j == node_idx) continue;
+            if (j < static_cast<int>(reachable.size()) && !reachable[static_cast<size_t>(j)]) continue;
+            const auto& cand = g.nodes[static_cast<size_t>(j)];
+            const bool is_op = (cand.type == NodeType::Unary || cand.type == NodeType::Binary);
+            if (!is_op) continue;
+            // DFS from candidate down through children seeking node_idx.
+            std::vector<int> stack;
+            stack.push_back(j);
+            std::vector<char> seen(static_cast<size_t>(n), 0);
+            while (!stack.empty()) {
+                int cur = stack.back();
+                stack.pop_back();
+                if (cur == node_idx) return true;
+                if (cur < 0 || cur >= n || seen[static_cast<size_t>(cur)]) continue;
+                seen[static_cast<size_t>(cur)] = 1;
+                const auto& nd = g.nodes[static_cast<size_t>(cur)];
+                if (nd.type == NodeType::Unary && nd.left_child >= 0) {
+                    if (nd.left_child == node_idx) return true;
+                    stack.push_back(nd.left_child);
+                } else if (nd.type == NodeType::Binary) {
+                    if (nd.left_child == node_idx || nd.right_child == node_idx) return true;
+                    if (nd.left_child >= 0) stack.push_back(nd.left_child);
+                    if (nd.right_child >= 0) stack.push_back(nd.right_child);
+                }
+            }
+        }
+        return false;
+    }
+
     void refine_inner_params_adam(IndividualGraph& ind) {
         if (ind.nodes.empty()) return;
         int n_samples = static_cast<int>(y_.size());
@@ -2625,10 +2698,20 @@ private:
                 // Nested unaries often have near-zero direct output weight; the
                 // analytical path multiplies by wi and starves gradients. Fall
                 // back to residual finite differences when |wi| is tiny (H-04).
+                // §3.3: even with large |wi|, a downstream nonlinear ancestor
+                // contributes a chain term the wi-only product omits, so nested
+                // nodes must also take FD (exact up to FD error).
                 constexpr double kDirectWeightEps = 1e-6;
-                const bool use_fd = !child_ok || !(std::abs(wi) > kDirectWeightEps)
+                bool use_fd = !child_ok || !(std::abs(wi) > kDirectWeightEps)
                     || node_idx >= static_cast<int>(base_cache.size())
                     || base_cache[static_cast<size_t>(node_idx)].size() != n_samples;
+                if (!use_fd) {
+                    const std::vector<char> reach_mask =
+                        collect_active_reachable_mask(base_graph);
+                    if (has_nonlinear_downstream(base_graph, node_idx, reach_mask)) {
+                        use_fd = true;
+                    }
+                }
 
                 // P-04: Log/Abs have no inner parameters — all three Jacobian
                 // columns are analytically zero. Skip entirely; count the six
@@ -3613,16 +3696,44 @@ private:
         for (int i = 0; i < n; ++i) {
             for (int j = i + 1; j < n; ++j) {
                 // 3-objective dominance: minimize raw_mse, complexity, age
+                // §3.102: non-finite raw_mse never earns rank 0 on
+                // complexity/age alone; use (is_finite, mse) as the key.
                 double mse_i = pop[i].raw_mse, mse_j = pop[j].raw_mse;
+                const bool fin_i = std::isfinite(mse_i);
+                const bool fin_j = std::isfinite(mse_j);
                 int comp_i = pop[i].active_complexity(), comp_j = pop[j].active_complexity();
                 int age_i = pop[i].age, age_j = pop[j].age;
-                
-                bool i_leq_j = (mse_i <= mse_j) && (comp_i <= comp_j) && (age_i <= age_j);
-                bool i_lt_j  = (mse_i < mse_j) || (comp_i < comp_j) || (age_i < age_j);
+
+                bool i_leq_j;
+                bool i_lt_j;
+                bool j_leq_i;
+                bool j_lt_i;
+                if (fin_i && fin_j) {
+                    i_leq_j = (mse_i <= mse_j) && (comp_i <= comp_j) && (age_i <= age_j);
+                    i_lt_j  = (mse_i < mse_j) || (comp_i < comp_j) || (age_i < age_j);
+                    j_leq_i = (mse_j <= mse_i) && (comp_j <= comp_i) && (age_j <= age_i);
+                    j_lt_i  = (mse_j < mse_i) || (comp_j < comp_i) || (age_j < age_i);
+                } else if (fin_i && !fin_j) {
+                    // Finite always dominates non-finite (strict on mse).
+                    i_leq_j = true; i_lt_j = true;
+                    j_leq_i = false; j_lt_i = false;
+                } else if (!fin_i && fin_j) {
+                    i_leq_j = false; i_lt_j = false;
+                    j_leq_i = true; j_lt_i = true;
+                } else {
+                    // Both non-finite: neither dominates on mse; fall back to
+                    // complexity/age only so invalid models cannot reach rank 0
+                    // unless nothing finite exists, and crowding keeps them grouped.
+                    i_leq_j = (comp_i <= comp_j) && (age_i <= age_j);
+                    i_lt_j  = (comp_i < comp_j) || (age_i < age_j);
+                    j_leq_i = (comp_j <= comp_i) && (age_j <= age_i);
+                    j_lt_i  = (comp_j < comp_i) || (age_j < age_i);
+                    // Demote both: require strict finite win for rank 0.
+                    // Handled by rank reassignment below; keep pairwise neutral
+                    // when equal so they share the worst front.
+                }
                 bool i_dom_j = i_leq_j && i_lt_j;
                 
-                bool j_leq_i = (mse_j <= mse_i) && (comp_j <= comp_i) && (age_j <= age_i);
-                bool j_lt_i  = (mse_j < mse_i) || (comp_j < comp_i) || (age_j < age_i);
                 bool j_dom_i = j_leq_i && j_lt_i;
 
                 if (i_dom_j) {

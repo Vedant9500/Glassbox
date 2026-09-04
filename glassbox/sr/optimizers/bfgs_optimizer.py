@@ -533,10 +533,18 @@ def build_formula_from_weights(
         feature_names = [f"f{i}" for i in range(len(weights))]
 
     # Build formula
+    # §3.15: scale-relative pruning. Raw absolute threshold alone erases
+    # all-valid-small-coefficient models (all ~0.01 vs thr 0.05 -> "0") and
+    # keeps negligible terms at large scales. Floor at 1e-3*max_abs.
     terms = []
+    try:
+        max_abs = float(weights.abs().max().item()) if len(weights) else 0.0
+    except Exception:
+        max_abs = 0.0
+    effective_threshold = min(float(threshold), 1e-3 * max_abs) if max_abs > 0 else float(threshold)
     for i, (w, name) in enumerate(zip(weights, feature_names)):
         w_val = w.item()
-        if abs(w_val) > threshold:
+        if abs(w_val) > effective_threshold:
             # Try to snap to known constant
             if snap_constants:
                 coef_str = get_constant_symbol(w_val, snap_threshold)

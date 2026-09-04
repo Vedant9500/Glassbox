@@ -38,6 +38,10 @@ inline ElasticNetResult elastic_net_cd_cpp(const Eigen::MatrixXd& X, const Eigen
                                            double l1_weight, double l2_weight, 
                                            int max_iter = 1000, double tol = 1e-7,
                                            const Eigen::VectorXd& initial_w = Eigen::VectorXd()) {
+    // §3.94 implemented objective: MSE + l1_weight*||w||_1 + l2_weight*||w||_2^2
+    // with MSE = ||r||^2/n (threshold = l1_weight/2, NOT sklearn's
+    // (1/2n)||r||^2 + alpha||w||_1 whose threshold is alpha). Callers passing
+    // sklearn alpha must scale explicitly; pybind boundary documents this.
     int n = X.rows();
     int p = X.cols();
     
@@ -113,6 +117,8 @@ inline ElasticNetResult multi_start_elastic_net(const Eigen::MatrixXd& X, const 
 
 // Optional sample_weight: when non-empty and length matches y, run weighted LS
 // via sqrt(w) row scaling (S5-9). Empty VectorXd keeps legacy unweighted path.
+// §3.95: returned mse is normalized weighted MSE sum(w r^2)/sum(w), not the
+// scaled sum/n (which dilutes excluded zero-weight rows).
 inline ElasticNetResult iterative_elastic_net(const Eigen::MatrixXd& X, const Eigen::VectorXd& y,
                                               double l1_weight, double l2_weight, 
                                               int n_starts = 3, int n_iterations = 3,
@@ -122,6 +128,12 @@ inline ElasticNetResult iterative_elastic_net(const Eigen::MatrixXd& X, const Ei
     Eigen::MatrixXd X_work = X;
     Eigen::VectorXd y_work = y;
     apply_sqrt_sample_weights(X_work, y_work, sample_weight);
+    const bool has_w = (sample_weight.size() == y.size());
+    double w_sum = 0.0;
+    if (has_w) {
+        w_sum = sample_weight.sum();
+        if (!(w_sum > 0.0) || !std::isfinite(w_sum)) w_sum = static_cast<double>(y.size());
+    }
 
     int p = X_work.cols();
     std::vector<bool> active_mask(p, true);
@@ -152,8 +164,16 @@ inline ElasticNetResult iterative_elastic_net(const Eigen::MatrixXd& X, const Ei
             full_weights(active_indices[j]) = res.weights(j);
         }
         
-        if (res.mse < best_res.mse) {
-            best_res.mse = res.mse;
+        // §3.95: normalize scaled objective to weighted MSE for selection.
+        double res_mse_norm = res.mse;
+        if (has_w) {
+            const double n_rows = static_cast<double>(X_work.rows());
+            if (w_sum > 0.0 && std::isfinite(w_sum) && n_rows > 0) {
+                res_mse_norm = res.mse * n_rows / w_sum;
+            }
+        }
+        if (res_mse_norm < best_res.mse) {
+            best_res.mse = res_mse_norm;
             best_res.weights = full_weights;
         }
         
@@ -274,10 +294,12 @@ inline FreqResult refine_frequencies_cpp(
         }
         
         // Gradient descent on omegas via finite differences
-        double eps = 1e-4;
+        // §3.97: scale-adaptive FD step (fixed 1e-4 under-resolves large
+        // |omega| and over-steps near zero). Relative step with floor.
         std::vector<double> grads(k, 0.0);
         
         for (int i = 0; i < k; ++i) {
+            const double eps = 1e-4 * (1.0 + std::abs(omegas[i]));
             // Forward step
             omegas[i] += eps;
             X.col(3 + 2*i) = (omegas[i] * x.array()).sin().matrix();
@@ -320,10 +342,12 @@ struct PowerResult {
 };
 
 // sign(x) * |x|^p (parity preserving)
+// §3.1: shares eval.h canonical parity tol (1e-9) + eps (1e-10).
+// Keep in sync with canonical_signed_power(); no independent formula.
 inline Eigen::VectorXd safe_power(const Eigen::VectorXd& x, double p) {
     Eigen::VectorXd abs_pow = (x.array().abs() + 1e-10).pow(p);
     double p_round = std::round(p);
-    bool is_even = (std::abs(p - p_round) < 1e-6) && (static_cast<long long>(p_round) % 2 == 0);
+    bool is_even = (std::abs(p - p_round) < 1e-9) && (static_cast<long long>(p_round) % 2 == 0);
     if (is_even) {
         return abs_pow;
     } else {

@@ -89,13 +89,28 @@ inline double stabilized_tau(double tau) {
 }
 
 inline double power_sign_blend(double p) {
-    // Only treat near-integers as parity-sensitive; otherwise use sign-preserving power.
+    // §3.1 canonical parity tolerance: single shared contract for all
+    // search paths (eval.h / refine.h / Torch bridge). Exact diagnostic
+    // path (core.cpp) intentionally keeps its tighter 1e-10 integer branch;
+    // see comment at evaluate_parse_node_exact.
+    constexpr double kParityTol = 1e-9;
     double p_round = std::round(p);
-    if (std::abs(p - p_round) < 1e-6) {
+    if (std::abs(p - p_round) < kParityTol) {
         long long p_int = static_cast<long long>(p_round);
         return (p_int % 2 == 0) ? 1.0 : 0.0;
     }
     return 0.0;
+}
+
+// §3.1 canonical signed power for search paths. Do not reimplement per
+// call site: eval.h Power, refine.h safe_power, and Torch CppGraphModule
+// must share tolerance/epsilon/clamp notes. eps=1e-10 matches historical
+// graph behaviour; exact path uses 1e-300 + integer pow (diagnostic only).
+inline Eigen::ArrayXd canonical_signed_power(const Eigen::ArrayXd& x, double p) {
+    Eigen::ArrayXd abs_pow = (x.abs() + 1e-10).pow(p);
+    double is_even = power_sign_blend(p);
+    Eigen::ArrayXd signed_pow = x.sign() * abs_pow;
+    return (1.0 - is_even) * signed_pow + is_even * abs_pow;
 }
 
 inline std::array<double, 4> arithmetic_soft_weights(const OpNode& node) {
@@ -255,11 +270,8 @@ inline Eigen::ArrayXd evaluate_graph_impl(
                         val = node.amplitude * (node.omega * x + node.phi).sin();
                         break;
                     case UnaryOp::Power: {
-                        auto abs_x = x.abs() + 1e-10;
-                        auto sign_x = x.sign();
-                        auto abs_pow = abs_x.pow(node.p);
-                        double is_even = power_sign_blend(node.p);
-                        val = (1.0 - is_even) * (sign_x * abs_pow) + is_even * abs_pow;
+                        // §3.1: shared canonical contract (parity tol + eps).
+                        val = canonical_signed_power(x, node.p);
                         val = val.max(-1e8).min(1e8);
                         break;
                     }
@@ -311,12 +323,24 @@ inline Eigen::ArrayXd evaluate_graph_impl(
                         break;
                     }
                     case BinaryOp::Aggregation: {
+                        // §3.6: true signed behavior. tau>0 -> soft-max,
+                        // tau<0 -> soft-min via -max(-x) with |tau|.
+                        // A convex combination with negative-tau softmax
+                        // weights alone does not yield a min operator.
                         double local_tau = stabilized_tau(node.tau);
-                        auto max_val = x.max(y);
-                        auto exp_x = ((x - max_val) / local_tau).exp();
-                        auto exp_y = ((y - max_val) / local_tau).exp();
+                        Eigen::ArrayXd ax = x;
+                        Eigen::ArrayXd ay = y;
+                        if (local_tau < 0.0) {
+                            ax = -ax;
+                            ay = -ay;
+                        }
+                        double mag = std::abs(local_tau);
+                        auto max_val = ax.max(ay);
+                        auto exp_x = ((ax - max_val) / mag).exp();
+                        auto exp_y = ((ay - max_val) / mag).exp();
                         auto sum_exp = exp_x + exp_y;
-                        val = (x * exp_x / sum_exp) + (y * exp_y / sum_exp);
+                        Eigen::ArrayXd blended = (ax * exp_x / sum_exp) + (ay * exp_y / sum_exp);
+                        val = (local_tau < 0.0) ? -blended : blended;
                         break;
                     }
                 }

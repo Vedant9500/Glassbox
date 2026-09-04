@@ -53,10 +53,11 @@ inline void simplify_node(IndividualGraph& graph, int node_idx) {
                     res = node.amplitude * std::sin(node.omega * v + node.phi);
                     break;
                 case UnaryOp::Power: {
+                    // §3.1 canonical parity tol 1e-9 (matches eval.h).
                     double abs_v = std::abs(v) + 1e-10;
                     double sign_v = (v >= 0) ? 1.0 : -1.0;
                     double p_round = std::round(node.p);
-                    bool is_even = (std::abs(node.p - p_round) < 1e-6) &&
+                    bool is_even = (std::abs(node.p - p_round) < 1e-9) &&
                                    (static_cast<long long>(p_round) % 2 == 0);
                     double abs_pow = std::pow(abs_v, node.p);
                     res = is_even ? abs_pow : sign_v * abs_pow;
@@ -67,8 +68,10 @@ inline void simplify_node(IndividualGraph& graph, int node_idx) {
                         v, std::clamp(static_cast<int>(std::round(node.p)), 2, 6));
                     break;
                 case UnaryOp::Exp:
-                    // Match eval.h clamp band for exp (H-02).
-                    res = std::exp(std::clamp(node.omega * v + node.phi, -50.0, 50.0));
+                    // §3.7/§3.112: exact path clamps arg ±500, graph clamps
+                    // output ±1e6. Fold must not saturate early at ±50: use
+                    // ±500 arg clamp then output clamp, matching exact+graph.
+                    res = std::exp(std::clamp(node.omega * v + node.phi, -500.0, 500.0));
                     res = std::clamp(res, -1e6, 1e6);
                     break;
                 case UnaryOp::Log:

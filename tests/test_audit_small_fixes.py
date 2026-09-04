@@ -15,7 +15,6 @@ from glassbox.sr.operations.meta_ops import MetaArithmeticExtended
 from glassbox.sr.optimizers import EvolutionaryOptimizer, LBFGSConstantOptimizer
 from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
-
 # ── M-04: Meta soft-div parity with C++ sqrt form ───────────────────────
 
 

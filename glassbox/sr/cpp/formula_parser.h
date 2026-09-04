@@ -334,6 +334,10 @@ inline std::string normalize_formula_string(std::string formula) {
     
     replace_all(formula, "π²", "(pi^2)");
     replace_all(formula, "e²", "(e^2)");
+    // §3.16: general superscript parity with benchmark normalizer so Phase-2
+    // feature names (x²/x³) parse natively without external normalization.
+    replace_all(formula, "²", "^2");
+    replace_all(formula, "³", "^3");
     replace_all(formula, "2π", "(2*pi)");
     replace_all(formula, "π/2", "(pi/2)");
     replace_all(formula, "π/3", "(pi/3)");
@@ -617,6 +621,9 @@ public:
     }
 
     // Variable exponent: sign(base) * exp(exp * log(|base|)), matching Unary Power domain.
+    // §3.8 note: approximation, not exact Unary Power. No parity blend, 5 extra
+    // nodes per variable power, and exp/log saturation (±1e6 out / log eps)
+    // differs from the direct Power path (±1e8). Documented, not silently equal.
     int append_variable_power(int base_idx, int exp_idx) {
         // log(|base|) — Log already applies abs inside eval.
         OpNode log_n;

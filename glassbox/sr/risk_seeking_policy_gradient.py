@@ -199,7 +199,11 @@ def compute_selection_probabilities_rspg(
 
     # Apply softmax to get probabilities
     # Lower temperature = more concentrated on best
-    exp_advantages = np.exp(advantages / (temperature + 1e-8))
+    # §3.18: max-subtracted stable softmax; raw exp overflows for
+    # moderate fitness scales (e.g. [-1000,0,1000]/0.5 -> inf/nan).
+    scaled = advantages / (temperature + 1e-8)
+    scaled = scaled - np.max(scaled)
+    exp_advantages = np.exp(scaled)
     probabilities = exp_advantages / (exp_advantages.sum() + 1e-8)
 
     return probabilities.tolist()

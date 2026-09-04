@@ -54,6 +54,12 @@ static Eigen::ArrayXd evaluate_parse_node_exact(
             return left * right.sign() / (right.abs() + kDivEps);
         }
         case sr::ParseNodeType::Pow: {
+            // §3.1 note: exact/diagnostic path. Integer branch tol 1e-10 +
+            // eps 1e-300 intentionally differs from search-path canonical
+            // contract (eval.h parity tol 1e-9, eps 1e-10). Prefer graph
+            // scorer for ranking; this path remains for display/exact
+            // diagnostics. Do not "fix" by copying graph formula here —
+            // change the shared contract, not local copies.
             Eigen::ArrayXd base = evaluate_parse_node_exact(node->left, X, num_samples);
             Eigen::ArrayXd exp_arr = evaluate_parse_node_exact(node->right, X, num_samples);
             Eigen::ArrayXd out(num_samples);
@@ -258,14 +264,15 @@ static py::list score_formula_candidates_cpp(
     }
     std::vector<CandidateScore> scores(formulas.size());
 
-    int previous_omp_threads = omp_get_max_threads();
-    if (num_threads > 0) omp_set_num_threads(num_threads);
+    // FC-1: per-call thread budget only; never mutate process-global
+    // omp_set_num_threads from a GIL-released path.
+    const int score_threads = (num_threads > 0) ? num_threads : omp_get_max_threads();
 
     {
         py::gil_scoped_release release;
         // Near-discrete soft arithmetic for ranking (set once outside OMP; E10).
         sr::ScopedArithmeticTemperature scoped_temp(100.0);
-        #pragma omp parallel for schedule(dynamic)
+        #pragma omp parallel for schedule(dynamic) num_threads(score_threads)
         for (int idx = 0; idx < static_cast<int>(formulas.size()); ++idx) {
             // H-06: reused OMP pool threads keep TLS from earlier engine runs;
             // re-apply the scoring temperature in every worker body so results
@@ -384,7 +391,7 @@ static py::list score_formula_candidates_cpp(
         }
     }
 
-    if (num_threads > 0) omp_set_num_threads(previous_omp_threads);
+    // FC-1: no global thread-count to restore (per-call num_threads clause only).
 
     py::list out;
     for (const auto& score : scores) {
@@ -583,26 +590,33 @@ static py::dict run_evolution_cpp(
     int seed_graph_node_limit = std::max(24, std::min(64, early_stop_max_nodes));
     const int n_features = static_cast<int>(X.size());
     for (auto item : seed_graphs_py) {
+        try {
         auto gdict = item.cast<py::dict>();
         sr::IndividualGraph g;
         
         if (gdict.contains("nodes")) {
             auto nodes_list = gdict["nodes"].cast<py::list>();
+            auto require_finite = [&](double v, const char* field) {
+                if (!std::isfinite(v)) {
+                    throw std::runtime_error(
+                        std::string("seed graph field ") + field + " must be finite");
+                }
+            };
             for (auto n_item : nodes_list) {
                 auto ndict = n_item.cast<py::dict>();
                 sr::OpNode node;
                 node.type = static_cast<sr::NodeType>(ndict["type"].cast<int>());
                 if (ndict.contains("feature_idx")) node.feature_idx = ndict["feature_idx"].cast<int>();
-                if (ndict.contains("value")) node.value = ndict["value"].cast<double>();
+                if (ndict.contains("value")) { node.value = ndict["value"].cast<double>(); require_finite(node.value, "value"); }
                 if (ndict.contains("unary_op")) node.unary_op = static_cast<sr::UnaryOp>(ndict["unary_op"].cast<int>());
                 if (ndict.contains("binary_op")) node.binary_op = static_cast<sr::BinaryOp>(ndict["binary_op"].cast<int>());
-                if (ndict.contains("p")) node.p = ndict["p"].cast<double>();
-                if (ndict.contains("omega")) node.omega = ndict["omega"].cast<double>();
-                if (ndict.contains("phi")) node.phi = ndict["phi"].cast<double>();
-                if (ndict.contains("amplitude")) node.amplitude = ndict["amplitude"].cast<double>();
-                if (ndict.contains("beta")) node.beta = ndict["beta"].cast<double>();
-                if (ndict.contains("gamma")) node.gamma = ndict["gamma"].cast<double>();
-                if (ndict.contains("tau")) node.tau = ndict["tau"].cast<double>();
+                if (ndict.contains("p")) { node.p = ndict["p"].cast<double>(); require_finite(node.p, "p"); }
+                if (ndict.contains("omega")) { node.omega = ndict["omega"].cast<double>(); require_finite(node.omega, "omega"); }
+                if (ndict.contains("phi")) { node.phi = ndict["phi"].cast<double>(); require_finite(node.phi, "phi"); }
+                if (ndict.contains("amplitude")) { node.amplitude = ndict["amplitude"].cast<double>(); require_finite(node.amplitude, "amplitude"); }
+                if (ndict.contains("beta")) { node.beta = ndict["beta"].cast<double>(); require_finite(node.beta, "beta"); }
+                if (ndict.contains("gamma")) { node.gamma = ndict["gamma"].cast<double>(); require_finite(node.gamma, "gamma"); }
+                if (ndict.contains("tau")) { node.tau = ndict["tau"].cast<double>(); require_finite(node.tau, "tau"); }
                 if (ndict.contains("left_child")) node.left_child = ndict["left_child"].cast<int>();
                 if (ndict.contains("right_child")) node.right_child = ndict["right_child"].cast<int>();
                 g.nodes.push_back(node);
@@ -612,11 +626,21 @@ static py::dict run_evolution_cpp(
         if (gdict.contains("output_weights")) {
             auto weights_list = gdict["output_weights"].cast<py::list>();
             for (auto w : weights_list) {
-                g.output_weights.push_back(w.cast<double>());
+                double wv = w.cast<double>();
+                // §3.9: non-finite seed weights must not enter hashing/scoring.
+                if (!std::isfinite(wv)) {
+                    throw std::runtime_error("seed graph field output_weights must be finite");
+                }
+                g.output_weights.push_back(wv);
             }
         }
         
-        if (gdict.contains("output_bias")) g.output_bias = gdict["output_bias"].cast<double>();
+        if (gdict.contains("output_bias")) {
+            g.output_bias = gdict["output_bias"].cast<double>();
+            if (!std::isfinite(g.output_bias)) {
+                throw std::runtime_error("seed graph field output_bias must be finite");
+            }
+        }
 
         // S6: normalize weight vector length to node count (short -> pad 0; long -> trim).
         // Mismatched lengths otherwise silently drop active terms or leave junk tails.
@@ -665,6 +689,12 @@ static py::dict run_evolution_cpp(
             continue;
         }
         cpp_seed_graphs.push_back(std::move(g));
+        } catch (const std::exception&) {
+            // §3.9: non-finite seed params / malformed seed dicts count as
+            // invalid (hash/score must never see NaN payloads).
+            ++seed_graphs_skipped_invalid;
+            continue;
+        }
     }
 
     // Parse input_units (list of lists)
@@ -761,21 +791,18 @@ static py::dict run_evolution_cpp(
     // RAII restores prior process temperature after this call (E10).
     sr::ScopedArithmeticTemperature scoped_run_temp(arithmetic_temperature);
 
-    // S6-4: prefer per-engine eval_num_threads over process-global omp_set_num_threads
-    // so concurrent run_evolution calls do not race on the OpenMP max-thread count.
-    // When num_threads>0 we still set global threads for outer island parallel regions,
-    // but restore immediately after the run; island eval budgets use eval_num_threads.
-    int previous_omp_threads = omp_get_max_threads();
-    const bool set_global_omp = (num_threads > 0);
-    if (set_global_omp) {
-        omp_set_num_threads(num_threads);
-        config.eval_num_threads = num_threads;
-    }
+    // FC-1: per-call thread budget only. Never mutate process-global ICVs:
+    // pybind11 releases the GIL, so concurrent Python threads would otherwise
+    // race on omp_set_num_threads / restore each other's settings.
+    // run_islands() derives outer/inner teams from eval_num_threads.
+    config.eval_num_threads = std::max(0, num_threads);
     
     // Avoid always-on library stdout; only banner when tracing is enabled.
     if (config.enable_trace) {
+        const int banner_threads = (config.eval_num_threads > 0)
+            ? config.eval_num_threads : omp_get_max_threads();
         std::cout << "[v6-nsga2] Starting C++ Evolution with "
-                  << omp_get_max_threads() << " OpenMP Threads!";
+                  << banner_threads << " OpenMP Threads!";
         if (use_nsga2) std::cout << " (NSGA-II mode)";
         if (num_islands > 1) {
             std::cout << " (Island Model: " << num_islands << " islands)";
@@ -786,9 +813,9 @@ static py::dict run_evolution_cpp(
     sr::EvolutionEngine engine(
         config, X, y, cpp_seed_omegas, cpp_seed_graphs, y_weights
     );
-    if (set_global_omp) {
-        engine.set_eval_num_threads(num_threads);
-    }
+    // Per-engine budget is already in config; mirror to engine explicitly
+    // so single-population runs also honor the caller's request.
+    engine.set_eval_num_threads(config.eval_num_threads);
     
     // 3. Run evolution loop natively in C++
     {
@@ -800,10 +827,8 @@ static py::dict run_evolution_cpp(
         }
     }
 
-    // Restore thread count if modified (S6-4).
-    if (set_global_omp) {
-        omp_set_num_threads(previous_omp_threads);
-    }
+    // FC-1: no global thread-count restore (no global mutation above;
+    // also exception-safe: an escaping exception cannot leak thread state).
     
     // 4. Return results as Python dict
     auto best = engine.get_best();
@@ -1016,6 +1041,19 @@ static py::tuple iterative_elastic_net_wrapper(py::array_t<double> X_arr, py::ar
     auto y_arr_c = ensure_f64_c(y_arr);
     auto X_buf = X_arr_c.request();
     auto y_buf = y_arr_c.request();
+    // §3.99: reject rank/shape reinterpretation before Eigen mapping.
+    if (X_buf.ndim != 2 || y_buf.ndim > 1) {
+        throw std::invalid_argument("X must be 2D and y must be 1D");
+    }
+    if (y_buf.size != X_buf.shape[0]) {
+        throw std::invalid_argument("X and y row counts must match");
+    }
+    if (!std::isfinite(l1_weight) || !std::isfinite(l2_weight) || l1_weight < 0 || l2_weight < 0) {
+        throw std::invalid_argument("l1_weight/l2_weight must be finite and non-negative");
+    }
+    if (max_iter <= 0 || n_starts <= 0 || n_iterations <= 0) {
+        throw std::invalid_argument("iteration/start counts must be positive");
+    }
     
     int n = X_buf.shape[0];
     int p = X_buf.shape[1];
@@ -1026,12 +1064,21 @@ static py::tuple iterative_elastic_net_wrapper(py::array_t<double> X_arr, py::ar
 
     Eigen::VectorXd sw;
     if (!sample_weight.is_none()) {
-        py::array_t<double> w_arr = py::cast<py::array_t<double>>(sample_weight);
+        // §3.100: forcecast/contiguous + finite/nonnegative/positive-total.
+        auto w_arr = ensure_f64_c(sample_weight);
         auto w_buf = w_arr.request();
-        if (static_cast<int>(w_buf.size) != static_cast<int>(y_buf.size)) {
+        if (w_buf.ndim != 1 || static_cast<int>(w_buf.size) != static_cast<int>(y_buf.size)) {
             throw std::invalid_argument("sample_weight length must match y");
         }
         sw = Eigen::Map<Eigen::VectorXd>(static_cast<double*>(w_buf.ptr), w_buf.size);
+        for (int i = 0; i < sw.size(); ++i) {
+            if (!std::isfinite(sw(i)) || sw(i) < 0) {
+                throw std::invalid_argument("sample_weight must be finite and non-negative");
+            }
+        }
+        if (sw.sum() <= 0 || !std::isfinite(sw.sum())) {
+            throw std::invalid_argument("sample_weight must have positive total");
+        }
     }
 
     auto res = sr::iterative_elastic_net(X, y, l1_weight, l2_weight, n_starts, n_iterations, prune_threshold, max_iter, sw);
@@ -1052,6 +1099,16 @@ static py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::
     auto y_arr_c = ensure_f64_c(y_arr);
     auto X_buf = X_arr_c.request();
     auto y_buf = y_arr_c.request();
+    // §3.99: reject rank/shape reinterpretation before Eigen mapping.
+    if (X_buf.ndim != 2 || y_buf.ndim > 1) {
+        throw std::invalid_argument("X must be 2D and y must be 1D");
+    }
+    if (y_buf.size != X_buf.shape[0]) {
+        throw std::invalid_argument("X and y row counts must match");
+    }
+    if (!std::isfinite(alpha) || alpha < 0 || !std::isfinite(tol) || tol <= 0 || max_iter <= 0) {
+        throw std::invalid_argument("alpha/tol/max_iter must be finite and positive (alpha>=0)");
+    }
     
     int n = X_buf.shape[0];
     int p = X_buf.shape[1];
@@ -1060,15 +1117,35 @@ static py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::
         static_cast<double*>(X_buf.ptr), n, p);
     Eigen::VectorXd y = Eigen::Map<Eigen::VectorXd>(static_cast<double*>(y_buf.ptr), y_buf.size);
     if (!sample_weight.is_none()) {
-        py::array_t<double> w_arr = py::cast<py::array_t<double>>(sample_weight);
+        // §3.100: forcecast/contiguous + finite/nonnegative/positive-total.
+        auto w_arr = ensure_f64_c(sample_weight);
         auto w_buf = w_arr.request();
-        if (static_cast<int>(w_buf.size) != n) {
+        if (w_buf.ndim != 1 || static_cast<int>(w_buf.size) != n) {
             throw std::invalid_argument("sample_weight length must match y");
         }
         Eigen::VectorXd sw = Eigen::Map<Eigen::VectorXd>(static_cast<double*>(w_buf.ptr), w_buf.size);
+        for (int i = 0; i < sw.size(); ++i) {
+            if (!std::isfinite(sw(i)) || sw(i) < 0) {
+                throw std::invalid_argument("sample_weight must be finite and non-negative");
+            }
+        }
+        if (sw.sum() <= 0 || !std::isfinite(sw.sum())) {
+            throw std::invalid_argument("sample_weight must have positive total");
+        }
         sr::apply_sqrt_sample_weights(X, y, sw);
     }
 
+    // §3.96: alpha=0/l2=0 is plain OLS — direct QR solve, not slow CD.
+    // Nonzero l2 means "iterative LASSO" is actually elastic net (shrinkage
+    // documented at the Python API); result stays shrinkage-biased by design.
+    if (alpha == 0.0) {
+        Eigen::VectorXd w = sr::solve_linear(X, y);
+        py::list w_out;
+        for (int i = 0; i < w.size(); ++i) {
+            w_out.append(w(i));
+        }
+        return w_out;
+    }
     auto res = sr::elastic_net_cd_cpp(X, y, alpha, 0.0, max_iter, tol);
     
     py::list w_out;

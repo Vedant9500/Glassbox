@@ -43,11 +43,15 @@ class CppGraphModule(nn.Module):
     # Match eval.h get_arithmetic_temperature default when no process hook.
     DEFAULT_ARITHMETIC_TEMPERATURE = 5.0
 
-    def __init__(self, cpp_result: dict, arithmetic_temperature: float | None = None):
+    def __init__(self, cpp_result: dict, arithmetic_temperature: float | None = None,
+                 strict_nonfinite: bool = True):
         super().__init__()
 
         self.nodes = cpp_result["nodes"]
         self.formula_str = cpp_result.get("formula", "")
+        # §3.5: strict parity with C++ eval (reject non-finite) by default.
+        # strict_nonfinite=False restores legacy zero-fill for training probes.
+        self.strict_nonfinite = bool(strict_nonfinite)
         self.arithmetic_temperature = (
             float(arithmetic_temperature)
             if arithmetic_temperature is not None
@@ -161,11 +165,12 @@ class CppGraphModule(nn.Module):
                 if unary_op == self.UNARY_PERIODIC:
                     out = amplitude * torch.sin(omega * child + phi)
                 elif unary_op == self.UNARY_POWER:
+                    # §3.1 canonical parity tol 1e-9 + eps 1e-10 (matches eval.h).
                     abs_child = torch.abs(child) + eps
                     sign_child = torch.sign(child)
                     abs_pow = abs_child.pow(p)
                     p_round = torch.round(p)
-                    is_even = (torch.abs(p - p_round) < 1e-6) & (
+                    is_even = (torch.abs(p - p_round) < 1e-9) & (
                         p_round.long() % 2 == 0
                     )
                     is_even = is_even.double()
@@ -225,6 +230,7 @@ class CppGraphModule(nn.Module):
                     )
                     out = torch.clamp(out, -1e6, 1e6)
                 elif binary_op == self.BINARY_AGGREGATION:
+                    # §3.6: mirror eval.h signed behavior (min via -max(-x)).
                     tau = getattr(self, f"tau_{i}")
                     local_tau = torch.where(
                         torch.abs(tau) >= 1e-3,
@@ -232,18 +238,26 @@ class CppGraphModule(nn.Module):
                         torch.tensor(1e-3, dtype=torch.float64, device=tau.device)
                         * torch.sign(tau + 1e-30),
                     )
-                    max_val = torch.maximum(left_val, right_val)
-                    exp_l = torch.exp((left_val - max_val) / local_tau)
-                    exp_r = torch.exp((right_val - max_val) / local_tau)
+                    is_min = bool(float(local_tau.detach().cpu()) < 0.0)
+                    ax = -left_val if is_min else left_val
+                    ay = -right_val if is_min else right_val
+                    mag = torch.abs(local_tau)
+                    max_val = torch.maximum(ax, ay)
+                    exp_l = torch.exp((ax - max_val) / mag)
+                    exp_r = torch.exp((ay - max_val) / mag)
                     sum_exp = exp_l + exp_r
-                    out = (left_val * exp_l + right_val * exp_r) / sum_exp
+                    blended = (ax * exp_l + ay * exp_r) / sum_exp
+                    out = -blended if is_min else blended
                 else:
                     out = left_val + right_val
             else:
                 out = torch.zeros(n_samples, dtype=torch.float64, device=device)
 
             out = torch.clamp(out, -1e6, 1e6)
-            out = torch.where(torch.isfinite(out), out, torch.zeros_like(out))
+            # §3.5: preserve C++ failure semantics by default; legacy
+            # zero-fill only when strict_nonfinite=False.
+            if not self.strict_nonfinite:
+                out = torch.where(torch.isfinite(out), out, torch.zeros_like(out))
             node_outputs.append(out)
 
         result = torch.zeros(n_samples, dtype=torch.float64, device=device)
@@ -262,7 +276,8 @@ class CppGraphModule(nn.Module):
 
 
 def cpp_result_to_module(
-    result: dict, arithmetic_temperature: float | None = None
+    result: dict, arithmetic_temperature: float | None = None,
+    strict_nonfinite: bool = True,
 ) -> CppGraphModule:
     """
     Convenience: convert a C++ run_evolution() result dict into a nn.Module.
@@ -273,4 +288,5 @@ def cpp_result_to_module(
         module = cpp_result_to_module(result)
         pred, _ = module(x_tensor)
     """
-    return CppGraphModule(result, arithmetic_temperature=arithmetic_temperature)
+    return CppGraphModule(result, arithmetic_temperature=arithmetic_temperature,
+                          strict_nonfinite=strict_nonfinite)
