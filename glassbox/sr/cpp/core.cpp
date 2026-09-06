@@ -582,6 +582,20 @@ static py::dict run_evolution_cpp(
         }
         cpp_multi_seed_omegas.push_back(seed_vec);
     }
+    // §3.253: island config vectors must be empty (inherit) or exactly
+    // num_islands. Ragged/extra entries were silently ignored or inherited
+    // per-island, producing inconsistent priors across islands.
+    {
+        auto require_island_len = [&](const char* name, size_t got) {
+            if (got != 0 && got != static_cast<size_t>(num_islands))
+                throw py::value_error(std::string(name) + " must be empty or have exactly num_islands entries");
+        };
+        require_island_len("multi_op_priors", cpp_multi_op_priors.size());
+        require_island_len("multi_binary_op_priors", cpp_multi_binary_op_priors.size());
+        require_island_len("multi_allowed_unary_ops", cpp_multi_allowed_unary_ops.size());
+        require_island_len("multi_allowed_binary_ops", cpp_multi_allowed_binary_ops.size());
+        require_island_len("multi_seed_omegas", cpp_multi_seed_omegas.size());
+    }
 
     // Parse seed_graphs
     std::vector<sr::IndividualGraph> cpp_seed_graphs;
@@ -715,6 +729,19 @@ static py::dict run_evolution_cpp(
 
     // 2. Configure engine
     sr::EvolutionConfig config;
+    // §3.248: reject nonpositive budgets that previously caused immediate
+    // stop / uninitialized-champion cleanup. Zero stays legal (existing
+    // semantics); negatives are caller errors.
+    if (timeout_seconds < 0)
+        throw py::value_error("timeout_seconds must be >= 0");
+    if (generations < 0)
+        throw py::value_error("generations must be >= 0");
+    // §3.247: NaN/inf or inverted power bounds make std::clamp UB and
+    // poison power sampling/seed filtering. Validate before engine build.
+    if (!std::isfinite(p_min) || !std::isfinite(p_max))
+        throw py::value_error("p_min and p_max must be finite");
+    if (!(p_min < p_max))
+        throw py::value_error("p_min must be < p_max");
     config.timeout_seconds = timeout_seconds;
     config.pop_size = pop_size;
     config.generations = generations;
@@ -756,16 +783,36 @@ static py::dict run_evolution_cpp(
     config.early_stop_max_nodes = early_stop_max_nodes;
     config.arithmetic_temperature = arithmetic_temperature;
     // S6-2 / E3: allow Python to override elite count and seed injection capacity.
+    // §3.251: negatives are rejected explicitly. Zero maps to 1: native elitism
+    // is structural (champion tracking assumes >=1 elite), so zero-elite is not
+    // a legal native configuration — documented here rather than silently raised.
+    if (elite_size < 0)
+        throw py::value_error("elite_size must be >= 0");
     config.elite_size = std::max(1, elite_size);
-    config.seed_fraction = std::clamp(seed_fraction, 0.05, 1.0);
+    // §3.250: single shared lower bound 0.1. Was 0.05 here while
+    // EvolutionEngine::max_seed_capacity floors at 0.1, so requests in
+    // [0.05, 0.1) were stored as-is but executed as 0.1 (same effective
+    // budget, confusing provenance). Boundary now matches effective.
+    if (!std::isfinite(seed_fraction))
+        throw py::value_error("seed_fraction must be finite");
+    config.seed_fraction = std::clamp(seed_fraction, 0.1, 1.0);
     config.macro_mutation_rate = std::clamp(macro_mutation_rate, 0.0, 0.9);
     // P-04: optional override for tests / experiments (engine default true).
     config.use_lm_inner_optimizer = use_lm_inner_optimizer;
     {
         std::vector<double> mmw;
         for (auto item : macro_mode_weights) {
-            mmw.push_back(item.cast<double>());
+            double v = item.cast<double>();
+            // §3.252: non-finite entries previously vanished into the engine.
+            if (!std::isfinite(v))
+                throw py::value_error("macro_mode_weights entries must be finite");
+            mmw.push_back(v);
         }
+        // §3.252: empty = engine defaults; exactly 4 = explicit modes.
+        // Other lengths were silently ignored — now an explicit error.
+        // Negatives keep the engine's max(0,·) clamp (no behavior change).
+        if (!mmw.empty() && mmw.size() != 4)
+            throw py::value_error("macro_mode_weights must be empty or have exactly 4 entries [wrap, multiply, divide, nest]");
         if (mmw.size() >= 4) {
             config.macro_mode_weights = std::move(mmw);
         }
@@ -773,15 +820,19 @@ static py::dict run_evolution_cpp(
     // leave eval_num_threads=0 for auto.
 
     // Phase 4: robust search loss (default mse preserves legacy behaviour).
+    // §3.246: unknown strings previously became MSE silently (typos like
+    // "trimmed-mse" disabled the robust objective). Reject at the boundary;
+    // accepted set mirrors Python _VALID_LOSS_MODES plus legacy aliases.
     {
         std::string mode = loss_mode;
         for (char& c : mode) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        if (mode == "huber") config.loss_mode = sr::LossMode::Huber;
+        if (mode == "mse") config.loss_mode = sr::LossMode::Mse;
+        else if (mode == "huber") config.loss_mode = sr::LossMode::Huber;
         else if (mode == "trimmed_mse" || mode == "trimmed") config.loss_mode = sr::LossMode::TrimmedMse;
         else if (mode == "student_t" || mode == "student-t" || mode == "studentt") {
             config.loss_mode = sr::LossMode::StudentT;
         } else {
-            config.loss_mode = sr::LossMode::Mse;
+            throw py::value_error("loss_mode must be one of mse, huber, trimmed_mse, student_t (aliases: trimmed, student-t, studentt)");
         }
         config.huber_delta = huber_delta;
         config.trim_fraction = trim_fraction;
@@ -847,6 +898,10 @@ static py::dict run_evolution_cpp(
     result["generation_to_first_acceptable"] = engine.get_first_acceptable_generation();
     result["evolution_wall_time_sec"] = engine.get_run_wall_time_sec();
     result["random_seed"] = engine.get_random_seed();
+    // §3.249: set_arithmetic_temperature silently clamps requests outside
+    // [0.1, 100] (eval.h). Record the effective value so callers can see
+    // the clamp instead of assuming the requested temperature applied.
+    result["effective_arithmetic_temperature"] = std::clamp(arithmetic_temperature, 0.1, 100.0);
     result["openmp_threads"] = omp_get_max_threads();
     result["island_outer_threads"] = engine.get_last_island_outer_threads();
     result["island_inner_threads"] = engine.get_last_island_inner_threads();

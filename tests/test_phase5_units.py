@@ -107,7 +107,10 @@ def test_estimator_auto_soft_when_units_provided():
     est._activate_physics_units(2)
     assert est.units_active_ is True
     assert est.physics_constrained_ is True
-    assert est.unit_mode == "soft"
+    # §3.203: public param stays "off" (sklearn clone contract); auto-soft
+    # lives on the fitted effective_unit_mode_ attribute.
+    assert est.unit_mode == "off"
+    assert est.effective_unit_mode_ == "soft"
     kw = est._evolution_units_kwargs()
     assert kw["input_units"] == [[1.0], [0.0]]
     assert kw["output_units"] == [1.0]

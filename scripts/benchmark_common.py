@@ -1333,15 +1333,23 @@ def fallback_estimator_predictions(run_result, eval_diag, *, split="test"):
     return pred, updated
 
 
-def apply_run_budget(est_params, timeout_budget):
-    """Keep estimator-internal adaptive compute inside the run budget."""
+def apply_run_budget(est_params, timeout_budget, enforce_min_compute_budget=False):
+    """Keep estimator-internal adaptive compute inside the run budget.
+
+    §3.144: by default preserves the legacy clamp (an explicit user
+    ``min_compute_budget`` above the derived budget is lowered to it).
+    With ``enforce_min_compute_budget=True`` the explicit minimum is never
+    silently reduced: timeout/max rise to that minimum instead (the run may
+    then exceed the derived wall-clock budget — documented tradeoff).
+    """
     params = dict(est_params)
     budget = int(max(1, round(float(timeout_budget))))
+    user_min = int(params.get("min_compute_budget", 10) or 10)
+    if enforce_min_compute_budget and user_min > budget:
+        budget = user_min
     params["timeout"] = budget
     params["max_compute_budget"] = budget
-    params["min_compute_budget"] = min(
-        int(params.get("min_compute_budget", 10) or 10), budget
-    )
+    params["min_compute_budget"] = min(user_min, budget)
     return params
 
 

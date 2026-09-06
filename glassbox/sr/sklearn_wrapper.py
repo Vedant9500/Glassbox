@@ -805,15 +805,20 @@ def _infer_formula_units(formula, input_units, output_units=None):
         if tok == "(":
             get()
             node = parse_expr()
-            if peek() == ")":
-                get()
+            # §3.197: missing close is a syntax error (was silently dropped,
+            # letting malformed formulas infer ok=True). Return None so the
+            # helper reports explicit inference failure.
+            if peek() != ")":
+                return None
+            get()
             return node
         if tok == "|":
             # abs |expr|
             get()
             node = parse_expr()
-            if peek() == "|":
-                get()
+            if peek() != "|":
+                return None
+            get()
             return node
         # number
         try:
@@ -839,8 +844,17 @@ def _infer_formula_units(formula, input_units, output_units=None):
             name = get().lower()
             get()  # (
             arg = parse_expr()
-            if peek() == ")":
-                get()
+            # §3.200: arity check — single-argument grammar. `atan2(x0,x1)`
+            # previously parsed `atan2(x0)` and failed downstream on trailing
+            # tokens (or partially inferred). Reject multi-arg calls here so
+            # the failure is an explicit inference failure at the call site.
+            if peek() == ",":
+                return None
+            # §3.197 (companion): a missing close here previously fell through
+            # and could still infer ok=True (e.g. "sin(x1"). Require it.
+            if peek() != ")":
+                return None
+            get()
             if name in _UNIT_UNARY_DIMLESS:
                 if arg is not None and not _units_zero(arg):
                     for d in range(n_dims):
@@ -856,10 +870,15 @@ def _infer_formula_units(formula, input_units, output_units=None):
             if arg is not None and _units_zero(arg):
                 return list(zero)
             return None
-        # bare identifier (pi, e, etc.) → dimensionless
+        # §3.199: bare identifiers were all dimensionless — typos like `xx`
+        # or undefined `velocity` passed unit filtering. Allowlist known
+        # dimensionless constants; reject anything else (explicit inference
+        # failure, not silent dimensionless).
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tok):
-            get()
-            return list(zero)
+            if str(tok).lower() in ("pi", "e", "tau"):
+                get()
+                return list(zero)
+            return None
         return None
 
     try:
@@ -960,12 +979,18 @@ def _mad_scale(resid, sample_weight=None):
         mad = float(np.median(np.abs(r - med)))
     scale = 1.4826 * mad
     if not np.isfinite(scale) or scale < 1e-12:
-        # Fall back to std / absolute level
-        s = float(np.std(r))
-        if np.isfinite(s) and s > 1e-12:
-            return s
-        a = float(np.mean(np.abs(r)))
-        return a if a > 1e-12 else 1.0
+        # §3.134: RMSE-around-zero fallback, matching C++ mad_scale.
+        # Was std-then-mean-abs (spread-only): diverged cross-language on
+        # asymmetric/biased residuals (e.g. [0,0,10]: std≈4.7 vs RMSE≈5.8).
+        if w is not None and w.shape == r.shape and float(np.sum(w)) > 0:
+            m = np.isfinite(w) & (w >= 0.0)
+            ws = float(np.sum(w[m])) if np.any(m) else 0.0
+            if ws > 0:
+                rmse = float(np.sqrt(np.sum(w[m] * r[m] ** 2) / ws))
+                return rmse if (np.isfinite(rmse) and rmse > 1e-12) else 1.0
+            return 1.0
+        rmse = float(np.sqrt(np.mean(r**2))) if r.size else 1.0
+        return rmse if (np.isfinite(rmse) and rmse > 1e-12) else 1.0
     return scale
 
 
@@ -4145,12 +4170,16 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.output_units_ = None
         self.units_active_ = False
         self.physics_constrained_ = False
+        # §3.203: effective mode is fitted state — never mutate the public
+        # `unit_mode` param (sklearn clone/get_params contract). Readers use
+        # `effective_unit_mode_` with fallback to the public value pre-fit.
+        self.effective_unit_mode_ = "off"
         # Auto-enable soft mode when user supplies units but left unit_mode at default off.
         if mode == "off" and raw_in is None and raw_out is None:
             return
         if mode == "off" and (raw_in is not None or raw_out is not None):
             mode = "soft"
-            self.unit_mode = mode
+            self.effective_unit_mode_ = mode
         if mode == "off":
             return
         parsed_in, parsed_out = _validate_physics_units(raw_in, raw_out, n_features)
@@ -4160,6 +4189,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.output_units_ = parsed_out
         self.units_active_ = True
         self.physics_constrained_ = True
+        self.effective_unit_mode_ = mode
 
     def _evolution_units_kwargs(self):
         """Kwargs for C++ run_evolution dimensional analysis (empty when inactive).
@@ -4175,7 +4205,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if not iu:
             return {}
         weight = float(getattr(self, "dim_penalty_weight", 0.1) or 0.0)
-        mode = _validate_unit_mode(getattr(self, "unit_mode", "soft"))
+        mode = _validate_unit_mode(
+            getattr(self, "effective_unit_mode_", getattr(self, "unit_mode", "soft"))
+        )
         if mode == "hard":
             weight = max(weight, 10.0)
         else:
@@ -4195,6 +4227,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         hard mode drops incompatible formulas when units infer successfully.
         soft mode keeps all but sorts physical formulas first and records penalty.
+        Sort policy (§3.204): soft sorts by (penalty if inference ok else 1e3,
+        mse, complexity) — inference failures tie at the fixed 1e3 cutoff, so
+        a successful but highly unphysical formula (penalty > 1e3) ranks behind
+        every failure regardless of fit. The cutoff is undocumented-scale;
+        failures are always fail-open (never rejected, §3.205).
         Never applies penalties when inference is unsafe.
         """
         if not candidate_formulas:
@@ -4203,9 +4240,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return list(candidate_formulas)
         iu = getattr(self, "input_units_", None)
         ou = getattr(self, "output_units_", None)
-        mode = _validate_unit_mode(getattr(self, "unit_mode", "soft"))
+        mode = _validate_unit_mode(
+            getattr(self, "effective_unit_mode_", getattr(self, "unit_mode", "soft"))
+        )
         kept = []
         rejected = []
+        inference_failures = 0
+        unsafe_kept = 0
         for cand in candidate_formulas:
             formula = str((cand or {}).get("formula", "")).strip()
             if not formula:
@@ -4215,7 +4256,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             merged["unit_penalty"] = float(info.get("penalty") or 0.0)
             merged["unit_ok"] = bool(info.get("ok"))
             merged["unit_reason"] = info.get("reason")
+            if not info.get("ok"):
+                # §3.204/§3.205: count inference failures (fail-open: kept).
+                inference_failures += 1
             if ok:
+                if not info.get("ok"):
+                    # §3.205: unsafe inference kept open (hard mode included).
+                    unsafe_kept += 1
                 kept.append(merged)
             else:
                 rejected.append(
@@ -4242,6 +4289,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 "kept": len(kept),
                 "rejected": len(rejected),
                 "rejected_examples": rejected[:6],
+                # §3.205: unsafe-inference provenance (fail-open keeps).
+                "inference_failures": inference_failures,
+                "unsafe_inference_count": unsafe_kept,
             }
         return kept
 
@@ -10851,15 +10901,24 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                     lo=10,
                                     hi=120,
                                 ),
-                                multi_allowed_unary_ops=blackbox_search_plan.get(
-                                    "multi_allowed_unary_ops", []
-                                ),
-                                multi_binary_op_priors=blackbox_search_plan.get(
-                                    "multi_binary_op_priors", []
-                                ),
-                                multi_allowed_binary_ops=blackbox_search_plan.get(
-                                    "multi_allowed_binary_ops", []
-                                ),
+                                # §3.253: island vectors are sized to self.num_islands
+                                # but eff_islands may shrink (S1-9); slice to the
+                                # effective count so the FFI length check passes.
+                                multi_allowed_unary_ops=list(
+                                    blackbox_search_plan.get(
+                                        "multi_allowed_unary_ops", []
+                                    )
+                                )[: int(eff_islands)],
+                                multi_binary_op_priors=list(
+                                    blackbox_search_plan.get(
+                                        "multi_binary_op_priors", []
+                                    )
+                                )[: int(eff_islands)],
+                                multi_allowed_binary_ops=list(
+                                    blackbox_search_plan.get(
+                                        "multi_allowed_binary_ops", []
+                                    )
+                                )[: int(eff_islands)],
                                 seed_graphs_py=seed_graphs_py,
                             )
                             if (

@@ -1948,8 +1948,10 @@ private:
             }
             
             if (unary_indices.empty()) {
-                // No unary nodes, fall back to wrap
-                return macro_mutate(parent); // Retry (will likely hit wrap/multiply)
+                // §3.229: no unary nodes — fall back without recursion.
+                // Recursive macro_mutate() retry redrew the mode and could
+                // pick nest again (unbounded stack, geometrically decaying).
+                return mutate_lamarckian(child, 0.3);
             }
             
             int f_idx = sample_active_from_candidates(child, unary_indices);
@@ -2951,14 +2953,17 @@ private:
                         is_duplicate = (max_abs_diff < 1e-10);
                     }
                     
-                    // Also check for proportional outputs (a = k*b)
-                    // These can be merged since SVD handles the scaling
+                    // Also check for proportional outputs (a = k*b, k > 0).
+                    // §3.236: require positive correlation only — f vs -f
+                    // merge drops the sign with no coefficient transfer;
+                    // surviving column cannot represent negation without
+                    // global refit compensation. Keep both signs distinct.
                     if (!is_duplicate) {
                         Eigen::ArrayXd a_norm = cache[i] - cache[i].mean();
                         Eigen::ArrayXd b_norm = cache[j] - cache[j].mean();
-                        double corr = (a_norm * b_norm).mean() / 
+                        double corr = (a_norm * b_norm).mean() /
                                      (std::sqrt(var_i * var_j) + 1e-15);
-                        is_duplicate = (std::abs(corr) > 0.9999);
+                        is_duplicate = (corr > 0.9999);
                     }
                 }
                 
@@ -3099,7 +3104,10 @@ private:
             evaluate_graph(ind, X_, n_samples, base_cache);
             DifferentialGramian dg;
             dg.initialize(base_cache, y_, has_y_weights_ ? y_weights_ : Eigen::ArrayXd());
-            double ridge_lambda = 1e-8; // Low lambda for precision during snapping
+            // §3.243: trial ridge matches final solve_output_weights (1e-4).
+            // Was 1e-8: snaps accepted under weaker regularization could
+            // disagree with exported coefficients after final re-regularize.
+            double ridge_lambda = 1e-4;
 
             auto compute_mse_from_trial = [&](const Eigen::VectorXd& w, 
                                               const std::vector<Eigen::ArrayXd>& cache) -> double {
@@ -3128,7 +3136,10 @@ private:
                     case SnapTier::Fraction:
                         return 1.02;
                     case SnapTier::Special:
-                        return 1.05;
+                        // §3.242: was 1.05 — accepted 4.9% worse fit with no
+                        // parsimony tradeoff. Cap at 1.02 like Fraction; clean
+                        // constants still get 2% headroom for interpretability.
+                        return 1.02;
                 }
                 return 1.02;
             };
@@ -3656,8 +3667,10 @@ private:
                         double original_w = ind.output_weights[i];
                         ind.output_weights[i] = candidate;
                         double trial_mse = mse_from_cache(ind, snap_base_cache);
-                        
-                        if (trial_mse < snap_baseline_mse * 1.05 + 1e-8 && trial_mse < best_snap_mse) {
+
+                        // §3.242: 1.05 allowed 5% degrade for clean constants;
+                        // cap at 1.02 (elimination path keeps its own 1.05).
+                        if (trial_mse < snap_baseline_mse * 1.02 + 1e-8 && trial_mse < best_snap_mse) {
                             best_snap_w = candidate;
                             best_snap_mse = trial_mse;
                         }
@@ -3692,8 +3705,9 @@ private:
                         
                         ind.output_bias = candidate;
                         double trial_mse = mse_from_cache(ind, snap_base_cache);
-                        
-                        if (trial_mse < snap_baseline_mse * 1.05 + 1e-8 && trial_mse < best_snap_mse) {
+
+                        // §3.242: see weight-snapping note above.
+                        if (trial_mse < snap_baseline_mse * 1.02 + 1e-8 && trial_mse < best_snap_mse) {
                             best_snap_b = candidate;
                             best_snap_mse = trial_mse;
                         }
@@ -3703,7 +3717,7 @@ private:
                     if (std::abs(bias - nearest_int) <= 0.3) {
                         ind.output_bias = nearest_int;
                         double trial_mse = mse_from_cache(ind, snap_base_cache);
-                        if (trial_mse < snap_baseline_mse * 1.05 + 1e-8 && trial_mse < best_snap_mse) {
+                        if (trial_mse < snap_baseline_mse * 1.02 + 1e-8 && trial_mse < best_snap_mse) {
                             best_snap_b = nearest_int;
                             best_snap_mse = trial_mse;
                         }

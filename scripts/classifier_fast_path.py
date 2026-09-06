@@ -1400,6 +1400,7 @@ def build_basis_from_predictions(
     detected_omegas: list[float] | None = None,
     universal_basis: bool = True,  # NEW: Always include common terms
     op_constraints: dict[str, bool] | None = None,
+    clip_info: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray, list[str]]:
     """
     Build regression basis matrix from classifier predictions.
@@ -1411,6 +1412,10 @@ def build_basis_from_predictions(
         max_power: Maximum polynomial degree
         detected_omegas: FFT-detected frequencies for sin/cos
         universal_basis: If True, always include polynomial + periodic terms
+        clip_info: Optional dict populated with clipping diagnostics
+            (per-column clipped fraction, names). Basis values are still
+            clipped to [-1e6, 1e6] for stability; names claim the unclipped
+            formula (§3.216).
 
     Returns:
         basis: (N, n_basis) matrix
@@ -1501,8 +1506,13 @@ def build_basis_from_predictions(
 
     if detected_omegas:
         for o in detected_omegas[:3]:
-            # Add if not too close to existing
-            if all(abs(o - existing) > 0.1 for existing in omegas):
+            # §3.220: relative dedup — abs 0.1 duplicates high freqs and
+            # drops distinct low freqs. Floor 0.02, else 5% of magnitude.
+            def _omega_close(a: float, b: float) -> bool:
+                tol = max(0.02, 0.05 * max(abs(a), abs(b)))
+                return abs(a - b) <= tol
+
+            if not any(_omega_close(o, existing) for existing in omegas):
                 omegas.append(o)
 
     # Periodic terms (always include in universal mode)
@@ -1523,6 +1533,8 @@ def build_basis_from_predictions(
             name = var_name(i)
 
             omega_limit = 2 if compact_multivariate else 6
+            # §3.219: nonstandard omegas use .6g so display names round-trip
+            # to the fitted frequency (2-decimal names scored a different freq).
             for omega in omegas[:omega_limit]:
                 basis_list.append(np.sin(omega * xi))
                 if omega == 1.0:
@@ -1536,7 +1548,7 @@ def build_basis_from_predictions(
                 elif abs(omega - 2 * math.pi) < 1e-4:
                     names.append(f"sin(2*pi*{name})")
                 else:
-                    names.append(f"sin({omega:.2f}*{name})")
+                    names.append(f"sin({omega:.6g}*{name})")
 
             for omega in omegas[:omega_limit]:
                 basis_list.append(np.cos(omega * xi))
@@ -1551,7 +1563,7 @@ def build_basis_from_predictions(
                 elif abs(omega - 2 * math.pi) < 1e-4:
                     names.append(f"cos(2*pi*{name})")
                 else:
-                    names.append(f"cos({omega:.2f}*{name})")
+                    names.append(f"cos({omega:.6g}*{name})")
 
     # Exponential operations (only if predicted OR universal)
     include_exp = allow_exp and (
@@ -1574,7 +1586,10 @@ def build_basis_from_predictions(
             names.append(f"exp({name})")
             basis_list.append(np.exp(-x_clamp))
             names.append(f"exp(-{name})")
-            basis_list.append(np.exp(-(xi**2)))
+            # §3.218: gaussian uses the same ±10 clamp so saturation
+            # semantics match ±exp terms (avoids xi**2 overflow warnings;
+            # |x|>10 maps to ~0 either way).
+            basis_list.append(np.exp(-(x_clamp**2)))
             names.append(f"exp(-{name}^2)")
 
             if not multivariate_blackbox:
@@ -1772,9 +1787,9 @@ def build_basis_from_predictions(
                     denom_q = xi**2 + c
                     for omega in omegas[:4]:
                         basis_list.append(np.sin(omega * xi) / denom_q)
-                        names.append(f"sin({omega:.2f}*{name})/({name}^2+{c})")
+                        names.append(f"sin({omega:.6g}*{name})/({name}^2+{c})")
                         basis_list.append(np.cos(omega * xi) / denom_q)
-                        names.append(f"cos({omega:.2f}*{name})/({name}^2+{c})")
+                        names.append(f"cos({omega:.6g}*{name})/({name}^2+{c})")
 
             basis_list.append(xi * np.sin(xi))
             names.append(f"{name}·sin({name})")
@@ -1790,19 +1805,37 @@ def build_basis_from_predictions(
                         if abs(omega - 1.0) < 0.1:
                             names.append(f"e^(-{alpha}*{name})·sin({name})")
                         else:
-                            names.append(f"e^(-{alpha}*{name})·sin({omega:.2f}*{name})")
+                            names.append(f"e^(-{alpha}*{name})·sin({omega:.6g}*{name})")
 
                         basis_list.append(decay * np.cos(omega * xi))
                         if abs(omega - 1.0) < 0.1:
                             names.append(f"e^(-{alpha}*{name})·cos({name})")
                         else:
-                            names.append(f"e^(-{alpha}*{name})·cos({omega:.2f}*{name})")
+                            names.append(f"e^(-{alpha}*{name})·cos({omega:.6g}*{name})")
 
     basis = np.column_stack(basis_list)
 
-    # CRITICAL: Clamp basis to prevent numerical explosion
+    # CRITICAL: Clamp basis to prevent numerical explosion.
+    # §3.216: clipping changes math (names still claim unclipped formula),
+    # so record per-column clipped fractions when clip_info is provided.
+    pre_clip = basis
     basis = np.clip(basis, -1e6, 1e6)
     basis = np.nan_to_num(basis, nan=0.0, posinf=1e6, neginf=-1e6)
+    if clip_info is not None:
+        with np.errstate(invalid="ignore"):
+            clipped = (
+                (np.abs(pre_clip) > 1e6)
+                | ~np.isfinite(pre_clip)
+            )
+        frac = clipped.mean(axis=0) if clipped.size else np.zeros(len(names))
+        clip_info.clear()
+        clip_info["clip_bound"] = 1e6
+        clip_info["clipped_fraction"] = [float(f) for f in frac]
+        clip_info["clipped_columns"] = [
+            {"name": n, "fraction": float(f)}
+            for n, f in zip(names, frac)
+            if f > 0
+        ]
 
     return basis, names
 
@@ -2054,30 +2087,64 @@ def find_exact_symbolic_match(
             )
         return None
 
-    combo_count = 0
-    for r in range(2, min(int(max_terms), 3) + 1):
-        if n_basis >= r:
-            combo_count += math.comb(n_basis, r)
-    if exact_match_max_combos is not None and combo_count > int(exact_match_max_combos):
+    # §3.147: per-rank combo caps — pairs alone below cap must still be
+    # searched even when pairs+triples summed exceed it.
+    pair_count = math.comb(n_basis, 2) if (max_terms >= 2 and n_basis >= 2) else 0
+    triple_count = math.comb(n_basis, 3) if (max_terms >= 3 and n_basis >= 3) else 0
+    skip_pairs = (
+        exact_match_max_combos is not None
+        and max_terms >= 2
+        and pair_count > int(exact_match_max_combos)
+    )
+    skip_triples = (
+        exact_match_max_combos is not None
+        and max_terms >= 3
+        and triple_count > int(exact_match_max_combos)
+    )
+    if exact_match_max_combos is not None and (
+        (max_terms >= 2 and max_terms < 3 and skip_pairs)
+        or (max_terms >= 3 and skip_pairs and skip_triples)
+    ):
         update_diagnostics(
             {
                 "backend_requested": exact_match_backend,
                 "fallback_reason": "combo_cap_exceeded",
-                "combo_count": int(combo_count),
+                "pair_count": int(pair_count),
+                "triple_count": int(triple_count),
                 "max_combos": int(exact_match_max_combos),
+                "skipped_ranks": [
+                    r
+                    for r, s in (("pairs", skip_pairs), ("triples", skip_triples))
+                    if s
+                ],
                 "torch_used": False,
                 "gpu_used": False,
             }
         )
         print(
             "  Skipping exhaustive exact-match search "
-            f"(combos={combo_count} > cap={int(exact_match_max_combos)})"
+            f"(pairs={pair_count}, triples={triple_count} > cap={int(exact_match_max_combos)})"
         )
         beam_match = bounded_sparse_beam_search(max_terms)
         if beam_match is not None:
             print("  Bounded sparse exact-match search succeeded")
             return beam_match
         return None
+    if skip_pairs or skip_triples:
+        update_diagnostics(
+            {
+                "combo_cap_skipped_ranks": [
+                    r
+                    for r, s in (("pairs", skip_pairs), ("triples", skip_triples))
+                    if s
+                ],
+                "pair_count": int(pair_count),
+                "triple_count": int(triple_count),
+                "max_combos": int(exact_match_max_combos)
+                if exact_match_max_combos is not None
+                else None,
+            }
+        )
 
     # Optional PyTorch acceleration for pairs and triples
     selected_device, torch_diagnostics = _select_exact_match_torch_device(
@@ -2103,7 +2170,10 @@ def find_exact_symbolic_match(
                 idx_len = int(idx_cpu.shape[0])
                 n_combos = idx_len
                 chunk_size = 50000
-
+                # §3.149: scan all chunks for the global best below tolerance
+                # (same support size r, so lowest MSE wins); early-exit only
+                # on exact-zero. Previously returned the first chunk match.
+                best_overall: tuple[list[int], np.ndarray, float] | None = None
                 for start in range(0, n_combos, chunk_size):
                     end = min(start + chunk_size, n_combos)
                     chunk_idx = idx_cpu[start:end].to(selected_device)
@@ -2121,14 +2191,18 @@ def find_exact_symbolic_match(
                     if best_mse < tolerance:
                         idx_in_chunk = best_idx.item()
                         real_idx = start + idx_in_chunk
-                        return (
+                        cand = (
                             idx_cpu[real_idx].tolist(),
                             sol[idx_in_chunk].flatten().detach().cpu().numpy(),
                             best_mse.item(),
                         )
-                return None
+                        if best_overall is None or cand[2] < best_overall[2]:
+                            best_overall = cand
+                        if best_overall[2] <= 0.0:
+                            break
+                return best_overall
 
-            if max_terms >= 2:
+            if max_terms >= 2 and not skip_pairs:
                 res = fast_torch_search(2)
                 if res is not None:
                     indices, coeffs, mse = res
@@ -2145,7 +2219,7 @@ def find_exact_symbolic_match(
                         formula, full_coeffs = build_formula(indices, coeffs_arr)
                         return formula, mse_cpu, full_coeffs
 
-            if max_terms >= 3:
+            if max_terms >= 3 and not skip_triples:
                 res = fast_torch_search(3)
                 if res is not None:
                     indices, coeffs, mse = res
@@ -2162,7 +2236,11 @@ def find_exact_symbolic_match(
                         formula, full_coeffs = build_formula(indices, coeffs_arr)
                         return formula, mse_cpu, full_coeffs
 
-            return None
+            # §3.147: torch miss with skipped ranks falls through to CPU
+            # exhaustive (allowed ranks) + beam below; torch-only None would
+            # strand skipped ranks with no fallback.
+            if not (skip_pairs or skip_triples):
+                return None
         except Exception as e:
             if selected_device.type == "cuda" and torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -2216,7 +2294,7 @@ def find_exact_symbolic_match(
         return None
 
     # Try pairs of basis functions (including constant)
-    if max_terms >= 2:
+    if max_terms >= 2 and not skip_pairs:
         if num_threads and num_threads > 1:
             stop_event = threading.Event()
             ranges = chunk_ranges(n_basis, num_threads)
@@ -2245,7 +2323,7 @@ def find_exact_symbolic_match(
                 return result
 
     # Try triples of basis functions (including constant)
-    if max_terms >= 3:
+    if max_terms >= 3 and not skip_triples:
         if num_threads and num_threads > 1:
             stop_event = threading.Event()
             ranges = chunk_ranges(n_basis, num_threads)
@@ -2271,6 +2349,27 @@ def find_exact_symbolic_match(
             result = search_triples_range(0, n_basis, threading.Event())
             if result is not None:
                 return result
+
+    # §3.147: skipped ranks fall back to bounded beam (exhaustive allowed
+    # ranks already failed above). Keeps old combo-cap beam contract.
+    if skip_pairs or skip_triples:
+        update_diagnostics(
+            {
+                "backend_requested": exact_match_backend,
+                "fallback_reason": "bounded_sparse_beam_match",
+                "combo_count": int(pair_count + triple_count),
+                "pair_count": int(pair_count),
+                "triple_count": int(triple_count),
+                "max_combos": int(exact_match_max_combos)
+                if exact_match_max_combos is not None
+                else None,
+                "torch_used": False,
+                "gpu_used": False,
+            }
+        )
+        beam_match = bounded_sparse_beam_search(max_terms)
+        if beam_match is not None:
+            return beam_match
 
     return None
 
@@ -2591,7 +2690,11 @@ def fast_path_regression(
             "exact_match_max_basis": int(exact_match_max_basis),
         }
 
-    # Normalize basis for numerical stability
+    # Normalize basis for numerical stability.
+    # §3.217: `basis` here is the fit subset (basis_full[~holdout_mask] when
+    # holdout is active), so std is fit-only by construction. The same fit
+    # std unnormalizes coeffs applied to full/holdout bases — no holdout
+    # feature-distribution leakage into fitting.
     basis_std = np.std(basis, axis=0, keepdims=True)
     basis_std[basis_std < 1e-10] = 1.0
     basis_norm = basis / basis_std
@@ -2643,16 +2746,20 @@ def fast_path_regression(
         n_terms_local = int(np.sum(np.abs(coeffs_arr) >= sparsity_threshold))
         score_local = float(mse_val + COMPLEXITY_PENALTY * n_terms_local)
 
-        # Out-of-domain holdout penalty: penalize solutions that overfit
+        # Out-of-domain holdout penalty: penalize solutions that overfit.
+        # §3.223: was unbounded `0.01 * ho_mse` with no per-candidate record.
+        # Bounded at 4x fit MSE; ratio stored on the pool entry.
+        holdout_ratio: float | None = None
         if basis_holdout is not None and y_holdout is not None:
             try:
                 y_pred_ho = basis_holdout @ coeffs_arr
                 ho_mse = float(np.mean((y_holdout - y_pred_ho) ** 2))
                 if np.isfinite(ho_mse):
                     ood_ratio = ho_mse / max(mse_val, 1e-12)
+                    holdout_ratio = float(ood_ratio)
                     # Penalize if holdout MSE is much worse than in-sample
                     if ood_ratio > 5.0:
-                        score_local += 0.01 * ho_mse
+                        score_local += min(0.01 * ho_mse, 4.0 * mse_val)
             except Exception:
                 pass
 
@@ -2666,6 +2773,7 @@ def fast_path_regression(
                 "score": score_local,
                 "alpha": alpha_val,
                 "solver_backend": solver_backend,
+                "holdout_ratio": holdout_ratio,
             }
 
     def _holdout_mse_for_best(coeffs_arr: np.ndarray) -> float | None:
@@ -2780,7 +2888,10 @@ def fast_path_regression(
             y_pred = basis_selected @ refit_coeffs
             refit_mse = float(np.mean((y_fit - y_pred) ** 2))
 
-            if refit_mse <= candidate["mse"] + 0.001:
+            # §3.222: relative refit tolerance — abs 0.001 is enormous for
+            # tiny-variance targets, negligible for large-scale ones.
+            refit_tol = 1e-6 * max(float(candidate["mse"]), float(y_variance), 1e-12)
+            if refit_mse <= candidate["mse"] + refit_tol:
                 updated = np.zeros_like(coeffs_local)
                 updated[selected_mask] = refit_coeffs
                 n_terms_local = int(np.sum(np.abs(updated) >= sparsity_threshold))
