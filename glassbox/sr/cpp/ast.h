@@ -172,6 +172,58 @@ struct IndividualGraph {
 };
 
 
+// M-161: reset type-irrelevant fields to struct defaults so stale params
+// (e.g. a Constant carrying an old p/omega, or Division carrying beta) can
+// never leak into hashes, exports, or later type transitions.
+inline void normalize_node_fields(OpNode& node) {
+    OpNode dflt;
+    if (node.type == NodeType::Input) {
+        node.value = 0.0;
+        node.unary_op = dflt.unary_op;
+        node.binary_op = dflt.binary_op;
+        node.p = dflt.p; node.omega = dflt.omega; node.phi = dflt.phi;
+        node.amplitude = dflt.amplitude;
+        node.beta = dflt.beta; node.gamma = dflt.gamma; node.tau = dflt.tau;
+        node.left_child = -1; node.right_child = -1;
+    } else if (node.type == NodeType::Constant) {
+        node.unary_op = dflt.unary_op;
+        node.binary_op = dflt.binary_op;
+        node.p = dflt.p; node.omega = dflt.omega; node.phi = dflt.phi;
+        node.amplitude = dflt.amplitude;
+        node.beta = dflt.beta; node.gamma = dflt.gamma; node.tau = dflt.tau;
+        node.left_child = -1; node.right_child = -1;
+    } else if (node.type == NodeType::Unary) {
+        node.binary_op = dflt.binary_op;
+        node.beta = dflt.beta; node.gamma = dflt.gamma; node.tau = dflt.tau;
+        node.right_child = -1;
+        switch (node.unary_op) {
+            case UnaryOp::Periodic: node.p = dflt.p; break;
+            case UnaryOp::Power:
+            case UnaryOp::IntPow:
+                node.omega = dflt.omega; node.phi = dflt.phi;
+                node.amplitude = dflt.amplitude; break;
+            case UnaryOp::Exp: node.p = dflt.p; node.amplitude = dflt.amplitude; break;
+            case UnaryOp::Log:
+            case UnaryOp::Abs:
+                node.p = dflt.p; node.omega = dflt.omega; node.phi = dflt.phi;
+                node.amplitude = dflt.amplitude; break;
+        }
+    } else if (node.type == NodeType::Binary) {
+        node.unary_op = dflt.unary_op;
+        node.p = dflt.p; node.omega = dflt.omega; node.phi = dflt.phi;
+        node.amplitude = dflt.amplitude;
+        switch (node.binary_op) {
+            case BinaryOp::Arithmetic: node.tau = dflt.tau; break;
+            case BinaryOp::Division:
+                node.beta = dflt.beta; node.gamma = dflt.gamma;
+                node.tau = dflt.tau; break;
+            case BinaryOp::Aggregation:
+                node.beta = dflt.beta; node.gamma = dflt.gamma; break;
+        }
+    }
+}
+
+
 // Remove dead nodes and compact the graph (shared by parse post-compile and simplify).
 // Child indices are bounds-checked so malformed graphs do not OOB.
 inline void compact_graph(IndividualGraph& graph) {
@@ -231,6 +283,10 @@ inline void compact_graph(IndividualGraph& graph) {
                 node.right_child = -1;
             }
         }
+        // M-161: normalize type-irrelevant fields on copy — stale params
+        // otherwise survive into hashes/exports (hashing excludes them by
+        // type, but serialized consumers see meaningless values).
+        normalize_node_fields(node);
         new_nodes.push_back(node);
 
         if (static_cast<size_t>(i) < graph.output_weights.size() &&

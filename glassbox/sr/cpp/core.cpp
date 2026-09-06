@@ -674,13 +674,74 @@ static py::dict run_evolution_cpp(
                 g.output_weights.back() = 1.0;
             }
         }
-        
+
         if (g.nodes.empty()) {
             ++seed_graphs_skipped_invalid;
             continue;
         }
+        // M-160: oversized verdict uses the RAW payload size (parity: junk
+        // payloads must not pass the limit by hiding behind pruning).
         if (static_cast<int>(g.nodes.size()) > seed_graph_node_limit) {
             ++seed_graphs_skipped_oversized;
+            continue;
+        }
+        // M-160: prune unreachable nodes so junk neither reaches insertion
+        // nor poisons the topology/feature checks below. Reachability roots
+        // are the active output weights (bias needs no nodes).
+        if (!g.nodes.empty()) {
+            const int nn = static_cast<int>(g.nodes.size());
+            std::vector<char> reach(static_cast<size_t>(nn), 0);
+            std::vector<int> stack;
+            for (int i = 0; i < nn; ++i) {
+                if (std::abs(g.output_weights[static_cast<size_t>(i)]) > 1e-12) {
+                    reach[static_cast<size_t>(i)] = 1;
+                    stack.push_back(i);
+                }
+            }
+            while (!stack.empty()) {
+                int u = stack.back(); stack.pop_back();
+                const sr::OpNode& nd = g.nodes[static_cast<size_t>(u)];
+                auto visit = [&](int c) {
+                    if (c >= 0 && c < nn && !reach[static_cast<size_t>(c)]) {
+                        reach[static_cast<size_t>(c)] = 1;
+                        stack.push_back(c);
+                    }
+                };
+                if (nd.type == sr::NodeType::Unary) {
+                    visit(nd.left_child);
+                } else if (nd.type == sr::NodeType::Binary) {
+                    visit(nd.left_child);
+                    visit(nd.right_child);
+                }
+            }
+            bool has_junk = false;
+            for (char r : reach) if (!r) { has_junk = true; break; }
+            if (has_junk) {
+                std::vector<int> new_idx(static_cast<size_t>(nn), -1);
+                std::vector<sr::OpNode> kept;
+                std::vector<double> kept_w;
+                kept.reserve(static_cast<size_t>(nn));
+                for (int i = 0; i < nn; ++i) {
+                    if (!reach[static_cast<size_t>(i)]) continue;
+                    new_idx[static_cast<size_t>(i)] = static_cast<int>(kept.size());
+                    kept.push_back(g.nodes[static_cast<size_t>(i)]);
+                    kept_w.push_back(g.output_weights[static_cast<size_t>(i)]);
+                }
+                for (auto& nd : kept) {
+                    if (nd.left_child >= 0 && nd.left_child < nn)
+                        nd.left_child = new_idx[static_cast<size_t>(nd.left_child)];
+                    else nd.left_child = -1;
+                    if (nd.right_child >= 0 && nd.right_child < nn)
+                        nd.right_child = new_idx[static_cast<size_t>(nd.right_child)];
+                    else nd.right_child = -1;
+                }
+                g.nodes = std::move(kept);
+                g.output_weights = std::move(kept_w);
+            }
+        }
+        
+        if (g.nodes.empty()) {
+            ++seed_graphs_skipped_invalid;
             continue;
         }
         // H-07: refuse seeds with bad topology or out-of-range feature indices.
@@ -1087,16 +1148,19 @@ static py::dict refine_periodic_rational_wrapper(
     out["d"] = res.d;
     out["e"] = res.e;
     out["mse"] = res.mse;
+    out["success"] = res.success;
     
     return out;
 }
 
 // Wrapper for iterative_elastic_net (optional sample_weight / y_weights for S5-9)
-static py::tuple iterative_elastic_net_wrapper(py::array_t<double> X_arr, py::array_t<double> y_arr, 
+static py::object iterative_elastic_net_wrapper(py::array_t<double> X_arr, py::array_t<double> y_arr, 
                                         double l1_weight, double l2_weight, 
                                         int n_starts = 3, int n_iterations = 3,
                                         double prune_threshold = 0.05, int max_iter = 1000,
-                                        py::object sample_weight = py::none()) {
+                                        py::object sample_weight = py::none(),
+                                        unsigned int seed = 42,
+                                        bool return_diagnostics = false) {
     auto X_arr_c = ensure_f64_c(X_arr);
     auto y_arr_c = ensure_f64_c(y_arr);
     auto X_buf = X_arr_c.request();
@@ -1141,13 +1205,23 @@ static py::tuple iterative_elastic_net_wrapper(py::array_t<double> X_arr, py::ar
         }
     }
 
-    auto res = sr::iterative_elastic_net(X, y, l1_weight, l2_weight, n_starts, n_iterations, prune_threshold, max_iter, sw);
+    auto res = sr::iterative_elastic_net(X, y, l1_weight, l2_weight, n_starts, n_iterations, prune_threshold, max_iter, sw, seed);
     
     py::list w_out;
     for (int i = 0; i < res.weights.size(); ++i) {
         w_out.append(res.weights(i));
     }
-    
+
+    // M-338: optional convergence diagnostics (default off ⇒ legacy 2-tuple).
+    if (return_diagnostics) {
+        py::dict out;
+        out["weights"] = w_out;
+        out["mse"] = res.mse;
+        out["iters_done"] = res.iters_done;
+        out["converged"] = res.converged;
+        out["penalized_objective"] = res.penalized_objective;
+        return out;
+    }
     return py::make_tuple(w_out, res.mse);
 }
 
@@ -1176,6 +1250,8 @@ static py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::
     Eigen::MatrixXd X = Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(
         static_cast<double*>(X_buf.ptr), n, p);
     Eigen::VectorXd y = Eigen::Map<Eigen::VectorXd>(static_cast<double*>(y_buf.ptr), y_buf.size);
+    Eigen::VectorXd sw;
+    bool have_sw = false;
     if (!sample_weight.is_none()) {
         // §3.100: forcecast/contiguous + finite/nonnegative/positive-total.
         auto w_arr = ensure_f64_c(sample_weight);
@@ -1183,15 +1259,17 @@ static py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::
         if (w_buf.ndim != 1 || static_cast<int>(w_buf.size) != n) {
             throw std::invalid_argument("sample_weight length must match y");
         }
-        Eigen::VectorXd sw = Eigen::Map<Eigen::VectorXd>(static_cast<double*>(w_buf.ptr), w_buf.size);
-        for (int i = 0; i < sw.size(); ++i) {
-            if (!std::isfinite(sw(i)) || sw(i) < 0) {
+        Eigen::VectorXd sw_tmp = Eigen::Map<Eigen::VectorXd>(static_cast<double*>(w_buf.ptr), w_buf.size);
+        for (int i = 0; i < sw_tmp.size(); ++i) {
+            if (!std::isfinite(sw_tmp(i)) || sw_tmp(i) < 0) {
                 throw std::invalid_argument("sample_weight must be finite and non-negative");
             }
         }
-        if (sw.sum() <= 0 || !std::isfinite(sw.sum())) {
+        if (sw_tmp.sum() <= 0 || !std::isfinite(sw_tmp.sum())) {
             throw std::invalid_argument("sample_weight must have positive total");
         }
+        sw = sw_tmp;
+        have_sw = true;
         sr::apply_sqrt_sample_weights(X, y, sw);
     }
 
@@ -1206,7 +1284,15 @@ static py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::
         }
         return w_out;
     }
-    auto res = sr::elastic_net_cd_cpp(X, y, alpha, 0.0, max_iter, tol);
+    auto res = sr::elastic_net_cd_cpp(X, y, alpha, 0.0, max_iter, tol,
+                                      Eigen::VectorXd(), have_sw ? sw : Eigen::VectorXd());
+    // §3.400: fail loud on non-finite results (was silent zero weights).
+    // Covers non-finite X/y as well as finite-but-unsolvable scale
+    // (e.g. 1e200 magnitudes overflowing the residual norm).
+    if (!std::isfinite(res.mse)) {
+        throw std::invalid_argument(
+            "lasso_coordinate_descent: X/y must be finite with solvable scale");
+    }
     
     py::list w_out;
     for (int i = 0; i < res.weights.size(); ++i) {
@@ -1214,6 +1300,19 @@ static py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::
     }
     
     return w_out;
+}
+
+// M-300: gate-mode diagnostics — soft weights, dominant op, and the effective
+// temperature that produced them, reported together.
+static py::dict arithmetic_gate_info_wrapper(double beta, double gamma) {
+    auto info = sr::arithmetic_gate_info(beta, gamma);
+    py::dict out;
+    py::list w;
+    for (int k = 0; k < 4; ++k) w.append(info.w[k]);
+    out["weights"] = w;
+    out["dominant"] = info.dominant;
+    out["temperature"] = info.temperature;
+    return out;
 }
 
 // Wrapper for simplify_formula_cpp.
@@ -1232,12 +1331,18 @@ static std::string simplify_formula_wrapper(
     double /*small_term_ratio*/ = 0.08,
     int n_features = 1
 ) {
+    // §3.335: standalone helpers run at the scoring/display policy temperature
+    // (100.0), never at whatever TLS a prior engine run left behind — soft-gate
+    // fold/print decisions would otherwise flip with caller history.
+    sr::ScopedArithmeticTemperature scoped_simplify_temp(100.0);
     return sr::simplify_formula_cpp(
         formula_str, int_tol, zero_tol, max_passes, n_features
     );
 }
 
 static std::string simplify_formula_cpp_wrapper(std::string formula_str) {
+    // §3.335: same policy-temperature isolation as above.
+    sr::ScopedArithmeticTemperature scoped_simplify_temp(100.0);
     return sr::simplify_formula_cpp(formula_str);
 }
 
@@ -1279,6 +1384,8 @@ static py::dict formula_to_seed_graph_wrapper(std::string formula_str) {
 
 // Wrapper for snap_formula_floats_cpp
 static std::string snap_formula_floats_wrapper(std::string formula_str, int n_features = 1) {
+    // §3.335: same policy-temperature isolation (simplify + display path).
+    sr::ScopedArithmeticTemperature scoped_snap_temp(100.0);
     sr::IndividualGraph graph = sr::formula_to_graph(formula_str);
     sr::simplify_ast(graph);
     return sr::get_formula_string(graph, n_features);
@@ -1329,6 +1436,8 @@ static std::string reduce_formula_noise_wrapper(
         w_ptr = &w_owned;
     }
     
+    // §3.335: policy-temperature isolation (see simplify wrappers above).
+    sr::ScopedArithmeticTemperature scoped_reduce_temp(100.0);
     return sr::reduce_formula_noise_cpp(
         formula_str, X, y, w_ptr, holdout_fraction, relative_slack
     );
@@ -1439,12 +1548,17 @@ PYBIND11_MODULE(_core, m) {
           py::arg("X"), py::arg("y"), py::arg("l1_weight"), py::arg("l2_weight"),
           py::arg("n_starts") = 3, py::arg("n_iterations") = 3,
           py::arg("prune_threshold") = 0.05, py::arg("max_iter") = 1000,
-          py::arg("sample_weight") = py::none());
+          py::arg("sample_weight") = py::none(), py::arg("seed") = 42,
+          py::arg("return_diagnostics") = false);
     m.def("lasso_coordinate_descent", &lasso_coordinate_descent_wrapper,
           "LASSO regression using coordinate descent",
           py::arg("X"), py::arg("y"), py::arg("alpha"),
           py::arg("max_iter") = 1000, py::arg("tol") = 1e-4,
           py::arg("sample_weight") = py::none());
+    m.def("arithmetic_gate_info", &arithmetic_gate_info_wrapper,
+          "Soft-arithmetic gate diagnostics: blend weights, dominant op index "
+          "(0=add,1=mul,2=div,3=sub) and the effective temperature",
+          py::arg("beta"), py::arg("gamma"));
     m.def("simplify_formula", &simplify_formula_wrapper, "Simplifies a math formula string natively in C++",
           py::arg("formula_str"), py::arg("int_tol")=1e-5, py::arg("zero_tol")=1e-8, py::arg("max_passes")=6,
           py::arg("use_nsimplify")=true, py::arg("use_identities")=true, py::arg("approximate_trig")=false,

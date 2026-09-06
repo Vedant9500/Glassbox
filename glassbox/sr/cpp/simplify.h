@@ -104,12 +104,22 @@ inline void simplify_node(IndividualGraph& graph, int node_idx) {
 
             if (node.binary_op == BinaryOp::Arithmetic) {
                 // S5-12 / P3-017: share eval soft-arithmetic weights (max-logit stable).
+                // §3.334/§3.336: at/above the shared near-discrete threshold the
+                // argmax pick is exact; below it, fold the true weighted mixture
+                // (w0*(l+r)+w1*(l*r)+w2*softdiv+w3*(l-r), live-eval form incl.
+                // its ±1e6 output clamp) instead of silently switching to argmax.
                 auto w = arithmetic_soft_weights(node);
                 double m = std::max({w[0], w[1], w[2], w[3]});
-                if (m == w[0]) res = l + r;
-                else if (m == w[3]) res = l - r;
-                else if (m == w[1]) res = l * r;
-                else res = l / std::sqrt(1.0 + r * r);
+                if (m >= kArithmeticNearDiscrete) {
+                    if (m == w[0]) res = l + r;
+                    else if (m == w[3]) res = l - r;
+                    else if (m == w[1]) res = l * r;
+                    else res = l / std::sqrt(1.0 + r * r);
+                } else {
+                    res = w[0] * (l + r) + w[1] * (l * r)
+                        + w[2] * (l / std::sqrt(1.0 + r * r)) + w[3] * (l - r);
+                    res = std::clamp(res, -1e6, 1e6);
+                }
             } else if (node.binary_op == BinaryOp::Division) {
                 res = (l / (std::abs(r) + 1e-6)) * ((r >= 0) ? 1.0 : -1.0);
             } else if (node.binary_op == BinaryOp::Aggregation) {

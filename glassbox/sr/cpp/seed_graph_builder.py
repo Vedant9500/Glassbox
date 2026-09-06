@@ -34,6 +34,9 @@ from glassbox.sr.cpp.graph_enums import (
     UNARY_LOG,
     UNARY_PERIODIC,
     UNARY_POWER,
+    validate_binary_op,
+    validate_node_type,
+    validate_unary_op,
 )
 
 _TRANSFORMATIONS = standard_transformations + (
@@ -133,6 +136,43 @@ def _parse_formula_expr(formula: str) -> sp.Expr | None:
     return sp.expand(expr)
 
 
+# Keys each downstream consumer reads per node type (export_pytorch
+# bracket-accesses these; core.cpp requires "type" and contains-guards the
+# rest). M-157: nodes carry only their type's keys — no contradictory
+# leftovers (input nodes with unary_op, constants with children, ...).
+_TYPE_KEYS: dict[Any, tuple[str, ...]] = {
+    TYPE_INPUT: ("type", "feature_idx"),
+    TYPE_CONSTANT: ("type", "value"),
+    TYPE_UNARY: ("type", "unary_op", "p", "omega", "phi", "amplitude", "left_child"),
+    TYPE_BINARY: (
+        "type",
+        "binary_op",
+        "beta",
+        "gamma",
+        "tau",
+        "left_child",
+        "right_child",
+    ),
+}
+
+
+def _normalize_node(node: dict[str, Any]) -> dict[str, Any]:
+    """M-157: keep only the constructed type's meaningful keys.
+
+    Unknown types / op IDs raise immediately (programming error at
+    construction time; core.cpp additionally rejects malformed seed dicts
+    as skipped_invalid).
+    """
+    node_type = validate_node_type(int(node.get("type")))
+    node["type"] = node_type
+    if "unary_op" in node:
+        node["unary_op"] = validate_unary_op(int(node["unary_op"]))
+    if "binary_op" in node:
+        node["binary_op"] = validate_binary_op(int(node["binary_op"]))
+    keep = _TYPE_KEYS.get(node_type, tuple(node.keys()))
+    return {key: node[key] for key in keep if key in node}
+
+
 def _default_node(**overrides: Any) -> dict[str, Any]:
     node = {
         "type": TYPE_CONSTANT,
@@ -151,7 +191,7 @@ def _default_node(**overrides: Any) -> dict[str, Any]:
         "right_child": -1,
     }
     node.update(overrides)
-    return node
+    return _normalize_node(node)
 
 
 class _GraphBuilder:
@@ -163,14 +203,17 @@ class _GraphBuilder:
         self.x_sym = x_sym
         self.feature_lookup = dict(feature_lookup or {})
         self.nodes: list[dict[str, Any]] = []
-        self.output_weights: list[float] = []
+        self.output_weights: list[float | None] = []
         self.output_bias = 0.0
         self.input_nodes: dict[int, int] = {}
 
     def _append(self, node: dict[str, Any]) -> int:
         idx = len(self.nodes)
         self.nodes.append(node)
-        self.output_weights.append(0.0)
+        # M-158: None = weight never assigned (vs explicit 0.0). Converted to
+        # 0.0 at the to_graph_dict boundary, so unset/explicit stay distinct
+        # inside the builder while exports keep the float contract.
+        self.output_weights.append(None)
         return idx
 
     def _input_node(self, feature_idx: int = 0) -> int:
@@ -186,7 +229,10 @@ class _GraphBuilder:
             self.output_weights[node_idx] = float(weight)
 
     def _mul_node(self, left: int, right: int) -> int:
-        idx = self._append(
+        # M-159: pure constructor — returns the new root without touching
+        # output weights. The combining call site owns the weight transfer
+        # (interior children contribute only through the product).
+        return self._append(
             _default_node(
                 type=TYPE_BINARY,
                 binary_op=BINARY_ARITHMETIC,
@@ -196,12 +242,10 @@ class _GraphBuilder:
                 right_child=right,
             )
         )
-        self.output_weights[left] = 0.0
-        self.output_weights[right] = 0.0
-        return idx
 
     def _div_node(self, left: int, right: int) -> int:
-        idx = self._append(
+        # M-159: pure constructor, see _mul_node.
+        return self._append(
             _default_node(
                 type=TYPE_BINARY,
                 binary_op=BINARY_DIVISION,
@@ -211,9 +255,6 @@ class _GraphBuilder:
                 right_child=right,
             )
         )
-        self.output_weights[left] = 0.0
-        self.output_weights[right] = 0.0
-        return idx
 
     def _linear_in_x(self, expr: sp.Expr) -> tuple[float, float] | None:
         """Return (omega, phi) for expr ≈ omega*x + phi, else None."""
@@ -346,6 +387,10 @@ class _GraphBuilder:
                 if left is None or right is None:
                     return None
                 div_idx = self._div_node(left, right)
+                # M-159: ownership transfer at the combining site — numerator
+                # and denominator contribute only through the quotient node.
+                self.output_weights[left] = 0.0
+                self.output_weights[right] = 0.0
                 self._set_root_weight(div_idx, coeff)
                 return div_idx
 
@@ -361,7 +406,12 @@ class _GraphBuilder:
 
             prod = built[0]
             for child in built[1:]:
+                prev = prod
                 prod = self._mul_node(prod, child)
+                # M-159: ownership transfer at the combining site — absorbed
+                # factors contribute only through the product node.
+                self.output_weights[prev] = 0.0
+                self.output_weights[child] = 0.0
             self._set_root_weight(prod, coeff)
             return prod
 
@@ -620,11 +670,14 @@ class _GraphBuilder:
 
     def to_graph_dict(self, root_idx: int) -> dict[str, Any]:
         # build() sets weights for sums/products; only default single-node graphs.
-        if abs(self.output_weights[root_idx]) < 1e-12:
+        # M-158: None = never assigned → default 1.0 (legacy dead-seed guard);
+        # explicit values (including 0.0) are kept as the caller set them.
+        if self.output_weights[root_idx] is None:
             self._set_root_weight(root_idx, 1.0)
+        weights = [0.0 if v is None else float(v) for v in self.output_weights]
         return {
             "nodes": self.nodes,
-            "output_weights": self.output_weights,
+            "output_weights": weights,
             "output_bias": float(self.output_bias),
         }
 

@@ -17,9 +17,27 @@ namespace sr {
 
 inline double snap_val(double val, double int_tol, double zero_tol) {
     if (std::abs(val) <= zero_tol) return 0.0;
+    // M-151: ULP-aware tolerance — absolute int_tol at ordinary magnitudes
+    // (identical below ~5e9), relative (8 ULPs) above, so huge magnitudes snap
+    // only within their own representable precision instead of aliasing any
+    // double within an absolute window to a nearby integer.
+    constexpr double kSnapUlpScale = 8.0 * 2.2204460492503131e-16;
+    const double tol_eff = std::max(int_tol, kSnapUlpScale * std::abs(val));
     double r = std::round(val);
-    if (std::abs(val - r) <= int_tol) return r;
+    if (std::abs(val - r) <= tol_eff) return r;
     return val;
+}
+
+// M-150: redirect helper — replacing node i by target must also neutralize
+// i itself (Constant 0, no children), so stale op params/children can never
+// leak into hashes, structural equality, or compaction before it is dropped.
+inline void redirect_node(IndividualGraph& graph, std::vector<int>& redirect, int i, int target) {
+    redirect[i] = target;
+    OpNode& node = graph.nodes[static_cast<size_t>(i)];
+    node.type = NodeType::Constant;
+    node.value = 0.0;
+    node.left_child = -1;
+    node.right_child = -1;
 }
 
 inline bool is_valid_graph_topology(const IndividualGraph& graph) {
@@ -169,7 +187,7 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
                 node.type = NodeType::Constant;
                 node.value = 1.0;
             } else if (node.p == 1.0) {
-                redirect[i] = node.left_child;
+                redirect_node(graph, redirect, i, node.left_child);
             } else if (child.type == NodeType::Unary && (child.unary_op == UnaryOp::Power || child.unary_op == UnaryOp::IntPow)) {
                 // §3.108: (x^a)^b = x^(a*b) changes signed-power domain
                 // semantics for fractional b over negative x (exact gives
@@ -212,12 +230,12 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
                 // §3.109: log(exp(y)) = y valid only for omega~1, phi~0
                 // (gated above); exp output is positive so log(|.|) is safe.
                 // No epsilon/range collapse beyond the existing gate.
-                redirect[i] = child.left_child;
+                redirect_node(graph, redirect, i, child.left_child);
             }
         } else if (node.unary_op == UnaryOp::Abs) {
             // abs(abs(y)) = abs(y); abs of non-negative-ish Power even integer may stay
             if (child.type == NodeType::Unary && child.unary_op == UnaryOp::Abs) {
-                redirect[i] = node.left_child;
+                redirect_node(graph, redirect, i, node.left_child);
             }
         }
         
@@ -245,12 +263,22 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
             double res = 0.0;
             
             if (node.binary_op == BinaryOp::Arithmetic) {
+                // S5-12 / P3-017: share eval soft-arithmetic weights (max-logit stable).
                 auto w = arithmetic_soft_weights(node);
                 double max_w = std::max({w[0], w[1], w[2], w[3]});
-                if (max_w == w[0]) res = l + r;
-                else if (max_w == w[3]) res = l - r;
-                else if (max_w == w[1]) res = l * r;
-                else res = l / std::sqrt(1.0 + r*r);
+                // §3.334/§3.336: shared threshold (was an unconditional argmax
+                // here); below it fold the exact weighted mixture in live-eval
+                // form incl. its ±1e6 output clamp.
+                if (max_w >= kArithmeticNearDiscrete) {
+                    if (max_w == w[0]) res = l + r;
+                    else if (max_w == w[3]) res = l - r;
+                    else if (max_w == w[1]) res = l * r;
+                    else res = l / std::sqrt(1.0 + r*r);
+                } else {
+                    res = w[0] * (l + r) + w[1] * (l * r)
+                        + w[2] * (l / std::sqrt(1.0 + r*r)) + w[3] * (l - r);
+                    res = std::clamp(res, -1e6, 1e6);
+                }
             } else if (node.binary_op == BinaryOp::Division) {
                 res = (l / (std::abs(r) + 1e-6)) * ((r >= 0) ? 1.0 : -1.0);
             }
@@ -270,18 +298,17 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
         auto is_one = [&](double v) { return std::abs(v - 1.0) <= int_tol; };
         if (node.binary_op == BinaryOp::Arithmetic) {
             auto w = arithmetic_soft_weights(node);
-            // §3.111: live eval blends all branches; identity rewrite must
-            // only fire when near-discrete. 0.99 (not 0.95) avoids
-            // contradicting live soft evaluation.
-            constexpr double kNearDiscrete = 0.99;
+            // §3.111 + §3.334: live eval blends all branches; identity rewrite
+            // must only fire when near-discrete — shared kArithmeticNearDiscrete
+            // (0.99, not 0.95/0.98) so print, fold, and identities agree.
             double max_w = std::max({w[0], w[1], w[2], w[3]});
             
-            if (max_w >= kNearDiscrete) {
+            if (max_w >= kArithmeticNearDiscrete) {
                 if (max_w == w[0]) { // Add
                     if (left.type == NodeType::Constant && is_zero(left.value)) {
-                        redirect[i] = node.right_child;
+                        redirect_node(graph, redirect, i, node.right_child);
                     } else if (right.type == NodeType::Constant && is_zero(right.value)) {
-                        redirect[i] = node.left_child;
+                        redirect_node(graph, redirect, i, node.left_child);
                     } else {
                         // Check for sin^2(A) + cos^2(A) = 1
                         uint64_t left_arg_hash = 0, right_arg_hash = 0;
@@ -296,7 +323,7 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
                     }
                 } else if (max_w == w[3]) { // Sub
                     if (right.type == NodeType::Constant && is_zero(right.value)) {
-                        redirect[i] = node.left_child;
+                        redirect_node(graph, redirect, i, node.left_child);
                     } else if (node.left_child == node.right_child) { // same index or same hash
                         node.type = NodeType::Constant;
                         node.value = 0.0;
@@ -313,9 +340,9 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
                         node.type = NodeType::Constant;
                         node.value = 0.0;
                     } else if (left.type == NodeType::Constant && is_one(left.value)) {
-                        redirect[i] = node.right_child;
+                        redirect_node(graph, redirect, i, node.right_child);
                     } else if (right.type == NodeType::Constant && is_one(right.value)) {
-                        redirect[i] = node.left_child;
+                        redirect_node(graph, redirect, i, node.left_child);
                     } else if (node.left_child >= 0 && node.right_child >= 0 &&
                                node.left_child < static_cast<int>(node_hashes.size()) &&
                                node.right_child < static_cast<int>(node_hashes.size()) &&
@@ -334,7 +361,7 @@ inline void simplify_node_advanced(IndividualGraph& graph, int i, std::vector<in
                 node.type = NodeType::Constant;
                 node.value = 0.0;
             } else if (right.type == NodeType::Constant && is_one(right.value)) {
-                redirect[i] = node.left_child;
+                redirect_node(graph, redirect, i, node.left_child);
             } else if (node.left_child >= 0 && node.right_child >= 0 &&
                        node.left_child < static_cast<int>(graph.nodes.size()) &&
                        node.right_child < static_cast<int>(graph.nodes.size()) &&
@@ -366,12 +393,29 @@ inline void simplify_ast_advanced(IndividualGraph& graph, double int_tol = 1e-5,
         // Pre-compute structural hashes for the un-simplified node
         node_hashes[i] = compute_node_hash(graph, i, node_hashes);
         simplify_node_advanced(graph, i, redirect, node_hashes, int_tol, zero_tol);
+        // M-149: refresh the hash AFTER rewriting node i. Descendant hashes
+        // (j < i) were already refreshed at their own step, so hash-guided
+        // checks below always compare post-rewrite identities, never a mix
+        // of pre/post simplification states.
+        node_hashes[i] = compute_node_hash(graph, i, node_hashes);
     }
     
-    // Output weights redirection & snapping
+    // Output weights redirection & snapping — follow transitive chains with
+    // a cycle guard (M-150: weight must land on a live node, never on a
+    // redirected-away intermediate).
+    auto resolve_redirect = [&](int idx) {
+        int t = idx;
+        int guard = 0;
+        const int nn = static_cast<int>(redirect.size());
+        while (t >= 0 && t < nn && redirect[static_cast<size_t>(t)] != t &&
+               guard++ < nn) {
+            t = redirect[static_cast<size_t>(t)];
+        }
+        return t;
+    };
     std::vector<double> new_weights(graph.nodes.size(), 0.0);
     for (size_t i = 0; i < graph.output_weights.size() && i < graph.nodes.size(); ++i) {
-        int target = redirect[i];
+        int target = resolve_redirect(static_cast<int>(i));
         if (target >= 0 && target < static_cast<int>(new_weights.size())) {
             new_weights[target] += graph.output_weights[i];
         }
@@ -451,7 +495,14 @@ inline void simplify_ast_advanced(IndividualGraph& graph, double int_tol = 1e-5,
             if (is_trig_sq(graph, static_cast<int>(i), post_redirect_hashes, i_arg_hash, i_cos)) {
                 // Find a matching trig term
                 for (size_t j = i + 1; j < graph.nodes.size(); ++j) {
-                    if (std::abs(new_weights[j] - new_weights[i]) < 1e-6) {
+                    // M-152: relative (not absolute 1e-6) coefficient match —
+                    // 1.0000001*sin²+0.9999999*cos² collapses at any scale,
+                    // while legacy absolute tol missed scaled-up pairs.
+                    // Argument identity comes from post-rewrite hashes (M-149).
+                    const double wi = new_weights[i], wj = new_weights[j];
+                    const double tol_ij =
+                        1e-6 * std::max(1.0, std::max(std::abs(wi), std::abs(wj)));
+                    if (std::abs(wj - wi) <= tol_ij) {
                         uint64_t j_arg_hash = 0;
                         bool j_cos = false;
                         if (is_trig_sq(graph, static_cast<int>(j), post_redirect_hashes, j_arg_hash, j_cos)) {

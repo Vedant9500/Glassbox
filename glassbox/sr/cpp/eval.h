@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -131,6 +132,45 @@ inline std::array<double, 4> arithmetic_soft_weights(const OpNode& node) {
     }
     return {w_add / sum_w, w_mul / sum_w, w_div / sum_w, w_sub / sum_w};
 }
+
+// §3.334: ONE shared near-discrete threshold for gate printing and algebraic
+// identities (was 0.98 print vs 0.99 identities, so a gate could be rewritten
+// while printed as a blend). Folds below threshold keep the exact weighted
+// blend (§3.336), so print and fold can never disagree.
+constexpr double kArithmeticNearDiscrete = 0.99;
+
+// M-300: gate-mode diagnostics — the same (beta, gamma) gate evaluates as a
+// different effective operation at different temperatures. Report weights,
+// dominant op, and the effective temperature together so consumers never
+// read a gate mode without knowing which temperature produced it.
+struct ArithmeticGateInfo {
+    double w[4];
+    int dominant;  // 0=add 1=mul 2=div 3=sub
+    double temperature;
+};
+inline ArithmeticGateInfo arithmetic_gate_info(double beta, double gamma) {
+    OpNode probe;
+    probe.type = NodeType::Binary;
+    probe.binary_op = BinaryOp::Arithmetic;
+    probe.beta = beta;
+    probe.gamma = gamma;
+    auto w = arithmetic_soft_weights(probe);
+    int dom = 0;
+    for (int k = 1; k < 4; ++k)
+        if (w[static_cast<size_t>(k)] > w[static_cast<size_t>(dom)]) dom = k;
+    ArithmeticGateInfo info;
+    info.w[0] = w[0]; info.w[1] = w[1]; info.w[2] = w[2]; info.w[3] = w[3];
+    info.dominant = dom;
+    info.temperature = get_arithmetic_temperature();
+    return info;
+}
+
+// M-153: formatter visit budget. Shared DAG subtrees are formatted once per
+// parent, so output can grow exponentially in node count; the depth guard
+// alone does not bound it. Threaded counter caps total node visits (each
+// visit emits O(10) framing chars), bounding both time and output size.
+// Generous: real formulas use hundreds of visits.
+constexpr size_t kMaxFormatNodeVisits = 65536;
 
 // Evaluates the output of a single graph given feature columns X
 enum class EvalPolicy { Simple, CacheOut, SharedCache, Partial };
@@ -581,6 +621,11 @@ inline bool has_top_level_add_sub(const std::string& s) {
             --depth;
         } else if (depth == 0 && (c == '+' || c == '-')) {
             if (i == 0) continue;
+            // M-155: skip signs that belong to scientific notation
+            // (1e-06, 2E+06) — they are numeric tokens, not operators.
+            if (i >= 2 && (s[i - 1] == 'e' || s[i - 1] == 'E') &&
+                (std::isdigit(static_cast<unsigned char>(s[i - 2])) || s[i - 2] == '.'))
+                continue;
             return true;
         }
     }
@@ -600,9 +645,16 @@ inline std::string format_node_to_string(
     int node_idx,
     int n_inputs,
     std::vector<unsigned char>* visiting_ptr = nullptr,
-    int depth = 0
+    int depth = 0,
+    size_t* visits_ptr = nullptr
 ) {
     if (node_idx < 0 || node_idx >= graph.nodes.size()) return "0";
+    // M-153: visit budget — exhausted subtrees format as "0" (valid token),
+    // keeping time and output bounded on pathologically shared graphs.
+    if (visits_ptr != nullptr) {
+        ++(*visits_ptr);
+        if (*visits_ptr > kMaxFormatNodeVisits) return "0";
+    }
     if (depth > static_cast<int>(graph.nodes.size()) + 8) return "0";
 
     std::vector<unsigned char> owned_visiting;
@@ -635,7 +687,7 @@ inline std::string format_node_to_string(
         case NodeType::Constant:
             return format_constant_display(node.value);
         case NodeType::Unary: {
-            std::string child_str = format_node_to_string(graph, node.left_child, n_inputs, visiting_ptr, depth + 1);
+            std::string child_str = format_node_to_string(graph, node.left_child, n_inputs, visiting_ptr, depth + 1, visits_ptr);
             switch (node.unary_op) {
                 case UnaryOp::Periodic: {
                     // Build clean periodic string: [amp*]sin([omega*]child[ + phi])
@@ -647,7 +699,12 @@ inline std::string format_node_to_string(
                         if (std::abs(node.amplitude - std::round(node.amplitude)) < 1e-6) {
                             snprintf(buf, sizeof(buf), "%d*", static_cast<int>(std::round(node.amplitude)));
                         } else {
-                            snprintf(buf, sizeof(buf), "%.4g*", node.amplitude);
+                            // §3.368: full precision for shown amplitudes —
+                            // %.4g rounded 1.0002 to "1*", permanently dropping
+                            // tuned near-one parameters on round-trip.
+                            // (pi_like omega/phi display stays: §3.370 designs
+                            // its clean-vs-lossless flag separately.)
+                            snprintf(buf, sizeof(buf), "%.17g*", node.amplitude);
                         }
                         result += std::string(buf);
                     }
@@ -686,21 +743,25 @@ inline std::string format_node_to_string(
                     // Odd integers keep signed base; non-integers keep sign*(abs)^p.
                     if (std::abs(node.p - std::round(node.p)) < 1e-6) {
                         int n = static_cast<int>(std::round(node.p));
+                        // M-154: build with std::string — %s into a fixed
+                        // buf truncates long child strings into corrupt,
+                        // unbalanced formulas (observed 255-char cut).
                         if ((n % 2) == 0) {
-                            snprintf(buf, sizeof(buf), "(abs(%s))^%d", child_str.c_str(), n);
+                            return "(abs(" + child_str + "))^" + std::to_string(n);
                         } else {
-                            snprintf(buf, sizeof(buf), "(%s)^%d", child_str.c_str(), n);
+                            return "(" + child_str + ")^" + std::to_string(n);
                         }
                     } else {
-                        snprintf(buf, sizeof(buf), "sign(%s)*(abs(%s))^%.4g", child_str.c_str(), child_str.c_str(), node.p);
+                        // Number-only snprintf stays: %.4g output is bounded
+                        // (~14 chars << 64B); only %s embedding was unsafe.
+                        snprintf(buf, sizeof(buf), "%.4g", node.p);
+                        return "sign(" + child_str + ")*(abs(" + child_str + "))^" + std::string(buf);
                     }
-                    return std::string(buf);
                 }
                 case UnaryOp::IntPow: {
                     int n = static_cast<int>(std::round(node.p));
                     n = std::clamp(n, 2, 6);
-                    snprintf(buf, sizeof(buf), "(%s)^%d", child_str.c_str(), n);
-                    return std::string(buf);
+                    return "(" + child_str + ")^" + std::to_string(n);
                 }
                 case UnaryOp::Exp: {
                     // Build exp string: exp([omega*]child[ + phi])
@@ -713,7 +774,8 @@ inline std::string format_node_to_string(
                             snprintf(buf, sizeof(buf), "%d*", static_cast<int>(std::round(node.omega)));
                             exp_arg += std::string(buf);
                         } else {
-                            snprintf(buf, sizeof(buf), "%.4g*", node.omega);
+                            // §3.368: full precision (see amplitude above).
+                            snprintf(buf, sizeof(buf), "%.17g*", node.omega);
                             exp_arg += std::string(buf);
                         }
                     }
@@ -723,7 +785,8 @@ inline std::string format_node_to_string(
                         if (std::abs(node.phi - std::round(node.phi)) < 1e-6) {
                             snprintf(buf, sizeof(buf), " + %d", static_cast<int>(std::round(node.phi)));
                         } else {
-                            snprintf(buf, sizeof(buf), " + %.4g", node.phi);
+                            // §3.368: full precision (see amplitude above).
+                            snprintf(buf, sizeof(buf), " + %.17g", node.phi);
                         }
                         exp_arg += std::string(buf);
                     }
@@ -739,15 +802,16 @@ inline std::string format_node_to_string(
             break;
         }
         case NodeType::Binary: {
-            std::string l_str = format_node_to_string(graph, node.left_child, n_inputs, visiting_ptr, depth + 1);
-            std::string r_str = format_node_to_string(graph, node.right_child, n_inputs, visiting_ptr, depth + 1);
+            std::string l_str = format_node_to_string(graph, node.left_child, n_inputs, visiting_ptr, depth + 1, visits_ptr);
+            std::string r_str = format_node_to_string(graph, node.right_child, n_inputs, visiting_ptr, depth + 1, visits_ptr);
             
             switch (node.binary_op) {
                 case BinaryOp::Arithmetic: {
                     auto w = arithmetic_soft_weights(node);
-                    constexpr double kNearDiscrete = 0.98;
+                    // §3.334: shared kArithmeticNearDiscrete (was a local
+                    // 0.98 here vs 0.99 in identities).
                     double max_w = std::max({w[0], w[1], w[2], w[3]});
-                    if (max_w >= kNearDiscrete) {
+                    if (max_w >= kArithmeticNearDiscrete) {
                         if (max_w == w[0]) return "(" + l_str + " + " + r_str + ")";
                         if (max_w == w[3]) return "(" + l_str + " - " + r_str + ")";
                         if (max_w == w[1]) return "(" + l_str + " * " + r_str + ")";
@@ -757,9 +821,12 @@ inline std::string format_node_to_string(
                     std::string blend = "(";
                     bool first = true;
                     auto append_term = [&](double ww, const std::string& expr) {
-                        if (ww < 1e-3) return;
+                        // §3.337: omission at the documented activity tolerance
+                        // (was 1e-3, a second aggressive display cut beside the
+                        // 0.99 single-op threshold); weights at %.6g like tau.
+                        if (!(ww > kOutputWeightActive)) return;
                         char wbuf[64];
-                        snprintf(wbuf, sizeof(wbuf), "%.3g", ww);
+                        snprintf(wbuf, sizeof(wbuf), "%.6g", ww);
                         if (!first) blend += " + ";
                         blend += std::string(wbuf) + "*" + expr;
                         first = false;
@@ -833,12 +900,15 @@ inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs
     
     std::string final_formula;
     bool first = true;
+    // M-153: one visit budget shared across all top-level terms.
+    size_t format_visits = 0;
     
     for (size_t i = 0; i < graph.output_weights.size() && i < graph.nodes.size(); ++i) {
         double w = graph.output_weights[i];
         // S5-6: match eval activity threshold (was 1e-4 -> silent dropped terms).
         if (std::abs(w) > kOutputWeightActive) {
-            std::string sub_formula = format_node_to_string(graph, static_cast<int>(i), n_inputs);
+            std::string sub_formula = format_node_to_string(graph, static_cast<int>(i), n_inputs,
+                                                            nullptr, 0, &format_visits);
             
             if (!first) {
                 final_formula += (w > 0) ? " + " : " - ";

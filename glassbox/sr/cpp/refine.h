@@ -9,6 +9,22 @@
 
 namespace sr {
 
+// Batch-12 finite guards (M-339): generous modeling-neutral caps. Engine trig
+// omegas live in [-8, 8] (evolution.h); 1e4 is headroom, not a modeling claim
+// — it rejects only non-finite/runaway values while leaving legit fits alone.
+constexpr double kRefineFreqOmegaMin = 0.01;
+constexpr double kRefineFreqOmegaMax = 1e4;
+constexpr double kRefineRationalOmegaMax = 1e4;
+constexpr double kRefineRationalCMin = 1e-6;
+constexpr double kRefineRationalCMax = 1e6;
+
+template <typename Derived>
+inline bool all_entries_finite(const Eigen::DenseBase<Derived>& m) {
+    for (int i = 0; i < m.size(); ++i)
+        if (!std::isfinite(m.derived()(i))) return false;
+    return true;
+}
+
 
 // Apply sqrt(sample weights) row scaling for weighted least squares.
 // Empty / wrong-size sw is a no-op. Non-positive weights clamp to 0.
@@ -32,22 +48,56 @@ inline void apply_sqrt_sample_weights(Eigen::MatrixXd& X, Eigen::VectorXd& y,
 struct ElasticNetResult {
     Eigen::VectorXd weights;
     double mse = 1e15;
+    // Batch-12 diagnostics (M-338; §3.399): convergence metadata. mse is the
+    // data-fit term — weighted sum(w r^2)/sum(w) when sample_weight is given,
+    // plain mean square otherwise. penalized_objective adds the l1/l2
+    // penalties: the function coordinate descent actually minimizes.
+    int iters_done = 0;
+    bool converged = false;
+    double penalized_objective = 1e15;
 };
 
 inline ElasticNetResult elastic_net_cd_cpp(const Eigen::MatrixXd& X, const Eigen::VectorXd& y,
                                            double l1_weight, double l2_weight, 
                                            int max_iter = 1000, double tol = 1e-7,
-                                           const Eigen::VectorXd& initial_w = Eigen::VectorXd()) {
+                                           const Eigen::VectorXd& initial_w = Eigen::VectorXd(),
+                                           const Eigen::VectorXd& sample_weight = Eigen::VectorXd()) {
     // §3.94 implemented objective: MSE + l1_weight*||w||_1 + l2_weight*||w||_2^2
     // with MSE = ||r||^2/n (threshold = l1_weight/2, NOT sklearn's
     // (1/2n)||r||^2 + alpha||w||_1 whose threshold is alpha). Callers passing
     // sklearn alpha must scale explicitly; pybind boundary documents this.
+    // §3.403: X/y arrive sqrt(w)-scaled (apply_sqrt_sample_weights), so the
+    // scaled residual sum is sum(w r_orig^2). With sample_weight given the
+    // returned mse is sum(w r^2)/sum(w) (residual_mse_weighted contract);
+    // otherwise legacy ||r||^2/n. Same data ⇒ same denominator, so
+    // multi-start ranking is unaffected by the convention.
     int n = X.rows();
     int p = X.cols();
     
     Eigen::VectorXd w = initial_w;
     if (w.size() != p) w = Eigen::VectorXd::Zero(p);
-    if (n == 0 || p == 0) return {w, 0.0};
+    if (n == 0 || p == 0) return {w, 0.0, 0, true, 0.0};
+
+    // §3.400: fail loud (inf mse) on non-finite data instead of silently
+    // iterating poisoned residuals to a bogus zero solution.
+    if (!all_entries_finite(X) || !all_entries_finite(y) || !all_entries_finite(w)) {
+        ElasticNetResult bad;
+        bad.weights = Eigen::VectorXd::Zero(p);
+        bad.mse = std::numeric_limits<double>::infinity();
+        bad.penalized_objective = std::numeric_limits<double>::infinity();
+        return bad;
+    }
+
+    const bool has_w = (sample_weight.size() == y.size());
+    double den = static_cast<double>(n);
+    if (has_w) {
+        const double s = sample_weight.sum();
+        if (s > 0.0 && std::isfinite(s)) den = s;
+    }
+
+    auto penalized = [&](const Eigen::VectorXd& ww, double mse_val) {
+        return mse_val + l1_weight * ww.cwiseAbs().sum() + l2_weight * ww.squaredNorm();
+    };
     
     // Precompute z_j = 1/n ||X_j||^2
     Eigen::VectorXd z(p);
@@ -57,6 +107,12 @@ inline ElasticNetResult elastic_net_cd_cpp(const Eigen::MatrixXd& X, const Eigen
     
     Eigen::VectorXd res = y - X * w;
     double l1_half = l1_weight / 2.0;
+    double prev_obj = penalized(w, res.squaredNorm() / den);
+
+    ElasticNetResult out;
+    out.weights = w;
+    out.mse = res.squaredNorm() / den;
+    out.penalized_objective = prev_obj;
     
     for (int iter = 0; iter < max_iter; ++iter) {
         double max_change = 0.0;
@@ -80,25 +136,45 @@ inline ElasticNetResult elastic_net_cd_cpp(const Eigen::MatrixXd& X, const Eigen
                 max_change = std::max(max_change, std::abs(new_w - old_w));
             }
         }
-        
-        if (max_change < tol) break;
+
+        double mse_now = res.squaredNorm() / den;
+        double cur_obj = penalized(w, mse_now);
+        out.iters_done = iter + 1;
+        // §3.399: dual stop — legacy coeff tolerance AND penalized-objective
+        // stall. Continuing while the objective still drops fixes premature
+        // stops on tiny-scale columns; flat-objective runs stop as before.
+        const double obj_drop = prev_obj - cur_obj;
+        if (max_change < tol && obj_drop <= tol * (1.0 + std::abs(cur_obj))) {
+            out.converged = true;
+            out.weights = w;
+            out.mse = mse_now;
+            out.penalized_objective = cur_obj;
+            break;
+        }
+        prev_obj = cur_obj;
+        out.weights = w;
+        out.mse = mse_now;
+        out.penalized_objective = cur_obj;
     }
     
-    double mse = res.squaredNorm() / n;
-    return {w, mse};
+    return out;
 }
 
 inline ElasticNetResult multi_start_elastic_net(const Eigen::MatrixXd& X, const Eigen::VectorXd& y,
                                                 double l1_weight, double l2_weight, 
                                                 int n_starts = 5, double init_scale = 0.1,
-                                                int max_iter = 1000) {
+                                                int max_iter = 1000,
+                                                const Eigen::VectorXd& sample_weight = Eigen::VectorXd(),
+                                                unsigned int seed = 42) {
     int p = X.cols();
     ElasticNetResult best_res;
-    best_res.mse = 1e15;
+    best_res.mse = std::numeric_limits<double>::infinity();
+    best_res.penalized_objective = std::numeric_limits<double>::infinity();
     best_res.weights = Eigen::VectorXd::Zero(p);
     
-    constexpr unsigned int kElasticNetSeed = 42;
-    std::mt19937 gen(kElasticNetSeed);
+    // M-136: start seed exposed (default 42 = legacy sequence). Callers
+    // wanting dataset-decorrelated starts pass their own seed.
+    std::mt19937 gen(seed);
     std::normal_distribution<double> dist(0.0, init_scale);
     
     for (int i = 0; i < n_starts; ++i) {
@@ -107,8 +183,11 @@ inline ElasticNetResult multi_start_elastic_net(const Eigen::MatrixXd& X, const 
             for (int j = 0; j < p; ++j) init_w(j) = dist(gen);
         }
         
-        auto res = elastic_net_cd_cpp(X, y, l1_weight, l2_weight, max_iter, 1e-7, init_w);
-        if (res.mse < best_res.mse) {
+        auto res = elastic_net_cd_cpp(X, y, l1_weight, l2_weight, max_iter, 1e-7, init_w,
+                                      sample_weight);
+        // §3.401: compare the penalized objective CD minimizes, not raw MSE —
+        // a lower-MSE start can be a worse solution of the regularized problem.
+        if (res.penalized_objective < best_res.penalized_objective) {
             best_res = res;
         }
     }
@@ -124,22 +203,19 @@ inline ElasticNetResult iterative_elastic_net(const Eigen::MatrixXd& X, const Ei
                                               int n_starts = 3, int n_iterations = 3,
                                               double prune_threshold = 0.05,
                                               int max_iter = 1000,
-                                              const Eigen::VectorXd& sample_weight = Eigen::VectorXd()) {
+                                              const Eigen::VectorXd& sample_weight = Eigen::VectorXd(),
+                                              unsigned int seed = 42) {
     Eigen::MatrixXd X_work = X;
     Eigen::VectorXd y_work = y;
     apply_sqrt_sample_weights(X_work, y_work, sample_weight);
-    const bool has_w = (sample_weight.size() == y.size());
-    double w_sum = 0.0;
-    if (has_w) {
-        w_sum = sample_weight.sum();
-        if (!(w_sum > 0.0) || !std::isfinite(w_sum)) w_sum = static_cast<double>(y.size());
-    }
 
     int p = X_work.cols();
+    const double l1_half = l1_weight / 2.0;
     std::vector<bool> active_mask(p, true);
     
     ElasticNetResult best_res;
-    best_res.mse = 1e15;
+    best_res.mse = std::numeric_limits<double>::infinity();
+    best_res.penalized_objective = std::numeric_limits<double>::infinity();
     best_res.weights = Eigen::VectorXd::Zero(p);
     
     for (int it = 0; it < n_iterations; ++it) {
@@ -157,24 +233,22 @@ inline ElasticNetResult iterative_elastic_net(const Eigen::MatrixXd& X, const Ei
             }
         }
         
-        auto res = multi_start_elastic_net(X_active, y_work, l1_weight, l2_weight, n_starts, 0.1, max_iter);
+        auto res = multi_start_elastic_net(X_active, y_work, l1_weight, l2_weight, n_starts,
+                                           0.1, max_iter, sample_weight, seed);
         
         Eigen::VectorXd full_weights = Eigen::VectorXd::Zero(p);
         for (int j = 0; j < num_active; ++j) {
             full_weights(active_indices[j]) = res.weights(j);
         }
         
-        // §3.95: normalize scaled objective to weighted MSE for selection.
-        double res_mse_norm = res.mse;
-        if (has_w) {
-            const double n_rows = static_cast<double>(X_work.rows());
-            if (w_sum > 0.0 && std::isfinite(w_sum) && n_rows > 0) {
-                res_mse_norm = res.mse * n_rows / w_sum;
-            }
-        }
-        if (res_mse_norm < best_res.mse) {
-            best_res.mse = res_mse_norm;
+        // §3.403: res.mse already carries the weighted contract from
+        // elastic_net_cd_cpp (single source of truth — no renormalization here).
+        if (res.mse < best_res.mse) {
+            best_res.mse = res.mse;
             best_res.weights = full_weights;
+            best_res.iters_done = res.iters_done;
+            best_res.converged = res.converged;
+            best_res.penalized_objective = res.penalized_objective;
         }
         
         double max_w = full_weights.cwiseAbs().maxCoeff();
@@ -183,14 +257,36 @@ inline ElasticNetResult iterative_elastic_net(const Eigen::MatrixXd& X, const Ei
         double thresh = prune_threshold * max_w;
         std::vector<bool> new_mask(p, false);
         bool any_active = false;
-        bool changed = false;
         
         for (int j = 0; j < p; ++j) {
             if (std::abs(full_weights(j)) > thresh) {
                 new_mask[j] = true;
                 any_active = true;
             }
-            if (new_mask[j] != active_mask[j]) changed = true;
+        }
+
+        // §3.402: KKT reentry — a pruned column with |X_j·res|/n above the
+        // soft threshold (same /n convention as the CD sweep) belongs back
+        // in the active set. best_res already preserves the unpruned optimum,
+        // so this only affects future iterations, bounded by n_iterations.
+        {
+            Eigen::VectorXd res_full = y_work - X_work * full_weights;
+            const double rn = static_cast<double>(X_work.rows());
+            for (int j = 0; j < p; ++j) {
+                if (active_mask[j] && !new_mask[j] && rn > 0) {
+                    const double score =
+                        std::abs(X_work.col(j).dot(res_full)) / rn;
+                    if (score > l1_half) {
+                        new_mask[j] = true;
+                        any_active = true;
+                    }
+                }
+            }
+        }
+
+        bool changed = false;
+        for (int j = 0; j < p; ++j) {
+            if (new_mask[j] != active_mask[j]) { changed = true; break; }
         }
         
         if (!any_active || !changed) break;
@@ -253,6 +349,9 @@ inline double residual_mse_weighted(
 struct FreqResult {
     std::vector<double> omegas;
     double mse;
+    // §3.405: true once a finite evaluation updates best (all-fail runs
+    // return the sanitized init with mse=inf instead of a 1e9 sentinel).
+    bool success = false;
 };
 
 inline FreqResult refine_frequencies_cpp(
@@ -266,8 +365,15 @@ inline FreqResult refine_frequencies_cpp(
     int n = static_cast<int>(x.size());
     int k = static_cast<int>(initial_omegas.size());
     std::vector<double> omegas = initial_omegas;
-    
-    double best_mse = 1e9;
+
+    // M-339/§3.405: sanitize + bound the init; best starts at inf so the
+    // first finite evaluation wins (never a 1e9 sentinel or garbage state).
+    for (double& o : omegas) {
+        if (!std::isfinite(o)) o = 1.0;
+        o = std::clamp(o, kRefineFreqOmegaMin, kRefineFreqOmegaMax);
+    }
+    double best_mse = std::numeric_limits<double>::infinity();
+    bool success = false;
     std::vector<double> best_omegas = omegas;
     
     for (int step = 0; step < steps; ++step) {
@@ -291,49 +397,51 @@ inline FreqResult refine_frequencies_cpp(
         if (mse < best_mse) {
             best_mse = mse;
             best_omegas = omegas;
+            success = true;
         }
         
         // Gradient descent on omegas via finite differences
         // §3.97: scale-adaptive FD step (fixed 1e-4 under-resolves large
         // |omega| and over-steps near zero). Relative step with floor.
+        // §3.404: probe on local copies (X_f/X_b), never by mutating the
+        // shared design matrix — the old perturb/restore left X corrupted
+        // on any exception or early return between the two.
         std::vector<double> grads(k, 0.0);
         
         for (int i = 0; i < k; ++i) {
             const double eps = 1e-4 * (1.0 + std::abs(omegas[i]));
-            // Forward step
-            omegas[i] += eps;
-            X.col(3 + 2*i) = (omegas[i] * x.array()).sin().matrix();
-            X.col(4 + 2*i) = (omegas[i] * x.array()).cos().matrix();
-            Eigen::VectorXd c_fwd = solve_linear_weighted(X, y, sample_weight);
-            double mse_fwd = residual_mse_weighted(X * c_fwd, y, sample_weight);
-            
-            // Backward step
-            omegas[i] -= 2*eps;
-            X.col(3 + 2*i) = (omegas[i] * x.array()).sin().matrix();
-            X.col(4 + 2*i) = (omegas[i] * x.array()).cos().matrix();
-            Eigen::VectorXd c_bwd = solve_linear_weighted(X, y, sample_weight);
-            double mse_bwd = residual_mse_weighted(X * c_bwd, y, sample_weight);
-            
-            // Restore
-            omegas[i] += eps;
-            X.col(3 + 2*i) = (omegas[i] * x.array()).sin().matrix();
-            X.col(4 + 2*i) = (omegas[i] * x.array()).cos().matrix();
+            const double o_fwd = omegas[i] + eps;
+            const double o_bwd = omegas[i] - eps;
+            Eigen::MatrixXd X_f = X;
+            X_f.col(3 + 2*i) = (o_fwd * x.array()).sin().matrix();
+            X_f.col(4 + 2*i) = (o_fwd * x.array()).cos().matrix();
+            Eigen::VectorXd c_fwd = solve_linear_weighted(X_f, y, sample_weight);
+            double mse_fwd = residual_mse_weighted(X_f * c_fwd, y, sample_weight);
+
+            Eigen::MatrixXd X_b = X;
+            X_b.col(3 + 2*i) = (o_bwd * x.array()).sin().matrix();
+            X_b.col(4 + 2*i) = (o_bwd * x.array()).cos().matrix();
+            Eigen::VectorXd c_bwd = solve_linear_weighted(X_b, y, sample_weight);
+            double mse_bwd = residual_mse_weighted(X_b * c_bwd, y, sample_weight);
             
             grads[i] = (mse_fwd - mse_bwd) / (2 * eps);
         }
         
         // Update omegas with projected gradient descent (§3.98): the FD
         // gradient is evaluated at the pre-clamp value, so project the step
-        // onto omega >= 0.01 rather than bare-clamping afterwards. Skip
-        // non-finite FD gradients instead of stepping on NaN.
+        // onto the feasible set rather than bare-clamping afterwards. Skip
+        // non-finite FD gradients instead of stepping on NaN. M-339: upper
+        // projection + finite-trial guard — omega can no longer run away
+        // to inf or persist as NaN.
         for (int i = 0; i < k; ++i) {
             if (!std::isfinite(grads[i])) continue;
             double trial = omegas[i] - lr * grads[i];
-            omegas[i] = std::max(trial, 0.01); // project onto feasible set
+            if (!std::isfinite(trial)) continue;
+            omegas[i] = std::clamp(trial, kRefineFreqOmegaMin, kRefineFreqOmegaMax);
         }
     }
     
-    return {best_omegas, best_mse};
+    return {best_omegas, best_mse, success};
 }
 
 struct PowerResult {
@@ -480,6 +588,10 @@ struct PeriodicRationalResult {
     double d; // linear
     double e; // const
     double mse;
+    // §3.405: true once a finite evaluation updates best (all-fail runs
+    // return the sanitized init with mse=inf instead of a 1e9 sentinel
+    // plus uninitialized fields).
+    bool success = false;
 };
 
 inline PeriodicRationalResult refine_periodic_rational_cpp(
@@ -492,12 +604,23 @@ inline PeriodicRationalResult refine_periodic_rational_cpp(
     const Eigen::VectorXd& sample_weight = Eigen::VectorXd()
 ) {
     int n = static_cast<int>(x.size());
-    double omega = omega0;
-    double c_val = std::max(c0, 1e-6); // enforce positivity
-    
-    double best_mse = 1e9;
+    // M-339/§3.405: sanitize + bound the init (omega keeps its sign freedom,
+    // only magnitude is capped; c stays strictly positive for denominator
+    // safety). best is fully initialized from the sanitized init with
+    // mse=inf, so all-fail runs return honest state, never garbage.
+    double omega = std::isfinite(omega0)
+        ? std::clamp(omega0, -kRefineRationalOmegaMax, kRefineRationalOmegaMax)
+        : 1.0;
+    double c_val = std::isfinite(c0)
+        ? std::clamp(c0, kRefineRationalCMin, kRefineRationalCMax)
+        : 1.0;
+
     PeriodicRationalResult best;
-    best.mse = best_mse;
+    best.omega = omega;
+    best.c = c_val;
+    best.a = best.b = best.d = best.e = 0.0;
+    best.mse = std::numeric_limits<double>::infinity();
+    best.success = false;
     
     for (int step = 0; step < steps; ++step) {
         Eigen::MatrixXd X(n, 4); // sin/(x^2+c), cos/(x^2+c), x, 1
@@ -511,8 +634,7 @@ inline PeriodicRationalResult refine_periodic_rational_cpp(
         Eigen::VectorXd pred = X * coef;
         double mse = residual_mse_weighted(pred, y, sample_weight);
         
-        if (mse < best_mse) {
-            best_mse = mse;
+        if (mse < best.mse) {
             best.omega = omega;
             best.c = c_val;
             best.a = coef[0];
@@ -520,6 +642,7 @@ inline PeriodicRationalResult refine_periodic_rational_cpp(
             best.d = coef[2];
             best.e = coef[3];
             best.mse = mse;
+            best.success = true;
         }
         
         double eps = 1e-4;
@@ -560,10 +683,20 @@ inline PeriodicRationalResult refine_periodic_rational_cpp(
         }
         double grad_c = (c_fwd - c_bwd) / (2 * eps);
         
-        // Finite-gradient guard + projection (§3.98): skip NaN FD probes;
-        // c_val stays strictly positive (denominator safety).
-        if (std::isfinite(grad_omega)) omega -= lr * grad_omega;
-        if (std::isfinite(grad_c)) c_val = std::max(c_val - lr * grad_c, 1e-6);
+        // Finite-gradient guard + projection (§3.98; M-339): skip NaN FD probes;
+        // omega keeps sign freedom but is magnitude-capped and can never
+        // persist as NaN; c_val stays in [1e-6, 1e6] (denominator safety).
+        if (std::isfinite(grad_omega)) {
+            double trial = omega - lr * grad_omega;
+            if (std::isfinite(trial))
+                omega = std::clamp(trial, -kRefineRationalOmegaMax,
+                                   kRefineRationalOmegaMax);
+        }
+        if (std::isfinite(grad_c)) {
+            double trial = c_val - lr * grad_c;
+            if (std::isfinite(trial))
+                c_val = std::clamp(trial, kRefineRationalCMin, kRefineRationalCMax);
+        }
     }
     return best;
 }

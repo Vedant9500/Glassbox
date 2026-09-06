@@ -609,6 +609,14 @@ public:
         node.type = NodeType::Unary;
         node.left_child = base_idx;
         node.right_child = -1;
+        // §3.330: non-finite exponents (e.g. x^(1/0)) are caller errors, not
+        // seed material — fail loud instead of admitting poisoned Power nodes.
+        // Finite out-of-domain exponents stay admitted by design: parsed seeds
+        // are exempt from the evolution domain and the engine clamps them on
+        // mutation/Adam (H-03), so clamping here would silently move seeds.
+        if (!std::isfinite(p_val)) {
+            throw std::runtime_error("Power exponent must be finite");
+        }
         double p_round = std::round(p_val);
         if (std::abs(p_val - p_round) < 1e-9 && p_round >= 2.0 && p_round <= 6.0) {
             node.unary_op = UnaryOp::IntPow;
