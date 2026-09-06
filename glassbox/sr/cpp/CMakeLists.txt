@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.14)
 project(glassbox_sr_cpp)
 
+# §3.389: pin the language standard explicitly (mirrors setup.py).
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
 # Find pybind11
 find_package(pybind11 REQUIRED)
 

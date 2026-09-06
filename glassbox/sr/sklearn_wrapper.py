@@ -1004,6 +1004,14 @@ def _robust_loss(
       - huber: smooth L1 outside ``delta`` (default = MAD scale)
       - trimmed_mse: drop largest ``trim_fraction`` of squared residuals
       - student_t: log(1 + (r/s)^2) with s = MAD scale (heavy-tail)
+
+    §3.338: ``delta`` (native ``huber_delta``) is shared by huber and
+    student_t — a Huber cutoff reused directly as the Student-t scale ``s``,
+    so the two objectives are not parameterized comparably. ``None`` or a
+    non-positive value falls back to the MAD scale in both modes; the native
+    default (-1.0) means the same fallback. A separate ``student_t_scale``
+    parameter is deliberately deferred (constructor + 4 forward sites);
+    pass an explicit positive ``delta`` to pin both scales identically.
     """
     mode = _validate_loss_mode(loss_mode)
     pred = np.asarray(pred, dtype=np.float64).reshape(-1)
@@ -10575,17 +10583,47 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                     x_t, y_t, hints, **guided_kw
                                 )
                             except TypeError:
-                                # Prefer call_with_optional_kwargs at call site when possible.
-                                guided_kw.pop("y_weights", None)
-                                guided_kw.pop("loss_mode", None)
-                                guided_kw.pop("huber_delta", None)
-                                guided_kw.pop("trim_fraction", None)
-                                guided_kw.pop("input_units", None)
-                                guided_kw.pop("output_units", None)
-                                guided_kw.pop("dim_penalty_weight", None)
-                                guided_result = run_guided_evolution(
-                                    x_t, y_t, hints, **guided_kw
+                                # §3.340: never drop every optional group on one
+                                # TypeError — a malformed y_weights object must
+                                # not silently disable robust-loss selection
+                                # (MSE fallback). Retry dropping one group at
+                                # a time and record which parameters were lost.
+                                _drop_groups = (
+                                    (
+                                        "input_units",
+                                        "output_units",
+                                        "dim_penalty_weight",
+                                    ),
+                                    (
+                                        "loss_mode",
+                                        "huber_delta",
+                                        "trim_fraction",
+                                    ),
+                                    ("y_weights",),
                                 )
+                                guided_result = None
+                                dropped_keys: list = []
+                                for _group in _drop_groups:
+                                    trial_kw = dict(guided_kw)
+                                    for _key in list(dropped_keys) + list(_group):
+                                        trial_kw.pop(_key, None)
+                                    try:
+                                        guided_result = run_guided_evolution(
+                                            x_t, y_t, hints, **trial_kw
+                                        )
+                                    except TypeError:
+                                        dropped_keys.extend(_group)
+                                        continue
+                                    break
+                                if guided_result is None:
+                                    raise
+                                if dropped_keys and isinstance(
+                                    getattr(self, "blackbox_diagnostics_", None),
+                                    dict,
+                                ):
+                                    self.blackbox_diagnostics_[
+                                        "guided_evolution_dropped_kwargs"
+                                    ] = list(dropped_keys)
 
                             if guided_result and guided_result.get("formula"):
                                 evo_formula = guided_result["formula"]

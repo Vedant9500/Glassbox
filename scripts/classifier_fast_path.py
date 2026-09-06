@@ -5279,7 +5279,11 @@ def beam_search_evolution(
 
     # [Optimized] Run SymPy ONLY ONCE on the absolute global winner
     formula_str = best_overall_result.get("formula", "0")
-    display_mse = best_overall_mse
+    # §3.341: fail closed — display MSE starts unknown (inf), never seeded
+    # from engine-internal MSE, so no future early-return can compare a
+    # fallback and a measured value as peers.
+    display_mse = float("inf")
+    display_mse_source = "evaluation_failed"
     try:
         from sympy.parsing.sympy_parser import (
             convert_xor,
@@ -5412,6 +5416,14 @@ def beam_search_evolution(
         "raw_mse": best_overall_mse,
         "display_mse": display_mse,
         "display_mse_source": display_mse_source,
+        # §3.344: carry the robust search objective through the bridge so the
+        # estimator can report what robust mode actually achieved.
+        "search_loss": best_overall_result.get("search_loss", best_overall_mse),
+        "loss_mode": best_overall_result.get("loss_mode", "mse"),
+        "weighted": best_overall_result.get("weighted", False),
+        "best_weighted_mse": best_overall_result.get(
+            "best_weighted_mse", best_overall_mse
+        ),
         "model": model,
         "time": elapsed,
         "config": best_overall_config,

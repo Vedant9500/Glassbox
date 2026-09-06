@@ -236,6 +236,12 @@ public:
         // recompute cross terms together. Row-by-row updates using a
         // partially refreshed A_ can leave G_ inconsistent with A^T W A
         // when several nonlinear-descendant columns change at once.
+        // §3.363: no ordering contract is needed on changed_indices — every
+        // listed column is written before the wholesale G_/c_ recompute, so
+        // any permutation yields the identical result (column writes
+        // commute; duplicates rewrite the same value). Callers may pass any
+        // order; a future incremental (non-wholesale) updater must re-add an
+        // order requirement here.
         for (int idx : changed_indices) {
             if (idx < 0 || idx >= n_features_) continue;
             if (idx >= static_cast<int>(new_cache.size())) continue;
@@ -550,12 +556,19 @@ public:
             // Distinct RNG stream per island under a fixed parent seed (E1).
             // Without this, all islands clone the same trajectories.
             if (config_.random_seed >= 0) {
-                // Large coprime-ish stride keeps streams far apart.
-                long long offset = static_cast<long long>(i) * 1000003LL;
-                long long seed = static_cast<long long>(config_.random_seed) + offset + static_cast<long long>(i);
-                // Keep in unsigned 32-bit range for mt19937.
+                // §3.357: non-affine mix of parent seed and island index.
+                // The old fixed stride (i * 1000003 + i, mod 2^32) collided
+                // exactly for parent seeds 1000004 apart; splitmix64 spreads
+                // adjacent (seed, island) pairs across the range.
+                // Deterministic in (parent seed, island) — same config
+                // replays. Masked to [0, 2^31): a negative int seed would
+                // take the random_device (nondeterministic) engine path.
+                uint64_t z = static_cast<uint64_t>(config_.random_seed) + 0x9E3779B97F4A7C15ULL + static_cast<uint64_t>(i);
+                z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+                z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+                z = z ^ (z >> 31);
                 current_island_cfg.random_seed = static_cast<int>(
-                    static_cast<unsigned int>(seed & 0xffffffffLL)
+                    static_cast<unsigned int>(z & 0x7fffffffULL)
                 );
             } else {
                 current_island_cfg.random_seed = -1;
@@ -2326,10 +2339,19 @@ private:
     // Phase 4 tighten: Huber / trimmed / student_t use a few IRLS iterations
     // so linear output coeffs are fit under the same robust objective as fitness.
     // Returns true if solve succeeded.
-    bool solve_output_weights(IndividualGraph& ind, const std::vector<Eigen::ArrayXd>& cache) {
+    // §3.359: a broken-off robust refit keeps the last good w (legacy) but
+    // now reports it — irls_converged_out=false means the coefficients came
+    // from the non-robust first iterate or an incomplete IRLS chain. Trailing
+    // optional args: existing callers are untouched. pruned_out reports the
+    // §3.360 prune count for the same reason.
+    bool solve_output_weights(IndividualGraph& ind, const std::vector<Eigen::ArrayXd>& cache, bool* irls_converged_out = nullptr, int* pruned_out = nullptr) {
         int n_samples = static_cast<int>(y_.size());
         int num_features = static_cast<int>(ind.nodes.size());
-        if (num_features == 0) return false;
+        if (num_features == 0) {
+            if (irls_converged_out) *irls_converged_out = false;
+            if (pruned_out) *pruned_out = 0;
+            return false;
+        }
         
         // Build Design Matrix A: [nodes | 1 (bias)]
         Eigen::MatrixXd A(n_samples, num_features + 1);
@@ -2365,6 +2387,11 @@ private:
                 Eigen::MatrixXd WA = ww.matrix().asDiagonal() * A;
                 Eigen::MatrixXd AtWA = A.transpose() * WA;
                 Eigen::VectorXd AtWb = A.transpose() * (ww * y_).matrix();
+                // §3.361: LDLT is valid here, not merely convenient. Sample
+                // weights are validated non-negative at the FFI boundary and
+                // wsum > 0 is checked above, so with lambda = 1e-4 > 0 the
+                // regularized normal matrix is positive-definite by
+                // construction; w_out.allFinite() gates the rest.
                 AtWA.diagonal() += Eigen::VectorXd::Constant(num_features + 1, lambda);
                 w_out = AtWA.ldlt().solve(AtWb);
                 return w_out.allFinite();
@@ -2403,6 +2430,13 @@ private:
                     rw(i) = (a <= d || a < 1e-15) ? 1.0 : (d / a);
                 }
             } else if (config_.loss_mode == LossMode::TrimmedMse) {
+                // §3.362: the IRLS fit keeps dropped samples at soft weight
+                // 1e-6 (matrix stays invertible) and renormalizes the mean to
+                // ~1 below, while the fitness objective hard-excludes the top
+                // fraction by count. The coefficients therefore optimize a
+                // softer surrogate than the accepting objective — documented,
+                // not aligned: hardening the fit weights to 0 risks singular
+                // normal equations on small fronts.
                 Eigen::ArrayXd sq = resid.square();
                 double frac = std::clamp(config_.trim_fraction, 0.0, 0.45);
                 int drop = static_cast<int>(std::llround(n_samples * frac));
@@ -2440,27 +2474,38 @@ private:
 
         Eigen::ArrayXd cur_w = base_w;
         if (!ridge_solve(cur_w, w)) {
+            if (irls_converged_out) *irls_converged_out = false;
+            if (pruned_out) *pruned_out = 0;
             return false;
         }
 
+        bool irls_ok = true;
         for (int it = 1; it < irls_iters; ++it) {
             Eigen::ArrayXd resid = pred_from_w(w) - y_;
-            if (!resid.isFinite().all()) break;
+            if (!resid.isFinite().all()) { irls_ok = false; break; }
             Eigen::ArrayXd rw = irls_weights(resid);
             cur_w = base_w * rw;
             // Renormalize mean ~1 for numerical stability with ridge scale.
             double mean_w = cur_w.mean();
             if (mean_w > 0.0 && std::isfinite(mean_w)) cur_w /= mean_w;
             Eigen::VectorXd w_next;
-            if (!ridge_solve(cur_w, w_next)) break;
+            if (!ridge_solve(cur_w, w_next)) { irls_ok = false; break; }
             // §3.137: stop when the IRLS fixed point settles instead of
             // always running the full fixed iteration budget.
             double w_change = (w_next - w).cwiseAbs().maxCoeff();
             w = w_next;
             if (std::isfinite(w_change) && w_change < 1e-10) break;
         }
+        // §3.359: non-robust mode has no IRLS chain (vacuously converged).
+        if (irls_converged_out) *irls_converged_out = (!robust || irls_ok);
         
-        // Coefficient pruning: zero out weak weights
+        // Coefficient pruning: zero out weak weights.
+        // §3.360: pruning is an explicit, counted step BEFORE fitness
+        // evaluation by design — every caller re-scores after solve
+        // (refine_constants, Adam phase 2, cleanup), so the accepted state
+        // always reflects pruned coefficients. Small-but-high-leverage
+        // columns can be cut; the count is reported via pruned_out instead
+        // of silently vanishing.
         double max_w = 0.0;
         for (int i = 0; i < num_features; ++i) {
             if (std::isfinite(w(i))) {
@@ -2469,14 +2514,17 @@ private:
                 w(i) = 0.0;
             }
         }
-        
+
+        int n_pruned = 0;
         for (int i = 0; i < num_features; ++i) {
             if (std::abs(w(i)) < config_.prune_threshold * max_w || std::abs(w(i)) < 1e-4) {
                 ind.output_weights[i] = 0.0;
+                ++n_pruned;
             } else {
                 ind.output_weights[i] = w(i);
             }
         }
+        if (pruned_out) *pruned_out = n_pruned;
         
         if (std::isfinite(w(num_features)) && std::abs(w(num_features)) >= 1e-4) {
             ind.output_bias = w(num_features);
@@ -2600,6 +2648,11 @@ private:
         if (active_unary.empty()) return;
         // E6: about to mutate inner params - force re-score if interrupted/early-exit.
         ind.fitness_valid = false;
+
+        // §3.365: score once before archiving — weighted_mse/raw_mse may be
+        // stale or at the 1e9 fallback sentinel, and the final restore below
+        // compares every later state against this first snapshot.
+        evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
         
         // Adam hyperparameters
         const double lr = 0.02;
@@ -2710,7 +2763,13 @@ private:
             {
                 std::vector<Eigen::ArrayXd> cache;
                 evaluate_graph(ind, X_, n_samples, cache);
-                if (!solve_output_weights(ind, cache)) continue;
+                if (!solve_output_weights(ind, cache)) {
+                    // §3.366: a failed refit keeps prior coefficients, so the
+                    // Adam-mutated inner params must still be re-scored —
+                    // otherwise the best-tracking below compares stale fitness.
+                    evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                    continue;
+                }
             }
             
             // Evaluate and track best

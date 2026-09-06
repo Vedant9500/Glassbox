@@ -102,6 +102,9 @@ static Eigen::ArrayXd evaluate_parse_node_exact(
             return evaluate_parse_node_exact(node->left, X, num_samples).abs();
         case sr::ParseNodeType::Sqrt:
             return evaluate_parse_node_exact(node->left, X, num_samples).max(0.0).sqrt();
+        case sr::ParseNodeType::Sign:
+            // §3.367: exact sign of the evaluated argument.
+            return evaluate_parse_node_exact(node->left, X, num_samples).sign();
     }
     return Eigen::ArrayXd::Zero(num_samples);
 }
@@ -1027,6 +1030,20 @@ static py::dict run_evolution_cpp(
             sr::simplify_ast(ind);
             py::dict pdict;
             pdict["mse"] = ind.raw_mse;
+            // §3.343: "mse" is the pre-simplification engine value while
+            // complexity/formula below are post-simplification. Recompute the
+            // simplified graph's MSE alongside (legacy key untouched) so the
+            // row no longer mixes two different graphs.
+            double mse_simplified = std::numeric_limits<double>::infinity();
+            try {
+                Eigen::ArrayXd spred = sr::evaluate_graph(
+                    ind, X, static_cast<int>(y.size()));
+                if (spred.size() == y.size() && spred.isFinite().all()) {
+                    mse_simplified = ((spred - y).square().mean());
+                }
+            } catch (...) {
+            }
+            pdict["mse_simplified"] = mse_simplified;
             pdict["weighted_mse"] = ind.weighted_mse;
             pdict["complexity"] = ind.active_complexity();
             pdict["raw_nodes"] = ind.complexity();

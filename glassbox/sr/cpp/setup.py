@@ -13,6 +13,11 @@ openmp_compile_args = (
 )
 openmp_link_args = [] if os.name == "nt" else ["-fopenmp"]
 
+# §3.389: pin the language standard explicitly (was implicit via
+# Pybind11Extension/toolchain default). Headers use C++17 (structured
+# bindings, std::clamp, if-constexpr paths).
+std_compile_args = ["/std:c++17"] if os.name == "nt" else ["-std=c++17"]
+
 ext_modules = [
     Pybind11Extension(
         "_core",  # Module name (build in current directory)
@@ -20,7 +25,7 @@ ext_modules = [
             os.path.join(HERE, "core.cpp")
         ],  # Absolute path so it resolves regardless of CWD
         include_dirs=[os.path.join(HERE, "eigen")],
-        extra_compile_args=(["/O2"] if os.name == "nt" else []) + openmp_compile_args,
+        extra_compile_args=(["/O2"] if os.name == "nt" else []) + openmp_compile_args + std_compile_args,
         extra_link_args=openmp_link_args,
     ),
 ]

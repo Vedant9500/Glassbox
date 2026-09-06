@@ -1538,6 +1538,23 @@ def intensive_coefficient_refinement(
     if initial_mse < target_mse:
         return initial_mse, 0
 
+    # §3.350: this routine only tunes "output_proj"/"scale" parameters.
+    # Modules without them (e.g. CppGraphModule, which carries
+    # output_weights/output_bias instead) would run to completion and return
+    # the input unchanged while the caller reports that intensive refinement
+    # ran. Skip loudly instead; returned values match the old no-op path.
+    tunable = [
+        n
+        for n, _ in model.named_parameters()
+        if "output_proj" in n or ("scale" in n and "alpha" not in n)
+    ]
+    if not tunable:
+        print(
+            "  [Refinement] no tunable output_proj/scale parameters "
+            f"({type(model).__name__}); skipping intensive refinement."
+        )
+        return initial_mse, 0
+
     total_steps = 0
     best_overall_mse = initial_mse
     best_overall_state = {

@@ -261,6 +261,12 @@ inline void compact_graph(IndividualGraph& graph) {
     }
 
     // Build compacted nodes
+    // §3.377: a retained operator node whose child maps to -1 keeps -1 here
+    // ON PURPOSE. The used-propagation above marks every in-range child of a
+    // retained node, so -1 survivors are exactly the out-of-range (invalid)
+    // references — the evaluator substitutes zero and topology validation
+    // rejects the graph downstream (§3.118). Do not silently drop the node —
+    // that would renumber output weights past a loud validation failure.
     for (int i = 0; i < n; ++i) {
         if (!used[static_cast<size_t>(i)]) continue;
         new_indices[static_cast<size_t>(i)] = static_cast<int>(new_nodes.size());
@@ -316,6 +322,11 @@ inline uint64_t hash_combine(uint64_t seed, uint64_t v) {
 // S5-5: default was 2 decimals -> SharedCache collisions (omega=1.004 vs 1.006).
 // Use 8 decimals for eval cache keys. decimals < 0 => bit-exact double bits.
 // Coarse CSE (if desired) can call quantize(v, 2) explicitly.
+// §3.375: boundary contract. Values straddling a rounding boundary hash
+// distinctly (cache miss only — safe, perf-level). Values inside one bin
+// collide by design and SHARE cache payloads, so this grid is approximate:
+// keep it cache/diversity-only and never infer semantic equality from a
+// hash (cleanup dedup decides by output correlation, not hashes).
 inline uint64_t quantize(double v, int decimals = 8) {
     if (decimals < 0) {
         uint64_t u = 0;
@@ -366,6 +377,12 @@ inline uint64_t compute_node_hash(const IndividualGraph& graph, int idx,
             h = hash_combine(h, quantize(node.amplitude));
             if (node.left_child >= 0 && node.left_child < idx) {
                 h = hash_combine(h, node_hashes[node.left_child]);
+            } else {
+                // §3.374: invalid children hash a distinct sentinel instead
+                // of vanishing — a malformed node can no longer collide with
+                // a well-formed node that merely shares op/params, and
+                // evaluation's zero-substitution has no cache twin.
+                h = hash_combine(h, 0xBADC0DEDU);
             }
             break;
         case NodeType::Binary:
@@ -375,9 +392,13 @@ inline uint64_t compute_node_hash(const IndividualGraph& graph, int idx,
             h = hash_combine(h, quantize(node.tau));
             if (node.left_child >= 0 && node.left_child < idx) {
                 h = hash_combine(h, node_hashes[node.left_child]);
+            } else {
+                h = hash_combine(h, 0x1EF7BABEU);
             }
             if (node.right_child >= 0 && node.right_child < idx) {
                 h = hash_combine(h, node_hashes[node.right_child]);
+            } else {
+                h = hash_combine(h, 0x6BADF00DU);
             }
             break;
     }

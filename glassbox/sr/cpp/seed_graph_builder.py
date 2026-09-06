@@ -59,22 +59,65 @@ _LOCAL_DICT = {
     "E": sp.E,
 }
 
+# §3.371: last native rejection reason (None when native parse succeeded).
+_LAST_NATIVE_ERROR: str | None = None
+
+
+def _maybe_expand(expr: sp.Expr | None) -> sp.Expr | None:
+    """§3.372: expand only small expressions before graph construction.
+
+    Product-heavy formulas explode under sp.expand before node limits are
+    known; inputs whose expansion more than triples operator count (or
+    exceeds 200 ops) keep their factored source shape instead.
+    """
+    if expr is None:
+        return None
+    try:
+        base_ops = int(expr.count_ops())
+    except Exception:
+        return expr
+    # Pre-guard: never pay for an expansion that is large even before it
+    # starts — factored source shape is the right graph for these.
+    if base_ops > 200:
+        return expr
+    try:
+        expanded = sp.expand(expr)
+        exp_ops = int(expanded.count_ops())
+    except Exception:
+        return expr
+    if exp_ops <= 200 and exp_ops <= 3 * max(base_ops, 1):
+        return expanded
+    return expr
+
 
 def _cpp_seed_graph_from_formula(
     formula: str, x_name: str = "x"
 ) -> dict[str, Any] | None:
+    global _LAST_NATIVE_ERROR
     _core = get_cpp_core()
     if _core is None or not hasattr(_core, "formula_to_seed_graph"):
+        _LAST_NATIVE_ERROR = "native core unavailable"
         return None
     try:
         graph = _core.formula_to_seed_graph(formula)
         if graph is None:
+            _LAST_NATIVE_ERROR = "native parser returned None"
             return None
         if x_name != "x":
+            _LAST_NATIVE_ERROR = "multi-feature name requires SymPy path"
             return None
+        _LAST_NATIVE_ERROR = None
         return graph
-    except Exception:
+    except Exception as exc:
+        # §3.371: keep the native rejection reason instead of discarding it
+        # so callers can distinguish semantic rejection from fallback success.
+        _LAST_NATIVE_ERROR = str(exc)[:300]
         return None
+
+
+def last_native_seed_error() -> str | None:
+    """§3.371: reason the native seed parse last failed (None on success)."""
+    return _LAST_NATIVE_ERROR
 
 
 def _multi_feature_formula_to_seed_graph(formula: str) -> dict[str, Any] | None:
@@ -100,7 +143,7 @@ def _multi_feature_formula_to_seed_graph(formula: str) -> dict[str, Any] | None:
     except Exception:
         return None
 
-    mapped_expr = sp.expand(expr)
+    mapped_expr = _maybe_expand(expr)
     lookup = {str(sym): (0 if str(sym) == "x" else int(str(sym)[1:])) for sym in free}
     builder = _GraphBuilder(sp.Symbol("x"), feature_lookup=lookup)
     root = builder.build(mapped_expr)
@@ -133,7 +176,7 @@ def _parse_formula_expr(formula: str) -> sp.Expr | None:
         )
     except Exception:
         return None
-    return sp.expand(expr)
+    return _maybe_expand(expr)
 
 
 # Keys each downstream consumer reads per node type (export_pytorch
@@ -682,11 +725,20 @@ class _GraphBuilder:
         }
 
 
-def formula_to_seed_graph(formula: str, x_name: str = "x") -> dict[str, Any] | None:
-    """Parse a formula string into a C++-compatible seed graph dict."""
+def formula_to_seed_graph(
+    formula: str, x_name: str = "x", allow_fallback: bool = True
+) -> dict[str, Any] | None:
+    """Parse a formula string into a C++-compatible seed graph dict.
+
+    Native parse runs first; the SymPy path is an explicit fallback
+    (§3.371: allow_fallback=False requires native success, and the native
+    rejection reason stays available via last_native_seed_error()).
+    """
     cpp_graph = _cpp_seed_graph_from_formula(formula, x_name=x_name)
     if cpp_graph is not None:
         return cpp_graph
+    if not allow_fallback:
+        return None
 
     expr = _parse_formula_expr(formula)
     if expr is None:

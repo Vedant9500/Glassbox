@@ -45,12 +45,46 @@ class CppGraphModule(nn.Module):
     # Match eval.h get_arithmetic_temperature default when no process hook.
     DEFAULT_ARITHMETIC_TEMPERATURE = 5.0
 
+    @staticmethod
+    def _validate_topology(nodes) -> None:
+        """§3.352: reject non-topological node references at construction."""
+        n = len(nodes)
+        for i, node in enumerate(nodes):
+            ntype = node.get("type")
+            if ntype == CppGraphModule.TYPE_INPUT:
+                if int(node.get("feature_idx", 0)) < 0:
+                    raise ValueError(f"node {i}: negative feature_idx")
+            elif ntype == CppGraphModule.TYPE_UNARY:
+                left = int(node.get("left_child", -1))
+                if not 0 <= left < i:
+                    raise ValueError(
+                        f"node {i}: unary child {left} outside prefix [0, {i})"
+                    )
+            elif ntype == CppGraphModule.TYPE_BINARY:
+                for key in ("left_child", "right_child"):
+                    child = int(node.get(key, -1))
+                    if not 0 <= child < i:
+                        raise ValueError(
+                            f"node {i}: {key} {child} outside prefix [0, {i})"
+                        )
+            elif ntype == CppGraphModule.TYPE_CONSTANT:
+                continue
+            else:
+                raise ValueError(f"node {i}: unknown type {ntype!r}")
+
     def __init__(self, cpp_result: dict, arithmetic_temperature: float | None = None,
-                 strict_nonfinite: bool = True):
+                 strict_nonfinite: bool = True, strict_topology: bool = True):
         super().__init__()
 
         self.nodes = cpp_result["nodes"]
         self.formula_str = cpp_result.get("formula", "")
+        # §3.352: malformed serialized topology (forward/out-of-range child
+        # indices) must fail here, not train silently against zero-filled
+        # inputs. strict_topology=False restores legacy forward zero-fill
+        # for inspection probes.
+        if strict_topology:
+            self._validate_topology(self.nodes)
+        self.strict_topology = bool(strict_topology)
         # §3.5: strict parity with C++ eval (reject non-finite) by default.
         # strict_nonfinite=False restores legacy zero-fill for training probes.
         self.strict_nonfinite = bool(strict_nonfinite)
@@ -178,6 +212,13 @@ class CppGraphModule(nn.Module):
                     out = amplitude * torch.sin(omega * child + phi)
                 elif unary_op == self.UNARY_POWER:
                     # §3.1 canonical parity tol 1e-9 + eps 1e-10 (matches eval.h).
+                    # §3.346: is_even is an exact 0/1 step, so d(out)/dp jumps
+                    # at round(p) +/- 1e-9 (autograd sees the selected branch
+                    # only, never the blend coefficient's derivative). Harmless
+                    # today: p is a buffer, and IntPow canonicalization keeps
+                    # training on output weights only. If p ever becomes a
+                    # Parameter, replace with a polynomial expansion in the
+                    # actual integer exponent instead.
                     abs_child = torch.abs(child) + eps
                     sign_child = torch.sign(child)
                     abs_pow = abs_child.pow(p)
@@ -287,7 +328,13 @@ class CppGraphModule(nn.Module):
         result = torch.zeros(n_samples, dtype=torch.float64, device=device)
         for i, out in enumerate(node_outputs):
             if i < len(self.output_weights):
-                # Match eval kOutputWeightActive: skip near-zero weights.
+                # §3.351: match eval kOutputWeightActive: skip near-zero
+                # weights. Note this is plain control flow around a trainable
+                # Parameter — a weight starting at |w| <= 1e-6 gets no
+                # gradient and can never activate via SGD/Adam (unlike
+                # refinement refits, which solve zero weights back to
+                # nonzero). Post-export fitting that must revive dead terms
+                # needs nonzero init or a straight-through estimator.
                 if torch.abs(self.output_weights[i]) > 1e-6:
                     result = result + self.output_weights[i] * out
         result = result + self.output_bias
@@ -301,7 +348,7 @@ class CppGraphModule(nn.Module):
 
 def cpp_result_to_module(
     result: dict, arithmetic_temperature: float | None = None,
-    strict_nonfinite: bool = True,
+    strict_nonfinite: bool = True, strict_topology: bool = True,
 ) -> CppGraphModule:
     """
     Convenience: convert a C++ run_evolution() result dict into a nn.Module.
@@ -313,4 +360,5 @@ def cpp_result_to_module(
         pred, _ = module(x_tensor)
     """
     return CppGraphModule(result, arithmetic_temperature=arithmetic_temperature,
-                          strict_nonfinite=strict_nonfinite)
+                           strict_nonfinite=strict_nonfinite,
+                           strict_topology=strict_topology)

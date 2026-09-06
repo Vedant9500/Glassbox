@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -79,14 +80,24 @@ inline std::vector<Token> tokenize(const std::string& input) {
             tokens.push_back({TokenType::Comma, ","});
             i++;
         } else if (is_digit_char(static_cast<unsigned char>(c)) || c == '.') {
+            // §3.392: strict numeric grammar — at least one mantissa digit
+            // and, when an exponent opens, at least one exponent digit.
+            // ("1e"/"1e+"/".e-" were silently worth 1.0 via stod's prefix
+            // parse; "2e1000" escaped as a raw out_of_range.) Malformed input
+            // is a parser diagnostic; overflow saturates to infinity, the one
+            // policy shared with non-finite-aware evaluation.
             std::string s;
             bool has_dot = false;
             bool has_exp = false;
+            int mantissa_digits = 0;
+            int exp_digits = 0;
             while (i < input.size()) {
                 char curr = input[i];
                 if (is_digit_char(static_cast<unsigned char>(curr))) {
                     s += curr;
                     i++;
+                    if (has_exp) exp_digits++;
+                    else mantissa_digits++;
                 } else if (curr == '.' && !has_dot && !has_exp) {
                     s += curr;
                     has_dot = true;
@@ -103,7 +114,18 @@ inline std::vector<Token> tokenize(const std::string& input) {
                     break;
                 }
             }
-            tokens.push_back({TokenType::Number, s, std::stod(s)});
+            if (mantissa_digits == 0 || (has_exp && exp_digits == 0)) {
+                throw std::runtime_error("Malformed numeric literal: " + s);
+            }
+            double number_value = 0.0;
+            try {
+                number_value = std::stod(s);
+            } catch (const std::invalid_argument&) {
+                throw std::runtime_error("Malformed numeric literal: " + s);
+            } catch (const std::out_of_range&) {
+                number_value = std::numeric_limits<double>::infinity();
+            }
+            tokens.push_back({TokenType::Number, s, number_value});
         } else if (is_alpha_char(static_cast<unsigned char>(c)) || c == '_') {
             std::string s;
             while (i < input.size() && (is_alnum_char(static_cast<unsigned char>(input[i])) || input[i] == '_')) {
@@ -132,7 +154,8 @@ enum class ParseNodeType {
     Exp,
     Log,
     Abs,
-    Sqrt
+    Sqrt,
+    Sign
 };
 
 struct ParseNode {
@@ -276,6 +299,7 @@ private:
                 else if (t.text == "log") node->type = ParseNodeType::Log;
                 else if (t.text == "abs") node->type = ParseNodeType::Abs;
                 else if (t.text == "sqrt") node->type = ParseNodeType::Sqrt;
+                else if (t.text == "sign") node->type = ParseNodeType::Sign;
                 else {
                     throw std::runtime_error("Unsupported function name: " + t.text);
                 }
@@ -354,6 +378,17 @@ inline std::string normalize_formula_string(std::string formula) {
     replace_all(formula, "π", "pi");
     replace_all(formula, "ln(", "log(");
     
+    // §3.394: bars must pair — a lone bar would flip every later
+    // abs-boundary (stateless alternation), turning two disjoint malformed
+    // expressions into one valid-looking wrong parenthesization. Fail closed.
+    {
+        size_t bar_count = 0;
+        for (char ch : formula) if (ch == '|') ++bar_count;
+        if (bar_count % 2 != 0) {
+            throw std::runtime_error(
+                "Unbalanced '|' in formula: absolute-value bars must pair");
+        }
+    }
     size_t bar_pos;
     bool is_opening = true;
     while ((bar_pos = formula.find('|')) != std::string::npos) {
@@ -574,6 +609,12 @@ public:
                 out = std::cos(a);
                 return std::isfinite(out);
             }
+            case ParseNodeType::Sign: {
+                double a = 0.0;
+                if (!try_const_value(pnode->left, a)) return false;
+                out = (a > 0.0) ? 1.0 : ((a < 0.0) ? -1.0 : 0.0);
+                return std::isfinite(out);
+            }
             default:
                 return false;
         }
@@ -632,6 +673,12 @@ public:
     // §3.8 note: approximation, not exact Unary Power. No parity blend, 5 extra
     // nodes per variable power, and exp/log saturation (±1e6 out / log eps)
     // differs from the direct Power path (±1e8). Documented, not silently equal.
+    // §3.331 zero/near-zero domain: Log evaluates log(|x|+1e-6) (vs Unary
+    // Power |x|+1e-10) and the sign leg is protected Division
+    // base*sign(abs)/(|abs|+1e-6), so at base=0 the rewrite yields 0 for any
+    // positive exp (exact 0^exp is also 0) but yields 0 for exp=0 where the
+    // conventional value is 1; near-zero bases diverge from the unary path by
+    // the 1e-6 vs 1e-10 floor. No silent equivalence is claimed.
     int append_variable_power(int base_idx, int exp_idx) {
         // log(|base|) — Log already applies abs inside eval.
         OpNode log_n;
@@ -753,6 +800,24 @@ public:
                 node.unary_op = UnaryOp::Power;
                 node.p = 0.5;
                 break;
+            case ParseNodeType::Sign: {
+                // §3.367: engine display emits sign(x) (non-integer Power
+                // and protected Division formatting). Parse it through
+                // existing ops as x/abs(x) protected Division — no new
+                // UnaryOp, no eval/format changes needed.
+                if (left_idx < 0) return append_const(0.0);
+                OpNode abs_n;
+                abs_n.type = NodeType::Unary;
+                abs_n.unary_op = UnaryOp::Abs;
+                abs_n.left_child = left_idx;
+                int abs_idx = intern_node(abs_n);
+                OpNode div_n;
+                div_n.type = NodeType::Binary;
+                div_n.binary_op = BinaryOp::Division;
+                div_n.left_child = left_idx;
+                div_n.right_child = abs_idx;
+                return intern_node(div_n);
+            }
             case ParseNodeType::Add:
                 node.type = NodeType::Binary;
                 node.binary_op = BinaryOp::Arithmetic;

@@ -552,8 +552,17 @@ inline double normalize_angle(double value) {
     return out;
 }
 
-inline std::string format_pi_like(double value) {
+inline std::string format_pi_like(double value, bool allow_pi_snap = true) {
     constexpr double kPiTol = 5e-3;
+    // §3.370: symbolic pi snapping is a clean-display approximation (5e-3),
+    // not a lossless export. allow_pi_snap=false prints full precision so
+    // tuned frequencies survive export/scoring round-trips — including the
+    // near-zero range the display path collapses to "0" below.
+    if (!allow_pi_snap) {
+        char lossbuf[64];
+        snprintf(lossbuf, sizeof(lossbuf), "%.17g", value);
+        return std::string(lossbuf);
+    }
     if (std::abs(value) <= 1e-4) return "0";
 
     bool negative = value < 0.0;
@@ -572,6 +581,7 @@ inline std::string format_pi_like(double value) {
         {1.5, "3*pi/2"},
     };
 
+    // Display path: snap near-pi multiples to symbols, else short %.4g.
     for (const auto& candidate : kCandidates) {
         double target = candidate.multiplier * kPi;
         if (near(abs_value, target, kPiTol)) {
@@ -588,8 +598,14 @@ inline std::string format_pi_like(double value) {
     return std::string(buf);
 }
 
-inline std::string format_constant_display(double value) {
+inline std::string format_constant_display(double value, bool allow_pi_snap = true) {
     constexpr double kPiTol = 5e-3;
+    // §3.370: same clean-vs-lossless contract as format_pi_like.
+    if (!allow_pi_snap) {
+        char lossbuf[64];
+        snprintf(lossbuf, sizeof(lossbuf), "%.17g", value);
+        return std::string(lossbuf);
+    }
     if (std::abs(value - kPi) < kPiTol) return "pi";
     if (std::abs(value + kPi) < kPiTol) return "-pi";
     if (std::abs(value - 2.0 * kPi) < kPiTol) return "2*pi";
@@ -646,7 +662,8 @@ inline std::string format_node_to_string(
     int n_inputs,
     std::vector<unsigned char>* visiting_ptr = nullptr,
     int depth = 0,
-    size_t* visits_ptr = nullptr
+    size_t* visits_ptr = nullptr,
+    bool allow_pi_snap = true
 ) {
     if (node_idx < 0 || node_idx >= graph.nodes.size()) return "0";
     // M-153: visit budget — exhausted subtrees format as "0" (valid token),
@@ -665,6 +682,13 @@ inline std::string format_node_to_string(
     if (visiting_ptr->size() != graph.nodes.size()) {
         visiting_ptr->assign(graph.nodes.size(), 0);
     }
+    // §3.373: the active-visit "0" fires only for genuinely invalid
+    // structure. Valid graphs are topological by construction (parser,
+    // mutations, and compaction all emit children with index < parent),
+    // so a node can never be its own ancestor; sibling DAG reuse formats
+    // once per parent because VisitGuard unmarks on exit. Reserve "0"
+    // for cycles/forward references (malformed input), never for valid
+    // shared subgraphs.
     if ((*visiting_ptr)[node_idx]) return "0";
     (*visiting_ptr)[node_idx] = 1;
     struct VisitGuard {
@@ -685,9 +709,9 @@ inline std::string format_node_to_string(
                 return "x";
             }
         case NodeType::Constant:
-            return format_constant_display(node.value);
+            return format_constant_display(node.value, allow_pi_snap);
         case NodeType::Unary: {
-            std::string child_str = format_node_to_string(graph, node.left_child, n_inputs, visiting_ptr, depth + 1, visits_ptr);
+            std::string child_str = format_node_to_string(graph, node.left_child, n_inputs, visiting_ptr, depth + 1, visits_ptr, allow_pi_snap);
             switch (node.unary_op) {
                 case UnaryOp::Periodic: {
                     // Build clean periodic string: [amp*]sin([omega*]child[ + phi])
@@ -722,14 +746,14 @@ inline std::string format_node_to_string(
                     
                     // Omega: omit if ~1.0, use integer if whole number
                     bool has_omega = std::abs(node.omega - 1.0) > 1e-4;
-                    if (has_omega) result += format_pi_like(node.omega) + "*";
+                    if (has_omega) result += format_pi_like(node.omega, allow_pi_snap) + "*";
                     result += child_str;
-                    
+
                     // Phase: omit if it is absorbed by sin/cos canonicalization
                     if (!use_cos) {
                         bool has_phi = std::abs(node.phi) > 1e-4;
                         if (has_phi) {
-                            result += " + " + format_pi_like(node.phi);
+                            result += " + " + format_pi_like(node.phi, allow_pi_snap);
                         }
                     }
                     
@@ -802,8 +826,8 @@ inline std::string format_node_to_string(
             break;
         }
         case NodeType::Binary: {
-            std::string l_str = format_node_to_string(graph, node.left_child, n_inputs, visiting_ptr, depth + 1, visits_ptr);
-            std::string r_str = format_node_to_string(graph, node.right_child, n_inputs, visiting_ptr, depth + 1, visits_ptr);
+            std::string l_str = format_node_to_string(graph, node.left_child, n_inputs, visiting_ptr, depth + 1, visits_ptr, allow_pi_snap);
+            std::string r_str = format_node_to_string(graph, node.right_child, n_inputs, visiting_ptr, depth + 1, visits_ptr, allow_pi_snap);
             
             switch (node.binary_op) {
                 case BinaryOp::Arithmetic: {
@@ -846,6 +870,13 @@ inline std::string format_node_to_string(
                 case BinaryOp::Aggregation: {
                     // Softmax-weighted mean of children (eval.h). Print forms that
                     // Python display eval can execute with abs/exp only (S5-4).
+                    // §3.369: display/eval contract. Evaluation always runs the
+                    // stabilized-tau softmax blend (no hard max/min/mean
+                    // branches); the |tau|>=10 mean and |tau|<=1e-2 hard
+                    // max/min branches below are display approximations of
+                    // that blend's limits, and reparse builds ordinary
+                    // arithmetic — never an Aggregation node. Display text is
+                    // diagnostic/numeric, not a structural round-trip.
                     double tau = stabilized_tau(node.tau);
                     if (std::abs(tau) >= 10.0) {
                         return "((" + l_str + " + " + r_str + ")/2)";
@@ -857,7 +888,7 @@ inline std::string format_node_to_string(
                         return "(0.5*((" + l_str + ")+(" + r_str + ")-abs((" + l_str + ")-(" + r_str + "))))";
                     }
                     char tbuf[64];
-                    snprintf(tbuf, sizeof(tbuf), "%.6g", tau);
+                    snprintf(tbuf, sizeof(tbuf), "%.17g", tau);
                     std::string t_str(tbuf);
                     std::string el = "exp(((" + l_str + ")-(" + max_lr + "))/" + t_str + ")";
                     std::string er = "exp(((" + r_str + ")-(" + max_lr + "))/" + t_str + ")";
@@ -884,7 +915,7 @@ inline int effective_n_inputs(const IndividualGraph& graph, int n_inputs) {
 }
 
 // Convert entire graph to formula string
-inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs) {
+inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs, bool allow_pi_snap = true) {
     n_inputs = effective_n_inputs(graph, n_inputs);
     char buf[256];
     if (graph.nodes.empty()) {
@@ -908,7 +939,7 @@ inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs
         // S5-6: match eval activity threshold (was 1e-4 -> silent dropped terms).
         if (std::abs(w) > kOutputWeightActive) {
             std::string sub_formula = format_node_to_string(graph, static_cast<int>(i), n_inputs,
-                                                            nullptr, 0, &format_visits);
+                                                            nullptr, 0, &format_visits, allow_pi_snap);
             
             if (!first) {
                 final_formula += (w > 0) ? " + " : " - ";
