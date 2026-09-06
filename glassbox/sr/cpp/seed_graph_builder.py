@@ -155,6 +155,13 @@ def _multi_feature_formula_to_seed_graph(formula: str) -> dict[str, Any] | None:
 def _normalize_formula_text(formula: str) -> str:
     text = str(formula).strip()
     text = text.replace("^", "**")
+    # §3.397: mirror benchmark_common.normalize_formula_text for Greek
+    # letters (φ→phi, ω→omega) so benchmark and seed builds agree on
+    # identifiers. Native keeps deliberate VALUE semantics for φ
+    # (golden ratio ((1+sqrt(5))/2)) and rejects bare phi/omega — a
+    # benchmark/seed `phi` symbol does not round-trip into native
+    # (known residual; needs an export-mode switch like §3.370).
+    text = text.replace("φ", "phi").replace("ω", "omega")
     text = re.sub(r"\|([^|]+)\|", r"abs(\1)", text)
     return text
 

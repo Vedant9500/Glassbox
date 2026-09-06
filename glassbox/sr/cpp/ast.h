@@ -106,6 +106,40 @@ inline void mark_active_nodes(const std::vector<OpNode>& nodes,
     }
 }
 
+// §3.414: true when victim also feeds another active output root — zeroing
+// its direct weight would drop an independent additive contribution, not
+// just the composed operand. Bounds-checked; inactive roots never share.
+inline bool is_shared_basis(const std::vector<OpNode>& nodes,
+                            const std::vector<double>& output_weights,
+                            int victim) {
+    const int n = static_cast<int>(nodes.size());
+    const int nw = static_cast<int>(output_weights.size());
+    if (victim < 0 || victim >= n) return false;
+    for (int r = 0; r < n && r < nw; ++r) {
+        if (r == victim) continue;
+        if (std::abs(output_weights[static_cast<size_t>(r)]) <= kOutputWeightActive)
+            continue;
+        std::vector<int> stack = {r};
+        std::vector<char> seen(static_cast<size_t>(n), 0);
+        while (!stack.empty()) {
+            int idx = stack.back();
+            stack.pop_back();
+            if (idx < 0 || idx >= n || seen[static_cast<size_t>(idx)]) continue;
+            seen[static_cast<size_t>(idx)] = 1;
+            if (idx == victim) return true;
+            const auto& node = nodes[static_cast<size_t>(idx)];
+            if ((node.type == NodeType::Unary || node.type == NodeType::Binary) &&
+                node.left_child >= 0) {
+                stack.push_back(node.left_child);
+            }
+            if (node.type == NodeType::Binary && node.right_child >= 0) {
+                stack.push_back(node.right_child);
+            }
+        }
+    }
+    return false;
+}
+
 // Pre-allocated array representing a formula's structure
 struct IndividualGraph {
     std::vector<OpNode> nodes;

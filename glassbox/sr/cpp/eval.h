@@ -409,7 +409,17 @@ inline Eigen::ArrayXd evaluate_graph_impl(
                     || (node.type == NodeType::Binary
                         && (is_op_child(node.left_child) || is_op_child(node.right_child)));
                 if (worth_caching) {
-                    shared_cache->insert_or_assign(node_hashes[i], (*cache_out)[i]);
+                    // §3.376: same structural key can arrive with a different
+                    // sample count (cross-shape cache reuse). The read path
+                    // already requires size match, so overwriting would only
+                    // evict a good entry to serve a size the reader rejects —
+                    // ping-ponging across shapes. Keep the existing entry on
+                    // size conflict; same-size overwrites keep today's refresh.
+                    auto itc = shared_cache->find(node_hashes[i]);
+                    if (itc == shared_cache->end() ||
+                        itc->second.size() == (*cache_out)[i].size()) {
+                        shared_cache->insert_or_assign(node_hashes[i], (*cache_out)[i]);
+                    }
                 }
             }
         }

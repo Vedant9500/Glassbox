@@ -533,6 +533,18 @@ inline void collect_additive_terms(
         } else {
             terms.push_back({node, coeff});
         }
+    } else if (node->type == ParseNodeType::Div) {
+        // §3.398: fold constant DENOMINATORS exactly like the Mul branch
+        // folds constant factors (x/2 becomes x with coeff/2 — IEEE-exact
+        // for /2, 1-ulp elsewhere, absorbed by the ridge refit). Constant
+        // numerators (2/x), zero and non-finite denominators stay whole
+        // terms: protected-division semantics have no additive equivalent.
+        if (node->right->type == ParseNodeType::Constant &&
+            std::isfinite(node->right->value) && node->right->value != 0.0) {
+            collect_additive_terms(node->left, coeff / node->right->value, terms, bias);
+        } else {
+            terms.push_back({node, coeff});
+        }
     } else if (node->type == ParseNodeType::Constant) {
         bias += coeff * node->value;
     } else {

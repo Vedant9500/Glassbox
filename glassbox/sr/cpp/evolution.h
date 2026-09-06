@@ -352,12 +352,12 @@ public:
                 // Append Abs prior (0): seeds/simplify can still introduce Abs.
                 config_.op_priors.push_back(0.0);
             }
-            normalize_prior_vector(config_.op_priors);
+            prior_entries_sanitized_ += normalize_prior_vector(config_.op_priors);
             op_cdf_ = build_cdf(config_.op_priors);
         }
 
         if (!config_.binary_op_priors.empty()) {
-            normalize_prior_vector(config_.binary_op_priors);
+            prior_entries_sanitized_ += normalize_prior_vector(config_.binary_op_priors);
             binary_op_cdf_ = build_cdf(config_.binary_op_priors);
         }
 
@@ -433,6 +433,10 @@ public:
     int get_last_island_inner_threads() const { return last_island_inner_threads_; }
     bool get_last_crossover_valid() const { return last_crossover_valid_; }
     int get_crossover_attempts() const { return crossover_attempts_; }
+    // M-283: prior entries zeroed by sanitize (>= 0; islands sum at join).
+    int get_prior_entries_sanitized() const { return prior_entries_sanitized_; }
+    // M-274: true when requested islands fell back to a single population.
+    bool get_island_fallback_to_single() const { return island_fallback_to_single_; }
     // P-04 diagnostics.
     long long get_fd_probes_total() const { return fd_probes_total_; }
     long long get_fd_probes_skipped_inert() const {
@@ -517,13 +521,28 @@ public:
         if (config_.num_islands <= 1) { run(); return; }
 
         int island_size = config_.pop_size / config_.num_islands;
-        if (island_size < 4) { run(); return; } // Too small for islands
+        // M-274: requested island mode silently became an ordinary run here.
+        // Record the fallback so the result reports it (no behavior change).
+        if (island_size < 4) {
+            island_fallback_to_single_ = true;
+            run();
+            return;
+        } // Too small for islands
         auto start_time = std::chrono::steady_clock::now();
         auto timed_out = [&]() {
+            // M-275: `>` matches the single-population loop — `>=` skipped
+            // a generation exactly at the budget boundary in islands only.
             return std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - start_time
-            ).count() >= static_cast<double>(config_.timeout_seconds);
+            ).count() > static_cast<double>(config_.timeout_seconds);
         };
+
+        // M-283: the parent never evolves in islands mode — its own
+        // construction-time sanitize count is unused below. Reset so the
+        // post-join sum counts exactly the islands' sanitize events
+        // (identical shared priors count per island that applied them;
+        // multi_* overrides count per distinct island config).
+        prior_entries_sanitized_ = 0;
 
         // Create per-island engines with split configs
         std::vector<EvolutionEngine> islands;
@@ -692,17 +711,31 @@ public:
         // (exception-safe; replaces manual omp_set_max_active_levels restore).
 
         // Collect the best overall across all islands and run cleanup
+        // M-272: reset-then-OR so a stale pre-run value cannot leak in.
+        last_crossover_valid_ = false;
         for (auto& island : islands) {
             auto best = island.get_best();
             consider_champion(best);
             crossover_attempts_ += island.get_crossover_attempts();
             crossover_successes_ += island.get_crossover_successes();
-            last_crossover_valid_ = island.get_last_crossover_valid();
+            // M-272: OR-aggregate — the old last-island-wins overwrite hid
+            // every other island's final validity in `last_crossover_valid`.
+            // Counters above stay summed, so the valid RATE is unchanged.
+            if (island.get_last_crossover_valid()) last_crossover_valid_ = true;
             // P-04 diagnostics: aggregate island FD probe counters.
             fd_probes_total_ += island.get_fd_probes_total();
             fd_probes_skipped_inert_ += island.get_fd_probes_skipped_inert();
             // P-01 diagnostics: sum island cache pressure into the parent engine.
             gen_cache_.add_evictions(island.get_subtree_cache_evictions());
+            // M-283: island configs are copies — sum their sanitize counts.
+            prior_entries_sanitized_ += island.get_prior_entries_sanitized();
+            // M-273: merge island subtree caches so parent entries/bytes
+            // diagnostics reflect retained island cache pressure (they read
+            // zero before — only evictions were summed). Bounded by the
+            // cache caps; same-N same-hash payloads are deterministic.
+            for (auto& kv : island.gen_cache_) {
+                gen_cache_.try_emplace(kv.first, kv.second);
+            }
         }
 
         // Merge all island populations for Pareto front (if NSGA-II)
@@ -746,6 +779,9 @@ private:
     bool last_crossover_valid_ = false;
     int crossover_attempts_ = 0;
     int crossover_successes_ = 0;
+    // M-283/M-274 diagnostics (plain ints; aggregated post-join like fd probes).
+    int prior_entries_sanitized_ = 0;
+    bool island_fallback_to_single_ = false;
     // P-04 diagnostics: FD probe volume + inert-param probes avoided.
     // Plain counters: each island engine is confined to one OpenMP thread
     // (parallel-for over islands) and the parent aggregates post-join.
@@ -1015,11 +1051,16 @@ private:
         return std::isfinite(mse) ? mse : std::numeric_limits<double>::infinity();
     }
 
-    static void normalize_prior_vector(std::vector<double>& priors) {
+    // M-283: returns how many entries were sanitized (NaN/negative → 0).
+    // Callers accumulate into prior_entries_sanitized_ so the Python result
+    // can report it instead of zeroing silently.
+    static int normalize_prior_vector(std::vector<double>& priors) {
+        int sanitized = 0;
         double sum = 0.0;
         for (double& p : priors) {
             if (!std::isfinite(p) || p < 0.0) {
                 p = 0.0;
+                ++sanitized;
             }
             sum += p;
         }
@@ -1028,6 +1069,7 @@ private:
                 p /= sum;
             }
         }
+        return sanitized;
     }
 
     static std::vector<double> build_cdf(const std::vector<double>& priors) {
@@ -1071,13 +1113,22 @@ private:
         if (population_.empty()) return 0;
         std::uniform_int_distribution<int> dist(0, static_cast<int>(population_.size()) - 1);
         int best_idx = dist(rng_);
+        // §3.423: stale finite fitness must not beat fresh scores. Prefer
+        // fitness-valid candidates; all-invalid falls back to best-any so
+        // early generations (nothing scored yet) still make progress.
+        int best_valid_idx = population_[best_idx].fitness_valid ? best_idx : -1;
         for (int i = 1; i < k; ++i) {
             int idx = dist(rng_);
             if (is_better_champion(population_[idx], population_[best_idx])) {
                 best_idx = idx;
             }
+            if (population_[idx].fitness_valid &&
+                (best_valid_idx < 0 ||
+                 is_better_champion(population_[idx], population_[best_valid_idx]))) {
+                best_valid_idx = idx;
+            }
         }
-        return best_idx;
+        return best_valid_idx >= 0 ? best_valid_idx : best_idx;
     }
     double run_wall_time_sec_ = 0.0;
 
@@ -1497,8 +1548,13 @@ private:
             best_overall_ = cand;
         }
         // Dual archive: best plain MSE regardless of complexity penalty (export aid).
+        // §3.422: the old test admitted any finite raw_mse — including graphs
+        // whose penalized fitness is non-finite (never usable for export;
+        // select_export_champion re-checks fitness before use). Require finite
+        // fitness for admission; strict < keeps the incumbent on exact ties
+        // (same stability rule as the fitness archive above).
         if (best_raw_overall_.nodes.empty()
-            || (std::isfinite(cand.raw_mse)
+            || (std::isfinite(cand.raw_mse) && std::isfinite(cand.fitness)
                 && (!std::isfinite(best_raw_overall_.raw_mse)
                     || cand.raw_mse < best_raw_overall_.raw_mse))) {
             best_raw_overall_ = cand;
@@ -1740,6 +1796,14 @@ private:
     IndividualGraph mutate_lamarckian(IndividualGraph parent, double structural_rate) {
         IndividualGraph child = parent;
         child.fitness_valid = false;  // E6: structure/params may change
+        // §3.420: a mutated child is a NEW individual — inherited AFPO/NSGA-II
+        // state (age, rank, crowding) describes the parent topology, not the
+        // child. Random immigrants already start at age 0; mutated children
+        // must too (NSGA-II recomputes ranks, but diagnostics/exports and
+        // non-NSGA-II age paths would otherwise read parent values).
+        child.age = 0;
+        child.pareto_rank = 0;
+        child.crowding_distance = 0.0;
         
         std::uniform_real_distribution<double> runif(0.0, 1.0);
         std::normal_distribution<double> rnorm(0.0, 0.5); 
@@ -1751,6 +1815,11 @@ private:
             
             if (runif(rng_) < structural_rate) {
                 // Structural mutation - change node type or connections
+                // §3.226/§3.227: a type change must not inherit stale
+                // per-type fields (child pointers, ops, params). Eval/hash
+                // read only live-op fields today, but exports and future
+                // readers must not see garbage from the previous type.
+                // normalize_node_fields keeps exactly the new type's fields.
                 if (i == 0 || runif(rng_) < 0.2) {
                     if (runif(rng_) < 0.5 && n_inputs > 0) {
                         node.type = NodeType::Input;
@@ -1760,12 +1829,18 @@ private:
                         node.type = NodeType::Constant;
                         node.value += rnorm(rng_); 
                     }
+                    normalize_node_fields(node);
                 } else {
-                    if (runif(rng_) < 0.6 || i < 2) {
+                    // M-246: node 1 was forced Unary by `i < 2`, limiting
+                    // structural diversity. A Binary with both children at 0
+                    // is bottom-up valid, so let i==1 sample both types —
+                    // child_dist(0, 0) deterministically yields (0, 0).
+                    if (runif(rng_) < 0.6) {
                         node.type = NodeType::Unary;
                         std::uniform_int_distribution<int> child_dist(0, i - 1);
                         node.left_child = child_dist(rng_);
                         node.unary_op = sample_unary_op_for_child(child, node.left_child);
+                        normalize_node_fields(node);
                         if (node.unary_op == UnaryOp::IntPow) {
                             const int intpow_candidates[] = {2, 3, 4, 5, 6};
                             std::uniform_int_distribution<int> ip_dist(0, 4);
@@ -1780,29 +1855,42 @@ private:
                         std::uniform_int_distribution<int> child_dist(0, i - 1);
                         node.left_child = child_dist(rng_);
                         node.right_child = child_dist(rng_);
+                        normalize_node_fields(node);
                     }
                 }
             } else {
                 // Continuous Parameter Mutation
-                if (runif(rng_) < 0.3) {
+                // M-247: mutate only LIVE parameters. The old code added
+                // noise to p/omega/phi on every node type (Input/Constant/
+                // Binary carry those fields dead), churning junk that
+                // compaction must later normalize. Type-guarded blocks below
+                // (Arithmetic/Aggregation/Constant) are unchanged.
+                if (node.type == NodeType::Unary && runif(rng_) < 0.3) {
                     node.p += rnorm(rng_);
                     node.omega += rnorm(rng_);
                     node.phi += rnorm(rng_);
                     // amplitude is fixed at 1.0 - SVD handles scaling
-                    if (node.type == NodeType::Constant) node.value += rnorm(rng_);
-                    
                     // H-03: clamp p/omega/phi (Exp tighter) after parametric mutation.
                     clamp_unary_inner_params(node);
-                    if (node.type == NodeType::Unary && node.unary_op == UnaryOp::IntPow) {
+                    if (node.unary_op == UnaryOp::IntPow) {
                         node.p = static_cast<double>(std::clamp(static_cast<int>(std::round(node.p)), 2, 6));
                     }
-                    if (node.type == NodeType::Binary && node.binary_op == BinaryOp::Arithmetic) {
-                        node.beta = std::clamp(node.beta + rnorm(rng_) * 0.15, 0.5, 2.5);
-                        node.gamma = std::clamp(node.gamma + rnorm(rng_) * 0.15, -1.5, 1.5);
-                    }
-                    if (node.type == NodeType::Binary && node.binary_op == BinaryOp::Aggregation) {
-                        node.tau = std::clamp(node.tau + rnorm(rng_) * 0.1, 0.1, 10.0);
-                    }
+                }
+                if (node.type == NodeType::Constant && runif(rng_) < 0.3) {
+                    node.value += rnorm(rng_);
+                }
+                // M-247 (cont.): keep the legacy 0.3 rate per live group —
+                // separate draws replace the old shared draw (which also
+                // paid 3 dead rnorms here). Streams shift vs older builds;
+                // same-seed replay holds going forward.
+                if (node.type == NodeType::Binary && node.binary_op == BinaryOp::Arithmetic &&
+                    runif(rng_) < 0.3) {
+                    node.beta = std::clamp(node.beta + rnorm(rng_) * 0.15, 0.5, 2.5);
+                    node.gamma = std::clamp(node.gamma + rnorm(rng_) * 0.15, -1.5, 1.5);
+                }
+                if (node.type == NodeType::Binary && node.binary_op == BinaryOp::Aggregation &&
+                    runif(rng_) < 0.3) {
+                    node.tau = std::clamp(node.tau + rnorm(rng_) * 0.1, 0.1, 10.0);
                 }
             }
         }
@@ -1818,6 +1906,12 @@ private:
     IndividualGraph macro_mutate(const IndividualGraph& parent) {
         IndividualGraph child = parent;
         child.fitness_valid = false;  // E6
+        // §3.424: same new-individual reset as mutate_lamarckian — the
+        // restart path (inject_restarts) builds on macro children, and the
+        // random-immigrant branch already sets age=0 explicitly.
+        child.age = 0;
+        child.pareto_rank = 0;
+        child.crowding_distance = 0.0;
         std::uniform_real_distribution<double> runif(0.0, 1.0);
         
         int n = static_cast<int>(child.nodes.size());
@@ -1889,6 +1983,11 @@ private:
             
             child.nodes.push_back(wrap_node);
             child.output_weights.push_back(0.5); // Small initial weight
+            // §3.231: additive wrap semantics are INTENTIONAL. The original
+            // target stays active, so the model becomes target + 0.5*f(target)
+            // and the ridge refit rebalances both columns. This preserves the
+            // existing basis (no destructive replacement); complexity cost is
+            // paid through the active-complexity penalty at scoring.
             
         } else if (roll < t_mul) {
             // -- Multiply Mutation --
@@ -1912,14 +2011,27 @@ private:
             mul_node.left_child = left;
             mul_node.right_child = right;
             
+            // §3.414: computed BEFORE the push — afterwards the new active
+            // root reaches both operands trivially and everything is "shared".
+            const bool shared_left =
+                is_shared_basis(child.nodes, child.output_weights, left);
+            const bool shared_right =
+                is_shared_basis(child.nodes, child.output_weights, right);
             child.nodes.push_back(mul_node);
             child.output_weights.push_back(1.0);
-            
-            // P3: Zero out children's additive contribution
-            if (left < static_cast<int>(child.output_weights.size())) {
+
+            // P3: Zero out children's additive contribution — but only when
+            // the child is exclusive to the new product (§3.414). A child
+            // that also feeds another active root keeps an independent
+            // contribution; dropping it would remove basis the solver uses.
+            // Shared-basis flags were computed on the pre-push graph (the
+            // new node itself always reaches both operands by construction).
+            if (!shared_left &&
+                left < static_cast<int>(child.output_weights.size())) {
                 child.output_weights[left] = 0.0;
             }
-            if (right < static_cast<int>(child.output_weights.size())) {
+            if (!shared_right &&
+                right < static_cast<int>(child.output_weights.size())) {
                 child.output_weights[right] = 0.0;
             }
             
@@ -1940,9 +2052,16 @@ private:
             div_node.type = NodeType::Binary;
             div_node.binary_op = sample_binary_op();
             if (div_node.binary_op == BinaryOp::Arithmetic) {
-                seed_arithmetic_gate(div_node);
+                // §3.415: was seed_arithmetic_gate() then an overwrite to
+                // beta=2/gamma=1 — the seed's RNG draw had no effect on the
+                // result (only tau=1.0 survived). Set the gate explicitly
+                // with no dead draw. NOTE: this shifts the downstream RNG
+                // stream vs older builds; same-seed replay holds going
+                // forward (no cross-version stream promise). The multiply
+                // branch keeps its historical seed+overwrite shape.
                 div_node.beta = 2.0;
                 div_node.gamma = 1.0;
+                div_node.tau = 1.0;
             } else if (div_node.binary_op == BinaryOp::Division) {
                 div_node.beta = 2.0;
                 div_node.gamma = -1.0;
@@ -1952,13 +2071,20 @@ private:
             div_node.left_child = left;
             div_node.right_child = right;
             
+            // §3.414: same shared-basis guard as multiply (pre-push graph).
+            const bool div_shared_left =
+                is_shared_basis(child.nodes, child.output_weights, left);
+            const bool div_shared_right =
+                is_shared_basis(child.nodes, child.output_weights, right);
             child.nodes.push_back(div_node);
             child.output_weights.push_back(1.0);
             
-            if (left < static_cast<int>(child.output_weights.size())) {
+            if (!div_shared_left &&
+                left < static_cast<int>(child.output_weights.size())) {
                 child.output_weights[left] = 0.0;
             }
-            if (right < static_cast<int>(child.output_weights.size())) {
+            if (!div_shared_right &&
+                right < static_cast<int>(child.output_weights.size())) {
                 child.output_weights[right] = 0.0;
             }
             
@@ -1990,8 +2116,16 @@ private:
             child.nodes[f_idx].left_child = g_idx;
         }
         
+        // §3.417/M-252: the old code returned the UNMUTATED parent with its
+        // original fitness-valid state — callers could not distinguish
+        // "mutation produced a parent clone" from a real no-op, and
+        // duplicates re-entered the pool. Fall back to an in-place
+        // Lamarckian step on the parent instead: size never grows there,
+        // the child is genuinely mutated, and fitness flows through the
+        // normal invalidate → re-score path (same fallback as the entry
+        // guard for n >= max_nodes above).
         if (static_cast<int>(child.nodes.size()) > config_.max_nodes) {
-            return parent;
+            return mutate_lamarckian(parent, 0.15);
         }
         return child;
     }
@@ -3114,13 +3248,24 @@ private:
                 bool is_duplicate = false;
                 
                 if (var_i < 1e-12 && var_j < 1e-12) {
-                    // Both constant - check if same constant
-                    is_duplicate = std::abs(cache[i].mean() - cache[j].mean()) < 1e-6;
+                    // Both constant - check if same constant.
+                    // M-254: absolute 1e-6 merged 1e-9 vs 2e-9 (2x apart)
+                    // yet split 1e9 vs 1e9+500 (5e-7 apart). Scale the
+                    // tolerance to the constants' magnitude (unit scale
+                    // keeps the legacy 1e-6 exactly).
+                    const double mi = cache[i].mean(), mj = cache[j].mean();
+                    const double cscale =
+                        std::max(1.0, std::max(std::abs(mi), std::abs(mj)));
+                    is_duplicate = std::abs(mi - mj) < 1e-6 * cscale;
                 } else if (var_i > 1e-12 && var_j > 1e-12) {
                     // Both non-constant - check correlation AND scale
                     Eigen::ArrayXd diff = cache[i] - cache[j];
                     double max_abs_diff = diff.abs().maxCoeff();
-                    double max_abs_val = cache[i].abs().maxCoeff();
+                    // M-253: denominator used only candidate i's magnitude —
+                    // a tiny i against a huge j measured j's scale by i's
+                    // ruler. Use the pair maximum (symmetric, order-free).
+                    double max_abs_val = std::max(cache[i].abs().maxCoeff(),
+                                                  cache[j].abs().maxCoeff());
                     
                     if (max_abs_val > 1e-10) {
                         // Relative error check: are they the same output?
@@ -3232,19 +3377,35 @@ private:
         // influencing the ridge fit). Caches still evaluate all nodes
         // (perf note); semantics are exclusion-correct.
         std::vector<char> eliminated(ind.nodes.size(), 0);
+        // §3.240: ranking basis for weakest-node choice (refreshed on every
+        // accepted elimination; structure is unchanged by elimination so
+        // columns stay comparable across iterations).
+        std::vector<Eigen::ArrayXd> elim_base_cache;
+        evaluate_graph(ind, X_, n_samples, elim_base_cache);
         for (int elim_iter = 0; elim_iter < 10; ++elim_iter) {
 
-            // Find least important node (smallest non-zero |output_weight|, non-Input)
+            // Find least important node. §3.240: raw |output_weight| alone
+            // prefers small-scale columns even when their basis contribution
+            // dominates — rank by contribution |w| * rms(column), the linear
+            // model's RMS impact. (Full ablation/subtree trials stay future
+            // work; nested-only nodes remain out of scope for removal.)
             int weakest = -1;
-            double weakest_weight = 1e18;
+            double weakest_key = 1e18;
             for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
                 if (i < static_cast<int>(eliminated.size()) && eliminated[static_cast<size_t>(i)]) continue;
                 if (ind.nodes[i].type == NodeType::Input) continue;
                 if (i >= static_cast<int>(ind.output_weights.size())) continue;
                 double w = std::abs(ind.output_weights[i]);
                 if (w < 1e-6) continue; // Skip already-dead nodes
-                if (w < weakest_weight) {
-                    weakest_weight = w;
+                double key = w;
+                if (i < static_cast<int>(elim_base_cache.size()) &&
+                    elim_base_cache[static_cast<size_t>(i)].size() == n_samples) {
+                    const double col_rms = std::sqrt(
+                        elim_base_cache[static_cast<size_t>(i)].square().mean());
+                    if (std::isfinite(col_rms)) key = w * col_rms;
+                }
+                if (key < weakest_key) {
+                    weakest_key = key;
                     weakest = i;
                 }
             }
@@ -3270,6 +3431,7 @@ private:
             // Accept if MSE is still acceptable (within 5% of baseline)
             if (objective_mse(candidate) < baseline_mse * 1.05 + 1e-8) {
                 ind = candidate;
+                elim_base_cache = trial_cache; // same structure; refresh ranking basis
                 if (weakest >= 0 && weakest < static_cast<int>(ind.output_weights.size())) {
                     ind.output_weights[static_cast<size_t>(weakest)] = 0.0;
                 }
@@ -4267,6 +4429,11 @@ private:
         } else {
             plateau_counter_ = 0;
             best_mse_history_ = best_overall_.fitness;
+            // §3.425: recovery event — improvement resumed, so restore the
+            // configured baseline rate. Without this, a restart-elevated
+            // rate (or plateau-decayed rate) persists for the rest of the
+            // run even after the search recovers.
+            current_structural_mutation_rate_ = config_.mutation_rate_structural;
         }
 
         if (plateau_counter_ > 50) {

@@ -823,10 +823,18 @@ static py::dict run_evolution_cpp(
     config.p_max = p_max;
     config.use_nsga2 = use_nsga2;
     config.num_islands = num_islands;
+    // M-262: interval 0 is a SIGFPE at `gen % interval`; negatives never
+    // fire migration. Fail loud (batch-7 FFI precedent).
+    if (migration_interval < 1)
+        throw py::value_error("migration_interval must be >= 1");
     config.migration_interval = migration_interval;
     config.migration_size = migration_size;
     config.input_units = cpp_input_units;
     config.output_units = cpp_output_units;
+    // M-263: keep the negative clamp (documented engine behavior) but reject
+    // non-finite — std::max with NaN silently propagates garbage.
+    if (!std::isfinite(dim_penalty_weight))
+        throw py::value_error("dim_penalty_weight must be finite");
     config.dim_penalty_weight = std::max(0.0, dim_penalty_weight);
     config.enable_trace = !trace_path.empty();
     config.trace_path = trace_path;
@@ -843,6 +851,12 @@ static py::dict run_evolution_cpp(
     config.post_restart_mutation_boost = post_restart_mutation_boost;
     config.random_seed = random_seed;
     config.acceptable_mse = acceptable_mse;
+    // M-261: negative caps make every candidate unacceptable (acceptable) or
+    // break early-stop width checks — fail loud instead of silent dead config.
+    if (acceptable_complexity < 0)
+        throw py::value_error("acceptable_complexity must be >= 0");
+    if (early_stop_max_nodes < 0)
+        throw py::value_error("early_stop_max_nodes must be >= 0");
     config.acceptable_complexity = acceptable_complexity;
     config.early_stop_max_nodes = early_stop_max_nodes;
     config.arithmetic_temperature = arithmetic_temperature;
@@ -898,6 +912,15 @@ static py::dict run_evolution_cpp(
         } else {
             throw py::value_error("loss_mode must be one of mse, huber, trimmed_mse, student_t (aliases: trimmed, student-t, studentt)");
         }
+        // M-264: engine treats non-positive/non-finite huber_delta as
+        // unset (MAD fallback) and clamps trim_fraction to [0, 0.45] —
+        // document the contract and reject only meaningless inputs:
+        // non-finite delta, or trim outside [0, 1] (silently re-clamped
+        // 0.9 → 0.45 before). In-range behavior is untouched.
+        if (!std::isfinite(huber_delta))
+            throw py::value_error("huber_delta must be finite (<= 0 selects MAD scale)");
+        if (!std::isfinite(trim_fraction) || trim_fraction < 0.0 || trim_fraction > 1.0)
+            throw py::value_error("trim_fraction must be finite and in [0, 1]");
         config.huber_delta = huber_delta;
         config.trim_fraction = trim_fraction;
     }
@@ -960,6 +983,18 @@ static py::dict run_evolution_cpp(
     result["generation_to_first_exact"] = engine.get_first_exact_generation();
     result["time_to_first_acceptable_sec"] = engine.get_first_acceptable_time_sec();
     result["generation_to_first_acceptable"] = engine.get_first_acceptable_generation();
+    // M-270: fractions of the requested budget for cross-budget comparison
+    // (benchmarks report seconds only). -1 when no timeout budget or no
+    // discovery — never divide by zero, never a silent raw second.
+    {
+        const double t_exact = engine.get_first_exact_time_sec();
+        const double t_acc = engine.get_first_acceptable_time_sec();
+        const double budget = static_cast<double>(timeout_seconds);
+        result["time_to_first_exact_frac"] =
+            (timeout_seconds > 0 && t_exact >= 0.0) ? t_exact / budget : -1.0;
+        result["time_to_first_acceptable_frac"] =
+            (timeout_seconds > 0 && t_acc >= 0.0) ? t_acc / budget : -1.0;
+    }
     result["evolution_wall_time_sec"] = engine.get_run_wall_time_sec();
     result["random_seed"] = engine.get_random_seed();
     // §3.249: set_arithmetic_temperature silently clamps requests outside
@@ -969,6 +1004,10 @@ static py::dict run_evolution_cpp(
     result["openmp_threads"] = omp_get_max_threads();
     result["island_outer_threads"] = engine.get_last_island_outer_threads();
     result["island_inner_threads"] = engine.get_last_island_inner_threads();
+    // M-274: requested islands with pop/islands < 4 run single-pop instead.
+    result["island_fallback_to_single"] = engine.get_island_fallback_to_single();
+    // M-283: prior entries zeroed by sanitize (NaN/negative → 0).
+    result["prior_entries_sanitized"] = engine.get_prior_entries_sanitized();
     result["seed_graphs_used"] = static_cast<int>(cpp_seed_graphs.size());
     result["seed_graphs_skipped_oversized"] = seed_graphs_skipped_oversized;
     result["seed_graphs_skipped_invalid"] = seed_graphs_skipped_invalid;  // H-07
@@ -986,6 +1025,14 @@ static py::dict run_evolution_cpp(
     result["subtree_cache_max_entries"] = static_cast<int>(engine.get_subtree_cache_max_entries());
     result["subtree_cache_max_bytes"] = static_cast<long long>(engine.get_subtree_cache_max_bytes());
     
+    // §3.271: simplify BEFORE serializing the graph. The old order wrote
+    // pre-simplification nodes/weights but a post-simplification formula,
+    // so rebuilding from nodes gave different semantics than `formula`.
+    // best_mse keys above already captured pre-simplify engine values.
+    // Simplify best graph before string export.
+    // Note: this is structural/constant-fold simplification (not SymPy-level algebra).
+    sr::simplify_ast(best);
+
     // Serialize graph structure
     py::list nodes_list;
     for (const auto& node : best.nodes) {
@@ -1015,10 +1062,6 @@ static py::dict run_evolution_cpp(
     result["output_weights"] = weights_list;
     result["output_bias"] = best.output_bias;
     
-    // Simplify best graph before string export.
-    // Note: this is structural/constant-fold simplification (not SymPy-level algebra).
-    sr::simplify_ast(best);
-
     // Add the parsed formula string for Python compatibility
     result["formula"] = sr::get_formula_string(best, static_cast<int>(X.size()));
 
@@ -1035,15 +1078,29 @@ static py::dict run_evolution_cpp(
             // simplified graph's MSE alongside (legacy key untouched) so the
             // row no longer mixes two different graphs.
             double mse_simplified = std::numeric_limits<double>::infinity();
+            // §3.272: legacy `mse`/`weighted_mse` stay pre-simplification
+            // engine values (back-compat); report the simplified graph's
+            // errors alongside so rows describe the returned formula.
+            double weighted_mse_simplified = std::numeric_limits<double>::infinity();
             try {
                 Eigen::ArrayXd spred = sr::evaluate_graph(
                     ind, X, static_cast<int>(y.size()));
                 if (spred.size() == y.size() && spred.isFinite().all()) {
                     mse_simplified = ((spred - y).square().mean());
+                    if (y_weights.size() == static_cast<int>(y.size())) {
+                        const double wsum = y_weights.sum();
+                        if (std::isfinite(wsum) && wsum > 0) {
+                            weighted_mse_simplified =
+                                ((y_weights * (spred - y).square()).sum() / wsum);
+                        }
+                    } else {
+                        weighted_mse_simplified = mse_simplified;
+                    }
                 }
             } catch (...) {
             }
             pdict["mse_simplified"] = mse_simplified;
+            pdict["weighted_mse_simplified"] = weighted_mse_simplified;
             pdict["weighted_mse"] = ind.weighted_mse;
             pdict["complexity"] = ind.active_complexity();
             pdict["raw_nodes"] = ind.complexity();
