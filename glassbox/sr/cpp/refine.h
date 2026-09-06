@@ -366,28 +366,55 @@ inline PowerResult refine_powers_model_cpp(
     const std::vector<double>& omegas,
     int steps = 200,
     double lr = 0.05,
-    const Eigen::VectorXd& sample_weight = Eigen::VectorXd()
+    const Eigen::VectorXd& sample_weight = Eigen::VectorXd(),
+    double p_min_bound = -2.0,
+    double p_max_bound = 5.0
 ) {
     int n = static_cast<int>(x_valid.size());
     int num_p = static_cast<int>(powers.size());
     int num_w = static_cast<int>(omegas.size());
     int num_features = 2 + num_p + 2 * num_w; // 1, x, p_i, sin(w_i), cos(w_i)
-    
-    double best_mse = 1e9;
-    std::vector<double> best_powers = powers;
-    Eigen::VectorXd best_coeffs;
-    
-    for (int step = 0; step < steps; ++step) {
-        Eigen::MatrixXd X(n, num_features);
+
+    // §3.332: caller-configured domain (was hard-coded [-2, 5] regardless
+    // of p_min/p_max). Invalid bounds fall back to the legacy hard range.
+    double plo = p_min_bound, phi_ = p_max_bound;
+    if (!(plo < phi_) || !std::isfinite(plo) || !std::isfinite(phi_)) {
+        plo = -2.0;
+        phi_ = 5.0;
+    }
+
+    auto build_design = [&](const std::vector<double>& pw, Eigen::MatrixXd& X) {
+        X.resize(n, num_features);
         X.col(0) = Eigen::VectorXd::Ones(n);
         X.col(1) = x_valid;
         for (int i = 0; i < num_p; ++i) {
-            X.col(2 + i) = safe_power(x_valid, powers[i]);
+            X.col(2 + i) = safe_power(x_valid, pw[i]);
         }
         for (int i = 0; i < num_w; ++i) {
             X.col(2 + num_p + 2*i) = (omegas[i] * x_valid.array()).sin().matrix();
             X.col(2 + num_p + 2*i + 1) = (omegas[i] * x_valid.array()).cos().matrix();
         }
+    };
+
+    double best_mse;
+    std::vector<double> best_powers = powers;
+    Eigen::VectorXd best_coeffs;
+    {
+        // §3.332: initialize from the first actual evaluation. Was 1e9, so
+        // all-non-finite runs implicitly "accepted" the initial powers while
+        // reporting 1e9 as the best objective.
+        Eigen::MatrixXd X0;
+        build_design(powers, X0);
+        Eigen::VectorXd c0 = solve_linear_weighted(X0, y_valid, sample_weight);
+        Eigen::VectorXd pred0 = X0 * c0;
+        best_mse = residual_mse_weighted(pred0, y_valid, sample_weight);
+        if (!std::isfinite(best_mse)) best_mse = std::numeric_limits<double>::infinity();
+        else best_coeffs = c0;
+    }
+    
+    for (int step = 0; step < steps; ++step) {
+        Eigen::MatrixXd X(n, num_features);
+        build_design(powers, X);
         
         Eigen::VectorXd c = solve_linear_weighted(X, y_valid, sample_weight);
         Eigen::VectorXd pred = X * c;
@@ -421,11 +448,12 @@ inline PowerResult refine_powers_model_cpp(
         
         // Projected bounds + finite-gradient guard (§3.98/§3.139): NaN powers
         // or non-finite FD probes must not step the search into NaN.
+        // §3.332: project onto the caller domain (was hard-coded [-2, 5]).
         for (int i = 0; i < num_p; ++i) {
             if (!std::isfinite(grads[i])) continue;
             powers[i] -= lr * grads[i];
-            if (powers[i] < -2.0) powers[i] = -2.0;
-            if (powers[i] > 5.0) powers[i] = 5.0;
+            if (powers[i] < plo) powers[i] = plo;
+            if (powers[i] > phi_) powers[i] = phi_;
         }
     }
     

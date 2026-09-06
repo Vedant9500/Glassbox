@@ -1312,8 +1312,26 @@ private:
 
     // H-03: keep unary inner params in safe ranges after Adam/LM/mutation.
     // Exp uses tighter omega/phi so omega*x+phi cannot explode into Inf.
-    void clamp_unary_inner_params(OpNode& node) const {
-        node.p = std::clamp(node.p, config_.p_min, config_.p_max);
+    // §3.326/§3.327: Power exponent sampler honoring the configured domain.
+    // Interesting-value table when it intersects [p_min, p_max]; bounded
+    // continuous fallback when the range misses the table (never leaves an
+    // unbounded Gaussian/default in place for Power nodes).
+    double sample_power_exponent() {
+        const double table[] = {-1.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0};
+        std::vector<double> valid;
+        for (double c : table) {
+            if (c >= config_.p_min && c <= config_.p_max) valid.push_back(c);
+        }
+        if (!valid.empty()) {
+            std::uniform_int_distribution<int> d(0, static_cast<int>(valid.size()) - 1);
+            return valid[static_cast<size_t>(d(rng_))];
+        }
+        double lo = config_.p_min, hi = config_.p_max;
+        if (!(lo < hi) || !std::isfinite(lo) || !std::isfinite(hi)) return 1.0;
+        return std::uniform_real_distribution<double>(lo, hi)(rng_);
+    }
+
+    void clamp_unary_inner_params(OpNode& node) const {        node.p = std::clamp(node.p, config_.p_min, config_.p_max);
         if (node.type == NodeType::Unary && node.unary_op == UnaryOp::Exp) {
             node.omega = std::clamp(node.omega, config_.exp_omega_min, config_.exp_omega_max);
             node.phi = std::clamp(node.phi, config_.exp_phi_min, config_.exp_phi_max);
@@ -1324,6 +1342,15 @@ private:
         if (!std::isfinite(node.p)) node.p = 1.0;
         if (!std::isfinite(node.omega)) node.omega = 1.0;
         if (!std::isfinite(node.phi)) node.phi = 0.0;
+        // §3.329/§3.314: IntPow evaluates rounded (eval.h) but the stored
+        // value stayed fractional after Adam/LM updates, so hashing/printing
+        // could describe a different integer than evaluation used.
+        // Canonicalize on every clamp pass (idempotent with mutation's own
+        // rounding; evaluation output unchanged).
+        if (node.type == NodeType::Unary && node.unary_op == UnaryOp::IntPow) {
+            node.p = static_cast<double>(
+                std::clamp(static_cast<int>(std::round(node.p)), 2, 6));
+        }
     }
     
     IndividualGraph create_random_individual(int n_inputs) {
@@ -1364,17 +1391,13 @@ private:
                     node.left_child = child_dist(rng_);
                     node.unary_op = sample_unary_op_for_child(ind, node.left_child);
                     if (node.unary_op == UnaryOp::Power && runif(rng_) < 0.7) {
-                        const double power_candidates[] = {-1.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0};
-                        std::vector<double> valid_powers;
-                        for (double candidate : power_candidates) {
-                            if (candidate >= config_.p_min && candidate <= config_.p_max) {
-                                valid_powers.push_back(candidate);
-                            }
-                        }
-                        if (!valid_powers.empty()) {
-                            std::uniform_int_distribution<int> p_dist(0, static_cast<int>(valid_powers.size()) - 1);
-                            node.p = valid_powers[p_dist(rng_)];
-                        }
+                        node.p = sample_power_exponent();
+                    }
+                    // §3.326: Power nodes keeping the pre-draw (30% branch)
+                    // are clamped into the configured domain (was unbounded
+                    // Gaussian). IntPow keeps its fixed 2..6 table below.
+                    if (node.unary_op == UnaryOp::Power) {
+                        node.p = std::clamp(node.p, config_.p_min, config_.p_max);
                     }
                     if (node.unary_op == UnaryOp::IntPow) {
                         const int intpow_candidates[] = {2, 3, 4, 5, 6};
@@ -1834,19 +1857,10 @@ private:
             wrap_node.phi = 0.0;
             wrap_node.amplitude = 1.0;
             
-            // If wrapping with Power, use interesting exponents
+            // If wrapping with Power, use interesting exponents honoring
+            // the configured domain (§3.327: bounded fallback, not 1.0).
             if (wrap_node.unary_op == UnaryOp::Power) {
-                const double power_candidates[] = {-1.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0};
-                std::vector<double> valid_powers;
-                for (double candidate : power_candidates) {
-                    if (candidate >= config_.p_min && candidate <= config_.p_max) {
-                        valid_powers.push_back(candidate);
-                    }
-                }
-                if (!valid_powers.empty()) {
-                    std::uniform_int_distribution<int> pow_dist(0, static_cast<int>(valid_powers.size()) - 1);
-                    wrap_node.p = valid_powers[pow_dist(rng_)];
-                }
+                wrap_node.p = sample_power_exponent();
             }
             if (wrap_node.unary_op == UnaryOp::IntPow) {
                 const int intpow_candidates[] = {2, 3, 4, 5, 6};
@@ -1972,13 +1986,44 @@ private:
     // -- Subtree Crossover --------------------------------------------------
     // Swaps a contiguous subtree between two parents to produce one child.
     // A "subtree" here is all nodes reachable from a selected crossover point.
+    // Bottom-up topology + required-children validation shared by
+    // crossover grafting (§3.235) and cleanup (§3.238/§3.239). Rejects
+    // forward references and operator nodes with missing children instead
+    // of silently repairing them.
+    static bool is_valid_topology(const IndividualGraph& g) {
+        int total = static_cast<int>(g.nodes.size());
+        for (int i = 0; i < total; ++i) {
+            const auto& n = g.nodes[i];
+            if (n.type == NodeType::Unary || n.type == NodeType::Binary) {
+                if (n.left_child < 0 || n.left_child >= i) return false;
+            }
+            if (n.type == NodeType::Binary) {
+                if (n.right_child < 0 || n.right_child >= i) return false;
+            }
+        }
+        return true;
+    }
+
     IndividualGraph crossover(const IndividualGraph& parent_a, const IndividualGraph& parent_b) {
         ++crossover_attempts_;
         last_crossover_valid_ = false;
         IndividualGraph child = parent_a; // Start from parent A
 
+        // §3.232: failure returns below must never look like an evaluated
+        // offspring. Invalidate fitness so a parent-A clone always flows
+        // through mutation + re-evaluation (callers already do), and success
+        // diagnostics stop undercounting real genetic contributions.
+        auto crossover_fail = [&]() -> IndividualGraph {
+            IndividualGraph c = parent_a;
+            c.fitness = 1e9;
+            c.raw_mse = 1e9;
+            c.weighted_mse = 1e9;
+            c.fitness_valid = false;
+            return c;
+        };
+
         if (parent_a.nodes.size() < 3 || parent_b.nodes.size() < 3) {
-            return child; // Too small for meaningful crossover
+            return crossover_fail(); // Too small for meaningful crossover
         }
 
         // Prefer active crossover points so recombination exchanges useful modules.
@@ -1989,7 +2034,7 @@ private:
         // (all nodes whose index >= xo_b that are reachable from xo_b)
         std::vector<int> subtree_b = collect_subtree(parent_b, xo_b);
         if (subtree_b.empty()) {
-            return child; // Degenerate, just return parent A
+            return crossover_fail(); // Degenerate, just return parent A
         }
 
         // Collect subtree rooted at xo_a in parent A (to remove)
@@ -2018,14 +2063,14 @@ private:
             if (donated.left_child >= 0) {
                 int new_left = donated.left_child + offset;
                 if (new_left < 0 || new_left >= static_cast<int>(xo_a + subtree_b.size())) {
-                    return parent_a;
+                    return crossover_fail();
                 }
                 donated.left_child = new_left;
             }
             if (donated.right_child >= 0) {
                 int new_right = donated.right_child + offset;
                 if (new_right < 0 || new_right >= static_cast<int>(xo_a + subtree_b.size())) {
-                    return parent_a;
+                    return crossover_fail();
                 }
                 donated.right_child = new_right;
             }
@@ -2037,44 +2082,94 @@ private:
         int size_diff = static_cast<int>(subtree_b.size()) - (end_of_subtree_a - xo_a);
         for (int i = end_of_subtree_a; i < static_cast<int>(parent_a.nodes.size()); ++i) {
             OpNode n = parent_a.nodes[i];
-            // Adjust child pointers for the size change
+            // Adjust child pointers for the size change.
+            // §3.234: children pointing into the REMOVED range
+            // [xo_a, end_of_subtree_a) no longer exist — rewire to the
+            // donated root (index xo_a) instead of merely shifting, which
+            // could land inside the unrelated donated subtree.
             if (n.left_child >= xo_a) {
-                int shifted = n.left_child + size_diff;
-                if (shifted < 0) return parent_a;
-                n.left_child = shifted;
+                if (n.left_child < end_of_subtree_a) {
+                    n.left_child = xo_a;
+                } else {
+                    int shifted = n.left_child + size_diff;
+                    if (shifted < 0) return crossover_fail();
+                    n.left_child = shifted;
+                }
             }
             if (n.right_child >= xo_a) {
-                int shifted = n.right_child + size_diff;
-                if (shifted < 0) return parent_a;
-                n.right_child = shifted;
+                if (n.right_child < end_of_subtree_a) {
+                    n.right_child = xo_a;
+                } else {
+                    int shifted = n.right_child + size_diff;
+                    if (shifted < 0) return crossover_fail();
+                    n.right_child = shifted;
+                }
             }
             new_nodes.push_back(n);
         }
 
         // Safety: cap graph size to prevent bloat
         if (new_nodes.size() > static_cast<size_t>(config_.max_nodes)) {
-            return parent_a;
+            return crossover_fail();
         }
 
         // Reject offspring that violate DAG invariants; do not silently repair.
-        int total = static_cast<int>(new_nodes.size());
-        for (int i = 0; i < total; ++i) {
-            const auto& n = new_nodes[i];
-            if ((n.type == NodeType::Unary || n.type == NodeType::Binary)) {
-                if (n.left_child < 0 || n.left_child >= i) return parent_a;
-            }
-            if (n.type == NodeType::Binary) {
-                if (n.right_child < 0 || n.right_child >= i) return parent_a;
-            }
+        {
+            IndividualGraph probe;
+            probe.nodes = new_nodes;
+            if (!is_valid_topology(probe)) return crossover_fail();
         }
 
         child.nodes = std::move(new_nodes);
 
-        // Resize output weights to match new node count
-        std::normal_distribution<double> rnorm(0.0, 0.1);
-        child.output_weights.resize(child.nodes.size());
-        for (size_t i = parent_a.output_weights.size(); i < child.output_weights.size(); ++i) {
-            child.output_weights[i] = rnorm(rng_);
+        // §3.233: remap retained parent-A weights to their shifted indices.
+        // The old resize kept stale index alignment (suffix weights followed
+        // removed nodes; the tail got random weights). Donated region
+        // inherits parent-B weights.
+        {
+            std::vector<double> remapped(child.nodes.size(), 0.0);
+            int na = static_cast<int>(parent_a.output_weights.size());
+            int nb = static_cast<int>(parent_b.output_weights.size());
+            for (int i = 0; i < xo_a && i < na; ++i) {
+                remapped[static_cast<size_t>(i)] =
+                    parent_a.output_weights[static_cast<size_t>(i)];
+            }
+            for (size_t k = 0; k < subtree_b.size(); ++k) {
+                int bidx = subtree_b[k];
+                double w = 0.0;
+                if (bidx >= 0 && bidx < nb) {
+                    w = parent_b.output_weights[static_cast<size_t>(bidx)];
+                }
+                remapped[static_cast<size_t>(xo_a) + k] = w;
+            }
+            for (int i = end_of_subtree_a; i < static_cast<int>(parent_a.nodes.size()); ++i) {
+                int ni = i + size_diff;
+                if (ni >= 0 && ni < static_cast<int>(remapped.size()) && i < na) {
+                    remapped[static_cast<size_t>(ni)] =
+                        parent_a.output_weights[static_cast<size_t>(i)];
+                }
+            }
+            child.output_weights = std::move(remapped);
+        }
+
+        // §3.235: a donation no suffix node references and whose root output
+        // weight is inactive is dead code, not recombination. Fail the graft
+        // (retry may produce a live one) instead of bloating the child.
+        {
+            bool referenced = false;
+            int new_total = static_cast<int>(child.nodes.size());
+            int donated_end = xo_a + static_cast<int>(subtree_b.size());
+            for (int i = donated_end; i < new_total; ++i) {
+                const auto& n = child.nodes[static_cast<size_t>(i)];
+                if (n.left_child == xo_a || n.right_child == xo_a) {
+                    referenced = true;
+                    break;
+                }
+            }
+            bool root_active =
+                xo_a < static_cast<int>(child.output_weights.size()) &&
+                std::abs(child.output_weights[static_cast<size_t>(xo_a)]) > 1e-8;
+            if (!referenced && !root_active) return crossover_fail();
         }
 
         child.fitness = 1e9; // Mark for re-evaluation
@@ -2286,11 +2381,21 @@ private:
             return pred;
         };
 
+        // §3.136: frozen robust scale. Re-estimating mad_scale from current
+        // residuals every iteration changes the objective each pass (no
+        // single Huber/Student-t loss decreases monotonically). Estimate once
+        // from the initial residual; explicit huber_delta stays frozen as set.
+        double frozen_scale = std::numeric_limits<double>::quiet_NaN();
         auto irls_weights = [&](const Eigen::ArrayXd& resid) -> Eigen::ArrayXd {
             Eigen::ArrayXd rw = Eigen::ArrayXd::Ones(n_samples);
             if (config_.loss_mode == LossMode::Huber) {
                 double d = config_.huber_delta;
-                if (!(d > 0.0) || !std::isfinite(d)) d = mad_scale(resid);
+                if (!(d > 0.0) || !std::isfinite(d)) {
+                    if (!std::isfinite(frozen_scale)) {
+                        frozen_scale = mad_scale(resid);
+                    }
+                    d = frozen_scale;
+                }
                 d = std::max(d, 1e-12);
                 for (int i = 0; i < n_samples; ++i) {
                     double a = std::abs(resid(i));
@@ -2317,7 +2422,12 @@ private:
                 }
             } else if (config_.loss_mode == LossMode::StudentT) {
                 double s = config_.huber_delta;
-                if (!(s > 0.0) || !std::isfinite(s)) s = mad_scale(resid);
+                if (!(s > 0.0) || !std::isfinite(s)) {
+                    if (!std::isfinite(frozen_scale)) {
+                        frozen_scale = mad_scale(resid);
+                    }
+                    s = frozen_scale;
+                }
                 s = std::max(s, 1e-12);
                 // IRLS for log(1+(r/s)^2): weight ∝ 1 / (1 + (r/s)^2)
                 for (int i = 0; i < n_samples; ++i) {
@@ -2898,11 +3008,19 @@ private:
     }
     
     // -- Post-Evolution Graph Cleanup ------------------------------------─
-    // Uses output-correlation-based deduplication (like PyTorch pruning.py):
-    // Nodes producing identical outputs get merged regardless of structure.
-    // This catches x == (x+x)/2 == (x+x+x)/3 etc.
+    // Uses output-correlation-based deduplication (like PyTorch pruning.py).
+    // §3.237: this is OUTPUT-layer deduplication only — direct active output
+    // terms with (near-)identical vectors are merged. It is not structural
+    // CSE: identical nested subexpressions without direct output weight are
+    // never merged here (see the active-weight gates below).
+    // This catches x == (x+x)/2 == (x+x+x)/3 etc. at the output layer.
     void cleanup_graph(IndividualGraph& ind) {
         if (ind.nodes.empty()) return;
+        // §3.238/§3.239: the passes below assume bottom-up topology and
+        // valid children. Never silently repair invalid graphs (no
+        // Constant-0 conversion, no Unary demotion): skip cleanup and leave
+        // selection to rout around the invalid individual.
+        if (!is_valid_topology(ind)) return;
         int n_samples = static_cast<int>(y_.size());
         
         // -- Step 1: Evaluate all nodes to get their actual output vectors --
@@ -3018,20 +3136,15 @@ private:
             }
         }
         
-        // Remap child pointers
+        // Remap child pointers. §3.239: no silent type changes here —
+        // entry validation plus transitive dependency marking guarantee
+        // every used child is kept, so remap targets always resolve.
         for (auto& node : clean_nodes) {
             if (node.left_child >= 0 && node.left_child < n_nodes) {
                 node.left_child = old_to_new[node.left_child];
             }
             if (node.right_child >= 0 && node.right_child < n_nodes) {
                 node.right_child = old_to_new[node.right_child];
-            }
-            if (node.left_child < 0 && (node.type == NodeType::Unary || node.type == NodeType::Binary)) {
-                node.type = NodeType::Constant;
-                node.value = 0.0;
-            }
-            if (node.right_child < 0 && node.type == NodeType::Binary) {
-                node.type = NodeType::Unary;
             }
         }
         
@@ -3054,12 +3167,19 @@ private:
         // -- Step 5: Iterative Backward Elimination --
         // Greedily remove least-important node, re-solve Ridge, repeat
         // until removing any more node degrades MSE too much.
+        // §3.241: eliminated nodes stay excluded via mask. Without it, each
+        // trial re-solves the full column set, so an eliminated node can be
+        // silently resurrected with nonzero weight (and dead columns keep
+        // influencing the ridge fit). Caches still evaluate all nodes
+        // (perf note); semantics are exclusion-correct.
+        std::vector<char> eliminated(ind.nodes.size(), 0);
         for (int elim_iter = 0; elim_iter < 10; ++elim_iter) {
-            
+
             // Find least important node (smallest non-zero |output_weight|, non-Input)
             int weakest = -1;
             double weakest_weight = 1e18;
             for (int i = 0; i < static_cast<int>(ind.nodes.size()); ++i) {
+                if (i < static_cast<int>(eliminated.size()) && eliminated[static_cast<size_t>(i)]) continue;
                 if (ind.nodes[i].type == NodeType::Input) continue;
                 if (i >= static_cast<int>(ind.output_weights.size())) continue;
                 double w = std::abs(ind.output_weights[i]);
@@ -3069,22 +3189,34 @@ private:
                     weakest = i;
                 }
             }
-            
+
             if (weakest < 0) break; // No more removable nodes
-            
+
             // Try removing it
             IndividualGraph candidate = ind;
             candidate.output_weights[weakest] = 0.0;
-            
+
             // Re-evaluate without that node and re-solve
             std::vector<Eigen::ArrayXd> trial_cache;
             evaluate_graph(candidate, X_, n_samples, trial_cache);
+            for (size_t f = 0; f < eliminated.size() && f < trial_cache.size(); ++f) {
+                if (eliminated[f]) trial_cache[f].setZero();
+            }
+            if (weakest >= 0 && weakest < static_cast<int>(trial_cache.size())) {
+                trial_cache[static_cast<size_t>(weakest)].setZero();
+            }
             solve_output_weights(candidate, trial_cache);
             evaluate_fitness_with_penalty(candidate, X_, y_, n_samples);
             
             // Accept if MSE is still acceptable (within 5% of baseline)
             if (objective_mse(candidate) < baseline_mse * 1.05 + 1e-8) {
                 ind = candidate;
+                if (weakest >= 0 && weakest < static_cast<int>(ind.output_weights.size())) {
+                    ind.output_weights[static_cast<size_t>(weakest)] = 0.0;
+                }
+                if (weakest >= 0 && weakest < static_cast<int>(eliminated.size())) {
+                    eliminated[static_cast<size_t>(weakest)] = 1;
+                }
                 baseline_mse = objective_mse(ind);
             } else {
                 break; // Can't remove any more without hurting accuracy
@@ -3197,8 +3329,15 @@ private:
                     
                     for (int si = 0; si < n_snap_p; ++si) {
                         double candidate = snap_candidates_p[si];
-                        if (std::abs(original_p - candidate) > 0.3) continue; 
-                        
+                        if (std::abs(original_p - candidate) > 0.3) continue;
+                        // §3.333: snaps must respect the configured power
+                        // domain (a p_max=2 config must not snap to 5), and
+                        // IntPow nodes only take integer exponents
+                        // (evaluation rounds; fractional snaps lie).
+                        if (candidate < config_.p_min || candidate > config_.p_max) continue;
+                        if (node.unary_op == UnaryOp::IntPow &&
+                            std::abs(candidate - std::round(candidate)) > 1e-9) continue;
+
                         node.p = candidate;
                         
                         // Finding 3: Incremental Trial
@@ -3641,6 +3780,12 @@ private:
             };
 
             // 6b. Output weight snapping - using cached node outputs (no graph re-eval)
+            // §3.244: track explicitly-snapped coefficients so the final
+            // refit below can be checked for snap-fidelity drift.
+            std::vector<char> snapped_w(ind.output_weights.size(), 0);
+            std::vector<double> snapped_w_val(ind.output_weights.size(), 0.0);
+            bool snapped_b = false;
+            double snapped_b_val = ind.output_bias;
             {
                 const double snap_weight_values[] = {
                     0.0, 0.25, 1.0/3.0, 0.5, 2.0/3.0, 0.75,
@@ -3679,6 +3824,8 @@ private:
                     
                     if (best_snap_w != w) {
                         ind.output_weights[i] = best_snap_w;
+                        snapped_w[static_cast<size_t>(i)] = 1;
+                        snapped_w_val[static_cast<size_t>(i)] = best_snap_w;
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples); // Update fitness/raw_mse
                         snap_baseline_mse = objective_mse(ind);
                     }
@@ -3725,21 +3872,69 @@ private:
                     
                     if (best_snap_b != bias) {
                         ind.output_bias = best_snap_b;
+                        snapped_b = true;
+                        snapped_b_val = best_snap_b;
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
                     }
                 }
             }
-            
+
             // Final Ridge refit after all snapping
             if (!ind.nodes.empty()) {
                 std::vector<Eigen::ArrayXd> final_cache;
                 evaluate_graph(ind, X_, n_samples, final_cache);
                 solve_output_weights(ind, final_cache);
             }
+
+            // §3.244: the refit above can drift explicitly-snapped
+            // coefficients away from their accepted clean values. Restore
+            // drifted snaps when fidelity costs ~nothing (within 0.5%),
+            // otherwise keep the refit.
+            {
+                IndividualGraph post_refit = ind;
+                bool restored_any = false;
+                for (size_t i = 0; i < snapped_w.size() && i < ind.output_weights.size(); ++i) {
+                    if (!snapped_w[i]) continue;
+                    double acc = snapped_w_val[i];
+                    double tol = std::max(1e-9, 1e-3 * std::abs(acc));
+                    if (std::abs(ind.output_weights[i] - acc) > tol) {
+                        ind.output_weights[i] = acc;
+                        restored_any = true;
+                    }
+                }
+                if (snapped_b) {
+                    double tol = std::max(1e-9, 1e-3 * std::abs(snapped_b_val));
+                    if (std::abs(ind.output_bias - snapped_b_val) > tol) {
+                        ind.output_bias = snapped_b_val;
+                        restored_any = true;
+                    }
+                }
+                if (restored_any) {
+                    evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                    evaluate_fitness_with_penalty(post_refit, X_, y_, n_samples);
+                    double m_restored = objective_mse(ind);
+                    double m_refit = objective_mse(post_refit);
+                    if (!(m_restored <= m_refit * 1.005 + 1e-9)) {
+                        ind = post_refit;
+                    }
+                }
+            }
         }
-        
-        // Final inner param refinement on the clean graph
-        refine_inner_params(ind);
+
+        // Final inner param refinement on the clean graph.
+        // §3.245: refinement runs after gated snapping without a global
+        // acceptance check — gate it: revert when the combined change
+        // worsens the snapped-state objective beyond numerical noise.
+        {
+            IndividualGraph pre_refine = ind;
+            double mse_before = objective_mse(ind);
+            refine_inner_params(ind);
+            evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+            double mse_after = objective_mse(ind);
+            if (!(mse_after <= mse_before * 1.0 + 1e-9)) {
+                ind = pre_refine;
+            }
+        }
     }
 
     // -- P5: NSGA-II Non-Dominated Sort ------------------------------------

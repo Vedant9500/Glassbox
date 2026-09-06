@@ -1017,7 +1017,9 @@ static py::tuple refine_powers_model_wrapper(
     py::list initial_omegas,
     int steps = 200,
     double lr = 0.05,
-    py::object sample_weight = py::none()
+    py::object sample_weight = py::none(),
+    double p_min = -2.0,
+    double p_max = 5.0
 ) {
     auto x_arr_c = ensure_f64_c(x_arr);
     auto y_arr_c = ensure_f64_c(y_arr);
@@ -1033,7 +1035,10 @@ static py::tuple refine_powers_model_wrapper(
     for (auto item : initial_powers) powers.push_back(item.cast<double>());
     for (auto item : initial_omegas) omegas.push_back(item.cast<double>());
 
-    auto res = sr::refine_powers_model_cpp(x, y, powers, omegas, steps, lr, sw);
+    // §3.332: domain bounds validated here (refine.h falls back to [-2, 5]).
+    if (!std::isfinite(p_min) || !std::isfinite(p_max) || !(p_min < p_max))
+        throw py::value_error("refine_powers p_min/p_max must be finite with p_min < p_max");
+    auto res = sr::refine_powers_model_cpp(x, y, powers, omegas, steps, lr, sw, p_min, p_max);
     
     py::dict out;
     out["mse"] = res.mse;
@@ -1420,7 +1425,8 @@ PYBIND11_MODULE(_core, m) {
     m.def("refine_powers", &refine_powers_model_wrapper,
           "Refines powers via Eigen varpro (optional sample_weight for WLS / S5-9)",
           py::arg("x"), py::arg("y"), py::arg("initial_powers"), py::arg("initial_omegas"),
-          py::arg("steps")=200, py::arg("lr")=0.05, py::arg("sample_weight")=py::none());
+          py::arg("steps")=200, py::arg("lr")=0.05, py::arg("sample_weight")=py::none(),
+          py::arg("p_min")=-2.0, py::arg("p_max")=5.0);
     m.def("refine_periodic_rational", &refine_periodic_rational_wrapper,
           "Refines periodic rational params via Eigen varpro (optional sample_weight / S5-9)",
           py::arg("x"), py::arg("y"), py::arg("omega0"), py::arg("c0"),

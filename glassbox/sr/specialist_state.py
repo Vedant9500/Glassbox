@@ -195,6 +195,15 @@ class SpecialistVaultEntry:
     run_index: int = 0
     last_improved_run: int = 0
     residual_relevance: float | None = None
+    # §3.209: metric provenance — entries compared by validation_mse must
+    # record whether it came from a holdout, full training data, or rescoring.
+    metric_source: str = "unknown"
+    # §3.207: data fingerprint so stale vectors are never compared against a
+    # different target. Set at admission, refreshed on successful rescore.
+    data_n: int = 0
+    data_fingerprint: str = ""
+    # §3.210: last run index at which rescoring proved the entry useful.
+    last_rescored_run: int | None = None
 
     def to_candidate_dict(self, *, source: str = "specialist_vault") -> dict[str, Any]:
         return {
@@ -203,6 +212,7 @@ class SpecialistVaultEntry:
             "validation_r2": self.validation_r2,
             "validation_mse": self.validation_mse,
             "mse": self.validation_mse,
+            "metric_source": self.metric_source,
             "complexity": self.complexity,
             "family_signature": self.family_signature,
             "from_specialist_vault": True,
@@ -216,13 +226,30 @@ class SpecialistVaultEntry:
             "source": self.source,
             "validation_r2": self.validation_r2,
             "validation_mse": self.validation_mse,
+            "metric_source": self.metric_source,
             "complexity": int(self.complexity),
             "family_signature": self.family_signature,
             "run_index": int(self.run_index),
             "last_improved_run": int(self.last_improved_run),
+            "last_rescored_run": (
+                None if self.last_rescored_run is None else int(self.last_rescored_run)
+            ),
+            "data_n": int(self.data_n),
+            "data_fingerprint": self.data_fingerprint,
             "residual_relevance": self.residual_relevance,
             "segment_scores": list(self.segment_scores),
         }
+
+
+def _data_fingerprint(X_arr: np.ndarray, y_arr: np.ndarray) -> tuple[int, str]:
+    """Cheap (shape, hash) fingerprint of the scoring target (§3.207)."""
+    import hashlib
+
+    y = np.ascontiguousarray(np.asarray(y_arr, dtype=np.float64)).reshape(-1)
+    h = hashlib.sha256()
+    h.update(np.asarray(X_arr.shape, dtype=np.int64).tobytes())
+    h.update(y.tobytes())
+    return int(y.shape[0]), h.hexdigest()[:16]
 
 
 @dataclass
@@ -430,14 +457,22 @@ class SpecialistVault:
             mse = _clean_float((candidate or {}).get("validation_mse"))
             if mse is None:
                 mse = float(np.mean(residual**2))
+                metric_source = "full_data"
+            else:
+                # §3.209: record metric provenance — candidate-provided
+                # validation MSE (holdout/weighted/clean) is ranked beside
+                # full-data MSE below, so its origin must travel with it.
+                metric_source = "candidate_provided"
             r2 = _clean_float((candidate or {}).get("validation_r2"))
             if r2 is None:
                 r2 = float(1.0 - mse / y_var)
+            data_n, data_fp = _data_fingerprint(X_arr, y_arr)
             entry = SpecialistVaultEntry(
                 formula=formula,
                 source=str((candidate or {}).get("source") or "candidate"),
                 validation_r2=r2,
                 validation_mse=mse,
+                metric_source=metric_source,
                 complexity=int(
                     (candidate or {}).get("complexity") or complexity_fn(formula)
                 ),
@@ -451,18 +486,22 @@ class SpecialistVault:
                 run_index=int(run_index),
                 last_improved_run=int(run_index),
                 residual_relevance=float(relevance),
+                data_n=data_n,
+                data_fingerprint=data_fp,
             )
             self.entries.append(entry)
             existing_keys.add(key)
             self.added_count += 1
             added += 1
 
+        # §3.208: evict stale BEFORE capacity truncation. Truncating first
+        # could capacity-evict a fresh high-quality entry while stale entries
+        # survived to evict further entries below.
+        self._evict_stale(run_index)
         self._sort_entries()
         if len(self.entries) > int(self.max_entries):
             self.evicted_count += len(self.entries) - int(self.max_entries)
             self.entries = self.entries[: int(self.max_entries)]
-        self._evict_stale(run_index)
-        self._sort_entries()
         return int(added)
 
     def rescore_against_target(
@@ -471,6 +510,7 @@ class SpecialistVault:
         y: Any,
         *,
         evaluate_formula: Callable[[str, Any], Any],
+        run_index: int | None = None,
     ) -> None:
         if not self.entries:
             return
@@ -478,15 +518,23 @@ class SpecialistVault:
         y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
         y_var = max(float(np.var(y_arr)), 1e-15)
         for entry in self.entries:
+            old_mse = entry.validation_mse
+            old_rel = entry.residual_relevance
             try:
                 pred = np.asarray(
                     evaluate_formula(entry.formula, X_arr), dtype=np.float64
                 ).reshape(-1)
             except Exception:
                 entry.residual_relevance = None
+                # §3.207: never leave stale vectors beside a failed rescore.
+                entry.prediction_vector = np.zeros(0, dtype=np.float64)
+                entry.residual_vector = np.zeros(0, dtype=np.float64)
                 continue
             if pred.shape != y_arr.shape or not np.all(np.isfinite(pred)):
                 entry.residual_relevance = None
+                # §3.207: shape mismatch or non-finite → stale vectors cleared.
+                entry.prediction_vector = np.zeros(0, dtype=np.float64)
+                entry.residual_vector = np.zeros(0, dtype=np.float64)
                 continue
             residual = pred - y_arr
             entry.prediction_vector = pred
@@ -497,6 +545,27 @@ class SpecialistVault:
             if np.isfinite(mse):
                 entry.validation_mse = mse
                 entry.validation_r2 = float(1.0 - mse / y_var)
+                entry.metric_source = "rescore_full_data"
+                entry.data_n, entry.data_fingerprint = _data_fingerprint(
+                    X_arr, y_arr
+                )
+                # §3.210: rescoring that proves usefulness refreshes staleness.
+                new_rel = entry.residual_relevance
+                improved = old_mse is None or (
+                    np.isfinite(mse) and mse < float(old_mse) - 1e-12
+                )
+                if (
+                    new_rel is not None
+                    and np.isfinite(float(new_rel))
+                    and (
+                        old_rel is None
+                        or float(new_rel) > float(old_rel) + 1e-12
+                    )
+                ):
+                    improved = True
+                if improved and run_index is not None:
+                    entry.last_improved_run = int(run_index)
+                    entry.last_rescored_run = int(run_index)
         # H-22: re-rank vault after residual relevance is refreshed
         self._sort_entries()
 
@@ -805,6 +874,9 @@ def compute_specialist_state(
     y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
     if y_arr.shape[0] != int(X_arr.shape[0]):
         return None
+    # §3.213: segment-win noise floor scaled to target variance. Bare 1e-12
+    # lets dust-level margins count as wins/switches on large-scale targets.
+    win_floor = max(1e-12, 1e-6 * max(float(np.var(y_arr)), 1e-15))
 
     # Rank candidates before the first-N slice so the top performers are kept
     # (L-01: previously sliced by input order with no rank sort).
@@ -979,10 +1051,10 @@ def compute_specialist_state(
             prev_winner = None
             segment_margin_sum = 0.0
             for seg_l, seg_r in zip(left.segment_scores, right.segment_scores):
-                if seg_l.mse + 1e-12 < seg_r.mse:
+                if seg_l.mse + win_floor < seg_r.mse:
                     winner = 0
                     left_wins += 1
-                elif seg_r.mse + 1e-12 < seg_l.mse:
+                elif seg_r.mse + win_floor < seg_l.mse:
                     winner = 1
                     right_wins += 1
                 else:
@@ -1093,6 +1165,12 @@ def compute_specialist_state(
                 np.mean(best_candidate_for_hot_spots.residual_vector**2)
             )
             if total_best_mse >= 1e-12 and len(hot_spot_segments) > 0:
+                # §3.214: significance control for the bonus. Chance variation
+                # across segments produces apparent wins, so a win counts only
+                # with enough samples AND a margin above a scale-relative
+                # floor (1% of overall best MSE) — not just the 0.7 factor,
+                # which fires on dust at tiny absolute scales.
+                excel_floor = 0.01 * total_best_mse
                 for seg_idx, (seg_l, seg_r) in enumerate(
                     zip(left.hot_spot_segment_scores, right.hot_spot_segment_scores)
                 ):
@@ -1100,7 +1178,17 @@ def compute_specialist_state(
                         seg_idx
                     ]
                     if seg_best.mse > 1.2 * total_best_mse:
-                        if min(seg_l.mse, seg_r.mse) < 0.7 * seg_best.mse:
+                        seg_min = min(seg_l.mse, seg_r.mse)
+                        seg_n = min(
+                            int(seg_l.n_samples),
+                            int(seg_r.n_samples),
+                            int(seg_best.n_samples),
+                        )
+                        if (
+                            seg_min < 0.7 * seg_best.mse
+                            and seg_best.mse - seg_min >= excel_floor
+                            and seg_n >= 8
+                        ):
                             hs_excel_bonus += 0.10
                 hs_excel_bonus = min(0.20, hs_excel_bonus)
 
@@ -1148,11 +1236,19 @@ def compute_specialist_state(
     )
 
 
-def nest_formulas(f: str, g: str) -> str:
-    """Replace variable (e.g. x0, x1, x) in f with (g)."""
+def nest_formulas(f: str, g: str, var: str | None = None) -> str:
+    """Replace variable (e.g. x0, x1, x) in f with (g).
+
+    §3.215: ``var=None`` keeps the legacy global replace (every ``x``/``xN``
+    token collapses to the same inner expression — multivariate outers lose
+    feature identity). Pass an explicit ``var`` (e.g. ``"x1"``) to replace
+    only that token; a ``var`` absent from ``f`` is a no-op.
+    """
     import re
 
-    return re.sub(r"\bx\d*\b", f"({g})", f)
+    if var is None:
+        return re.sub(r"\bx\d*\b", f"({g})", f)
+    return re.sub(rf"\b{re.escape(var)}\b", f"({g})", f)
 
 
 def _dedupe_append(forms: list[tuple[str, str]], operator: str, formula: str) -> None:

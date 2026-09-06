@@ -4296,7 +4296,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         return kept
 
     def _search_loss_kwargs(self):
-        """Kwargs for robust search loss (Phase 4). Display path ignores these."""
+        """Kwargs for robust search loss (Phase 4). Display path ignores these.
+
+        §3.138: search objectives are NOT comparable across modes or scales —
+        Huber loss, trimmed MSE, and Student-t log-loss have different units
+        from plain MSE. ``search_loss`` must always be read with its
+        ``loss_mode`` kind; ``acceptable_mse``/``early_stop_mse`` thresholds
+        apply to raw MSE only (the engine early-stops on raw MSE for this
+        reason).
+        """
         return {
             "loss_mode": getattr(self, "loss_mode", "mse") or "mse",
             "delta": getattr(self, "huber_delta", None),

@@ -6,6 +6,8 @@ inside PyTorch pipelines (training, export, ONNX, etc.).
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 
@@ -67,8 +69,18 @@ class CppGraphModule(nn.Module):
         for i, node in enumerate(self.nodes):
             ntype = node["type"]
             if ntype == self.TYPE_UNARY:
+                p_val = float(node["p"])
+                # §3.347: IntPow evaluates rounded (C++ and forward() both
+                # round to 2..6), so a fractional stored p is invisible yet
+                # real (see §3.329). Canonicalize the buffer at export so
+                # serialization matches evaluation (no dD/dp either way —
+                # integer cast is non-differentiable by design). NOTE: must
+                # match C++ std::round (half away from zero), NOT Python
+                # banker's round(): round(2.5) is 2 in Python, 3 in C++.
+                if node["unary_op"] == self.UNARY_INTPOW:
+                    p_val = float(min(6, max(2, math.floor(p_val + 0.5))))
                 self.register_buffer(
-                    f"p_{i}", torch.tensor(node["p"], dtype=torch.float64)
+                    f"p_{i}", torch.tensor(p_val, dtype=torch.float64)
                 )
                 self.register_buffer(
                     f"omega_{i}", torch.tensor(node["omega"], dtype=torch.float64)
@@ -225,6 +237,13 @@ class CppGraphModule(nn.Module):
                     )
                     out = torch.clamp(out, -1e6, 1e6)
                 elif binary_op == self.BINARY_DIVISION:
+                    # §3.348: protected division x/(|y|+1e-6)*sign(y). Note
+                    # for training consumers: autograd's d/dy flows only
+                    # through the denominator (sign' = 0), so the gradient
+                    # wrt the right child vanishes at y=0 even though the
+                    # forward value swings sign there. C++ never assumes this
+                    # gradient is useful; keep trainable structure away from
+                    # exact-zero denominators or use output-only training.
                     out = (
                         left_val / (torch.abs(right_val) + 1e-6) * torch.sign(right_val)
                     )
@@ -253,7 +272,12 @@ class CppGraphModule(nn.Module):
             else:
                 out = torch.zeros(n_samples, dtype=torch.float64, device=device)
 
-            out = torch.clamp(out, -1e6, 1e6)
+            # §3.345/§3.349: no second global clamp. Per-operator clamps above
+            # already mirror eval.h exactly (Power/IntPow ±1e8, Exp/Log and
+            # Arithmetic/Division ±1e6, Abs unbounded, Aggregation unclamped).
+            # The old unconditional ±1e6 pass diverged from C++ for Power in
+            # (1e6, 1e8] and for large Aggregation/Abs values. Non-finite
+            # policy stays in the strict_nonfinite block below (§3.5).
             # §3.5: preserve C++ failure semantics by default; legacy
             # zero-fill only when strict_nonfinite=False.
             if not self.strict_nonfinite:

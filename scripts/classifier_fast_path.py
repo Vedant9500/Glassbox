@@ -2740,6 +2740,7 @@ def fast_path_regression(
         mse_val: float,
         alpha_val: float,
         solver_backend: str = "auto",
+        alpha_convention: str = "unknown",
     ) -> None:
         if not np.isfinite(mse_val):
             return
@@ -2773,6 +2774,7 @@ def fast_path_regression(
                 "score": score_local,
                 "alpha": alpha_val,
                 "solver_backend": solver_backend,
+                "alpha_convention": alpha_convention,
                 "holdout_ratio": holdout_ratio,
             }
 
@@ -2801,7 +2803,14 @@ def fast_path_regression(
     if cpp_core is not None and hasattr(cpp_core, "lasso_coordinate_descent"):
         solver_backends.insert(0, "cpp")
 
-    # Try multiple alpha values to find best sparsity-accuracy tradeoff
+    # Try multiple alpha values to find best sparsity-accuracy tradeoff.
+    # §3.221: the same alpha is NOT the same sparsity path across backends —
+    # C++ thresholds at l1/2 (refine.h) while NumPy thresholds at alpha.
+    # Cross-backend comparison stays valid because final selection uses
+    # post-OLS-refit MSE (§3.222), but the recorded alpha is backend-relative:
+    # pool entries carry alpha_convention so diagnostics don't compare raw
+    # alphas across backends.
+    _ALPHA_CONVENTION = {"cpp": "l1_threshold=alpha/2", "numpy": "l1_threshold=alpha"}
     for alpha in [0.0, 0.001, 0.01, 0.05, 0.1, 0.2]:
         for solver_backend in solver_backends:
             try:
@@ -2851,6 +2860,9 @@ def fast_path_regression(
                     mse,
                     alpha,
                     solver_backend=solver_backend,
+                    alpha_convention=_ALPHA_CONVENTION.get(
+                        solver_backend, "unknown"
+                    ),
                 )
             except Exception as e:
                 print(f"  Error with {solver_backend} alpha={alpha}: {e}")
@@ -2895,6 +2907,19 @@ def fast_path_regression(
                 updated = np.zeros_like(coeffs_local)
                 updated[selected_mask] = refit_coeffs
                 n_terms_local = int(np.sum(np.abs(updated) >= sparsity_threshold))
+                # Recompute holdout diagnostics for the refit coeffs (§3.223:
+                # pre-refit ratio would be stale); carry backend convention.
+                refit_holdout_ratio: float | None = None
+                if basis_holdout is not None and y_holdout is not None:
+                    try:
+                        y_pred_ho = basis_holdout @ updated
+                        ho_mse = float(np.mean((y_holdout - y_pred_ho) ** 2))
+                        if np.isfinite(ho_mse):
+                            refit_holdout_ratio = float(
+                                ho_mse / max(refit_mse, 1e-12)
+                            )
+                    except Exception:
+                        pass
                 candidate_pool[signature] = {
                     "coeffs": updated,
                     "mse": refit_mse,
@@ -2902,6 +2927,10 @@ def fast_path_regression(
                     "score": refit_mse + COMPLEXITY_PENALTY * n_terms_local,
                     "alpha": candidate.get("alpha", -1.0),
                     "solver_backend": candidate.get("solver_backend", "auto"),
+                    "alpha_convention": candidate.get(
+                        "alpha_convention", "unknown"
+                    ),
+                    "holdout_ratio": refit_holdout_ratio,
                 }
         except (np.linalg.LinAlgError, ValueError):
             pass
@@ -2955,10 +2984,12 @@ def fast_path_regression(
         "after": len(governed_candidates),
         "removed": 0,
         "enabled": True,
+        "same_prediction_retained": 0,
     }
     if governed_candidates:
-        semantic_pool: dict[tuple[int, ...], dict[str, Any]] = {}
+        semantic_pool: dict[tuple[tuple[int, ...], tuple[int, ...]], dict[str, Any]] = {}
         unique_fallback: list[dict[str, Any]] = []
+        seen_semantic: set[tuple[int, ...]] = set()
 
         def _candidate_rank_key(
             c: dict[str, Any],
@@ -2978,11 +3009,22 @@ def fast_path_regression(
             if semantic_signature is None:
                 unique_fallback.append(cand)
                 continue
-            current = semantic_pool.get(semantic_signature)
-            if current is None or _candidate_rank_key(cand) < _candidate_rank_key(
-                current
-            ):
-                semantic_pool[semantic_signature] = cand
+            # §3.224/§3.225: the quantized prediction signature is
+            # scale-dependent (1e-7 grid) and keyed predictions alone —
+            # materially different supports with near-equal predictions
+            # collapsed to whichever scored lower first. Key by
+            # (prediction, support) so structural alternatives survive, and
+            # count same-prediction retentions for diagnostics.
+            support_signature = _candidate_signature(cand["coeffs"])
+            key = (semantic_signature, support_signature)
+            current = semantic_pool.get(key)
+            if current is None:
+                if semantic_signature in seen_semantic:
+                    semantic_dedup["same_prediction_retained"] += 1
+                seen_semantic.add(semantic_signature)
+                semantic_pool[key] = cand
+            elif _candidate_rank_key(cand) < _candidate_rank_key(current):
+                semantic_pool[key] = cand
 
         governed_candidates = list(semantic_pool.values()) + unique_fallback
         semantic_dedup["after"] = len(governed_candidates)
