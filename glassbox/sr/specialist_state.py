@@ -7,6 +7,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
+import re
+
+# M-237: nest_formulas runs in the composition loop; the static any-var
+# pattern is compiled once (explicit-var patterns stay dynamic per var).
+_NEST_ANY_VAR_RE = re.compile(r"\bx\d*\b")
 
 from glassbox.sr.formula_safety import validate_formula_expr
 
@@ -351,6 +356,12 @@ class SpecialistVault:
     ) -> int:
         if not candidate_formulas:
             self._evict_stale(run_index)
+            return 0
+
+        # M-231: zero capacity means every evaluation is discarded at
+        # truncation — skip the scoring work instead of evaluating then
+        # dropping. (M-181 ctor allocation stays queued separately.)
+        if int(self.max_entries) <= 0:
             return 0
 
         X_arr = np.asarray(X, dtype=np.float64)
@@ -1037,6 +1048,10 @@ def compute_specialist_state(
         ),
         candidates[0],
     )
+    # M-236: the fallback above is silent AND the state label below kept
+    # the unmatched name while segments came from candidates[0]. Label
+    # what is actually used so base formula and residual always agree.
+    best_formula_for_hot_spots = str(best_candidate_for_hot_spots.formula)
 
     pair_scores: list[SpecialistPairScore] = []
     for left_idx in range(len(candidates)):
@@ -1244,10 +1259,8 @@ def nest_formulas(f: str, g: str, var: str | None = None) -> str:
     feature identity). Pass an explicit ``var`` (e.g. ``"x1"``) to replace
     only that token; a ``var`` absent from ``f`` is a no-op.
     """
-    import re
-
     if var is None:
-        return re.sub(r"\bx\d*\b", f"({g})", f)
+        return _NEST_ANY_VAR_RE.sub(f"({g})", f)
     return re.sub(rf"\b{re.escape(var)}\b", f"({g})", f)
 
 

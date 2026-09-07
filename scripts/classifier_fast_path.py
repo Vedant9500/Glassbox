@@ -49,6 +49,7 @@ def _lasso_coordinate_descent_python(
     alpha: float = 0.1,
     max_iter: int = 1000,
     tol: float = 1e-4,
+    sample_weight: np.ndarray | None = None,
 ) -> np.ndarray:
     """Small NumPy fallback for the optional C++ coordinate-descent solver."""
     X_np = np.asarray(X, dtype=np.float64)
@@ -57,6 +58,19 @@ def _lasso_coordinate_descent_python(
         raise ValueError("X must be a 2D array")
     if X_np.shape[0] != y_np.shape[0]:
         raise ValueError("X and y row counts must match")
+    if sample_weight is not None:
+        # M-141: mirror the C++ sqrt-weight scaling so the fallback solves
+        # the same weighted objective (C++ validates identically).
+        w = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+        if w.shape[0] != y_np.shape[0]:
+            raise ValueError("sample_weight length must match y")
+        if not np.all(np.isfinite(w)) or np.any(w < 0):
+            raise ValueError("sample_weight must be finite and non-negative")
+        if not np.isfinite(float(w.sum())) or float(w.sum()) <= 0:
+            raise ValueError("sample_weight must have positive total")
+        s = np.sqrt(w)
+        X_np = X_np * s[:, None]
+        y_np = y_np * s
 
     if alpha <= 0.0:
         coeffs, _, _, _ = np.linalg.lstsq(X_np, y_np, rcond=None)
@@ -1363,23 +1377,33 @@ def lasso_coordinate_descent(
     max_iter: int = 1000,
     tol: float = 1e-4,
     backend: str = "auto",
+    sample_weight: np.ndarray | None = None,
 ) -> np.ndarray:
     """
     LASSO regression using coordinate descent via C++ Eigen backend.
+
+    M-141: sample_weight is plumbed to both backends (C++ sqrt-scaling
+    and the NumPy fallback mirror it). None preserves legacy behavior.
     """
     X_np = np.asarray(X, dtype=np.float64)
     y_np = np.asarray(y, dtype=np.float64).flatten()
 
     backend_norm = str(backend or "auto").lower()
     if backend_norm in {"numpy", "python", "fallback"}:
-        return _lasso_coordinate_descent_python(X_np, y_np, alpha, max_iter, tol)
+        return _lasso_coordinate_descent_python(
+            X_np, y_np, alpha, max_iter, tol, sample_weight
+        )
 
     _core, _ = _load_cpp_core()
     if _core is None or not hasattr(_core, "lasso_coordinate_descent"):
-        return _lasso_coordinate_descent_python(X_np, y_np, alpha, max_iter, tol)
+        return _lasso_coordinate_descent_python(
+            X_np, y_np, alpha, max_iter, tol, sample_weight
+        )
 
     # Run fast C++ coordinate descent
-    w_list = _core.lasso_coordinate_descent(X_np, y_np, alpha, max_iter, tol)
+    w_list = _core.lasso_coordinate_descent(
+        X_np, y_np, alpha, max_iter, tol, sample_weight
+    )
     return np.array(w_list, dtype=np.float64)
 
 
@@ -1420,6 +1444,12 @@ def build_basis_from_predictions(
     Returns:
         basis: (N, n_basis) matrix
         names: List of basis function names
+
+    Notes (audit §3.216/M-239/M-241/M-242): non-finite input rows are NOT
+    dropped — basis functions receive raw x and the assembled matrix is
+    zero-filled via nan_to_num after clipping. clip_info (when provided)
+    records non-finite input counts, the effective max_power after the
+    compact-multivariate cap, and the rational-block epsilon regime.
     """
     predictions = _with_derived_predictions(predictions)
     if x.ndim == 1:
@@ -1428,6 +1458,10 @@ def build_basis_from_predictions(
         raise ValueError(f"Expected x to be 1D or 2D, got shape {x.shape}")
 
     n, n_vars = x.shape
+    # M-239: per-row missing-data policy is zero-fill (see nan_to_num at
+    # assembly); count non-finite input rows up front for diagnostics.
+    _nonfinite_rows = int(np.sum(~np.all(np.isfinite(x), axis=1))) if n else 0
+    _requested_max_power = int(max_power)
     prediction_uncertainty = _prediction_uncertainty_metrics(predictions)
     low_trust_multivariate = (
         n_vars > 1
@@ -1440,10 +1474,16 @@ def build_basis_from_predictions(
     )
     # Multi-var default: compact basis unless classifier is highly confident.
     # Kitchen-sink expansion (triples/ratios) was winning high R2 with complexity 90+.
+    # M-241 companion: `or 1.0` treated a genuine 0.0 entropy as missing,
+    # so a maximally confident classifier (single positive class) could
+    # never satisfy the <=0.45 gate and the full-basis path was dead.
+    # None still defaults to 1.0 (conservative); present 0.0 stays 0.0.
+    _ht_entropy = prediction_uncertainty.get("prediction_entropy")
+    _ht_entropy = 1.0 if _ht_entropy is None else float(_ht_entropy)
     high_trust_multivariate = (
         n_vars > 1
         and not bool(prediction_uncertainty.get("prediction_uncertain", False))
-        and float(prediction_uncertainty.get("prediction_entropy") or 1.0) <= 0.45
+        and _ht_entropy <= 0.45
         and float(prediction_uncertainty.get("prediction_margin") or 0.0) >= 0.25
     )
     compact_multivariate = bool(
@@ -1678,6 +1718,11 @@ def build_basis_from_predictions(
                 names.append(f"{var_name(i)}*{var_name(j)}")
 
     # Product-ratio terms for physics formulas (e.g., G*m1*m2/r²)
+    # M-242: epsilon + near-zero-denominator exposure. Denominators are
+    # |xk|+eps shaped, so rows with |xk| below 100*eps sit in the
+    # epsilon-dominated regime and inherit the fixed 1e-8 floor.
+    _rational_eps: float | None = None
+    _near_zero_denom_rows = 0
     if (
         universal_basis
         and allow_arithmetic
@@ -1685,6 +1730,11 @@ def build_basis_from_predictions(
         and not compact_multivariate
     ):
         epsilon = 1e-8  # Prevent division by zero
+        _rational_eps = float(epsilon)
+        with np.errstate(invalid="ignore"):
+            _near_zero_denom_rows = int(
+                np.sum(np.min(np.abs(x), axis=1) < 100 * epsilon)
+            )
 
         # Triple products: a*b*c
         if n_vars >= 3:
@@ -1836,6 +1886,20 @@ def build_basis_from_predictions(
             for n, f in zip(names, frac)
             if f > 0
         ]
+        # M-239/M-241/M-242: surface input-quality + capability mutations
+        # alongside clip stats (written after clear so they survive).
+        clip_info["nonfinite_input_rows"] = _nonfinite_rows
+        clip_info["nonfinite_input_fraction"] = (
+            float(_nonfinite_rows / n) if n else 0.0
+        )
+        clip_info["requested_max_power"] = _requested_max_power
+        clip_info["effective_max_power"] = int(max_power)
+        if _rational_eps is not None:
+            clip_info["rational_epsilon"] = float(_rational_eps)
+            clip_info["near_zero_denom_rows"] = int(_near_zero_denom_rows)
+            clip_info["near_zero_denom_fraction"] = (
+                float(_near_zero_denom_rows / n) if n else 0.0
+            )
 
     return basis, names
 
@@ -1873,12 +1937,39 @@ def find_exact_symbolic_match(
 
     Returns:
         (formula, mse, coefficients) if exact match found, else None
+
+    Note (M-182): the returned mse/coefficients are RAW fit values, while
+    the formula string may snap near-integers (≈1%) and drop sub-1e-6
+    terms for display. fast_path_regression re-validates the DISPLAYED
+    formula (display_mse wall) before accepting, so drift cannot slip
+    through the in-tree path; direct callers should re-evaluate the
+    string if they consume it instead of the coefficients.
+
+    Intercept contract per branch (M-188): single-term trials fit with and
+    without an explicit ones column; beam seeds const-paired supports;
+    pairs/triples (CPU and torch) fit raw combos and see an intercept only
+    when a "1" column is present in basis. Diagnostics record
+    exact_match_const_present so callers can tell which regime ran.
     """
     import math
     import threading
 
     n_basis = basis.shape[1]
     y = y.flatten()
+
+    # M-185: validate once before enumeration. NaN/inf basis rows make
+    # LAPACK emit illegal-value noise (and torch raise internally) while
+    # never yielding an acceptable match, so fail closed with a diagnostic
+    # instead of looping. Callers treat None as "no exact match" and fall
+    # back to LASSO.
+    if not np.all(np.isfinite(np.asarray(basis))) or not np.all(
+        np.isfinite(np.asarray(y))
+    ):
+        if diagnostics is not None:
+            diagnostics["nonfinite_exact_match_inputs"] = True
+        return None
+    if diagnostics is not None:
+        diagnostics["exact_match_const_present"] = bool("1" in names)
 
     def build_formula(indices: list[int], coeffs: np.ndarray) -> tuple[str, np.ndarray]:
         from glassbox.sr.operations.meta_ops import get_constant_symbol
@@ -1904,6 +1995,13 @@ def find_exact_symbolic_match(
 
         formula = _join_formula_terms(terms)
         return formula, full_coeffs
+
+    # M-243: helper hoisted above the single-term loop — the no-"1"-basis
+    # skip path reports through it, and defining it after the loop made
+    # that path raise UnboundLocalError instead of skipping loudly.
+    def update_diagnostics(values: dict[str, Any]) -> None:
+        if diagnostics is not None:
+            diagnostics.update(values)
 
     # Try single basis functions with coefficient fitting
     for i in range(n_basis):
@@ -1958,10 +2056,6 @@ def find_exact_symbolic_match(
                         return formula, mse, full_coeffs
                 except (np.linalg.LinAlgError, ValueError):
                     pass
-
-    def update_diagnostics(values: dict[str, Any]) -> None:
-        if diagnostics is not None:
-            diagnostics.update(values)
 
     def bounded_sparse_beam_search(
         max_support_size: int,
@@ -2025,6 +2119,11 @@ def find_exact_symbolic_match(
             initial_supports.append((idx,))
 
         seen = set()
+        # M-184: the seen-set is valid memoization, not a search defect —
+        # fit_support scores a support tuple only (no path state), so a
+        # repeat expansion from a better parent refits identically. If a
+        # future path-dependent feature (e.g. expansion-order priors) is
+        # added, this set must become path-aware.
         for support in initial_supports:
             if support in seen:
                 continue
@@ -2157,11 +2256,21 @@ def find_exact_symbolic_match(
 
     if selected_device is not None and max_terms >= 2:
         try:
+            # M-186: float64 on CPU torch so near-threshold candidates agree
+            # with the float64 NumPy validators; float32 kept on CUDA for
+            # throughput (results are always CPU-validated before accept).
+            _torch_dtype = (
+                torch.float64
+                if selected_device.type == "cpu"
+                else torch.float32
+            )
             basis_t = torch.as_tensor(
-                np.ascontiguousarray(basis), dtype=torch.float32, device=selected_device
+                np.ascontiguousarray(basis),
+                dtype=_torch_dtype,
+                device=selected_device,
             )
             y_t = torch.as_tensor(
-                np.ascontiguousarray(y), dtype=torch.float32, device=selected_device
+                np.ascontiguousarray(y), dtype=_torch_dtype, device=selected_device
             ).unsqueeze(1)
             N = basis_t.shape[0]
 
@@ -2236,11 +2345,12 @@ def find_exact_symbolic_match(
                         formula, full_coeffs = build_formula(indices, coeffs_arr)
                         return formula, mse_cpu, full_coeffs
 
-            # §3.147: torch miss with skipped ranks falls through to CPU
-            # exhaustive (allowed ranks) + beam below; torch-only None would
-            # strand skipped ranks with no fallback.
+            # §3.147 + M-187: torch miss falls through to the CPU
+            # exhaustive search below (it is the float64 reference the torch
+            # result is validated against). Returning None here skipped the
+            # NumPy search entirely and suppressed the fallback reason.
             if not (skip_pairs or skip_triples):
-                return None
+                update_diagnostics({"torch_completed_no_match": True})
         except Exception as e:
             if selected_device.type == "cuda" and torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -2266,7 +2376,13 @@ def find_exact_symbolic_match(
                     coeffs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
                     y_pred = X @ coeffs
                     mse = np.mean((y - y_pred) ** 2)
-                    if mse < tolerance:
+                    # M-185: explicit finite gates (beam path precedent
+                    # §3.150) — NaN MSE already fails `<`, but pin it.
+                    if (
+                        mse < tolerance
+                        and np.isfinite(mse)
+                        and np.all(np.isfinite(coeffs))
+                    ):
                         formula, full_coeffs = build_formula([i, j], coeffs)
                         stop_event.set()
                         return formula, mse, full_coeffs
@@ -2285,7 +2401,12 @@ def find_exact_symbolic_match(
                         coeffs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
                         y_pred = X @ coeffs
                         mse = np.mean((y - y_pred) ** 2)
-                        if mse < tolerance:
+                        # M-185: same explicit finite gates as pairs.
+                        if (
+                            mse < tolerance
+                            and np.isfinite(mse)
+                            and np.all(np.isfinite(coeffs))
+                        ):
                             formula, full_coeffs = build_formula([i, j, k], coeffs)
                             stop_event.set()
                             return formula, mse, full_coeffs
@@ -2430,6 +2551,8 @@ def fast_path_regression(
     holdout_mask = None
     x_fit, y_fit = x, y  # default: fit on everything
     x_holdout, y_holdout = None, None
+    # M-53: why holdout was disabled (None when active/unrequested).
+    holdout_disabled_reason: dict[str, Any] | None = None
 
     if holdout_fraction > 0 and x.ndim <= 2:
         n = len(y)
@@ -2456,6 +2579,12 @@ def fast_path_regression(
             y_holdout = y[holdout_indices]
         else:
             holdout_mask = None  # not enough data, skip
+            holdout_disabled_reason = {
+                "reason": "insufficient_fit_rows",
+                "requested_edge_rows": int(n_edge),
+                "fit_rows": int(fit_mask.sum()),
+                "min_fit_rows": 10,
+            }
 
     # Multi-var templates are seed candidates only (no hard Exact win).
     # Real blackbox recovery must compete via basis / evolution / Pareto.
@@ -2566,6 +2695,7 @@ def fast_path_regression(
                     "holdout_mse": _shortcut_holdout_mse(
                         formula, x_holdout, y_holdout, holdout_mask
                     ),
+                    "holdout_disabled": holdout_disabled_reason,
                 },
             )
 
@@ -2677,6 +2807,7 @@ def fast_path_regression(
                             ],
                             "holdout_mse": holdout_mse,
                             "candidate_governor": governed_exact,
+                            "holdout_disabled": holdout_disabled_reason,
                         },
                     )
     elif exact_match_enabled:
@@ -2795,8 +2926,12 @@ def fast_path_regression(
     best_score = float("inf")  # Complexity-penalized score
     candidate_pool: dict[tuple[int, ...], dict[str, Any]] = {}
 
-    # Complexity penalty: prefer simpler solutions
-    COMPLEXITY_PENALTY = 0.001  # λ in: score = MSE + λ * n_terms
+    # Complexity penalty: prefer simpler solutions.
+    # M-245: absolute 0.001 is enormous for tiny-variance targets and
+    # negligible for large-scale ones (native uses multiplicative
+    # parsimony). Scale by target variance; unit-variance behavior is
+    # byte-identical to legacy.
+    COMPLEXITY_PENALTY = 0.001 * max(float(y_variance), 1e-12)
 
     cpp_core, _cpp_reason = _load_cpp_core()
     solver_backends = ["numpy"]
@@ -3043,6 +3178,22 @@ def fast_path_regression(
             c["mse"],
         ),
     )
+    # M-244: backend-order tie-break is structural (stable sort keeps the
+    # earlier, cpp-first pool entry on exact ties). Ranking unchanged;
+    # record near-ties so backend-parity confidence is observable.
+    backend_tie: dict[str, Any] | None = None
+    if len(sorted_candidates) >= 2:
+        _top, _next = sorted_candidates[0], sorted_candidates[1]
+        if _top.get("solver_backend") != _next.get("solver_backend"):
+            _gs = float(_top["governor_score"])
+            _ns = float(_next["governor_score"])
+            if abs(_gs - _ns) <= max(1e-12, 1e-9 * max(abs(_gs), abs(_ns))):
+                backend_tie = {
+                    "kept_backend": _top.get("solver_backend"),
+                    "runner_up_backend": _next.get("solver_backend"),
+                    "kept_governor_score": _gs,
+                    "runner_up_governor_score": _ns,
+                }
     top_candidates = sorted_candidates[:5]
     best_candidate = top_candidates[0]
 
@@ -3181,11 +3332,13 @@ def fast_path_regression(
             "holdout_mse": best_candidate.get("holdout_mse")
             if holdout_mask is not None
             else None,
+            "holdout_disabled": holdout_disabled_reason,
             "candidate_governor": best_candidate.get("governor"),
             "candidate_semantic_dedup": semantic_dedup,
             "decomposition_probe_candidates": decomposition_candidates,
             "solver_backends": solver_backends,
             "winning_solver_backend": best_candidate.get("solver_backend"),
+            "backend_tie": backend_tie,
             "multivar_template_seed": template_seed_meta,
         },
     )

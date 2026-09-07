@@ -593,6 +593,43 @@ def _validate_unit_mode(unit_mode):
     return mode
 
 
+def _normalize_auto_bool(value, *, name, default_false=True):
+    """M-179: strict auto|bool normalization for mode flags.
+
+    Accepts True/False ("auto" stays "auto"); 0/1 map explicitly;
+    None maps to False (matches current effective behavior: None is
+    neither True nor "auto" at every consumer). Common spellings map
+    explicitly. Anything else raises — a truthy "false" string must not
+    silently enable one path while disabling another.
+    """
+    if value is None:
+        return False if default_false else "auto"
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text == "auto":
+        return "auto"
+    if text in ("1", "true", "yes", "y", "on"):
+        return True
+    if text in ("0", "false", "no", "n", "off"):
+        return False
+    raise ValueError(
+        f"{name} must be True, False, or 'auto', got {value!r}"
+    )
+
+
+def _require_finite_delta(delta):
+    """M-171: NaN/inf delta is caller garbage, not a "use default" signal.
+
+    None and non-positive values keep the deliberate MAD-scale fallback
+    (§3.338, native -1.0 equivalence); only non-finite explicit values raise.
+    """
+    if delta is not None and not np.isfinite(float(delta)):
+        raise ValueError("delta must be finite or None")
+
+
 def _as_unit_vector(vec, *, name="units", n_dims=None):
     try:
         arr = np.asarray(vec, dtype=np.float64).reshape(-1)
@@ -1015,8 +1052,10 @@ def _robust_loss(
     student_t — a Huber cutoff reused directly as the Student-t scale ``s``,
     so the two objectives are not parameterized comparably. ``None`` or a
     non-positive value falls back to the MAD scale in both modes; the native
-    default (-1.0) means the same fallback. A separate ``student_t_scale``
-    parameter is deliberately deferred (constructor + 4 forward sites);
+    default (-1.0) means the same fallback. M-171: NaN is NOT a fallback
+    signal (it is never an intentional scale) and raises ValueError.
+    A separate ``student_t_scale`` parameter is deliberately deferred
+    (constructor + 4 forward sites);
     pass an explicit positive ``delta`` to pin both scales identically.
     """
     mode = _validate_loss_mode(loss_mode)
@@ -1042,6 +1081,7 @@ def _robust_loss(
 
     abs_r = np.abs(resid)
     if mode == "huber":
+        _require_finite_delta(delta)
         scale = (
             float(delta)
             if delta is not None and float(delta) > 0
@@ -1088,6 +1128,7 @@ def _robust_loss(
         return float(np.sum(w[kept_arr] * sq[kept_arr]) / acc_w)
 
     # student_t
+    _require_finite_delta(delta)
     s = float(delta) if delta is not None and float(delta) > 0 else _mad_scale(resid, w)
     s = max(s, 1e-12)
     z2 = (resid / s) ** 2
@@ -1233,6 +1274,22 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.prefer_cpp_1d_evolution = bool(prefer_cpp_1d_evolution)
         self.use_simplification = use_simplification
         self.classifier_path = classifier_path
+        # M-177: negative tolerances silently change native semantics
+        # (abs(val)<=negative never snaps; negative int_tol inverts the
+        # snap gate). Zero stays legal (exact-only); negatives/non-finite
+        # raise eagerly.
+        for _tol_name, _tol_val in (
+            ("simplification_int_tol", simplification_int_tol),
+            ("simplification_zero_tol", simplification_zero_tol),
+        ):
+            try:
+                _tol_f = float(_tol_val)
+            except (TypeError, ValueError):
+                raise ValueError(f"{_tol_name} must be numeric")
+            if not np.isfinite(_tol_f) or _tol_f < 0:
+                raise ValueError(
+                    f"{_tol_name} must be finite and non-negative"
+                )
         self.simplification_int_tol = simplification_int_tol
         self.simplification_zero_tol = simplification_zero_tol
         self.max_power = max_power
@@ -1279,10 +1336,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         # Rollback switch via environment variable
         legacy_mode = os.environ.get("GLASSBOX_USE_LEGACY_FASTPATH", "0") != "0"
 
+        # M-179: "auto" keeps legacy-dependent default; anything else goes
+        # through strict normalization (truthy "false" must not enable).
         self.use_universal_proposer = (
             not legacy_mode
             if use_universal_proposer == "auto"
-            else use_universal_proposer
+            else _normalize_auto_bool(
+                use_universal_proposer, name="use_universal_proposer"
+            )
         )
         self.universal_proposer_path = universal_proposer_path
         self.universal_proposer_shadow_mode = (
@@ -1292,7 +1353,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         )
         self.universal_proposer_log_routing = universal_proposer_log_routing
         self.universal_proposer_top_k = universal_proposer_top_k
-        self.blackbox_mode = blackbox_mode
+        # M-179: same strict normalization ("auto" preserved for the
+        # multivariate default-on rule at fit).
+        self.blackbox_mode = _normalize_auto_bool(
+            blackbox_mode, name="blackbox_mode"
+        )
         self.blackbox_max_features = blackbox_max_features
         self.blackbox_feature_selection = blackbox_feature_selection
         self.blackbox_standardize = blackbox_standardize
@@ -1324,7 +1389,27 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             else bool(enable_residual_boosting)
         )
         self.max_boosting_stages = max(0, int(max_boosting_stages))
-        self.boosting_learning_rates = list(boosting_learning_rates or [0.5, 0.8, 1.0])
+        # M-175/M-219: preserve None as "defaults" (empty list is NOT the
+        # same — it would silently become defaults via `or`). Explicit
+        # lists must be non-empty and finite; signs are allowed (negative
+        # eta is a shrinkage direction, gated by holdout improvement) but
+        # documented here rather than silently accepted.
+        if boosting_learning_rates is None:
+            self.boosting_learning_rates = [0.5, 0.8, 1.0]
+        else:
+            try:
+                rates = [float(v) for v in boosting_learning_rates]
+            except TypeError:
+                raise ValueError(
+                    "boosting_learning_rates must be None or a non-empty "
+                    "list of finite rates"
+                )
+            if not rates or not all(np.isfinite(rates)):
+                raise ValueError(
+                    "boosting_learning_rates must be None or a non-empty "
+                    "list of finite rates"
+                )
+            self.boosting_learning_rates = rates
         self.residual_mini_search_max_candidates = max(
             1, int(residual_mini_search_max_candidates)
         )
@@ -1338,6 +1423,31 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.max_frozen_subexpressions = max(0, int(max_frozen_subexpressions))
         self.device = device
         self.exact_match_backend = exact_match_backend
+        # M-176: negative min-work silently disables CUDA selection and
+        # negative combo caps silently skip all exhaustive ranks. Reject
+        # negatives/non-numeric eagerly. max_combos None/0 stays valid
+        # (uncapped / exhaustive-disabled, both observable downstream);
+        # min-work vs max-combos cross-check skipped — different units
+        # (estimated work vs combo count, mapped nonlinearly).
+        try:
+            _min_work = float(exact_match_min_gpu_work)
+        except (TypeError, ValueError):
+            raise ValueError("exact_match_min_gpu_work must be numeric")
+        if not np.isfinite(_min_work) or _min_work < 0:
+            raise ValueError(
+                "exact_match_min_gpu_work must be finite and non-negative"
+            )
+        if exact_match_max_combos is not None:
+            try:
+                _max_combos = float(exact_match_max_combos)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "exact_match_max_combos must be None or non-negative"
+                )
+            if not np.isfinite(_max_combos) or _max_combos < 0:
+                raise ValueError(
+                    "exact_match_max_combos must be None or non-negative"
+                )
         self.exact_match_min_gpu_work = exact_match_min_gpu_work
         self.exact_match_max_combos = exact_match_max_combos
         self.skip_evolution_if_bloated = skip_evolution_if_bloated
@@ -4048,6 +4158,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "enabled": bool(getattr(self, "enable_inception_reuse", True)),
             "accepted_rounds": 0,
             "attempted_rounds": 0,
+            # M-222: rejected rounds/candidates were invisible (bare breaks).
+            "rejected_rounds": [],
+            "last_reject_reason": None,
         }
         if (
             not getattr(self, "enable_inception_reuse", True)
@@ -4071,6 +4184,18 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         except Exception:
             return base_formula
 
+        def _record_inception_reject(reason, *, candidate=None, mse=None):
+            # M-222: every non-accepting exit records why (additive).
+            self.inception_diagnostics_["rejected_rounds"].append(
+                {
+                    "round": int(round_idx),
+                    "reason": str(reason),
+                    "candidate_formula": candidate,
+                    "mse": mse,
+                }
+            )
+            self.inception_diagnostics_["last_reject_reason"] = str(reason)
+
         base_feature_count = int(X_base.shape[1])
         rounds = int(getattr(self, "max_inception_rounds", 2) or 0)
         for round_idx in range(rounds):
@@ -4084,6 +4209,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             )
             self.inception_diagnostics_["attempted_rounds"] = round_idx + 1
             if not frozen:
+                _record_inception_reject("no_frozen_subexpressions")
                 break
 
             X_aug = np.column_stack([X_base] + [item["values"] for item in frozen])
@@ -4101,6 +4227,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             finally:
                 self.n_features_in_ = prior_n_features
             if not candidate or not candidate.get("formula"):
+                _record_inception_reject("no_candidate")
                 break
 
             expanded = self._substitute_frozen_features(
@@ -4118,11 +4245,23 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 pred = self._safe_eval_formula_array(expanded, X_base).reshape(-1)
                 mse = float(np.mean((pred - y_arr) ** 2))
             except Exception:
+                _record_inception_reject(
+                    "candidate_eval_failed",
+                    candidate=candidate.get("formula"),
+                )
                 break
             if not np.isfinite(mse):
+                _record_inception_reject(
+                    "nonfinite_mse", candidate=candidate.get("formula")
+                )
                 break
             improvement = current_mse - mse
             if improvement <= max(1e-9, 0.01 * max(current_mse, 1e-9)):
+                _record_inception_reject(
+                    "insufficient_improvement",
+                    candidate=candidate.get("formula"),
+                    mse=float(mse),
+                )
                 break
 
             round_info = {
@@ -4282,6 +4421,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 rejected.append(
                     {
                         "formula": formula[:160],
+                        # M-229: truncation marker (M-221 precedent).
+                        "formula_truncated": len(formula) > 160,
+                        "formula_length": len(formula),
                         "unit_penalty": merged["unit_penalty"],
                         "reason": info.get("reason"),
                     }
@@ -4295,7 +4437,12 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 )
             )
         if max_candidates is not None:
-            kept = kept[: max(1, int(max_candidates))]
+            # M-230: honor an explicit 0 (no candidates) instead of
+            # coercing to 1; negatives are caller error.
+            _mc = int(max_candidates)
+            if _mc < 0:
+                raise ValueError("max_candidates must be non-negative or None")
+            kept = kept[:_mc]
         if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
             self.blackbox_diagnostics_["unit_filter"] = {
                 "mode": mode,
@@ -8508,6 +8655,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         best = None
         reject_noise = 0
+        edge_guard_errors = 0
         for cand in refined:
             formula = str((cand or {}).get("formula", "")).strip()
             if not formula or formula == "0":
@@ -8581,10 +8729,18 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             if comb_e_w > base_e_w * (1.0 + rel_slack) + abs_slack:
                                 reject_noise += 1
                                 continue
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
+                        except Exception as exc:
+                            # M-217: weighted-edge failure stays fail-open
+                            # (primary validation already passed; edge is
+                            # auxiliary) but is counted, not swallowed.
+                            edge_guard_errors += 1
+                            self._record_swallowed_error(
+                                "residual_edge_guard_weighted", exc
+                            )
+                except Exception as exc:
+                    # M-217: same fail-open + count for edge-eval failure.
+                    edge_guard_errors += 1
+                    self._record_swallowed_error("residual_edge_guard", exc)
             score = (
                 combined_mse_w,
                 _finite_float((cand or {}).get("risk_score"), 0.0),
@@ -8606,6 +8762,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     else None,
                     "refined_count": len(refined),
                     "relative_slack": rel_slack,
+                    "edge_guard_errors": int(edge_guard_errors),
                 }
             )
             if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
@@ -8613,10 +8770,21 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return None
 
         _, formula, combined_mse_w, combined_mse_u, cand = best
+        # M-218: ranking stays (mse, risk, complexity) by design, but the
+        # winning validation-improvement magnitude is recorded so a tiny
+        # gain defeating a simpler candidate is observable post-fit.
+        _improvement = float(base_mse_w - combined_mse_w)
         self._residual_stage_guard_.update(
             {
                 "accepted": True,
                 "formula": formula[:240],
+                # M-221: truncated display is indistinguishable from a full
+                # formula without a marker; record both.
+                "formula_truncated": len(formula) > 240,
+                "formula_length": len(formula),
+                "improvement": _improvement,
+                "relative_improvement": _improvement / max(float(base_mse_w), 1e-12),
+                "edge_guard_errors": int(edge_guard_errors),
                 "base_mse": float(base_mse_w),
                 "base_mse_unweighted": float(base_mse_u)
                 if np.isfinite(base_mse_u)
@@ -8821,8 +8989,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return float(1.0 - np.mean((y_true - y_pred) ** 2) / var)
 
         max_boosting_stages = getattr(self, "max_boosting_stages", 3)
-        learning_rates = list(
-            getattr(self, "boosting_learning_rates", [0.5, 0.8, 1.0]) or [0.5, 0.8, 1.0]
+        # M-175: default only when unset (None/missing); an explicit []
+        # stays [] and yields no rate candidates below (never boosted).
+        _rates_attr = getattr(self, "boosting_learning_rates", None)
+        learning_rates = (
+            [0.5, 0.8, 1.0] if _rates_attr is None else list(_rates_attr)
         )
         if int(max_boosting_stages) <= 0:
             return base_formula
@@ -8889,7 +9060,19 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 break
 
             orig_timeout = self.timeout
-            stage_timeout = max(5, orig_timeout // (2 ** (stage + 1)))
+            # M-220: the 5s floor exists so nested stages can run, but it
+            # must not exceed the user's total budget (timeout=1 meant
+            # stages each taking 5s). Cap the floor at the user budget.
+            try:
+                _orig_budget = float(orig_timeout)
+            except (TypeError, ValueError):
+                _orig_budget = float("inf")
+            stage_timeout = min(
+                int(_orig_budget)
+                if np.isfinite(_orig_budget)
+                else 2**31,
+                max(5, orig_timeout // (2 ** (stage + 1))),
+            )
             self.timeout = stage_timeout
             self.boosting_attempted_ = True
 
