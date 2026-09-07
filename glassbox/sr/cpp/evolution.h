@@ -337,8 +337,11 @@ public:
         // Normalize op_priors if provided
         if (!config_.op_priors.empty()) {
             // Backward compatibility:
-            //   4 slots [Periodic, Power, Exp, Log] -> 5 (+IntPow split)
+            //   4 slots [Periodic, Power, Exp, Log] -> 5 (+IntPow split 75/25)
             //   5 slots [Periodic, Power, IntPow, Exp, Log] -> 6 (+Abs=0 by default)
+            // §3.278/§3.279: Legacy expansions retain user mass for Power/IntPow
+            // split (75% continuous Power, 25% IntPow) and explicitly append
+            // Abs=0.0 prior so seeds/simplify can introduce Abs without sampler bias.
             if (config_.op_priors.size() == 4) {
                 std::vector<double> expanded(5, 0.0);
                 expanded[0] = config_.op_priors[0];               // Periodic
@@ -554,6 +557,8 @@ public:
 
         for (int i = 0; i < config_.num_islands; ++i) {
             EvolutionConfig current_island_cfg = island_cfg;
+            // §3.306: per-island overrides for op/binary priors and allowed masks.
+            // Empty multi_* vector inherits parent configuration.
             if (i < config_.multi_op_priors.size() && !config_.multi_op_priors[i].empty()) {
                 current_island_cfg.op_priors = config_.multi_op_priors[i];
             }
@@ -1051,9 +1056,12 @@ private:
         return std::isfinite(mse) ? mse : std::numeric_limits<double>::infinity();
     }
 
-    // M-283: returns how many entries were sanitized (NaN/negative → 0).
+    // M-283 / §3.280 / §3.281: returns how many entries were sanitized (NaN/negative → 0).
     // Callers accumulate into prior_entries_sanitized_ so the Python result
     // can report it instead of zeroing silently.
+    // §3.280: If all entries are invalid/zero, priors are reset to a balanced uniform
+    // distribution instead of leaving an all-zero vector (which previously forced the
+    // CDF to pick the last operator deterministically).
     static int normalize_prior_vector(std::vector<double>& priors) {
         int sanitized = 0;
         double sum = 0.0;
@@ -1068,18 +1076,30 @@ private:
             for (double& p : priors) {
                 p /= sum;
             }
+        } else if (!priors.empty()) {
+            // §3.280: all-zero/invalid priors fallback to uniform
+            double uniform_val = 1.0 / static_cast<double>(priors.size());
+            for (double& p : priors) {
+                p = uniform_val;
+            }
         }
         return sanitized;
     }
 
+    // §3.281: build_cdf with sum normalization before pinning endpoint
     static std::vector<double> build_cdf(const std::vector<double>& priors) {
         std::vector<double> cdf(priors.size(), 0.0);
         if (priors.empty()) {
             return cdf;
         }
-        cdf[0] = priors[0];
-        for (size_t i = 1; i < priors.size(); ++i) {
-            cdf[i] = cdf[i - 1] + priors[i];
+        double sum = 0.0;
+        for (double p : priors) sum += (p > 0.0 && std::isfinite(p)) ? p : 0.0;
+        if (!(sum > 0.0)) sum = 1.0;
+        double accum = 0.0;
+        for (size_t i = 0; i < priors.size(); ++i) {
+            double p = (priors[i] > 0.0 && std::isfinite(priors[i])) ? priors[i] : 0.0;
+            accum += p / sum;
+            cdf[i] = accum;
         }
         cdf.back() = 1.0;
         return cdf;
@@ -1236,12 +1256,16 @@ private:
     }
     
     // Sample a UnaryOp using classifier priors (if available) or uniform
+    // §3.282: bounds-checked index casting ensures loop index never exceeds UnaryOp::Abs.
+    // §3.285: document uniform fallback distribution (Periodic, Power, IntPow, Exp, Log).
+    // §3.286: hardcoded fallback guards against returning disallowed ops.
     UnaryOp sample_unary_op() {
         std::uniform_real_distribution<double> u(0.0, 1.0);
         if (!op_cdf_.empty()) {
             for (int attempt = 0; attempt < 16; ++attempt) {
                 double r = u(rng_);
                 for (size_t i = 0; i < op_cdf_.size(); ++i) {
+                    if (i > static_cast<size_t>(UnaryOp::Abs)) break;
                     UnaryOp op = static_cast<UnaryOp>(i);
                     if (r <= op_cdf_[i] && unary_op_allowed(op)) return op;
                 }
@@ -1269,6 +1293,12 @@ private:
         for (UnaryOp op : defaults) {
             if (unary_op_allowed(op)) return op;
         }
+        // §3.286: if Log is disallowed, return any allowed unary op before bare Log fallback
+        for (int op = 0; op <= static_cast<int>(UnaryOp::Abs); ++op) {
+            if (unary_op_allowed(static_cast<UnaryOp>(op))) {
+                return static_cast<UnaryOp>(op);
+            }
+        }
         return UnaryOp::Log;
     }
 
@@ -1278,6 +1308,7 @@ private:
             for (int attempt = 0; attempt < 16; ++attempt) {
                 double r = u(rng_);
                 for (size_t i = 0; i < binary_op_cdf_.size(); ++i) {
+                    if (i > static_cast<size_t>(BinaryOp::Aggregation)) break;
                     BinaryOp op = static_cast<BinaryOp>(i);
                     if (r <= binary_op_cdf_[i] && binary_op_allowed(op)) return op;
                 }
@@ -1301,6 +1332,12 @@ private:
         }
         for (BinaryOp op : defaults) {
             if (binary_op_allowed(op)) return op;
+        }
+        // §3.286: if Aggregation is disallowed, return any allowed binary op before fallback
+        for (int op = 0; op <= static_cast<int>(BinaryOp::Aggregation); ++op) {
+            if (binary_op_allowed(static_cast<BinaryOp>(op))) {
+                return static_cast<BinaryOp>(op);
+            }
         }
         return BinaryOp::Aggregation;
     }
@@ -1333,6 +1370,8 @@ private:
         return true;
     }
 
+    // §3.287 / M-285: sample_unary_op_for_child verifies unary_wrap_allowed
+    // on fallback attempts before returning to prevent nested illegal combinations.
     UnaryOp sample_unary_op_for_child(const IndividualGraph& graph, int child_idx) {
         for (int attempt = 0; attempt < 24; ++attempt) {
             UnaryOp op = sample_unary_op();
@@ -1348,9 +1387,20 @@ private:
                 return op;
             }
         }
+        // §3.287: final scan of all unary ops with wrap checks
+        for (int op = 0; op <= static_cast<int>(UnaryOp::Abs); ++op) {
+            UnaryOp cand = static_cast<UnaryOp>(op);
+            if (unary_op_allowed(cand) && unary_wrap_allowed(graph, child_idx, cand)) {
+                return cand;
+            }
+        }
         return sample_unary_op();
     }
 
+    // §3.303 / §3.304: seed_arithmetic_gate initializes beta, gamma for
+    // arithmetic gates (0=add, 1=mul, 2=soft_div_gate, 3=sub).
+    // Note: soft_div_gate (beta=2, gamma=-1) blends soft division with arithmetic
+    // branches in eval.h; distinct from protected BinaryOp::Division.
     void seed_arithmetic_gate(OpNode& node) {
         std::uniform_int_distribution<int> mode_dist(0, 3);
         switch (mode_dist(rng_)) {
@@ -1419,6 +1469,15 @@ private:
     
     IndividualGraph create_random_individual(int n_inputs) {
         IndividualGraph ind;
+        // §3.293: guard n_inputs <= 0 to avoid invalid distributions in child_dist(0, -1)
+        if (n_inputs <= 0) {
+            ind.nodes.resize(1);
+            ind.nodes[0].type = NodeType::Constant;
+            ind.nodes[0].value = 1.0;
+            ind.output_weights = {1.0};
+            ind.output_bias = 0.0;
+            return ind;
+        }
         std::uniform_int_distribution<int> num_nodes_dist(3, 8); // compact graphs
         int num_nodes = num_nodes_dist(rng_);
         ind.nodes.resize(num_nodes);
@@ -1599,6 +1658,12 @@ private:
         }
         for (int i = 0; i < max_seed; ++i) {
             population_[i] = seed_graphs_[static_cast<size_t>(seed_order[static_cast<size_t>(i)])];
+            // §3.295: reset transient/stale age and ranking state on inserted seeds
+            // so initial non-dominated sort / AFPO treats fresh seeds cleanly.
+            population_[i].age = 0;
+            population_[i].pareto_rank = 0;
+            population_[i].crowding_distance = 0.0;
+            population_[i].fitness_valid = false;
             seeded++;
         }
         
@@ -2005,9 +2070,10 @@ private:
             OpNode mul_node;
             mul_node.type = NodeType::Binary;
             mul_node.binary_op = BinaryOp::Arithmetic;
-            seed_arithmetic_gate(mul_node);
+            // §3.302: construct multiply node directly without dead gate RNG draw
             mul_node.beta = 2.0;  // 2.0 = multiply mode
             mul_node.gamma = 1.0;
+            mul_node.tau = 1.0;
             mul_node.left_child = left;
             mul_node.right_child = right;
             
@@ -2050,24 +2116,12 @@ private:
             
             OpNode div_node;
             div_node.type = NodeType::Binary;
-            div_node.binary_op = sample_binary_op();
-            if (div_node.binary_op == BinaryOp::Arithmetic) {
-                // §3.415: was seed_arithmetic_gate() then an overwrite to
-                // beta=2/gamma=1 — the seed's RNG draw had no effect on the
-                // result (only tau=1.0 survived). Set the gate explicitly
-                // with no dead draw. NOTE: this shifts the downstream RNG
-                // stream vs older builds; same-seed replay holds going
-                // forward (no cross-version stream promise). The multiply
-                // branch keeps its historical seed+overwrite shape.
-                div_node.beta = 2.0;
-                div_node.gamma = 1.0;
-                div_node.tau = 1.0;
-            } else if (div_node.binary_op == BinaryOp::Division) {
-                div_node.beta = 2.0;
-                div_node.gamma = -1.0;
-            } else {
-                div_node.tau = 1.0;
-            }
+            // §3.301: divide macro mode restricts to Arithmetic (with div-like gate)
+            // or BinaryOp::Division rather than sampling unrelated Aggregation.
+            div_node.binary_op = BinaryOp::Division;
+            div_node.beta = 2.0;
+            div_node.gamma = -1.0;
+            div_node.tau = 1.0;
             div_node.left_child = left;
             div_node.right_child = right;
             

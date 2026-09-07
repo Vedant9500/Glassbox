@@ -488,15 +488,9 @@ static py::dict run_evolution_cpp(
     py::list macro_mode_weights = py::list()
 ) {
     // 1. Convert Python/Numpy inputs to C++/Eigen
-    std::vector<Eigen::ArrayXd> X;
-    for (auto item : X_list) {
-        auto arr = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(item);
-        if (!arr) {
-            throw std::runtime_error("X_list entries must be convertible to contiguous float64 arrays");
-        }
-        auto buf = arr.request();
-        double* ptr = static_cast<double*>(buf.ptr);
-        X.emplace_back(Eigen::Map<Eigen::ArrayXd>(ptr, buf.size));
+    // §3.319: require at least one feature
+    if (py::len(X_list) == 0) {
+        throw py::value_error("X_list must contain at least one feature");
     }
     
     auto y_contig = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(y_array);
@@ -504,8 +498,46 @@ static py::dict run_evolution_cpp(
         throw std::runtime_error("y must be convertible to a contiguous float64 array");
     }
     auto y_buf = y_contig.request();
+    // §3.319: require at least one sample
+    if (y_buf.size == 0) {
+        throw py::value_error("y must contain at least one sample");
+    }
+    if (y_buf.ndim > 1) {
+        throw py::value_error("y must be a 1D array");
+    }
     double* y_ptr = static_cast<double*>(y_buf.ptr);
+    // §3.318: validate y finiteness
+    for (ssize_t i = 0; i < y_buf.size; ++i) {
+        if (!std::isfinite(y_ptr[i])) {
+            throw py::value_error("y array contains non-finite values (NaN or Inf)");
+        }
+    }
     Eigen::Map<Eigen::ArrayXd> y(y_ptr, y_buf.size);
+
+    std::vector<Eigen::ArrayXd> X;
+    for (auto item : X_list) {
+        auto arr = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(item);
+        if (!arr) {
+            throw std::runtime_error("X_list entries must be convertible to contiguous float64 arrays");
+        }
+        auto buf = arr.request();
+        // §3.316: require each X entry to be 1D
+        if (buf.ndim != 1) {
+            throw py::value_error("X_list entries must be 1D arrays");
+        }
+        // §3.317: validate X feature length matches y
+        if (buf.size != y_buf.size) {
+            throw py::value_error("X feature length must match y length");
+        }
+        double* ptr = static_cast<double*>(buf.ptr);
+        // §3.318: validate X finiteness
+        for (ssize_t i = 0; i < buf.size; ++i) {
+            if (!std::isfinite(ptr[i])) {
+                throw py::value_error("X_list feature contains non-finite values (NaN or Inf)");
+            }
+        }
+        X.emplace_back(Eigen::Map<Eigen::ArrayXd>(ptr, buf.size));
+    }
 
     // Optional per-point weights (Phase 3). Empty => uniform / legacy path.
     Eigen::ArrayXd y_weights = load_optional_weights(
@@ -622,11 +654,28 @@ static py::dict run_evolution_cpp(
             for (auto n_item : nodes_list) {
                 auto ndict = n_item.cast<py::dict>();
                 sr::OpNode node;
-                node.type = static_cast<sr::NodeType>(ndict["type"].cast<int>());
+                // §3.320: validate enum ranges before static_cast
+                int raw_type = ndict["type"].cast<int>();
+                if (raw_type < 0 || raw_type > static_cast<int>(sr::NodeType::Binary)) {
+                    throw std::runtime_error("invalid node type enum in seed graph");
+                }
+                node.type = static_cast<sr::NodeType>(raw_type);
                 if (ndict.contains("feature_idx")) node.feature_idx = ndict["feature_idx"].cast<int>();
                 if (ndict.contains("value")) { node.value = ndict["value"].cast<double>(); require_finite(node.value, "value"); }
-                if (ndict.contains("unary_op")) node.unary_op = static_cast<sr::UnaryOp>(ndict["unary_op"].cast<int>());
-                if (ndict.contains("binary_op")) node.binary_op = static_cast<sr::BinaryOp>(ndict["binary_op"].cast<int>());
+                if (ndict.contains("unary_op")) {
+                    int raw_uop = ndict["unary_op"].cast<int>();
+                    if (raw_uop < 0 || raw_uop > static_cast<int>(sr::UnaryOp::Abs)) {
+                        throw std::runtime_error("invalid unary_op enum in seed graph");
+                    }
+                    node.unary_op = static_cast<sr::UnaryOp>(raw_uop);
+                }
+                if (ndict.contains("binary_op")) {
+                    int raw_bop = ndict["binary_op"].cast<int>();
+                    if (raw_bop < 0 || raw_bop > static_cast<int>(sr::BinaryOp::Aggregation)) {
+                        throw std::runtime_error("invalid binary_op enum in seed graph");
+                    }
+                    node.binary_op = static_cast<sr::BinaryOp>(raw_bop);
+                }
                 if (ndict.contains("p")) { node.p = ndict["p"].cast<double>(); require_finite(node.p, "p"); }
                 if (ndict.contains("omega")) { node.omega = ndict["omega"].cast<double>(); require_finite(node.omega, "omega"); }
                 if (ndict.contains("phi")) { node.phi = ndict["phi"].cast<double>(); require_finite(node.phi, "phi"); }
@@ -1323,6 +1372,7 @@ static py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::
     
     Eigen::MatrixXd X = Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(
         static_cast<double*>(X_buf.ptr), n, p);
+    // §3.309: copy y to owned VectorXd before applying sample weights so caller's y is never mutated in place
     Eigen::VectorXd y = Eigen::Map<Eigen::VectorXd>(static_cast<double*>(y_buf.ptr), y_buf.size);
     Eigen::VectorXd sw;
     bool have_sw = false;
@@ -1526,6 +1576,8 @@ static py::array_t<double> eval_formula_exact_wrapper(const std::string& formula
         auto arr = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(item);
         if (!arr) throw std::runtime_error("X_list entries must be float64 arrays");
         auto buf = arr.request();
+        // §3.313 / §3.314: require X entries to be 1D vectors
+        if (buf.ndim != 1) throw std::invalid_argument("X_list entries must be 1D arrays");
         if (n < 0) n = static_cast<int>(buf.size);
         if (static_cast<int>(buf.size) != n) throw std::runtime_error("X feature lengths mismatch");
         X.emplace_back(Eigen::Map<Eigen::ArrayXd>(static_cast<double*>(buf.ptr), buf.size));
