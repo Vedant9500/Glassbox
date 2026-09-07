@@ -876,6 +876,10 @@ private:
             const int wi = (*weight_idx)[order[k]];
             double w = (wi >= 0 && wi < static_cast<int>(weights->size()))
                            ? (*weights)(wi) : 0.0;
+            // M-168: invalid weights map to zero (sample excluded). FFI (#25)
+            // already rejects non-finite/negative/zero-total vectors, so this
+            // is unreachable-today defense for direct engine use, not a silent
+            // policy on user data.
             if (!std::isfinite(w) || w < 0.0) w = 0.0;
             total += w;
         }
@@ -983,6 +987,10 @@ private:
         }
 
         if (config_.loss_mode == LossMode::Huber) {
+            // M-172: Huber is scale-relative by construction (delta defaults
+            // to the MAD scale, so the 0.5r^2/d(|r|-d/2) shape is unit-free);
+            // the complexity/parsimony multiplier is a separate fixed term by
+            // design, not normalized per loss mode. No alignment change.
             double d = config_.huber_delta;
             if (!(d > 0.0) || !std::isfinite(d)) d = mad_scale(resid);
             d = std::max(d, 1e-12);
@@ -1849,7 +1857,11 @@ private:
             }
         }
 
-        // P7: Dimensional analysis penalty (only active when input_units provided)
+        // P7: Dimensional analysis penalty (only active when input_units provided).
+        // M-147: the penalty is absolute (squared exponent mismatches added to
+        // MSE), so its bite is target-scale dependent — dominant on tiny-MSE
+        // targets, negligible on huge ones. Scale explicitly via
+        // dim_penalty_weight; a scale-normalized objective is deferred.
         if (!config_.input_units.empty()) {
             graph.fitness += config_.dim_penalty_weight * dimensional_penalty(graph);
         }
@@ -4621,7 +4633,13 @@ private:
                         child_u = node_units[node.left_child];
 
                     if (node.unary_op == UnaryOp::Power || node.unary_op == UnaryOp::IntPow) {
-                        // x^p: multiply units by p
+                        // x^p: multiply units by p.
+                        // M-146: a variable exponent never reaches this branch —
+                        // the seed builder desugars x^y into sign/exp/log/div
+                        // nodes, each handled generically below (a dimensioned
+                        // base is penalized via the log-child rule; exp forces
+                        // a dimensionless argument). Incidental, not explicit:
+                        // a dedicated var-power unit rule is deferred.
                         double exp_val = node.p;
                         if (node.unary_op == UnaryOp::IntPow) {
                             exp_val = static_cast<double>(std::clamp(static_cast<int>(std::round(node.p)), 2, 6));

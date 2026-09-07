@@ -76,8 +76,15 @@ def load_cpp_core() -> tuple[ModuleType | None, str | None]:
 
     # 3) Load the shared library from this directory via importlib (no permanent
     #    sys.path mutation required for callers).
+    # §3.386: filter candidates by exact EXT_SUFFIX and valid extension suffixes
+    import sysconfig
+    ext_suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
     candidates = sorted(_CPP_DIR.glob("_core.*"))
-    # Prefer extension modules over unrelated files.
+    # Prefer exact match for active ABI first
+    exact_match = _CPP_DIR / f"_core{ext_suffix}"
+    if exact_match.is_file() and exact_match not in candidates:
+        candidates.insert(0, exact_match)
+    
     ext_suffixes = (".so", ".pyd", ".dll")
     for path in candidates:
         if not path.name.startswith("_core"):
@@ -101,6 +108,9 @@ def load_cpp_core() -> tuple[ModuleType | None, str | None]:
             _loaded = True
             return _core_module, None
         except Exception as exc:  # pragma: no cover - ABI mismatch path
+            # §3.388: clean partially registered names on failure
+            sys.modules.pop("_core", None)
+            sys.modules.pop("glassbox.sr.cpp._core", None)
             errors.append(f"{path.name}: {exc}")
 
     # 4) Bare import after temporary path insert (legacy fallback).

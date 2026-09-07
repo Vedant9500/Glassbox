@@ -559,7 +559,8 @@ class StructureConfidenceTracker:
         Returns:
             Updated confidence score (0.0 to 1.0)
         """
-        # Track history
+        # Track history (M-134: bounded — this list is diagnostic-only, no
+        # reader needs the full run; cap keeps long runs constant-memory).
         self.history.append(
             {
                 "gen": generation,
@@ -568,6 +569,8 @@ class StructureConfidenceTracker:
                 "val_corr": validation_corr,
             }
         )
+        if len(self.history) > 2000:
+            del self.history[: len(self.history) - 2000]
 
         # Track improvement
         if mse < self.best_mse_seen * 0.99:  # 1% improvement
@@ -580,8 +583,16 @@ class StructureConfidenceTracker:
         stability_confidence = self._stability_confidence(generation)
 
         # Validation bonus (if available)
+        # M-131: a single validation_corr > 0.98 used to award +0.1 with no
+        # stability evidence, pushing capped confidence on noise. Require at
+        # least one stable generation first (uses the prior-gen counter, same
+        # one-generation lag documented for the stability update below).
         val_bonus = 0.0
-        if validation_corr is not None and validation_corr > 0.98:
+        if (
+            validation_corr is not None
+            and validation_corr > 0.98
+            and self.generations_stable > 0
+        ):
             val_bonus = 0.1  # Extra confidence if validation is good
 
         # Combined confidence (weighted average)
@@ -1116,7 +1127,9 @@ def refine_constants(
                 pred, _ = model(x, hard=hard)
                 pred = pred.squeeze()
                 loss = F.mse_loss(pred, y_squeezed)
-                if torch.isnan(loss):
+                # M-59: NaN-only guards let +inf flow into backward/step and
+                # poison params silently — all loss guards are finite checks.
+                if not torch.isfinite(loss):
                     return torch.tensor(float("inf"))
                 loss.backward()
                 best_loss = min(best_loss, loss.item())
@@ -1145,7 +1158,7 @@ def refine_constants(
                     pred = pred.squeeze()
                     loss = F.mse_loss(pred, y_squeezed)
 
-                if torch.isnan(loss):
+                if not torch.isfinite(loss):
                     if was_training:
                         model.train()
                     return float("inf")
@@ -1588,7 +1601,7 @@ def intensive_coefficient_refinement(
                 pred, _ = model(x, hard=True)
                 loss = F.mse_loss(pred.squeeze(), y_sq)
 
-            if torch.isnan(loss):
+            if not torch.isfinite(loss):
                 break
 
             # AMP backward pass
@@ -1664,7 +1677,7 @@ def intensive_coefficient_refinement(
                     pred, _ = model(x, hard=True)
                     loss = F.mse_loss(pred.squeeze(), y_sq)
 
-                if torch.isnan(loss):
+                if not torch.isfinite(loss):
                     break
 
                 # AMP backward pass
@@ -1805,7 +1818,7 @@ def finalize_model_coefficients(
                 # Add L1 sparsity penalty
                 l1_loss = sum(p.abs().sum() for p in output_params)
                 loss = mse_loss + l1_weight * l1_loss
-                if not torch.isnan(loss):
+                if not torch.isfinite(loss):
                     loss.backward()
                 else:
                     return torch.tensor(float("inf"), requires_grad=True)
@@ -1846,7 +1859,7 @@ def finalize_model_coefficients(
                 optimizer2.zero_grad()
                 pred, _ = model(x, hard=True)
                 loss = F.mse_loss(pred.squeeze(), y_sq)
-                if not torch.isnan(loss):
+                if not torch.isfinite(loss):
                     loss.backward()
                 return loss
 
@@ -2002,7 +2015,7 @@ def ablate_and_select_terms(
                     optimizer.zero_grad()
                     pred, _ = model(x, hard=True)
                     loss = F.mse_loss(pred.squeeze(), y_sq)
-                    if not torch.isnan(loss):
+                    if not torch.isfinite(loss):
                         loss.backward()
                     return loss
 
@@ -2177,6 +2190,9 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
         explorer_mutation_rate: float = 0.8,  # High mutation for exploration
         # NEW: Risk-seeking selection (Tier 2)
         risk_seeking: bool = False,  # Optimize top-k percentile instead of mean
+        # M-127: fraction-scale in (0, 1] (0.1 = top 10% breeders). Percent
+        # values (e.g. 10) silently selected the whole population here while
+        # RSPG received out-of-range q — fail loud instead.
         risk_seeking_percentile: float = 0.1,  # Top 10% fitness
         # NEW: Visualization
         visualizer: Any | None = None,  # LiveTrainingVisualizer instance
@@ -2238,6 +2254,14 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
 
         # NEW: Risk-seeking selection (research Tier 2)
         self.risk_seeking = risk_seeking
+        # M-127: fraction-scale contract (0, 1]; percent-scale input used to
+        # silently broaden the pool to everything (len * 10) while RSPG got
+        # q > 100. In-tree callers all use the 0.1 default.
+        if not 0.0 < float(risk_seeking_percentile) <= 1.0:
+            raise ValueError(
+                "risk_seeking_percentile must be a fraction in (0, 1] "
+                f"(got {risk_seeking_percentile!r}); 0.1 selects the top 10%"
+            )
         self.risk_seeking_percentile = risk_seeking_percentile
 
         # Initialize RSPG if available and enabled
@@ -2704,6 +2728,10 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                     child = Individual(model, generation=self.generation)
                 else:
                     # Heavily mutated elite (Exploration)
+                    # M-128: deliberately the single best only — exploitation
+                    # concentrates on the champion (Lamarckian: refined weights
+                    # inherited); exploration comes from the fresh-random half
+                    # above, not from spreading mutations across ranks.
                     parent = sorted_pop[0]  # Best one
                     child = mutate_operations(parent, mutation_rate=0.8)
                     # Lamarckian: child inherits parent's refined weights
@@ -3585,7 +3613,7 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                             optimizer.zero_grad()
                             pred, _ = self.best_ever.model(x, hard=True)
                             loss = F.mse_loss(pred.squeeze(), y_sq)
-                            if torch.isnan(loss):
+                            if not torch.isfinite(loss):
                                 break
                             if loss.item() < best_mse:
                                 best_mse = loss.item()
@@ -3937,7 +3965,7 @@ def train_onn_hybrid(
                 pred, _ = es_best(x, hard=False)
                 loss = F.mse_loss(pred.squeeze(), y.squeeze())
 
-                if torch.isnan(loss):
+                if not torch.isfinite(loss):
                     break
 
                 loss.backward()
@@ -3978,6 +4006,10 @@ def train_onn_hybrid(
         corr = torch.corrcoef(torch.stack([pred.squeeze().cpu(), y.squeeze().cpu()]))[
             0, 1
         ].item()
+        # M-60: constant predictions make corrcoef NaN — report 0.0 (no linear
+        # signal), mirroring the guarded mid-training sites, not NaN.
+        if not math.isfinite(corr):
+            corr = 0.0
 
     formula = "N/A"
     if hasattr(best_model, "get_formula"):

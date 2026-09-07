@@ -611,6 +611,10 @@ inline std::string format_pi_like(double value, bool allow_pi_snap = true) {
 inline std::string format_constant_display(double value, bool allow_pi_snap = true) {
     constexpr double kPiTol = 5e-3;
     // §3.370: same clean-vs-lossless contract as format_pi_like.
+    // §3.115: non-integer fallthrough below is deliberately 4 significant
+    // digits (clean-display contract, matches benchmark display scoring).
+    // Near-exact solutions needing full precision use allow_pi_snap=false
+    // (%.17g lossless) — compact human text stays the default.
     if (!allow_pi_snap) {
         char lossbuf[64];
         snprintf(lossbuf, sizeof(lossbuf), "%.17g", value);
@@ -929,7 +933,9 @@ inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs
     n_inputs = effective_n_inputs(graph, n_inputs);
     char buf[256];
     if (graph.nodes.empty()) {
-        if (std::abs(graph.output_bias) <= 1e-4) return "0";
+        // §3.114: bias display uses the eval activity threshold — a bias in
+        // (1e-6, 1e-4] affects predictions and must survive display scoring.
+        if (std::abs(graph.output_bias) <= kOutputWeightActive) return "0";
         double abs_bias = std::abs(graph.output_bias);
         if (std::abs(abs_bias - std::round(abs_bias)) < 1e-6) {
             snprintf(buf, sizeof(buf), "%s%d", graph.output_bias < 0 ? "-" : "", static_cast<int>(std::round(abs_bias)));
@@ -972,7 +978,9 @@ inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs
         }
     }
     
-    if (std::abs(graph.output_bias) > 1e-4) {
+    // §3.114: same activity-threshold contract as the term loop above —
+    // the full bias always evaluates, so display keeps everything eval keeps.
+    if (std::abs(graph.output_bias) > kOutputWeightActive) {
         if (!first) {
             final_formula += (graph.output_bias > 0) ? " + " : " - ";
         } else if (graph.output_bias < 0) {

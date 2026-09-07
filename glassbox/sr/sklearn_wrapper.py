@@ -693,9 +693,12 @@ def _infer_formula_units(formula, input_units, output_units=None):
     penalty = [0.0]
 
     # Tokenize: numbers, names, operators, punctuation.
+    # M-225: accept leading-decimal (.5e-3) and trailing-dot (5.) forms —
+    # float() parses both; the old [0-9]+ head silently parse-errored them
+    # and dropped dimensional gating for those formulas.
     token_re = re.compile(
         r"\s*("
-        r"[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
+        r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
         r"|x\d+"
         r"|[A-Za-z_][A-Za-z0-9_]*"
         r"|[\+\-\*/\^]|\*\*"
@@ -960,6 +963,9 @@ def _mad_scale(resid, sample_weight=None):
             )
         # Align weights with finite residuals (same mask).
         w = w[finite]
+        # M-169: non-finite/zero-total weights fall back to the unweighted MAD
+        # deliberately (a scale estimator must stay total — _robust_loss raises
+        # on the same inputs because it defines the search objective).
         if not np.all(np.isfinite(w)) or float(np.sum(np.maximum(w, 0.0))) <= 0.0:
             w = None
     r = r[finite]

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -349,6 +350,9 @@ inline void compact_graph(IndividualGraph& graph) {
 // outputs and can share cached Eigen::ArrayXd results.
 
 inline uint64_t hash_combine(uint64_t seed, uint64_t v) {
+    // M-162: plain splitmix-style mix, no avalanche finalization — these
+    // hashes are cache/diversity keys only, never identity or security
+    // decisions (dedup decides by output correlation; see §3.375 note).
     seed ^= v + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
     return seed;
 }
@@ -374,9 +378,11 @@ inline uint64_t quantize(double v, int decimals = 8) {
     // Clamp huge values so round stays in int64 range.
     double scaled = v * scale;
     if (!std::isfinite(scaled)) {
-        uint64_t u = 0;
-        std::memcpy(&u, &v, sizeof(u));
-        return u;
+        // §3.126: non-finite params share one sentinel bucket. Raw double
+        // bits would give +NaN/-NaN/+Inf/-Inf distinct hashes, letting the
+        // most degenerate nodes bypass canonicalization. Valid params are
+        // finite (seed/FFI validation), so only malformed graphs hash here.
+        return 0x7FF8000000000000ULL; // canonical quiet-NaN bits
     }
     const double kMaxI64 = static_cast<double>(std::numeric_limits<int64_t>::max());
     const double kMinI64 = static_cast<double>(std::numeric_limits<int64_t>::min());
@@ -424,6 +430,20 @@ inline uint64_t compute_node_hash(const IndividualGraph& graph, int idx,
             h = hash_combine(h, quantize(node.beta));
             h = hash_combine(h, quantize(node.gamma));
             h = hash_combine(h, quantize(node.tau));
+            // §3.119/§3.127: Aggregation eval is symmetric in its children
+            // (softmax blend commutes), so hash children order-free to share
+            // cache/CSE hits. Arithmetic (sub/div components) and Division
+            // stay order-sensitive. Node-index order still affects hashes of
+            // otherwise identical graphs — accepted residual, not fixed here.
+            if (node.binary_op == BinaryOp::Aggregation) {
+                uint64_t lh = (node.left_child >= 0 && node.left_child < idx)
+                    ? node_hashes[node.left_child] : 0x1EF7BABEU;
+                uint64_t rh = (node.right_child >= 0 && node.right_child < idx)
+                    ? node_hashes[node.right_child] : 0x6BADF00DU;
+                h = hash_combine(h, std::min(lh, rh));
+                h = hash_combine(h, std::max(lh, rh));
+                break;
+            }
             if (node.left_child >= 0 && node.left_child < idx) {
                 h = hash_combine(h, node_hashes[node.left_child]);
             } else {
@@ -467,7 +487,13 @@ public:
           evictions_(other.evictions_) {
         for (const auto& entry : other.order_) {
             order_.push_back(entry);
-            index_.emplace(order_.back().first, std::prev(order_.end()));
+            // §3.128: insertion paths guarantee unique keys, so a duplicate
+            // here means a corrupted source — fail loud, never silently drop
+            // the map association while keeping unreachable list nodes.
+            const bool ok =
+                index_.emplace(order_.back().first, std::prev(order_.end())).second;
+            assert(ok && "SubtreeCache copy: duplicate key in source");
+            (void)ok;
         }
     }
 
@@ -480,7 +506,11 @@ public:
         evictions_ = other.evictions_;
         for (const auto& entry : other.order_) {
             order_.push_back(entry);
-            index_.emplace(order_.back().first, std::prev(order_.end()));
+            // §3.128: same duplicate-key invariant as the copy constructor.
+            const bool ok =
+                index_.emplace(order_.back().first, std::prev(order_.end())).second;
+            assert(ok && "SubtreeCache copy-assign: duplicate key in source");
+            (void)ok;
         }
         return *this;
     }
@@ -492,7 +522,11 @@ public:
           max_bytes_(other.max_bytes_),
           bytes_used_(other.bytes_used_),
           evictions_(other.evictions_) {
+        // §3.129: moved-from cache restarts empty — zero both payload bytes
+        // and the cumulative eviction count so a reused source cannot
+        // double-count diagnostics the destination already owns.
         other.bytes_used_ = 0;
+        other.evictions_ = 0;
     }
 
     SubtreeCache& operator=(SubtreeCache&& other) noexcept {
@@ -503,7 +537,9 @@ public:
         max_bytes_ = other.max_bytes_;
         bytes_used_ = other.bytes_used_;
         evictions_ = other.evictions_;
+        // §3.129: same moved-from reset as the move constructor.
         other.bytes_used_ = 0;
+        other.evictions_ = 0;
         return *this;
     }
 
@@ -601,6 +637,10 @@ public:
     }
 
     // Convenience for sites that previously used operator[] = value.
+    // §3.130: legacy accessor — assignment through the returned reference
+    // bypasses byte accounting (bytes_used_ is not re-measured), and the
+    // empty-sentinel re-insert below is unreachable-today defense for
+    // degenerate budgets. Prefer insert_or_assign; in-tree callers do.
     mapped_type& operator[](key_type key) {
         auto it = index_.find(key);
         if (it != index_.end()) {
@@ -623,6 +663,8 @@ public:
     }
 
 private:
+    // §3.131: payload bytes only — map/list node overhead is not counted, so
+    // bytes_used()/max_bytes() bound cached Eigen payloads, not allocator use.
     static std::size_t entry_bytes(const mapped_type& v) {
         if (v.size() <= 0) return 0;
         return static_cast<std::size_t>(v.size()) * sizeof(double);

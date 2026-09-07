@@ -439,6 +439,13 @@ inline void simplify_ast_advanced(IndividualGraph& graph, double int_tol = 1e-5,
             uint64_t h = final_hashes[i];
             auto it = hash_to_first_node.find(h);
             if (it != hash_to_first_node.end()) {
+                // §3.113: merging sums exact-duplicate (identical-hash)
+                // subtree weights, so opposite-sign cancellation is
+                // algebraically exact — but the zero_tol snap below can then
+                // zero a cancelled |sum| <= zero_tol. Drift is bounded by
+                // zero_tol x subtree magnitude (<=1e-8 x 1e6 clamp = 0.01
+                // worst case). No pre/post eval guard here: the standalone
+                // API has no data; the engine path re-scores after cleanup.
                 final_redirect[i] = it->second;
                 new_weights[it->second] += new_weights[i];
                 new_weights[i] = 0.0;

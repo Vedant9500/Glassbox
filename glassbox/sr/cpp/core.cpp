@@ -839,6 +839,38 @@ static py::dict run_evolution_cpp(
     for (auto item : output_units) {
         cpp_output_units.push_back(item.cast<double>());
     }
+    // §3.254/M-145/M-148: direct native callers bypass the wrapper's
+    // _validate_physics_units. Ragged rows silently truncate in
+    // dimensional_penalty (n_dims trusts row 0; short rows read OOB) and
+    // the clamped output loop hides length mismatches; NaN poisons fitness.
+    // Mirror the wrapper contract here (batch-7 FFI fail-loud precedent).
+    if (!cpp_input_units.empty()) {
+        const size_t n_dims = cpp_input_units[0].size();
+        if (n_dims == 0)
+            throw py::value_error("input_units vectors must be non-empty");
+        // Reanalysis: mirror the full wrapper contract — one row per feature
+        // (extra rows ignored / missing rows zero-filled silently otherwise).
+        if (cpp_input_units.size() != X.size())
+            throw py::value_error("input_units must have one row per feature");
+        for (size_t i = 0; i < cpp_input_units.size(); ++i) {
+            if (cpp_input_units[i].size() != n_dims)
+                throw py::value_error("input_units rows must share one dimension length");
+            for (double v : cpp_input_units[i])
+                if (!std::isfinite(v))
+                    throw py::value_error("input_units must be finite");
+        }
+        if (!cpp_output_units.empty()) {
+            if (cpp_output_units.size() != n_dims)
+                throw py::value_error("output_units length must match input_units dimension");
+            for (double v : cpp_output_units)
+                if (!std::isfinite(v))
+                    throw py::value_error("output_units must be finite");
+        }
+    } else if (!cpp_output_units.empty()) {
+        // Reanalysis: output-only units are ignored when input is empty
+        // (penalty early-returns) — reject the meaningless combination.
+        throw py::value_error("output_units requires input_units");
+    }
 
     // 2. Configure engine
     sr::EvolutionConfig config;

@@ -528,6 +528,11 @@ class _GraphBuilder:
                     )
                 )
             # Variable exponent → sign(base) * exp(exp * log(|base|)) (S5-3).
+            # §3.122: magnitude routes through UNARY_EXP (output clamp ±1e6)
+            # while a direct UNARY_POWER clamps ±1e8, so very large
+            # |exp*log(|base|)| saturates two decades earlier here. Seeds are
+            # starting points refined under engine clamping — documented,
+            # not aligned (a dedicated var-power node would be L effort).
             exp_idx = self.build(exp)
             if exp_idx is None:
                 return None

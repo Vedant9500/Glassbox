@@ -166,6 +166,12 @@ def grouped_train_val_split(
             "exclusive_groups": True,
             "target_val_rows": target_val,
             "target_val_groups": target_groups,
+            # §3.23: greedy size-ordered accumulation can overshoot the row
+            # target by up to the final group size — report the deviation so
+            # readers need not re-derive it from indices.
+            "val_rows": int(val_idx.shape[0]),
+            "val_row_ratio": float(val_idx.shape[0]) / float(n_samples),
+            "target_overshoot": int(val_idx.shape[0]) - int(target_val),
         },
     )
 
