@@ -1198,6 +1198,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         multi_start_runs=1,  # S1-9/O1: default single start; escalate only if poor
         multi_start_auto_escalate=True,
         multi_start_escalate_max=3,
+        # C-6: operator-mix overrides for evolution (None = engine defaults:
+        # structural 0.3, parametric 0.5, crossover 0.3, explorer 0.2).
+        # Macro default 0.30 (engine 0.15): within-binary sweep showed +2/-0
+        # conversions on the near-miss probe set, no harm elsewhere.
+        evolution_structural_rate=None,
+        evolution_parametric_rate=None,
+        evolution_crossover_rate=None,
+        evolution_explorer_fraction=None,
+        evolution_macro_rate=0.30,
         adaptive_compute_budget=True,
         min_compute_budget=10,
         max_compute_budget=300,
@@ -1298,6 +1307,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.multi_start_runs = multi_start_runs
         self.multi_start_auto_escalate = multi_start_auto_escalate
         self.multi_start_escalate_max = multi_start_escalate_max
+        self.evolution_structural_rate = evolution_structural_rate
+        self.evolution_parametric_rate = evolution_parametric_rate
+        self.evolution_crossover_rate = evolution_crossover_rate
+        self.evolution_explorer_fraction = evolution_explorer_fraction
+        self.evolution_macro_rate = evolution_macro_rate
         self.adaptive_compute_budget = adaptive_compute_budget
         # §3.142: eager cross-field validation — a minimum above the maximum
         # would otherwise silently collapse every budget to max_compute_budget
@@ -1548,7 +1562,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 self, "swallowed_errors_summary_", {"total": 0, "sites": {}}
             )
 
-    def _estimate_compute_budget(self, X, current_r2, term_count, uncertainty=None):
+    def _estimate_compute_budget(
+        self, X, current_r2, term_count, uncertainty=None, *, exact_hit=False
+    ):
         """Adaptive compute budget: easy problems get short runs, hard problems get longer runs.
 
         When *uncertainty* (from the fast-path FPIP) is supplied the budget
@@ -1569,10 +1585,13 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         score += 0.08 * min(1.0, np.log10(max(50, n_samples)) / 3.0)
 
         # Fast-path confidence gates: reduce budget on easy problems.
+        # C-7: the 0.2x compact-high-R2 branch starved near-miss APPROX fits
+        # (failing runs used 4-13s of 60s) — they never got search. Exact
+        # hits keep the floor; near-misses keep a refinement floor instead.
         if current_r2 >= 0.995 and term_count <= 5:
-            score *= 0.2
+            score *= 0.2 if exact_hit else 0.6
         elif current_r2 >= 0.98 and term_count <= 8:
-            score *= 0.5
+            score *= 0.5 if exact_hit else 0.7
         elif current_r2 >= 0.90:
             score *= 0.9
         else:
@@ -3771,7 +3790,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         _phase_start = _time.time()
         # S8-4: hard caps (was up to 6 candidates / 5 pairs per multi_start run).
-        max_candidates = max(1, min(int(max_candidates), 4))
+        # A-4: allow 6 candidates so family-diverse pair-mining inputs survive.
+        max_candidates = max(1, min(int(max_candidates), 6))
         max_pairs = max(1, min(int(max_pairs), 3))
         try:
             state = compute_specialist_state(
@@ -3813,7 +3833,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 y,
                 evaluate_formula=self._safe_eval_formula_array,
                 max_pairs=2,
-                min_complementarity=0.30,
+                # A-4: 0.30 admitted almost nothing (complementarity is
+                # segment-win based and rarely that high); 0.15 lets
+                # add/mul/nested proposals compete, acceptance still gated.
+                min_complementarity=0.15,
             )
             if not proposals:
                 if isinstance(self.blackbox_diagnostics_, dict):
@@ -5654,30 +5677,19 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             blend_mse = val_mse
             if edge_mse is not None and np.isfinite(edge_mse):
                 blend_mse = 0.72 * val_mse + 0.28 * edge_mse
-            # Penalize heavy residual tails / outlier memorization.
+            # A-2: single principled criterion — validation BIC. Lower wins:
+            # fit quality on blended holdout MSE, priced by complexity.
+            # Former ad-hoc voters (complexity_weight, risk, gap,
+            # residual_penalty, seed preference, governor blend, risk veto)
+            # are still computed + recorded for observability but no longer
+            # vote — stacked penalties vetoed structural candidates.
+            n_val = max(int(np.asarray(y_val).reshape(-1).shape[0]), 1)
+            bic = float(n_val * np.log(max(float(blend_mse), 1e-300)))
+            bic += float(complexity) * float(np.log(float(n_val)))
+            # Penalize heavy residual tails / outlier memorization (recorded).
             residual_penalty = 0.15 * min(max(outlier_frac, 0.0), 1.0) + 0.05 * min(
                 max(resid_scale / max(float(np.std(y_val)), 1e-12), 0.0), 2.0
             )
-            n_features_bb = (
-                int(np.asarray(X).shape[1]) if X is not None and np.ndim(X) == 2 else 1
-            )
-            complexity_weight = 0.055 if n_features_bb > 1 else 0.030
-            score = blend_mse * (
-                1.0
-                + complexity_weight * complexity
-                + 0.50 * risk
-                + 0.25 * gap
-                + residual_penalty
-            )
-            # Prefer simpler structure when MSE is only modestly worse (Exact recovery).
-            if n_features_bb > 1 and complexity > 24:
-                score *= 1.0 + 0.015 * (complexity - 24)
-            # Mild preference for free-const structure seeds over kitchen-sink when close.
-            if n_features_bb > 1 and (
-                (candidate or {}).get("from_structure_seed")
-                or str((candidate or {}).get("source", "")).startswith("structure_seed")
-            ):
-                score *= 0.92
             governor = None
             try:
                 from scripts import benchmark_common as bc
@@ -5694,8 +5706,6 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 )
                 governor_score = float(governor.get("score", float("inf")))
                 governor_display = governor.get("display_mse")
-                if np.isfinite(governor_score):
-                    score = 0.82 * score + 0.18 * governor_score
             except Exception:
                 governor_score = None
                 governor_display = None
@@ -5725,7 +5735,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     "residual_std": resid_std,
                     "residual_outlier_fraction": outlier_frac,
                     "residual_penalty": float(residual_penalty),
-                    "pareto_score": float(score),
+                    "pareto_score": float(bic),
+                    "selection_criterion": "validation_bic",
                     "display_governor_score": governor_score,
                     "display_mse": governor_display,
                     "display_governor": governor,
@@ -5737,14 +5748,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return None
 
         best_raw = min(scored, key=lambda c: c["validation_mse"])
-        eligible = [
-            c
-            for c in scored
-            if c["validation_mse"] <= best_raw["validation_mse"] * 1.08 + 1e-12
-            and c["risk_score"] <= max(0.45, best_raw["risk_score"] + 0.15)
-        ]
+        # A-2: BIC decides alone — no eligibility band, no risk veto.
         selected = min(
-            eligible or scored, key=lambda c: (c["pareto_score"], c["complexity"])
+            scored, key=lambda c: (c["pareto_score"], c["complexity"])
         )
         selected["evaluated_candidates"] = len(scored)
         selected["best_raw_validation_mse"] = best_raw["validation_mse"]
@@ -7019,21 +7025,51 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return candidate_formulas or []
 
         # S8-4: also skip composition screening when already excellent (R²≥0.999).
-        existing_strong = best_existing_r2 >= 0.999 or (
-            np.isfinite(best_existing_mse)
-            and best_existing_mse
-            <= max(
-                1e-6,
-                1e-4
-                * max(float(np.var(np.asarray(y, dtype=np.float64).reshape(-1))), 1.0),
-            )
+        # A-4: R2>=0.999 blocked composition on every APPROX pool (near-miss
+        # fits live at 0.999-0.99999). Skip only when the best candidate is
+        # already at the EXACT wall — composition is cheap (refine cap 4).
+        y_var_for_strong = max(
+            float(np.var(np.asarray(y, dtype=np.float64).reshape(-1))), 1.0
+        )
+        existing_strong = np.isfinite(best_existing_mse) and (
+            best_existing_mse <= max(1e-8, 1e-6 * y_var_for_strong)
         )
 
+        # A-4: pair-mining needs clean components, but top-by-mse are all
+        # mush variants of one family. Feed family-diverse inputs (first per
+        # family signature, then fill) so add/mul/nested can combine parts
+        # that score poorly alone (e.g. product probe + x trend).
+        diverse_for_pairs = []
+        try:
+            _seen_fam = set()
+            _ordered = sorted(
+                candidate_formulas or [],
+                key=lambda c: _finite_float((c or {}).get("mse"), float("inf")),
+            )
+            for _c in _ordered:
+                _f = str((_c or {}).get("formula", "") or "")
+                try:
+                    _fam = self._formula_family_signature(_f)
+                except Exception:
+                    _fam = ""
+                if _fam not in _seen_fam:
+                    _seen_fam.add(_fam)
+                    diverse_for_pairs.append(_c)
+            for _c in _ordered:
+                if len(diverse_for_pairs) >= 6:
+                    break
+                if _c not in diverse_for_pairs:
+                    diverse_for_pairs.append(_c)
+        except Exception:
+            diverse_for_pairs = list(candidate_formulas or [])[:6]
+        if not diverse_for_pairs:
+            diverse_for_pairs = list(candidate_formulas or [])
+
         specialist_screening = self._compute_specialist_screening_diagnostics(
-            candidate_formulas,
+            diverse_for_pairs,
             X,
             y,
-            max_candidates=4,
+            max_candidates=6,
             max_pairs=3,
         )
         if specialist_screening is None:
@@ -10220,6 +10256,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         # Optional benchmark policy: if fast-path is very bloated, keep it as-is
         # and avoid launching evolution search for this sample.
+        refinement_mode = False
         if (
             self.skip_evolution_if_bloated
             and best_formula is not None
@@ -10247,6 +10284,19 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 n_sel = len(getattr(blackbox_state, "selected_features", []) or [])
                 if n_sel > 1 and (fp_comp > 24 or term_count > 6):
                     need_evolution = True
+            # A-1: high-R2 non-exact incumbents never evolve, so near-miss
+            # APPROX formulas are final without any search. Route one bounded
+            # refinement start instead of nothing; plan multipliers shrink it
+            # below (single start, tiny pop/gens, capped seconds).
+            if (
+                not need_evolution
+                and best_formula is not None
+                and best_mse is not None
+                and math.isfinite(best_mse)
+                and float(best_mse) > max(float(self.early_stop_mse), 1e-10)
+            ):
+                need_evolution = True
+                refinement_mode = True
 
         if (
             best_formula is not None
@@ -10360,6 +10410,26 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if isinstance(self.blackbox_diagnostics_, dict):
             self.blackbox_diagnostics_["search_plan"] = blackbox_search_plan
             self.blackbox_diagnostics_["runtime_noise"] = dict(noise_diag)
+
+        # A-1: shrink the refinement start to a fraction of a normal run.
+        if refinement_mode:
+            blackbox_search_plan["population_multiplier"] = min(
+                float(blackbox_search_plan.get("population_multiplier", 1.0)),
+                0.30,
+            )
+            blackbox_search_plan["generation_multiplier"] = min(
+                float(blackbox_search_plan.get("generation_multiplier", 1.0)),
+                0.25,
+            )
+            blackbox_search_plan["seed_budget"] = min(
+                int(blackbox_search_plan.get("seed_budget", 8)),
+                6,
+            )
+            blackbox_search_plan["focus"] = "refinement_probe"
+            if isinstance(self.blackbox_diagnostics_, dict):
+                self.blackbox_diagnostics_["evolution_budget_policy"] = (
+                    "tiny_refinement_probe"
+                )
 
         candidate_formulas = None
         if blackbox_state is not None and blackbox_state.enabled:
@@ -10668,6 +10738,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             current_r2,
             term_count,
             uncertainty=_fp_uncertainty,
+            # C-7: exact fast-path hits keep the starvation floor; near-miss
+            # high-R2 incumbents get the refinement floor instead.
+            exact_hit=bool(
+                best_formula is not None
+                and best_mse is not None
+                and math.isfinite(best_mse)
+                and float(best_mse) <= max(float(self.early_stop_mse), 1e-10)
+            ),
         ) * float(blackbox_search_plan.get("timeout_multiplier", 1.0))
 
         basis_result = getattr(self, "blackbox_basis_model_", None)
@@ -11153,7 +11231,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                         self.blackbox_diagnostics_[
                                             "evolution_budget_policy"
                                         ] = "tiny_accepted_candidate_probe"
-                                else:
+                                elif not refinement_mode:
+                                    # A-1: refinement exists precisely because
+                                    # high-R2 acceptance is cheap on
+                                    # trend-dominated targets — never cancel it.
                                     need_evolution = False
 
                         # S1-9/O1: default multi_start_runs=1; auto-escalate only when
@@ -11167,6 +11248,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             1, int(getattr(self, "multi_start_escalate_max", 3) or 3)
                         )
                         max_runs = escalate_cap if auto_escalate else planned_runs
+                        # A-1: refinement is a single bounded start, never escalated.
+                        if refinement_mode:
+                            auto_escalate = False
+                            max_runs = 1
                         multi_start_diag = {
                             "planned_runs": planned_runs,
                             "auto_escalate": bool(auto_escalate),
@@ -11252,6 +11337,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                             if auto_escalate and not multi_start_diag.get("escalated"):
                                 runs_left = 1
                             run_timeout = max(1, int(remaining / runs_left))
+                            # A-1: cap refinement wall-clock even when budget remains.
+                            if refinement_mode:
+                                run_timeout = min(int(run_timeout), 12)
 
                             run_seed = -1
                             if self.random_state is not None:
@@ -11395,6 +11483,20 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 )
                                 if evo_w.shape[0] == y_arr.shape[0]:
                                     evo_kwargs["y_weights"] = evo_w
+                            # C-6: operator-mix overrides (None = engine default).
+                            for _attr, _key in (
+                                ("evolution_structural_rate", "mutation_rate_structural"),
+                                ("evolution_parametric_rate", "mutation_rate_parametric"),
+                                ("evolution_crossover_rate", "crossover_rate"),
+                                ("evolution_explorer_fraction", "explorer_fraction"),
+                                ("evolution_macro_rate", "macro_mutation_rate"),
+                            ):
+                                _val = getattr(self, _attr, None)
+                                if _val is not None:
+                                    try:
+                                        evo_kwargs[_key] = float(_val)
+                                    except (TypeError, ValueError):
+                                        pass
                             mode = str(getattr(self, "loss_mode", "mse") or "mse")
                             if mode != "mse":
                                 evo_kwargs["loss_mode"] = mode

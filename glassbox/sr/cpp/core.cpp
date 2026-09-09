@@ -483,6 +483,11 @@ static py::dict run_evolution_cpp(
     double seed_fraction = 0.5,
     // Macro mutation rate + mode weights [wrap, multiply, divide, nest].
     double macro_mutation_rate = 0.15,
+    // C-6: operator-mix sweep hooks (engine defaults preserved).
+    double mutation_rate_structural = 0.3,
+    double mutation_rate_parametric = 0.5,
+    double crossover_rate = 0.3,
+    double explorer_fraction = 0.2,
     // P-04 test hook: force the FD-Adam inner optimizer (default LM).
     bool use_lm_inner_optimizer = true,
     py::list macro_mode_weights = py::list()
@@ -956,6 +961,10 @@ static py::dict run_evolution_cpp(
         throw py::value_error("seed_fraction must be finite");
     config.seed_fraction = std::clamp(seed_fraction, 0.1, 1.0);
     config.macro_mutation_rate = std::clamp(macro_mutation_rate, 0.0, 0.9);
+    config.mutation_rate_structural = std::clamp(mutation_rate_structural, 0.0, 1.0);
+    config.mutation_rate_parametric = std::clamp(mutation_rate_parametric, 0.0, 1.0);
+    config.crossover_rate = std::clamp(crossover_rate, 0.0, 1.0);
+    config.explorer_fraction = std::clamp(explorer_fraction, 0.0, 0.9);
     // P-04: optional override for tests / experiments (engine default true).
     config.use_lm_inner_optimizer = use_lm_inner_optimizer;
     {
@@ -1682,6 +1691,10 @@ PYBIND11_MODULE(_core, m) {
           py::arg("elite_size")=10,
           py::arg("seed_fraction")=0.5,
           py::arg("macro_mutation_rate")=0.15,
+          py::arg("mutation_rate_structural")=0.3,
+          py::arg("mutation_rate_parametric")=0.5,
+          py::arg("crossover_rate")=0.3,
+          py::arg("explorer_fraction")=0.2,
           py::arg("use_lm_inner_optimizer")=true,
           py::arg("macro_mode_weights")=py::list());
 
