@@ -44,6 +44,11 @@ class BlackboxState:
     interaction_scores: dict[str, float] = field(default_factory=dict)
     feature_selection_uncertain: bool = False
     candidate_seed_formulas: list[str] = field(default_factory=list)
+    # §3.170: which rankers actually voted and with what effective weight.
+    # Absent rankers (empty return: unavailable lib or swallowed exception)
+    # renormalize the survivors — the omission must travel with the scores.
+    active_ranker_weights: dict[str, float] = field(default_factory=dict)
+    omitted_rankers: list[str] = field(default_factory=list)
 
 
 def _safe_std(values: np.ndarray) -> np.ndarray:
@@ -363,7 +368,6 @@ def _cheap_feature_scores(
     w_all = _as_sample_weight(sample_weight, y.shape[0])
     scores: dict[int, float] = {}
 
-    y_rank = _rankdata(y)
     for j in range(X.shape[1]):
         col = X[:, j]
         finite = np.isfinite(col) & np.isfinite(y)
@@ -376,7 +380,9 @@ def _cheap_feature_scores(
         yj = y[finite]
         wj = w_all[finite] if w_all is not None else None
         pearson = _corr_score(xj, yj, wj)
-        spearman = _corr_score(_rankdata(xj), y_rank[finite], wj)
+        # §3.174: rank y AFTER masking — global ranks indexed by each
+        # feature's mask made cross-feature Spearman scores incomparable.
+        spearman = _corr_score(_rankdata(xj), _rankdata(yj), wj)
         poly = _univariate_poly_score(xj, yj, wj)
         holdout_poly = _univariate_holdout_poly_score(
             xj,
@@ -390,6 +396,12 @@ def _cheap_feature_scores(
     return scores
 
 
+# §3.173: cap on the expected sampled count of any single row in
+# _ranking_subsample. One extreme sample weight can otherwise occupy the
+# whole ranking sample and destabilize MI/Lasso/tree behavior.
+_RANKING_SUBSAMPLE_MAX_EXPECTED = 10.0
+
+
 def _ranking_subsample(
     X: np.ndarray,
     y: np.ndarray,
@@ -399,8 +411,13 @@ def _ranking_subsample(
     random_state: int = 0,
 ) -> tuple:
     """Cap ranking rows on large n so MI/trees/Lasso stay sub-second.
-
     Deterministic subsample preserves relative feature signal for ranking.
+
+    §3.173: per-row inclusion probabilities are capped (expected count per
+    row ≤ `_RANKING_SUBSAMPLE_MAX_EXPECTED`) so one extreme sample weight
+    cannot occupy the whole ranking sample and destabilize MI/Lasso/tree
+    behavior. Water-filling redistribution keeps weights below the cap
+    untouched in relative order; only excess mass moves.
     """
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
@@ -415,6 +432,23 @@ def _ranking_subsample(
         total = float(np.sum(p))
         if total > 0:
             p = p / total
+            cap = min(1.0, _RANKING_SUBSAMPLE_MAX_EXPECTED / float(max_rows))
+            if bool(np.any(p > cap)):
+                # Water-filling: cap the dominators, spread only the excess
+                # over uncapped rows (plain renormalize would hand the mass
+                # straight back to the dominator).
+                p = np.minimum(p, cap)
+                for _ in range(100):
+                    shortfall = 1.0 - float(np.sum(p))
+                    if shortfall <= 1e-12:
+                        break
+                    open_mask = p < cap
+                    open_total = float(np.sum(p[open_mask]))
+                    if open_total <= 0:
+                        break
+                    add = shortfall * (p[open_mask] / open_total)
+                    p[open_mask] = np.minimum(p[open_mask] + add, cap)
+                p = p / float(np.sum(p))
             idx = rng.choice(n, size=int(max_rows), replace=False, p=p)
         else:
             idx = rng.choice(n, size=int(max_rows), replace=False)
@@ -604,14 +638,20 @@ def compute_blackbox_feature_ranking(
     w_all = _as_sample_weight(sample_weight, y.shape[0])
     n_features = int(X.shape[1]) if X.ndim == 2 else 0
     if n_features <= 0:
-        return {"feature_scores": {}, "ranker_votes": {}, "sample_weight_mode": "none"}
+        return {
+            "feature_scores": {},
+            "ranker_votes": {},
+            "sample_weight_mode": "none",
+            "active_weights": {},
+            "weight_total": 1.0,
+            "omitted_rankers": [],
+        }
 
     pearson_scores: dict[int, float] = {}
     spearman_scores: dict[int, float] = {}
     poly_scores: dict[int, float] = {}
     holdout_poly_scores: dict[int, float] = {}
 
-    y_rank = _rankdata(y)
     for j in range(n_features):
         col = X[:, j]
         finite = np.isfinite(col) & np.isfinite(y)
@@ -627,7 +667,8 @@ def compute_blackbox_feature_ranking(
         yj = y[finite]
         wj = w_all[finite] if w_all is not None else None
         pearson_scores[j] = _corr_score(xj, yj, wj)
-        spearman_scores[j] = _corr_score(_rankdata(xj), y_rank[finite], wj)
+        # §3.174: conditional ranks (see _cheap_feature_scores above).
+        spearman_scores[j] = _corr_score(_rankdata(xj), _rankdata(yj), wj)
         poly_scores[j] = _univariate_poly_score(xj, yj, wj)
         holdout_poly_scores[j] = _univariate_holdout_poly_score(
             xj,
@@ -668,6 +709,8 @@ def compute_blackbox_feature_ranking(
         name: weight for name, weight in weights.items() if name in ranker_votes
     }
     weight_total = sum(active_weights.values()) or 1.0
+    # §3.170: record the renormalization contract, not just the present votes.
+    omitted_rankers = [name for name in weights if name not in ranker_votes]
     feature_scores: dict[int, float] = {}
     for j in range(n_features):
         score = 0.0
@@ -681,6 +724,9 @@ def compute_blackbox_feature_ranking(
         "feature_scores": feature_scores,
         "ranker_votes": ranker_votes,
         "sample_weight_mode": "provided" if w_all is not None else "none",
+        "active_weights": dict(active_weights),
+        "weight_total": float(weight_total),
+        "omitted_rankers": list(omitted_rankers),
     }
 
 
@@ -716,6 +762,19 @@ def discover_blackbox_interactions(
 
     cols = list(range(X.shape[1]))
     labels = list(selected_features) if selected_features is not None else list(cols)
+    # §3.175: labels index nothing directly (data uses positions a/b), but
+    # they become interaction names and RNG bases — validate the contract:
+    # one label per column, non-negative ints, unique. (The in-tree caller
+    # passes X[:, selected] with labels=selected, so lengths agree.)
+    if len(labels) != len(cols):
+        raise ValueError(
+            f"selected_features length {len(labels)} != n_columns {len(cols)}"
+        )
+    if any(int(la) != la or int(la) < 0 for la in labels):
+        raise ValueError("selected_features must be non-negative integer labels")
+    if len(set(int(la) for la in labels)) != len(labels):
+        raise ValueError("selected_features labels must be unique")
+    labels = [int(la) for la in labels]
     if len(cols) < 2:
         return {
             "interaction_pairs": [],
@@ -724,7 +783,10 @@ def discover_blackbox_interactions(
         }
 
     base_scores = _cheap_feature_scores(X, y, w_all)
-    candidate_rows: list[tuple[float, tuple[int, int], str, np.ndarray]] = []
+    # §3.176: entries carry the original-row selector `sel` so redundancy
+    # correlation intersects shared rows (pair masks differ across pairs;
+    # positional corrcoef over unequal/misaligned rows was meaningless).
+    candidate_rows: list[tuple[float, tuple[int, int], str, np.ndarray, np.ndarray]] = []
 
     def _interaction_family(term: str) -> str:
         lower = term.lower()
@@ -745,6 +807,9 @@ def discover_blackbox_interactions(
         return "other"
 
     def _normalized_signal(values: np.ndarray) -> np.ndarray | None:
+        # §3.176: signals are normalized on THEIR OWN finite rows; the row
+        # selector travels alongside (see `sel`) so redundancy correlation
+        # compares only shared original rows, never zero-filled gaps.
         arr = np.asarray(values, dtype=np.float64).reshape(-1)
         mask = np.isfinite(arr)
         if int(mask.sum()) < 8:
@@ -771,6 +836,8 @@ def discover_blackbox_interactions(
             if int(mask.sum()) < 12:
                 continue
 
+            # §3.176: original-row positions of this pair's rows.
+            sel = np.where(mask)[0]
             xi = xi[mask]
             xj = xj[mask]
             yj = y[mask]
@@ -812,36 +879,55 @@ def discover_blackbox_interactions(
                         + 0.10 * max(base_scores.get(a, 0.0), base_scores.get(b, 0.0))
                     )
                     if score > best_score:
+                        normed = _normalized_signal(values)
+                        if normed is None:
+                            continue
                         best_score = score
                         best_term = name
-                        best_signal = _normalized_signal(values)
+                        best_signal = normed
                 except Exception:
                     continue
 
             if best_term is not None and best_signal is not None:
-                candidate_rows.append((best_score, (la, lb), best_term, best_signal))
+                candidate_rows.append((best_score, (la, lb), best_term, best_signal, sel))
 
     candidate_rows.sort(key=lambda item: item[0], reverse=True)
-    top: list[tuple[float, tuple[int, int], str, np.ndarray]] = []
+    top: list[tuple[float, tuple[int, int], str, np.ndarray, np.ndarray]] = []
     family_counts: dict[str, int] = {}
-    for score, pair, term, signal in candidate_rows:
+    for score, pair, term, signal, sel in candidate_rows:
         if len(top) >= max(0, int(max_pairs)):
             break
         family = _interaction_family(term)
         # Keep the pool diverse: one dominant template is useful, many
         # near-collinear variants waste seeds and inflate operator hints.
+        # §3.177 note: the family cap below never overrides max_pairs — the
+        # outer `len(top) >= max(0, max_pairs)` break honors it (max_pairs=1
+        # returns at most 1). The cap only skips 3rd+ same-family items once
+        # past the diversity threshold.
         if family_counts.get(family, 0) >= 2 and len(top) >= max(
             2, int(max_pairs) // 2
         ):
             continue
         redundant = False
-        for _, existing_pair, existing_term, existing_signal in top:
+        for _, existing_pair, existing_term, existing_signal, existing_sel in top:
             same_pair = tuple(pair) == tuple(existing_pair)
             same_family = _interaction_family(existing_term) == family
             if not (same_pair or same_family):
                 continue
             try:
-                corr = float(np.corrcoef(signal, existing_signal)[0, 1])
+                # §3.176: correlate on shared original rows only. Different
+                # pairs have different row masks; positional corrcoef over
+                # unequal/misaligned rows was meaningless (exception → 0.0).
+                common, ia, ib = np.intersect1d(
+                    sel, existing_sel, return_indices=True
+                )
+                if int(common.size) < 8:
+                    continue
+                sa = np.asarray(signal, dtype=np.float64).reshape(-1)[ia]
+                sb = np.asarray(existing_signal, dtype=np.float64).reshape(-1)[ib]
+                if float(np.std(sa)) < 1e-12 or float(np.std(sb)) < 1e-12:
+                    continue
+                corr = float(np.corrcoef(sa, sb)[0, 1])
             except Exception:
                 corr = 0.0
             if np.isfinite(corr) and abs(corr) >= 0.985:
@@ -850,12 +936,16 @@ def discover_blackbox_interactions(
         if redundant:
             continue
         family_counts[family] = family_counts.get(family, 0) + 1
-        top.append((score, pair, term, signal))
+        top.append((score, pair, term, signal, sel))
 
     return {
-        "interaction_pairs": [pair for _, pair, _, _ in top],
-        "interaction_terms": [term for _, _, term, _ in top],
-        "interaction_scores": {term: float(score) for score, _, term, _ in top},
+        "interaction_pairs": [pair for _, pair, _, _, _ in top],
+        "interaction_terms": [term for _, _, term, _, _ in top],
+        "interaction_scores": {term: float(score) for score, _, term, _, _ in top},
+        # §3.177: family-cap diagnostic (cap honors max_pairs via the outer
+        # break above — the ledger records the §3.177 max_pairs=1 override
+        # claim as a false-positive portion; kept here as proof).
+        "family_counts": dict(family_counts),
     }
 
 
@@ -930,6 +1020,8 @@ def prepare_blackbox_search(
     y_scaled = (y_clean - y_mean) / y_scale if standardize else y_clean.copy()
     w_all = _as_sample_weight(sample_weight, y_clean.shape[0])
     ranking_weight_mode = "provided" if w_all is not None else "none"
+    active_ranker_weights: dict[str, float] = {}
+    omitted_rankers: list[str] = []
     if n_features < int(min_features_to_select):
         selected = sorted(usable)
         feature_scores = {idx: 0.0 for idx in usable}
@@ -954,6 +1046,9 @@ def prepare_blackbox_search(
                 ranking.get("ranker_votes") or {}
             ).items()
         }
+        # §3.170: omitted-ranker record travels with the votes.
+        active_ranker_weights = dict(ranking.get("active_weights") or {})
+        omitted_rankers = list(ranking.get("omitted_rankers") or [])
 
         k = int(max(1, min(max_features, len(usable))))
         ranked_usable = sorted(
@@ -1156,6 +1251,7 @@ def prepare_blackbox_search(
             "interaction_pairs": [],
             "interaction_terms": [],
             "interaction_scores": {},
+            "family_counts": {},
         }
 
     state = BlackboxState(
@@ -1181,6 +1277,8 @@ def prepare_blackbox_search(
         candidate_seed_formulas=build_blackbox_seed_formulas(
             selected, interaction_state["interaction_terms"]
         ),
+        active_ranker_weights=active_ranker_weights,
+        omitted_rankers=omitted_rankers,
     )
     # Attach ranking weight mode for diagnostics (not a dataclass field).
     state.ranking_sample_weight_mode = ranking_weight_mode  # type: ignore[attr-defined]

@@ -1037,7 +1037,18 @@ def assert_row_contract(rows: Sequence[dict[str, Any]]) -> None:
 def summarize_noise_protocol(
     rows: Sequence[dict[str, Any]], *, acceptable_r2: float = 0.9
 ) -> dict[str, Any]:
-    """Per (problem, tier) rollup + clean-vs-noisy delta table."""
+    """Per (problem, tier) rollup + clean-vs-noisy delta table.
+
+    §3.162: denominators differ per metric by design — R²/raw/display/
+    complexity medians use `valid` (non-None test_r2) runs, exact/acceptable
+    rates use all runs, false-confidence uses non-None fc runs, clean R²/MSE
+    use their own non-None subsets. Every cell therefore carries explicit
+    per-metric `n_*` counts (`n_runs`, `n_valid`, ...) so readers never
+    mistake a median-over-successes for a rate-over-all-runs.
+    M-195: `false_confidence_rate` denominator is non-None-fc runs only
+    (see `false_confidence_n` vs `n_runs`); failed fits with fc=None are
+    excluded, not counted as negative.
+    """
     assert_row_contract(rows)
     by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for row in rows:
@@ -1071,11 +1082,33 @@ def summarize_noise_protocol(
         acceptable_rate = float(
             np.mean([1.0 if r.get("acceptable_clean") else 0.0 for r in runs])
         )
+        fc_n = sum(1 for r in runs if r.get("false_confidence") is not None)
         cells.append(
             {
                 "problem": problem,
                 "tier": tier,
                 "n_runs": len(runs),
+                # §3.162: explicit per-metric denominators.
+                "n_valid": len(valid),
+                "n_test_r2": len(r2s),
+                "n_clean_r2": len(clean_r2s),
+                "n_exact": len(runs),
+                "n_acceptable": len(runs),
+                # M-195: fc rate denominator (non-None fc runs).
+                "false_confidence_n": fc_n,
+                "n_raw_mse": sum(
+                    1 for r in valid if r.get("raw_mse") is not None
+                ),
+                "n_display_mse": sum(
+                    1 for r in valid if r.get("display_mse") is not None
+                ),
+                "n_clean_mse": sum(
+                    1 for r in runs if r.get("clean_test_mse") is not None
+                ),
+                "n_complexity": sum(
+                    1 for r in valid
+                    if r.get("formula_complexity") is not None
+                ),
                 "median_test_r2": float(np.median(r2s)) if r2s else None,
                 "median_clean_test_r2": float(np.median(clean_r2s))
                 if clean_r2s
@@ -1132,6 +1165,12 @@ def summarize_noise_protocol(
 
 
 def _median_key(runs: Sequence[dict[str, Any]], key: str) -> float | None:
+    """Median over rows where `key` is not None.
+
+    §3.163: failures (None) are excluded, not worst-cased — the median is
+    finite-only. Callers needing failure visibility must also record the
+    `*_n` / `*_failures` counts alongside (see publish cells).
+    """
     vals = [float(r[key]) for r in runs if r.get(key) is not None]
     return float(np.median(vals)) if vals else None
 
@@ -1234,11 +1273,23 @@ def build_ablation_table(
         for cell in summary["cells"]:
             key = (cell["problem"], cell["tier"])
             base = baseline_cells.get(key)
+            # §3.165/M-197: grid signature + comparability. Deltas are only
+            # meaningful when the baseline ran the same (problem, tier) grid
+            # with the same run count; denominators ride along via n_* keys
+            # (§3.162) so differing-denominator comparisons stay visible.
+            comparable = base is not None
             row = {
                 "ablation": name,
                 "problem": cell["problem"],
                 "tier": cell["tier"],
                 "n_runs": cell["n_runs"],
+                "n_valid": cell.get("n_valid"),
+                "base_n_runs": base.get("n_runs") if base is not None else None,
+                "base_n_valid": base.get("n_valid") if base is not None else None,
+                "grid_comparable": comparable,
+                "noncomparable_reason": (
+                    None if comparable else "missing_baseline_cell"
+                ),
                 "median_clean_test_r2": cell.get("median_clean_test_r2"),
                 "acceptable_clean_rate": cell.get("acceptable_clean_rate"),
                 "exact_match_rate": cell.get("exact_match_rate"),
@@ -1264,6 +1315,9 @@ def build_ablation_table(
             comparison_rows.append(row)
 
     # Aggregate headline: mean Accept/R2clean on non-clean tiers per ablation.
+    # §3.164: equal-weight per-cell means are kept (legacy) AND seed-weighted
+    # means (weight = cell n_runs) ride alongside with run totals, so a
+    # one-seed cell no longer silently equals a five-seed cell.
     headlines: list[dict[str, Any]] = []
     for name, summary in summaries.items():
         noisy_cells = [c for c in summary["cells"] if c.get("tier") != "clean"]
@@ -1274,10 +1328,24 @@ def build_ablation_table(
             vals = [float(c[key]) for c in cells if c.get(key) is not None]
             return float(np.mean(vals)) if vals else None
 
+        def _wtd_mean_key(cells, key):
+            num = den = 0.0
+            for c in cells:
+                if c.get(key) is None:
+                    continue
+                w = float(c.get("n_runs", 0) or 0)
+                if w <= 0:
+                    continue
+                num += w * float(c[key])
+                den += w
+            return float(num / den) if den > 0 else None
+
+        headline_n_runs = int(sum(int(c.get("n_runs", 0) or 0) for c in noisy_cells))
         headlines.append(
             {
                 "ablation": name,
                 "n_cells": len(summary["cells"]),
+                "headline_n_runs": headline_n_runs,
                 "mean_clean_test_r2_noisy_tiers": _mean_key(
                     noisy_cells, "median_clean_test_r2"
                 ),
@@ -1288,6 +1356,18 @@ def build_ablation_table(
                     noisy_cells, "exact_match_rate"
                 ),
                 "mean_formula_complexity_noisy_tiers": _mean_key(
+                    noisy_cells, "median_formula_complexity"
+                ),
+                "wtd_mean_clean_test_r2_noisy_tiers": _wtd_mean_key(
+                    noisy_cells, "median_clean_test_r2"
+                ),
+                "wtd_mean_acceptable_clean_rate_noisy_tiers": _wtd_mean_key(
+                    noisy_cells, "acceptable_clean_rate"
+                ),
+                "wtd_mean_exact_match_rate_noisy_tiers": _wtd_mean_key(
+                    noisy_cells, "exact_match_rate"
+                ),
+                "wtd_mean_formula_complexity_noisy_tiers": _wtd_mean_key(
                     noisy_cells, "median_formula_complexity"
                 ),
                 "is_baseline": name == baseline,
@@ -1320,6 +1400,18 @@ def build_ablation_table(
         "comparison_rows": comparison_rows,
         "headlines": headlines,
         "n_ablations": len(summaries),
+        # §3.169: every (problem, tier) the baseline did not run while some
+        # other ablation did — deltas there are absent, not zero.
+        "missing_baseline_cells": sorted(
+            {
+                (r["problem"], r["tier"])
+                for r in comparison_rows
+                if r.get("noncomparable_reason") == "missing_baseline_cell"
+            }
+        ),
+        "partial_comparison": any(
+            r.get("noncomparable_reason") is not None for r in comparison_rows
+        ),
     }
 
 
@@ -1406,16 +1498,21 @@ def build_publish_table(
     visibility. Suitable for release notes — never use noisy-label R² alone.
     """
     assert_row_contract(rows)
-    seed_list = [
-        int(s)
-        for s in (
-            seeds
-            if seeds is not None
-            else sorted({int(r["seed"]) for r in rows if r.get("seed") is not None})
-        )
-    ]
-    if not seed_list:
+    seeds_observed = sorted(
+        {int(r["seed"]) for r in rows if r.get("seed") is not None}
+    )
+    if seeds is not None:
+        seed_list = [int(s) for s in seeds]
+        seeds_provenance = "requested"
+    elif seeds_observed:
+        seed_list = list(seeds_observed)
+        seeds_provenance = "observed"
+    else:
+        # §3.168: no row carries seed identity — fall back to requested
+        # defaults but label them as requested-only, never observed.
         seed_list = list(DEFAULT_PUBLISH_SEEDS)
+        seeds_provenance = "requested_only"
+    rows_have_seed = sum(1 for r in rows if r.get("seed") is not None)
 
     summary = summarize_noise_protocol(rows)
     by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -1429,6 +1526,12 @@ def build_publish_table(
         seed_r2clean = {}
         seed_formula = {}
         for r in runs:
+            # §3.168: fail loud with a clear reason instead of KeyError.
+            if r.get("seed") is None:
+                raise ValueError(
+                    f"build_publish_table: row missing 'seed' for "
+                    f"{problem}/{tier} (seeds_provenance={seeds_provenance})"
+                )
             s = int(r["seed"])
             seed_exact[s] = bool(r.get("exact_match"))
             seed_accept[s] = bool(r.get("acceptable_clean"))
@@ -1436,12 +1539,14 @@ def build_publish_table(
                 seed_r2clean[s] = float(r["clean_test_r2"])
             if r.get("formula") is not None:
                 seed_formula[s] = str(r.get("formula") or "")[:120]
-        n_seeds = len({int(r["seed"]) for r in runs})
+        n_seeds = len({int(r["seed"]) for r in runs if r.get("seed") is not None})
         clean_r2s = [
             float(r["clean_test_r2"])
             for r in runs
             if r.get("clean_test_r2") is not None
         ]
+        # §3.163: finite-only median plus explicit failure counts.
+        cfm_n = sum(1 for r in runs if r.get("clean_full_mse") is not None)
         cells.append(
             {
                 "problem": problem,
@@ -1465,6 +1570,9 @@ def build_publish_table(
                 "seed_formula": seed_formula,
                 "median_formula_complexity": _median_key(runs, "formula_complexity"),
                 "median_clean_full_mse": _median_key(runs, "clean_full_mse"),
+                # §3.163: finite-only median denominator + excluded count.
+                "median_clean_full_mse_n": cfm_n,
+                "median_clean_full_mse_failures": len(runs) - cfm_n,
                 "publishable_seed_coverage": bool(n_seeds >= int(min_seeds)),
             }
         )
@@ -1472,8 +1580,12 @@ def build_publish_table(
     # Headline: clean tiers vs outlier tiers across all multi-var problems.
     clean_cells = [c for c in cells if c["tier"] == "clean"]
     outlier_cells = [c for c in cells if "outlier" in str(c["tier"]).lower()]
+    # §3.167: record the tier selection actually used; fallback is honest.
+    outlier_fallback_used = False
     if not outlier_cells:
         outlier_cells = [c for c in cells if c["tier"] != "clean"]
+        outlier_fallback_used = bool(cells)
+    outlier_tiers_selected = sorted({c["tier"] for c in outlier_cells})
 
     def _mean_cells(cs, key):
         vals = [float(c[key]) for c in cs if c.get(key) is not None]
@@ -1503,12 +1615,24 @@ def build_publish_table(
     }
 
     n_seed_obs = max((c["n_seeds"] for c in cells), default=0)
+    n_seed_min = min((c["n_seeds"] for c in cells), default=0)
     return {
         "seeds": seed_list,
+        # §3.168: requested vs observed provenance.
+        "seeds_observed": seeds_observed,
+        "seeds_provenance": seeds_provenance,
+        "rows_have_seed": rows_have_seed,
         "min_seeds": int(min_seeds),
         "n_rows": len(rows),
         "n_cells": len(cells),
-        "seed_coverage_ok": bool(n_seed_obs >= int(min_seeds)),
+        # §3.166: coverage gate uses the MINIMUM cell seed count — one
+        # well-covered cell must not publish the whole table.
+        "seed_coverage_ok": bool(cells) and bool(n_seed_min >= int(min_seeds)),
+        "seed_coverage_min": n_seed_min,
+        "seed_coverage_max": n_seed_obs,
+        # §3.167: which tiers fed the outlier headline + fallback flag.
+        "outlier_tiers_selected": outlier_tiers_selected,
+        "outlier_fallback_used": outlier_fallback_used,
         "cells": cells,
         "headlines": headlines,
         "summary": summary,

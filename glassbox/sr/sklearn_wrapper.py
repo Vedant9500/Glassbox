@@ -4215,17 +4215,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             X_aug = np.column_stack([X_base] + [item["values"] for item in frozen])
             frozen_formulas = [item["formula"] for item in frozen]
             pool = self._build_inception_basis_pool(base_feature_count, frozen_formulas)
-            prior_n_features = getattr(self, "n_features_in_", base_feature_count)
-            try:
-                self.n_features_in_ = X_aug.shape[1]
-                candidate = self._fit_blackbox_basis_model(
-                    X_aug,
-                    y_arr,
-                    pool,
-                    max_terms=max(2, min(5, base_feature_count + len(frozen))),
-                )
-            finally:
-                self.n_features_in_ = prior_n_features
+            # §3.195: no public-state mutation — the augmented fit path is
+            # fully X-driven (_split_blackbox_holdout/_safe_eval/complexity
+            # read widths from X_aug, never n_features_in_), so the old
+            # temporary n_features_in_ overwrite was vestigial. Public
+            # sklearn width stays original throughout (S1-4 precedent).
+            candidate = self._fit_blackbox_basis_model(
+                X_aug,
+                y_arr,
+                pool,
+                max_terms=max(2, min(5, base_feature_count + len(frozen))),
+            )
             if not candidate or not candidate.get("formula"):
                 _record_inception_reject("no_candidate")
                 break
@@ -4263,6 +4263,48 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     mse=float(mse),
                 )
                 break
+            # §3.194: train-only acceptance overfits the frozen basis — gate
+            # the expansion on a shuffled holdout split as well. The basis
+            # selection inside _fit_blackbox_basis_model is already
+            # val-gated; this guards the final augmented acceptance.
+            inception_val = self._split_blackbox_holdout(
+                X_base, y_arr, validation_fraction=0.2
+            )
+            val_mse_current = val_mse_expanded = None
+            if inception_val is not None:
+                try:
+                    _cur_val = np.asarray(
+                        self._safe_eval_formula_array(
+                            current_formula, inception_val["X_val"]
+                        ),
+                        dtype=np.float64,
+                    ).reshape(-1)
+                    _exp_val = np.asarray(
+                        self._safe_eval_formula_array(
+                            expanded, inception_val["X_val"]
+                        ),
+                        dtype=np.float64,
+                    ).reshape(-1)
+                    _yv = np.asarray(
+                        inception_val["y_val"], dtype=np.float64
+                    ).reshape(-1)
+                    val_mse_current = float(np.mean((_cur_val - _yv) ** 2))
+                    val_mse_expanded = float(np.mean((_exp_val - _yv) ** 2))
+                except Exception:
+                    val_mse_current = val_mse_expanded = None
+                if (
+                    val_mse_current is not None
+                    and val_mse_expanded is not None
+                    and np.isfinite(val_mse_current)
+                    and np.isfinite(val_mse_expanded)
+                    and val_mse_expanded > val_mse_current
+                ):
+                    _record_inception_reject(
+                        "no_holdout_improvement",
+                        candidate=candidate.get("formula"),
+                        mse=float(mse),
+                    )
+                    break
 
             round_info = {
                 "round": int(round_idx),
@@ -4279,6 +4321,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 "previous_mse": float(current_mse),
                 "mse": float(mse),
                 "improvement": float(improvement),
+                "val_mse_current": val_mse_current,
+                "val_mse_expanded": val_mse_expanded,
             }
             self.inception_rounds_.append(round_info)
             self.inception_diagnostics_["accepted_rounds"] = len(self.inception_rounds_)
@@ -4795,6 +4839,69 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     rejected_reasons[-1]
                 )
         return current
+
+    def _promote_best_screened_candidate(
+        self, candidate_formulas, best_formula, best_mse, y
+    ):
+        """Promote the best screened candidate over a bloated incumbent.
+
+        Screened pools (structure seeds, targeted probes, composition) are
+        otherwise dropped whenever evolution is skipped, so an exact probe
+        can sit ranked-first on validation while the fast-path incumbent
+        still wins. Honest competition, not auto-win: the challenger needs
+        a strictly-better validation fit AND (much simpler OR strong
+        absolute fit OR strictly better than incumbent). Never raises;
+        returns ``(formula, mse, promoted_dict_or_None)``.
+        """
+        try:
+            incumbent_comp = (
+                self._formula_complexity(best_formula) if best_formula else 999
+            )
+            best_cand = None
+            best_cand_mse = float("inf")
+            for cand in candidate_formulas or []:
+                try:
+                    mse_c = float((cand or {}).get("mse", float("inf")))
+                except (TypeError, ValueError):
+                    continue
+                if not np.isfinite(mse_c):
+                    continue
+                if mse_c < best_cand_mse:
+                    best_cand_mse = mse_c
+                    best_cand = cand
+            if best_cand is None:
+                return best_formula, best_mse, None
+            seed_mse = float(best_cand_mse)
+            seed_comp = int(
+                best_cand.get("complexity")
+                or self._formula_complexity(best_cand.get("formula"))
+            )
+            fp_mse = (
+                float(best_mse)
+                if best_mse is not None and np.isfinite(best_mse)
+                else float("inf")
+            )
+            better_fit = seed_mse <= fp_mse * 1.02 + 1e-15
+            much_simpler = seed_comp + 12 <= incumbent_comp
+            strong_fit = seed_mse <= max(
+                1e-4, 0.05 * max(float(np.var(y)), 1e-12)
+            )
+            if not (
+                better_fit and (much_simpler or strong_fit or seed_mse < fp_mse)
+            ):
+                return best_formula, best_mse, None
+            promoted = {
+                "formula": str(best_cand["formula"]),
+                "mse": seed_mse,
+                "complexity": seed_comp,
+                "skeleton": str(best_cand.get("skeleton") or ""),
+                "from_structure_seed": True,
+                "promoted_from_source": str(best_cand.get("source") or ""),
+            }
+            return str(best_cand["formula"]), seed_mse, promoted
+        except Exception as exc:
+            self._record_swallowed_error("screened_candidate.promote", exc)
+            return best_formula, best_mse, None
 
     def _candidate_pool_has_actionable_fit(
         self, candidate_formulas, incumbent_mse, search_plan=None
@@ -8515,9 +8622,23 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         _phase_start = _time.time()
         try:
-            return self._stage_residual_symbolic_fit_impl(
+            out = self._stage_residual_symbolic_fit_impl(
                 X, y, base_formula, _allow_recursion=_allow_recursion
             )
+            # §3.192: the impl resets _residual_stage_guard_ at entry, so
+            # sequential/nested calls overwrite each other's evidence —
+            # keep an append-only history alongside the latest snapshot
+            # (capped like M-134 tracker history).
+            try:
+                _hist = getattr(self, "_residual_stage_guards_", None)
+                if not isinstance(_hist, list):
+                    _hist = []
+                    self._residual_stage_guards_ = _hist
+                _hist.append(dict(getattr(self, "_residual_stage_guard_", {}) or {}))
+                del _hist[:-200]
+            except Exception:
+                pass
+            return out
         finally:
             self._add_phase_time("residual_symbolic_fit", _time.time() - _phase_start)
 
@@ -8546,46 +8667,80 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             self._residual_stage_guard_["reason"] = "no_features"
             return None
 
-        try:
-            y_pred = self._safe_eval_formula_array(base_formula, X)
-        except Exception:
-            self._residual_stage_guard_["reason"] = "base_eval_failed"
-            return None
-
-        residual = np.asarray(y, dtype=np.float64).reshape(-1) - np.asarray(
-            y_pred, dtype=np.float64
-        ).reshape(-1)
-        if not np.all(np.isfinite(residual)) or float(np.var(residual)) < 1e-12:
-            self._residual_stage_guard_["reason"] = "flat_or_nonfinite_residual"
-            return None
-
-        candidate_pool = self._build_residual_mini_search_candidates(
-            X,
-            residual,
-            base_formula,
-            max_candidates=getattr(self, "residual_mini_search_max_candidates", 64),
-        )
-        self._residual_stage_guard_["candidate_count"] = len(candidate_pool)
-        if not candidate_pool:
-            self._residual_stage_guard_["reason"] = "no_candidate_pool"
-            return None
-
-        top_k = max(1, int(getattr(self, "residual_mini_search_refine_top_k", 6)))
-        refined = self._refine_candidate_formulas(
-            candidate_pool,
-            X,
-            residual,
-            max_candidates=top_k,
-        )
-        if not refined:
-            self._residual_stage_guard_["reason"] = "no_refined_residual_candidates"
-            return None
-
+        # §3.187: split BEFORE candidate generation. Generation/refinement
+        # previously saw full-data residuals, so the validation gate was not
+        # out-of-sample for candidate selection. Fit rows drive generation;
+        # validation rows only judge unchanged candidates below.
         split, split_mode = self._guard_validation_split(X, y, validation_fraction=0.2)
         if split is None:
             self._residual_stage_guard_["reason"] = "no_validation_split"
             return None
         self._residual_stage_guard_["holdout_mode"] = split_mode
+        self._residual_stage_guard_["split_first"] = True
+        gen_X = np.asarray(split["X_fit"], dtype=np.float64)
+        gen_y = np.asarray(split["y_fit"], dtype=np.float64).reshape(-1)
+
+        try:
+            y_pred = self._safe_eval_formula_array(base_formula, gen_X)
+        except Exception:
+            self._residual_stage_guard_["reason"] = "base_eval_failed"
+            return None
+
+        residual = gen_y - np.asarray(y_pred, dtype=np.float64).reshape(-1)
+        if not np.all(np.isfinite(residual)) or float(np.var(residual)) < 1e-12:
+            self._residual_stage_guard_["reason"] = "flat_or_nonfinite_residual"
+            return None
+
+        # Narrow the sample-weight view so nested generation/refinement
+        # splits (indexed 0..n_fit-1) stay consistent with fit rows.
+        _weights_sliced = False
+        _saved_weights = None
+        try:
+            _fit_idx = split.get("fit_idx")
+            if (
+                getattr(self, "sample_weight_provided_", False)
+                and _fit_idx is not None
+            ):
+                _w_full = np.asarray(
+                    getattr(self, "sample_weight_", None), dtype=np.float64
+                ).reshape(-1)
+                if _w_full.shape[0] == int(np.asarray(y).reshape(-1).shape[0]):
+                    _saved_weights = getattr(self, "sample_weight_", None)
+                    self.sample_weight_ = _w_full[np.asarray(_fit_idx, dtype=int)]
+                    _weights_sliced = True
+        except Exception:
+            _weights_sliced = False
+            _saved_weights = None
+
+        try:
+            candidate_pool = self._build_residual_mini_search_candidates(
+                gen_X,
+                residual,
+                base_formula,
+                max_candidates=getattr(
+                    self, "residual_mini_search_max_candidates", 64
+                ),
+            )
+            self._residual_stage_guard_["candidate_count"] = len(candidate_pool)
+            if not candidate_pool:
+                self._residual_stage_guard_["reason"] = "no_candidate_pool"
+                return None
+
+            top_k = max(1, int(getattr(self, "residual_mini_search_refine_top_k", 6)))
+            refined = self._refine_candidate_formulas(
+                candidate_pool,
+                gen_X,
+                residual,
+                max_candidates=top_k,
+            )
+            if not refined:
+                self._residual_stage_guard_["reason"] = (
+                    "no_refined_residual_candidates"
+                )
+                return None
+        finally:
+            if _weights_sliced:
+                self.sample_weight_ = _saved_weights
 
         # Phase 6: residual acceptance requires weighted val improvement AND
         # unweighted/edge val not worse beyond noise-aware slack.
@@ -8656,6 +8811,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         best = None
         reject_noise = 0
         edge_guard_errors = 0
+        raw_nonfinite_rejects = 0
         for cand in refined:
             formula = str((cand or {}).get("formula", "")).strip()
             if not formula or formula == "0":
@@ -8663,6 +8819,21 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             try:
                 res_pred = self._safe_eval_formula_array(formula, split["X_val"])
                 res_pred = np.asarray(res_pred, dtype=np.float64).reshape(-1)
+                # §3.188: zero-fill can fake finite combined MSE for formulas
+                # invalid on a few validation rows — require raw finite
+                # predictions before scoring.
+                try:
+                    res_raw = np.asarray(
+                        self._eval_formula_raw(formula, split["X_val"]),
+                        dtype=np.float64,
+                    ).reshape(-1)
+                except Exception:
+                    res_raw = np.full_like(res_pred, np.nan)
+                if res_raw.shape != res_pred.shape or not bool(
+                    np.all(np.isfinite(res_raw))
+                ):
+                    raw_nonfinite_rejects += 1
+                    continue
                 combined = base_pred + res_pred
                 combined_mse_u = float(np.mean((combined - y_val) ** 2))
                 combined_mse_w = (
@@ -8712,6 +8883,19 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                         formula, edge_split["X_val"]
                     )
                     res_edge = np.asarray(res_edge, dtype=np.float64).reshape(-1)
+                    # §3.188: same raw-finite gate on the edge split.
+                    try:
+                        res_edge_raw = np.asarray(
+                            self._eval_formula_raw(formula, edge_split["X_val"]),
+                            dtype=np.float64,
+                        ).reshape(-1)
+                    except Exception:
+                        res_edge_raw = np.full_like(res_edge, np.nan)
+                    if res_edge_raw.shape != res_edge.shape or not bool(
+                        np.all(np.isfinite(res_edge_raw))
+                    ):
+                        raw_nonfinite_rejects += 1
+                        continue
                     comb_edge = base_edge_pred + res_edge
                     edge_mse_u = float(np.mean((comb_edge - edge_split["y_val"]) ** 2))
                     edge_allowed = base_edge_mse_u * (1.0 + rel_slack) + abs_slack
@@ -8763,6 +8947,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     "refined_count": len(refined),
                     "relative_slack": rel_slack,
                     "edge_guard_errors": int(edge_guard_errors),
+                    "raw_nonfinite_rejects": int(raw_nonfinite_rejects),
                 }
             )
             if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
@@ -8796,6 +8981,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 "noise_rejects": int(reject_noise),
                 "relative_slack": rel_slack,
                 "weighted_validation": bool(val_w is not None),
+                "raw_nonfinite_rejects": int(raw_nonfinite_rejects),
             }
         )
         if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
@@ -8919,6 +9105,12 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self.boosting_stages_ = []
         self.boosting_attempted_ = False
         self.boosting_improved_ = False
+        # §3.193: stage locally until the run completes, then commit — an
+        # exception escaping mid-run (or a later fit failure) must not leave
+        # partially accepted stages on the estimator.
+        _stages: list = []
+        _improved = False
+        _final_r2 = None
         residual_enabled = bool(
             getattr(self, "enable_residual_boosting", self.enable_residual_stage)
         )
@@ -8929,6 +9121,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             "final_holdout_r2": None,
             "accepted_stages": 0,
             "decoupled_from_guided_evolution": True,
+            # §3.189: the boosting holdout is a raw trailing suffix
+            # (X[-holdout_n:]), NOT a shuffled/stratisfied split like the
+            # residual stage's _guard_validation_split — holdout R² across
+            # the two stages is not comparable. §3.190: every learning-rate
+            # candidate and every stage tunes on this SAME holdout, so it is
+            # a tuning set; both names are reported.
+            "holdout_mode": "suffix",
+            "holdout_is_tuning_set": True,
         }
         if not residual_enabled or not base_formula:
             return base_formula
@@ -9075,6 +9275,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             )
             self.timeout = stage_timeout
             self.boosting_attempted_ = True
+            # §3.191: the public-timeout mutation window is try/finally
+            # contained (restored below), but concurrent fits on one
+            # estimator are still unsafe (M-12 precedent) and children read
+            # the staged value live — record every staging for post-fit audit.
+            # Threading timeout explicitly through the stage call chain is a
+            # larger refactor (M, deferred); values here are unchanged.
+            try:
+                _st = self.boosting_diagnostics_.setdefault("stage_timeouts", [])
+                _st.append({"stage": int(stage), "timeout": stage_timeout})
+            except Exception:
+                pass
 
             try:
                 h_k = self._stage_residual_symbolic_fit(
@@ -9164,7 +9375,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             else:
                 current_formula = best_combined_formula
 
-            self.boosting_stages_.append(
+            _stages.append(
                 {
                     "stage": stage,
                     "h_k": h_k,
@@ -9175,13 +9386,24 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     "combined_formula": current_formula,
                 }
             )
-            self.boosting_improved_ = True
-            self.boosting_diagnostics_["accepted_stages"] = len(self.boosting_stages_)
-            self.boosting_diagnostics_["final_holdout_r2"] = float(best_holdout_r2)
+            _improved = True
+            _final_r2 = float(best_holdout_r2)
 
             if best_holdout_r2 > 0.999:
                 break
 
+        # §3.193 commit point: publish staged state only on clean exit.
+        self.boosting_stages_ = list(_stages)
+        self.boosting_improved_ = bool(_improved)
+        self.boosting_diagnostics_["accepted_stages"] = len(_stages)
+        if _final_r2 is not None:
+            self.boosting_diagnostics_["final_holdout_r2"] = float(_final_r2)
+            # §3.190: tuning-set alias (same holdout tunes every rate+stage).
+            self.boosting_diagnostics_["tuning_holdout_r2"] = float(_final_r2)
+        if self.boosting_diagnostics_.get("initial_holdout_r2") is not None:
+            self.boosting_diagnostics_["tuning_initial_holdout_r2"] = float(
+                self.boosting_diagnostics_["initial_holdout_r2"]
+            )
         if self.boosting_diagnostics_.get("final_holdout_r2") is None:
             try:
                 final_pred_holdout = self._safe_eval_formula_array(
@@ -9190,8 +9412,14 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 self.boosting_diagnostics_["final_holdout_r2"] = float(
                     local_r2(y_holdout, final_pred_holdout)
                 )
+                self.boosting_diagnostics_["tuning_holdout_r2"] = float(
+                    self.boosting_diagnostics_["final_holdout_r2"]
+                )
             except Exception:
                 self.boosting_diagnostics_["final_holdout_r2"] = (
+                    self.boosting_diagnostics_.get("initial_holdout_r2")
+                )
+                self.boosting_diagnostics_["tuning_holdout_r2"] = (
                     self.boosting_diagnostics_.get("initial_holdout_r2")
                 )
         return current_formula
@@ -10235,59 +10463,39 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 blackbox_search_plan,
                 diagnostics_key="candidate_screening",
             )
-            # Promote best structure seed over bloated fast-path when it is
-            # clearly better on validation (honest competition, not auto-win).
+            # Promote the best screened candidate over a bloated fast-path
+            # when it is clearly better on validation (honest competition,
+            # not auto-win). Any source may win: structure seeds, targeted
+            # probes, or composition — previously only structure seeds
+            # competed here, so exact probes were dropped whenever evolution
+            # was skipped.
             self._promoted_structure_seed_ = None
             try:
-                fp_comp = (
+                _fp_mse_before = (
+                    float(best_mse)
+                    if best_mse is not None and np.isfinite(best_mse)
+                    else None
+                )
+                _fp_comp_before = (
                     self._formula_complexity(best_formula) if best_formula else 999
                 )
-                best_seed = None
-                for cand in candidate_formulas or []:
-                    if not (cand or {}).get("from_structure_seed"):
-                        continue
-                    mse_c = float((cand or {}).get("mse", float("inf")))
-                    if best_seed is None or mse_c < float(
-                        best_seed.get("mse", float("inf"))
-                    ):
-                        best_seed = cand
-                if best_seed is not None and np.isfinite(
-                    float(best_seed.get("mse", float("inf")))
-                ):
-                    seed_mse = float(best_seed["mse"])
-                    seed_comp = int(
-                        best_seed.get("complexity")
-                        or self._formula_complexity(best_seed.get("formula"))
+                best_formula, best_mse, promoted = (
+                    self._promote_best_screened_candidate(
+                        candidate_formulas, best_formula, best_mse, y
                     )
-                    fp_mse = (
-                        float(best_mse)
-                        if best_mse is not None and np.isfinite(best_mse)
-                        else float("inf")
-                    )
-                    better_fit = seed_mse <= fp_mse * 1.02 + 1e-15
-                    much_simpler = seed_comp + 12 <= fp_comp
-                    strong_fit = seed_mse <= max(
-                        1e-4, 0.05 * max(float(np.var(y)), 1e-12)
-                    )
-                    if better_fit and (much_simpler or strong_fit or seed_mse < fp_mse):
-                        best_formula = str(best_seed["formula"])
-                        best_mse = seed_mse
-                        self._promoted_structure_seed_ = {
-                            "formula": best_formula,
-                            "mse": seed_mse,
-                            "complexity": seed_comp,
-                            "skeleton": str(best_seed.get("skeleton") or ""),
-                            "from_structure_seed": True,
+                )
+                self._promoted_structure_seed_ = promoted
+                if isinstance(promoted, dict):
+                    if isinstance(self.blackbox_diagnostics_, dict):
+                        self.blackbox_diagnostics_["structure_seed_promoted"] = {
+                            "formula": promoted["formula"][:160],
+                            "mse": promoted["mse"],
+                            "complexity": promoted["complexity"],
+                            "fp_mse": _fp_mse_before,
+                            "fp_complexity": _fp_comp_before,
+                            "skeleton": str(promoted.get("skeleton") or "")[:120],
+                            "source": promoted.get("promoted_from_source", ""),
                         }
-                        if isinstance(self.blackbox_diagnostics_, dict):
-                            self.blackbox_diagnostics_["structure_seed_promoted"] = {
-                                "formula": best_formula[:160],
-                                "mse": seed_mse,
-                                "complexity": seed_comp,
-                                "fp_mse": fp_mse if np.isfinite(fp_mse) else None,
-                                "fp_complexity": fp_comp,
-                                "skeleton": str(best_seed.get("skeleton") or "")[:120],
-                            }
             except Exception as exc:
                 self._record_swallowed_error("structure_seed.promote", exc)
 
@@ -10327,6 +10535,28 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 candidate_formulas = screened_univariate_candidates
             else:
                 candidate_formulas = None
+            # 1D path never reaches the blackbox promotion block above, so
+            # run the same honest promotion here — otherwise an exact
+            # targeted probe is dropped while the fast-path incumbent wins.
+            try:
+                _new_best, _new_mse, _promoted_1d = (
+                    self._promote_best_screened_candidate(
+                        candidate_formulas, best_formula, best_mse, y
+                    )
+                )
+                if isinstance(_promoted_1d, dict):
+                    best_formula, best_mse = _new_best, _new_mse
+                    self._promoted_structure_seed_ = _promoted_1d
+                    if isinstance(self.blackbox_diagnostics_, dict):
+                        self.blackbox_diagnostics_["structure_seed_promoted"] = {
+                            "formula": _promoted_1d["formula"][:160],
+                            "mse": _promoted_1d["mse"],
+                            "complexity": _promoted_1d["complexity"],
+                            "skeleton": str(_promoted_1d.get("skeleton") or "")[:120],
+                            "source": _promoted_1d.get("promoted_from_source", ""),
+                        }
+            except Exception as exc:
+                self._record_swallowed_error("univariate.promote", exc)
 
         if (
             getattr(self, "blackbox_state_", None) is not None

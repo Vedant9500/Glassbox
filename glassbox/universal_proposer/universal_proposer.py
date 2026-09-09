@@ -86,6 +86,29 @@ SKELETON_CONFIDENCE_MIN_TOP1_ACC = 0.60
 SKELETON_CONFIDENCE_MIN_TOP5_ACC = 0.80
 CANDIDATE_SUCCESS_REL_MSE_THRESHOLD = 1e-8
 
+# §3.185: relative-MSE noise floor for plan difficulty. Structure recovery
+# under noise can never beat the noise floor; difficulty must vanish there
+# instead of reporting a substantially nonzero term at 1e-6 relative MSE.
+PLAN_REL_MSE_NOISE_FLOOR = 1e-6
+
+# §3.186: joint bound inputs for multivariate multiplier compounding. Base
+# multipliers (≤3.0) times the feature-count factor are capped jointly so
+# high-D plans cannot scale without bound; components ride in the plan.
+PLAN_FEATURE_FACTOR_CAP_FEATURES = 8
+
+# §3.180: decoder prior/fit blend weights, centralized. Univariate and
+# multivariate modes intentionally differ (univariate trusts the prior more);
+# change both together or document why they diverge.
+UNIVARIATE_PRIOR_WEIGHT = 0.65
+UNIVARIATE_FIT_WEIGHT = 0.35
+MULTIVARIATE_PRIOR_WEIGHT = 0.60
+MULTIVARIATE_FIT_WEIGHT = 0.40
+
+# §3.183: entropy-sparsification threshold for operator priors. Operators
+# below this are dropped (not down-weighted) — see last_prior_suppression()
+# for the recorded cut. The returned priors dict stays pure float.
+OPERATOR_PRIOR_SUPPRESSION_THRESHOLD = 0.40
+
 
 def normalize_formula_key(formula: str) -> str:
     text = str(formula)
@@ -412,6 +435,11 @@ def grammar_decode_topk_skeletons(
     Candidate ranking combines:
     - prior compatibility (operator tags vs predicted operator priors)
     - optional data fit quality via affine fit MSE
+
+    §3.180: blend weights are mode-specific by design — univariate uses
+    `UNIVARIATE_PRIOR_WEIGHT`/`UNIVARIATE_FIT_WEIGHT`, multivariate uses
+    `MULTIVARIATE_PRIOR_WEIGHT`/`MULTIVARIATE_FIT_WEIGHT`. Values unchanged;
+    centralized here so cross-mode ordering differences stay visible.
     """
     candidates = _build_univariate_grammar_candidates(max_depth=max_depth)
     y = y.reshape(-1)
@@ -434,13 +462,14 @@ def grammar_decode_topk_skeletons(
             fit_score = float(np.exp(-mse / y_var)) if np.isfinite(mse) else 0.0
 
         # Weighted blend; keep score in [0,1] neighborhood.
-        score = 0.65 * prior_score + 0.35 * fit_score
+        score = UNIVARIATE_PRIOR_WEIGHT * prior_score + UNIVARIATE_FIT_WEIGHT * fit_score
         scored.append(
             {
                 "formula": formula,
                 "probability": float(max(1e-9, score)),
                 "score": float(1.0 - min(score, 1.0)),
                 "mse": None if not np.isfinite(mse) else float(mse),
+                "decode_mode": "univariate",
             }
         )
 
@@ -546,20 +575,31 @@ def grammar_decode_multivariate_skeletons(
                     )
                 else:
                     prior_score = 1e-6
-                score = 0.6 * prior_score + 0.4 * fit_score
+                score = MULTIVARIATE_PRIOR_WEIGHT * prior_score + MULTIVARIATE_FIT_WEIGHT * fit_score
                 scored.append(
                     {
                         "formula": formula,
                         "probability": float(max(1e-9, score)),
                         "score": float(1.0 - min(score, 1.0)),
                         "mse": None if not np.isfinite(mse) else float(mse),
+                        # §3.182: fit domain metadata — the affine fit ran on
+                        # the finite (xi, xj, y) mask, not necessarily full X.
+                        "decode_mode": "multivariate",
+                        "n_fit_rows": int(mask.sum()),
+                        "finite_fraction": float(mask.sum()) / max(1, int(y.shape[0])),
                     }
                 )
 
     if not scored:
-        return grammar_decode_topk_skeletons(
+        # §3.181: first-column univariate-projection fallback — annotated so
+        # downstream FPIP/search plans never mistake these for multivariate
+        # grammar candidates.
+        fallback = grammar_decode_topk_skeletons(
             operator_priors, x[:, 0], y, top_k=top_k, max_depth=2
         )
+        for d in fallback:
+            d["decode_mode"] = "univariate_projection"
+        return fallback
     scored.sort(key=lambda d: (-d["probability"], d["score"]))
     return scored[: max(1, int(top_k))]
 
@@ -587,12 +627,48 @@ def _operator_priors(
         if child in predictions and parent in predictions:
             predictions[parent] = max(predictions[parent], predictions[child])
 
-    # Entropy-based Sparsification: Silence weak guesses
-    for op in list(predictions.keys()):
-        if predictions[op] < 0.4:
-            del predictions[op]
+    # Entropy-based Sparsification: Silence weak guesses.
+    # §3.183: the cut is destructive (downstream scores missing tags as 1e-6
+    # and empty dicts change routing), so the threshold lives in
+    # OPERATOR_PRIOR_SUPPRESSION_THRESHOLD and every suppressed value is
+    # recorded in _LAST_PRIOR_SUPPRESSION (see last_prior_suppression()).
+    # The returned dict stays pure float: callers iterate values
+    # (benchmark_suite compares prob > 0.15) and must never see metadata.
+    suppressed = {
+        op: predictions[op]
+        for op in list(predictions.keys())
+        if predictions[op] < OPERATOR_PRIOR_SUPPRESSION_THRESHOLD
+    }
+    for op in suppressed:
+        del predictions[op]
+    global _LAST_PRIOR_SUPPRESSION
+    _LAST_PRIOR_SUPPRESSION = {
+        "suppressed_operators": dict(suppressed),
+        "suppression_threshold": float(OPERATOR_PRIOR_SUPPRESSION_THRESHOLD),
+        "n_retained": len(predictions),
+    }
 
     return predictions
+
+
+_LAST_PRIOR_SUPPRESSION: dict[str, Any] = {
+    "suppressed_operators": {},
+    "suppression_threshold": float(OPERATOR_PRIOR_SUPPRESSION_THRESHOLD),
+    "n_retained": 0,
+}
+
+
+def last_prior_suppression() -> dict[str, Any]:
+    """Diagnostic snapshot of the last _operator_priors sparsification."""
+    return {
+        "suppressed_operators": dict(
+            _LAST_PRIOR_SUPPRESSION.get("suppressed_operators") or {}
+        ),
+        "suppression_threshold": float(
+            _LAST_PRIOR_SUPPRESSION.get("suppression_threshold", 0.4)
+        ),
+        "n_retained": int(_LAST_PRIOR_SUPPRESSION.get("n_retained", 0)),
+    }
 
 
 def _proposer_model_contract(
@@ -874,9 +950,13 @@ def build_search_plan(
 
     difficulty = 0.0
     difficulty += 0.35 * uncertain
-    difficulty += 0.20 * float(
-        np.clip(np.log10(best_rel_mse + 1e-12) + 6.0, 0.0, 6.0) / 6.0
+    # §3.185: floor-aware rel-MSE term — perfect noisy recovery
+    # (rel ≈ floor) contributes ~0, not a substantially nonzero term.
+    rel_above_floor = max(float(best_rel_mse) - PLAN_REL_MSE_NOISE_FLOOR, 0.0)
+    rel_mse_term = float(
+        np.clip(np.log10(rel_above_floor + 1e-12) + 6.0, 0.0, 6.0) / 6.0
     )
+    difficulty += 0.20 * rel_mse_term
     difficulty += 0.15 * float(np.clip(roughness / 4.0, 0.0, 1.0))
     difficulty += 0.10 * float(np.clip(turning_rate * 3.0, 0.0, 1.0))
     difficulty += 0.10 * float(max(has_rational, has_exp, has_log))
@@ -929,6 +1009,9 @@ def build_search_plan(
             "best_relative_mse": None
             if not np.isfinite(best_rel_mse)
             else float(best_rel_mse),
+            # §3.185/186: raw difficulty components for auditability.
+            "rel_mse_term": float(rel_mse_term),
+            "rel_mse_noise_floor": float(PLAN_REL_MSE_NOISE_FLOOR),
             "uncertainty": float(uncertain),
             "roughness": roughness,
             "turning_rate": turning_rate,
@@ -984,12 +1067,25 @@ def build_multivariate_search_plan(
     plan["seed_budget"] = max(
         int(plan.get("seed_budget", 0)), min(24, 6 + 2 * n_features)
     )
-    plan["generation_multiplier"] = float(plan.get("generation_multiplier", 1.0)) * (
-        1.0 + 0.1 * max(0, n_features - 1)
+    base_generation = float(plan.get("generation_multiplier", 1.0))
+    base_population = float(plan.get("population_multiplier", 1.0))
+    capped_features = min(n_features, PLAN_FEATURE_FACTOR_CAP_FEATURES)
+    plan["generation_multiplier"] = base_generation * (
+        1.0 + 0.1 * max(0, capped_features - 1)
     )
-    plan["population_multiplier"] = float(plan.get("population_multiplier", 1.0)) * (
-        1.0 + 0.08 * max(0, n_features - 1)
+    plan["population_multiplier"] = base_population * (
+        1.0 + 0.08 * max(0, capped_features - 1)
     )
+    # §3.186: compounding is now jointly bounded and auditable — the feature
+    # factor stops growing past the cap, and all components ride along.
+    plan["multiplier_components"] = {
+        "base_generation_multiplier": base_generation,
+        "base_population_multiplier": base_population,
+        "feature_count": n_features,
+        "feature_count_capped": capped_features,
+        "generation_multiplier": float(plan.get("generation_multiplier", 1.0)),
+        "population_multiplier": float(plan.get("population_multiplier", 1.0)),
+    }
     if interaction_strength > 0.2:
         plan["early_stop_max_nodes"] = max(
             int(plan.get("early_stop_max_nodes", 20)), 24 + 4 * n_features
