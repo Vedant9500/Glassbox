@@ -715,6 +715,23 @@ def _infer_formula_units(formula, input_units, output_units=None):
       penalty: float (squared mismatches; higher = more unphysical)
       ok: bool (safe inference succeeded)
       reason: str
+
+    §3.201 parity note: this parser sees only discrete display text, so
+    ``+``/``-`` propagate left units and ``*``/``/`` add/subtract exponents
+    — matching the native graph side for seeded graphs: the seed builder
+    weight-combines additive terms (no soft gate involved), emits mul at
+    exact mode (beta 2, gamma 1, distance 0 under the native metric), and
+    uses hard Division; native ``dimensional_penalty`` in evolution.h snaps
+    any soft Arithmetic to the nearest of the four discrete modes. Probed:
+    ``x0*x1`` seeds Arithmetic(2,1) (mul, distance 0), ``x0/x1`` seeds hard
+    Division, ``x0±x1`` seed with no Binary node. Near-soft gates have no
+    text form, so no observable divergence remains on these branches.
+
+    §3.202 contract: ``output_units=None`` skips the output comparison
+    (helper-level opt-out for direct callers). The estimator never takes
+    this path — ``_validate_physics_units`` requires both-or-neither and
+    the native bridge receives ``[]``-for-absent, which native also treats
+    as skip. Asymmetry is deliberate: None = "don't check outputs".
     """
     text = str(formula or "").strip()
     if not text or not input_units:

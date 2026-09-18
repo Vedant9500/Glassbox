@@ -521,11 +521,14 @@ class StructureConfidenceTracker:
     ):
         """
         Args:
-            mse_threshold: MSE below this is considered "good"
+            mse_threshold: MSE below this is considered "good". Absolute
+                fallback — call calibrate_mse_threshold(y) once target data
+                is available for a scale-aware threshold (see §3.93).
             stability_generations: Consecutive good generations needed for high confidence
             min_mutation_fraction: Minimum mutation rate fraction (0.1 = 10% of original)
         """
         self.mse_threshold = mse_threshold
+        self._mse_threshold_calibrated = False
         self.stability_generations = stability_generations
         self.min_mutation_fraction = min_mutation_fraction
 
@@ -535,6 +538,32 @@ class StructureConfidenceTracker:
         self.best_mse_seen = float("inf")
         self.generations_stable = 0
         self.last_improvement_gen = 0
+
+    def calibrate_mse_threshold(self, y) -> float:
+        """Scale the "good MSE" threshold to target variance (§3.93).
+
+        Good fit means R² ≳ 0.99, i.e. MSE ≲ 1% of target variance — not an
+        absolute 0.01 (a 1e-8-variance target would earn full confidence
+        while relatively poor; a 1e6-scaled target never could). Returns
+        the calibrated threshold; without calibration the ctor absolute
+        value remains as fallback.
+        """
+        try:
+            import torch
+
+            if isinstance(y, torch.Tensor):
+                var = float(y.detach().cpu().float().var().item())
+            else:
+                import numpy as np
+
+                var = float(np.var(np.asarray(y, dtype=np.float64)))
+        except Exception:
+            var = float("nan")
+        if not math.isfinite(var):
+            return self.mse_threshold
+        self.mse_threshold = max(1e-12, 0.01 * max(var, 1e-15))
+        self._mse_threshold_calibrated = True
+        return self.mse_threshold
 
         # Escape hatch state
         self.refinement_mse_before = None
@@ -1425,6 +1454,11 @@ def adaptive_coefficient_pruning(
 
         n_features = weights.shape[1] if weights.dim() == 2 else weights.shape[0]
         pruned_indices = []
+        # §3.92: joint pruning of independently-marked coefficients can blow
+        # up on correlated weights (each negligible alone, large together).
+        # Track the additive expectation so the joint result below can roll
+        # back super-additive degradation instead of returning it.
+        marked_increase_total = 0.0
 
         for i in range(n_features):
             # Save original weight
@@ -1449,6 +1483,10 @@ def adaptive_coefficient_pruning(
             mse_increase = new_mse - base_mse
             if mse_increase < prune_ratio * base_mse:
                 pruned_indices.append(i)
+                marked_increase_total += max(0.0, mse_increase)
+
+        # Snapshot for §3.92 rollback (joint prune may be super-additive).
+        orig_all = weights.clone()
 
         # Prune marked coefficients
         for i in pruned_indices:
@@ -1460,6 +1498,15 @@ def adaptive_coefficient_pruning(
         # Final MSE
         pred, _ = model(x, hard=True)
         final_mse = F.mse_loss(pred.squeeze(), y.squeeze()).item()
+
+        # §3.92: reject super-additive joint degradation — restore and report
+        # no pruning rather than returning an uncompared worse model.
+        allowed = (
+            base_mse + marked_increase_total + 1e-9 * max(1.0, abs(base_mse))
+        )
+        if (not math.isfinite(final_mse)) or final_mse > allowed:
+            weights.copy_(orig_all)
+            return 0, base_mse
 
     return len(pruned_indices), final_mse
 
@@ -2589,34 +2636,46 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
 
             # Check if explorer found something better than main population
             if best_explorer.fitness < best_current.fitness:
-                # MIGRATION: Explorer found a better basin!
-                # Inject the explorer's solution into main population
+                # Archive the record (best_explorer tracks the best basin
+                # ever seen by explorers).
                 if (
                     self.best_explorer is None
                     or best_explorer.fitness < self.best_explorer.fitness
                 ):
                     self.best_explorer = best_explorer.clone()
 
-                    # Replace worst individuals in main population with
-                    # copies of the explorer's discovery
-                    sorted_pop = sorted(self.population, key=lambda ind: ind.fitness)
-                    n_migrate = min(3, len(sorted_pop) // 4)  # Migrate up to 3 or 25%
+                # §3.89: MIGRATION is a population need, not a record event.
+                # The old code injected only on a new explorer record, so a
+                # still-leading basin was never re-injected after the main
+                # population lost its descendants. Inject whenever the
+                # current best explorer beats the current population — no
+                # dedup key needed: once descendants survive, best_current
+                # matches the basin and the strict inequality stops firing.
+                # Replace worst individuals in main population with
+                # copies of the explorer's discovery
+                sorted_pop = sorted(self.population, key=lambda ind: ind.fitness)
+                n_migrate = min(3, len(sorted_pop) // 4)  # Migrate up to 3 or 25%
 
-                    for i in range(n_migrate):
-                        # Clone explorer and add slight variation
-                        migrant = best_explorer.clone()
-                        migrant.is_explorer = False
-                        # §3.88: migrants are new individuals — never inherit an
-                        # elite evaluation skip (Tier-3 keeps stale fitness for
-                        # flagged elites; migrant fitness must be remeasured
-                        # in the main population next generation).
-                        migrant._is_elite = False
-                        # Replace worst individual
-                        self.population[-(i + 1)] = migrant
+                for i in range(n_migrate):
+                    # Clone explorer and add slight variation
+                    migrant = best_explorer.clone()
+                    migrant.is_explorer = False
+                    # §3.88: migrants are new individuals — never inherit an
+                    # elite evaluation skip (Tier-3 keeps stale fitness for
+                    # flagged elites; migrant fitness must be remeasured
+                    # in the main population next generation).
+                    migrant._is_elite = False
+                    # Replace worst individual
+                    self.population[-(i + 1)] = migrant
 
-                    # Also update best_ever if explorer beat it
-                    if best_explorer.fitness < self.best_ever.fitness:
-                        self.best_ever = best_explorer.clone()
+                if n_migrate:
+                    self._explorer_migrations = (
+                        getattr(self, "_explorer_migrations", 0) + 1
+                    )
+
+                # Also update best_ever if explorer beat it
+                if best_explorer.fitness < self.best_ever.fitness:
+                    self.best_ever = best_explorer.clone()
 
     def evolve_explorers(self, x: torch.Tensor, y: torch.Tensor):
         """
@@ -2880,6 +2939,10 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
 
         # ---------------------------------------------------------------------
         # NEW C++ BACKEND INTEGRATION
+        # §3.93: scale the confidence MSE threshold to the fitness target
+        # (normalized targets keep ~0.01; unnormalized ones stop using an
+        # absolute unit).
+        self.confidence_tracker.calibrate_mse_threshold(fit_y_cpu)
         # If the C++ core is available, we run the evolution natively in C++
         # for a massive speedup (100x+), skipping the PyTorch loop.
         # ---------------------------------------------------------------------

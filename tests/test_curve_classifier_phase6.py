@@ -42,6 +42,8 @@ def test_checkpoint_card_records_phase6_rollout_contract():
         data_generation_command="python -m glassbox.curve_classifier.generate_curve_data --out data/fixed.npz",
         training_command="python -m glassbox.curve_classifier.train_curve_classifier --data data/fixed.npz",
         runtime_contract={"univariate": "trained_univariate_neural"},
+        row_order_stress={"passed": True, "source": "test_evidence"},
+        runtime_fallback={"passed": True, "source": "test_evidence"},
     )
 
     assert card["schema_version"] == CHECKPOINT_CARD_SCHEMA_VERSION
@@ -63,12 +65,16 @@ def test_rollout_comparison_blocks_without_baseline_and_passes_when_candidate_wi
         checkpoint_path=Path("models/new.pt"),
         validation_report=_validation_report(val_f1=0.82),
         checkpoint_metadata={"feature_dim": 398},
+        row_order_stress={"passed": True, "source": "test_evidence"},
+        runtime_fallback={"passed": True, "source": "test_evidence"},
     )
     baseline = build_checkpoint_card(
         model_kind="curve_classifier",
         checkpoint_path=Path("models/old.pt"),
         validation_report=_validation_report(val_f1=0.80),
         checkpoint_metadata={"feature_dim": 398},
+        row_order_stress={"passed": True, "source": "test_evidence"},
+        runtime_fallback={"passed": True, "source": "test_evidence"},
     )
 
     missing_baseline = build_rollout_comparison(candidate_card=candidate)

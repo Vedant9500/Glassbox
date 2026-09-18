@@ -15,6 +15,19 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/eigen)
 # Add our C++ module (same sources/flags intent as setup.py)
 pybind11_add_module(_core core.cpp)
 
+# §3.391: stamp the source revision (mirrors setup.py GB_BUILD_COMMIT).
+execute_process(
+  COMMAND git rev-parse --short=12 HEAD
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  OUTPUT_VARIABLE GB_BUILD_COMMIT
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+)
+if(NOT GB_BUILD_COMMIT MATCHES "^[0-9a-f]+$")
+  set(GB_BUILD_COMMIT "unknown")
+endif()
+target_compile_definitions(_core PRIVATE GB_BUILD_COMMIT=${GB_BUILD_COMMIT})
+
 # Optimize for speed + OpenMP (align with setup.py / P6-004)
 if(MSVC)
   target_compile_options(_core PRIVATE /O2 /openmp)

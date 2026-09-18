@@ -888,6 +888,11 @@ def compute_specialist_state(
     # §3.213: segment-win noise floor scaled to target variance. Bare 1e-12
     # lets dust-level margins count as wins/switches on large-scale targets.
     win_floor = max(1e-12, 1e-6 * max(float(np.var(y_arr)), 1e-15))
+    # §3.213 (margin half): margins normalize by baseline target variance,
+    # not by the worse of the two candidates, and dust below win_floor
+    # contributes nothing. Otherwise many narrow wins on tiny absolute
+    # improvements outrank a few decisive ones.
+    base_var = max(float(np.var(y_arr)), 1e-15)
 
     # Rank candidates before the first-N slice so the top performers are kept
     # (L-01: previously sliced by input order with no rank sort).
@@ -1083,8 +1088,9 @@ def compute_specialist_state(
                     segment_switches += 1
                 if winner != -1:
                     prev_winner = winner
-                denom = max(seg_l.mse, seg_r.mse, 1e-12)
-                segment_margin_sum += abs(seg_l.mse - seg_r.mse) / denom
+                seg_gap = abs(seg_l.mse - seg_r.mse)
+                if seg_gap >= win_floor:
+                    segment_margin_sum += min(1.0, seg_gap / base_var)
 
             split_score = min(left_wins, right_wins) / max(
                 1.0, float(len(left.segment_scores))
@@ -1150,8 +1156,9 @@ def compute_specialist_state(
                         hs_segment_switches += 1
                     if winner != -1:
                         hs_prev_winner = winner
-                    denom = max(seg_l.mse, seg_r.mse, 1e-12)
-                    hs_segment_margin_sum += abs(seg_l.mse - seg_r.mse) / denom
+                    hs_gap = abs(seg_l.mse - seg_r.mse)
+                    if hs_gap >= win_floor:
+                        hs_segment_margin_sum += min(1.0, hs_gap / base_var)
 
                 hs_split_score = min(hs_left_wins, hs_right_wins) / max(
                     1.0, float(len(hot_spot_segments))
@@ -1264,6 +1271,16 @@ def nest_formulas(f: str, g: str, var: str | None = None) -> str:
     return re.sub(rf"\b{re.escape(var)}\b", f"({g})", f)
 
 
+def _token_complexity(formula: str) -> int:
+    """Paren-neutral structural token count for complexity budgets (M-31)."""
+    return len(
+        re.findall(
+            r"[A-Za-z_]\w*|\d+(?:\.\d*)?(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?|\*\*|[+\-*/^]",
+            str(formula),
+        )
+    )
+
+
 def _dedupe_append(forms: list[tuple[str, str]], operator: str, formula: str) -> None:
     key = (operator, "".join(str(formula).lower().split()))
     if key not in {
@@ -1288,15 +1305,34 @@ def propose_specialist_compositions(
     proposals: list[SpecialistCompositionProposal] = []
     seen = set()
 
-    # Simple local eval helper if evaluate_formula is not provided
+    # Simple local eval helper if evaluate_formula is not provided.
+    # M-30: use the estimator's protected function mapping — raw np.log /
+    # np.sqrt / np.exp turn domain failures into warnings + NaN/Inf with
+    # different accept/reject semantics than _eval_formula_raw.
+    def _safe_log(x):
+        x = np.asarray(x, dtype=np.float64)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(
+                np.abs(x) > 1e-300,
+                np.log(np.abs(x) + 1e-300),
+                -300.0,
+            )
+
+    def _safe_sqrt(x):
+        return np.sqrt(np.maximum(np.asarray(x, dtype=np.float64), 0.0))
+
+    def _safe_exp(x):
+        with np.errstate(over="ignore"):
+            return np.exp(np.clip(np.asarray(x, dtype=np.float64), -500, 500))
+
     def _local_eval(expr_str: str, X_val: np.ndarray) -> np.ndarray:
         context = {
             "np": np,
             "sin": np.sin,
             "cos": np.cos,
-            "exp": np.exp,
-            "log": np.log,
-            "sqrt": np.sqrt,
+            "exp": _safe_exp,
+            "log": _safe_log,
+            "sqrt": _safe_sqrt,
             "abs": np.abs,
         }
         X_val = np.asarray(X_val, dtype=np.float64)
@@ -1329,8 +1365,48 @@ def propose_specialist_compositions(
         pred_f, pred_g = None, None
         if y is not None:
             y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
-            pred_f = left.residual_vector + y_arr
-            pred_g = right.residual_vector + y_arr
+            # §3.19: residual_vector may have been recorded on a split,
+            # subsample, weighted, or reordered run, so residual + y can
+            # silently describe the wrong rows. Recompute on the current X
+            # when available (same eval_fn the template grading below uses);
+            # reconstruction is only a fallback and must match shapes.
+            def _recompute(formula_text: str) -> np.ndarray | None:
+                if X is None:
+                    return None
+                try:
+                    p = np.asarray(
+                        eval_fn(formula_text, np.asarray(X, dtype=np.float64)),
+                        dtype=np.float64,
+                    ).reshape(-1)
+                except Exception:
+                    return None
+                if p.shape != y_arr.shape or not np.all(np.isfinite(p)):
+                    return None
+                return p
+
+            fresh_f = _recompute(pair.formula_a)
+            fresh_g = _recompute(pair.formula_b)
+            if fresh_f is not None and fresh_g is not None:
+                pred_f, pred_g = fresh_f, fresh_g
+            else:
+                try:
+                    rec_f = np.asarray(
+                        left.residual_vector, dtype=np.float64
+                    ).reshape(-1) + y_arr
+                    rec_g = np.asarray(
+                        right.residual_vector, dtype=np.float64
+                    ).reshape(-1) + y_arr
+                except Exception:
+                    rec_f = rec_g = None
+                if (
+                    rec_f is not None
+                    and rec_g is not None
+                    and rec_f.shape == y_arr.shape
+                    and rec_g.shape == y_arr.shape
+                    and np.all(np.isfinite(rec_f))
+                    and np.all(np.isfinite(rec_g))
+                ):
+                    pred_f, pred_g = rec_f, rec_g
 
         forms: list[tuple[str, str]] = []
         _dedupe_append(forms, "add", f"(({pair.formula_a})+({pair.formula_b}))")
@@ -1367,7 +1443,23 @@ def propose_specialist_compositions(
                     return
                 if "log" in nestable and np.min(inner_pred) <= 0.01:
                     return
-            _dedupe_append(forms, "nested", nest_formulas(outer_formula, inner_formula))
+            # §3.215: nest into an explicit target variable. Legacy global
+            # replace collapses every feature of a multivariate outer to the
+            # same inner expression; emit one candidate per distinct outer
+            # variable instead (the grading loop below scores each honestly).
+            outer_vars = sorted(
+                set(re.findall(r"\bx\d*\b", str(outer_formula))),
+                key=lambda v: (len(v), v),
+            )
+            if len(outer_vars) <= 1:
+                _dedupe_append(forms, "nested", nest_formulas(outer_formula, inner_formula))
+            else:
+                for target in outer_vars:
+                    _dedupe_append(
+                        forms,
+                        "nested",
+                        nest_formulas(outer_formula, inner_formula, var=target),
+                    )
 
         _maybe_add_nested(pair.formula_a, pair.formula_b, pair.family_a, pred_g)
         _maybe_add_nested(pair.formula_b, pair.formula_a, pair.family_b, pred_f)
@@ -1529,8 +1621,11 @@ def propose_specialist_compositions(
                 mse_val = 0.0
 
             # Reject too complex templates
-            comp_f = len(pair.formula_a)
-            comp_g = len(pair.formula_b)
+            # M-31: string length mixes lexical formatting with structure
+            # (extra parens inflate budget). Count structural tokens
+            # (names, numbers, operators) instead — paren-neutral.
+            comp_f = _token_complexity(pair.formula_a)
+            comp_g = _token_complexity(pair.formula_b)
             if left is not None and right is not None:
                 comp_f = left.complexity
                 comp_g = right.complexity

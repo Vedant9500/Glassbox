@@ -478,7 +478,8 @@ def run_exactness_pass(
     """If raw fit is strong but display form is weak, try integer-power / identity rewrites.
 
     Returns ``(best_formula, diagnostics)``. Never worsens MSE beyond *improve_tol*
-    relative to the better of raw/display baselines.
+    relative to the displayed formula's own MSE (raw engine MSE is recorded
+    for comparison but never used as the acceptance baseline).
     """
     diagnostics = {
         "attempted": False,
@@ -486,6 +487,8 @@ def run_exactness_pass(
         "reason": None,
         "n_candidates": 0,
         "baseline_mse": None,
+        "base_display_mse": None,
+        "base_raw_mse": None,
         "best_mse": None,
         "best_formula": None,
     }
@@ -511,12 +514,14 @@ def run_exactness_pass(
     base_raw = (
         float(raw_mse) if raw_mse is not None and np.isfinite(raw_mse) else base_display
     )
-    baseline = (
-        min(base_display, base_raw)
-        if np.isfinite(base_display) or np.isfinite(base_raw)
-        else float("inf")
-    )
-    diagnostics["baseline_mse"] = float(baseline) if np.isfinite(baseline) else None
+    # §3.342: acceptance gates on the DISPLAYED formula's own measured MSE.
+    # min(raw, display) let a rewrite pass as "within 5% of baseline" against
+    # an internal-graph MSE it does not reproduce. Raw is kept only as a
+    # diagnostic comparison (eligibility/drift logic below still uses it).
+    gate = base_display
+    diagnostics["base_display_mse"] = float(base_display) if np.isfinite(base_display) else None
+    diagnostics["base_raw_mse"] = float(base_raw) if np.isfinite(base_raw) else None
+    diagnostics["baseline_mse"] = float(gate) if np.isfinite(gate) else None
 
     # Eligibility: strong raw fit but display not exact, or large raw↔display
     # drift. Skip when both metrics are already excellent.
@@ -540,7 +545,7 @@ def run_exactness_pass(
     diagnostics["n_candidates"] = len(candidates)
 
     best_f = text
-    best_m = base_display if np.isfinite(base_display) else baseline
+    best_m = base_display if np.isfinite(base_display) else gate
     for cand in candidates:
         m = _mse(cand)
         if not np.isfinite(m):
@@ -555,7 +560,7 @@ def run_exactness_pass(
     diagnostics["best_mse"] = float(best_m) if np.isfinite(best_m) else None
     diagnostics["best_formula"] = best_f
     if best_f.replace(" ", "") != text.replace(" ", "") and np.isfinite(best_m):
-        if not np.isfinite(baseline) or best_m <= baseline * 1.05 + 1e-15:
+        if not np.isfinite(gate) or best_m <= gate * 1.05 + 1e-15:
             diagnostics["accepted"] = True
             diagnostics["reason"] = "improved_or_equal"
             return best_f, diagnostics
@@ -1083,7 +1088,12 @@ def postprocess_formula_with_fidelity_guard(
         }
 
     if raw_mse is None and processed != fallback:
-        return fallback, {
+        # M-80: the old branch returned fallback solely for differing from
+        # processed, without any fidelity comparison — and neither rewrite's
+        # fidelity is provable when raw itself cannot be measured. Fail
+        # closed to the original formula; both measurements stay recorded
+        # for diagnostics.
+        return formula, {
             "postprocess_guard_triggered": True,
             "postprocess_raw_mse": raw_mse,
             "postprocess_processed_mse": processed_mse,

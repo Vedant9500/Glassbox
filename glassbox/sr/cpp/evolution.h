@@ -440,6 +440,14 @@ public:
     int get_prior_entries_sanitized() const { return prior_entries_sanitized_; }
     // M-274: true when requested islands fell back to a single population.
     bool get_island_fallback_to_single() const { return island_fallback_to_single_; }
+    // §3.426: effective explorer/main split of the last generation (the
+    // requested fraction is clamped to elites when small, silently making
+    // every non-elite offspring an explorer).
+    int get_last_num_explorers() const { return last_num_explorers_; }
+    int get_last_main_pop_target() const { return last_main_pop_target_; }
+    bool get_last_main_population_elites_only() const {
+        return last_main_population_elites_only_;
+    }
     // P-04 diagnostics.
     long long get_fd_probes_total() const { return fd_probes_total_; }
     long long get_fd_probes_skipped_inert() const {
@@ -673,18 +681,25 @@ public:
                 islands[i].evolve_one_generation(gen);
             }
 
-            // Migration: ring topology (island i -> island i+1)
+            // Migration: ring topology (island i -> island i+1).
+            // §3.427: stage from pre-migration snapshots. The old in-place
+            // ring let a received migrant re-propagate in the same exchange
+            // (island i+1 becomes a source after receiving), so one elite
+            // could sweep the whole ring in a single generation.
             if (gen > 0 && gen % config_.migration_interval == 0) {
+                std::vector<std::vector<IndividualGraph>> snapshots;
+                snapshots.reserve(static_cast<size_t>(config_.num_islands));
                 for (int i = 0; i < config_.num_islands; ++i) {
-                    int next = (i + 1) % config_.num_islands;
-                    auto& src = islands[i].population_;
-                    auto& dst = islands[next].population_;
-
-                    // Sort source by fitness (raw_mse tie-break) to get top elites
-                    std::sort(src.begin(), src.end(),
+                    snapshots.push_back(islands[i].population_);
+                    std::sort(snapshots.back().begin(), snapshots.back().end(),
                               [](const IndividualGraph& a, const IndividualGraph& b) {
                                   return is_better_champion(a, b);
                               });
+                }
+                for (int i = 0; i < config_.num_islands; ++i) {
+                    int next = (i + 1) % config_.num_islands;
+                    const auto& src = snapshots[static_cast<size_t>(i)];
+                    auto& dst = islands[next].population_;
 
                     // Replace worst in destination with source elites
                     std::sort(dst.begin(), dst.end(),
@@ -783,6 +798,10 @@ private:
     bool trace_enabled_ = false;
     bool last_crossover_valid_ = false;
     int crossover_attempts_ = 0;
+    // §3.426: last generation's effective explorer/main split.
+    int last_num_explorers_ = 0;
+    int last_main_pop_target_ = 0;
+    bool last_main_population_elites_only_ = false;
     int crossover_successes_ = 0;
     // M-283/M-274 diagnostics (plain ints; aggregated post-join like fd probes).
     int prior_entries_sanitized_ = 0;
@@ -1898,6 +1917,13 @@ private:
                 // readers must not see garbage from the previous type.
                 // normalize_node_fields keeps exactly the new type's fields.
                 if (i == 0 || runif(rng_) < 0.2) {
+                    // §3.228: a type-category change must not inherit the old
+                    // basis weight. The previous output weight described a
+                    // different operator/leaf; keeping it silently reinterprets
+                    // a fresh constant/input as an evolved coefficient and can
+                    // spike collinearity for the ridge solve. Restart at 0 —
+                    // the post-mutation solve re-scores and re-fits weights.
+                    const NodeType old_type_leaf = node.type;
                     if (runif(rng_) < 0.5 && n_inputs > 0) {
                         node.type = NodeType::Input;
                         std::uniform_int_distribution<int> feat_dist(0, n_inputs - 1);
@@ -1907,23 +1933,33 @@ private:
                         node.value += rnorm(rng_); 
                     }
                     normalize_node_fields(node);
+                    if (node.type != old_type_leaf &&
+                        i < static_cast<int>(child.output_weights.size())) {
+                        child.output_weights[static_cast<size_t>(i)] = 0.0;
+                    }
                 } else {
                     // M-246: node 1 was forced Unary by `i < 2`, limiting
                     // structural diversity. A Binary with both children at 0
                     // is bottom-up valid, so let i==1 sample both types —
                     // child_dist(0, 0) deterministically yields (0, 0).
                     if (runif(rng_) < 0.6) {
+                        const NodeType old_type_unary = node.type;
                         node.type = NodeType::Unary;
                         std::uniform_int_distribution<int> child_dist(0, i - 1);
                         node.left_child = child_dist(rng_);
                         node.unary_op = sample_unary_op_for_child(child, node.left_child);
                         normalize_node_fields(node);
+                        if (node.type != old_type_unary &&
+                            i < static_cast<int>(child.output_weights.size())) {
+                            child.output_weights[static_cast<size_t>(i)] = 0.0;
+                        }
                         if (node.unary_op == UnaryOp::IntPow) {
                             const int intpow_candidates[] = {2, 3, 4, 5, 6};
                             std::uniform_int_distribution<int> ip_dist(0, 4);
                             node.p = static_cast<double>(intpow_candidates[ip_dist(rng_)]);
                         }
                     } else {
+                        const NodeType old_type_binary = node.type;
                         node.type = NodeType::Binary;
                         node.binary_op = sample_binary_op();
                         if (node.binary_op == BinaryOp::Arithmetic) {
@@ -1933,6 +1969,10 @@ private:
                         node.left_child = child_dist(rng_);
                         node.right_child = child_dist(rng_);
                         normalize_node_fields(node);
+                        if (node.type != old_type_binary &&
+                            i < static_cast<int>(child.output_weights.size())) {
+                            child.output_weights[static_cast<size_t>(i)] = 0.0;
+                        }
                     }
                 }
             } else {
@@ -2993,6 +3033,16 @@ private:
     // Optimizes unary {p, omega, phi} while analytically refitting output
     // weights for each trial point (variable projection style).
     bool refine_inner_params_lm(IndividualGraph& ind) {
+        // §3.364 objective semantics: the LM direction is a raw-residual
+        // Gauss-Newton proposal — FD/varpro Jacobians differentiate the raw
+        // residual vector, and solve_output_weights may hard-prune
+        // coefficients (a non-smooth jump) inside evaluate_residual. The
+        // ACCEPTANCE gate below compares only the configured objective
+        // (trial_mse < base_mse, both from evaluate_residual), so a step is
+        // never kept unless the exact accepted objective improves; prune
+        // jumps and robust-mode direction/objective mismatch can only waste
+        // iterations (bounded by lm_max_iterations), never corrupt the
+        // Champion. In MSE mode direction and objective coincide exactly.
         if (ind.nodes.empty()) return false;
         const int n_samples = static_cast<int>(y_.size());
         if (n_samples <= 0) return false;
@@ -3279,7 +3329,17 @@ private:
         // valid children. Never silently repair invalid graphs (no
         // Constant-0 conversion, no Unary demotion): skip cleanup and leave
         // selection to rout around the invalid individual.
-        if (!is_valid_topology(ind)) return;
+        // §3.421: invalidate loudly on this path — the caller archives are
+        // compared by select_export_champion on their fitness/raw_mse
+        // fields, so returning with pre-cleanup values would export stale
+        // state. (Every other path re-evaluates at step 4 at the latest.)
+        if (!is_valid_topology(ind)) {
+            ind.raw_mse = std::numeric_limits<double>::infinity();
+            ind.weighted_mse = std::numeric_limits<double>::infinity();
+            ind.fitness = 1e30;
+            ind.fitness_valid = false;
+            return;
+        }
         int n_samples = static_cast<int>(y_.size());
         
         // -- Step 1: Evaluate all nodes to get their actual output vectors --
@@ -4533,6 +4593,10 @@ private:
 
         int num_explorers = static_cast<int>(config_.pop_size * config_.explorer_fraction);
         int main_pop_target = std::max(elite_count, config_.pop_size - num_explorers);
+        // §3.426: record the effective split (diagnostics, no behavior change).
+        last_num_explorers_ = num_explorers;
+        last_main_pop_target_ = main_pop_target;
+        last_main_population_elites_only_ = (main_pop_target <= elite_count);
 
         std::uniform_int_distribution<int> parent_dist(0, std::max(0, elite_count - 1));
         std::uniform_real_distribution<double> coin(0.0, 1.0);
@@ -4671,6 +4735,13 @@ private:
                         // Propagate units of the NEAREST discrete mode under
                         // the same distance metric as arithmetic_soft_weights.
                         // 0=add 1=mul 2=div 3=sub.
+                        // §3.201: display text is always discrete, and seeded
+                        // graphs use discrete forms (additive terms are
+                        // weight-combined with no soft gate, mul seeds at
+                        // exact mode (2,1), division seeds hard Division) —
+                        // identical to the Python text-side propagation in
+                        // _infer_formula_units. Near-soft gates have no text
+                        // form, so no observable divergence remains.
                         const double d_add = (node.beta - 1.0) * (node.beta - 1.0) + (node.gamma - 1.0) * (node.gamma - 1.0);
                         const double d_mul = (node.beta - 2.0) * (node.beta - 2.0) + (node.gamma - 1.0) * (node.gamma - 1.0);
                         const double d_div = (node.beta - 2.0) * (node.beta - 2.0) + (node.gamma + 1.0) * (node.gamma + 1.0);

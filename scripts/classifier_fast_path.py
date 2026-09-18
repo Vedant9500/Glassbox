@@ -520,14 +520,28 @@ def _evaluate_formula_values(formula: str, x_np: np.ndarray) -> np.ndarray | Non
         else:
             return None
 
-        if len(free_symbol_names) > len(x_columns):
-            return None
+        # M-54: bind indexed symbols to their explicit column (x7 -> column
+        # 7), not to sorted position. Producers emit x{i} names while columns
+        # arrive in index order, so positional binding misreads any formula
+        # whose symbols are non-contiguous (x_2 + x_10) or multi-digit.
+        args: list[Any] = []
+        positional = list(x_columns)
+        for name in free_symbol_names:
+            idx = _indexed_symbol_column(name)
+            if idx is not None:
+                if idx < 0 or idx >= len(x_columns):
+                    return None
+                args.append(x_columns[idx])
+            else:
+                if not positional:
+                    return None
+                args.append(positional.pop(0))
 
         import warnings
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", RuntimeWarning)
-            y_pred = func(*x_columns[: len(free_symbol_names)])
+            y_pred = func(*args)
 
         y_arr = np.asarray(y_pred, dtype=np.float64)
         if y_arr.shape == ():
@@ -590,6 +604,17 @@ def _safe_numpy_log(x, base=None):
 
 
 @lru_cache(maxsize=256)
+def _indexed_symbol_column(name: str) -> int | None:
+    """Column index for an explicitly indexed feature symbol, else None."""
+    core = name[1:] if name.startswith("x") else None
+    if core is None:
+        return None
+    digits = core[1:] if core.startswith("_") else core
+    if digits.isdigit():
+        return int(digits)
+    return None
+
+
 def _compile_formula_evaluator(
     normalized_formula: str,
 ) -> tuple[tuple[str, ...], float | None, Any | None]:
@@ -600,6 +625,11 @@ def _compile_formula_evaluator(
         parse_expr,
         standard_transformations,
     )
+
+    # M-54: shield multi-digit feature names from implicit multiplication
+    # (x10 would otherwise parse as x*10). x_10 survives as one symbol and
+    # binds to column 10 at the call site.
+    parseable_formula = re.sub(r"\bx(\d+)\b", r"x_\1", normalized_formula)
 
     transformations = standard_transformations + (
         convert_xor,
@@ -621,12 +651,19 @@ def _compile_formula_evaluator(
         "e": sp.E,
     }
     expr = parse_expr(
-        normalized_formula,
+        parseable_formula,
         local_dict=local_dict,
         transformations=transformations,
         evaluate=False,
     )
-    free_syms = sorted(expr.free_symbols, key=lambda sym: sym.name)
+    def _symbol_order(sym):
+        name = sym.name
+        idx = _indexed_symbol_column(name)
+        if idx is not None:
+            return (0, idx, "")
+        return (1, 0, name)
+
+    free_syms = sorted(expr.free_symbols, key=_symbol_order)
 
     if not free_syms:
         return tuple(), float(expr), None

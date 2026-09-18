@@ -2160,7 +2160,13 @@ def _benchmark_worker_cli(input_path: str, output_path: str) -> int:
     try:
         with open(input_path, "rb") as fh:
             call_spec = pickle.load(fh)
-        fn = globals()[call_spec["function"]]
+        # §3.28: never dispatch an arbitrary module global from a pickle
+        # file any local process could have planted in the scratch dir.
+        # Only the three benchmark entry points may run in a worker.
+        name = call_spec["function"]
+        if name not in _BENCHMARK_WORKER_ALLOWLIST:
+            raise ValueError(f"worker function not allowlisted: {name!r}")
+        fn = globals()[name]
         payload = {"status": "ok", "result": fn(**call_spec["kwargs"])}
     except Exception as exc:
         payload = {
@@ -2172,6 +2178,17 @@ def _benchmark_worker_cli(input_path: str, output_path: str) -> int:
     return 0
 
 
+# §3.28: the only functions a timeout worker may execute. Checked in the
+# worker (untrusted pickle input) and up front in the parent (fail fast).
+_BENCHMARK_WORKER_ALLOWLIST = frozenset(
+    {
+        "run_formula",
+        "run_formula_cpp_evolution",
+        "run_formula_specialist_regressor",
+    }
+)
+
+
 def run_benchmark_call_with_timeout(
     function_name: str,
     kwargs: dict[str, Any],
@@ -2179,6 +2196,8 @@ def run_benchmark_call_with_timeout(
 ) -> dict[str, Any]:
     """Run a benchmark formula call in a child process with hard wall-clock timeout."""
     timeout_seconds = float(timeout_seconds or 0.0)
+    if function_name not in _BENCHMARK_WORKER_ALLOWLIST:
+        raise ValueError(f"worker function not allowlisted: {function_name!r}")
     if timeout_seconds <= 0:
         return globals()[function_name](**kwargs)
 

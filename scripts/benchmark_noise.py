@@ -879,49 +879,68 @@ def _run_single(
         return out
 
     # Predictions / metrics.
+    # §3.59: a predict failure must not fabricate train-mean predictions —
+    # the crash would report as a valid mean-baseline result. Record the
+    # error and leave every prediction-derived metric None (fail-closed,
+    # like the fit-failure path above and the full-predict path below).
+    prediction_error = None
     try:
         y_pred_train = est.predict(X_train)
         y_pred_test = est.predict(X_test)
-    except Exception:
-        y_pred_train = np.full_like(y_train, float(np.mean(y_train)))
-        y_pred_test = np.full_like(y_test, float(np.mean(y_train)))
+    except Exception as exc:
+        prediction_error = str(exc)[:200]
+        y_pred_train = None
+        y_pred_test = None
 
-    train_r2 = _safe_r2(y_train, y_pred_train)
-    test_r2 = _safe_r2(y_test, y_pred_test)
-    raw_mse = (
-        float(np.mean((y_pred_test - y_test) ** 2))
-        if np.all(np.isfinite(y_pred_test))
-        else None
-    )
-    display_mse = (
-        bc.evaluate_formula_mse_on_X(formula, X_test, y_test) if formula else None
-    )
-    # §3.58: record whether display_mse was genuinely evaluated or silently
-    # substituted with the protected estimator's raw MSE, so rollup medians
-    # mixing raw/display provenance can be disentangled downstream.
-    if display_mse is None or not math.isfinite(float(display_mse)):
-        display_mse = raw_mse
-        display_mse_source = "raw_mse_fallback"
+    if y_pred_train is None or y_pred_test is None:
+        train_r2 = test_r2 = raw_mse = None
+        display_mse = None
+        display_mse_source = "prediction_failed"
+        holdout_mse = None
+        clean_test_mse = None
+        clean_test_r2 = None
     else:
-        display_mse_source = "evaluated_formula"
-
-    # Holdout currently mirrors the noisy test split; Phase 6 may add a
-    # separate fidelity holdout. Clean columns below are the recovery signal.
-    holdout_mse = raw_mse
-    clean_test_mse = (
-        float(
-            np.mean(
-                (
-                    np.asarray(y_pred_test, dtype=np.float64)
-                    - np.asarray(y_test_clean, dtype=np.float64)
-                )
-                ** 2
-            )
+        train_r2 = _safe_r2(y_train, y_pred_train)
+        test_r2 = _safe_r2(y_test, y_pred_test)
+        raw_mse = (
+            float(np.mean((y_pred_test - y_test) ** 2))
+            if np.all(np.isfinite(y_pred_test))
+            else None
         )
-        if np.all(np.isfinite(y_pred_test))
-        else None
-    )
-    clean_test_r2 = _safe_r2(y_test_clean, y_pred_test)
+    if prediction_error is not None:
+        # §3.59 fail-closed: display/holdout/clean all derive from the failed
+        # predictions, so they stay None with the failure source recorded.
+        pass
+    else:
+        display_mse = (
+            bc.evaluate_formula_mse_on_X(formula, X_test, y_test) if formula else None
+        )
+        # §3.58: record whether display_mse was genuinely evaluated or silently
+        # substituted with the protected estimator's raw MSE, so rollup medians
+        # mixing raw/display provenance can be disentangled downstream.
+        if display_mse is None or not math.isfinite(float(display_mse)):
+            display_mse = raw_mse
+            display_mse_source = "raw_mse_fallback"
+        else:
+            display_mse_source = "evaluated_formula"
+
+        # Holdout currently mirrors the noisy test split; Phase 6 may add a
+        # separate fidelity holdout. Clean columns below are the recovery signal.
+        holdout_mse = raw_mse
+        clean_test_mse = (
+            float(
+                np.mean(
+                    (
+                        np.asarray(y_pred_test, dtype=np.float64)
+                        - np.asarray(y_test_clean, dtype=np.float64)
+                    )
+                    ** 2
+                )
+            )
+            if np.all(np.isfinite(y_pred_test))
+            else None
+        )
+        clean_test_r2 = _safe_r2(y_test_clean, y_pred_test)
 
     # Exact-match check uses the *clean* target on the full selection so noise
     # injection does not corrupt the ground-truth equality test.
@@ -968,6 +987,7 @@ def _run_single(
         "discovered_formula": formula,
         "true_formula": true_formula,
         "error": None,
+        "prediction_error": prediction_error,
     }
     row.update(_blackbox_diag_fields(est, int(n_features)))
     return row

@@ -18,6 +18,33 @@ openmp_link_args = [] if os.name == "nt" else ["-fopenmp"]
 # bindings, std::clamp, if-constexpr paths).
 std_compile_args = ["/std:c++17"] if os.name == "nt" else ["-std=c++17"]
 
+# §3.391: stamp the source revision into the binary so Python can tell
+# whether the loaded extension matches current headers/source.
+def _git_commit() -> str:
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=HERE,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        commit = (out.stdout or "").strip()
+        if commit and all(c in "0123456789abcdef" for c in commit):
+            return commit
+    except Exception:
+        pass
+    return "unknown"
+
+
+_GB_BUILD_COMMIT = _git_commit()
+if os.name == "nt":
+    build_id_args = [f'/DGB_BUILD_COMMIT={_GB_BUILD_COMMIT}']
+else:
+    build_id_args = [f"-DGB_BUILD_COMMIT={_GB_BUILD_COMMIT}"]
+
 ext_modules = [
     Pybind11Extension(
         "_core",  # Module name (build in current directory)
@@ -25,7 +52,7 @@ ext_modules = [
             os.path.join(HERE, "core.cpp")
         ],  # Absolute path so it resolves regardless of CWD
         include_dirs=[os.path.join(HERE, "eigen")],
-        extra_compile_args=(["/O2"] if os.name == "nt" else []) + openmp_compile_args + std_compile_args,
+        extra_compile_args=(["/O2"] if os.name == "nt" else []) + openmp_compile_args + std_compile_args + build_id_args,
         extra_link_args=openmp_link_args,
     ),
 ]

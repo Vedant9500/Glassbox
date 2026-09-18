@@ -59,6 +59,35 @@ _NSIMPLIFY_CONSTANTS = (
     (1 + sp.sqrt(5)) / 2,
 )
 
+# §3.30: bound symbolic-simplification work before SymPy sees the input.
+# Pathological generated formulas (thousands of nested powers / huge
+# polynomials) otherwise consume unbounded CPU/memory in parse_expr,
+# simplify, nsimplify, and repeated trigsimp calls.
+MAX_SIMPLIFY_CHARS = 20_000
+MAX_SIMPLIFY_SYMBOLS = 64
+MAX_SIMPLIFY_AST_NODES = 5_000
+
+
+def _assert_simplifiable(text: str) -> None:
+    """Fail loud on inputs too large for symbolic simplification."""
+    if len(text) > MAX_SIMPLIFY_CHARS:
+        raise ValueError("formula too large for symbolic simplification")
+    symbols = _discover_symbols(text)
+    if len(symbols) > MAX_SIMPLIFY_SYMBOLS:
+        raise ValueError("too many free symbols for symbolic simplification")
+    try:
+        node_count = sum(1 for _ in ast.walk(ast.parse(text, mode="eval")))
+    except SyntaxError:
+        # Non-Pythonic pretty-printed input skips the AST budget here;
+        # parse_expr callers still enforce the char/symbol budgets above.
+        return
+    except (RecursionError, MemoryError):
+        # Pathological nesting defeats the AST walk itself: fail loud as
+        # too large instead of leaking a raw recursion error outward.
+        raise ValueError("formula AST too large for symbolic simplification")
+    if node_count > MAX_SIMPLIFY_AST_NODES:
+        raise ValueError("formula AST too large for symbolic simplification")
+
 
 def _normalize_formula_syntax(formula: str) -> str:
     """Normalize minor syntax differences before parsing.
@@ -205,6 +234,7 @@ class FloatSnapTransformer(ast.NodeTransformer):
 
 def snap_formula_floats(raw_formula: str, cfg: SnapConfig) -> str:
     """Apply tolerance-based float snapping to all numeric literals in a formula."""
+    _assert_simplifiable(raw_formula)
     normalized = _normalize_formula_syntax(raw_formula)
 
     try:
@@ -513,6 +543,7 @@ def sympy_simplify_formula(
     smallest candidate each pass. An optional approximate pass can collapse weak
     Fourier-like harmonics when one mode clearly dominates.
     """
+    _assert_simplifiable(clean_formula)
     transformations = standard_transformations + (
         convert_xor,
         implicit_multiplication_application,

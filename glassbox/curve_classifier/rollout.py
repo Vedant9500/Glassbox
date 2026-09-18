@@ -140,6 +140,7 @@ def build_checkpoint_card(
     runtime_contract: Mapping[str, Any] | None = None,
     row_order_stress: Mapping[str, Any] | None = None,
     runtime_fallback: Mapping[str, Any] | None = None,
+    assume_legacy_gate_evidence: bool = False,
 ) -> dict[str, Any]:
     checkpoint_metadata = checkpoint_metadata or {}
     validation_report = validation_report or {}
@@ -156,26 +157,37 @@ def build_checkpoint_card(
     )
     grouped_release_metric = _validation_uses_grouped_release_metric(validation_report)
 
-    row_order_stress = dict(
-        row_order_stress
-        or {
-            "passed": True,
-            "source": "phase1_univariate_row_order_regression_tests",
-        }
-    )
-    runtime_fallback = dict(
-        runtime_fallback
-        or {
-            "passed": True,
-            "source": "checkpoint_metadata_validators_and_runtime_wrapper_fallbacks",
-        }
-    )
+    # S3.24: missing gate evidence must not default to passed. A default
+    # True is indistinguishable from a measured pass downstream and can
+    # recommend release on evidence that was never collected. Missing stays
+    # passed=None/"not_run" (blocks comparison); the legacy default-pass is
+    # available only behind assume_legacy_gate_evidence=True.
+    _legacy_row_order = {
+        "passed": True,
+        "source": "phase1_univariate_row_order_regression_tests",
+    }
+    _legacy_fallback = {
+        "passed": True,
+        "source": "checkpoint_metadata_validators_and_runtime_wrapper_fallbacks",
+    }
+    if assume_legacy_gate_evidence:
+        row_order_stress = dict(row_order_stress or _legacy_row_order)
+        runtime_fallback = dict(runtime_fallback or _legacy_fallback)
+    else:
+        row_order_stress = dict(
+            row_order_stress or {"passed": None, "source": "not_run"}
+        )
+        runtime_fallback = dict(
+            runtime_fallback or {"passed": None, "source": "not_run"}
+        )
     unsupported = list(known_unsupported_cases or DEFAULT_KNOWN_UNSUPPORTED_CASES)
 
     release_gates = {
         "grouped_or_family_validation_reported": bool(grouped_release_metric),
-        "row_order_stress_passed": bool(row_order_stress.get("passed", False)),
-        "runtime_fallback_passed": bool(runtime_fallback.get("passed", False)),
+        # S3.24: preserve None (not run) vs False (failed) vs True (passed)
+        # so rollout comparison can block specifically on missing evidence.
+        "row_order_stress_passed": row_order_stress.get("passed", False),
+        "runtime_fallback_passed": runtime_fallback.get("passed", False),
         "baseline_comparison_required": True,
     }
 
@@ -237,12 +249,14 @@ def build_rollout_comparison(
             candidate_card, ("release_gates", "grouped_or_family_validation_reported")
         )
     )
-    row_order_ok = bool(
-        _nested_get(candidate_card, ("release_gates", "row_order_stress_passed"))
+    row_order_gate = _nested_get(
+        candidate_card, ("release_gates", "row_order_stress_passed")
     )
-    fallback_ok = bool(
-        _nested_get(candidate_card, ("release_gates", "runtime_fallback_passed"))
+    fallback_gate = _nested_get(
+        candidate_card, ("release_gates", "runtime_fallback_passed")
     )
+    row_order_ok = bool(row_order_gate)
+    fallback_ok = bool(fallback_gate)
 
     beats_baseline = None
     required_metric = None
@@ -254,6 +268,10 @@ def build_rollout_comparison(
         recommendation = "needs_baseline_comparison"
     elif not grouped_ok:
         recommendation = "blocked_missing_grouped_validation"
+    elif row_order_gate is None:
+        recommendation = "blocked_row_order_stress_not_run"
+    elif fallback_gate is None:
+        recommendation = "blocked_runtime_fallback_not_run"
     elif not row_order_ok:
         recommendation = "blocked_row_order_stress"
     elif not fallback_ok:

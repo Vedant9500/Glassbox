@@ -1098,6 +1098,11 @@ static py::dict run_evolution_cpp(
     result["island_fallback_to_single"] = engine.get_island_fallback_to_single();
     // M-283: prior entries zeroed by sanitize (NaN/negative → 0).
     result["prior_entries_sanitized"] = engine.get_prior_entries_sanitized();
+    // §3.426: effective explorer/main split (requested fraction clamps to
+    // elites when small; elites_only flags zero non-elite main offspring).
+    result["num_explorers"] = engine.get_last_num_explorers();
+    result["main_pop_target"] = engine.get_last_main_pop_target();
+    result["main_population_elites_only"] = engine.get_last_main_population_elites_only();
     result["seed_graphs_used"] = static_cast<int>(cpp_seed_graphs.size());
     result["seed_graphs_skipped_oversized"] = seed_graphs_skipped_oversized;
     result["seed_graphs_skipped_invalid"] = seed_graphs_skipped_invalid;  // H-07
@@ -1756,5 +1761,27 @@ PYBIND11_MODULE(_core, m) {
           py::arg("y_weights") = py::none(),
           py::arg("holdout_fraction") = 0.0,
           py::arg("relative_slack") = 0.10);
+    // §3.391: build manifest — lets Python verify the loaded binary matches
+    // current source (git commit), toolchain (C++ standard, OpenMP), and age.
+#ifndef GB_BUILD_COMMIT
+#define GB_BUILD_COMMIT unknown
+#endif
+#define GB_STR_(x) #x
+#define GB_STR(x) GB_STR_(x)
+    m.def("build_manifest", []() {
+        py::dict manifest;
+        manifest["git_commit"] = GB_STR(GB_BUILD_COMMIT);
+        manifest["build_date"] = __DATE__;
+        manifest["build_time"] = __TIME__;
+        manifest["cxx_standard"] = __cplusplus;
+#ifdef _OPENMP
+        manifest["openmp"] = true;
+        manifest["openmp_version"] = _OPENMP;
+#else
+        manifest["openmp"] = false;
+        manifest["openmp_version"] = 0;
+#endif
+        return manifest;
+    }, "Build manifest: source revision, build time, C++ standard, OpenMP flags of this binary");
 }
 

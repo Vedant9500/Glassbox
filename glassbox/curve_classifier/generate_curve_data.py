@@ -700,16 +700,28 @@ def extract_raw_features(
 
     # Accumulate CDF from w, then invert to get non-uniform sample positions
     cdf = np.cumsum(w)
-    cdf = cdf / cdf[-1]  # normalize to [0, 1]
+    # M-49: cdf[-1] can be 0/non-finite on pathological inputs (kappa
+    # overflow to inf, or zeros surviving with alpha<0 clamped) — dividing
+    # poisons every sample position with NaN.
+    # Fall back to uniform resampling when the total mass is unusable.
+    total = cdf[-1] if cdf.size else 0.0
+    if not np.isfinite(total) or not total > 0.0:
+        x_old = np.linspace(0, 1, len(y)) if len(y) else np.zeros(1)
+        x_new = np.linspace(0, 1, n_points)
+        y_resampled = np.interp(
+            x_new, x_old, y if len(y) else np.zeros(1, dtype=np.float64)
+        )
+    else:
+        cdf = cdf / total  # normalize to [0, 1]
 
-    # Target uniform positions in CDF space → non-uniform in original space
-    target_cdf = np.linspace(0, 1, n_points)
-    # Map to original indices (fractional)
-    x_old = np.linspace(0, 1, len(y))
-    sample_positions = np.interp(target_cdf, cdf, x_old)
+        # Target uniform positions in CDF space → non-uniform in original space
+        target_cdf = np.linspace(0, 1, n_points)
+        # Map to original indices (fractional)
+        x_old = np.linspace(0, 1, len(y))
+        sample_positions = np.interp(target_cdf, cdf, x_old)
 
-    # Interpolate y at the non-uniform sample positions
-    y_resampled = np.interp(sample_positions, x_old, y)
+        # Interpolate y at the non-uniform sample positions
+        y_resampled = np.interp(sample_positions, x_old, y)
 
     # Normalize to [0, 1] range
     y_min, y_max = y_resampled.min(), y_resampled.max()
@@ -1164,13 +1176,22 @@ def extract_all_features(y: np.ndarray) -> np.ndarray:
 
     Together, these make the classifier invariant to (x → ax+b, y → cy+d).
     """
-    y = np.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+    # M-48/§3.32: locate non-finite samples BEFORE statistics. Imputed zeros
+    # must not influence location/scale (they did — a 5%-missing curve got a
+    # different normalization than its complete twin), and the neutral fill
+    # is the finite mean (exactly 0 after normalization), not 0.0 pre-norm.
+    # All-finite inputs take the identical path as before.
+    finite = np.isfinite(y)
+    if np.any(finite):
+        mu = float(np.mean(y[finite]))
+        sigma = float(np.std(y[finite]))
+    else:
+        mu, sigma = 0.0, 0.0
+    y = np.where(finite, y, mu)
 
     # ── Canonical y-normalization: zero-mean, unit-variance ──
     # This is the KEY to basis independence. Without it, the same curve
     # sampled on different domains produces wildly different raw/FFT features.
-    mu = np.mean(y)
-    sigma = np.std(y)
     if sigma > 1e-12:
         y = (y - mu) / sigma
     else:

@@ -42,6 +42,16 @@ struct Token {
 };
 
 inline std::vector<Token> tokenize(const std::string& input) {
+    // FC-3/M-11: unbounded nesting ('(' * n) recursed once per paren in
+    // parse_expression and segfaulted instead of raising (ledger runtime
+    // proof). Bound length, token count, and paren depth fail-loud here —
+    // the single choke point for both formula_to_graph and the exact path.
+    constexpr size_t kMaxFormulaChars = 20000;
+    constexpr size_t kMaxTokens = 10000;
+    constexpr int kMaxParenDepth = 256;
+    if (input.size() > kMaxFormulaChars) {
+        throw std::runtime_error("Formula too long for parsing");
+    }
     std::vector<Token> tokens;
     size_t i = 0;
     while (i < input.size()) {
@@ -135,6 +145,19 @@ inline std::vector<Token> tokenize(const std::string& input) {
             tokens.push_back({TokenType::Identifier, s});
         } else {
             throw std::runtime_error("Unexpected character in formula: " + std::string(1, c));
+        }
+        if (tokens.size() > kMaxTokens) {
+            throw std::runtime_error("Formula has too many tokens for parsing");
+        }
+    }
+    int paren_depth = 0;
+    for (const auto& tok : tokens) {
+        if (tok.type == TokenType::LParen) {
+            if (++paren_depth > kMaxParenDepth) {
+                throw std::runtime_error("Formula nesting too deep for parsing");
+            }
+        } else if (tok.type == TokenType::RParen) {
+            if (--paren_depth < 0) break;  // unbalanced; parser reports it
         }
     }
     tokens.push_back({TokenType::End, ""});
@@ -338,6 +361,13 @@ private:
 
 inline std::string normalize_formula_string(std::string formula) {
     // Intentionally Unicode: rewrite common math glyphs (x, pi, sqrt, ...) to ASCII ops.
+    // §3.393 ordering invariant: replacements run top-to-bottom and later
+    // patterns MUST NOT match earlier outputs. Today this holds only
+    // because the π-specific forms (π², 2π, π/2, ...) precede the bare
+    // π→pi rewrite. Any new table entry whose output contains a
+    // later-matched pattern (π, e^(', bare identifier chars) will silently
+    // rewrite inside its own replacement — add it after its ingredients,
+    // and keep outputs ASCII-only unless a later rule consumes them.
     auto replace_all = [](std::string& str, const std::string& from, const std::string& to) {
         size_t start_pos = 0;
         while ((start_pos = str.find(from, start_pos)) != std::string::npos) {
@@ -381,6 +411,8 @@ inline std::string normalize_formula_string(std::string formula) {
     // §3.394: bars must pair — a lone bar would flip every later
     // abs-boundary (stateless alternation), turning two disjoint malformed
     // expressions into one valid-looking wrong parenthesization. Fail closed.
+    // (Byte scan is UTF-8-safe: '|' is 0x7C, which never appears inside a
+    // multibyte sequence.)
     {
         size_t bar_count = 0;
         for (char ch : formula) if (ch == '|') ++bar_count;
@@ -401,14 +433,25 @@ inline std::string normalize_formula_string(std::string formula) {
         }
     }
     
+    // §3.395: operator normalization runs BEFORE the e^( special form,
+    // so callers supplying e**(...) get the same exp(...) as e^(...).
+    // (The old order left e**(x) as a power of identifier e.)
+    replace_all(formula, "**", "^");
+
     size_t e_pow_pos;
     while ((e_pow_pos = formula.find("e^(")) != std::string::npos) {
         formula.replace(e_pow_pos, 3, "exp(");
     }
-    
-    replace_all(formula, "**", "^");
 
     // S5-14: "sin x" / "sin 2" / "abs (x)" → function(arg) for known unaries.
+    // §3.396 accepted-grammar contract: the rewrite wraps ONE bare atom
+    // (number, identifier, or balanced paren group) — not a
+    // precedence-bounded expression. So `sin 2*x` is sin(2)*x and
+    // `sqrt x+1` is sqrt(x)+1 (both probed on the exact path); anything
+    // else (`sin -x`, `sin 2x`, `log x y`) is left for the later stages
+    // and fails closed there (e.g. bare `sin` is an unsupported symbol),
+    // never silently re-parenthesized. Multi-token arguments require
+    // explicit parentheses.
     {
         const char* funcs[] = {
             "sin", "cos", "tan", "exp", "log", "ln", "abs", "sqrt", "sign", "asin", "acos", "atan"

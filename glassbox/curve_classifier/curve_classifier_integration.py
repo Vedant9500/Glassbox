@@ -504,25 +504,34 @@ _warned_no_cuda = False
 def _curve_feature_cache_key(
     x: np.ndarray, y: np.ndarray, n_points: int = 256
 ) -> tuple:
-    """Coarse deterministic key for feature-vector reuse within a process."""
+    """Content-bound deterministic key for feature-vector reuse in-process.
+
+    §3.70: the old key (length + strided-sample moments + one x·y sum) let
+    two distinct curves collide and silently share a 398-dim vector. Keys
+    now bind full bytes under a 64 KiB budget, else four independent
+    strided slices — both via sha256 (process-seed-independent).
+    """
+    import hashlib
+
     x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
     y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
     n = int(min(x_arr.size, y_arr.size))
     if n <= 0:
-        return (0, 0.0, 0.0, 0.0, 0.0, int(n_points))
-    # Sample up to 32 points for a cheap content fingerprint.
-    step = max(1, n // 32)
-    xs = x_arr[::step][:32]
-    ys = y_arr[::step][:32]
-    return (
-        int(n),
-        float(np.nanmean(xs)),
-        float(np.nanstd(xs)),
-        float(np.nanmean(ys)),
-        float(np.nanstd(ys)),
-        float(np.nansum(ys * xs)),
-        int(n_points),
-    )
+        return (0, "", int(n_points))
+    x_arr = np.ascontiguousarray(x_arr[:n])
+    y_arr = np.ascontiguousarray(y_arr[:n])
+    if n * 16 <= 65536:
+        digest = hashlib.sha256(
+            x_arr.tobytes() + y_arr.tobytes()
+        ).hexdigest()
+    else:
+        h = hashlib.sha256()
+        for offset in range(4):
+            h.update(x_arr[offset::4].tobytes())
+            h.update(y_arr[offset::4].tobytes())
+        h.update(np.ascontiguousarray([n]).tobytes())
+        digest = h.hexdigest()
+    return (int(n), digest, int(n_points))
 
 
 def _extract_features_xy_cached(
