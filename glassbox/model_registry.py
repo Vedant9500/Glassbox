@@ -9,7 +9,12 @@ DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_multi.pt"
 PYTORCH_CLASSIFIER_FALLBACKS = (
     "models/curve_classifier_wide.pt",
     "models/curve_classifier_mlp_eql.pt",
-    "models/curve_classfier_v4.pt",
+    # M-38: "curve_classfier_v4.pt" is misspelled on disk. Prefer the
+    # correctly spelled filename so a future rename just works; keep the
+    # misspelled name as an explicit compatibility alias (it is the
+    # artifact actually present in this checkout).
+    "models/curve_classifier_v4.pt",
+    "models/curve_classfier_v4.pt",  # compat alias, see above
     "models/curve_classifier_wider.pt",
     "models/curve_classifier.pt",
 )

@@ -74,6 +74,16 @@ def get_last_classifier_load_status() -> dict[str, object]:
     return dict(LAST_CLASSIFIER_LOAD_STATUS)
 
 
+# S3.71: which inference path produced the last predict_operators result.
+# Kept out of the {op: float} dict (same reason as the load status above).
+LAST_OPERATOR_INFERENCE_MODE: str = "never_called"
+
+
+def get_last_operator_inference_mode() -> str:
+    """Return the inference mode of the last predict_operators call."""
+    return LAST_OPERATOR_INFERENCE_MODE
+
+
 def describe_curve_classifier_inference(x: np.ndarray) -> dict[str, object]:
     """Describe the public classifier inference contract for the given input shape."""
     x_arr = np.asarray(x)
@@ -1007,7 +1017,7 @@ def predict_operators(
     Returns:
         Dictionary mapping operator names to probabilities
     """
-    global LAST_CLASSIFIER_LOAD_STATUS
+    global LAST_CLASSIFIER_LOAD_STATUS, LAST_OPERATOR_INFERENCE_MODE
 
     # Detect multi-input early (needed for S9-5 tiny-n device choice).
     x = np.asarray(x)
@@ -1090,6 +1100,7 @@ def predict_operators(
 
     # For multi-input: use per-variable slicing
     if n_vars > 1:
+        LAST_OPERATOR_INFERENCE_MODE = "median_slice_heuristic"
         return _predict_operators_multi_input(
             x, y, model, metadata, resolved_device, threshold, n_vars, cache_key
         )
@@ -1101,6 +1112,7 @@ def predict_operators(
     )
     probs = _predict_pytorch(model, features, metadata, resolved_device)
 
+    LAST_OPERATOR_INFERENCE_MODE = "univariate_trained"
     return _build_result_dict(probs, threshold, metadata, cache_key)
 
 

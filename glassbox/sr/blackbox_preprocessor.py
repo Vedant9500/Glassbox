@@ -49,6 +49,14 @@ class BlackboxState:
     # renormalize the survivors — the omission must travel with the scores.
     active_ranker_weights: dict[str, float] = field(default_factory=dict)
     omitted_rankers: list[str] = field(default_factory=list)
+    # M-35: imputation provenance (all-NaN columns take mean 0/scale 1 and
+    # non-finite y takes the finite mean to stay shape-stable). Counts only;
+    # no behavior change.
+    imputed_columns: list[int] = field(default_factory=list)
+    imputed_y_rows: int = 0
+    # M-32: declared diagnostic field (was an undeclared dynamic attribute,
+    # invisible to serialization and type checkers).
+    ranking_sample_weight_mode: str = "none"
 
 
 def _safe_std(values: np.ndarray) -> np.ndarray:
@@ -967,6 +975,13 @@ def prepare_blackbox_search(
 
     X_finite = np.where(np.isfinite(X), X, np.nan)
     y_finite = np.where(np.isfinite(y), y, np.nan)
+    # M-35: which columns/rows were imputed to stay shape-stable.
+    _imputed_columns = [
+        int(j)
+        for j in range(int(X.shape[1]))
+        if not bool(np.any(np.isfinite(X[:, j])))
+    ]
+    _imputed_y_rows = int(np.sum(~np.isfinite(y)))
     x_mean = np.nanmean(X_finite, axis=0)
     x_mean = np.where(np.isfinite(x_mean), x_mean, 0.0)
     X_clean = np.where(np.isfinite(X), X, x_mean.reshape(1, -1))
@@ -991,6 +1006,8 @@ def prepare_blackbox_search(
             y_scale=y_scale,
             standardized=False,
             reason="disabled_or_low_dimensional",
+            imputed_columns=list(_imputed_columns),
+            imputed_y_rows=int(_imputed_y_rows),
         )
         return X_clean, y_clean, state
 
@@ -1013,6 +1030,8 @@ def prepare_blackbox_search(
             y_scale=y_scale,
             standardized=False,
             reason="no_variable_features",
+            imputed_columns=list(_imputed_columns),
+            imputed_y_rows=int(_imputed_y_rows),
         )
         return X_clean, y_clean, state
 
@@ -1279,9 +1298,10 @@ def prepare_blackbox_search(
         ),
         active_ranker_weights=active_ranker_weights,
         omitted_rankers=omitted_rankers,
+        ranking_sample_weight_mode=str(ranking_weight_mode or "none"),
+        imputed_columns=list(_imputed_columns),
+        imputed_y_rows=int(_imputed_y_rows),
     )
-    # Attach ranking weight mode for diagnostics (not a dataclass field).
-    state.ranking_sample_weight_mode = ranking_weight_mode  # type: ignore[attr-defined]
     return X_scaled_all[:, selected], y_scaled, state
 
 
@@ -1542,6 +1562,8 @@ def state_to_dict(state: BlackboxState | None) -> dict[str, Any]:
         "ranking_sample_weight_mode": str(
             getattr(state, "ranking_sample_weight_mode", "none") or "none"
         ),
+        "imputed_columns": list(getattr(state, "imputed_columns", []) or []),
+        "imputed_y_rows": int(getattr(state, "imputed_y_rows", 0) or 0),
         "n_selected_features": len(state.selected_features),
         "n_dropped_features": len(state.dropped_features),
     }

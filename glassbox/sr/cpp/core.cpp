@@ -1087,6 +1087,10 @@ static py::dict run_evolution_cpp(
     }
     result["evolution_wall_time_sec"] = engine.get_run_wall_time_sec();
     result["random_seed"] = engine.get_random_seed();
+    // S3.274: the seed actually drawn (== requested when >= 0). Single-pop
+    // runs replay from this; island runs derive per-island streams from the
+    // parent seed when >= 0 (deterministic) or draw per island otherwise.
+    result["actual_random_seed"] = engine.get_actual_random_seed();
     // §3.249: set_arithmetic_temperature silently clamps requests outside
     // [0.1, 100] (eval.h). Record the effective value so callers can see
     // the clamp instead of assuming the requested temperature applied.
@@ -1098,6 +1102,7 @@ static py::dict run_evolution_cpp(
     result["island_fallback_to_single"] = engine.get_island_fallback_to_single();
     // M-283: prior entries zeroed by sanitize (NaN/negative → 0).
     result["prior_entries_sanitized"] = engine.get_prior_entries_sanitized();
+    result["priors_masked_by_allowed"] = engine.get_priors_masked_by_allowed();
     // §3.426: effective explorer/main split (requested fraction clamps to
     // elites when small; elites_only flags zero non-elite main offspring).
     result["num_explorers"] = engine.get_last_num_explorers();

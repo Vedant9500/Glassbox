@@ -320,9 +320,10 @@ public:
                     const std::vector<IndividualGraph>& seed_graphs = {},
                     const Eigen::ArrayXd& y_weights = Eigen::ArrayXd())
                 : config_(config), X_(X), y_(y), seed_omegas_(seed_omegas), seed_graphs_(seed_graphs),
-                    rng_(config.random_seed >= 0
+                    actual_random_seed_(config.random_seed >= 0
                             ? static_cast<unsigned int>(config.random_seed)
-                            : std::random_device{}()) {
+                            : std::random_device{}()),
+                    rng_(actual_random_seed_) {
         set_y_weights(y_weights);
         sanitize_config();
 
@@ -334,6 +335,14 @@ public:
             }
         }
 
+        allowed_unary_ops_ = sanitize_allowed_ops<UnaryOp>(
+            config_.allowed_unary_ops,
+            static_cast<int>(UnaryOp::Abs)
+        );
+        allowed_binary_ops_ = sanitize_allowed_ops<BinaryOp>(
+            config_.allowed_binary_ops,
+            static_cast<int>(BinaryOp::Aggregation)
+        );
         // Normalize op_priors if provided
         if (!config_.op_priors.empty()) {
             // Backward compatibility:
@@ -355,23 +364,29 @@ public:
                 // Append Abs prior (0): seeds/simplify can still introduce Abs.
                 config_.op_priors.push_back(0.0);
             }
+            // S3.283: reconcile priors with allowed masks BEFORE CDF
+            // construction (slots are enum-aligned here: legacy 4/5-slot
+            // inputs were expanded above). Disallowed ops keep zero mass,
+            // so the sampler draws the effective distribution directly
+            // instead of burning 16 attempts and collapsing to
+            // first-allowed (which silently ignored the prior).
+            mask_disallowed_priors(config_.op_priors,
+                static_cast<size_t>(UnaryOp::Abs), true);
             prior_entries_sanitized_ += normalize_prior_vector(config_.op_priors);
+            spread_uniform_over_allowed(config_.op_priors,
+                static_cast<size_t>(UnaryOp::Abs), true);
             op_cdf_ = build_cdf(config_.op_priors);
         }
 
         if (!config_.binary_op_priors.empty()) {
+            mask_disallowed_priors(config_.binary_op_priors,
+                static_cast<size_t>(BinaryOp::Aggregation), false);
             prior_entries_sanitized_ += normalize_prior_vector(config_.binary_op_priors);
+            spread_uniform_over_allowed(config_.binary_op_priors,
+                static_cast<size_t>(BinaryOp::Aggregation), false);
             binary_op_cdf_ = build_cdf(config_.binary_op_priors);
         }
 
-        allowed_unary_ops_ = sanitize_allowed_ops<UnaryOp>(
-            config_.allowed_unary_ops,
-            static_cast<int>(UnaryOp::Abs)
-        );
-        allowed_binary_ops_ = sanitize_allowed_ops<BinaryOp>(
-            config_.allowed_binary_ops,
-            static_cast<int>(BinaryOp::Aggregation)
-        );
         current_structural_mutation_rate_ = config_.mutation_rate_structural;
         best_mse_history_ = 1e9;
         plateau_counter_ = 0;
@@ -384,7 +399,19 @@ public:
         initialize_population();
         
         // Initial Refinement
+        // S3.256: bound by the run budget - a huge population or
+        // pathological seed refinement must not blow past the timeout
+        // before generation zero. Skipped individuals keep
+        // fitness_valid=false and are scored in the generation loop, so
+        // breaking here degrades refinement, never validity. Timeout<=0
+        // keeps legacy run-to-completion init.
         for (auto& ind : population_) {
+            if (config_.timeout_seconds > 0
+                && std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - start_time).count()
+                    > static_cast<double>(config_.timeout_seconds)) {
+                break;
+            }
             refine_constants(ind);
         }
         trace_event("init.refined", -1);
@@ -397,6 +424,7 @@ public:
 
             evolve_one_generation(gen);
 
+            last_executed_generation_ = gen;
             update_discovery_metrics(gen, start_time);
 
             if (config_.use_early_stop && early_stop_metric(best_overall_) < config_.early_stop_mse && best_overall_.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
@@ -412,7 +440,7 @@ public:
         }
         // Re-evaluate export choice after cleanup (raw_mse may change).
         // consider_champion is non-const; re-pick via select after cleanup.
-        update_discovery_metrics(config_.generations, start_time);
+        update_discovery_metrics(last_executed_generation_, start_time);
         run_wall_time_sec_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
         trace_event("run.end", -1);
     }
@@ -432,12 +460,16 @@ public:
     double get_first_acceptable_time_sec() const { return first_acceptable_time_sec_; }
     double get_run_wall_time_sec() const { return run_wall_time_sec_; }
     int get_random_seed() const { return config_.random_seed; }
+    // S3.274: reproducing a random_device run requires the drawn seed.
+    unsigned int get_actual_random_seed() const { return actual_random_seed_; }
     int get_last_island_outer_threads() const { return last_island_outer_threads_; }
     int get_last_island_inner_threads() const { return last_island_inner_threads_; }
     bool get_last_crossover_valid() const { return last_crossover_valid_; }
     int get_crossover_attempts() const { return crossover_attempts_; }
     // M-283: prior entries zeroed by sanitize (>= 0; islands sum at join).
     int get_prior_entries_sanitized() const { return prior_entries_sanitized_; }
+    // S3.283: prior slots zeroed for contradicting allowed masks.
+    int get_priors_masked_by_allowed() const { return priors_masked_by_allowed_; }
     // M-274: true when requested islands fell back to a single population.
     bool get_island_fallback_to_single() const { return island_fallback_to_single_; }
     // §3.426: effective explorer/main split of the last generation (the
@@ -710,6 +742,13 @@ public:
                     int n_migrate = std::min(config_.migration_size, static_cast<int>(src.size()) / 2);
                     for (int m = 0; m < n_migrate; ++m) {
                         dst[dst.size() - 1 - m] = src[m];
+                        // S3.264: the copy inherits source-front ranking state
+                        // (pareto_rank/crowding describe the SOURCE island's
+                        // front, not the destination's). Reset the recomputed
+                        // fields; age is kept as AFPO lineage by design.
+                        auto& migrant = dst[dst.size() - 1 - m];
+                        migrant.pareto_rank = 0;
+                        migrant.crowding_distance = 0.0;
                     }
                 }
             }
@@ -723,6 +762,7 @@ public:
                 }
                 consider_champion(best);
             }
+            last_executed_generation_ = gen;
             update_discovery_metrics(gen, start_time);
 
             if (config_.use_early_stop && should_stop) break;
@@ -770,7 +810,7 @@ public:
         if (!best_raw_overall_.nodes.empty()) {
             cleanup_graph(best_raw_overall_);
         }
-        update_discovery_metrics(config_.generations, start_time);
+        update_discovery_metrics(last_executed_generation_, start_time);
         run_wall_time_sec_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
     }
 
@@ -793,6 +833,8 @@ private:
     std::vector<int> allowed_unary_ops_;
     std::vector<int> allowed_binary_ops_;
     
+    // S3.274: the seed actually drawn (== requested when >= 0).
+    unsigned int actual_random_seed_ = 0;
     std::mt19937 rng_;
     std::ofstream trace_stream_;
     bool trace_enabled_ = false;
@@ -802,9 +844,13 @@ private:
     int last_num_explorers_ = 0;
     int last_main_pop_target_ = 0;
     bool last_main_population_elites_only_ = false;
+    // S3.265: last generation actually executed (timeout/early-stop aware).
+    // Post-loop discovery accounting must use this, not config_.generations.
+    int last_executed_generation_ = 0;
     int crossover_successes_ = 0;
     // M-283/M-274 diagnostics (plain ints; aggregated post-join like fd probes).
     int prior_entries_sanitized_ = 0;
+    int priors_masked_by_allowed_ = 0;
     bool island_fallback_to_single_ = false;
     // P-04 diagnostics: FD probe volume + inert-param probes avoided.
     // Plain counters: each island engine is confined to one OpenMP thread
@@ -1144,6 +1190,44 @@ private:
         return allowed;
     }
 
+    // S3.283 helpers: zero disallowed mass, then keep the uniform
+    // fallback (all-masked) inside the allowed set instead of spreading
+    // it back over disallowed ops.
+    void mask_disallowed_priors(std::vector<double>& priors, size_t max_idx, bool unary) {
+        for (size_t i = 0; i < priors.size() && i <= max_idx; ++i) {
+            bool allowed = unary ? unary_op_allowed(static_cast<UnaryOp>(i))
+                                 : binary_op_allowed(static_cast<BinaryOp>(i));
+            if (!allowed) {
+                if (priors[i] != 0.0) ++priors_masked_by_allowed_;
+                priors[i] = 0.0;
+            }
+        }
+        // S3.282: slots past the enum range are never sampled (sampler
+        // breaks at the max); drop their mass so they cannot dilute the CDF.
+        for (size_t i = max_idx + 1; i < priors.size(); ++i) {
+            if (priors[i] != 0.0) ++priors_masked_by_allowed_;
+            priors[i] = 0.0;
+        }
+    }
+    void spread_uniform_over_allowed(std::vector<double>& priors, size_t max_idx, bool unary) {
+        bool masks_active = unary ? !allowed_unary_ops_.empty() : !allowed_binary_ops_.empty();
+        if (!masks_active || priors.empty()) return;
+        double allowed_mass = 0.0;
+        size_t allowed_count = 0;
+        for (size_t i = 0; i < priors.size() && i <= max_idx; ++i) {
+            bool allowed = unary ? unary_op_allowed(static_cast<UnaryOp>(i))
+                                 : binary_op_allowed(static_cast<BinaryOp>(i));
+            if (allowed) { allowed_mass += priors[i]; ++allowed_count; }
+        }
+        if (allowed_mass <= 0.0 && allowed_count > 0) {
+            double uniform_val = 1.0 / static_cast<double>(allowed_count);
+            for (size_t i = 0; i < priors.size() && i <= max_idx; ++i) {
+                bool allowed = unary ? unary_op_allowed(static_cast<UnaryOp>(i))
+                                     : binary_op_allowed(static_cast<BinaryOp>(i));
+                priors[i] = allowed ? uniform_val : 0.0;
+            }
+        }
+    }
     bool unary_op_allowed(UnaryOp op) const {
         if (allowed_unary_ops_.empty()) return true;
         int value = static_cast<int>(op);

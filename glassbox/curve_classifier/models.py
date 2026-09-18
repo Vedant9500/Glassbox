@@ -169,7 +169,17 @@ class SemanticFeatureAttention(nn.Module):
                     nn.init.zeros_(m.bias)
         nn.init.normal_(self.cls_token, std=0.02)
 
+    # S3.83: fixed block slicing silently truncates wider inputs and
+    # zero-fills missing invariant blocks. Require the schema width
+    # (FEATURE_SCHEMA sums to 398) unless the caller adapts explicitly.
+    EXPECTED_WIDTH = 398
+
     def forward(self, x):
+        if x.size(1) != SemanticFeatureAttention.EXPECTED_WIDTH:
+            raise ValueError(
+                "SemanticFeatureAttention expects width "
+                f"{SemanticFeatureAttention.EXPECTED_WIDTH}, got {x.size(1)}"
+            )
         b = x.size(0)
 
         raw = x[:, 0:128]
