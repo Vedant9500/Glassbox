@@ -642,6 +642,7 @@ def main() -> None:
 
         # If C++ trace was generated, ingest it
         if temp_trace.exists():
+            ingest_malformed = 0
             with open(temp_trace, "r", encoding="utf-8") as f:
                 for line in f:
                     try:
@@ -650,7 +651,14 @@ def main() -> None:
                         data.pop("ts", None)  # Use logger's timestamp
                         logger.log(event, **data)
                     except Exception:
+                        # §3.72: same counting rule as analyze_trace.
+                        ingest_malformed += 1
                         continue
+            if ingest_malformed:
+                print(
+                    f"Warning: skipped {ingest_malformed} malformed "
+                    "ingested trace line(s)."
+                )
             temp_trace.unlink()
 
         print_section("FINALIZATION", logger=logger)
@@ -665,6 +673,19 @@ def main() -> None:
         logger.close()
 
 
+def _first_present(event: dict, *keys):
+    """Return the first present (not-None) value for keys in order.
+
+    §3.73: the analyzer used `ev.get(a) or ev.get(b)`, so a valid zero
+    MSE/fitness fell through to the fallback field, and zero-in-both was
+    discarded as falsy. Zero-MSE exact solutions are central here.
+    """
+    for key in keys:
+        if key in event and event[key] is not None:
+            return event[key]
+    return None
+
+
 def analyze_trace(trace_path: str, out_path: str | None = None) -> None:
     """Post-hoc analysis of a JSONL evolution trace file.
 
@@ -676,12 +697,26 @@ def analyze_trace(trace_path: str, out_path: str | None = None) -> None:
     - Elite structure changes
     """
     events = []
+    malformed_lines = 0
+    first_malformed_line = None
+    last_malformed_line = None
     with open(trace_path, "r", encoding="utf-8") as f:
-        for line in f:
+        for lineno, line in enumerate(f, start=1):
             try:
                 events.append(json.loads(line))
             except Exception:
+                # §3.72: count (not silently drop) malformed lines so
+                # systematic corruption cannot masquerade as convergence.
+                malformed_lines += 1
+                if first_malformed_line is None:
+                    first_malformed_line = lineno
+                last_malformed_line = lineno
                 continue
+    if malformed_lines:
+        print(
+            f"Warning: skipped {malformed_lines} malformed trace line(s) "
+            f"(first={first_malformed_line}, last={last_malformed_line})."
+        )
 
     if not events:
         print("No valid events found in trace file.")
@@ -712,11 +747,11 @@ def analyze_trace(trace_path: str, out_path: str | None = None) -> None:
                 if gen not in gen_data:
                     gen_data[gen] = {}
 
-                best_mse = ev.get("best_raw_mse") or ev.get("best_mse")
+                best_mse = _first_present(ev, "best_raw_mse", "best_mse")
                 if best_mse is not None:
                     gen_data[gen]["best_mse"] = best_mse
 
-                best_f = ev.get("best_ever_fitness") or ev.get("best_fitness")
+                best_f = _first_present(ev, "best_ever_fitness", "best_fitness")
                 if best_f is not None:
                     gen_data[gen]["best_fitness"] = best_f
 

@@ -98,6 +98,10 @@ class ONNVisualizer:
         self.y_pred = None
         self.best_fitness = float("inf")
         self.correlation = 0.0
+        # §3.45: retain the last drawing failure instead of silently
+        # swallowing it (blank/stale dashboard with no diagnostic).
+        self.last_draw_error_ = None
+        self._warned_draw_errors = set()
 
         # Threading for non-blocking updates
         self.update_queue = queue.Queue()
@@ -907,16 +911,17 @@ class ONNVisualizer:
             )
             return
 
-        x_np = (
-            self.x_data.cpu().numpy().flatten()
-            if torch.is_tensor(self.x_data)
-            else self.x_data.flatten()
-        )
-        y_np = (
-            self.y_data.cpu().numpy().flatten()
-            if torch.is_tensor(self.y_data)
-            else self.y_data.flatten()
-        )
+        # §3.44: multivariate input is shown as an explicit first-feature
+        # projection (was flatten(), which interleaved feature columns
+        # into an invalid scalar axis). The x label names the projection.
+        def _to_1d(values):
+            arr = values.cpu().numpy() if torch.is_tensor(values) else np.asarray(values)
+            if arr.ndim > 1 and arr.shape[1] > 1:
+                return np.ascontiguousarray(arr[:, 0]), True
+            return np.ascontiguousarray(arr).reshape(-1), False
+
+        x_np, x_projected = _to_1d(self.x_data)
+        y_np, _ = _to_1d(self.y_data)
 
         # Sort for line plot
         sort_idx = np.argsort(x_np)
@@ -930,11 +935,7 @@ class ONNVisualizer:
 
         # Plot prediction if available
         if self.y_pred is not None:
-            y_pred_np = (
-                self.y_pred.cpu().numpy().flatten()
-                if torch.is_tensor(self.y_pred)
-                else self.y_pred.flatten()
-            )
+            y_pred_np, _ = _to_1d(self.y_pred)
             y_pred_sorted = y_pred_np[sort_idx]
             ax.plot(
                 x_sorted,
@@ -944,7 +945,10 @@ class ONNVisualizer:
                 label="Prediction",
             )
 
-        ax.set_xlabel("x", color=COLORS["text_dim"])
+        ax.set_xlabel(
+            "x[:, 0] (first-feature projection)" if x_projected else "x",
+            color=COLORS["text_dim"],
+        )
         ax.set_ylabel("y", color=COLORS["text_dim"])
         ax.legend(
             loc="upper right",
@@ -969,8 +973,15 @@ class ONNVisualizer:
             self._draw_fit_plot()
             self.fig.canvas.draw_idle()  # More efficient than draw()
             self.fig.canvas.flush_events()  # Process events without blocking
-        except Exception:
-            pass  # Silently handle drawing errors to avoid crashes
+            self.last_draw_error_ = None
+        except Exception as exc:
+            # §3.45: keep drawing crash-safe but never silent — retain the
+            # failure and warn once per distinct error type.
+            self.last_draw_error_ = exc
+            key = type(exc).__name__
+            if key not in self._warned_draw_errors:
+                self._warned_draw_errors.add(key)
+                print(f"Warning: visualizer draw failed ({key}): {exc}")
         return []
 
     def update_from_trainer(
@@ -1013,6 +1024,13 @@ class ONNVisualizer:
 
         # Get prediction on CPU (don't use GPU for visualization)
         if model is not None:
+            # §3.43: never leave the caller's live training model in eval
+            # mode (BatchNorm/Dropout and Hard-Concrete gates behave
+            # differently between modes). Restore the entry mode.
+            try:
+                was_training = bool(model.training)
+            except Exception:
+                was_training = False
             try:
                 model.eval()
                 with torch.no_grad():
@@ -1022,6 +1040,11 @@ class ONNVisualizer:
                     self.y_pred = pred.squeeze().cpu()  # Always move back to CPU
             except Exception:
                 self.y_pred = None
+            finally:
+                try:
+                    model.train(was_training)
+                except Exception:
+                    pass
 
         # Redraw with minimal blocking
         self.update()
@@ -1132,10 +1155,21 @@ def create_network_diagram(
     Returns:
         matplotlib Figure
     """
-    # Get model dimensions
-    n_inputs = model.n_inputs if hasattr(model, "n_inputs") else 1
-    n_layers = model.n_hidden_layers if hasattr(model, "n_hidden_layers") else 2
-    nodes_per_layer = model.nodes_per_layer if hasattr(model, "nodes_per_layer") else 4
+    # §3.46: require a real ONN architecture instead of drawing fabricated
+    # 1/2/4 defaults (a CppGraphModule flat node list rendered as a 2x4 ONN
+    # while labeled as the supplied model). Dedicated graph rendering or an
+    # explicit opt-in is future work; mislabeling is not.
+    missing = [a for a in ("n_inputs", "n_hidden_layers", "nodes_per_layer")
+               if not hasattr(model, a)]
+    if missing:
+        raise TypeError(
+            f"create_network_diagram requires an ONN model exposing "
+            f"{missing} (got {type(model).__name__}); refusing to draw "
+            "default architecture under its name."
+        )
+    n_inputs = model.n_inputs
+    n_layers = model.n_hidden_layers
+    nodes_per_layer = model.nodes_per_layer
 
     viz = ONNVisualizer(
         n_inputs=n_inputs,

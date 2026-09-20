@@ -850,6 +850,13 @@ def evaluate_formula_mse(formula, x, y):
     if y_pred.shape != y_true.shape:
         return None
 
+    # §3.54: strict-evaluator contract — grade only fully finite data.
+    # y_pred is already all-finite-or-None via evaluate_formula; the live
+    # hole was non-finite y_true rows silently dropped by the mask below.
+    if not np.all(np.isfinite(y_true)):
+        return None
+    if not np.all(np.isfinite(y_pred)):
+        return None
     mask = np.isfinite(y_pred) & np.isfinite(y_true)
     if mask.sum() < 10:
         return None
@@ -873,6 +880,12 @@ def evaluate_formula_mse_on_X(formula, X, y):
         return None
     y_pred = np.asarray(y_pred, dtype=np.float64).reshape(-1)
     if y_pred.shape != y_true.shape:
+        return None
+    # §3.54: strict-evaluator contract — grade only fully finite data (see
+    # evaluate_formula_mse for the live-hole analysis).
+    if not np.all(np.isfinite(y_true)):
+        return None
+    if not np.all(np.isfinite(y_pred)):
         return None
     mask = np.isfinite(y_pred) & np.isfinite(y_true)
     if mask.sum() < 10:

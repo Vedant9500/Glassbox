@@ -4760,19 +4760,27 @@ def beam_search_evolution(
     dim_penalty_weight: float = 0.1,
 ) -> dict:
     """
-    Beam search over diverse C++ evolution configurations.
+    Heterogeneous island search over diverse C++ evolution configurations.
 
-    Generates K diverse beams (different op_priors, seed_omegas, graph sizes),
-    runs them in parallel via C++ backend, prunes bottom 80%, mutates top 20%,
-    and repeats for R rounds.
+    Generates K diverse island configs (different op_priors, seed_omegas,
+    graph sizes) and runs them in ONE native multi-island call
+    (num_islands=n_beams, generations=base_generations*n_rounds).
+
+    §3.38 honesty note: despite the historical "beam search" name, there is
+    no Python-side round loop, no per-round pruning by keep_fraction, and no
+    config mutation between rounds — n_rounds only scales the generation
+    budget and keep_fraction is currently reserved (not applied). The
+    returned "config" is the first island config (island-level attribution
+    is unavailable from the native champion), not a traced winning beam.
+    Round-wise prune/mutate would be a behavior redesign, explicitly deferred.
 
     Args:
         x: Input tensor (N,) or (N,1)
         y: Target tensor (N,) or (N,1)
         operator_hints: From extract_operator_hints()
-        n_beams: Number of beams per round (default 20)
-        n_rounds: Number of tournament rounds (default 3)
-        keep_fraction: Fraction of beams to keep each round (default 0.2)
+        n_beams: Number of islands (default 20)
+        n_rounds: Generation-budget multiplier (default 3)
+        keep_fraction: Reserved; per-round pruning is not implemented (default 0.2)
         base_pop_size: Base population size for C++ runs
         base_generations: Base generation count for C++ runs
         device: Device string
@@ -5284,13 +5292,9 @@ def beam_search_evolution(
             f"target_p={max(float(poly_degree), hinted_max_power)})"
         )
 
-    # 1. Get initial configs
-    configs = make_beam_configs(n=n_beams, round_idx=0)
-
     best_overall_mse = float("inf")
     best_overall_result = None
     best_overall_config = None
-    rng = np.random.RandomState(123)
 
     # 1. Get initial configs
     configs = make_beam_configs(n=n_beams, round_idx=0)
@@ -5474,7 +5478,9 @@ def beam_search_evolution(
 
     best_overall_mse = result.get("best_mse", float("inf"))
     best_overall_result = result
-    best_overall_config = configs[0]  # Default, as they were merged
+    # §3.38: island-level attribution is unavailable from the native champion;
+    # this is the first island config by construction, not a traced winner.
+    best_overall_config = configs[0]
 
     elapsed = time.time() - start_time
     if best_overall_result is None:

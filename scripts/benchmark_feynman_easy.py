@@ -1,4 +1,6 @@
 import argparse
+import hashlib
+import os
 import sys
 import time
 import urllib.request
@@ -70,7 +72,20 @@ def validate_classifier_path(classifier_path: str) -> Path:
     )
 
 
-def download_if_missing(url: str, dest_path: Path) -> bool:
+def download_if_missing(
+    url: str,
+    dest_path: Path,
+    *,
+    expected_sha256: str | None = None,
+    max_bytes: int = 256 * 1024 * 1024,
+) -> bool:
+    """Fetch a benchmark dataset with integrity guards (§3.66).
+
+    Streams to a temporary sibling file with a size cap, optionally pins
+    the SHA-256 digest, and atomically renames on success — a truncated
+    download or changed upstream file can no longer be cached silently as
+    if valid. Existing callers keep working (pin optional).
+    """
     if dest_path.exists():
         return False
     if not url:
@@ -78,7 +93,37 @@ def download_if_missing(url: str, dest_path: Path) -> bool:
             f"Dataset missing at {dest_path} and no download URL was provided"
         )
     dest_path.parent.mkdir(parents=True, exist_ok=True)
-    urllib.request.urlretrieve(url, dest_path)  # nosec - trusted source
+    tmp_path = dest_path.with_name(dest_path.name + ".part")
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp, open(tmp_path, "wb") as f:
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(
+                        f"Download exceeds size cap ({max_bytes} bytes): {url}"
+                    )
+                digest.update(chunk)
+                f.write(chunk)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    hex_digest = digest.hexdigest()
+    if expected_sha256 is not None and hex_digest != expected_sha256.lower():
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise ValueError(f"SHA-256 mismatch for {url}")
+    print(f"SHA-256({dest_path.name}) = {hex_digest}")
+    os.replace(tmp_path, dest_path)
     return True
 
 

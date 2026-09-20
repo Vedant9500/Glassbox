@@ -48,7 +48,13 @@ pip install -r requirements.txt
 
 The Python dependencies are listed in `requirements.txt`. The C++ extension uses
 pybind11 and Eigen. A built Windows extension may already be present in a local
-workspace, but source installs should rebuild it:
+workspace, but source installs should rebuild it. Native build prerequisites
+(§3.390 — `requirements.txt` covers only the pybind11 Python package): a C++17
+compiler, CMake ≥3.15 (alternate CMake build) or setuptools (setup.py build),
+and Eigen (vendored under `glassbox/sr/cpp/eigen`; no separate install needed).
+
+Run the build from the extension directory (there is no root `setup.py`, so
+the command below must not be run from the repository root):
 
 ```bash
 cd glassbox/sr/cpp

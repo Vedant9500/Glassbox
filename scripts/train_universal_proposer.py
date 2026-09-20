@@ -7,6 +7,7 @@ independent of a finalized dataset schema.
 from __future__ import annotations
 
 import argparse
+import copy
 import re
 import sys
 from collections.abc import Sequence
@@ -1219,6 +1220,7 @@ def main():
     best_selection_metric = -1.0
     best_metrics = {}
     patience_counter = 0
+    best_checkpoint_payload = None  # §3.35: in-memory best, avoids reload-from-disk
 
     print(f"Training GLU Proposer on {device}...")
     for epoch in range(1, args.epochs + 1):
@@ -1290,8 +1292,7 @@ def main():
             best_metrics["skeleton_loss_weight"] = float(skeleton_loss_weight)
             best_metrics["train_skeleton_coverage"] = float(skeleton_coverage)
             patience_counter = 0
-            torch.save(
-                {
+            best_payload = {
                     "model_state_dict": model.state_dict(),
                     "config": {
                         "hidden_dim": config.hidden_dim,
@@ -1332,9 +1333,9 @@ def main():
                     ),
                     "skeleton_loss_weight": float(skeleton_loss_weight),
                     "train_skeleton_coverage": float(skeleton_coverage),
-                },
-                out_path,
-            )
+                }
+            torch.save(best_payload, out_path)
+            best_checkpoint_payload = copy.deepcopy(best_payload)
             print(
                 f"  -> Saved best model (select={selection_metric:.4f}, val_f1={val_f1:.4f})"
             )
@@ -1346,7 +1347,13 @@ def main():
                 )
                 break
 
-    checkpoint = torch.load(out_path, weights_only=False)
+    # §3.35: reuse the in-memory best instead of re-unpickling the file we
+    # just wrote (a partially written file or writer with directory access
+    # could otherwise execute arbitrary pickle code in this process).
+    if best_checkpoint_payload is not None:
+        checkpoint = copy.deepcopy(best_checkpoint_payload)
+    else:
+        checkpoint = torch.load(out_path, weights_only=True)
     best_checkpoint_metrics = dict(checkpoint.get("validation_metrics") or best_metrics)
     best_checkpoint_metrics.setdefault("val_f1", checkpoint.get("val_f1"))
     best_checkpoint_metrics.setdefault("val_micro_f1", checkpoint.get("val_micro_f1"))

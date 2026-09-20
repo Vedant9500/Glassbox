@@ -36,6 +36,11 @@ def shrink_log(
 
     count_in = 0
     count_out = 0
+    malformed_lines = 0
+    # §3.75: native C++ traces never carry is_elite — track whether ANY
+    # individual in the file has the marker so --elite-only on a native
+    # trace can warn loudly instead of silently emptying populations.
+    seen_is_elite_marker = False
 
     print(f"Processing {input_path} -> {output_path}...")
 
@@ -48,6 +53,10 @@ def shrink_log(
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
+                # Same counting rule as the §3.72 trace-analyzer fix: a
+                # truncated tail record is expected, systematic corruption
+                # must not masquerade as a smaller log.
+                malformed_lines += 1
                 continue
 
             event_type = event.get("event", "")
@@ -67,8 +76,14 @@ def shrink_log(
                 if not is_sampled and event_type != "init.refined":
                     # In non-sampled generations, we might still want to keep the event
                     # but clear the population lists to save space
-                    event["population"] = []
-                    event["explorers"] = []
+                    for key in ["population", "explorers"]:
+                        cleared = event.get(key, [])
+                        if any(
+                            isinstance(ind, dict) and ind.get("is_elite", False)
+                            for ind in cleared
+                        ):
+                            seen_is_elite_marker = True
+                        event[key] = []
                     event["is_full_snapshot"] = False
                 else:
                     # Sampled generation: apply pruning
@@ -77,11 +92,15 @@ def shrink_log(
                         if not pop:
                             continue
 
+                        # §3.74: preserve pre-prune sizes before shrinking.
+                        event[key + "_size_original"] = len(pop)
                         processed_pop = []
                         for ind in pop:
                             # In C++, elites are the first N in some phases, but let's check for 'is_elite'
                             # Actually C++ doesn't have 'is_elite' in JSON by default, but we can assume
                             # the top K in any generation are the ones to keep.
+                            if ind.get("is_elite", False):
+                                seen_is_elite_marker = True
                             is_elite = ind.get("is_elite", False)
 
                             # Filtering logic
@@ -110,12 +129,27 @@ def shrink_log(
                             processed_pop = processed_pop[:keep_top_k]
 
                         event[key] = processed_pop
-                        event["is_full_snapshot"] = True
+                        # §3.74: a pruned listing is NOT a full snapshot —
+                        # downstream population-size/diversity analysis keys
+                        # off this flag (evolution_pipeline_log:113-118).
+                        event["is_full_snapshot"] = False
 
             # Write event
             f_out.write(json.dumps(event) + "\n")
             count_out += 1
 
+    if malformed_lines:
+        print(
+            f"Warning: skipped {malformed_lines} malformed input line(s); "
+            "a truncated tail record is expected, systematic corruption is not."
+        )
+    if elite_only and not seen_is_elite_marker:
+        # §3.75: fail loud instead of silently emitting empty populations.
+        print(
+            "Warning: --elite-only matched zero individuals: no 'is_elite' "
+            "marker exists in this trace (native C++ traces never emit one). "
+            "Populations were emptied by the filter, not by evolution."
+        )
     print(f"Done. Processed {count_in} lines into {count_out} lines.")
     size_in = input_path.stat().st_size / (1024 * 1024)
     size_out = output_path.stat().st_size / (1024 * 1024)
@@ -143,7 +177,8 @@ def main():
     parser.add_argument(
         "--elite-only",
         action="store_true",
-        help="Only keep individuals marked as elite",
+        help="Only keep individuals marked as elite (§3.75: native C++ traces "
+        "never emit 'is_elite', so this empties their populations with a warning)",
     )
     parser.add_argument(
         "--skip-formulas",

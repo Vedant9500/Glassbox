@@ -589,7 +589,27 @@ def _resolve_device(
 
 
 def _make_cache_key(model_path: str, resolved_device: torch.device) -> str:
-    return f"{resolved_device!s}:{Path(model_path).resolve()!s}"
+    # §3.26: bind the key to artifact content identity (mtime + size) so an
+    # overwritten checkpoint cannot keep serving the stale cached model.
+    resolved = Path(model_path).resolve()
+    try:
+        st = resolved.stat()
+        fingerprint = f"{st.st_mtime_ns}:{st.st_size}"
+    except OSError:
+        fingerprint = "missing"
+    return f"{resolved_device!s}:{resolved!s}:{fingerprint}"
+
+
+def clear_classifier_cache() -> None:
+    """Drop all cached classifier models, operator classes, and metadata.
+
+    §3.26 companion: lets callers force a fresh artifact read after an
+    out-of-band checkpoint overwrite without restarting the process.
+    """
+    global _cached_classifier_by_device, _cached_operator_classes_by_key, _cached_metadata_by_device
+    _cached_classifier_by_device.clear()
+    _cached_operator_classes_by_key.clear()
+    _cached_metadata_by_device.clear()
 
 
 def _is_trusted_checkpoint_path(model_path: Path) -> bool:

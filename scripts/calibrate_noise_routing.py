@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -32,6 +33,16 @@ from glassbox.sr.sklearn_wrapper import (
 from scripts.benchmark_noise import NOISE_TIERS, apply_noise_tier
 
 
+def _stable_name_offset(name: str, mod: int = 1000) -> int:
+    """Process-stable per-formula seed offset.
+
+    §3.76: `hash(name)` is salted per process (PYTHONHASHSEED), so generated
+    noise differed across runs. SHA-256 is stable across processes/machines.
+    """
+    digest = hashlib.sha256(name.encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") % mod
+
+
 def _poly_targets(n: int, seed: int):
     rng = np.random.RandomState(seed)
     x = np.linspace(-2.0, 2.0, n)
@@ -49,7 +60,7 @@ def _metrics_for_tier(
     for seed in seeds:
         x, targets = _poly_targets(n, seed)
         for name, y_clean in targets:
-            y_noisy = apply_noise_tier(y_clean, tier, seed=seed + hash(name) % 1000)
+            y_noisy = apply_noise_tier(y_clean, tier, seed=seed + _stable_name_offset(name))
             # Residual vs true structure (oracle residual) — reliability of noise geometry
             resid = y_noisy - y_clean
             ac = abs(_residual_lag1_autocorr(resid))

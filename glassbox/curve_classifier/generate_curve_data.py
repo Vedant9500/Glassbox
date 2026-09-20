@@ -398,6 +398,11 @@ class PCFGFormulaGenerator:
         ("np.tanh", "exp"),  # tanh decomposes to exp/rational
     ]
 
+    # §3.77: "/" never emits ordinary f/g division — it always generates the
+    # protected rational form left/(right**2 + 0.1), hence the "rational"
+    # class label (accurate for the composition, not for true division).
+    # Emitting raw division where numerically safe would be a distribution
+    # redesign, explicitly deferred; the rewrite is recorded in metadata.
     BINARY_OPS = [
         ("+", "addition"),
         ("-", "addition"),
@@ -489,7 +494,8 @@ class PCFGFormulaGenerator:
         right = self._generate_expr(right_budget, ops)
 
         if op_str == "/":
-            # Division: protect denominator from zero
+            # Division: protect denominator from zero (see BINARY_OPS note:
+            # this is a rational composition, not ordinary division).
             ops.add("rational")
             return f"(({left}) / (({right}) ** 2 + 0.1))"
         else:
@@ -1905,6 +1911,40 @@ def build_formula_audit_metadata(
     return payload
 
 
+def _unique_worker_seeds(seed_seq, n_workers):
+    """Deterministic collision-free 32-bit worker seeds (§3.79).
+
+    Workers consume seeds via np.random.seed/random.seed, which require
+    32-bit ints, so the full 64-bit SeedSequence state cannot pass through
+    (birthday collisions are plausible at large worker counts, silently
+    duplicating RNG streams). Draw 32-bit states in spawn order —
+    legacy-identical when no collision — and extend deterministically only
+    if a duplicate occurs.
+    """
+    seeds = [int(s.generate_state(1)[0]) for s in seed_seq.spawn(n_workers)]
+    if len(set(seeds)) == len(seeds):
+        return seeds
+    fixed = list(seeds)
+    used = set()
+    extra = [int(s.generate_state(1)[0]) for s in seed_seq.spawn(n_workers)]
+    ei = 0
+    for i, v in enumerate(fixed):
+        if v in used:
+            while ei < len(extra) and extra[ei] in used:
+                ei += 1
+            if ei < len(extra):
+                fixed[i] = extra[ei]
+                used.add(extra[ei])
+                ei += 1
+        else:
+            used.add(v)
+    if len(set(fixed)) != len(fixed):
+        print("Warning: duplicate 32-bit worker seeds persist; workers may share RNG streams.")
+    else:
+        print("Warning: duplicate 32-bit worker seeds detected and replaced deterministically.")
+    return fixed
+
+
 def generate_dataset(
     n_samples: int,
     x_range: tuple[float, float] = (-5, 5),
@@ -1989,7 +2029,7 @@ def generate_dataset(
     # Deterministic worker seeds (if provided)
     if seed is not None:
         seed_seq = np.random.SeedSequence(seed)
-        worker_seeds = [int(s.generate_state(1)[0]) for s in seed_seq.spawn(n_workers)]
+        worker_seeds = _unique_worker_seeds(seed_seq, n_workers)
     else:
         worker_seeds = [None] * n_workers
 
@@ -2077,8 +2117,9 @@ def generate_dataset(
         for k in reject_stats:
             reject_stats[k] += stats.get(k, 0)
 
-    # Shuffle
-    indices = np.random.permutation(len(features_list))
+    # §3.80: seed the final shuffle from `seed` (was parent-global RNG:
+    # nondeterministic ordering and global-state mutation even with fixed seed).
+    indices = np.random.default_rng(seed).permutation(len(features_list))
     features = np.array(features_list, dtype=np.float32)[indices]
     labels = np.array(labels_list, dtype=np.float32)[indices]
     formulas = [formulas_list[i] for i in indices]
@@ -2184,7 +2225,7 @@ def generate_dataset_streamed(
 
     if seed is not None:
         seed_seq = np.random.SeedSequence(seed)
-        worker_seeds = [int(s.generate_state(1)[0]) for s in seed_seq.spawn(n_workers)]
+        worker_seeds = _unique_worker_seeds(seed_seq, n_workers)
     else:
         worker_seeds = [None] * n_workers
 
@@ -2367,9 +2408,13 @@ def generate_chunk(
 
         if use_pcfg:
             # PCFG-based generation
-            formula, _ = pcfg_gen.generate()
+            # §3.78: retain the grammar-selected ops (were discarded, so
+            # wrapper-recognition bugs were silent label corruption).
+            # _make_generation_metadata records provided vs syntax vs
+            # semantic side by side; rows where they differ are flaggable.
+            formula, pcfg_ops = pcfg_gen.generate()
             operators = derive_semantic_operators_from_formula(formula)
-            provided_operators = set()
+            provided_operators = set(pcfg_ops)
             generator_family = "pcfg"
         elif use_multivariate:
             template_id, template_text, operators = _choose_multivariate_template(
@@ -2920,7 +2965,8 @@ def main():
         formulas = forms_r + forms_g
         generation_metadata = meta_r + meta_g
 
-        indices = np.random.permutation(len(features))
+        # §3.80: same seeded-shuffle rule as generate_dataset.
+        indices = np.random.default_rng(args.seed).permutation(len(features))
         features = features[indices]
         labels = labels[indices]
         formulas = [formulas[i] for i in indices]

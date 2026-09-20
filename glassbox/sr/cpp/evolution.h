@@ -834,6 +834,9 @@ public:
         }
         update_discovery_metrics(last_executed_generation_, start_time);
         run_wall_time_sec_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
+        // §3.385: island runs previously omitted run.end (only run() emitted
+        // it), leaving parent traces unterminated. Same position as run().
+        trace_event("run.end", -1);
     }
 
 private:

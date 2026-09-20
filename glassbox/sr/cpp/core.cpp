@@ -1408,6 +1408,23 @@ static py::object iterative_elastic_net_wrapper(py::array_t<double> X_arr, py::a
     if (max_iter <= 0 || n_starts <= 0 || n_iterations <= 0) {
         throw std::invalid_argument("iteration/start counts must be positive");
     }
+    // §3.315: reject non-finite X/y at the FFI boundary (was silent NaN
+    // propagation; lasso fail-louds via §3.400, elastic net had no backstop).
+    // Matches the run_evolution §3.318 contract.
+    {
+        const double* xp = static_cast<const double*>(X_buf.ptr);
+        for (ssize_t i = 0, n = X_buf.size; i < n; ++i) {
+            if (!std::isfinite(xp[i])) {
+                throw std::invalid_argument("X must contain only finite values");
+            }
+        }
+        const double* yp = static_cast<const double*>(y_buf.ptr);
+        for (ssize_t i = 0, n = y_buf.size; i < n; ++i) {
+            if (!std::isfinite(yp[i])) {
+                throw std::invalid_argument("y must contain only finite values");
+            }
+        }
+    }
     
     int n = X_buf.shape[0];
     int p = X_buf.shape[1];
@@ -1472,6 +1489,23 @@ static py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::
     }
     if (!std::isfinite(alpha) || alpha < 0 || !std::isfinite(tol) || tol <= 0 || max_iter <= 0) {
         throw std::invalid_argument("alpha/tol/max_iter must be finite and positive (alpha>=0)");
+    }
+    // §3.315: reject non-finite X/y at the FFI boundary (previously only the
+    // §3.400 result check caught these, after wasted compute). Same contract
+    // as iterative_elastic_net above and run_evolution §3.318.
+    {
+        const double* xp = static_cast<const double*>(X_buf.ptr);
+        for (ssize_t i = 0, n = X_buf.size; i < n; ++i) {
+            if (!std::isfinite(xp[i])) {
+                throw std::invalid_argument("X must contain only finite values");
+            }
+        }
+        const double* yp = static_cast<const double*>(y_buf.ptr);
+        for (ssize_t i = 0, n = y_buf.size; i < n; ++i) {
+            if (!std::isfinite(yp[i])) {
+                throw std::invalid_argument("y must contain only finite values");
+            }
+        }
     }
     
     int n = X_buf.shape[0];

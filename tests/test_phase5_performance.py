@@ -198,7 +198,13 @@ def test_s1_7_structure_probe_reuse_skips_family_bank():
 
 @requires_cpp
 def test_e6_evolution_still_recovers_simple_target():
-    """E6 elite skip must not break recovery on a simple polynomial."""
+    """E6 elite skip must not break recovery on a simple polynomial.
+
+    SMOKE tier (§3.50): ``mse < 0.05`` asserts real progress / no broken
+    fitness cache — deliberately loose, not exact recovery. Do not cite this
+    threshold as optimizer-exactness proof; exactness is gated by the
+    benchmark protocol suites.
+    """
     rng = np.random.RandomState(7)
     x = np.linspace(-1.5, 1.5, 80)
     y = x**2 + 0.5 * x
@@ -217,12 +223,15 @@ def test_e6_evolution_still_recovers_simple_target():
     assert res is not None
     mse = float(res.get("best_mse", float("inf")))
     assert np.isfinite(mse)
-    # Should make real progress (not broken fitness cache).
+    # Smoke tier only (see docstring): real progress, not exactness.
     assert mse < 0.05
 
 
 @requires_cpp
 def test_e6_repeated_runs_finite_and_deterministic_under_seed():
+    # §3.49: pin the OpenMP team size so process-global thread state cannot
+    # leak nondeterminism into this comparison (both runs share the setting;
+    # cross-worker comparability is a separate concern).
     x = np.linspace(-1, 1, 60)
     y = np.sin(2.0 * x)
     X_list = [x.astype(np.float64)]
@@ -236,6 +245,7 @@ def test_e6_repeated_runs_finite_and_deterministic_under_seed():
         num_islands=2,
         random_seed=123,
         arithmetic_temperature=5.0,
+        num_threads=1,
     )
     a = _core.run_evolution(**kwargs)
     b = _core.run_evolution(**kwargs)

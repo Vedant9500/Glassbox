@@ -1,4 +1,12 @@
-"""Phase 3-6 recovery verification probe (clean recovery, not noisy EXACT%)."""
+"""Phase 3-6 recovery verification probe (clean recovery, not noisy EXACT%).
+
+§3.156: this script is INFORMATIONAL, not a release gate. Its phase
+criteria are broad OR-conditions (e.g. 50%-improvement OR below an absolute
+floor), so a printed PASS means "probe signal observed", never "phase
+proven". Do not quote PASS/WEAK as acceptance evidence; gate releases on the
+pytest suites and benchmark protocol instead. Exit status stays
+count-based (≥4 probes) for backward compatibility.
+"""
 from __future__ import annotations
 
 import sys
@@ -325,11 +333,13 @@ def main():
     print("  PASS" if results["e2e_weights"] else "  WEAK")
 
     # ------------------------------------------------------------------
-    section("SUMMARY")
+    section("SUMMARY (informational — not a release gate; see module docstring)")
     for k, v in results.items():
         print(f"  {k:20s} {'PASS' if v else 'FAIL/WEAK'}")
     n_pass = sum(1 for v in results.values() if v)
     print(f"  {n_pass}/{len(results)} probes passed")
+    print("  NOTE: broad-OR probe criteria — PASS signals recovery behavior,")
+    print("  it does not certify the phase. Gate releases on pytest suites.")
     return 0 if n_pass >= 4 else 1
 
 

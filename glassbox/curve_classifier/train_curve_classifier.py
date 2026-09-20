@@ -9,6 +9,7 @@ Usage:
 """
 
 import argparse
+import copy
 import sys
 from pathlib import Path
 
@@ -1118,6 +1119,8 @@ def train_model(
     best_val_loss = float("inf")
     best_val_f1 = -1.0
     best_epoch = 0
+    best_checkpoint_payload = None  # M-21: in-memory best, avoids reload-from-disk
+    checkpoint = None
     patience_counter = 0
 
     for epoch in range(epochs):
@@ -1168,8 +1171,7 @@ def train_model(
             best_val_f1 = val_metrics["f1_mean"]
             best_epoch = epoch + 1
             patience_counter = 0
-            torch.save(
-                {
+            best_payload = {
                     "model_state_dict": model.state_dict(),
                     "epoch": epoch,
                     "val_loss": val_metrics["loss"],
@@ -1187,9 +1189,9 @@ def train_model(
                         "architecture_version": CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
                     },
                     "architecture_version": CURVE_CLASSIFIER_ARCHITECTURE_VERSION,
-                },
-                save_path,
-            )
+                }
+            torch.save(best_payload, save_path)
+            best_checkpoint_payload = copy.deepcopy(best_payload)
             print(
                 f"  -> Saved best model (val_loss: {val_metrics['loss']:.4f}, val_f1: {val_metrics['f1_mean']:.4f})"
             )
@@ -1205,8 +1207,12 @@ def train_model(
         f"\nBest model at epoch {best_epoch} with val_loss: {best_val_loss:.4f}, val_f1: {best_val_f1:.4f}"
     )
 
-    # Reload best model for final evaluation
-    checkpoint = torch.load(save_path, weights_only=False)
+    # M-21: reuse the in-memory best instead of re-unpickling the file we
+    # just wrote (numpy metric arrays inside rule out weights_only=True).
+    if best_checkpoint_payload is not None:
+        checkpoint = copy.deepcopy(best_checkpoint_payload)
+    else:
+        checkpoint = torch.load(save_path, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
     val_metrics = evaluate(
         model, val_loader, criterion, device, return_preds=True, return_logits=True
@@ -1236,8 +1242,12 @@ def train_model(
     for i, name in enumerate(operator_classes):
         print(f"  {name:15s}: {val_metrics['f1_per_class'][i]:.4f}")
 
-    # Tune thresholds and store alongside model checkpoint
-    checkpoint = torch.load(save_path, weights_only=False)
+    # M-21: same in-memory source; a fresh deepcopy keeps the legacy
+    # semantics (site-1 in-memory additions are not carried forward).
+    if best_checkpoint_payload is not None:
+        checkpoint = copy.deepcopy(best_checkpoint_payload)
+    else:
+        checkpoint = torch.load(save_path, weights_only=True)
 
     # Optional calibration
     temperature = None
@@ -1306,7 +1316,7 @@ def train_model(
 
     torch.save(checkpoint, save_path)
 
-    return model
+    return model, checkpoint
 
 
 def load_training_data(
@@ -1895,7 +1905,7 @@ def main():
 
     # Train
     print(f"\nTraining for {args.epochs} epochs...")
-    train_model(
+    _, trained_checkpoint = train_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -1920,8 +1930,12 @@ def main():
         ),
     )
 
-    # Persist scaler and schema metadata
-    checkpoint = torch.load(output_path, weights_only=False)
+    # M-21: reuse the checkpoint train_model just saved (same process, same
+    # bytes) instead of re-unpickling it from disk.
+    if trained_checkpoint is not None:
+        checkpoint = copy.deepcopy(trained_checkpoint)
+    else:
+        checkpoint = torch.load(output_path, weights_only=True)
     if scaler is not None:
         checkpoint["feature_scaler"] = scaler
     checkpoint["feature_schema"] = feature_schema

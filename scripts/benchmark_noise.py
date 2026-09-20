@@ -960,13 +960,14 @@ def _run_single(
 
     # Exact-match check uses the *clean* target on the full selection so noise
     # injection does not corrupt the ground-truth equality test.
+    # §3.57: y_sel_noisy sits next to y_sel in this scope with a similar name;
+    # bind the clean vector explicitly so a future edit cannot silently grade
+    # against noisy labels.
+    y_sel_clean = y_sel
+    assert y_sel_clean.shape == y_sel_noisy.shape
     try:
         y_pred_full = est.predict(X_sel)
-        full_clean_mse = (
-            float(np.mean((y_pred_full - y_sel) ** 2))
-            if np.all(np.isfinite(y_pred_full))
-            else float("inf")
-        )
+        full_clean_mse = _clean_exact_match_mse(y_pred_full, y_sel_clean)
     except Exception:
         full_clean_mse = float("inf")
         y_pred_full = None
@@ -1018,6 +1019,23 @@ def _safe_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float | None:
     if var < 1e-15:
         return 1.0 if float(np.mean((y_pred - y_true) ** 2)) < 1e-15 else 0.0
     return float(1.0 - np.mean((y_pred - y_true) ** 2) / var)
+
+
+def _clean_exact_match_mse(y_pred_full, y_clean) -> float:
+    """MSE of full-selection predictions against CLEAN labels (§3.57).
+
+    Callers must pass the clean target explicitly — the noisy-fit labels
+    (`y_sel_noisy`) live next to it in `_run_single` under a similar name,
+    and grading against them would silently redefine exactness. Non-finite
+    predictions or shape mismatch score inf (no match), matching legacy.
+    """
+    y_pred_full = np.asarray(y_pred_full, dtype=np.float64).reshape(-1)
+    y_clean = np.asarray(y_clean, dtype=np.float64).reshape(-1)
+    if y_pred_full.shape != y_clean.shape:
+        return float("inf")
+    if not np.all(np.isfinite(y_pred_full)):
+        return float("inf")
+    return float(np.mean((y_pred_full - y_clean) ** 2))
 
 
 def _to_json_float(value) -> float | None:

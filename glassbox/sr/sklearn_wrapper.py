@@ -9517,6 +9517,23 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             self._fft_phase_info = None
             return []
 
+    def _restore_torch_rng_state(self):
+        """Restore pre-fit Torch RNG state saved at fit start (§3.47)."""
+        state = getattr(self, "_torch_rng_state_before_", None)
+        if state is not None:
+            try:
+                torch.set_rng_state(state)
+            except Exception:
+                pass
+            self._torch_rng_state_before_ = None
+        cuda_state = getattr(self, "_torch_cuda_rng_state_before_", None)
+        if cuda_state is not None:
+            try:
+                torch.cuda.set_rng_state_all(cuda_state)
+            except Exception:
+                pass
+            self._torch_cuda_rng_state_before_ = None
+
     def fit(self, X, y, sample_weight=None):
         """
         Fit the symbolic regression model using the full Glassbox pipeline:
@@ -9602,11 +9619,24 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self._fit_rng_ = np.random.RandomState(
             None if self.random_state is None else int(self.random_state)
         )
+        # §3.47: torch.manual_seed reseeds process-global Torch RNG, which
+        # contradicts the invariant above for unrelated models/threads. The
+        # seed stays active during this fit (torch-path determinism), but the
+        # prior CPU (+CUDA, if present) RNG state is saved here and restored
+        # at both fit exits, so post-fit global state is untouched. Concurrent
+        # fits sharing global torch state can still race mid-fit; fully
+        # isolating that needs a dedicated fit lock (M-65, deferred).
+        self._torch_rng_state_before_ = None
+        self._torch_cuda_rng_state_before_ = None
         if self.random_state is not None:
             try:
+                self._torch_rng_state_before_ = torch.get_rng_state()
+                if torch.cuda.is_available():
+                    self._torch_cuda_rng_state_before_ = torch.cuda.get_rng_state_all()
                 torch.manual_seed(int(self.random_state))
             except Exception:
-                pass
+                self._torch_rng_state_before_ = None
+                self._torch_cuda_rng_state_before_ = None
 
         blackbox_enabled = bool(self.blackbox_feature_selection) and (
             self.blackbox_mode is True
@@ -10100,6 +10130,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             self._restore_user_loss_mode_if_auto_switched()
             self._add_phase_time("total_fit", _time.time() - fit_start)
             self._finalize_swallowed_errors_summary()
+            self._restore_torch_rng_state()
             return self
 
         # ── Stage 1: Classifier Fast Path ──
@@ -12570,6 +12601,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         self._finalize_swallowed_errors_summary()
         self._restore_user_loss_mode_if_auto_switched()
         self._add_phase_time("total_fit", _time.time() - fit_start)
+        self._restore_torch_rng_state()
         return self
 
     def predict(self, X):

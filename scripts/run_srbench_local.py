@@ -1071,6 +1071,12 @@ def run_track2_ground_truth(
                                 split="full",
                             )
                         specialist_metadata = run_result.get("specialist_metadata")
+                        # §3.65: re-stamp post-evaluation so successful-run `time`
+                        # means total wall including postprocessing in BOTH
+                        # branches (the non-hard branch stamps after its own
+                        # evaluate call below). Early error/timeout returns above
+                        # keep the fit-only stamp — no eval ran on those paths.
+                        elapsed = time.time() - t0
                     else:
                         est_copy = est.__class__(**est_params)
                         est_copy.fit(X_train, y_train)
@@ -1187,21 +1193,29 @@ def run_track2_ground_truth(
         )
 
         best_run = min(valid_seed_runs, key=lambda r: float(r.get("mse", float("inf"))))
+        # §3.64: full_mse median is finite-only with a None fallback. The legacy
+        # unconditional float(np.median([...])) returned nan (and warned on an
+        # empty list) when every valid run lacked a usable full_mse, which
+        # later stringified through default=str. Missing stays None like the
+        # other metric summaries.
+        _full_mse_vals = [
+            float(r["full_mse"])
+            for r in valid_seed_runs
+            if r.get("full_mse") is not None and math.isfinite(float(r["full_mse"]))
+        ]
+        _full_mse_med = float(np.median(_full_mse_vals)) if _full_mse_vals else None
         aggregate = {
             "problem": name,
             "true_formula": best_run.get("true_formula"),
             "discovered_formula": best_run.get("discovered_formula"),
             "r2": stability["r2_stats"]["median"],
             "mse": stability["mse_stats"]["median"],
-            "full_mse": float(
-                np.median(
-                    [
-                        r["full_mse"]
-                        for r in valid_seed_runs
-                        if r.get("full_mse") is not None
-                    ]
-                )
-            ),
+            "full_mse": _full_mse_med,
+            # §3.63: medians come from all valid runs but formula/size come
+            # from the best-MSE run — record both sources explicitly so the
+            # printed row cannot be misread as one run's artifacts.
+            "discovered_formula_source": "best_mse_run",
+            "median_run_formula": median_run.get("discovered_formula"),
             "exact_match": bool(stability.get("exact_recovery_rate", 0.0) == 1.0),
             "exact_recovery_rate": stability.get("exact_recovery_rate"),
             "time": stability["time_stats"]["median"],

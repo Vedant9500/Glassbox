@@ -509,3 +509,58 @@ def test_main_smoke_writes_protocol_artifacts(tmp_path, monkeypatch):
     assert (out / "noise_protocol_report.md").exists()
     stamped = list(out.glob("noise_protocol_*"))
     assert any(p.is_dir() for p in stamped)
+
+
+def test_exact_match_grades_clean_labels_not_noisy():
+    # §3.57 wiring (load-bearing): a stub recovering the truth exactly must
+    # score exact_match even when the FIT labels are heavily noised. Grading
+    # against y_sel_noisy — the similarly-named neighbor in _run_single —
+    # would fail this test.
+    class _TruthStub:
+        def __init__(self, **kw):
+            pass
+
+        def get_params(self):
+            return {}
+
+        def fit(self, X, y):
+            return self
+
+        def predict(self, X):
+            X = np.asarray(X, dtype=np.float64)
+            return 2.0 * X[:, 0] + 1.0
+
+        def get_formula(self):
+            return "2*x0 + 1"
+
+    noisy_tier = next(
+        t
+        for t in bn.NOISE_TIERS
+        if t.get("noise_type") == "gaussian" and float(t.get("noise_level")) >= 0.1
+    )
+    row = bn._run_single(
+        _TruthStub,
+        _toy_problem(),
+        noisy_tier,
+        seed=7,
+        n_samples=60,
+        train_fraction=0.8,
+        acceptable_r2=0.99,
+    )
+    assert row["error"] is None
+    assert row["exact_match"] is True
+    assert row["clean_full_mse"] is not None and row["clean_full_mse"] < 1e-6
+
+
+def test_clean_exact_match_helper_grades_clean_labels():
+    # §3.57: exactness must be measured against clean labels even though the
+    # noisy-fit labels sit next to them in _run_single.
+    y_clean = np.array([1.0, 2.0, 3.0])
+    y_noisy = y_clean + np.array([5.0, -5.0, 5.0])
+    assert bn._clean_exact_match_mse(y_clean, y_clean) == 0.0
+    # A prediction matching the NOISY labels must not count as exact.
+    assert bn._clean_exact_match_mse(y_noisy, y_clean) > 1e-6
+    assert bn._clean_exact_match_mse(
+        np.array([np.nan, np.nan, np.nan]), y_clean
+    ) == float("inf")
+    assert bn._clean_exact_match_mse(np.array([1.0, 2.0]), y_clean) == float("inf")
