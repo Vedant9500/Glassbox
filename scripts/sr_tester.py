@@ -240,6 +240,23 @@ class Config:
 
 def parse_formula(formula_str: str) -> Callable[[torch.Tensor], torch.Tensor]:
     """Parse a user-entered formula string into a PyTorch function."""
+    # §3.51: fail-closed AST allowlist before eval (was unrestricted eval = RCE).
+    try:
+        from glassbox.sr.formula_safety import validate_formula_expr
+    except ImportError:
+        validate_formula_expr = None  # type: ignore
+    if validate_formula_expr is not None:
+        _check = formula_str.strip().lower()
+        _check = re.sub(r"\^(\d+)", r"**\1", _check)
+        _check = re.sub(r"\^(\()", r"**\1", _check)
+        _check = _check.replace("np.", "")
+        _check = re.sub(r"\|([^|]+)\|", r"abs(\1)", _check)
+        # Reanalysis: collapse indexed vars (x0..xN, any N) to x for the
+        # allowlist so wide formulas are not rejected by the x0..x49 cap.
+        _check = re.sub(r"\bx\d+\b", "x", _check)
+        _allowed = {"x", "sin", "cos", "tan", "exp", "log", "sqrt",
+                    "abs", "pi", "e", "np"}
+        validate_formula_expr(_check, _allowed)
     formula = formula_str.strip().lower()
     formula = re.sub(r"\^(\d+)", r"**\1", formula)
     formula = re.sub(r"\^(\()", r"**\1", formula)
@@ -282,7 +299,8 @@ def parse_formula(formula_str: str) -> Callable[[torch.Tensor], torch.Tensor]:
         if x.dim() == 1:
             x = x.reshape(-1, 1)
         try:
-            result = eval(formula)
+            # §3.51: restricted globals (was closure globals with full builtins).
+            result = eval(formula, {"__builtins__": None}, {"x": x, "torch": torch})
             if isinstance(result, (int, float)):
                 result = torch.full(
                     (x.shape[0], 1), result, dtype=x.dtype, device=x.device

@@ -189,7 +189,10 @@ def test_training_data_loader_reads_phase2_validation_metadata():
     assert metadata["labels_match_semantic"].tolist() == [True, True, True, True]
 
 
-def test_proposer_replay_dataset_preserves_loader_compatibility():
+def test_proposer_replay_dataset_preserves_loader_compatibility(monkeypatch):
+    # §3.53: scratch/ is outside the trusted data roots; opt in for this
+    # test-created file (same precedent as the universal_proposer tests).
+    monkeypatch.setenv("GLASSBOX_ALLOW_PICKLE_CHECKPOINT", "1")
     formulas = ["np.sin(x)", "x ** 2"]
     labels = np.vstack([operators_to_labels(set(), formula=f) for f in formulas])
     features = np.zeros((len(formulas), FEATURE_DIM), dtype=np.float32)

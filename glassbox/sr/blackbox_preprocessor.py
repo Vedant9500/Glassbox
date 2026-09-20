@@ -57,6 +57,10 @@ class BlackboxState:
     # M-32: declared diagnostic field (was an undeclared dynamic attribute,
     # invisible to serialization and type checkers).
     ranking_sample_weight_mode: str = "none"
+    # §3.21: standardization provenance — stats fit on all rows by default
+    # (legacy). Pass fit_indices to fit stats on training rows only.
+    stats_fit_rows: int = 0
+    stats_fit_on_all_rows: bool = True
 
 
 def _safe_std(values: np.ndarray) -> np.ndarray:
@@ -967,29 +971,56 @@ def prepare_blackbox_search(
     min_features_to_select: int = 5,
     interaction_search: bool = True,
     sample_weight: np.ndarray | None = None,
+    fit_indices: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, BlackboxState]:
-    """Return reduced/standardized search data and remapping metadata."""
+    """Return reduced/standardized search data and remapping metadata.
+
+    §3.21: pass training-only ``fit_indices`` so standardization stats do
+    not leak validation rows. Default ``None`` preserves legacy fit-on-all
+    behavior and records ``stats_fit_on_all_rows=True``.
+    """
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
     n_features = int(X.shape[1])
+    n_rows = int(X.shape[0])
+    # §3.21: optional fit-only mask for stats (transform still applies to all rows).
+    _fit_idx = None
+    _fit_on_all = True
+    if fit_indices is not None:
+        try:
+            _fit_idx = np.asarray(fit_indices).reshape(-1).astype(int)
+            _fit_idx = _fit_idx[(_fit_idx >= 0) & (_fit_idx < n_rows)]
+            if _fit_idx.size > 0:
+                _fit_on_all = False
+            else:
+                _fit_idx = None
+        except Exception:
+            _fit_idx = None
+    X_stats = X[_fit_idx] if _fit_idx is not None else X
+    y_stats = y[_fit_idx] if _fit_idx is not None else y
+    _stats_fit_rows = int(_fit_idx.size) if _fit_idx is not None else n_rows
 
-    X_finite = np.where(np.isfinite(X), X, np.nan)
-    y_finite = np.where(np.isfinite(y), y, np.nan)
     # M-35: which columns/rows were imputed to stay shape-stable.
+    # Reanalysis: count on the stats frame — with fit_indices, a column
+    # all-NaN on fit rows takes the 0.0 fallback even when finite rows
+    # exist outside fit, so full-frame counts would miss it.
     _imputed_columns = [
         int(j)
-        for j in range(int(X.shape[1]))
-        if not bool(np.any(np.isfinite(X[:, j])))
+        for j in range(int(X_stats.shape[1]))
+        if not bool(np.any(np.isfinite(X_stats[:, j])))
     ]
-    _imputed_y_rows = int(np.sum(~np.isfinite(y)))
-    x_mean = np.nanmean(X_finite, axis=0)
+    _imputed_y_rows = int(np.sum(~np.isfinite(y_stats)))
+    # §3.21: stats on fit rows only when fit_indices given (all-row legacy otherwise).
+    _X_stats_finite = np.where(np.isfinite(X_stats), X_stats, np.nan)
+    _y_stats_finite = np.where(np.isfinite(y_stats), y_stats, np.nan)
+    x_mean = np.nanmean(_X_stats_finite, axis=0)
     x_mean = np.where(np.isfinite(x_mean), x_mean, 0.0)
     X_clean = np.where(np.isfinite(X), X, x_mean.reshape(1, -1))
-    x_scale = _safe_std(X)
-    y_mean_raw = float(np.nanmean(y_finite)) if np.any(np.isfinite(y_finite)) else 0.0
+    x_scale = _safe_std(X_stats)
+    y_mean_raw = float(np.nanmean(_y_stats_finite)) if np.any(np.isfinite(_y_stats_finite)) else 0.0
     y_mean = y_mean_raw if np.isfinite(y_mean_raw) else 0.0
     y_clean = np.where(np.isfinite(y), y, y_mean)
-    y_scale = float(np.nanstd(y_finite)) if np.any(np.isfinite(y_finite)) else 1.0
+    y_scale = float(np.nanstd(_y_stats_finite)) if np.any(np.isfinite(_y_stats_finite)) else 1.0
     if not np.isfinite(y_scale) or y_scale < 1e-12:
         y_scale = 1.0
 
@@ -1008,6 +1039,8 @@ def prepare_blackbox_search(
             reason="disabled_or_low_dimensional",
             imputed_columns=list(_imputed_columns),
             imputed_y_rows=int(_imputed_y_rows),
+            stats_fit_rows=int(_stats_fit_rows),
+            stats_fit_on_all_rows=bool(_fit_on_all),
         )
         return X_clean, y_clean, state
 
@@ -1032,6 +1065,8 @@ def prepare_blackbox_search(
             reason="no_variable_features",
             imputed_columns=list(_imputed_columns),
             imputed_y_rows=int(_imputed_y_rows),
+            stats_fit_rows=int(_stats_fit_rows),
+            stats_fit_on_all_rows=bool(_fit_on_all),
         )
         return X_clean, y_clean, state
 
@@ -1301,6 +1336,8 @@ def prepare_blackbox_search(
         ranking_sample_weight_mode=str(ranking_weight_mode or "none"),
         imputed_columns=list(_imputed_columns),
         imputed_y_rows=int(_imputed_y_rows),
+        stats_fit_rows=int(_stats_fit_rows),
+        stats_fit_on_all_rows=bool(_fit_on_all),
     )
     return X_scaled_all[:, selected], y_scaled, state
 
@@ -1564,6 +1601,10 @@ def state_to_dict(state: BlackboxState | None) -> dict[str, Any]:
         ),
         "imputed_columns": list(getattr(state, "imputed_columns", []) or []),
         "imputed_y_rows": int(getattr(state, "imputed_y_rows", 0) or 0),
+        "stats_fit_rows": int(getattr(state, "stats_fit_rows", 0) or 0),
+        "stats_fit_on_all_rows": bool(
+            getattr(state, "stats_fit_on_all_rows", True)
+        ),
         "n_selected_features": len(state.selected_features),
         "n_dropped_features": len(state.dropped_features),
     }

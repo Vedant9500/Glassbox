@@ -134,7 +134,14 @@ def load_training_data(
     return_metadata: bool = False,
 ) -> tuple:
     """Load proposer training data from the current curve dataset format."""
-    blob = np.load(data_path, allow_pickle=True)
+    from glassbox.curve_classifier.generate_curve_data import (
+        assert_trusted_npz_pickle_path,
+    )
+
+    resolved = assert_trusted_npz_pickle_path(
+        data_path, required=("features", "labels")
+    )
+    blob = np.load(resolved, allow_pickle=True)
     features = np.asarray(blob["features"], dtype=np.float32)
     labels = np.asarray(blob["labels"], dtype=np.float32)
     formulas = blob["formulas"].tolist() if "formulas" in blob else None

@@ -67,6 +67,17 @@ for formula_str, func, (xmin, xmax), pop, gens, desc in TEST_CASES:
     mse = res["best_mse"]
     formula = res["formula"]
 
+    # §3.159: report displayed-formula MSE alongside engine MSE (was engine
+    # only, so EXACT meant internal fitness not display contract). Grading
+    # below still uses engine mse to keep the gate stable; display is diagnostic.
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from benchmark_common import evaluate_formula_mse_on_X as _eval_display_mse
+
+        _display_mse = _eval_display_mse(formula, X, y)
+    except Exception:
+        _display_mse = None
+
     # Grade
     if mse < 1e-6:
         grade = "🟢 EXACT"
@@ -79,6 +90,12 @@ for formula_str, func, (xmin, xmax), pop, gens, desc in TEST_CASES:
 
     print(f"{desc:<25} {mse:>12.6e} {elapsed:>7.2f}s  {grade}")
     print(f"  → {formula[:70]}")
+    if _display_mse is None:
+        print("    display_mse=None (unevaluable/strict-reject)")
+    else:
+        print(f"    display_mse={_display_mse:.6e}")
+        if (mse < 1e-6) != (_display_mse < 1e-6):
+            print("    note: engine/display EXACT disagree (display contract)")
     results.append((desc, mse, elapsed, grade))
 
 print("\n" + "=" * 72)

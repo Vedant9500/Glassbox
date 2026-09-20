@@ -656,14 +656,25 @@ def run_track1_blackbox(
     post_simplify=False,
     skip_evolution_if_bloated=True,
     ablation_mode=False,
+    auto_install_pmlb=False,
 ):
     """Track 1: Black-box regression on PMLB datasets."""
     try:
         from pmlb import fetch_data
-    except ImportError:
+    except ImportError as exc:
+        # §3.31: never mutate the active environment implicitly (no pin,
+        # no venv check, possible network failure midway). Explicit opt-in.
+        if not auto_install_pmlb:
+            raise ImportError(
+                "Track 1 requires the 'pmlb' package, which is not installed. "
+                "Install it explicitly (pip install pmlb) or re-run with "
+                "--auto-install-pmlb to allow this script to install it."
+            ) from exc
         import subprocess
 
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "pmlb"])
+        cmd = [sys.executable, "-m", "pip", "install", "pmlb"]
+        print(f"  --auto-install-pmlb: running {' '.join(cmd)}")
+        subprocess.check_call(cmd)
         from pmlb import fetch_data
 
     results = []
@@ -1455,6 +1466,13 @@ def main():
         help="Disable adaptive timeout scaling (now enabled by default)",
     )
     parser.add_argument(
+        "--auto-install-pmlb",
+        action="store_true",
+        help="Allow Track 1 to pip-install 'pmlb' when missing "
+        "(default: fail with an actionable ImportError instead of "
+        "mutating the active environment)",
+    )
+    parser.add_argument(
         "--post-simplify",
         action="store_true",
         help="Post-simplify formulas with a fidelity guard",
@@ -1668,6 +1686,7 @@ def main():
             post_simplify=args.post_simplify,
             skip_evolution_if_bloated=args.skip_evolution_if_bloated,
             ablation_mode=args.blackbox_ablation,
+            auto_install_pmlb=args.auto_install_pmlb,
         )
 
     print_summary(track1_results, track2_results, output_dir=args.output_dir)

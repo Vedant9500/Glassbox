@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+import math
 import numpy as np
 
 
@@ -214,14 +215,14 @@ def build_fpip_v2_from_fast_path(
 
     top_candidates: list[CandidateSkeleton] = []
     for idx, cand in enumerate(selected_candidates):
-        explicit_prob = _to_float_or_none(cand.get("probability"))
+        # §3.14: store collectively-normalized probability (was raw explicit,
+        # so [0.2,0.2] summed to 0.4 with different fallback semantics than
+        # derived probs). Relative order preserved; sum is now 1.0.
         top_candidates.append(
             CandidateSkeleton(
                 formula=str(cand.get("formula", "")),
                 score=_to_float_or_none(cand.get("score")),
-                probability=explicit_prob
-                if explicit_prob is not None and explicit_prob > 0.0
-                else candidate_probs[idx],
+                probability=float(candidate_probs[idx]),
                 mse=_to_float_or_none(cand.get("mse")),
             )
         )
@@ -321,6 +322,19 @@ def validate_fpip_v2_payload(payload: dict[str, Any]) -> tuple[bool, list[str]]:
         for idx, c in enumerate(candidates):
             if not isinstance(c, dict) or not str(c.get("formula", "")).strip():
                 errors.append(f"candidate_skeletons[{idx}] must include formula")
+            # §3.14: explicit probabilities must be numeric in [0,1].
+            if "probability" in c and c.get("probability") is not None:
+                try:
+                    pf = float(c.get("probability"))
+                except (TypeError, ValueError):
+                    errors.append(
+                        f"candidate_skeletons[{idx}].probability must be numeric"
+                    )
+                else:
+                    if not math.isfinite(pf) or pf < 0.0 or pf > 1.0:
+                        errors.append(
+                            f"candidate_skeletons[{idx}].probability must be in [0,1]"
+                        )
 
     uncertainty = payload.get("sequence_uncertainty")
     if not isinstance(uncertainty, dict):

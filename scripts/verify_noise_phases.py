@@ -35,7 +35,13 @@ def r2(y, p):
 
 
 def eval_formula(est, formula, X):
-    return np.asarray(est._safe_eval_formula_array(formula, X), dtype=np.float64).reshape(-1)
+    # §3.157: strict (was zero-fill via _safe_eval_formula_array, which let
+    # NaN-on-outlier formulas fake finite clean MSE). Non-finite now raises
+    # so callers score 1e9/fail instead of passing on fabricated zeros.
+    raw = np.asarray(est._eval_formula_raw(formula, X), dtype=np.float64).reshape(-1)
+    if not np.all(np.isfinite(raw)):
+        raise ValueError(f"non-finite predictions for {str(formula)[:60]}")
+    return raw
 
 
 def section(title):

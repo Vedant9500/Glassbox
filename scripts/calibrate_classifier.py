@@ -61,7 +61,14 @@ def load_calibration_data(
     seed: int,
 ):
     """Load validation data for calibration from .npz file."""
-    data = np.load(data_path, allow_pickle=True)
+    from glassbox.curve_classifier.generate_curve_data import (
+        assert_trusted_npz_pickle_path,
+    )
+
+    resolved = assert_trusted_npz_pickle_path(
+        data_path, required=("features", "labels")
+    )
+    data = np.load(resolved, allow_pickle=True)
     features = data["features"]
     labels = data["labels"]
 

@@ -441,16 +441,19 @@ def default_parallel_config(
     return int(jobs), int(omp)
 
 
+_WORKER_THREAD_ENV_KEYS = (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+
 def _set_worker_thread_env(omp_num_threads: int) -> None:
     """Pin BLAS/OpenMP threads for a protocol worker process."""
     n = str(max(1, int(omp_num_threads)))
-    for key in (
-        "OMP_NUM_THREADS",
-        "MKL_NUM_THREADS",
-        "OPENBLAS_NUM_THREADS",
-        "NUMEXPR_NUM_THREADS",
-        "VECLIB_MAXIMUM_THREADS",
-    ):
+    for key in _WORKER_THREAD_ENV_KEYS:
         os.environ[key] = n
 
 
@@ -701,31 +704,44 @@ def run_noise_protocol(
     dash = _ProtocolDashboard(total_cells, enabled=bool(verbose), detail=bool(detail))
 
     if not use_pool:
-        if omp_num_threads is not None and int(omp_num_threads) > 0:
-            _set_worker_thread_env(int(omp_num_threads))
-        rows: list[dict[str, Any]] = []
-        for problem in problems:
-            name = problem[0]
-            for tier in tiers:
-                tier_name = str(tier["name"])
-                for seed in seeds:
-                    dash.start_cell(name, tier_name, int(seed))
-                    with _silence_stdio(enabled=bool(silence_fit)):
-                        row = _run_single(
-                            estimator_factory,
-                            problem,
-                            tier,
-                            int(seed),
-                            n_samples=n_samples,
-                            train_fraction=train_fraction,
-                            acceptable_r2=acceptable_r2,
-                        )
-                    row["problem"] = name
-                    row["tier"] = tier_name
-                    row["seed"] = int(seed)
-                    rows.append(row)
-                    dash.finish_cell(row, acceptable_r2=acceptable_r2)
-        return rows
+        # §3.60: the sequential path mutated the parent process env
+        # permanently. Save/restore around the run (worker processes
+        # inherit a copy, so only this path needs the guard).
+        _saved_thread_env = {
+            key: os.environ.get(key) for key in _WORKER_THREAD_ENV_KEYS
+        }
+        try:
+            if omp_num_threads is not None and int(omp_num_threads) > 0:
+                _set_worker_thread_env(int(omp_num_threads))
+            rows: list[dict[str, Any]] = []
+            for problem in problems:
+                name = problem[0]
+                for tier in tiers:
+                    tier_name = str(tier["name"])
+                    for seed in seeds:
+                        dash.start_cell(name, tier_name, int(seed))
+                        with _silence_stdio(enabled=bool(silence_fit)):
+                            row = _run_single(
+                                estimator_factory,
+                                problem,
+                                tier,
+                                int(seed),
+                                n_samples=n_samples,
+                                train_fraction=train_fraction,
+                                acceptable_r2=acceptable_r2,
+                            )
+                        row["problem"] = name
+                        row["tier"] = tier_name
+                        row["seed"] = int(seed)
+                        rows.append(row)
+                        dash.finish_cell(row, acceptable_r2=acceptable_r2)
+            return rows
+        finally:
+            for key, value in _saved_thread_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     # Process-pool path: one independent cell per job.
     payloads: list[dict[str, Any]] = []

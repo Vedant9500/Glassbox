@@ -570,10 +570,28 @@ static py::dict run_evolution_cpp(
     for (auto item : allowed_unary_ops) {
         cpp_allowed_unary_ops.push_back(item.cast<int>());
     }
+    // §3.284: all-invalid mask sanitizes to empty which meant allow-all
+    // (opposite intent). Fail-closed when raw nonempty but nothing valid.
+    if (!cpp_allowed_unary_ops.empty()) {
+        bool any_valid = false;
+        for (int v : cpp_allowed_unary_ops) {
+            if (v >= 0 && v <= 5) { any_valid = true; break; }
+        }
+        if (!any_valid)
+            throw py::value_error("allowed_unary_ops contains no valid op ids 0..5");
+    }
 
     std::vector<int> cpp_allowed_binary_ops;
     for (auto item : allowed_binary_ops) {
         cpp_allowed_binary_ops.push_back(item.cast<int>());
+    }
+    if (!cpp_allowed_binary_ops.empty()) {
+        bool any_valid = false;
+        for (int v : cpp_allowed_binary_ops) {
+            if (v >= 0 && v <= 2) { any_valid = true; break; }
+        }
+        if (!any_valid)
+            throw py::value_error("allowed_binary_ops contains no valid op ids 0..2");
     }
 
     // Parse multi_op_priors
@@ -641,9 +659,23 @@ static py::dict run_evolution_cpp(
     std::vector<sr::IndividualGraph> cpp_seed_graphs;
     int seed_graphs_skipped_oversized = 0;
     int seed_graphs_skipped_invalid = 0;  // H-07: topology / feature_idx
+    // §3.323/§3.325/§3.322: bounded reject/adjustment diagnostics (additive).
+    std::vector<std::string> seed_rejected_reasons;
+    int seed_weights_trimmed_total = 0;
+    int seed_weights_activated_last = 0;
+    auto note_seed_reject = [&](int idx, const char* reason) {
+        if (seed_rejected_reasons.size() < 8)
+            seed_rejected_reasons.push_back("seed " + std::to_string(idx) + ": " + reason);
+    };
     int seed_graph_node_limit = std::max(24, std::min(64, early_stop_max_nodes));
+    // §3.324: the seed-admission limit intentionally derives from the
+    // early-stop complexity gate (a seed larger than the acceptable final
+    // model is rejected up front). Set early_stop_max_nodes to admit
+    // larger seeds; the effective limit is exposed as seed_graph_node_limit.
     const int n_features = static_cast<int>(X.size());
+    int seed_graph_index = 0;
     for (auto item : seed_graphs_py) {
+        const int seed_idx = seed_graph_index++;
         try {
         auto gdict = item.cast<py::dict>();
         sr::IndividualGraph g;
@@ -715,18 +747,24 @@ static py::dict run_evolution_cpp(
 
         // S6: normalize weight vector length to node count (short -> pad 0; long -> trim).
         // Mismatched lengths otherwise silently drop active terms or leave junk tails.
+        // §3.325: count trimmed tail weights instead of dropping them silently.
         if (!g.nodes.empty()) {
             if (g.output_weights.size() < g.nodes.size()) {
                 g.output_weights.resize(g.nodes.size(), 0.0);
             } else if (g.output_weights.size() > g.nodes.size()) {
+                seed_weights_trimmed_total += static_cast<int>(
+                    g.output_weights.size() - g.nodes.size());
                 g.output_weights.resize(g.nodes.size());
             }
-            // If all weights were missing/zero, activate last node so seed is not dead.
+            // §3.322: all-zero weights activate the last node so the seed is
+            // not dead. Record the rewrite instead of resemanticing silently
+            // (an arbitrary internal node may become the output).
             bool any_active = false;
             for (double w : g.output_weights) {
                 if (std::abs(w) > 1e-12) { any_active = true; break; }
             }
             if (!any_active) {
+                ++seed_weights_activated_last;
                 g.output_weights.assign(g.nodes.size(), 0.0);
                 g.output_weights.back() = 1.0;
             }
@@ -734,12 +772,14 @@ static py::dict run_evolution_cpp(
 
         if (g.nodes.empty()) {
             ++seed_graphs_skipped_invalid;
+            note_seed_reject(seed_idx, "empty_nodes");
             continue;
         }
         // M-160: oversized verdict uses the RAW payload size (parity: junk
         // payloads must not pass the limit by hiding behind pruning).
         if (static_cast<int>(g.nodes.size()) > seed_graph_node_limit) {
             ++seed_graphs_skipped_oversized;
+            note_seed_reject(seed_idx, "oversized");
             continue;
         }
         // M-160: prune unreachable nodes so junk neither reaches insertion
@@ -799,12 +839,14 @@ static py::dict run_evolution_cpp(
         
         if (g.nodes.empty()) {
             ++seed_graphs_skipped_invalid;
+            note_seed_reject(seed_idx, "empty_after_prune");
             continue;
         }
         // H-07: refuse seeds with bad topology or out-of-range feature indices.
         // Eval would otherwise silently treat them as zero and poison search.
         if (!sr::is_valid_graph_topology(g)) {
             ++seed_graphs_skipped_invalid;
+            note_seed_reject(seed_idx, "bad_topology");
             continue;
         }
         bool features_ok = true;
@@ -818,13 +860,16 @@ static py::dict run_evolution_cpp(
         }
         if (!features_ok) {
             ++seed_graphs_skipped_invalid;
+            note_seed_reject(seed_idx, "bad_feature_idx");
             continue;
         }
         cpp_seed_graphs.push_back(std::move(g));
         } catch (const std::exception&) {
             // §3.9: non-finite seed params / malformed seed dicts count as
             // invalid (hash/score must never see NaN payloads).
+            // §3.320/§3.321: enum-range and finiteness throws land here.
             ++seed_graphs_skipped_invalid;
+            note_seed_reject(seed_idx, "parse_error");
             continue;
         }
     }
@@ -1111,11 +1156,22 @@ static py::dict run_evolution_cpp(
     result["seed_graphs_used"] = static_cast<int>(cpp_seed_graphs.size());
     result["seed_graphs_skipped_oversized"] = seed_graphs_skipped_oversized;
     result["seed_graphs_skipped_invalid"] = seed_graphs_skipped_invalid;  // H-07
+    // §3.323: bounded reject reasons (was counters only, undiagnosable).
+    py::list seed_reject_list;
+    for (const auto& s : seed_rejected_reasons) seed_reject_list.append(s);
+    result["seed_rejected_reasons"] = seed_reject_list;
+    // §3.325: trimmed tail weights (was silent truncation).
+    result["seed_weights_trimmed"] = seed_weights_trimmed_total;
+    // §3.322: last-node activations of all-zero weight vectors (was silent).
+    result["seed_weights_activated_last"] = seed_weights_activated_last;
     result["seed_graph_node_limit"] = seed_graph_node_limit;
     result["last_crossover_valid"] = engine.get_last_crossover_valid();
     result["crossover_attempts"] = engine.get_crossover_attempts();
     result["crossover_successes"] = engine.get_crossover_successes();
     result["crossover_valid_rate"] = engine.get_crossover_valid_rate();
+    // M-251: failure-reason breakdown (was attempts-only).
+    result["crossover_failures_size"] = engine.get_crossover_failures_size();
+    result["crossover_failures_topology"] = engine.get_crossover_failures_topology();
     // P-04 diagnostics: FD probe volume + inert-parameter probes avoided.
     result["fd_probes_total"] = engine.get_fd_probes_total();
     result["fd_probes_skipped_inert"] = engine.get_fd_probes_skipped_inert();

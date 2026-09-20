@@ -320,9 +320,11 @@ public:
                     const std::vector<IndividualGraph>& seed_graphs = {},
                     const Eigen::ArrayXd& y_weights = Eigen::ArrayXd())
                 : config_(config), X_(X), y_(y), seed_omegas_(seed_omegas), seed_graphs_(seed_graphs),
+                    // Reanalysis: mask into [0,2^31) so the exposed seed
+                    // feeds back into the signed-int FFI random_seed.
                     actual_random_seed_(config.random_seed >= 0
                             ? static_cast<unsigned int>(config.random_seed)
-                            : std::random_device{}()),
+                            : (std::random_device{}() & 0x7fffffff)),
                     rng_(actual_random_seed_) {
         set_y_weights(y_weights);
         sanitize_config();
@@ -343,6 +345,12 @@ public:
             config_.allowed_binary_ops,
             static_cast<int>(BinaryOp::Aggregation)
         );
+        // §3.284: defense-in-depth (FFI already rejects). Raw-nonempty but
+        // sanitized-empty must not silently become allow-all.
+        if (!config_.allowed_unary_ops.empty() && allowed_unary_ops_.empty())
+            throw std::invalid_argument("allowed_unary_ops contains no valid op ids");
+        if (!config_.allowed_binary_ops.empty() && allowed_binary_ops_.empty())
+            throw std::invalid_argument("allowed_binary_ops contains no valid op ids");
         // Normalize op_priors if provided
         if (!config_.op_priors.empty()) {
             // Backward compatibility:
@@ -370,20 +378,23 @@ public:
             // so the sampler draws the effective distribution directly
             // instead of burning 16 attempts and collapsing to
             // first-allowed (which silently ignored the prior).
+            // Reanalysis: spread runs BEFORE normalize — normalize's
+            // all-zero→uniform fallback would otherwise resurrect
+            // disallowed mass first, making the spread guard dead code.
             mask_disallowed_priors(config_.op_priors,
                 static_cast<size_t>(UnaryOp::Abs), true);
-            prior_entries_sanitized_ += normalize_prior_vector(config_.op_priors);
             spread_uniform_over_allowed(config_.op_priors,
                 static_cast<size_t>(UnaryOp::Abs), true);
+            prior_entries_sanitized_ += normalize_prior_vector(config_.op_priors);
             op_cdf_ = build_cdf(config_.op_priors);
         }
 
         if (!config_.binary_op_priors.empty()) {
             mask_disallowed_priors(config_.binary_op_priors,
                 static_cast<size_t>(BinaryOp::Aggregation), false);
-            prior_entries_sanitized_ += normalize_prior_vector(config_.binary_op_priors);
             spread_uniform_over_allowed(config_.binary_op_priors,
                 static_cast<size_t>(BinaryOp::Aggregation), false);
+            prior_entries_sanitized_ += normalize_prior_vector(config_.binary_op_priors);
             binary_op_cdf_ = build_cdf(config_.binary_op_priors);
         }
 
@@ -486,6 +497,9 @@ public:
         return fd_probes_skipped_inert_;
     }
     int get_crossover_successes() const { return crossover_successes_; }
+    // M-251: failure reasons (size rejection vs topology/graft rejection).
+    int get_crossover_failures_size() const { return crossover_failures_size_; }
+    int get_crossover_failures_topology() const { return crossover_failures_topology_; }
     double get_crossover_valid_rate() const {
         if (crossover_attempts_ <= 0) return 0.0;
         return static_cast<double>(crossover_successes_) / static_cast<double>(crossover_attempts_);
@@ -586,6 +600,9 @@ public:
         // (identical shared priors count per island that applied them;
         // multi_* overrides count per distinct island config).
         prior_entries_sanitized_ = 0;
+        // Reanalysis: same reset for the mask-reconciliation counter,
+        // otherwise islands mode reports the parent's phantom count.
+        priors_masked_by_allowed_ = 0;
 
         // Create per-island engines with split configs
         std::vector<EvolutionEngine> islands;
@@ -778,6 +795,9 @@ public:
             consider_champion(best);
             crossover_attempts_ += island.get_crossover_attempts();
             crossover_successes_ += island.get_crossover_successes();
+            // M-251: sum island failure reasons alongside attempts/successes.
+            crossover_failures_size_ += island.get_crossover_failures_size();
+            crossover_failures_topology_ += island.get_crossover_failures_topology();
             // M-272: OR-aggregate — the old last-island-wins overwrite hid
             // every other island's final validity in `last_crossover_valid`.
             // Counters above stay summed, so the valid RATE is unchanged.
@@ -789,6 +809,8 @@ public:
             gen_cache_.add_evictions(island.get_subtree_cache_evictions());
             // M-283: island configs are copies — sum their sanitize counts.
             prior_entries_sanitized_ += island.get_prior_entries_sanitized();
+            // Reanalysis: sum mask-reconciliation counts the same way.
+            priors_masked_by_allowed_ += island.get_priors_masked_by_allowed();
             // M-273: merge island subtree caches so parent entries/bytes
             // diagnostics reflect retained island cache pressure (they read
             // zero before — only evictions were summed). Bounded by the
@@ -848,6 +870,9 @@ private:
     // Post-loop discovery accounting must use this, not config_.generations.
     int last_executed_generation_ = 0;
     int crossover_successes_ = 0;
+    // M-251: crossover failure reasons (summed across islands like attempts).
+    int crossover_failures_size_ = 0;
+    int crossover_failures_topology_ = 0;
     // M-283/M-274 diagnostics (plain ints; aggregated post-join like fd probes).
     int prior_entries_sanitized_ = 0;
     int priors_masked_by_allowed_ = 0;
@@ -1284,6 +1309,12 @@ private:
         }
     }
 
+    // §3.270: non-finite doubles are not valid JSON (NaN/Inf). Emit null.
+    static void json_write_finite(std::ostream& os, double v) {
+        if (std::isfinite(v)) os << v;
+        else os << "null";
+    }
+
     static std::string json_escape(const std::string& s) {
         std::string out;
         out.reserve(s.size());
@@ -1315,8 +1346,10 @@ private:
                 population_.begin(), population_.end(),
                 [](const IndividualGraph& a, const IndividualGraph& b) { return a.fitness < b.fitness; }
             );
-            trace_stream_ << ",\"best_fitness\":" << best_it->fitness;
-            trace_stream_ << ",\"best_raw_mse\":" << best_it->raw_mse;
+            trace_stream_ << ",\"best_fitness\":";
+            json_write_finite(trace_stream_, best_it->fitness);
+            trace_stream_ << ",\"best_raw_mse\":";
+            json_write_finite(trace_stream_, best_it->raw_mse);
             trace_stream_ << ",\"best_complexity\":" << best_it->complexity();
             trace_stream_ << ",\"best_nodes\":" << best_it->nodes.size();
         }
@@ -1326,9 +1359,11 @@ private:
             const auto& ind = population_[i];
             if (i) trace_stream_ << ",";
             trace_stream_ << "{\"idx\":" << i
-                          << ",\"fitness\":" << ind.fitness
-                          << ",\"raw_mse\":" << ind.raw_mse
-                          << ",\"complexity\":" << ind.complexity()
+                          << ",\"fitness\":";
+            json_write_finite(trace_stream_, ind.fitness);
+            trace_stream_ << ",\"raw_mse\":";
+            json_write_finite(trace_stream_, ind.raw_mse);
+            trace_stream_ << ",\"complexity\":" << ind.complexity()
                           << ",\"nodes\":" << ind.nodes.size()
                           << ",\"age\":" << ind.age;
             if (config_.trace_include_formulas) {
@@ -1339,8 +1374,10 @@ private:
         }
         trace_stream_ << "]";
 
-        trace_stream_ << ",\"best_overall_fitness\":" << best_overall_.fitness;
-        trace_stream_ << ",\"best_overall_raw_mse\":" << best_overall_.raw_mse;
+        trace_stream_ << ",\"best_overall_fitness\":";
+        json_write_finite(trace_stream_, best_overall_.fitness);
+        trace_stream_ << ",\"best_overall_raw_mse\":";
+        json_write_finite(trace_stream_, best_overall_.raw_mse);
         if (config_.trace_include_formulas && !best_overall_.nodes.empty()) {
             std::string best_formula = get_formula_string(best_overall_, static_cast<int>(X_.size()));
             trace_stream_ << ",\"best_overall_formula\":\"" << json_escape(best_formula) << "\"";
@@ -2350,7 +2387,11 @@ private:
         // offspring. Invalidate fitness so a parent-A clone always flows
         // through mutation + re-evaluation (callers already do), and success
         // diagnostics stop undercounting real genetic contributions.
-        auto crossover_fail = [&]() -> IndividualGraph {
+        // M-251: count failures by reason (size vs topology/graft) instead
+        // of a single attempts counter.
+        auto crossover_fail = [&](bool size_reason) -> IndividualGraph {
+            if (size_reason) ++crossover_failures_size_;
+            else ++crossover_failures_topology_;
             IndividualGraph c = parent_a;
             c.fitness = 1e9;
             c.raw_mse = 1e9;
@@ -2360,7 +2401,7 @@ private:
         };
 
         if (parent_a.nodes.size() < 3 || parent_b.nodes.size() < 3) {
-            return crossover_fail(); // Too small for meaningful crossover
+            return crossover_fail(true); // Too small for meaningful crossover
         }
 
         // Prefer active crossover points so recombination exchanges useful modules.
@@ -2371,7 +2412,7 @@ private:
         // (all nodes whose index >= xo_b that are reachable from xo_b)
         std::vector<int> subtree_b = collect_subtree(parent_b, xo_b);
         if (subtree_b.empty()) {
-            return crossover_fail(); // Degenerate, just return parent A
+            return crossover_fail(false); // Degenerate, just return parent A
         }
 
         // Collect subtree rooted at xo_a in parent A (to remove)
@@ -2400,14 +2441,14 @@ private:
             if (donated.left_child >= 0) {
                 int new_left = donated.left_child + offset;
                 if (new_left < 0 || new_left >= static_cast<int>(xo_a + subtree_b.size())) {
-                    return crossover_fail();
+                    return crossover_fail(false);
                 }
                 donated.left_child = new_left;
             }
             if (donated.right_child >= 0) {
                 int new_right = donated.right_child + offset;
                 if (new_right < 0 || new_right >= static_cast<int>(xo_a + subtree_b.size())) {
-                    return crossover_fail();
+                    return crossover_fail(false);
                 }
                 donated.right_child = new_right;
             }
@@ -2429,7 +2470,7 @@ private:
                     n.left_child = xo_a;
                 } else {
                     int shifted = n.left_child + size_diff;
-                    if (shifted < 0) return crossover_fail();
+                    if (shifted < 0) return crossover_fail(false);
                     n.left_child = shifted;
                 }
             }
@@ -2438,7 +2479,7 @@ private:
                     n.right_child = xo_a;
                 } else {
                     int shifted = n.right_child + size_diff;
-                    if (shifted < 0) return crossover_fail();
+                    if (shifted < 0) return crossover_fail(false);
                     n.right_child = shifted;
                 }
             }
@@ -2447,14 +2488,14 @@ private:
 
         // Safety: cap graph size to prevent bloat
         if (new_nodes.size() > static_cast<size_t>(config_.max_nodes)) {
-            return crossover_fail();
+            return crossover_fail(true);
         }
 
         // Reject offspring that violate DAG invariants; do not silently repair.
         {
             IndividualGraph probe;
             probe.nodes = new_nodes;
-            if (!is_valid_topology(probe)) return crossover_fail();
+            if (!is_valid_topology(probe)) return crossover_fail(false);
         }
 
         child.nodes = std::move(new_nodes);
@@ -2506,7 +2547,7 @@ private:
             bool root_active =
                 xo_a < static_cast<int>(child.output_weights.size()) &&
                 std::abs(child.output_weights[static_cast<size_t>(xo_a)]) > 1e-8;
-            if (!referenced && !root_active) return crossover_fail();
+            if (!referenced && !root_active) return crossover_fail(false);
         }
 
         child.fitness = 1e9; // Mark for re-evaluation
@@ -4473,13 +4514,17 @@ private:
         }
 
         // For each objective, sort and compute distance
+        // §3.101: boundary handling is standard NSGA-II (each objective
+        // promotes its own extrema). Assignment uses max() so a prior
+        // objective's infinity is never lost when repositioned as middle;
+        // middle contributions only accumulate on top of 1e18.
         // Objective 0: raw_mse
         std::sort(front.begin(), front.end(),
                   [](const IndividualGraph* a, const IndividualGraph* b) {
                       return a->raw_mse < b->raw_mse;
                   });
-        front.front()->crowding_distance = 1e18;
-        front.back()->crowding_distance = 1e18;
+        front.front()->crowding_distance = std::max(front.front()->crowding_distance, 1e18);
+        front.back()->crowding_distance = std::max(front.back()->crowding_distance, 1e18);
         double mse_range = front.back()->raw_mse - front.front()->raw_mse;
         if (mse_range > 1e-15) {
             for (int i = 1; i < n - 1; ++i) {
@@ -4492,8 +4537,8 @@ private:
                   [](const IndividualGraph* a, const IndividualGraph* b) {
                       return a->active_complexity() < b->active_complexity();
                   });
-        front.front()->crowding_distance = 1e18;
-        front.back()->crowding_distance = 1e18;
+        front.front()->crowding_distance = std::max(front.front()->crowding_distance, 1e18);
+        front.back()->crowding_distance = std::max(front.back()->crowding_distance, 1e18);
         double comp_range = front.back()->active_complexity() - front.front()->active_complexity();
         if (comp_range > 1e-15) {
             for (int i = 1; i < n - 1; ++i) {
@@ -4507,8 +4552,8 @@ private:
                   [](const IndividualGraph* a, const IndividualGraph* b) {
                       return a->age < b->age;
                   });
-        front.front()->crowding_distance = 1e18;
-        front.back()->crowding_distance = 1e18;
+        front.front()->crowding_distance = std::max(front.front()->crowding_distance, 1e18);
+        front.back()->crowding_distance = std::max(front.back()->crowding_distance, 1e18);
         double age_range = static_cast<double>(front.back()->age - front.front()->age);
         if (age_range > 0.5) {
             for (int i = 1; i < n - 1; ++i) {

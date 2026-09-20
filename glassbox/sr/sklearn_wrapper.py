@@ -1188,6 +1188,23 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
     Omit units for normal ML/tabular use — no dimensional penalties applied.
     """
 
+    def set_params(self, **params):
+        """§3.143: re-validate enum modes set post-construction.
+
+        sklearn's default set_params assigns directly, bypassing the
+        __init__ normalization (e.g. loss_mode="invalid" stayed until
+        arbitrary downstream code ran). loss_mode/unit_mode are
+        re-validated here through the same schema; other numeric
+        cross-field checks remain fit-time (deferred, documented).
+        """
+        for key in ("loss_mode", "unit_mode"):
+            if key in params:
+                if key == "loss_mode":
+                    params[key] = _validate_loss_mode(params[key])
+                else:
+                    params[key] = _validate_unit_mode(params[key])
+        return super().set_params(**params)
+
     def __init__(
         self,
         population_size=100,

@@ -143,7 +143,10 @@ def test_multivariate_grammar_decoder_preserves_feature_names_after_first_pair()
     assert "x1*x2" in joined
 
 
-def test_formula_replay_dataset_loads_npz(tmp_path: Path):
+def test_formula_replay_dataset_loads_npz(tmp_path: Path, monkeypatch):
+    # §3.53: replay files staged under tmp_path are outside the trusted
+    # data roots, so opt in to the pickle trust gate (test-created file).
+    monkeypatch.setenv("GLASSBOX_ALLOW_PICKLE_CHECKPOINT", "1")
     n = 16
     labels = np.zeros((n, 14), dtype=np.float32)
     labels[:, 1] = 1.0  # sin
@@ -160,7 +163,9 @@ def test_formula_replay_dataset_loads_npz(tmp_path: Path):
     assert int(skeleton_target.item()) >= 0
 
 
-def test_formula_replay_dataset_matches_multivariate_skeleton(tmp_path: Path):
+def test_formula_replay_dataset_matches_multivariate_skeleton(tmp_path: Path, monkeypatch):
+    # §3.53: same trust opt-in as above (test-created tmp file).
+    monkeypatch.setenv("GLASSBOX_ALLOW_PICKLE_CHECKPOINT", "1")
     n = 12
     labels = np.zeros((n, 14), dtype=np.float32)
     labels[:, 7] = 1.0  # multiplication

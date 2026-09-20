@@ -1,6 +1,8 @@
 import argparse
 import re
+import shlex
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -86,16 +88,27 @@ def run_test(benchmark, model_path=None):
     print(f"TARGET:  {benchmark['formula']}")
     print("============================================================")
 
-    model_arg = f'--curve-classifier-model "{model_path}"' if model_path else ""
-    n_inputs_arg = f"--n-inputs {benchmark.get('n_inputs', 1)}"
-    cmd = f'python scripts/sr_tester.py --mode single --formula "{benchmark["formula"]}" --curve-classifier {model_arg} {n_inputs_arg} --no-viz {benchmark["args"]}'
+    # §3.52: argv vector, no shell (was shell=True with interpolated
+    # formula/model strings = metachar execution).
+    cmd = [
+        sys.executable,
+        "scripts/sr_tester.py",
+        "--mode", "single",
+        "--formula", benchmark["formula"],
+        "--curve-classifier",
+        "--n-inputs", str(benchmark.get("n_inputs", 1)),
+        "--no-viz",
+        *shlex.split(benchmark["args"]),
+    ]
+    if model_path:
+        cmd.extend(["--curve-classifier-model", model_path])
 
     start_time = time.time()
     try:
         # Use utf-8 and ignore errors to handle Windows console special chars
         result = subprocess.run(
             cmd,
-            shell=True,
+            shell=False,
             capture_output=True,
             text=True,
             encoding="utf-8",

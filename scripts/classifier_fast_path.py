@@ -2121,6 +2121,20 @@ def find_exact_symbolic_match(
             idx
             for _, idx in col_scores[: max(1, min(candidate_limit, len(col_scores)))]
         ]
+        # §3.155 (S slice): univariate correlation ranking can exclude
+        # jointly-essential columns before expansion. Record coverage so
+        # callers can tell truncated search from exhaustive search
+        # (diversity-aware selection is a larger redesign, deferred).
+        update_diagnostics(
+            {
+                "beam_candidate_coverage": {
+                    "n_basis": int(n_basis),
+                    "ranked_candidates": int(len(ranked)),
+                    "candidate_limit": int(candidate_limit),
+                    "truncated": bool(len(col_scores) > len(ranked)),
+                }
+            }
+        )
         if not ranked:
             return None
 

@@ -209,6 +209,14 @@ class SemanticFeatureAttention(nn.Module):
         nn.init.normal_(self.cls_token, std=0.02)
 
     def forward(self, x):
+        # S3.83 (train copy): same schema-width guard as the inference copy
+        # in models.py — fixed block slicing silently truncates wider inputs
+        # and zero-fills missing invariant blocks. Training always feeds 398.
+        if x.size(1) != 398:
+            raise ValueError(
+                "SemanticFeatureAttention expects width 398, "
+                f"got {x.size(1)}"
+            )
         b = x.size(0)
 
         # Slice based on FEATURE_SCHEMA from generate_curve_data.py

@@ -2565,10 +2565,73 @@ def save_dataset(
     print(f"Saved {len(features)} samples to {filepath}")
 
 
+def _trusted_npz_roots() -> list[Path]:
+    try:
+        repo_root = Path(__file__).resolve().parents[2]
+    except Exception:
+        return []
+    roots = []
+    for sub in ("data", "models", "artifacts"):
+        try:
+            roots.append((repo_root / sub).resolve())
+        except Exception:
+            pass
+    return roots
+
+
+def assert_trusted_npz_pickle_path(filepath: str | Path, *, required: tuple[str, ...] = ()) -> Path:
+    """§3.53/§3.82: fail-closed gate for npz pickle loads.
+
+    Requires a `.npz` suffix, inspects archive members without
+    deserialization, and requires outside-repo paths to opt in via
+    GLASSBOX_ALLOW_PICKLE_CHECKPOINT=1 (checkpoint precedent). Returns
+    the resolved path for the subsequent allow_pickle load.
+    """
+    import os
+    import zipfile
+
+    path = Path(filepath)
+    if path.suffix != ".npz":
+        raise ValueError(f"dataset path must end in .npz, got {path}")
+    resolved = path.resolve()
+    try:
+        with zipfile.ZipFile(resolved, "r") as zf:
+            names = set(zf.namelist())
+    except Exception as exc:
+        raise ValueError(f"cannot inspect dataset archive {path}: {exc}") from exc
+    for member in required:
+        if f"{member}.npy" not in names:
+            raise ValueError(f"dataset archive missing {member}.npy")
+    if not any(
+        resolved == root or root in resolved.parents
+        for root in _trusted_npz_roots()
+    ) and not os.environ.get("GLASSBOX_ALLOW_PICKLE_CHECKPOINT"):
+        raise RuntimeError(
+            "Refusing dataset pickle load outside trusted data directories. "
+            f"Move {path} under data/, models/ or artifacts/, or set "
+            "GLASSBOX_ALLOW_PICKLE_CHECKPOINT=1 for trusted local files."
+        )
+    return resolved
+
+
 def load_dataset(filepath: Path) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """Load dataset from npz file."""
-    data = np.load(filepath, allow_pickle=True)
-    return data["features"], data["labels"], data["formulas"].tolist()
+    """Load dataset from npz file.
+
+    §3.82: npz pickle gate (was unrestricted allow_pickle=True). Members
+    are inspected without deserialization first; object-dtype formulas
+    still need pickle, so outside-repo paths require explicit
+    GLASSBOX_ALLOW_PICKLE_CHECKPOINT=1 opt-in (checkpoint precedent).
+    """
+    resolved = assert_trusted_npz_pickle_path(
+        filepath, required=("features", "labels", "formulas")
+    )
+    data = np.load(resolved, allow_pickle=True)
+    formulas = data["formulas"].tolist()
+    if not isinstance(formulas, list) or not all(
+        isinstance(f, str) for f in formulas
+    ):
+        raise ValueError("dataset formulas must be a list[str]")
+    return data["features"], data["labels"], formulas
 
 
 # =============================================================================
