@@ -208,7 +208,14 @@ def compute_selection_probabilities_rspg(
     scaled = advantages / (temperature + 1e-8)
     scaled = scaled - np.max(scaled)
     exp_advantages = np.exp(scaled)
-    probabilities = exp_advantages / (exp_advantages.sum() + 1e-8)
+    # M-29: exact renormalization — the +1e-8 denominator left the weights
+    # summing to 1-eps, which np.random.choice can reject (tight tolerance,
+    # worse under float32). Sum is >= 1 by construction (max element is
+    # exp(0) == 1), so divide exactly, then renormalize once more for
+    # last-ulp exactness.
+    total = float(exp_advantages.sum())
+    probabilities = exp_advantages / total
+    probabilities = probabilities / float(probabilities.sum())
 
     return probabilities.tolist()
 

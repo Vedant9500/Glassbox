@@ -7,6 +7,7 @@ decoding and downstream search use the original multivariate `X`.
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 from collections.abc import Sequence
@@ -239,7 +240,19 @@ def _safe_softmax(logits: np.ndarray) -> np.ndarray:
 def _topk_indices(values: np.ndarray, k: int) -> np.ndarray:
     if values.size == 0:
         return np.asarray([], dtype=np.int64)
-    k = int(max(1, min(k, values.size)))
+    # M-211: explicit zero is honored (was coerced to 1); negatives and
+    # non-integral types raise instead of silently becoming 1.
+    if isinstance(k, bool) or (
+        not isinstance(k, (int, np.integer))
+        and not (isinstance(k, float) and k.is_integer())
+    ):
+        raise ValueError(f"top_k must be an integer, got {k!r}")
+    k = int(k)
+    if k < 0:
+        raise ValueError(f"top_k must be >= 0, got {k}")
+    if k == 0:
+        return np.asarray([], dtype=np.int64)
+    k = int(min(k, values.size))
     part = np.argpartition(values, -k)[-k:]
     return part[np.argsort(values[part])[::-1]]
 
@@ -303,6 +316,45 @@ def _safe_formula_eval_multivariate(formula: str, x: np.ndarray) -> np.ndarray |
     if not np.all(np.isfinite(y)):
         return None
     return y
+
+
+def _formula_has_variable_interaction(
+    formula: str, variables: Sequence[str]
+) -> bool:
+    """M-213: AST-based multivariate interaction test.
+
+    The old check (``"*" or "/" in text``) fired on constant-only slashes
+    (e.g. ``1/2*x0``) and missed ``sqrt(x0^2+x1^2)`` (no ``sqrt((`` prefix).
+    Interaction now means a ``*``/``/`` combining two sides that jointly
+    mention ≥2 distinct variables, or a ``sqrt``/``pow``/``abs`` call over
+    ≥2 distinct variables. Unparseable text falls back to the legacy
+    substring heuristic (documented fail-open).
+    """
+    var_set = {str(v) for v in variables}
+    if len(var_set) < 2:
+        return False
+    text = str(formula or "").replace("^", "**")
+    try:
+        tree = ast.parse(text, mode="eval")
+    except Exception:
+        return ("*" in text) or ("/" in text) or ("sqrt((" in text)
+
+    def _names(node: ast.AST) -> set[str]:
+        return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)} & var_set
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.BinOp) and isinstance(
+            node.op, (ast.Mult, ast.Div, ast.FloorDiv, ast.Mod)
+        ):
+            left, right = _names(node.left), _names(node.right)
+            if left and right and len(left | right) >= 2:
+                return True
+        elif isinstance(node, ast.Call):
+            func = node.func
+            fname = func.id if isinstance(func, ast.Name) else ""
+            if fname.lower() in ("sqrt", "pow", "abs") and len(_names(node)) >= 2:
+                return True
+    return False
 
 
 def _formula_operator_tags(formula: str) -> set[str]:
@@ -858,7 +910,7 @@ def _uncertainty_from_logits(
     }
 
 
-def _signal_complexity(x: np.ndarray, y: np.ndarray) -> dict[str, float]:
+def _signal_complexity(x: np.ndarray, y: np.ndarray) -> dict[str, Any]:
     """Cheap curve complexity diagnostics for search planning."""
     x_arr = np.asarray(x, dtype=np.float64)
     x = x_arr[:, 0].reshape(-1) if x_arr.ndim == 2 else x_arr.reshape(-1)
@@ -886,6 +938,26 @@ def _signal_complexity(x: np.ndarray, y: np.ndarray) -> dict[str, float]:
             return out
         y_unique = y_sorted[unique_idx]
 
+        # M-215: sampling-density guard — np.gradient divides by local gaps,
+        # so one near-duplicate x dominates the roughness estimate. Merge
+        # points closer than 1% of the mean gap (uniform data keeps every
+        # point, so well-sampled inputs are unaffected).
+        x_span_raw = float(np.max(x_unique) - np.min(x_unique))
+        if x_span_raw <= 0 or not np.isfinite(x_span_raw):
+            return out
+        min_gap = x_span_raw / max(1, x_unique.size - 1) / 100.0
+        keep = np.ones(x_unique.size, dtype=bool)
+        last_kept = 0
+        for i in range(1, x_unique.size):
+            if x_unique[i] - x_unique[last_kept] < min_gap:
+                keep[i] = False
+            else:
+                last_kept = i
+        if int(keep.sum()) < 5:
+            return out
+        x_unique = x_unique[keep]
+        y_unique = y_unique[keep]
+
         dy = np.gradient(y_unique, x_unique)
         ddy = np.gradient(dy, x_unique)
         if not (np.all(np.isfinite(dy)) and np.all(np.isfinite(ddy))):
@@ -901,8 +973,10 @@ def _signal_complexity(x: np.ndarray, y: np.ndarray) -> dict[str, float]:
         nz = signs[signs != 0.0]
         if nz.size > 1:
             out["turning_rate"] = float(np.mean(nz[1:] != nz[:-1]))
-    except Exception:
-        pass
+    except Exception as exc:
+        # M-214: record WHY complexity is zeros (was silent) — the zeros
+        # feed the difficulty score, so the reason must travel with them.
+        out["error_reason"] = f"{type(exc).__name__}: {exc}"
     return out
 
 
@@ -932,7 +1006,11 @@ def build_search_plan(
 
     entropy = uncertainty.get("entropy")
     margin = uncertainty.get("margin")
-    entropy_f = 0.75 if entropy is None else float(np.clip(entropy, 0.0, 1.0))
+    # M-212: absent uncertainty is genuinely unknown — neutral 0.5 with
+    # provenance instead of a confident-looking 0.75 default. Callers that
+    # need the distinction read `uncertainty_available`.
+    uncertainty_available = entropy is not None
+    entropy_f = 0.5 if entropy is None else float(np.clip(entropy, 0.0, 1.0))
     margin_f = 0.0 if margin is None else float(np.clip(margin, 0.0, 1.0))
     uncertain = 0.65 * entropy_f + 0.35 * (1.0 - margin_f)
 
@@ -1013,9 +1091,13 @@ def build_search_plan(
             "rel_mse_term": float(rel_mse_term),
             "rel_mse_noise_floor": float(PLAN_REL_MSE_NOISE_FLOOR),
             "uncertainty": float(uncertain),
+            # M-212: provenance for the neutral default — absent entropy is
+            # unknown (0.5), not fairly-uncertain (0.75).
+            "uncertainty_available": bool(uncertainty_available),
             "roughness": roughness,
             "turning_rate": turning_rate,
         },
+        "uncertainty_available": bool(uncertainty_available),
     }
 
 
@@ -1041,15 +1123,24 @@ def build_multivariate_search_plan(
         return plan
 
     n_features = int(x_arr.shape[1])
-    input_variables = (
-        list(input_variables)
-        if input_variables
-        else [f"x{i}" for i in range(n_features)]
-    )
+    # M-216: exact-length contract — silently dropping extras hid wiring
+    # bugs, and too-few names mislabeled columns downstream. Explicit
+    # input (even []) must match exactly; only None takes defaults.
+    if input_variables is not None:
+        input_variables = list(input_variables)
+        if len(input_variables) != n_features:
+            raise ValueError(
+                f"input_variables length {len(input_variables)} != "
+                f"n_features {n_features}"
+            )
+    else:
+        input_variables = [f"x{i}" for i in range(n_features)]
     interaction_strength = 0.0
     for term in candidates:
         formula = str(term.get("formula", ""))
-        if "*" in formula or "/" in formula or "sqrt((" in formula:
+        # M-213: AST-based test (was substring "*" or "/" — fired on
+        # constant-only slashes, missed sqrt(x0^2+x1^2)).
+        if _formula_has_variable_interaction(formula, input_variables):
             interaction_strength = max(
                 interaction_strength, float(term.get("probability", 0.0))
             )
@@ -1061,7 +1152,7 @@ def build_multivariate_search_plan(
     plan["supports_trained_multivariate_neural_model"] = False
     plan["operator_prior_source"] = "one_dimensional_y_projection_features"
     plan["candidate_source"] = "multivariate_grammar_with_mse_ranking"
-    plan["input_variables"] = input_variables[: min(len(input_variables), n_features)]
+    plan["input_variables"] = list(input_variables)
     plan["feature_count"] = n_features
     plan["interaction_strength"] = float(interaction_strength)
     plan["seed_budget"] = max(

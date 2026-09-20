@@ -1452,7 +1452,18 @@ def adaptive_coefficient_pruning(
         if math.isnan(base_mse) or math.isinf(base_mse):
             return 0, float("inf")
 
-        n_features = weights.shape[1] if weights.dim() == 2 else weights.shape[0]
+        # M-132: ablate every output row — the old loop touched row 0 only
+        # while using shape[1] as the feature count, so multi-output models
+        # pruned output 0 and skipped the rest. Single-row/single-output
+        # behavior is identical (same order, same indices).
+        if weights.dim() == 2:
+            coeff_indices = [
+                (r, c)
+                for r in range(weights.shape[0])
+                for c in range(weights.shape[1])
+            ]
+        else:
+            coeff_indices = [(0, i) for i in range(weights.shape[0])]
         pruned_indices = []
         # §3.92: joint pruning of independently-marked coefficients can blow
         # up on correlated weights (each negligible alone, large together).
@@ -1460,14 +1471,14 @@ def adaptive_coefficient_pruning(
         # back super-additive degradation instead of returning it.
         marked_increase_total = 0.0
 
-        for i in range(n_features):
+        for r, c in coeff_indices:
             # Save original weight
             if weights.dim() == 2:
-                orig_weight = weights[0, i].clone()
-                weights[0, i] = 0.0
+                orig_weight = weights[r, c].clone()
+                weights[r, c] = 0.0
             else:
-                orig_weight = weights[i].clone()
-                weights[i] = 0.0
+                orig_weight = weights[c].clone()
+                weights[c] = 0.0
 
             # Measure MSE without this coefficient
             pred, _ = model(x, hard=True)
@@ -1475,25 +1486,25 @@ def adaptive_coefficient_pruning(
 
             # Restore weight
             if weights.dim() == 2:
-                weights[0, i] = orig_weight
+                weights[r, c] = orig_weight
             else:
-                weights[i] = orig_weight
+                weights[c] = orig_weight
 
             # If MSE increase is small, mark for pruning
             mse_increase = new_mse - base_mse
             if mse_increase < prune_ratio * base_mse:
-                pruned_indices.append(i)
+                pruned_indices.append((r, c))
                 marked_increase_total += max(0.0, mse_increase)
 
         # Snapshot for §3.92 rollback (joint prune may be super-additive).
         orig_all = weights.clone()
 
         # Prune marked coefficients
-        for i in pruned_indices:
+        for r, c in pruned_indices:
             if weights.dim() == 2:
-                weights[0, i] = 0.0
+                weights[r, c] = 0.0
             else:
-                weights[i] = 0.0
+                weights[c] = 0.0
 
         # Final MSE
         pred, _ = model(x, hard=True)

@@ -2498,8 +2498,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         def _score(f):
             try:
-                pred = self._safe_eval_formula_array(f, X_arr)
-                pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+                # FC-2: reject domain failures on raw values before any
+                # zero-fill scoring — a snapped formula non-finite anywhere
+                # is a domain failure, not a near-zero error.
+                raw = np.asarray(
+                    self._eval_formula_raw(f, X_arr), dtype=np.float64
+                ).reshape(-1)
+                if not np.all(np.isfinite(raw)):
+                    return float("inf"), float("inf")
+                pred = np.where(np.isfinite(raw), raw, 0.0)
                 mse = float(np.mean((pred - y_arr) ** 2))
                 inlier = self._inlier_mse(pred, y_arr)
                 return mse, inlier
@@ -3584,9 +3591,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         if not text:
             return None
         try:
-            pred_fit = self._safe_eval_formula_array(text, X_fit)
-            pred_val = self._safe_eval_formula_array(text, X_val)
+            pred_fit = self._eval_formula_raw(text, X_fit)
+            pred_val = self._eval_formula_raw(text, X_val)
         except Exception:
+            return None
+        # FC-2/H-2: match C++ evaluate_fitness_with_penalty — any
+        # non-finite prediction invalidates the candidate (domain failure),
+        # not an invitation to score the favorable finite subset. The
+        # zero-fill policy lives only in the predict-only wrapper.
+        if not (np.all(np.isfinite(pred_fit)) and np.all(np.isfinite(pred_val))):
             return None
 
         y_fit = np.asarray(y_fit, dtype=np.float64).reshape(-1)

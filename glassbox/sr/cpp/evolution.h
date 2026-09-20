@@ -430,6 +430,8 @@ public:
         for (int gen = 0; gen < config_.generations; ++gen) {
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() > config_.timeout_seconds) {
+                // M-280: record how the loop exited.
+                termination_reason_ = "timeout";
                 break;
             }
 
@@ -440,8 +442,14 @@ public:
 
             if (config_.use_early_stop && early_stop_metric(best_overall_) < config_.early_stop_mse && best_overall_.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
                 trace_event("run.early_stop", gen);
+                // M-280: record how the loop exited.
+                termination_reason_ = "early_stop";
                 break;
             }
+        }
+        if (termination_reason_ == "not_run") {
+            // M-280: loop ran to completion without timeout/early-stop.
+            termination_reason_ = "generations_exhausted";
         }
         
         // Post-evolution cleanup: deduplicate + prune; then export may prefer raw champion.
@@ -470,6 +478,9 @@ public:
     int get_first_acceptable_generation() const { return first_acceptable_generation_; }
     double get_first_acceptable_time_sec() const { return first_acceptable_time_sec_; }
     double get_run_wall_time_sec() const { return run_wall_time_sec_; }
+    // M-280: how the run loop exited (timeout/early_stop/
+    // generations_exhausted; not_run if never started).
+    const std::string& get_termination_reason() const { return termination_reason_; }
     int get_random_seed() const { return config_.random_seed; }
     // S3.274: reproducing a random_device run requires the drawn seed.
     unsigned int get_actual_random_seed() const { return actual_random_seed_; }
@@ -718,8 +729,14 @@ public:
         }
 
         // Run generations with periodic migration
+        // M-280: parent records its own loop-exit cause (island engines
+        // track theirs independently; the parent never runs run() here
+        // except via the size<4 fallback, which sets it there).
+        termination_reason_ = "not_run";
+        bool islands_early_stopped = false;
         for (int gen = 0; gen < config_.generations; ++gen) {
             if (init_timed_out.load(std::memory_order_relaxed) || timed_out()) {
+                termination_reason_ = "timeout";
                 break;
             }
 
@@ -782,7 +799,14 @@ public:
             last_executed_generation_ = gen;
             update_discovery_metrics(gen, start_time);
 
-            if (config_.use_early_stop && should_stop) break;
+            if (config_.use_early_stop && should_stop) {
+                islands_early_stopped = true;
+                break;
+            }
+        }
+        if (termination_reason_ == "not_run") {
+            // M-280: distinguish early-stop from clean completion.
+            termination_reason_ = islands_early_stopped ? "early_stop" : "generations_exhausted";
         }
         // MaxActiveLevelsGuard destructor restores previous levels here
         // (exception-safe; replaces manual omp_set_max_active_levels restore).
@@ -869,6 +893,9 @@ private:
     int last_num_explorers_ = 0;
     int last_main_pop_target_ = 0;
     bool last_main_population_elites_only_ = false;
+    // M-280: how the run loop exited (was invisible — timeout and
+    // clean completion were indistinguishable downstream).
+    std::string termination_reason_ = "not_run";
     // S3.265: last generation actually executed (timeout/early-stop aware).
     // Post-loop discovery accounting must use this, not config_.generations.
     int last_executed_generation_ = 0;
@@ -2144,6 +2171,24 @@ private:
     //   - Wrap:     f(x) -> sin(f(x)) or exp(f(x)) or |f(x)|^p
     //   - Multiply: f(x), g(x) -> f(x) * g(x)
     //   - Nest:     f(x), g(x) -> f(g(x))
+    // M-298: deterministic fallback prefers an active (|w| above the eval
+    // gate) node over blind (left+1)%n, which could graft an irrelevant
+    // subtree. Falls back to legacy when nothing active qualifies.
+    static int next_active_fallback(const IndividualGraph& graph, int left) {
+        int n = static_cast<int>(graph.nodes.size());
+        if (n <= 0) return 0;
+        int w_count = static_cast<int>(graph.output_weights.size());
+        for (int k = 1; k < n; ++k) {
+            int cand = (left + k) % n;
+            if (cand == left) continue;
+            if (cand < w_count &&
+                std::abs(graph.output_weights[static_cast<size_t>(cand)]) >
+                    kOutputWeightActive)
+                return cand;
+        }
+        return (left + 1) % n;
+    }
+
     IndividualGraph macro_mutate(const IndividualGraph& parent) {
         IndividualGraph child = parent;
         child.fitness_valid = false;  // E6
@@ -2240,7 +2285,8 @@ private:
                 right = sample_active_node(child, 0, n - 1);
             }
             if (right == left && n > 1) {
-                right = (left + 1) % n;
+                // M-298: next active node, not blind (left+1)%n.
+                right = next_active_fallback(child, left);
             }
             
             OpNode mul_node;
@@ -2287,7 +2333,8 @@ private:
                 right = sample_active_node(child, 0, n - 1);
             }
             if (right == left && n > 1) {
-                right = (left + 1) % n;
+                // M-298: next active node, not blind (left+1)%n.
+                right = next_active_fallback(child, left);
             }
             
             OpNode div_node;
@@ -2661,6 +2708,13 @@ private:
         return scores;
     }
 
+    // M-249: inclusive bounds [min_idx, max_idx]. Inverted/empty ranges
+    // (lo > hi after clamping, or degenerate graphs) deterministically
+    // return the clamped lower bound — never an out-of-range index and
+    // never an RNG draw on an empty distribution (discrete_distribution
+    // on an empty range is UB). All in-tree call sites pass valid ranges
+    // (wrap n>=2, nest lo<=hi by construction); this is the loud contract
+    // for future callers.
     int sample_active_node(const IndividualGraph& graph, int min_idx, int max_idx) {
         int n = static_cast<int>(graph.nodes.size());
         if (n == 0) return 0;

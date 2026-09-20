@@ -24,7 +24,9 @@ from torch.utils.data import DataLoader, Dataset
 # loading from training statistics). Falls back to literals if the schema
 # module is unavailable.
 try:
-    from glassbox.curve_classifier.generate_curve_data import FEATURE_SCHEMA as _FEATURE_SCHEMA
+    from glassbox.curve_classifier.generate_curve_data import (
+        FEATURE_SCHEMA as _FEATURE_SCHEMA,
+    )
 
     SYMLOG_START = int(_FEATURE_SCHEMA["deriv"][0])
     SYMLOG_END = int(_FEATURE_SCHEMA["invariants"][1])

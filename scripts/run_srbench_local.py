@@ -16,7 +16,7 @@ Usage:
 
 import argparse
 import json
-import math  # noqa: F401
+import math
 import sys
 import time
 import warnings
@@ -618,6 +618,22 @@ def make_seeded_train_test_split(X, y, *, n_samples, seed, train_fraction=0.8):
 # ---------------------------------------------------------------------------
 
 
+def _finite_mse_sort_key(row):
+    """M-89: best-run ordering with explicit non-finite handling.
+
+    Rows missing MSE (None/absent/non-numeric/non-finite) previously raised
+    ``float(None)`` (TypeError). Finite MSE sorts first by value; anything
+    else sorts last, preserving legacy order among finite rows.
+    """
+    try:
+        value = float(row.get("mse", float("nan")))
+    except (TypeError, ValueError):
+        return (1.0, float("inf"))
+    if math.isfinite(value):
+        return (0.0, value)
+    return (1.0, float("inf"))
+
+
 def generate_ground_truth_data(problem, n_samples=500, seed=42):
     """Generate data from a ground-truth problem."""
     name, fn, n_features, x_ranges, formula_str = problem
@@ -919,7 +935,7 @@ def run_track1_blackbox(
             continue
 
         stability = summarize_seed_runs(seed_runs)
-        best_run = min(valid_seed_runs, key=lambda r: float(r.get("mse", float("inf"))))
+        best_run = min(valid_seed_runs, key=_finite_mse_sort_key)
         best_blackbox_diag = best_run.get("blackbox_diagnostics") or {}
         best_search_plan = best_blackbox_diag.get("search_plan") or {}
         aggregate = {
@@ -1192,7 +1208,7 @@ def run_track2_ground_truth(
             key=lambda r: abs(float(r["r2"]) - float(stability["r2_stats"]["median"])),
         )
 
-        best_run = min(valid_seed_runs, key=lambda r: float(r.get("mse", float("inf"))))
+        best_run = min(valid_seed_runs, key=_finite_mse_sort_key)
         # §3.64: full_mse median is finite-only with a None fallback. The legacy
         # unconditional float(np.median([...])) returned nan (and warned on an
         # empty list) when every valid run lacked a usable full_mse, which
@@ -1287,6 +1303,18 @@ def print_summary(track1_results, track2_results, output_dir=None):
             )
             print(f"  Mean time:          {np.mean(times):.2f}s")
             print(f"  Total time:         {sum(times):.1f}s")
+            # M-90: failed-dataset wall-clock was invisible (valid-only
+            # means). Quality metrics stay valid-scoped; cost is reported
+            # for all rows.
+            failed_times = [
+                t
+                for r in track1_results
+                if r.get("r2") is None
+                for t in [r.get("time", 0)]
+                if isinstance(t, (int, float)) and math.isfinite(t)
+            ]
+            print(f"  Failed datasets:    {len(track1_results) - len(valid)}")
+            print(f"  Failed total time:  {sum(failed_times):.1f}s")
 
     # Track 2 summary
     if track2_results:
@@ -1340,6 +1368,17 @@ def print_summary(track1_results, track2_results, output_dir=None):
             )
             print(f"  Mean time:          {np.mean(times):.2f}s")
             print(f"  Total time:         {sum(times):.1f}s")
+            # M-90: failed-problem wall-clock (same valid-scoped rationale
+            # as track 1 above).
+            failed_times = [
+                t
+                for r in track2_results
+                if r.get("r2") is None
+                for t in [r.get("time", 0)]
+                if isinstance(t, (int, float)) and math.isfinite(t)
+            ]
+            print(f"  Failed problems:    {len(track2_results) - len(valid)}")
+            print(f"  Failed total time:  {sum(failed_times):.1f}s")
             if tfe:
                 print(f"  TTF exact (median): {np.median(tfe):.2f}s")
             if tfa:

@@ -663,6 +663,10 @@ static py::dict run_evolution_cpp(
     std::vector<std::string> seed_rejected_reasons;
     int seed_weights_trimmed_total = 0;
     int seed_weights_activated_last = 0;
+    // M-312: unknown seed keys were ignored silently (typos vanished).
+    // Counted (bounded reasons like §3.323) — still accepted for
+    // forward-compat with newer producers, but now visible.
+    int seed_unknown_keys_total = 0;
     auto note_seed_reject = [&](int idx, const char* reason) {
         if (seed_rejected_reasons.size() < 8)
             seed_rejected_reasons.push_back("seed " + std::to_string(idx) + ": " + reason);
@@ -679,6 +683,22 @@ static py::dict run_evolution_cpp(
         try {
         auto gdict = item.cast<py::dict>();
         sr::IndividualGraph g;
+
+        // M-312: unknown top-level keys counted, not silently dropped.
+        for (auto kv : gdict) {
+            std::string k;
+            try {
+                k = kv.first.cast<std::string>();
+            } catch (...) {
+                ++seed_unknown_keys_total;
+                continue;
+            }
+            if (k != "nodes" && k != "output_weights" && k != "output_bias") {
+                // Accepted for forward-compat; counted so typos surface.
+                // (Not a reject reason — the seed still loads.)
+                ++seed_unknown_keys_total;
+            }
+        }
         
         if (gdict.contains("nodes")) {
             auto nodes_list = gdict["nodes"].cast<py::list>();
@@ -722,6 +742,24 @@ static py::dict run_evolution_cpp(
                 if (ndict.contains("tau")) { node.tau = ndict["tau"].cast<double>(); require_finite(node.tau, "tau"); }
                 if (ndict.contains("left_child")) node.left_child = ndict["left_child"].cast<int>();
                 if (ndict.contains("right_child")) node.right_child = ndict["right_child"].cast<int>();
+                // M-312: unknown per-node keys counted (same forward-compat
+                // policy as top-level keys above).
+                for (auto kv : ndict) {
+                    std::string k;
+                    try {
+                        k = kv.first.cast<std::string>();
+                    } catch (...) {
+                        ++seed_unknown_keys_total;
+                        continue;
+                    }
+                    if (k != "type" && k != "feature_idx" && k != "value" &&
+                        k != "unary_op" && k != "binary_op" && k != "p" &&
+                        k != "omega" && k != "phi" && k != "amplitude" &&
+                        k != "beta" && k != "gamma" && k != "tau" &&
+                        k != "left_child" && k != "right_child") {
+                        ++seed_unknown_keys_total;
+                    }
+                }
                 g.nodes.push_back(node);
             }
         }
@@ -1012,13 +1050,19 @@ static py::dict run_evolution_cpp(
     config.explorer_fraction = std::clamp(explorer_fraction, 0.0, 0.9);
     // P-04: optional override for tests / experiments (engine default true).
     config.use_lm_inner_optimizer = use_lm_inner_optimizer;
+    // M-248: macro weight entries the engine clamp zeroes (see below).
+    int macro_weights_clamped = 0;
     {
         std::vector<double> mmw;
+        // M-248: count entries the engine's max(0,·) clamp will zero so
+        // negative weights are visible instead of silently discarded.
+        // (Negatives keep the clamp by §3.252 precedent — no behavior change.)
         for (auto item : macro_mode_weights) {
             double v = item.cast<double>();
             // §3.252: non-finite entries previously vanished into the engine.
             if (!std::isfinite(v))
                 throw py::value_error("macro_mode_weights entries must be finite");
+            if (v < 0) ++macro_weights_clamped;
             mmw.push_back(v);
         }
         // §3.252: empty = engine defaults; exactly 4 = explicit modes.
@@ -1112,6 +1156,15 @@ static py::dict run_evolution_cpp(
     result["best_weighted_mse"] = best.weighted_mse;
     result["weighted"] = (y_weights.size() == static_cast<int>(y_buf.size));
     result["loss_mode"] = loss_mode;
+    // M-318: requested string (aliases/case preserved above) vs the
+    // effective engine mode (aliases resolved, typos rejected at §3.246).
+    {
+        std::string effective = "mse";
+        if (config.loss_mode == sr::LossMode::Huber) effective = "huber";
+        else if (config.loss_mode == sr::LossMode::TrimmedMse) effective = "trimmed_mse";
+        else if (config.loss_mode == sr::LossMode::StudentT) effective = "student_t";
+        result["effective_loss_mode"] = effective;
+    }
     result["search_loss"] = best.weighted_mse;
     result["penalized_fitness"] = best.fitness;
     result["time_to_first_exact_sec"] = engine.get_first_exact_time_sec();
@@ -1131,6 +1184,9 @@ static py::dict run_evolution_cpp(
             (timeout_seconds > 0 && t_acc >= 0.0) ? t_acc / budget : -1.0;
     }
     result["evolution_wall_time_sec"] = engine.get_run_wall_time_sec();
+    // M-280: how the run loop exited (timeout/early_stop/
+    // generations_exhausted) — was invisible downstream.
+    result["termination_reason"] = engine.get_termination_reason();
     result["random_seed"] = engine.get_random_seed();
     // S3.274: the seed actually drawn (== requested when >= 0). Single-pop
     // runs replay from this; island runs derive per-island streams from the
@@ -1164,6 +1220,10 @@ static py::dict run_evolution_cpp(
     result["seed_weights_trimmed"] = seed_weights_trimmed_total;
     // §3.322: last-node activations of all-zero weight vectors (was silent).
     result["seed_weights_activated_last"] = seed_weights_activated_last;
+    // M-248: macro weights the engine max(0,·) clamp zeroed (was silent).
+    result["macro_weights_clamped"] = macro_weights_clamped;
+    // M-312: unknown seed keys counted at load (accepted, forward-compat).
+    result["seed_unknown_keys"] = seed_unknown_keys_total;
     result["seed_graph_node_limit"] = seed_graph_node_limit;
     result["last_crossover_valid"] = engine.get_last_crossover_valid();
     result["crossover_attempts"] = engine.get_crossover_attempts();
@@ -1220,6 +1280,34 @@ static py::dict run_evolution_cpp(
     
     // Add the parsed formula string for Python compatibility
     result["formula"] = sr::get_formula_string(best, static_cast<int>(X.size()));
+
+    // M-282: top-level best_mse/best_weighted_mse are pre-simplification
+    // engine values while `formula`/nodes are post-simplification (§3.271).
+    // Report the simplified graph's errors alongside (pareto rows carry the
+    // same pair since §3.343/§3.272); legacy keys untouched.
+    {
+        double best_mse_simplified = std::numeric_limits<double>::infinity();
+        double best_weighted_mse_simplified = std::numeric_limits<double>::infinity();
+        try {
+            Eigen::ArrayXd bpred = sr::evaluate_graph(
+                best, X, static_cast<int>(y.size()));
+            if (bpred.size() == y.size() && bpred.isFinite().all()) {
+                best_mse_simplified = ((bpred - y).square().mean());
+                if (y_weights.size() == static_cast<int>(y.size())) {
+                    const double wsum = y_weights.sum();
+                    if (std::isfinite(wsum) && wsum > 0) {
+                        best_weighted_mse_simplified =
+                            ((y_weights * (bpred - y).square()).sum() / wsum);
+                    }
+                } else {
+                    best_weighted_mse_simplified = best_mse_simplified;
+                }
+            }
+        } catch (...) {
+        }
+        result["best_mse_simplified"] = best_mse_simplified;
+        result["best_weighted_mse_simplified"] = best_weighted_mse_simplified;
+    }
 
     // P5: Pareto front (if NSGA-II enabled)
     if (use_nsga2) {
@@ -1407,6 +1495,12 @@ static py::object iterative_elastic_net_wrapper(py::array_t<double> X_arr, py::a
     }
     if (max_iter <= 0 || n_starts <= 0 || n_iterations <= 0) {
         throw std::invalid_argument("iteration/start counts must be positive");
+    }
+    // M-303: prune_threshold had no validation (NaN/negative silently
+    // changed pruning). Finite non-negative required; l1/l2/alpha already
+    // guarded above and at §3.400.
+    if (!std::isfinite(prune_threshold) || prune_threshold < 0) {
+        throw std::invalid_argument("prune_threshold must be finite and non-negative");
     }
     // §3.315: reject non-finite X/y at the FFI boundary (was silent NaN
     // propagation; lasso fail-louds via §3.400, elastic net had no backstop).

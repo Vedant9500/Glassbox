@@ -609,7 +609,7 @@ def _indexed_symbol_column(name: str) -> int | None:
     core = name[1:] if name.startswith("x") else None
     if core is None:
         return None
-    digits = core[1:] if core.startswith("_") else core
+    digits = core.removeprefix("_")
     if digits.isdigit():
         return int(digits)
     return None
@@ -2129,7 +2129,7 @@ def find_exact_symbolic_match(
             {
                 "beam_candidate_coverage": {
                     "n_basis": int(n_basis),
-                    "ranked_candidates": int(len(ranked)),
+                    "ranked_candidates": len(ranked),
                     "candidate_limit": int(candidate_limit),
                     "truncated": bool(len(col_scores) > len(ranked)),
                 }

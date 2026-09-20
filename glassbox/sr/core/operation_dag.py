@@ -449,6 +449,12 @@ class OperationDAG(nn.Module):
 
     def _simplify_formula(self, formula_str: str) -> str:
         """Simplify formula using sympy."""
+        # M-20: bound expression size BEFORE sympify/simplify — unbounded
+        # input can hang or exhaust memory in simplify, and the broad except
+        # below would silently return raw. Fail closed to raw (display path
+        # must never raise), same 20k-char budget as §3.30.
+        if len(formula_str) > 20000:
+            return formula_str
         try:
             from sympy import simplify, symbols, sympify
 
@@ -481,6 +487,13 @@ class OperationDAG(nn.Module):
             formula_str = re.sub(r"0\.00\*\w+", "0", formula_str)
 
             expr = sympify(formula_str, locals=local_dict)
+            # M-20: bound tree size before simplify (operation count, not
+            # just text length — deeply nested short strings hang too).
+            try:
+                if int(expr.count_ops()) > 5000:
+                    return formula_str
+            except Exception:
+                return formula_str
             simplified = simplify(expr)
 
             # Round floats in the simplified expression for readability
@@ -903,8 +916,14 @@ class ONNLoss(nn.Module):
         l1_loss = torch.tensor(0.0, device=pred.device)
         for layer in model.layers:
             for node in layer.nodes:
-                if hasattr(node.router, "edge_weights"):
-                    l1_loss = l1_loss + node.router.edge_weights.abs().sum()
+                # M-121: router-only lookup silently skipped simple nodes
+                # (edge_weights lives directly on OperationNodeSimple).
+                router = getattr(node, "router", None)
+                w = getattr(router, "edge_weights", None)
+                if w is None:
+                    w = getattr(node, "edge_weights", None)
+                if w is not None:
+                    l1_loss = l1_loss + w.abs().sum()
 
         # Entropy regularization (encourage discrete selection)
         # Higher entropy = more uncertain/softer selection -> penalize it
@@ -1020,6 +1039,9 @@ def train_onn(
 
     history = {"mse": [], "total": []}
     best_mse = float("inf")
+    # M-126: the reported best must describe the returned model — keep the
+    # best-epoch parameters and roll back before returning.
+    best_state = None
 
     for epoch in range(epochs):
         # Anneal temperature
@@ -1050,7 +1072,12 @@ def train_onn(
         history["mse"].append(components["mse"])
         history["total"].append(components["total"])
 
-        best_mse = min(best_mse, components["mse"])
+        mse_now = float(components["mse"])
+        if mse_now < best_mse:
+            best_mse = mse_now
+            best_state = {
+                k: v.detach().clone() for k, v in model.state_dict().items()
+            }
 
         if epoch % print_every == 0:
             tau_str = f"τ={model.tau:.2f}" if anneal_tau else ""
@@ -1058,6 +1085,10 @@ def train_onn(
                 f"Epoch {epoch:4d} | MSE: {components['mse']:.4f} | Total: {components['total']:.4f} | {tau_str}"
             )
 
+    # M-126: roll back to the best-epoch parameters so the returned model
+    # matches the reported best MSE (was: final-epoch state).
+    if best_state is not None:
+        model.load_state_dict(best_state)
     print(f"\nBest MSE: {best_mse:.4f}")
     print("\nLearned Operations:")
     print(model.get_graph_summary())

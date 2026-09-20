@@ -491,6 +491,17 @@ inline PowerResult refine_powers_model_cpp(
         phi_ = 5.0;
     }
 
+    // M-139: sanitize the initial powers — a NaN/inf entry previously
+    // persisted forever (NaN FD grads are skipped by the guard below), so
+    // the search burned all steps in a degenerate region and returned NaN
+    // powers. Finite entries are clamped into the caller domain.
+    for (double& pw : powers) {
+        if (!std::isfinite(pw))
+            pw = std::clamp(1.0, plo, phi_);
+        else
+            pw = std::clamp(pw, plo, phi_);
+    }
+
     auto build_design = [&](const std::vector<double>& pw, Eigen::MatrixXd& X) {
         X.resize(n, num_features);
         X.col(0) = Eigen::VectorXd::Ones(n);

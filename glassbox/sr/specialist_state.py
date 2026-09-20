@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
-import re
 
 # M-237: nest_formulas runs in the composition loop; the static any-var
 # pattern is compiled once (explicit-var patterns stay dynamic per var).
@@ -417,8 +417,13 @@ class SpecialistVault:
                 p_val = pred[val_idx]
                 y_fit = y_arr[fit_idx]
                 p_fit = pred[fit_idx]
-                var_val = max(float(np.var(y_val)), 1e-15)
-                var_fit = max(float(np.var(y_fit)), 1e-15)
+                # M-233: scale-aware variance floor — a bare 1e-15 floor lets
+                # tiny split variance make hold_r2 hugely negative and gap
+                # >0.5, rejecting otherwise stable formulas. Same idiom as
+                # the win_floor below (1e-6 of full-data variance).
+                var_floor = max(1e-12, 1e-6 * float(y_var))
+                var_val = max(float(np.var(y_val)), var_floor)
+                var_fit = max(float(np.var(y_fit)), var_floor)
                 hold_mse = float(np.mean((p_val - y_val) ** 2))
                 fit_mse = float(np.mean((p_fit - y_fit) ** 2))
                 hold_r2 = float(1.0 - hold_mse / var_val)
@@ -540,12 +545,21 @@ class SpecialistVault:
                 # §3.207: never leave stale vectors beside a failed rescore.
                 entry.prediction_vector = np.zeros(0, dtype=np.float64)
                 entry.residual_vector = np.zeros(0, dtype=np.float64)
+                # M-234: failure must also invalidate the metrics — otherwise
+                # the stale validation_mse/r2 keeps ranking the entry.
+                entry.validation_mse = float("inf")
+                entry.validation_r2 = float("-inf")
+                entry.metric_source = "rescore_failed"
                 continue
             if pred.shape != y_arr.shape or not np.all(np.isfinite(pred)):
                 entry.residual_relevance = None
                 # §3.207: shape mismatch or non-finite → stale vectors cleared.
                 entry.prediction_vector = np.zeros(0, dtype=np.float64)
                 entry.residual_vector = np.zeros(0, dtype=np.float64)
+                # M-234: same invalidation (metrics describe a different target).
+                entry.validation_mse = float("inf")
+                entry.validation_r2 = float("-inf")
+                entry.metric_source = "rescore_failed"
                 continue
             residual = pred - y_arr
             entry.prediction_vector = pred

@@ -42,6 +42,13 @@ class BlackboxState:
     interaction_pairs: list[tuple[int, int]] = field(default_factory=list)
     interaction_terms: list[str] = field(default_factory=list)
     interaction_scores: dict[str, float] = field(default_factory=dict)
+    # M-207: blended-score components per winning term (validation/train/
+    # univariate-base); lets later stages reweight or diagnose selection.
+    interaction_score_components: dict[str, dict[str, float]] = field(
+        default_factory=dict
+    )
+    # M-204: per-ranker failure provenance (empty when the ranker voted).
+    ranker_errors: dict[str, list[str]] = field(default_factory=dict)
     feature_selection_uncertain: bool = False
     candidate_seed_formulas: list[str] = field(default_factory=list)
     # §3.170: which rankers actually voted and with what effective weight.
@@ -509,14 +516,25 @@ def _sparse_linear_scores(
     X: np.ndarray,
     y: np.ndarray,
     sample_weight: np.ndarray | None = None,
+    error_sink: list[str] | None = None,
 ) -> dict[int, float]:
+    """Sparse-linear ranker votes. Failures append reasons to error_sink."""
     if LassoCV is None or ElasticNetCV is None:
+        # M-204: record WHY the ranker is absent (was indistinguishable {}).
+        if error_sink is not None:
+            error_sink.append("sklearn_unavailable")
         return {}
     X = np.asarray(X, dtype=np.float64)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
     # S7-3: subsample large n; cheaper CV grids.
     X, y, w = _ranking_subsample(X, y, sample_weight, max_rows=1200, random_state=1)
     if X.ndim != 2 or X.shape[1] == 0 or X.shape[0] < max(24, X.shape[1] + 4):
+        # M-204: shape rejection is a reason, not a silent empty.
+        if error_sink is not None:
+            error_sink.append(
+                f"shape_rejected:n={X.shape[0] if X.ndim == 2 else -1},"
+                f"p={X.shape[1] if X.ndim == 2 else -1}"
+            )
         return {}
 
     # Prefer Lasso only when p is large (ElasticNet CV is expensive).
@@ -537,8 +555,10 @@ def _sparse_linear_scores(
         else:
             lasso.fit(X, y, sample_weight=w)
         score_pool.append(np.abs(np.asarray(lasso.coef_, dtype=np.float64)))
-    except Exception:
-        pass
+    except Exception as exc:
+        # M-204: convergence/memory failures recorded (was silent pass).
+        if error_sink is not None:
+            error_sink.append(f"lasso:{type(exc).__name__}")
     if run_enet:
         try:
             enet = ElasticNetCV(
@@ -554,8 +574,10 @@ def _sparse_linear_scores(
             else:
                 enet.fit(X, y, sample_weight=w)
             score_pool.append(np.abs(np.asarray(enet.coef_, dtype=np.float64)))
-        except Exception:
-            pass
+        except Exception as exc:
+            # M-204: same provenance for the ElasticNet leg.
+            if error_sink is not None:
+                error_sink.append(f"enet:{type(exc).__name__}")
     if not score_pool:
         return {}
 
@@ -700,7 +722,8 @@ def compute_blackbox_feature_ranking(
     if mi_scores:
         ranker_votes["mutual_information"] = mi_scores
 
-    sparse_scores = _sparse_linear_scores(X, y, w_all)
+    sparse_errors: list[str] = []
+    sparse_scores = _sparse_linear_scores(X, y, w_all, error_sink=sparse_errors)
     if sparse_scores:
         ranker_votes["sparse_linear"] = sparse_scores
 
@@ -739,6 +762,8 @@ def compute_blackbox_feature_ranking(
         "active_weights": dict(active_weights),
         "weight_total": float(weight_total),
         "omitted_rankers": list(omitted_rankers),
+        # M-204: sparse-ranker failure provenance (empty when it voted).
+        "ranker_errors": {"sparse_linear": list(sparse_errors)},
     }
 
 
@@ -770,6 +795,8 @@ def discover_blackbox_interactions(
             "interaction_pairs": [],
             "interaction_terms": [],
             "interaction_scores": {},
+            "interaction_score_components": {},
+            "family_counts": {},
         }
 
     cols = list(range(X.shape[1]))
@@ -787,11 +814,24 @@ def discover_blackbox_interactions(
     if len(set(int(la) for la in labels)) != len(labels):
         raise ValueError("selected_features labels must be unique")
     labels = [int(la) for la in labels]
+    # M-208: max_pairs<=0 previously scored every pair × 14 templates and
+    # then selected none. Bound the work here — after contract validation
+    # (fail-loud on bad labels is preserved) but before any scoring.
+    if int(max_pairs) <= 0:
+        return {
+            "interaction_pairs": [],
+            "interaction_terms": [],
+            "interaction_scores": {},
+            "interaction_score_components": {},
+            "family_counts": {},
+        }
     if len(cols) < 2:
         return {
             "interaction_pairs": [],
             "interaction_terms": [],
             "interaction_scores": {},
+            "interaction_score_components": {},
+            "family_counts": {},
         }
 
     base_scores = _cheap_feature_scores(X, y, w_all)
@@ -799,6 +839,8 @@ def discover_blackbox_interactions(
     # correlation intersects shared rows (pair masks differ across pairs;
     # positional corrcoef over unequal/misaligned rows was meaningless).
     candidate_rows: list[tuple[float, tuple[int, int], str, np.ndarray, np.ndarray]] = []
+    # M-207: per-winning-term score components (weights documented at use).
+    term_components: dict[str, dict[str, float]] = {}
 
     def _interaction_family(term: str) -> str:
         lower = term.lower()
@@ -850,30 +892,44 @@ def discover_blackbox_interactions(
 
             # §3.176: original-row positions of this pair's rows.
             sel = np.where(mask)[0]
-            xi = xi[mask]
-            xj = xj[mask]
+            # M-206: canonical column assignment — names, values, mask rows
+            # and seed all derive from LABEL order (stable across input
+            # reorderings); positions permute with column order and must not
+            # leak into scoring. The template SET per unordered pair is now
+            # identical however the pair is visited (both asymmetric
+            # directions are emitted explicitly, as before).
+            if la <= lb:
+                llo, lhi = la, lb
+                cxi, cxj = xi[mask], xj[mask]
+            else:
+                llo, lhi = lb, la
+                cxi, cxj = xj[mask], xi[mask]
+            xi, xj = cxi, cxj
             yj = y[mask]
             wj = w_all[mask] if w_all is not None else None
 
             candidates = {
-                f"x{la}*x{lb}": xi * xj,
-                f"x{la}+x{lb}": xi + xj,
-                f"x{la}-x{lb}": xi - xj,
-                f"x{la}/(x{lb}+1e-6)": xi / (xj + 1e-6),
-                f"x{la}^2+x{lb}^2": xi * xi + xj * xj,
-                f"x{la}*sin(x{lb})": xi * np.sin(xj),
-                f"x{lb}*sin(x{la})": xj * np.sin(xi),
-                f"x{la}*cos(x{lb})": xi * np.cos(xj),
-                f"x{lb}*cos(x{la})": xj * np.cos(xi),
-                f"x{la}*exp(-abs(x{lb}))": xi * np.exp(-np.clip(np.abs(xj), 0.0, 60.0)),
-                f"x{lb}*exp(-abs(x{la}))": xj * np.exp(-np.clip(np.abs(xi), 0.0, 60.0)),
-                f"x{la}*log(abs(x{lb})+1e-6)": xi * np.log(np.abs(xj) + 1e-6),
-                f"x{lb}*log(abs(x{la})+1e-6)": xj * np.log(np.abs(xi) + 1e-6),
+                f"x{llo}*x{lhi}": xi * xj,
+                f"x{llo}+x{lhi}": xi + xj,
+                f"x{llo}-x{lhi}": xi - xj,
+                f"x{llo}/(x{lhi}+1e-6)": xi / (xj + 1e-6),
+                f"x{llo}^2+x{lhi}^2": xi * xi + xj * xj,
+                f"x{llo}*sin(x{lhi})": xi * np.sin(xj),
+                f"x{lhi}*sin(x{llo})": xj * np.sin(xi),
+                f"x{llo}*cos(x{lhi})": xi * np.cos(xj),
+                f"x{lhi}*cos(x{llo})": xj * np.cos(xi),
+                f"x{llo}*exp(-abs(x{lhi}))": xi * np.exp(-np.clip(np.abs(xj), 0.0, 60.0)),
+                f"x{lhi}*exp(-abs(x{llo}))": xj * np.exp(-np.clip(np.abs(xi), 0.0, 60.0)),
+                f"x{llo}*log(abs(x{lhi})+1e-6)": xi * np.log(np.abs(xj) + 1e-6),
+                f"x{lhi}*log(abs(x{llo})+1e-6)": xj * np.log(np.abs(xi) + 1e-6),
             }
 
             best_term = None
             best_score = -np.inf
             best_signal = None
+            best_comps: dict[str, float] | None = None
+            # M-207: univariate-base input is order-free (max is symmetric).
+            pair_base = max(base_scores.get(a, 0.0), base_scores.get(b, 0.0))
             for name, values in candidates.items():
                 if not np.all(np.isfinite(values)):
                     continue
@@ -882,13 +938,13 @@ def discover_blackbox_interactions(
                         values,
                         yj,
                         validation_fraction=validation_fraction,
-                        random_state=31 * (a + 1) + 17 * (b + 1),
+                        random_state=31 * (llo + 1) + 17 * (lhi + 1),
                         sample_weight=wj,
                     )
                     score = (
                         0.75 * val_rel
                         + 0.15 * train_rel
-                        + 0.10 * max(base_scores.get(a, 0.0), base_scores.get(b, 0.0))
+                        + 0.10 * pair_base
                     )
                     if score > best_score:
                         normed = _normalized_signal(values)
@@ -897,11 +953,23 @@ def discover_blackbox_interactions(
                         best_score = score
                         best_term = name
                         best_signal = normed
+                        # M-207: retain the blended components for later
+                        # reweighting/diagnosis (was final-score-only).
+                        best_comps = {
+                            "validation_relative": float(val_rel),
+                            "train_relative": float(train_rel),
+                            "univariate_base": float(pair_base),
+                        }
                 except Exception:
                     continue
 
             if best_term is not None and best_signal is not None:
-                candidate_rows.append((best_score, (la, lb), best_term, best_signal, sel))
+                # M-206: canonical pair identity (term keeps direction).
+                candidate_rows.append(
+                    (best_score, (llo, lhi), best_term, best_signal, sel)
+                )
+                if best_comps is not None:
+                    term_components[best_term] = dict(best_comps)
 
     candidate_rows.sort(key=lambda item: item[0], reverse=True)
     top: list[tuple[float, tuple[int, int], str, np.ndarray, np.ndarray]] = []
@@ -954,6 +1022,12 @@ def discover_blackbox_interactions(
         "interaction_pairs": [pair for _, pair, _, _, _ in top],
         "interaction_terms": [term for _, _, term, _, _ in top],
         "interaction_scores": {term: float(score) for score, _, term, _, _ in top},
+        # M-207: blended-score components per winning term (0.75 val +
+        # 0.15 train + 0.10 univariate-base); additive, .get-safe readers.
+        "interaction_score_components": {
+            term: dict(term_components.get(term, {}))
+            for term in [t for _, _, t, _, _ in top]
+        },
         # §3.177: family-cap diagnostic (cap honors max_pairs via the outer
         # break above — the ledger records the §3.177 max_pairs=1 override
         # claim as a false-positive portion; kept here as proof).
@@ -1076,6 +1150,7 @@ def prepare_blackbox_search(
     ranking_weight_mode = "provided" if w_all is not None else "none"
     active_ranker_weights: dict[str, float] = {}
     omitted_rankers: list[str] = []
+    ranker_errors: dict[str, list[str]] = {}
     if n_features < int(min_features_to_select):
         selected = sorted(usable)
         feature_scores = {idx: 0.0 for idx in usable}
@@ -1103,6 +1178,11 @@ def prepare_blackbox_search(
         # §3.170: omitted-ranker record travels with the votes.
         active_ranker_weights = dict(ranking.get("active_weights") or {})
         omitted_rankers = list(ranking.get("omitted_rankers") or [])
+        # M-204: sparse-ranker failure provenance travels alongside.
+        ranker_errors = {
+            k: list(v)
+            for k, v in (ranking.get("ranker_errors") or {}).items()
+        }
 
         k = int(max(1, min(max_features, len(usable))))
         ranked_usable = sorted(
@@ -1305,6 +1385,7 @@ def prepare_blackbox_search(
             "interaction_pairs": [],
             "interaction_terms": [],
             "interaction_scores": {},
+            "interaction_score_components": {},
             "family_counts": {},
         }
 
@@ -1323,6 +1404,10 @@ def prepare_blackbox_search(
         interaction_pairs=list(interaction_state["interaction_pairs"]),
         interaction_terms=list(interaction_state["interaction_terms"]),
         interaction_scores=dict(interaction_state["interaction_scores"]),
+        interaction_score_components={
+            str(k): dict(v)
+            for k, v in (interaction_state.get("interaction_score_components") or {}).items()
+        },
         feature_selection_uncertain=reason
         in (
             "retained_all_features_uncertain_selection",
@@ -1333,6 +1418,7 @@ def prepare_blackbox_search(
         ),
         active_ranker_weights=active_ranker_weights,
         omitted_rankers=omitted_rankers,
+        ranker_errors=ranker_errors,
         ranking_sample_weight_mode=str(ranking_weight_mode or "none"),
         imputed_columns=list(_imputed_columns),
         imputed_y_rows=int(_imputed_y_rows),

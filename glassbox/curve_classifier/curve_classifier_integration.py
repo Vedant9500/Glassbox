@@ -995,6 +995,14 @@ def _prepare_curve_features(
     features: np.ndarray, scaler: dict | None = None
 ) -> np.ndarray:
     """Apply the classifier feature transform used by training and inference."""
+    # M-102: fail loud on non-finite features — NaN/Inf previously flowed
+    # silently into the classifier tensors (extract_all_features sanitizes
+    # its own output, but cached/corrupt caller features bypass it).
+    if not np.all(np.isfinite(np.asarray(features))):
+        raise ValueError(
+            "curve features must be finite (got NaN/Inf in "
+            f"{int(np.sum(~np.isfinite(np.asarray(features, dtype=np.float64))))} entries)"
+        )
     prepared = np.asarray(features, dtype=np.float32).copy()
     end = min(prepared.shape[0], 398)
     if end > 192:
