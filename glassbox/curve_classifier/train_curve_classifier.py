@@ -486,6 +486,8 @@ except (ImportError, ValueError):
         write_validation_report,
     )
 
+from glassbox.curve_classifier.stable_losses import StableBCEWithLogitsLoss
+
 
 class IndexedFeatureDataset(Dataset):
     """Dataset view over feature/label arrays using explicit indices.
@@ -1101,16 +1103,26 @@ def train_model(
     class_weights: torch.Tensor | None = None,
     calibration_loader=None,
     val_groups: np.ndarray | None = None,
+    weight_decay: float = 1e-4,
+    adam_eps: float = 1e-8,
+    loss_name: str = "bce",
 ):
     """Full training loop with early stopping."""
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=lr, weight_decay=weight_decay, eps=adam_eps
+    )
     scheduler_mode = "max" if early_stop_metric == "f1" else "min"
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode=scheduler_mode, factor=0.5, patience=5
     )
 
     # Use class weights for imbalanced labels if provided
-    if class_weights is not None:
+    if loss_name == "stable_bce":
+        criterion = StableBCEWithLogitsLoss(
+            pos_weight=class_weights.to(device) if class_weights is not None else None
+        )
+        print("Using stable BCE loss (arXiv:2610.31642 binary form)")
+    elif class_weights is not None:
         criterion = nn.BCEWithLogitsLoss(pos_weight=class_weights.to(device))
         print(f"Using class weights: {class_weights.numpy()}")
     else:
@@ -1495,6 +1507,22 @@ def main():
     )
     parser.add_argument("--batch-size", type=int, default=8192, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument(
+        "--loss",
+        type=str,
+        default="bce",
+        choices=["bce", "stable_bce"],
+        help=(
+            "Training loss. 'stable_bce' uses the arXiv:2610.31642 binary "
+            "form that keeps confident-positive gradients."
+        ),
+    )
+    parser.add_argument(
+        "--weight-decay", type=float, default=1e-4, help="Adam weight decay"
+    )
+    parser.add_argument(
+        "--adam-eps", type=float, default=1e-8, help="Adam epsilon"
+    )
     parser.add_argument(
         "--hidden", type=int, default=512, help="Hidden layer size (default: 512)"
     )
@@ -1930,6 +1958,9 @@ def main():
             if generator_families is not None
             else None
         ),
+        weight_decay=args.weight_decay,
+        adam_eps=args.adam_eps,
+        loss_name=args.loss,
     )
 
     # M-21: reuse the checkpoint train_model just saved (same process, same

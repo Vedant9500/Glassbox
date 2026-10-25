@@ -296,7 +296,8 @@ class CurveClassifierGLU(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0.1)
 
-    def forward(self, x):
+    def forward_features(self, x):
+        """Return the shared trunk embedding before the classifier head."""
         attn_features = self.attn(x)
         eql_features = self.eql(x)
 
@@ -306,8 +307,51 @@ class CurveClassifierGLU(nn.Module):
         x = self.dropout(F.glu(self.bn2(self.fc2(x)), dim=1))
         x = self.dropout(F.glu(self.bn3(self.fc3(x)), dim=1))
         x = self.dropout(F.glu(self.bn4(self.fc4(x)), dim=1))
+        return x
 
-        return self.classifier(x)
+    def forward(self, x):
+        return self.classifier(self.forward_features(x))
+
+
+class DualHeadCurveClassifier(nn.Module):
+    """GLU trunk with separate operator and shape-property heads.
+
+    The operator head reuses ``CurveClassifierGLU.classifier`` so the trunk
+    keeps the exact parameter names of the single-head production model. The
+    shape head is an independent linear probe on the shared trunk embedding.
+
+    ``forward`` returns ``(operator_logits, shape_logits)``.
+    """
+
+    def __init__(
+        self,
+        n_features: int = 398,
+        n_operator_classes: int = 9,
+        n_shape_labels: int = 10,
+        hidden: int = 512,
+    ):
+        super().__init__()
+        self.backbone = CurveClassifierGLU(
+            n_features=n_features,
+            n_classes=n_operator_classes,
+            hidden=hidden,
+        )
+        self.shape_head = nn.Linear(hidden, n_shape_labels)
+
+        nn.init.xavier_normal_(self.shape_head.weight)
+        if self.shape_head.bias is not None:
+            nn.init.constant_(self.shape_head.bias, 0.1)
+
+    @property
+    def operator_head(self) -> nn.Linear:
+        return self.backbone.classifier
+
+    def forward_features(self, x):
+        return self.backbone.forward_features(x)
+
+    def forward(self, x):
+        features = self.forward_features(x)
+        return self.backbone.classifier(features), self.shape_head(features)
 
 
 __all__ = [
@@ -315,6 +359,7 @@ __all__ = [
     "CurveClassifierCNN",
     "CurveClassifierGLU",
     "CurveClassifierMLP",
+    "DualHeadCurveClassifier",
     "EQLLayer",
     "SemanticFeatureAttention",
 ]

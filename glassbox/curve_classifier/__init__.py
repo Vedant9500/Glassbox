@@ -6,6 +6,10 @@ from .curve_classifier_integration import (
     predict_operators,
     validate_curve_classifier_checkpoint_metadata,
 )
+from .dual_head_inference import (
+    load_dual_head_checkpoint,
+    predict_dual_head,
+)
 from .generate_curve_data import (
     SEMANTIC_LABELER_VERSION,
     build_formula_audit_metadata,
@@ -20,6 +24,7 @@ from .models import (
     CurveClassifierCNN,
     CurveClassifierGLU,
     CurveClassifierMLP,
+    DualHeadCurveClassifier,
     EQLLayer,
     SemanticFeatureAttention,
 )
@@ -33,6 +38,7 @@ __all__ = [
     "CurveClassifierCNN",
     "CurveClassifierGLU",
     "CurveClassifierMLP",
+    "DualHeadCurveClassifier",
     "EQLLayer",
     "SemanticFeatureAttention",
     "build_formula_audit_metadata",
@@ -40,6 +46,8 @@ __all__ = [
     "describe_curve_classifier_inference",
     "extract_all_features_xy",
     "formula_to_key",
+    "load_dual_head_checkpoint",
+    "predict_dual_head",
     "predict_operators",
     "prepare_univariate_curve_xy",
     "resolve_curve_classifier_path",

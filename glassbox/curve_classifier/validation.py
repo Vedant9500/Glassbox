@@ -321,6 +321,10 @@ def build_validation_report(
     template_ids: Sequence[Any] | None = None,
     split_details: Mapping[str, Any] | None = None,
     metrics: Mapping[str, Any] | None = None,
+    shape_label_names: Sequence[str] | None = None,
+    shape_metrics: Mapping[str, Any] | None = None,
+    thresholds: Mapping[str, Any] | None = None,
+    family_holdout: Mapping[str, Any] | None = None,
     notes: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     train_idx_arr = np.asarray(train_idx, dtype=np.int64)
@@ -351,6 +355,17 @@ def build_validation_report(
         "metrics": dict(metrics or {}),
         "notes": list(notes or []),
     }
+    # Optional dual-head extensions. Absent for single-head checkpoints so the
+    # base schema stays unchanged.
+    if shape_label_names is not None or shape_metrics is not None:
+        report["shape_head"] = {
+            "label_names": [str(x) for x in (shape_label_names or [])],
+            "metrics": dict(shape_metrics or {}),
+        }
+    if family_holdout is not None:
+        report["family_holdout"] = dict(family_holdout)
+    if thresholds is not None:
+        report["thresholds"] = dict(thresholds)
     return report
 
 
