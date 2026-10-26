@@ -106,7 +106,8 @@ python scripts/sr_tester.py --mode single --formula "x^2 + sin(x)"
 ## Important CLIs
 
 - `scripts/benchmark_suite.py`: 8-tier synthetic benchmark. Current defaults are
-  `models/curve_classifier_multi.pt` and `models/universal_proposer_multi.pt`.
+  `models/curve_classifier_v7_dual.pt` (dual-head Phase 1) and
+  `models/universal_proposer_multi.pt`.
   Supports `--with-evolution`, `--evolution-only`, `--specialist-regressor`,
   `--specialist-full`, `--exact-match-backend`, repeated `--tier`, and report
   output under `results/`.

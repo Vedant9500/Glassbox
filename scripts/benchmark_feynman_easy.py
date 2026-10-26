@@ -18,6 +18,7 @@ sys.path.insert(0, str(SCRIPTS_DIR))
 from classifier_fast_path import run_fast_path
 
 from glassbox.evolution import EvolutionaryONNTrainer, detect_dominant_frequency
+from glassbox.model_registry import DEFAULT_CURVE_CLASSIFIER_PATH
 from glassbox.sr.core.operation_dag import OperationDAG
 
 # AI-Feynman demo mappings from the upstream README/Table 4:
@@ -43,7 +44,7 @@ DATASETS: list[dict[str, str]] = [
     },
 ]
 
-DEFAULT_CLASSIFIER_PATH = "models/curve_classifier_multi.pt"
+DEFAULT_CLASSIFIER_PATH = DEFAULT_CURVE_CLASSIFIER_PATH
 
 
 def resolve_repo_path(path_str: str) -> Path:

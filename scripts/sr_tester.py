@@ -145,6 +145,7 @@ from glassbox.evolution import (
     EvolutionaryONNTrainer,
     finalize_model_coefficients,
 )
+from glassbox.model_registry import DEFAULT_CURVE_CLASSIFIER_PATH
 from glassbox.sr.core.operation_dag import OperationDAG
 from glassbox.sr.pruning import PostTrainingPruner
 from glassbox.sr.visualization import LiveTrainingVisualizer
@@ -809,7 +810,7 @@ def run_single_mode(config: Config):
                 x_tensor,
                 y_tensor,
                 classifier_path=getattr(config, "curve_classifier_model", None)
-                or "models/curve_classifier_multi.pt",
+                or DEFAULT_CURVE_CLASSIFIER_PATH,
                 detected_omegas=detected_omegas,
                 op_constraints=op_constraints,
                 auto_expand=True,

@@ -75,6 +75,7 @@ import classifier_fast_path as cfp
 from classifier_fast_path import run_fast_path, run_guided_evolution
 
 from glassbox.evolution import detect_dominant_frequency
+from glassbox.model_registry import DEFAULT_CURVE_CLASSIFIER_PATH
 from glassbox.sr.cpp.seed_graph_builder import (
     build_seed_graphs_from_signal,
 )
@@ -2776,8 +2777,8 @@ Examples:
     parser.add_argument(
         "--classifier-model",
         type=str,
-        default="models/curve_classifier_multi.pt",
-        help="Path to the curve classifier model (default: models/curve_classifier_multi.pt)",
+        default=DEFAULT_CURVE_CLASSIFIER_PATH,
+        help=f"Path to the curve classifier model (default: {DEFAULT_CURVE_CLASSIFIER_PATH})",
     )
     parser.add_argument(
         "--proposer-model",

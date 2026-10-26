@@ -5,8 +5,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_multi.pt"
+DEFAULT_CURVE_CLASSIFIER_PATH = "models/curve_classifier_v7_dual.pt"
 PYTORCH_CLASSIFIER_FALLBACKS = (
+    # Previous production single-head checkpoint; keeps callers working when the
+    # dual-head artifact is absent.
+    "models/curve_classifier_multi.pt",
     "models/curve_classifier_wide.pt",
     "models/curve_classifier_mlp_eql.pt",
     # M-38: "curve_classfier_v4.pt" is misspelled on disk. Prefer the

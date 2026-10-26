@@ -34,6 +34,7 @@ if str(_REPO_ROOT) not in sys.path:
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
+from glassbox.model_registry import DEFAULT_CURVE_CLASSIFIER_PATH
 from glassbox.sr.cpp.seed_graph_builder import build_seed_graphs_from_signal
 from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 from scripts import benchmark_common as bc
@@ -1478,7 +1479,7 @@ def main():
     parser.add_argument(
         "--classifier-model",
         type=str,
-        default="models/curve_classifier_multi.pt",
+        default=DEFAULT_CURVE_CLASSIFIER_PATH,
         help="Classifier model path",
     )
     parser.add_argument(
