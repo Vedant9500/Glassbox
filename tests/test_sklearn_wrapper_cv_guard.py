@@ -1,4 +1,5 @@
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -578,7 +579,10 @@ def test_multivariate_blackbox_cpp_seeds_use_reduced_indices(monkeypatch):
 
     rng = np.random.RandomState(8)
     X = rng.randn(80, 5)
-    y = X[:, 1] * X[:, 4]
+    # Interaction of features 1 and 4, but non-polynomial: a plain product is
+    # recoverable exactly from the screened interaction pool, which short-circuits
+    # evolution (candidate_screening_win) and leaves no seed graphs to inspect.
+    y = np.exp(-(X[:, 1] ** 2)) * X[:, 4]
 
     est = GlassboxRegressor(
         use_fast_path=True,
@@ -596,6 +600,9 @@ def test_multivariate_blackbox_cpp_seeds_use_reduced_indices(monkeypatch):
     )
     est.fit(X, y)
 
+    assert captured.get("seed_graphs"), (
+        "evolution did not run; the seed-graph path was short-circuited"
+    )
     feature_indices = [
         node.get("feature_idx")
         for graph in captured.get("seed_graphs", [])
@@ -603,7 +610,8 @@ def test_multivariate_blackbox_cpp_seeds_use_reduced_indices(monkeypatch):
         if node.get("type") == 0
     ]
     assert feature_indices
-    assert max(feature_indices) < est.n_features_in_
+    # Seeds live in the reduced search space, not the original feature space.
+    assert max(feature_indices) < est.n_features_search_
     assert est.blackbox_search_plan_["seed_budget"] >= 8
     assert est.blackbox_diagnostics_["search_plan"] == est.blackbox_search_plan_
     assert captured["pop_size"] >= est.population_size
@@ -616,6 +624,40 @@ def test_multivariate_blackbox_cpp_seeds_use_reduced_indices(monkeypatch):
         captured["early_stop_max_nodes"]
         == est.blackbox_search_plan_["early_stop_max_nodes"]
     )
+
+
+def test_blackbox_candidate_pool_remaps_interaction_terms_to_reduced_space():
+    rng = np.random.RandomState(3)
+    X = rng.randn(60, 5)
+    y = X[:, 2] * X[:, 4]
+    _, _, state = prepare_blackbox_search(
+        X,
+        y,
+        enabled=True,
+        max_features=2,
+        standardize=False,
+        min_features_to_select=2,
+    )
+    # Interaction terms are named in original feature space, so the candidate
+    # pool must rewrite x2*x4 -> x0*x1 for a 2-column search matrix. Without the
+    # remap the term references columns the search matrix does not have.
+    state = replace(
+        state,
+        selected_features=[2, 4],
+        dropped_features=[0, 1, 3],
+        interaction_terms=["x2*x4"],
+        interaction_scores={"x2*x4": 1.0},
+        candidate_seed_formulas=["x2*x4"],
+    )
+    est = GlassboxRegressor(population_size=10, generations=10, random_state=0)
+    est._fit_search_space_structure_seeds = lambda *args, **kwargs: []
+
+    candidates = est._build_blackbox_candidate_formulas(
+        None, None, {}, state, X[:, [2, 4]], y, max_candidates=8
+    )
+    formulas = [str(candidate["formula"]) for candidate in candidates]
+    assert any("x0*x1" in formula for formula in formulas)
+    assert not any("x2" in formula or "x4" in formula for formula in formulas)
 
 
 def test_blackbox_refined_candidate_can_skip_cpp(monkeypatch):
