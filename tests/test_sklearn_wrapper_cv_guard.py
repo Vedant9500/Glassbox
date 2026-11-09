@@ -1195,7 +1195,7 @@ def test_blackbox_cpp_receives_binary_priors(monkeypatch):
         population_size=10,
         generations=10,
         multi_start_runs=1,
-        timeout=20,
+        timeout=5,
         num_islands=4,
         random_state=89,
         evolution_skip_r2=0.999999,
@@ -1257,7 +1257,7 @@ def test_blackbox_candidate_screening_exports_interaction_operator_hints(monkeyp
         population_size=10,
         generations=10,
         multi_start_runs=1,
-        timeout=20,
+        timeout=5,
         random_state=41,
     )
     est.fit(X, y)
@@ -1318,7 +1318,7 @@ def test_blackbox_candidate_screening_exports_specialist_pair_diagnostics(monkey
         population_size=10,
         generations=10,
         multi_start_runs=1,
-        timeout=20,
+        timeout=5,
         random_state=53,
     )
     est.fit(X, y)
@@ -1377,7 +1377,7 @@ def test_blackbox_candidate_screening_can_disable_specialist_diagnostics(monkeyp
         population_size=10,
         generations=10,
         multi_start_runs=1,
-        timeout=20,
+        timeout=5,
         random_state=59,
     )
     est.fit(X, y)

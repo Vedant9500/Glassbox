@@ -1,11 +1,18 @@
 import numpy as np
+import pytest
 
 from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 from scripts import specialist_phase_eval as spe
 
 
-def test_phase0_harness_returns_summary_and_cases():
-    result = spe.run_phase0(quick=True)
+@pytest.fixture(scope="module")
+def phase0_result():
+    """Run the phase-0 smoke harness once for every test in this module."""
+    return spe.run_phase0(quick=True)
+
+
+def test_phase0_harness_returns_summary_and_cases(phase0_result):
+    result = phase0_result
 
     assert isinstance(result, dict)
     assert "summary" in result
@@ -26,8 +33,8 @@ def test_phase0_harness_returns_summary_and_cases():
         assert "error" in case
 
 
-def test_phase0_harness_emits_specialist_diagnostics_for_phase_run():
-    result = spe.run_phase0(quick=True)
+def test_phase0_harness_emits_specialist_diagnostics_for_phase_run(phase0_result):
+    result = phase0_result
 
     phase_cases = [case["phase0"] for case in result["cases"]]
     assert any(run.get("has_specialist_screening") for run in phase_cases)

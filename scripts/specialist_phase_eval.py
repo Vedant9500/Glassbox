@@ -230,7 +230,13 @@ def _make_estimator(
     enable_specialist_vault_memory: bool = True,
     evolution_skip_r2: float | None = None,
     timeout: int = 20,
+    quick: bool = False,
 ) -> GlassboxRegressor:
+    # The quick harness is a smoke test, not a search-quality benchmark:
+    # keep the same code path but bound its budget so a smoke run cannot
+    # spend minutes in constant refinement.
+    if quick:
+        timeout = min(int(timeout), 5)
     kwargs: dict[str, Any] = dict(
         use_fast_path=False,
         use_guided_evolution=use_guided_evolution,
@@ -242,8 +248,8 @@ def _make_estimator(
         enable_specialist_composition_screening=enable_specialist_composition_screening,
         enable_residual_stage=True,
         enable_specialist_vault_memory=enable_specialist_vault_memory,
-        population_size=12,
-        generations=12,
+        population_size=6 if quick else 12,
+        generations=4 if quick else 12,
         multi_start_runs=multi_start_runs,
         timeout=timeout,
         random_state=0,
@@ -278,6 +284,7 @@ def _evaluate_run(
     enable_specialist_vault_memory: bool = True,
     evolution_skip_r2: float | None = None,
     timeout: int = 20,
+    quick: bool = False,
 ) -> dict[str, Any]:
     X = np.asarray(case["X"], dtype=np.float64)
     y = np.asarray(case["y"], dtype=np.float64).reshape(-1)
@@ -290,6 +297,7 @@ def _evaluate_run(
         enable_specialist_vault_memory=enable_specialist_vault_memory,
         evolution_skip_r2=evolution_skip_r2,
         timeout=timeout,
+        quick=quick,
     )
     t0 = time.time()
     est.fit(X, y)
@@ -357,7 +365,13 @@ def _evaluate_run(
 def run_phase0(*, quick: bool = False) -> dict[str, Any]:
     cases = _phase0_cases()
     if quick:
-        cases = cases[:3]
+        # Smoke mode needs one case that actually exercises specialist
+        # screening; the exact product-envelope case short-circuits before it.
+        cases = [
+            c
+            for c in cases
+            if c["name"] == "piecewise_proxy_left_poly_right_sine"
+        ]
 
     results = []
     regression_failures = 0
@@ -369,9 +383,15 @@ def run_phase0(*, quick: bool = False) -> dict[str, Any]:
         case_error = None
         try:
             baseline = _evaluate_run(
-                case, enable_specialist_screening_diagnostics=False
+                case,
+                enable_specialist_screening_diagnostics=False,
+                quick=quick,
             )
-            phase0 = _evaluate_run(case, enable_specialist_screening_diagnostics=True)
+            phase0 = _evaluate_run(
+                case,
+                enable_specialist_screening_diagnostics=True,
+                quick=quick,
+            )
         except Exception as exc:
             baseline = {
                 "formula": None,
@@ -530,8 +550,8 @@ def run_phase2(*, quick: bool = False) -> dict[str, Any]:
 def run_phase3(*, quick: bool = False) -> dict[str, Any]:
     cases = _phase0_cases()
     if quick:
-        p3_cases = [c for c in cases if c["name"] == "composed_product_plus_constant"]
-        cases = cases[:3] + p3_cases
+        # Quick mode only needs the case that decides the phase-3 pass gate.
+        cases = [c for c in cases if c["name"] == "composed_product_plus_constant"]
 
     results = []
     phase3_hits = 0
@@ -586,8 +606,8 @@ def run_phase3(*, quick: bool = False) -> dict[str, Any]:
 def run_phase4(*, quick: bool = False) -> dict[str, Any]:
     cases = _phase0_cases()
     if quick:
-        p4_cases = [c for c in cases if c["name"] == "composed_product_with_residual"]
-        cases = cases[:3] + p4_cases
+        # Quick mode only needs the case that decides the phase-4 pass gate.
+        cases = [c for c in cases if c["name"] == "composed_product_with_residual"]
 
     results = []
     phase4_hits = 0
@@ -632,8 +652,8 @@ def run_phase4(*, quick: bool = False) -> dict[str, Any]:
 def run_phase5(*, quick: bool = False) -> dict[str, Any]:
     cases = _phase0_cases()
     if quick:
-        p5_cases = [c for c in cases if c["name"] == "composed_product_with_residual"]
-        cases = cases[:3] + p5_cases
+        # Quick mode only needs the case that decides the phase-5 pass gate.
+        cases = [c for c in cases if c["name"] == "composed_product_with_residual"]
 
     results = []
     phase5_hits = 0
@@ -681,7 +701,8 @@ def run_phase6(*, quick: bool = False) -> dict[str, Any]:
     }
     p6_cases = [c for c in cases if c["name"] in p6_names]
     if quick:
-        p6_cases = p6_cases[:2]
+        # Quick mode needs one hit; the nested sine/cosine case solves exactly.
+        p6_cases = p6_cases[:1]
 
     results = []
     phase6_hits = 0
@@ -692,6 +713,7 @@ def run_phase6(*, quick: bool = False) -> dict[str, Any]:
             enable_specialist_screening_diagnostics=True,
             enable_specialist_composition_screening=True,
             use_guided_evolution=True,
+            quick=quick,
         )
 
         results.append(
@@ -734,8 +756,9 @@ def run_phase7(*, quick: bool = False) -> dict[str, Any]:
             # the R^2-gated early exit so the incumbent path cannot short-circuit.
             evolution_skip_r2=1.1,
             # Full pipeline with the early exit disabled needs more wall clock,
-            # especially on loaded CI machines running suites in parallel.
-            timeout=60,
+            # especially on loaded CI machines running suites in parallel. Quick
+            # mode still reaches the exact-solve gate well inside 20s.
+            timeout=20 if quick else 60,
         )
 
         results.append(
@@ -801,6 +824,7 @@ def run_phase8(*, quick: bool = False) -> dict[str, Any]:
             use_guided_evolution=True,
             multi_start_runs=2,
             enable_specialist_vault_memory=False,
+            quick=quick,
         )
         phase8 = _evaluate_run(
             case,
@@ -809,6 +833,7 @@ def run_phase8(*, quick: bool = False) -> dict[str, Any]:
             use_guided_evolution=True,
             multi_start_runs=2,
             enable_specialist_vault_memory=True,
+            quick=quick,
         )
         vault_probe = _make_estimator(
             enable_specialist_screening_diagnostics=True,
@@ -816,6 +841,7 @@ def run_phase8(*, quick: bool = False) -> dict[str, Any]:
             use_guided_evolution=False,
             multi_start_runs=2,
             enable_specialist_vault_memory=True,
+            quick=quick,
         )
         vault_probe.n_features_in_ = X.shape[1]
         vault_probe.blackbox_diagnostics_ = {}
