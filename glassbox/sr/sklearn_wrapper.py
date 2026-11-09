@@ -8395,8 +8395,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             if not isinstance(cache, dict):
                 cache = {}
                 self._formula_eval_cache_ = cache
-            if len(cache) >= 512:
-                cache.clear()
+            # P-5: evict oldest entries one-at-a-time instead of clearing the
+            # whole cache. A full clear at the 512-entry boundary caused a
+            # latency spike and discarded every still-reusable prediction.
+            while len(cache) >= 512:
+                cache.pop(next(iter(cache)), None)
             cache[cache_key] = np.asarray(out, dtype=np.float64).copy()
         return out
 

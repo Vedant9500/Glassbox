@@ -334,3 +334,109 @@ def test_p04_fixed_seed_determinism(cpp_core, periodic_power_problem):
     a = _run_p04(cpp_core, x, y, seeds, use_lm=False)
     b = _run_p04(cpp_core, x, y, seeds, use_lm=False)
     assert a["best_mse"] == b["best_mse"]
+
+
+# ── §3.288/§3.289: seed fraction bounds and effective capacity ──────────
+
+
+def _simple_seeds(cpp_core):
+    return [
+        cpp_core.formula_to_seed_graph(s)
+        for s in (
+            "x0",
+            "x0+1",
+            "x0*2",
+            "x0**2",
+            "sin(x0)",
+            "x0-1",
+            "x0/2",
+            "x0**3",
+            "cos(x0)",
+            "x0+2",
+        )
+    ]
+
+
+@_p04_skip
+def test_3_288_seed_fraction_reports_effective_bound(cpp_core):
+    x = np.linspace(-1.0, 1.0, 40)
+    y = 2.0 * x + 1.0
+    seeds = _simple_seeds(cpp_core)
+    common = dict(
+        pop_size=10,
+        generations=1,
+        num_islands=1,
+        random_seed=7,
+        early_stop_mse=1e-20,
+        timeout_seconds=30,
+        seed_graphs_py=seeds,
+        use_lm_inner_optimizer=False,
+    )
+    high = cpp_core.run_evolution([x], y, seed_fraction=0.95, **common)
+    assert high["seed_fraction_requested"] == 0.95
+    assert high["seed_fraction_effective"] == 0.9
+    # pop-1 keeps one random slot; 0.9 * 10 rounds up to 9.
+    assert high["seed_capacity"] == 9
+
+    low = cpp_core.run_evolution([x], y, seed_fraction=0.05, **common)
+    assert low["seed_fraction_requested"] == 0.05
+    assert low["seed_fraction_effective"] == 0.1
+    # Tiny-pop anti-starvation floor is pop/4 (=2), not pop-1.
+    assert low["seed_capacity"] == 2
+
+
+# ── §3.291/§3.292: island seed sharding is balanced and reported ────────
+
+
+@_p04_skip
+def test_3_291_island_seed_counts_balanced(cpp_core):
+    x = np.linspace(-1.0, 1.0, 40)
+    y = 2.0 * x + 1.0
+    seeds = _simple_seeds(cpp_core)
+    res = cpp_core.run_evolution(
+        [x],
+        y,
+        pop_size=32,
+        generations=1,
+        num_islands=4,
+        random_seed=7,
+        early_stop_mse=1e-20,
+        timeout_seconds=30,
+        seed_graphs_py=seeds,
+        seed_fraction=0.5,
+        use_lm_inner_optimizer=False,
+    )
+    counts = list(res["island_seed_counts"])
+    assert len(counts) == 4
+    assert sum(counts) == res["seed_graphs_used"]
+    assert max(counts) - min(counts) <= 1
+
+
+# ── §3.91: refinement escape-hatch state exists before first use ────────
+
+
+def test_3_91_refinement_state_initialized():
+    from glassbox.evolution.evolution import StructureConfidenceTracker
+
+    tracker = StructureConfidenceTracker()
+    assert tracker.refinement_mse_before is None
+    assert tracker.refinement_failures == 0
+    # Previously raised AttributeError: state was assigned after a return.
+    assert tracker.end_refinement_tracking(1.0) is True
+
+
+# ── P-5: formula eval cache evicts oldest entry, not the whole cache ────
+
+
+def test_p5_formula_eval_cache_evicts_oldest_not_all():
+    model = GlassboxRegressor()
+    x = np.linspace(0.1, 2.0, 8).reshape(-1, 1)
+    model._formula_eval_cache_ = {f"placeholder-{i}": i for i in range(512)}
+    oldest = next(iter(model._formula_eval_cache_))
+
+    out = model._eval_formula_raw("x0", x)
+
+    cache = model._formula_eval_cache_
+    assert np.allclose(out, x[:, 0])
+    assert len(cache) == 512  # one evicted, one inserted — not a full clear
+    assert oldest not in cache

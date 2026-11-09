@@ -471,6 +471,10 @@ public:
     void set_eval_num_threads(int n) { config_.eval_num_threads = std::max(0, n); }
     void set_arithmetic_temperature_config(double t) { config_.arithmetic_temperature = t; }
     int max_seed_capacity_public() const { return max_seed_capacity(); }
+    // §3.288: effective (clamped) fraction actually used by the engine.
+    double effective_seed_fraction_public() const {
+        return effective_seed_fraction();
+    }
 
 
     int get_first_exact_generation() const { return first_exact_generation_; }
@@ -494,6 +498,10 @@ public:
     int get_priors_masked_by_allowed() const { return priors_masked_by_allowed_; }
     // M-274: true when requested islands fell back to a single population.
     bool get_island_fallback_to_single() const { return island_fallback_to_single_; }
+    // §3.291: per-island seeded-graph counts (empty when not in island mode).
+    const std::vector<int>& get_island_seed_counts() const {
+        return island_seed_counts_;
+    }
     // §3.426: effective explorer/main split of the last generation (the
     // requested fraction is clamped to elites when small, silently making
     // every non-elite offspring an explorer).
@@ -586,6 +594,7 @@ public:
 
     // P6: Island Model run
     void run_islands() {
+        island_seed_counts_.clear();
         if (config_.num_islands <= 1) { run(); return; }
 
         int island_size = config_.pop_size / config_.num_islands;
@@ -666,20 +675,28 @@ public:
                 current_island_cfg.random_seed = -1;
             }
 
-            // Optional light sharding of seed graphs across islands to increase diversity.
+            // §3.291/§3.292: balanced round-robin sharding. `s % K` gives
+            // per-island counts that differ by at most one; keep that
+            // guarantee explicit, record the counts, and spread replicas
+            // round-robin when there are fewer seeds than islands (identical
+            // seeds cannot be avoided then, but per-island RNG streams still
+            // diverge and no single seed lands on every island).
             std::vector<IndividualGraph> island_seeds = seed_graphs_;
             if (seed_graphs_.size() > 1 && config_.num_islands > 1) {
                 island_seeds.clear();
-                for (size_t s = 0; s < seed_graphs_.size(); ++s) {
-                    if (static_cast<int>(s % static_cast<size_t>(config_.num_islands)) == i) {
+                const size_t n_islands = static_cast<size_t>(config_.num_islands);
+                const size_t n_seeds = seed_graphs_.size();
+                for (size_t s = 0; s < n_seeds; ++s) {
+                    if (s % n_islands == static_cast<size_t>(i)) {
                         island_seeds.push_back(seed_graphs_[s]);
                     }
                 }
-                // Ensure every island gets at least one seed when possible.
                 if (island_seeds.empty()) {
-                    island_seeds.push_back(seed_graphs_[static_cast<size_t>(i % static_cast<int>(seed_graphs_.size()))]);
+                    island_seeds.push_back(
+                        seed_graphs_[static_cast<size_t>(i) % n_seeds]);
                 }
             }
+            island_seed_counts_.push_back(static_cast<int>(island_seeds.size()));
             
             // Pass seed_graphs_ + y_weights_ to all islands
             islands.emplace_back(
@@ -907,6 +924,8 @@ private:
     int prior_entries_sanitized_ = 0;
     int priors_masked_by_allowed_ = 0;
     bool island_fallback_to_single_ = false;
+    // §3.291: seeds assigned to each island (empty outside island mode).
+    std::vector<int> island_seed_counts_;
     // P-04 diagnostics: FD probe volume + inert-param probes avoided.
     // Plain counters: each island engine is confined to one OpenMP thread
     // (parallel-for over islands) and the parent aggregates post-join.
@@ -1623,7 +1642,23 @@ private:
         return std::uniform_real_distribution<double>(lo, hi)(rng_);
     }
 
-    void clamp_unary_inner_params(OpNode& node) const {        node.p = std::clamp(node.p, config_.p_min, config_.p_max);
+    void clamp_unary_inner_params(OpNode& node) const {
+        // §3.328/§3.329: IntPow's exponent is discrete and lives on 2..6.
+        // Round and clamp it BEFORE the continuous [p_min, p_max] clamp; the
+        // old order truncated 4..6 to p_max (default 3) on every pass. Doing
+        // the round here also means a small continuous mutation of an already
+        // integral exponent rounds back to the same integer, so a separate
+        // discrete mutation operator is unnecessary (and changed replay).
+        if (node.type == NodeType::Unary && node.unary_op == UnaryOp::IntPow) {
+            if (!std::isfinite(node.p)) node.p = 2.0;
+            // Round first, then clamp the rounded double: eval.h rounds and
+            // clamps an int, but clamping in double avoids overflow on a huge
+            // stored p before it reaches the 2..6 domain.
+            node.p = std::clamp(std::round(node.p), 2.0, 6.0);
+        } else {
+            node.p = std::clamp(node.p, config_.p_min, config_.p_max);
+            if (!std::isfinite(node.p)) node.p = 1.0;
+        }
         if (node.type == NodeType::Unary && node.unary_op == UnaryOp::Exp) {
             node.omega = std::clamp(node.omega, config_.exp_omega_min, config_.exp_omega_max);
             node.phi = std::clamp(node.phi, config_.exp_phi_min, config_.exp_phi_max);
@@ -1631,18 +1666,8 @@ private:
             node.omega = std::clamp(node.omega, config_.omega_min, config_.omega_max);
             node.phi = std::clamp(node.phi, config_.phi_min, config_.phi_max);
         }
-        if (!std::isfinite(node.p)) node.p = 1.0;
         if (!std::isfinite(node.omega)) node.omega = 1.0;
         if (!std::isfinite(node.phi)) node.phi = 0.0;
-        // §3.329/§3.314: IntPow evaluates rounded (eval.h) but the stored
-        // value stayed fractional after Adam/LM updates, so hashing/printing
-        // could describe a different integer than evaluation used.
-        // Canonicalize on every clamp pass (idempotent with mutation's own
-        // rounding; evaluation output unchanged).
-        if (node.type == NodeType::Unary && node.unary_op == UnaryOp::IntPow) {
-            node.p = static_cast<double>(
-                std::clamp(static_cast<int>(std::round(node.p)), 2, 6));
-        }
     }
     
     IndividualGraph create_random_individual(int n_inputs) {
@@ -1741,25 +1766,32 @@ private:
         return ind;
     }
 
-    // E3: seed capacity - allow up to seed_fraction of pop (default 50%),
-    // and on tiny island pops keep almost all slots for seeds while leaving
-    // at least one random individual when pop > 1.
+    // E3: seed capacity - allow up to seed_fraction of pop (default 50%).
+    // §3.288: effective fraction uses the same [0.1, 0.9] bound as the pybind
+    // boundary, so provenance and executed capacity cannot disagree.
+    // §3.289: tiny islands keep a documented 25% anti-starvation floor, but a
+    // request is never silently raised to pop-1, and at least one random slot
+    // always survives when pop > 1.
+    double effective_seed_fraction() const {
+        double frac = config_.seed_fraction;
+        if (!(frac > 0.0) || !std::isfinite(frac)) frac = 0.5;
+        return std::clamp(frac, 0.1, 0.9);
+    }
+
     int max_seed_capacity() const {
         const int pop = std::max(1, config_.pop_size);
         const int n_seeds = static_cast<int>(seed_graphs_.size());
         if (n_seeds <= 0) return 0;
-        double frac = config_.seed_fraction;
-        if (!(frac > 0.0) || !std::isfinite(frac)) frac = 0.5;
-        frac = std::clamp(frac, 0.1, 0.9);
-        int by_frac = std::max(1, static_cast<int>(std::ceil(frac * static_cast<double>(pop))));
-        int cap;
+        const double frac = effective_seed_fraction();
+        int cap = std::max(1, static_cast<int>(std::ceil(frac * static_cast<double>(pop))));
         if (pop <= 12) {
-            // Small island/pop: avoid historical pop/4 starvation (e.g. 12->3).
-            cap = std::max(by_frac, pop - 1);
-        } else {
-            cap = by_frac;
+            // Historical pop/4 starvation (e.g. 12 -> 3) is the floor we
+            // refuse to go below; it no longer overrides a larger request.
+            const int anti_starvation = std::max(1, pop / 4);
+            cap = std::max(cap, std::min(anti_starvation, pop > 1 ? pop - 1 : 1));
         }
         cap = std::min(cap, pop);
+        if (pop > 1) cap = std::min(cap, pop - 1);
         return std::min(cap, n_seeds);
     }
 
@@ -3533,25 +3565,63 @@ private:
         int n_nodes = static_cast<int>(ind.nodes.size());
         std::vector<int> canonical(n_nodes); // Maps each node to its canonical representative
         for (int i = 0; i < n_nodes; ++i) canonical[i] = i;
+
+        // P-75: hoist per-node reductions out of the O(N^2) pair loop and add
+        // a normalized-fingerprint gate. Previously var_j and max|.| were
+        // recomputed for every i, and each pair paid several full n_samples
+        // passes before the cheap correlation decision.
+        std::vector<char> node_usable(n_nodes, 0);
+        std::vector<double> node_mean(n_nodes, 0.0);
+        std::vector<double> node_var(n_nodes, 0.0);
+        std::vector<double> node_maxabs(n_nodes, 0.0);
+        std::vector<Eigen::ArrayXd> node_centered(n_nodes);
+        for (int i = 0; i < n_nodes; ++i) {
+            if (i >= static_cast<int>(ind.output_weights.size())) continue;
+            if (std::abs(ind.output_weights[i]) < 1e-8) continue; // Skip dead
+            if (!cache[i].isFinite().all()) continue;
+            const double mean_i = cache[i].mean();
+            node_usable[i] = 1;
+            node_mean[i] = mean_i;
+            node_var[i] = (cache[i] - mean_i).square().mean();
+            node_maxabs[i] = cache[i].abs().maxCoeff();
+            node_centered[i] = cache[i] - mean_i;
+        }
+
+        // For unit-RMS vectors E[(a-b)^2] = 2(1-corr), so a pair that can pass
+        // corr > 0.9999 is pointwise close almost everywhere. Sampling 16
+        // positions is a conservative prefilter: a missed merge only keeps a
+        // redundant column (the refit absorbs it), never changes predictions.
+        auto fingerprint_may_match = [&](int a, int b) -> bool {
+            const double sa = std::sqrt(std::max(node_var[a], 0.0));
+            const double sb = std::sqrt(std::max(node_var[b], 0.0));
+            if (!(sa > 1e-12) || !(sb > 1e-12)) return true;
+            const Eigen::ArrayXd& va = node_centered[a];
+            const Eigen::ArrayXd& vb = node_centered[b];
+            const int len = static_cast<int>(va.size());
+            if (len <= 0) return true;
+            const int k_samples = std::min(16, len);
+            if (k_samples <= 1) return true;
+            for (int s = 0; s < k_samples; ++s) {
+                const int idx = (s * (len - 1)) / (k_samples - 1);
+                const double d = std::abs(va[idx] / sa - vb[idx] / sb);
+                if (!std::isfinite(d)) return true;
+                if (d > 0.1) return false;
+            }
+            return true;
+        };
         
         for (int i = 0; i < n_nodes; ++i) {
             if (canonical[i] != i) continue; // Already merged
-            if (i >= static_cast<int>(ind.output_weights.size())) continue;
-            if (std::abs(ind.output_weights[i]) < 1e-8) continue; // Skip dead
-            
-            // Skip if output is all zeros or constant NaN
-            if (!cache[i].isFinite().all()) continue;
-            double var_i = (cache[i] - cache[i].mean()).square().mean();
+            if (!node_usable[i]) continue;
+            const double var_i = node_var[i];
             
             for (int j = i + 1; j < n_nodes; ++j) {
                 if (canonical[j] != j) continue;
-                if (j >= static_cast<int>(ind.output_weights.size())) continue;
-                if (std::abs(ind.output_weights[j]) < 1e-8) continue;
-                if (!cache[j].isFinite().all()) continue;
+                if (!node_usable[j]) continue;
                 
                 // Check if outputs are identical (or proportional)
                 // Use normalized correlation: sum((a-mean(a)) * (b-mean(b))) / (std(a)*std(b)*N)
-                double var_j = (cache[j] - cache[j].mean()).square().mean();
+                const double var_j = node_var[j];
                 
                 bool is_duplicate = false;
                 
@@ -3561,19 +3631,20 @@ private:
                     // yet split 1e9 vs 1e9+500 (5e-7 apart). Scale the
                     // tolerance to the constants' magnitude (unit scale
                     // keeps the legacy 1e-6 exactly).
-                    const double mi = cache[i].mean(), mj = cache[j].mean();
+                    const double mi = node_mean[i], mj = node_mean[j];
                     const double cscale =
                         std::max(1.0, std::max(std::abs(mi), std::abs(mj)));
                     is_duplicate = std::abs(mi - mj) < 1e-6 * cscale;
                 } else if (var_i > 1e-12 && var_j > 1e-12) {
+                    if (!fingerprint_may_match(i, j)) continue;
                     // Both non-constant - check correlation AND scale
                     Eigen::ArrayXd diff = cache[i] - cache[j];
                     double max_abs_diff = diff.abs().maxCoeff();
                     // M-253: denominator used only candidate i's magnitude —
                     // a tiny i against a huge j measured j's scale by i's
                     // ruler. Use the pair maximum (symmetric, order-free).
-                    double max_abs_val = std::max(cache[i].abs().maxCoeff(),
-                                                  cache[j].abs().maxCoeff());
+                    double max_abs_val = std::max(node_maxabs[i],
+                                                  node_maxabs[j]);
                     
                     if (max_abs_val > 1e-10) {
                         // Relative error check: are they the same output?
@@ -3589,9 +3660,7 @@ private:
                     // surviving column cannot represent negation without
                     // global refit compensation. Keep both signs distinct.
                     if (!is_duplicate) {
-                        Eigen::ArrayXd a_norm = cache[i] - cache[i].mean();
-                        Eigen::ArrayXd b_norm = cache[j] - cache[j].mean();
-                        double corr = (a_norm * b_norm).mean() /
+                        double corr = (node_centered[i] * node_centered[j]).mean() /
                                      (std::sqrt(var_i * var_j) + 1e-15);
                         is_duplicate = (corr > 0.9999);
                     }

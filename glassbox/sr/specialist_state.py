@@ -405,34 +405,49 @@ class SpecialistVault:
             )
             # S8-1: admission gate — reject bloated / overfit / weak-holdout specialists
             # so vault memory is less easily poisoned by noisy false positives.
+            # §3.206: one fixed 25% holdout gave a high-variance gate that every
+            # candidate shared. Evaluate K disjoint folds and require the mean
+            # holdout R2 (worst-fold gap) to pass, so admission no longer hinges
+            # on a single arbitrary quarter of the rows.
             n_pts = int(y_arr.shape[0])
             n_val = max(4, int(round(0.25 * n_pts)))
             n_val = min(n_val, max(1, n_pts - 8)) if n_pts > 12 else max(1, n_pts // 5)
             if n_pts >= 16 and n_val >= 4:
-                # M-01: Deterministic permuted index holdout (uniform across dataset, stable for fixed n_pts).
                 perm = np.random.RandomState(42).permutation(n_pts)
-                val_idx = perm[:n_val]
-                fit_idx = perm[n_val:]
-                y_val = y_arr[val_idx]
-                p_val = pred[val_idx]
-                y_fit = y_arr[fit_idx]
-                p_fit = pred[fit_idx]
-                # M-233: scale-aware variance floor — a bare 1e-15 floor lets
-                # tiny split variance make hold_r2 hugely negative and gap
-                # >0.5, rejecting otherwise stable formulas. Same idiom as
-                # the win_floor below (1e-6 of full-data variance).
+                n_folds = 3 if n_pts >= 3 * n_val else 1
                 var_floor = max(1e-12, 1e-6 * float(y_var))
-                var_val = max(float(np.var(y_val)), var_floor)
-                var_fit = max(float(np.var(y_fit)), var_floor)
-                hold_mse = float(np.mean((p_val - y_val) ** 2))
-                fit_mse = float(np.mean((p_fit - y_fit) ** 2))
-                hold_r2 = float(1.0 - hold_mse / var_val)
-                fit_r2 = float(1.0 - fit_mse / var_fit)
-                gap = (
-                    float(fit_r2 - hold_r2)
-                    if np.isfinite(fit_r2) and np.isfinite(hold_r2)
-                    else 0.0
-                )
+                fold_r2: list[float] = []
+                fold_gap: list[float] = []
+                for fold_idx in np.array_split(perm, n_folds):
+                    if fold_idx.size < 2:
+                        continue
+                    fit_idx = np.setdiff1d(perm, fold_idx, assume_unique=False)
+                    if fit_idx.size < 2:
+                        continue
+                    y_val = y_arr[fold_idx]
+                    p_val = pred[fold_idx]
+                    y_fit = y_arr[fit_idx]
+                    p_fit = pred[fit_idx]
+                    # M-233: scale-aware variance floor — a bare 1e-15 floor lets
+                    # tiny split variance make hold_r2 hugely negative and gap
+                    # >0.5, rejecting otherwise stable formulas. Same idiom as
+                    # the win_floor below (1e-6 of full-data variance).
+                    var_val = max(float(np.var(y_val)), var_floor)
+                    var_fit = max(float(np.var(y_fit)), var_floor)
+                    hold_mse = float(np.mean((p_val - y_val) ** 2))
+                    fit_mse = float(np.mean((p_fit - y_fit) ** 2))
+                    fr2 = float(1.0 - hold_mse / var_val)
+                    gr2 = float(1.0 - fit_mse / var_fit)
+                    if not np.isfinite(fr2) or not np.isfinite(gr2):
+                        continue
+                    fold_r2.append(fr2)
+                    fold_gap.append(gr2 - fr2)
+                if fold_r2:
+                    hold_r2 = float(np.mean(fold_r2))
+                    gap = float(np.max(fold_gap))
+                else:
+                    hold_r2 = float(r2) if r2 is not None else -1.0
+                    gap = 0.0
             else:
                 hold_r2 = float(r2) if r2 is not None else -1.0
                 gap = 0.0

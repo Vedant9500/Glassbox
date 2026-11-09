@@ -1036,13 +1036,13 @@ static py::dict run_evolution_cpp(
     if (elite_size < 0)
         throw py::value_error("elite_size must be >= 0");
     config.elite_size = std::max(1, elite_size);
-    // §3.250: single shared lower bound 0.1. Was 0.05 here while
-    // EvolutionEngine::max_seed_capacity floors at 0.1, so requests in
-    // [0.05, 0.1) were stored as-is but executed as 0.1 (same effective
-    // budget, confusing provenance). Boundary now matches effective.
+    // §3.250/§3.288: single shared bound [0.1, 0.9] with
+    // EvolutionEngine::effective_seed_fraction(). The old upper bound of 1.0
+    // stored requests the engine then executed at 0.9, so provenance and
+    // effective capacity disagreed.
     if (!std::isfinite(seed_fraction))
         throw py::value_error("seed_fraction must be finite");
-    config.seed_fraction = std::clamp(seed_fraction, 0.1, 1.0);
+    config.seed_fraction = std::clamp(seed_fraction, 0.1, 0.9);
     config.macro_mutation_rate = std::clamp(macro_mutation_rate, 0.0, 0.9);
     config.mutation_rate_structural = std::clamp(mutation_rate_structural, 0.0, 1.0);
     config.mutation_rate_parametric = std::clamp(mutation_rate_parametric, 0.0, 1.0);
@@ -1225,6 +1225,15 @@ static py::dict run_evolution_cpp(
     // M-312: unknown seed keys counted at load (accepted, forward-compat).
     result["seed_unknown_keys"] = seed_unknown_keys_total;
     result["seed_graph_node_limit"] = seed_graph_node_limit;
+    // §3.288/§3.289: requested vs effective seed budget plus actual capacity,
+    // so clamping and the small-pop floor are visible in the result.
+    result["seed_fraction_requested"] = seed_fraction;
+    result["seed_fraction_effective"] = engine.effective_seed_fraction_public();
+    result["seed_capacity"] = engine.max_seed_capacity_public();
+    // §3.291: seeds assigned to each island (empty outside island mode).
+    py::list island_seed_counts_py;
+    for (int n : engine.get_island_seed_counts()) island_seed_counts_py.append(n);
+    result["island_seed_counts"] = island_seed_counts_py;
     result["last_crossover_valid"] = engine.get_last_crossover_valid();
     result["crossover_attempts"] = engine.get_crossover_attempts();
     result["crossover_successes"] = engine.get_crossover_successes();

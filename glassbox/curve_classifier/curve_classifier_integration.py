@@ -13,6 +13,7 @@ Usage:
 
 import os
 import sys
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -508,6 +509,36 @@ _cached_metadata_by_device = {}
 _cached_interpolators_by_signature: dict[tuple, tuple[object | None, object]] = {}
 # S9-3: short-lived curve feature cache (same fit / dual-path re-entry).
 _cached_curve_features: dict[tuple, np.ndarray] = {}
+
+# §3.27 / P-12: caches must be published atomically and stay bounded. The key
+# embeds the checkpoint mtime+size, so a retrained artifact leaves the old
+# entry behind; without a cap a long benchmark process retains every version.
+_CLASSIFIER_CACHE_MAX_ENTRIES = 8
+_classifier_cache_lock = threading.Lock()
+
+
+def _publish_classifier_cache(cache_key, model, operator_classes, metadata) -> None:
+    """Publish model + operator classes + metadata as one consistent unit.
+
+    §3.27: the previous loader wrote operator classes before model construction,
+    so a failed load left a key with classes but no model/metadata. Callers that
+    tolerated the partial state then mixed new classes with an old model.
+    """
+    with _classifier_cache_lock:
+        # Publish the model LAST: the lookup path returns as soon as the model
+        # dict has the key, so classes/metadata must already be visible.
+        _cached_operator_classes_by_key[cache_key] = operator_classes
+        _cached_metadata_by_device[cache_key] = metadata
+        _cached_classifier_by_device[cache_key] = model
+        # P-12: FIFO cap. Insertion order is the load order; oldest artifacts go
+        # first. Never evict the entry we just published. Drop the model first
+        # so a concurrent lookup cannot observe a model without its metadata.
+        while len(_cached_classifier_by_device) > _CLASSIFIER_CACHE_MAX_ENTRIES:
+            oldest = next(iter(_cached_classifier_by_device))
+            _cached_classifier_by_device.pop(oldest, None)
+            _cached_operator_classes_by_key.pop(oldest, None)
+            _cached_metadata_by_device.pop(oldest, None)
+
 _warned_no_cuda = False
 
 
@@ -607,9 +638,10 @@ def clear_classifier_cache() -> None:
     out-of-band checkpoint overwrite without restarting the process.
     """
     global _cached_classifier_by_device, _cached_operator_classes_by_key, _cached_metadata_by_device
-    _cached_classifier_by_device.clear()
-    _cached_operator_classes_by_key.clear()
-    _cached_metadata_by_device.clear()
+    with _classifier_cache_lock:
+        _cached_classifier_by_device.clear()
+        _cached_operator_classes_by_key.clear()
+        _cached_metadata_by_device.clear()
 
 
 def _is_trusted_checkpoint_path(model_path: Path) -> bool:
@@ -839,7 +871,6 @@ def _load_pytorch_classifier(
 
     # Get operator classes
     operator_classes = checkpoint.get("operator_classes", list(OPERATOR_CLASSES.keys()))
-    _cached_operator_classes_by_key[cache_key] = operator_classes
     n_classes = len(operator_classes)
 
     state_dict = checkpoint["model_state_dict"]
@@ -899,18 +930,24 @@ def _load_pytorch_classifier(
     model.to(resolved_device)
     model.eval()
 
-    _cached_classifier_by_device[cache_key] = model
-    _cached_metadata_by_device[cache_key] = {
-        "thresholds": checkpoint.get("thresholds"),
-        "temperature": checkpoint.get("temperature"),
-        "feature_scaler": checkpoint.get("feature_scaler"),
-        "type": "pytorch",
-        "model_type": model_type,
-        "n_features": n_features,
-        "operator_classes": operator_classes,
-        "isotonic_calibration": checkpoint.get("isotonic_calibration"),
-        "architecture_version": metadata_report.get("architecture_version"),
-    }
+    # §3.27: publish model + classes + metadata together, after every
+    # construction/load step succeeded (bounded by the FIFO cap).
+    _publish_classifier_cache(
+        cache_key,
+        model,
+        operator_classes,
+        {
+            "thresholds": checkpoint.get("thresholds"),
+            "temperature": checkpoint.get("temperature"),
+            "feature_scaler": checkpoint.get("feature_scaler"),
+            "type": "pytorch",
+            "model_type": model_type,
+            "n_features": n_features,
+            "operator_classes": operator_classes,
+            "isotonic_calibration": checkpoint.get("isotonic_calibration"),
+            "architecture_version": metadata_report.get("architecture_version"),
+        },
+    )
     print(f"Loaded PyTorch curve classifier from {model_path}")
     if "val_acc" in checkpoint:
         print(f"  Val accuracy: {checkpoint.get('val_acc'):.4f}")

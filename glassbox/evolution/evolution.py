@@ -538,6 +538,12 @@ class StructureConfidenceTracker:
         self.best_mse_seen = float("inf")
         self.generations_stable = 0
         self.last_improvement_gen = 0
+        # §3.91: escape-hatch state. These were previously assigned after an
+        # unconditional return inside calibrate_mse_threshold, so they never
+        # ran; end_refinement_tracking() raised AttributeError whenever it was
+        # called without a preceding start_refinement_tracking().
+        self.refinement_mse_before = None
+        self.refinement_failures = 0
 
     def calibrate_mse_threshold(self, y) -> float:
         """Scale the "good MSE" threshold to target variance (§3.93).
@@ -564,10 +570,6 @@ class StructureConfidenceTracker:
         self.mse_threshold = max(1e-12, 0.01 * max(var, 1e-15))
         self._mse_threshold_calibrated = True
         return self.mse_threshold
-
-        # Escape hatch state
-        self.refinement_mse_before = None
-        self.refinement_failures = 0
 
     def update(
         self,
@@ -2826,21 +2828,38 @@ class EvolutionaryONNTrainer(RiskSeekingEvolutionMixin):
                 new_population.append(elite)
 
             # Fill rest with mutations of top performers
-            while len(new_population) < self.population_size:
-                # Check if RSPG should be used
-                use_rspg = (
-                    self.gradient_monitor is not None
-                    and hasattr(self, "should_use_rspg")
-                    and self.should_use_rspg()
+            # P-9: RSPG activation and the parent pool are constant while the
+            # new population is filled, so compute the percentile-softmax once
+            # instead of once per offspring.
+            use_rspg = (
+                self.gradient_monitor is not None
+                and hasattr(self, "should_use_rspg")
+                and self.should_use_rspg()
+            )
+            rspg_probabilities = None
+            if use_rspg and selection_pool and RSPG_AVAILABLE:
+                rspg_probabilities = compute_selection_probabilities_rspg(
+                    [ind.fitness for ind in selection_pool],
+                    percentile=self.rspg_percentile,
+                    temperature=self.rspg_temperature,
                 )
+                if not rspg_probabilities:
+                    use_rspg = False
 
+            while len(new_population) < self.population_size:
                 if use_rspg:
-                    # Risk-seeking selection: use probabilities that favor top performers
-                    fitnesses = [ind.fitness for ind in selection_pool]
-                    parents = self.select_parents_rspg(
-                        selection_pool, fitnesses, n_parents=1
+                    # Risk-seeking selection: probabilities favor top performers.
+                    # Same one-draw shape as select_parents_rspg(..., n_parents=1),
+                    # so the RNG stream is unchanged.
+                    index = int(
+                        np.random.choice(
+                            len(selection_pool),
+                            size=1,
+                            replace=True,
+                            p=rspg_probabilities,
+                        )[0]
                     )
-                    parent = parents[0]
+                    parent = selection_pool[index]
                 else:
                     # Normal tournament selection
                     candidates = random.sample(
