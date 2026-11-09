@@ -14,6 +14,7 @@ import sys
 import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -2063,6 +2064,42 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     return float(np.sum(ww * resid[idx] ** 2) / total)
         return float(np.mean(resid[idx] ** 2))
 
+    @contextmanager
+    def _fit_deadline(self, fit_start):
+        """Expose the current fit's start time to deep refinement helpers.
+
+        The context is scoped to expensive candidate building, so private
+        helpers called directly outside a fit keep their previous behavior.
+        """
+        previous = getattr(self, "_active_fit_start_", None)
+        self._active_fit_start_ = float(fit_start)
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    delattr(self, "_active_fit_start_")
+                except AttributeError:
+                    pass
+            else:
+                self._active_fit_start_ = previous
+
+    def _fit_budget_remaining(self):
+        """Seconds left in the active fit budget, or None outside a fit."""
+        start = getattr(self, "_active_fit_start_", None)
+        if start is None:
+            return None
+        try:
+            import time as _time
+
+            return float(self.timeout) - (_time.time() - float(start))
+        except Exception:
+            return None
+
+    def _fit_budget_exhausted(self, *, reserve=0.0):
+        remaining = self._fit_budget_remaining()
+        return remaining is not None and remaining <= float(reserve)
+
     def _refine_formula_constants(
         self,
         formula,
@@ -2087,6 +2124,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         structure is already strong.
         """
         if least_squares is None:
+            return None
+        if self._fit_budget_exhausted():
             return None
         text = str(formula or "").strip()
         if not text:
@@ -2228,6 +2267,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         x0 = initial.copy()
 
         for _irls in range(n_irls):
+            if self._fit_budget_exhausted():
+                break
             sw = np.sqrt(np.clip(w_cur, 1e-8, None))
 
             def residuals(params, _sw=sw):
@@ -2264,6 +2305,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     w_cur = w_soft
 
         if best_params is None:
+            if self._fit_budget_exhausted():
+                return None
             # Fallback: single unweighted soft_l1 (legacy path)
             try:
                 result = least_squares(
@@ -3469,6 +3512,8 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             if base0 is not None:
                 candidates_for_skel.append((skeleton, base0, False))
             for start_map in multi_starts:
+                if self._fit_budget_exhausted():
+                    break
                 skel_try = skeleton
                 if start_map is not None:
                     skel_try = self._rewrite_structure_seed_init(skeleton, start_map)
@@ -10427,15 +10472,16 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         candidate_screening = None
         blackbox_state = getattr(self, "blackbox_state_", None)
         if blackbox_state is not None and blackbox_state.enabled:
-            preview_candidates = self._build_blackbox_candidate_formulas(
-                best_formula,
-                best_mse,
-                proposer_payload,
-                blackbox_state,
-                X,
-                y,
-                max_candidates=10,
-            )
+            with self._fit_deadline(fit_start):
+                preview_candidates = self._build_blackbox_candidate_formulas(
+                    best_formula,
+                    best_mse,
+                    proposer_payload,
+                    blackbox_state,
+                    X,
+                    y,
+                    max_candidates=10,
+                )
             if demoted_fast_path_candidate is not None:
                 preview_candidates = self._prune_blackbox_candidate_formulas(
                     [demoted_fast_path_candidate] + list(preview_candidates or []),
@@ -10514,18 +10560,19 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         candidate_formulas = None
         if blackbox_state is not None and blackbox_state.enabled:
-            candidate_formulas = self._build_blackbox_candidate_formulas(
-                best_formula,
-                best_mse,
-                proposer_payload,
-                blackbox_state,
-                X,
-                y,
-                max_candidates=max(
-                    8,
-                    int(blackbox_search_plan.get("seed_budget", 8)),
-                ),
-            )
+            with self._fit_deadline(fit_start):
+                candidate_formulas = self._build_blackbox_candidate_formulas(
+                    best_formula,
+                    best_mse,
+                    proposer_payload,
+                    blackbox_state,
+                    X,
+                    y,
+                    max_candidates=max(
+                        8,
+                        int(blackbox_search_plan.get("seed_budget", 8)),
+                    ),
+                )
             if demoted_fast_path_candidate is not None:
                 candidate_formulas = self._prune_blackbox_candidate_formulas(
                     [demoted_fast_path_candidate] + list(candidate_formulas or []),
@@ -10655,19 +10702,20 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             and getattr(self, "enable_specialist_screening_diagnostics", True)
             and self.n_features_in_ == 1
         ):
-            univariate_candidate_formulas = (
-                self._build_univariate_specialist_candidate_formulas(
-                    best_formula,
-                    best_mse,
-                    proposer_payload,
-                    X,
-                    y,
-                    max_candidates=max(
-                        8,
-                        int(blackbox_search_plan.get("seed_budget", 8)),
-                    ),
+            with self._fit_deadline(fit_start):
+                univariate_candidate_formulas = (
+                    self._build_univariate_specialist_candidate_formulas(
+                        best_formula,
+                        best_mse,
+                        proposer_payload,
+                        X,
+                        y,
+                        max_candidates=max(
+                            8,
+                            int(blackbox_search_plan.get("seed_budget", 8)),
+                        ),
+                    )
                 )
-            )
             had_composed_seeds = bool(self.has_composed_seeds_)
             screened_univariate_candidates = self._run_specialist_candidate_screening(
                 univariate_candidate_formulas,

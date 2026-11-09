@@ -1,6 +1,7 @@
 """Tier B performance fixes: refine skip, ranking cost, screening caps, dual-path skip."""
 
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +47,30 @@ def test_s3_6_refine_still_runs_when_constants_off():
     # May return refined or None if LS fails; must not claim already_near_exact.
     if out is not None:
         assert out.get("refine_skipped") != "already_near_exact"
+
+
+def test_refine_constants_honors_active_fit_deadline():
+    est = GlassboxRegressor(random_state=0, timeout=5)
+    est.n_features_in_ = 1
+    x = np.linspace(-1.0, 1.0, 40)
+    X = x.reshape(-1, 1)
+    y = 2.0 * x + 1.0
+    args = ("1.2*x0+0.1", X[:30], y[:30], X[30:], y[30:])
+
+    # Candidate building must stop spending time on least squares once the
+    # enclosing fit's wall-clock budget is gone.
+    with est._fit_deadline(time.time() - 10.0):
+        assert est._fit_budget_exhausted() is True
+        assert (
+            est._refine_formula_constants(*args, robust=False, irls_iters=1)
+            is None
+        )
+
+    # The deadline is scoped: direct refinement outside a fit still works.
+    assert est._fit_budget_exhausted() is False
+    out = est._refine_formula_constants(*args, robust=False, irls_iters=1)
+    assert out is not None
+    assert out.get("constant_refined") is True
 
 
 def test_s7_3_ranking_subsample_caps_rows():
