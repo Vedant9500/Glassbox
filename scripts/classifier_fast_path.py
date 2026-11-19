@@ -2296,6 +2296,28 @@ def find_exact_symbolic_match(
             }
         )
 
+    # P-55/P-56 shared Gram/cross-product layout. For a support S the
+    # least-squares coefficients and residual sum of squares are
+    #   w = G[S,S]^-1 c[S],   SSE = yTy - 2 w.c + w'G w
+    # with G = basis^T basis, c = basis^T y. The torch path uses it on-device
+    # (chunked r x r systems instead of N x C x r lstsq) and the CPU fallback
+    # uses it in the exhaustive scan. Built in float64 on the host — once per
+    # call, O(N * n_basis^2) — because normal equations square the design's
+    # conditioning and float32 Gram entries would re-introduce the
+    # near-threshold drift the M-186 float64 validator exists to catch.
+    _gram_state: dict[str, np.ndarray] | None = None
+
+    def gram_state() -> dict[str, np.ndarray]:
+        nonlocal _gram_state
+        if _gram_state is None:
+            g = basis.T @ basis
+            _gram_state = {
+                "G": g,
+                "c": basis.T @ y,
+                "yty": float(y @ y),
+            }
+        return _gram_state
+
     # Optional PyTorch acceleration for pairs and triples
     selected_device, torch_diagnostics = _select_exact_match_torch_device(
         exact_match_backend,
@@ -2307,27 +2329,36 @@ def find_exact_symbolic_match(
 
     if selected_device is not None and max_terms >= 2:
         try:
-            # M-186: float64 on CPU torch so near-threshold candidates agree
-            # with the float64 NumPy validators; float32 kept on CUDA for
-            # throughput (results are always CPU-validated before accept).
-            _torch_dtype = (
-                torch.float64
-                if selected_device.type == "cpu"
-                else torch.float32
-            )
-            basis_t = torch.as_tensor(
-                np.ascontiguousarray(basis),
-                dtype=_torch_dtype,
+            # P-55: exhaustive combination search from the block Gram layout.
+            # For a support S the fit and residual sum of squares are
+            #   G[S,S]^-1 c[S]   and   yTy - 2 w.c + w'G w,
+            # so the N x chunk x r gather and the batched full-length lstsq
+            # disappear; each chunk only carries r x r systems. Math stays
+            # float64 (M-186): the reduced flop count makes the precision cost
+            # negligible, and the accepted candidate is re-validated against
+            # the real design below, so a near-singular solve only costs a
+            # retry — never a false accept.
+            _gram = gram_state()
+            G_t = torch.as_tensor(
+                np.ascontiguousarray(_gram["G"]),
+                dtype=torch.float64,
                 device=selected_device,
             )
-            y_t = torch.as_tensor(
-                np.ascontiguousarray(y), dtype=_torch_dtype, device=selected_device
+            c_t = torch.as_tensor(
+                np.ascontiguousarray(_gram["c"]),
+                dtype=torch.float64,
+                device=selected_device,
             ).unsqueeze(1)
-            N = basis_t.shape[0]
+            yty_t = torch.tensor(
+                float(_gram["yty"]), dtype=torch.float64, device=selected_device
+            )
+            N = int(len(y))
 
             def fast_torch_search(r: int):
                 idx_cpu = torch.combinations(torch.arange(n_basis, device="cpu"), r=r)
                 idx_len = int(idx_cpu.shape[0])
+                if idx_len == 0:
+                    return None
                 n_combos = idx_len
                 chunk_size = 50000
                 # §3.149: scan all chunks for the global best below tolerance
@@ -2336,15 +2367,22 @@ def find_exact_symbolic_match(
                 best_overall: tuple[list[int], np.ndarray, float] | None = None
                 for start in range(0, n_combos, chunk_size):
                     end = min(start + chunk_size, n_combos)
-                    chunk_idx = idx_cpu[start:end].to(selected_device)
+                    chunk_idx = idx_cpu[start:end].to(selected_device)  # C x r
 
-                    X = basis_t[:, chunk_idx]  # N x C x r
-                    X = X.permute(1, 0, 2)  # C x N x r
-                    y_batch = y_t.expand(end - start, N, 1)
-
-                    sol = torch.linalg.lstsq(X, y_batch).solution  # C x r x 1
-                    pred = torch.bmm(X, sol)  # C x N x 1
-                    mse = torch.mean((y_batch - pred) ** 2, dim=1).squeeze(-1)  # C
+                    # C x r x r  and  C x r x 1
+                    G_sub = G_t[
+                        chunk_idx.unsqueeze(2), chunk_idx.unsqueeze(1)
+                    ]
+                    c_sub = c_t[chunk_idx]
+                    sol = torch.linalg.lstsq(G_sub, c_sub).solution  # C x r x 1
+                    w = sol.squeeze(-1)                              # C x r
+                    Gw = torch.bmm(G_sub, sol).squeeze(-1)           # C x r
+                    sse = (
+                        yty_t
+                        - 2.0 * torch.sum(w * c_sub.squeeze(-1), dim=1)
+                        + torch.sum(w * Gw, dim=1)
+                    )
+                    mse = torch.clamp(sse, min=0.0) / N
 
                     best_mse, best_idx = torch.min(mse, dim=0)
 
@@ -2417,52 +2455,130 @@ def find_exact_symbolic_match(
         size = max(1, math.ceil(n / chunks))
         return [(i, min(i + size, n)) for i in range(0, n, size)]
 
+    # P-56: same Gram layout for the exhaustive CPU scan (shared state above;
+    # built lazily here in case the torch path already matched). The
+    # per-combination N-row lstsq plus prediction sweep collapses to a
+    # 2x2/3x3 solve and a handful of dot products. The accepted candidate is
+    # still refit with the real design before being returned, so the reported
+    # coefficients/mse stay exactly the lstsq values callers validated before.
+    def gram_batch_fit(
+        st: dict[str, np.ndarray], idx: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Batched (coeffs, mse) for support-index rows ``idx`` (C x r)."""
+        g = st["G"]
+        cvec = st["c"]
+        yty = float(st["yty"])
+        r = int(idx.shape[1])
+        a = g[idx[:, :, None], idx[:, None, :]]
+        b = cvec[idx]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            if r == 2:
+                a00, a01 = a[:, 0, 0], a[:, 0, 1]
+                a10, a11 = a[:, 1, 0], a[:, 1, 1]
+                det = a00 * a11 - a01 * a10
+                scale = np.abs(a00 * a11)
+                b0, b1 = b[:, 0], b[:, 1]
+                ok = np.abs(det) > 1e-12 * np.maximum(scale, 1e-300)
+                det_safe = np.where(ok, det, 1.0)
+                w = np.stack(
+                    [
+                        (b0 * a11 - b1 * a01) / det_safe,
+                        (a00 * b1 - a10 * b0) / det_safe,
+                    ],
+                    axis=1,
+                )
+            elif r == 3:
+                a00, a01, a02 = a[:, 0, 0], a[:, 0, 1], a[:, 0, 2]
+                a10, a11, a12 = a[:, 1, 0], a[:, 1, 1], a[:, 1, 2]
+                a20, a21, a22 = a[:, 2, 0], a[:, 2, 1], a[:, 2, 2]
+                m00 = a11 * a22 - a12 * a21
+                m01 = a02 * a21 - a01 * a22
+                m02 = a01 * a12 - a02 * a11
+                m10 = a12 * a20 - a10 * a22
+                m11 = a00 * a22 - a02 * a20
+                m12 = a02 * a10 - a00 * a12
+                m20 = a10 * a21 - a11 * a20
+                m21 = a01 * a20 - a00 * a21
+                m22 = a00 * a11 - a01 * a10
+                det = a00 * m00 + a01 * m10 + a02 * m20
+                scale = np.abs(a00 * a11 * a22)
+                ok = np.abs(det) > 1e-12 * np.maximum(scale, 1e-300)
+                det_safe = np.where(ok, det, 1.0)
+                b0, b1, b2 = b[:, 0], b[:, 1], b[:, 2]
+                w = np.stack(
+                    [
+                        (m00 * b0 + m10 * b1 + m20 * b2) / det_safe,
+                        (m01 * b0 + m11 * b1 + m21 * b2) / det_safe,
+                        (m02 * b0 + m12 * b1 + m22 * b2) / det_safe,
+                    ],
+                    axis=1,
+                )
+            else:  # pragma: no cover - pairs/triples are the only callers
+                w = np.full(idx.shape, np.nan)
+                ok = np.zeros(idx.shape[0], dtype=bool)
+            w[~ok] = np.nan
+            sse = (
+                yty
+                - 2.0 * np.sum(w * b, axis=1)
+                + np.einsum("ci,ci->c", w, np.einsum("cij,cj->ci", a, w))
+            )
+        sse = np.where(np.isfinite(sse), np.maximum(sse, 0.0), np.inf)
+        mse = sse / float(len(y))
+        mse[~ok] = np.inf
+        return w, mse
+
+    def exact_support_fit(support: tuple[int, ...]):
+        """Refit one accepted support with the real design (the old path)."""
+        X = basis[:, list(support)]
+        try:
+            coeffs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        except (np.linalg.LinAlgError, ValueError):
+            return None
+        coeffs = np.asarray(coeffs, dtype=np.float64)
+        if not np.all(np.isfinite(coeffs)):
+            return None
+        y_pred = X @ coeffs
+        mse_val = float(np.mean((y - y_pred) ** 2))
+        if not (mse_val < tolerance and np.isfinite(mse_val)):
+            return None
+        formula, full_coeffs = build_formula(list(support), coeffs)
+        return formula, mse_val, full_coeffs
+
     def search_pairs_range(start_i: int, end_i: int, stop_event: threading.Event):
+        st = gram_state()
         for i in range(start_i, end_i):
             if stop_event.is_set():
                 return None
-            for j in range(i + 1, n_basis):
-                X = basis[:, [i, j]]
-                try:
-                    coeffs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
-                    y_pred = X @ coeffs
-                    mse = np.mean((y - y_pred) ** 2)
-                    # M-185: explicit finite gates (beam path precedent
-                    # §3.150) — NaN MSE already fails `<`, but pin it.
-                    if (
-                        mse < tolerance
-                        and np.isfinite(mse)
-                        and np.all(np.isfinite(coeffs))
-                    ):
-                        formula, full_coeffs = build_formula([i, j], coeffs)
-                        stop_event.set()
-                        return formula, mse, full_coeffs
-                except (np.linalg.LinAlgError, ValueError):
-                    pass
+            js = np.arange(i + 1, n_basis)
+            if js.size == 0:
+                continue
+            idx = np.stack([np.full(js.shape, i, dtype=np.intp), js.astype(np.intp)], axis=1)
+            _coeffs, mse = gram_batch_fit(st, idx)
+            for h in np.nonzero(mse < tolerance)[0]:
+                result = exact_support_fit((i, int(js[h])))
+                if result is not None:
+                    stop_event.set()
+                    return result
         return None
 
     def search_triples_range(start_i: int, end_i: int, stop_event: threading.Event):
+        st = gram_state()
         for i in range(start_i, end_i):
             if stop_event.is_set():
                 return None
-            for j in range(i + 1, n_basis):
-                for k in range(j + 1, n_basis):
-                    X = basis[:, [i, j, k]]
-                    try:
-                        coeffs, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
-                        y_pred = X @ coeffs
-                        mse = np.mean((y - y_pred) ** 2)
-                        # M-185: same explicit finite gates as pairs.
-                        if (
-                            mse < tolerance
-                            and np.isfinite(mse)
-                            and np.all(np.isfinite(coeffs))
-                        ):
-                            formula, full_coeffs = build_formula([i, j, k], coeffs)
-                            stop_event.set()
-                            return formula, mse, full_coeffs
-                    except (np.linalg.LinAlgError, ValueError):
-                        pass
+            sub = np.arange(i + 1, n_basis, dtype=np.intp)
+            if sub.size < 2:
+                continue
+            jl, kl = np.triu_indices(sub.size, k=1)
+            j = sub[jl]
+            k = sub[kl]
+            idx = np.stack([np.full(j.shape, i, dtype=np.intp), j, k], axis=1)
+            _coeffs, mse = gram_batch_fit(st, idx)
+            for h in np.nonzero(mse < tolerance)[0]:
+                result = exact_support_fit((i, int(j[h]), int(k[h])))
+                if result is not None:
+                    stop_event.set()
+                    return result
         return None
 
     # Try pairs of basis functions (including constant)

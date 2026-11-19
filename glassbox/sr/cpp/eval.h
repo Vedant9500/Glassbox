@@ -139,6 +139,15 @@ inline std::array<double, 4> arithmetic_soft_weights(const OpNode& node) {
 // blend (§3.336), so print and fold can never disagree.
 constexpr double kArithmeticNearDiscrete = 0.99;
 
+// P-94: settled-gate short circuit. The soft Arithmetic node evaluates four
+// branches and blends them; when one weight is 1 to within double rounding the
+// blend is that branch, so three extra array expressions (including the soft
+// division sqrt) are pure overhead. This threshold is far below any gate the
+// search can express (weights are softmax-normalized, and even a single
+// 1e-12 residual weight is unlearnable), so evaluated values are unchanged for
+// every reachable gate; only the wasted branch evaluations disappear.
+constexpr double kArithmeticDominantWeight = 1.0 - 1e-12;
+
 // M-300: gate-mode diagnostics — the same (beta, gamma) gate evaluates as a
 // different effective operation at different temperatures. Report weights,
 // dominant op, and the effective temperature together so consumers never
@@ -348,6 +357,31 @@ inline Eigen::ArrayXd evaluate_graph_impl(
                 switch (node.binary_op) {
                     case BinaryOp::Arithmetic: {
                         auto w = arithmetic_soft_weights(node);
+                        // P-94: a settled gate (one weight ~1) is evaluated by
+                        // its dominant branch only. Branch order matches
+                        // arithmetic_soft_weights / arithmetic_gate_info:
+                        // 0=add 1=mul 2=div 3=sub.
+                        int dom = 0;
+                        double dom_w = w[0];
+                        for (int k = 1; k < 4; ++k) {
+                            if (w[static_cast<size_t>(k)] > dom_w) {
+                                dom_w = w[static_cast<size_t>(k)];
+                                dom = k;
+                            }
+                        }
+                        if (dom_w >= kArithmeticDominantWeight) {
+                            Eigen::ArrayXd res;
+                            switch (dom) {
+                                case 0: res = x + y; break;
+                                case 1: res = x * y; break;
+                                // Soft division: x / sqrt(1 + y^2) (protected;
+                                // matches display S5-4).
+                                case 2: res = x / (1.0 + y.square()).sqrt(); break;
+                                default: res = x - y; break;
+                            }
+                            val = res.max(-1e6).min(1e6);
+                            break;
+                        }
                         auto res_add = x + y;
                         auto res_sub = x - y;
                         auto res_mul = x * y;

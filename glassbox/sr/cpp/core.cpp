@@ -12,6 +12,8 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <omp.h>
@@ -24,89 +26,192 @@
 namespace py = pybind11;
 
 
+namespace {
+
+struct ExactEvalFrame {
+    const sr::ParseNode* node;
+    bool expanded;
+};
+
+}  // namespace
+
+// P-90 / §3.406: exact evaluator workspace. The old recursive form allocated a
+// fresh Eigen array for every parse node on every call (and re-evaluated shared
+// DAG nodes once per parent). This iterative post-order walk keeps one array
+// per unique node in a thread-local arena, so repeated scoring reuses buffers
+// instead of paying O(nodes x samples) allocation traffic per formula.
 static Eigen::ArrayXd evaluate_parse_node_exact(
-    const std::shared_ptr<sr::ParseNode>& node,
+    const std::shared_ptr<sr::ParseNode>& root,
     const std::vector<Eigen::ArrayXd>& X,
     int num_samples
 ) {
-    if (!node) return Eigen::ArrayXd::Zero(num_samples);
-    switch (node->type) {
-        case sr::ParseNodeType::Input:
-            if (node->feature_idx >= 0 && node->feature_idx < static_cast<int>(X.size())) {
-                return X[node->feature_idx];
-            }
-            throw std::runtime_error("feature_index_out_of_range");
-        case sr::ParseNodeType::Constant:
-            return Eigen::ArrayXd::Constant(num_samples, node->value);
-        case sr::ParseNodeType::Add:
-            return evaluate_parse_node_exact(node->left, X, num_samples) + evaluate_parse_node_exact(node->right, X, num_samples);
-        case sr::ParseNodeType::Sub:
-            return evaluate_parse_node_exact(node->left, X, num_samples) - evaluate_parse_node_exact(node->right, X, num_samples);
-        case sr::ParseNodeType::Mul:
-            return evaluate_parse_node_exact(node->left, X, num_samples) * evaluate_parse_node_exact(node->right, X, num_samples);
-        case sr::ParseNodeType::Div: {
-            // S5-10: protected division (match graph Division spirit).
-            // Bare left/right produced Inf/NaN near zeros and desynced ranking
-            // from soft search eval. Keep a small eps so normal denominators stay exact.
-            Eigen::ArrayXd left = evaluate_parse_node_exact(node->left, X, num_samples);
-            Eigen::ArrayXd right = evaluate_parse_node_exact(node->right, X, num_samples);
-            constexpr double kDivEps = 1e-12;
-            return left * right.sign() / (right.abs() + kDivEps);
+    if (!root) return Eigen::ArrayXd::Zero(num_samples);
+
+    thread_local std::vector<Eigen::ArrayXd> arena;
+    thread_local std::vector<const sr::ParseNode*> postorder;
+    thread_local std::vector<ExactEvalFrame> stack;
+    thread_local std::unordered_set<const sr::ParseNode*> scheduled;
+    thread_local std::unordered_map<const sr::ParseNode*, int> slot_of;
+
+    postorder.clear();
+    stack.clear();
+    scheduled.clear();
+    slot_of.clear();
+
+    // Build a post-order list of unique nodes (children always precede their
+    // parent). Right is pushed first so the left subtree is emitted first,
+    // matching the previous recursion order for path-dependent side effects
+    // (there are none today, but the order is part of the observable parse).
+    stack.push_back({root.get(), false});
+    while (!stack.empty()) {
+        ExactEvalFrame frame = stack.back();
+        if (frame.node == nullptr) {
+            stack.pop_back();
+            continue;
         }
-        case sr::ParseNodeType::Pow: {
-            // §3.1 note: exact/diagnostic path. Integer branch tol 1e-10 +
-            // eps 1e-300 intentionally differs from search-path canonical
-            // contract (eval.h parity tol 1e-9, eps 1e-10). Prefer graph
-            // scorer for ranking; this path remains for display/exact
-            // diagnostics. Do not "fix" by copying graph formula here —
-            // change the shared contract, not local copies.
-            Eigen::ArrayXd base = evaluate_parse_node_exact(node->left, X, num_samples);
-            Eigen::ArrayXd exp_arr = evaluate_parse_node_exact(node->right, X, num_samples);
-            Eigen::ArrayXd out(num_samples);
-            bool constant_exp = exp_arr.size() == num_samples && (exp_arr - exp_arr(0)).abs().maxCoeff() < 1e-12;
-            if (constant_exp) {
-                double p = exp_arr(0);
-                double p_round = std::round(p);
-                if (std::abs(p - p_round) < 1e-10) {
-                    out = base.pow(static_cast<int>(p_round));
-                } else {
-                    // Non-integer constant power: abs-base to stay real-valued (S5-10 domain).
-                    out = base.sign() * (base.abs() + 1e-300).pow(p);
-                }
-            } else {
-                // Variable exponent: protected real power (sign * |base|^exp).
-                for (int i = 0; i < num_samples; ++i) {
-                    double b = base(i);
-                    double p = exp_arr(i);
-                    if (!std::isfinite(b) || !std::isfinite(p)) {
-                        out(i) = std::numeric_limits<double>::quiet_NaN();
-                        continue;
-                    }
-                    out(i) = std::copysign(std::pow(std::abs(b) + 1e-300, p), b);
-                }
+        if (!frame.expanded) {
+            if (!scheduled.insert(frame.node).second) {
+                stack.pop_back();  // shared subexpression already scheduled
+                continue;
             }
-            return out;
+            stack.back().expanded = true;
+            if (frame.node->right) stack.push_back({frame.node->right.get(), false});
+            if (frame.node->left) stack.push_back({frame.node->left.get(), false});
+        } else {
+            postorder.push_back(frame.node);
+            stack.pop_back();
         }
-        case sr::ParseNodeType::Sin:
-            return evaluate_parse_node_exact(node->left, X, num_samples).sin();
-        case sr::ParseNodeType::Cos:
-            return evaluate_parse_node_exact(node->left, X, num_samples).cos();
-        case sr::ParseNodeType::Exp:
-            // S5-10 dual-domain note: exact path clamps the *argument* to +/-500;
-            // graph eval clamps the *output* of exp to +/-1e6. Prefer graph scorer
-            // for ranking (S5-2); this path remains for display/exact diagnostics.
-            return evaluate_parse_node_exact(node->left, X, num_samples).min(500.0).max(-500.0).exp();
-        case sr::ParseNodeType::Log:
-            return (evaluate_parse_node_exact(node->left, X, num_samples).abs() + 1e-300).log();
-        case sr::ParseNodeType::Abs:
-            return evaluate_parse_node_exact(node->left, X, num_samples).abs();
-        case sr::ParseNodeType::Sqrt:
-            return evaluate_parse_node_exact(node->left, X, num_samples).max(0.0).sqrt();
-        case sr::ParseNodeType::Sign:
-            // §3.367: exact sign of the evaluated argument.
-            return evaluate_parse_node_exact(node->left, X, num_samples).sign();
     }
-    return Eigen::ArrayXd::Zero(num_samples);
+
+    int slot = 0;
+    for (const sr::ParseNode* p : postorder) {
+        const sr::ParseNode& node = *p;
+        if (slot >= static_cast<int>(arena.size())) arena.emplace_back();
+        Eigen::ArrayXd& out = arena[static_cast<size_t>(slot)];
+
+        auto child_ptr = [&](const std::shared_ptr<sr::ParseNode>& c) -> const Eigen::ArrayXd* {
+            if (!c) return nullptr;
+            auto it = slot_of.find(c.get());
+            return (it == slot_of.end()) ? nullptr : &arena[static_cast<size_t>(it->second)];
+        };
+        const Eigen::ArrayXd* left_ptr = child_ptr(node.left);
+        const Eigen::ArrayXd* right_ptr = child_ptr(node.right);
+        Eigen::ArrayXd zero_child;
+        auto child = [&](const Eigen::ArrayXd* c) -> const Eigen::ArrayXd& {
+            if (c) return *c;
+            if (zero_child.size() != num_samples) {
+                zero_child = Eigen::ArrayXd::Zero(num_samples);
+            }
+            return zero_child;
+        };
+
+        switch (node.type) {
+            case sr::ParseNodeType::Input:
+                if (node.feature_idx >= 0 && node.feature_idx < static_cast<int>(X.size())) {
+                    out = X[node.feature_idx];
+                } else {
+                    throw std::runtime_error("feature_index_out_of_range");
+                }
+                break;
+            case sr::ParseNodeType::Constant:
+                out = Eigen::ArrayXd::Constant(num_samples, node.value);
+                break;
+            case sr::ParseNodeType::Add:
+                out = child(left_ptr) + child(right_ptr);
+                break;
+            case sr::ParseNodeType::Sub:
+                out = child(left_ptr) - child(right_ptr);
+                break;
+            case sr::ParseNodeType::Mul:
+                out = child(left_ptr) * child(right_ptr);
+                break;
+            case sr::ParseNodeType::Div: {
+                // S5-10: protected division (match graph Division spirit).
+                // Bare left/right produced Inf/NaN near zeros and desynced
+                // ranking from soft search eval. Keep a small eps so normal
+                // denominators stay exact.
+                const Eigen::ArrayXd& l = child(left_ptr);
+                const Eigen::ArrayXd& r = child(right_ptr);
+                constexpr double kDivEps = 1e-12;
+                out = l * r.sign() / (r.abs() + kDivEps);
+                break;
+            }
+            case sr::ParseNodeType::Pow: {
+                // §3.1 note: exact/diagnostic path. Integer branch tol 1e-10 +
+                // eps 1e-300 intentionally differs from search-path canonical
+                // contract (eval.h parity tol 1e-9, eps 1e-10). Prefer graph
+                // scorer for ranking; this path remains for display/exact
+                // diagnostics. Do not "fix" by copying graph formula here —
+                // change the shared contract, not local copies.
+                const Eigen::ArrayXd& base = child(left_ptr);
+                const Eigen::ArrayXd& exp_arr = child(right_ptr);
+                bool constant_exp = num_samples > 0 && exp_arr.size() == num_samples
+                    && (exp_arr - exp_arr(0)).abs().maxCoeff() < 1e-12;
+                if (constant_exp) {
+                    double p = exp_arr(0);
+                    double p_round = std::round(p);
+                    if (std::abs(p - p_round) < 1e-10) {
+                        out = base.pow(static_cast<int>(p_round));
+                    } else {
+                        // Non-integer constant power: abs-base to stay
+                        // real-valued (S5-10 domain).
+                        out = base.sign() * (base.abs() + 1e-300).pow(p);
+                    }
+                } else {
+                    // Variable exponent: protected real power
+                    // (sign * |base|^exp).
+                    out.resize(num_samples);
+                    for (int i = 0; i < num_samples; ++i) {
+                        double b = base(i);
+                        double p = exp_arr(i);
+                        if (!std::isfinite(b) || !std::isfinite(p)) {
+                            out(i) = std::numeric_limits<double>::quiet_NaN();
+                            continue;
+                        }
+                        out(i) = std::copysign(std::pow(std::abs(b) + 1e-300, p), b);
+                    }
+                }
+                break;
+            }
+            case sr::ParseNodeType::Sin:
+                out = child(left_ptr).sin();
+                break;
+            case sr::ParseNodeType::Cos:
+                out = child(left_ptr).cos();
+                break;
+            case sr::ParseNodeType::Exp:
+                // S5-10 dual-domain note: exact path clamps the *argument* to
+                // +/-500; graph eval clamps the *output* of exp to +/-1e6.
+                // Prefer graph scorer for ranking (S5-2); this path remains
+                // for display/exact diagnostics.
+                out = child(left_ptr).min(500.0).max(-500.0).exp();
+                break;
+            case sr::ParseNodeType::Log:
+                out = (child(left_ptr).abs() + 1e-300).log();
+                break;
+            case sr::ParseNodeType::Abs:
+                out = child(left_ptr).abs();
+                break;
+            case sr::ParseNodeType::Sqrt:
+                out = child(left_ptr).max(0.0).sqrt();
+                break;
+            case sr::ParseNodeType::Sign:
+                // §3.367: exact sign of the evaluated argument.
+                out = child(left_ptr).sign();
+                break;
+        }
+
+        slot_of.emplace(p, slot);
+        ++slot;
+    }
+
+    Eigen::ArrayXd result = arena[static_cast<size_t>(slot_of.at(root.get()))];
+    // Bound workspace retention: keep buffers around the last formula's size,
+    // release slots a single large formula left behind.
+    if (static_cast<int>(arena.size()) > 128 && static_cast<int>(arena.size()) > 2 * slot) {
+        arena.resize(static_cast<size_t>(slot));
+    }
+    return result;
 }
 
 static std::shared_ptr<sr::ParseNode> parse_formula_exact(const std::string& formula) {
@@ -1379,9 +1484,14 @@ static py::tuple refine_frequencies_wrapper(
     auto x_arr_c = ensure_f64_c(x_arr);
     auto y_arr_c = ensure_f64_c(y_arr);
     auto x_buf = x_arr_c.request();
-    Eigen::Map<Eigen::VectorXd> x(static_cast<double*>(x_buf.ptr), x_buf.size);
     auto y_buf = y_arr_c.request();
-    Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
+    // P-89: own the refinement inputs before dropping the GIL. Mapping the
+    // NumPy buffers directly (the previous form) is only safe while the GIL is
+    // held — another Python thread could resize or free the arrays mid-solve.
+    const Eigen::VectorXd x = Eigen::Map<const Eigen::VectorXd>(
+        static_cast<const double*>(x_buf.ptr), x_buf.size).eval();
+    const Eigen::VectorXd y = Eigen::Map<const Eigen::VectorXd>(
+        static_cast<const double*>(y_buf.ptr), y_buf.size).eval();
     Eigen::VectorXd sw = load_optional_vector_weights(
         sample_weight, static_cast<int>(y_buf.size), "sample_weight"
     );
@@ -1389,7 +1499,11 @@ static py::tuple refine_frequencies_wrapper(
     std::vector<double> omegas;
     for (auto item : initial_omegas) omegas.push_back(item.cast<double>());
 
-    auto res = sr::refine_frequencies_cpp(x, y, omegas, steps, lr, sw);
+    sr::FreqResult res;
+    {
+        py::gil_scoped_release release;
+        res = sr::refine_frequencies_cpp(x, y, omegas, steps, lr, sw);
+    }
     
     py::list omegas_out;
     for (double w : res.omegas) omegas_out.append(w);
@@ -1412,9 +1526,12 @@ static py::tuple refine_powers_model_wrapper(
     auto x_arr_c = ensure_f64_c(x_arr);
     auto y_arr_c = ensure_f64_c(y_arr);
     auto x_buf = x_arr_c.request();
-    Eigen::Map<Eigen::VectorXd> x(static_cast<double*>(x_buf.ptr), x_buf.size);
     auto y_buf = y_arr_c.request();
-    Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
+    // P-89: owned inputs — the GIL is released around the solver below.
+    const Eigen::VectorXd x = Eigen::Map<const Eigen::VectorXd>(
+        static_cast<const double*>(x_buf.ptr), x_buf.size).eval();
+    const Eigen::VectorXd y = Eigen::Map<const Eigen::VectorXd>(
+        static_cast<const double*>(y_buf.ptr), y_buf.size).eval();
     Eigen::VectorXd sw = load_optional_vector_weights(
         sample_weight, static_cast<int>(y_buf.size), "sample_weight"
     );
@@ -1426,7 +1543,11 @@ static py::tuple refine_powers_model_wrapper(
     // §3.332: domain bounds validated here (refine.h falls back to [-2, 5]).
     if (!std::isfinite(p_min) || !std::isfinite(p_max) || !(p_min < p_max))
         throw py::value_error("refine_powers p_min/p_max must be finite with p_min < p_max");
-    auto res = sr::refine_powers_model_cpp(x, y, powers, omegas, steps, lr, sw, p_min, p_max);
+    sr::PowerResult res;
+    {
+        py::gil_scoped_release release;
+        res = sr::refine_powers_model_cpp(x, y, powers, omegas, steps, lr, sw, p_min, p_max);
+    }
     
     py::dict out;
     out["mse"] = res.mse;
@@ -1458,14 +1579,21 @@ static py::dict refine_periodic_rational_wrapper(
     auto x_arr_c = ensure_f64_c(x_arr);
     auto y_arr_c = ensure_f64_c(y_arr);
     auto x_buf = x_arr_c.request();
-    Eigen::Map<Eigen::VectorXd> x(static_cast<double*>(x_buf.ptr), x_buf.size);
     auto y_buf = y_arr_c.request();
-    Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
+    // P-89: owned inputs — the GIL is released around the solver below.
+    const Eigen::VectorXd x = Eigen::Map<const Eigen::VectorXd>(
+        static_cast<const double*>(x_buf.ptr), x_buf.size).eval();
+    const Eigen::VectorXd y = Eigen::Map<const Eigen::VectorXd>(
+        static_cast<const double*>(y_buf.ptr), y_buf.size).eval();
     Eigen::VectorXd sw = load_optional_vector_weights(
         sample_weight, static_cast<int>(y_buf.size), "sample_weight"
     );
 
-    auto res = sr::refine_periodic_rational_cpp(x, y, omega0, c0, steps, lr, sw);
+    sr::PeriodicRationalResult res;
+    {
+        py::gil_scoped_release release;
+        res = sr::refine_periodic_rational_cpp(x, y, omega0, c0, steps, lr, sw);
+    }
     
     py::dict out;
     out["omega"] = res.omega;
@@ -1532,9 +1660,13 @@ static py::object iterative_elastic_net_wrapper(py::array_t<double> X_arr, py::a
     int n = X_buf.shape[0];
     int p = X_buf.shape[1];
     
-    Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> X(
-        static_cast<double*>(X_buf.ptr), n, p);
-    Eigen::Map<Eigen::VectorXd> y(static_cast<double*>(y_buf.ptr), y_buf.size);
+    // P-89: own X/y before releasing the GIL. The mapped views above alias
+    // caller memory; the solve below can run for many milliseconds.
+    const Eigen::MatrixXd X_owned = Eigen::Map<
+        const Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(
+            static_cast<const double*>(X_buf.ptr), n, p);
+    const Eigen::VectorXd y_owned = Eigen::Map<const Eigen::VectorXd>(
+        static_cast<const double*>(y_buf.ptr), y_buf.size).eval();
 
     Eigen::VectorXd sw;
     if (!sample_weight.is_none()) {
@@ -1555,7 +1687,13 @@ static py::object iterative_elastic_net_wrapper(py::array_t<double> X_arr, py::a
         }
     }
 
-    auto res = sr::iterative_elastic_net(X, y, l1_weight, l2_weight, n_starts, n_iterations, prune_threshold, max_iter, sw, seed);
+    sr::ElasticNetResult res;
+    {
+        py::gil_scoped_release release;
+        res = sr::iterative_elastic_net(
+            X_owned, y_owned, l1_weight, l2_weight, n_starts, n_iterations,
+            prune_threshold, max_iter, sw, seed);
+    }
     
     py::list w_out;
     for (int i = 0; i < res.weights.size(); ++i) {
@@ -1614,8 +1752,12 @@ static py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::
     int n = X_buf.shape[0];
     int p = X_buf.shape[1];
     
-    Eigen::MatrixXd X = Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(
-        static_cast<double*>(X_buf.ptr), n, p);
+    // §3.309 + P-89: own X (the map aliased caller memory, and the weight
+    // scaling below mutates it in place), so the GIL can be released around
+    // the solve and the caller's array is never modified.
+    Eigen::MatrixXd X = Eigen::Map<
+        Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>>(
+            static_cast<double*>(X_buf.ptr), n, p);
     // §3.309: copy y to owned VectorXd before applying sample weights so caller's y is never mutated in place
     Eigen::VectorXd y = Eigen::Map<Eigen::VectorXd>(static_cast<double*>(y_buf.ptr), y_buf.size);
     Eigen::VectorXd sw;
@@ -1645,15 +1787,23 @@ static py::list lasso_coordinate_descent_wrapper(py::array_t<double> X_arr, py::
     // Nonzero l2 means "iterative LASSO" is actually elastic net (shrinkage
     // documented at the Python API); result stays shrinkage-biased by design.
     if (alpha == 0.0) {
-        Eigen::VectorXd w = sr::solve_linear(X, y);
+        Eigen::VectorXd w;
+        {
+            py::gil_scoped_release release;
+            w = sr::solve_linear(X, y);
+        }
         py::list w_out;
         for (int i = 0; i < w.size(); ++i) {
             w_out.append(w(i));
         }
         return w_out;
     }
-    auto res = sr::elastic_net_cd_cpp(X, y, alpha, 0.0, max_iter, tol,
-                                      Eigen::VectorXd(), have_sw ? sw : Eigen::VectorXd());
+    sr::ElasticNetResult res;
+    {
+        py::gil_scoped_release release;
+        res = sr::elastic_net_cd_cpp(X, y, alpha, 0.0, max_iter, tol,
+                                     Eigen::VectorXd(), have_sw ? sw : Eigen::VectorXd());
+    }
     // §3.400: fail loud on non-finite results (was silent zero weights).
     // Covers non-finite X/y as well as finite-but-unsolvable scale
     // (e.g. 1e200 magnitudes overflowing the residual norm).

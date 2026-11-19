@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -2834,21 +2835,75 @@ private:
         const int irls_iters = robust ? 4 : 1;
         const double lambda = 1e-4;
 
-        auto ridge_solve = [&](const Eigen::ArrayXd& ww, Eigen::VectorXd& w_out) -> bool {
+        // P-99 base pieces: constant across the IRLS chain (see ridge_solve).
+        Eigen::MatrixXd G_base;
+        Eigen::VectorXd rhs_base;
+        bool base_ready = false;
+        auto ensure_base = [&]() {
+            if (base_ready) return;
+            Eigen::MatrixXd WbA = base_w.matrix().asDiagonal() * A;
+            G_base.noalias() = A.transpose() * WbA;
+            rhs_base.noalias() = A.transpose() * (base_w * y_).matrix();
+            base_ready = true;
+        };
+        auto build_direct = [&](const Eigen::ArrayXd& ww,
+                                Eigen::MatrixXd& G,
+                                Eigen::VectorXd& rhs) {
+            Eigen::MatrixXd WA = ww.matrix().asDiagonal() * A;
+            G.noalias() = A.transpose() * WA;
+            rhs.noalias() = A.transpose() * (ww * y_).matrix();
+        };
+        auto ridge_from_gram = [&](Eigen::MatrixXd G,
+                                   Eigen::VectorXd rhs,
+                                   Eigen::VectorXd& w_out) -> bool {
+            // §3.361: LDLT is valid here, not merely convenient. Sample
+            // weights are validated non-negative at the FFI boundary and
+            // wsum > 0 is checked by the caller, so with lambda = 1e-4 > 0 the
+            // regularized normal matrix is positive-definite by construction;
+            // w_out.allFinite() gates the rest.
+            G.diagonal().array() += lambda;
+            w_out = G.ldlt().solve(rhs);
+            return w_out.allFinite();
+        };
+
+        // P-99: the IRLS chain changes only the robust reweighting `rw`
+        // (caller weights are base_w .* rw / norm), so the base-weighted
+        // Gramian A^T diag(base_w) A and cross product A^T (base_w .* y) are
+        // built once and each iteration adds only the rows whose weight
+        // actually moved. Huber/trimmed down-weight a small minority of rows —
+        // precisely the case the old per-iteration full rebuild (O(n p^2))
+        // paid for. When most rows move (student-t) the direct build is
+        // cheaper, so the delta path is capped at half the rows. Both paths
+        // solve the same normal equations; only summation order differs.
+        auto ridge_solve = [&](const Eigen::ArrayXd& rw, double norm,
+                              Eigen::VectorXd& w_out) -> bool {
             try {
-                double wsum = ww.sum();
+                if (!(norm > 0.0) || !std::isfinite(norm)) return false;
+                double wsum = (base_w * rw).sum();
                 if (!(wsum > 0.0) || !std::isfinite(wsum)) return false;
-                Eigen::MatrixXd WA = ww.matrix().asDiagonal() * A;
-                Eigen::MatrixXd AtWA = A.transpose() * WA;
-                Eigen::VectorXd AtWb = A.transpose() * (ww * y_).matrix();
-                // §3.361: LDLT is valid here, not merely convenient. Sample
-                // weights are validated non-negative at the FFI boundary and
-                // wsum > 0 is checked above, so with lambda = 1e-4 > 0 the
-                // regularized normal matrix is positive-definite by
-                // construction; w_out.allFinite() gates the rest.
-                AtWA.diagonal() += Eigen::VectorXd::Constant(num_features + 1, lambda);
-                w_out = AtWA.ldlt().solve(AtWb);
-                return w_out.allFinite();
+                ensure_base();
+                int n_delta = 0;
+                for (int i = 0; i < n_samples; ++i) {
+                    if (rw(i) != 1.0 && base_w(i) != 0.0) ++n_delta;
+                }
+                Eigen::MatrixXd G;
+                Eigen::VectorXd rhs;
+                if (n_delta * 2 > n_samples) {
+                    build_direct(base_w * rw, G, rhs);
+                } else {
+                    G = G_base;
+                    rhs = rhs_base;
+                    for (int i = 0; i < n_samples; ++i) {
+                        if (rw(i) == 1.0 || base_w(i) == 0.0) continue;
+                        const double d = base_w(i) * (rw(i) - 1.0);
+                        Eigen::VectorXd ai = A.row(i).transpose();
+                        G.noalias() += d * ai * ai.transpose();
+                        rhs.noalias() += (d * y_(i)) * ai;
+                    }
+                }
+                G *= 1.0 / norm;
+                rhs *= 1.0 / norm;
+                return ridge_from_gram(std::move(G), std::move(rhs), w_out);
             } catch (...) {
                 return false;
             }
@@ -2926,8 +2981,8 @@ private:
             return rw;
         };
 
-        Eigen::ArrayXd cur_w = base_w;
-        if (!ridge_solve(cur_w, w)) {
+        Eigen::ArrayXd cur_rw = Eigen::ArrayXd::Ones(n_samples);
+        if (!ridge_solve(cur_rw, 1.0, w)) {
             if (irls_converged_out) *irls_converged_out = false;
             if (pruned_out) *pruned_out = 0;
             return false;
@@ -2938,12 +2993,11 @@ private:
             Eigen::ArrayXd resid = pred_from_w(w) - y_;
             if (!resid.isFinite().all()) { irls_ok = false; break; }
             Eigen::ArrayXd rw = irls_weights(resid);
-            cur_w = base_w * rw;
             // Renormalize mean ~1 for numerical stability with ridge scale.
-            double mean_w = cur_w.mean();
-            if (mean_w > 0.0 && std::isfinite(mean_w)) cur_w /= mean_w;
+            const double mean_w = (base_w * rw).mean();
+            const double norm = (mean_w > 0.0 && std::isfinite(mean_w)) ? mean_w : 1.0;
             Eigen::VectorXd w_next;
-            if (!ridge_solve(cur_w, w_next)) { irls_ok = false; break; }
+            if (!ridge_solve(rw, norm, w_next)) { irls_ok = false; break; }
             // §3.137: stop when the IRLS fixed point settles instead of
             // always running the full fixed iteration budget.
             double w_change = (w_next - w).cwiseAbs().maxCoeff();
@@ -3321,46 +3375,112 @@ private:
         bool improved_any = false;
         const double fd_eps = 1e-4;
 
+        // P-100: reuse the LM setup across outer iterations that see the same
+        // base state. Every rejected trial doubles lambda and previously
+        // re-ran the whole setup (graph evaluation, ridge refit, A^T A, QR of
+        // the projection system) even though best_snapshot had not changed.
+        // The signature covers topology + inner parameters + output weights,
+        // so a hit guarantees the design matrix, factors, residual and
+        // objective are byte-for-byte the ones the last iteration used. A miss
+        // (accepted step) rebuilds; only the perturbed subtree's columns
+        // actually changed, but the factorization is not updatable in place.
+        auto graph_state_signature = [](const IndividualGraph& g) -> uint64_t {
+            uint64_t h = 1469598103934665603ULL;
+            auto mix = [&h](uint64_t v) {
+                h ^= v;
+                h *= 1099511628211ULL;
+            };
+            auto mix_d = [&mix](double v) {
+                uint64_t bits = 0;
+                std::memcpy(&bits, &v, sizeof(bits));
+                mix(bits);
+            };
+            mix(static_cast<uint64_t>(g.nodes.size()));
+            for (const auto& nd : g.nodes) {
+                mix(static_cast<uint64_t>(static_cast<int>(nd.type)));
+                mix(static_cast<uint64_t>(static_cast<int>(nd.unary_op)));
+                mix(static_cast<uint64_t>(static_cast<int>(nd.binary_op)));
+                mix(static_cast<uint64_t>(static_cast<uint32_t>(nd.feature_idx)));
+                mix(static_cast<uint64_t>(static_cast<uint32_t>(nd.left_child)));
+                mix(static_cast<uint64_t>(static_cast<uint32_t>(nd.right_child)));
+                mix_d(nd.value);
+                mix_d(nd.p);
+                mix_d(nd.omega);
+                mix_d(nd.phi);
+                mix_d(nd.amplitude);
+                mix_d(nd.beta);
+                mix_d(nd.gamma);
+                mix_d(nd.tau);
+            }
+            mix(static_cast<uint64_t>(g.output_weights.size()));
+            for (double w : g.output_weights) mix_d(w);
+            mix_d(g.output_bias);
+            return h;
+        };
+
+        struct LmBaseCache {
+            bool valid = false;
+            uint64_t sig = 0;
+            std::vector<Eigen::ArrayXd> cache;
+            Eigen::VectorXd base_w;
+            Eigen::VectorXd residual;
+            double base_mse = std::numeric_limits<double>::infinity();
+            Eigen::MatrixXd A;
+            Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr;
+        } lm_cache;
+
         for (int iter = 0; iter < config_.lm_max_iterations; ++iter) {
             IndividualGraph base_graph = best_snapshot;
             unpack_params(base_graph, theta);
-            
-            std::vector<Eigen::ArrayXd> base_cache;
-            evaluate_graph(base_graph, X_, n_samples, base_cache);
-            
-            DifferentialGramian dg;
-            dg.initialize(base_cache, y_, has_y_weights_ ? y_weights_ : Eigen::ArrayXd());
-            
-            Eigen::VectorXd r;
-            double base_mse = evaluate_residual(base_graph, &r);
-            if (!std::isfinite(base_mse)) {
-                lambda *= 10.0;
-                continue;
-            }
-            
-            int n_features = static_cast<int>(base_cache.size());
 
-            // Get base weights explicitly to use in analytical jacobian
-            Eigen::VectorXd base_w;
-            if (!dg.solve_ridge(1e-4, base_w)) {
-                lambda *= 10.0;
-                continue;
+            const uint64_t sig = graph_state_signature(best_snapshot);
+            const bool cache_hit = lm_cache.valid
+                && lm_cache.sig == sig
+                && lm_cache.cache.size() == best_snapshot.nodes.size();
+            if (!cache_hit) {
+                std::vector<Eigen::ArrayXd> base_cache;
+                evaluate_graph(base_graph, X_, n_samples, base_cache);
+                
+                DifferentialGramian dg;
+                dg.initialize(base_cache, y_, has_y_weights_ ? y_weights_ : Eigen::ArrayXd());
+                
+                Eigen::VectorXd r;
+                double base_mse = evaluate_residual(base_graph, &r);
+                Eigen::VectorXd base_w;
+                bool ok = std::isfinite(base_mse) && dg.solve_ridge(1e-4, base_w);
+                if (!ok) {
+                    lambda *= 10.0;
+                    continue;
+                }
+                int n_features = static_cast<int>(base_cache.size());
+                // Build A matrix for the VARPRO projection step.
+                Eigen::MatrixXd A(n_samples, n_features + 1);
+                for (int i = 0; i < n_features; ++i) A.col(i) = base_cache[i].matrix();
+                A.col(n_features).setOnes();
+                // Precompute the projection factorization:
+                // v - A * (A^T A + lambda I)^{-1} A^T * v
+                Eigen::MatrixXd G_ridge = A.transpose() * A;
+                G_ridge.diagonal().array() += 1e-4;
+                lm_cache.qr.compute(G_ridge);
+
+                lm_cache.cache = std::move(base_cache);
+                lm_cache.base_w = std::move(base_w);
+                lm_cache.residual = std::move(r);
+                lm_cache.base_mse = base_mse;
+                lm_cache.A = std::move(A);
+                lm_cache.sig = sig;
+                lm_cache.valid = true;
             }
+
+            const std::vector<Eigen::ArrayXd>& base_cache = lm_cache.cache;
+            const Eigen::VectorXd& base_w = lm_cache.base_w;
+            const Eigen::VectorXd& r = lm_cache.residual;
+            const Eigen::MatrixXd& A = lm_cache.A;
+            auto& qr = lm_cache.qr;
+            const double base_mse = lm_cache.base_mse;
 
             Eigen::MatrixXd J(n_samples, n_params);
             J.setZero();
-            
-            // Build A matrix for the VARPRO projection step
-            Eigen::MatrixXd A(n_samples, n_features + 1);
-            for (int i = 0; i < n_features; ++i) A.col(i) = base_cache[i].matrix();
-            A.col(n_features).setOnes();
-            
-            // Precompute QR decomposition of A for the projection P_perp
-            // We want to compute v - A * (A^T A + lambda I)^{-1} A^T * v
-            Eigen::MatrixXd G_ridge = A.transpose() * A;
-            G_ridge.diagonal().array() += 1e-4;
-            Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr;
-            qr.compute(G_ridge);
             
             for (int ai = 0; ai < static_cast<int>(active_unary.size()); ++ai) {
                 int node_idx = active_unary[ai];
@@ -4377,6 +4497,76 @@ private:
                 return std::isfinite(mse) ? mse : std::numeric_limits<double>::infinity();
             };
 
+            // P-76: rank-one residual bookkeeping for output-coefficient snaps.
+            // mse_from_cache is O(n * n_feat) per candidate; a scalar weight or
+            // bias change only needs
+            //   SSR(d) = SSR + 2 d (r, col) + d^2 (col, col)
+            // with the dot products built once per base state, so every trial
+            // drops to O(n) instead of a full prediction sweep. Only the plain
+            // (optionally y-weighted) MSE objective is quadratic in the
+            // residual, so robust losses keep the explicit scan.
+            const int snap_ns = static_cast<int>(y_.size());
+            const bool snap_weighted = has_y_weights_ && y_weights_.size() == snap_ns;
+            const bool snap_quadratic = (config_.loss_mode == LossMode::Mse)
+                && (!snap_weighted
+                    || (y_weight_sum_ > 0.0 && std::isfinite(y_weight_sum_)));
+            const double snap_den = snap_weighted ? y_weight_sum_
+                                                  : static_cast<double>(snap_ns);
+            Eigen::ArrayXd snap_resid;
+            std::vector<double> snap_col_dot;
+            std::vector<double> snap_col_ss;
+            double snap_rr = 0.0;
+            double snap_bias_dot = 0.0;
+            double snap_bias_ss = 0.0;
+
+            auto snap_wdot = [&](const Eigen::ArrayXd& a, const Eigen::ArrayXd& b) -> double {
+                return snap_weighted ? (y_weights_ * a * b).sum() : (a * b).sum();
+            };
+            auto rebuild_snap_state = [&]() {
+                snap_resid = Eigen::ArrayXd::Constant(snap_ns, ind.output_bias);
+                for (int f = 0; f < static_cast<int>(ind.output_weights.size()); ++f) {
+                    if (std::abs(ind.output_weights[f]) > 1e-15
+                        && f < static_cast<int>(snap_base_cache.size())
+                        && snap_base_cache[static_cast<size_t>(f)].size() == snap_ns) {
+                        snap_resid += ind.output_weights[f]
+                            * snap_base_cache[static_cast<size_t>(f)];
+                    }
+                }
+                snap_resid -= y_;
+                snap_rr = snap_wdot(snap_resid, snap_resid);
+                const int nf = static_cast<int>(snap_base_cache.size());
+                snap_col_dot.assign(static_cast<size_t>(nf), 0.0);
+                snap_col_ss.assign(static_cast<size_t>(nf), 0.0);
+                for (int f = 0; f < nf; ++f) {
+                    const auto& col = snap_base_cache[static_cast<size_t>(f)];
+                    if (col.size() != snap_ns) continue;
+                    snap_col_dot[static_cast<size_t>(f)] = snap_wdot(snap_resid, col);
+                    snap_col_ss[static_cast<size_t>(f)] = snap_wdot(col, col);
+                }
+                Eigen::ArrayXd ones = Eigen::ArrayXd::Ones(snap_ns);
+                snap_bias_dot = snap_wdot(snap_resid, ones);
+                snap_bias_ss = snap_wdot(ones, ones);
+            };
+            if (snap_quadratic) rebuild_snap_state();
+
+            // MSE for a hypothetical scalar change to one output coefficient
+            // (col < 0 means the bias). Callers have already written the
+            // candidate into `ind`, matching mse_from_cache's contract.
+            auto trial_mse_for = [&](int col, double new_value, double old_value) -> double {
+                if (!snap_quadratic) return mse_from_cache(ind, snap_base_cache);
+                const double dot = (col < 0)
+                    ? snap_bias_dot
+                    : snap_col_dot[static_cast<size_t>(col)];
+                const double ss = (col < 0)
+                    ? snap_bias_ss
+                    : snap_col_ss[static_cast<size_t>(col)];
+                double rr = snap_rr + 2.0 * (new_value - old_value) * dot
+                    + (new_value - old_value) * (new_value - old_value) * ss;
+                if (rr < 0.0) rr = 0.0;  // rounding on an exact fit
+                const double m = rr / snap_den;
+                return std::isfinite(m) ? m : std::numeric_limits<double>::infinity();
+            };
+
             // 6b. Output weight snapping - using cached node outputs (no graph re-eval)
             // §3.244: track explicitly-snapped coefficients so the final
             // refit below can be checked for snap-fidelity drift.
@@ -4409,7 +4599,7 @@ private:
                         
                         double original_w = ind.output_weights[i];
                         ind.output_weights[i] = candidate;
-                        double trial_mse = mse_from_cache(ind, snap_base_cache);
+                        double trial_mse = trial_mse_for(i, candidate, original_w);
 
                         // §3.242: 1.05 allowed 5% degrade for clean constants;
                         // cap at 1.02 (elimination path keeps its own 1.05).
@@ -4426,6 +4616,7 @@ private:
                         snapped_w_val[static_cast<size_t>(i)] = best_snap_w;
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples); // Update fitness/raw_mse
                         snap_baseline_mse = objective_mse(ind);
+                        if (snap_quadratic) rebuild_snap_state();
                     }
                 }
             }
@@ -4449,7 +4640,7 @@ private:
                         if (std::abs(bias - candidate) > 0.5) continue;
                         
                         ind.output_bias = candidate;
-                        double trial_mse = mse_from_cache(ind, snap_base_cache);
+                        double trial_mse = trial_mse_for(-1, candidate, bias);
 
                         // §3.242: see weight-snapping note above.
                         if (trial_mse < snap_baseline_mse * 1.02 + 1e-8 && trial_mse < best_snap_mse) {
@@ -4461,18 +4652,24 @@ private:
                     double nearest_int = std::round(bias);
                     if (std::abs(bias - nearest_int) <= 0.3) {
                         ind.output_bias = nearest_int;
-                        double trial_mse = mse_from_cache(ind, snap_base_cache);
+                        double trial_mse = trial_mse_for(-1, nearest_int, bias);
                         if (trial_mse < snap_baseline_mse * 1.02 + 1e-8 && trial_mse < best_snap_mse) {
                             best_snap_b = nearest_int;
                             best_snap_mse = trial_mse;
                         }
                     }
                     
+                    // P-76: the trial loop leaves ind.output_bias on the last
+                    // candidate; restore the accepted value (best_snap_b is the
+                    // original bias when nothing improved) so a rejected snap
+                    // never mutates the graph.
+                    ind.output_bias = best_snap_b;
                     if (best_snap_b != bias) {
-                        ind.output_bias = best_snap_b;
                         snapped_b = true;
                         snapped_b_val = best_snap_b;
                         evaluate_fitness_with_penalty(ind, X_, y_, n_samples);
+                        snap_baseline_mse = objective_mse(ind);
+                        if (snap_quadratic) rebuild_snap_state();
                     }
                 }
             }

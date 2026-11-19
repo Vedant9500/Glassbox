@@ -400,31 +400,36 @@ inline FreqResult refine_frequencies_cpp(
             success = true;
         }
         
-        // Gradient descent on omegas via finite differences
-        // §3.97: scale-adaptive FD step (fixed 1e-4 under-resolves large
-        // |omega| and over-steps near zero). Relative step with floor.
-        // §3.404: probe on local copies (X_f/X_b), never by mutating the
-        // shared design matrix — the old perturb/restore left X corrupted
-        // on any exception or early return between the two.
+        // P-42: analytic frequency gradient (variable projection / envelope
+        // theorem). At the least-squares optimum the coefficient re-solve
+        // contributes nothing to dMSE/domega, so
+        //   dMSE/domega_i = 2 * sum(w * r * dX/domega_i * c) / sum(w)
+        // with dX/domega_i = x*cos(omega_i*x) for the sin column and
+        // -x*sin(omega_i*x) for the cos column. This is the exact derivative
+        // the old forward/backward finite differences approximated, and it
+        // removes two full weighted LS solves per omega per step — the
+        // dominant cost of this routine (§3.404's "never mutate the shared
+        // design matrix" hazard disappears with them). Observable difference:
+        // an init with exactly duplicate omegas no longer drifts from a
+        // pivoted-QR coefficient redistribution artifact — a duplicated
+        // column carries zero coefficient, so its gradient is correctly zero.
         std::vector<double> grads(k, 0.0);
-        
+        const bool weighted =
+            sample_weight.size() == y.size() && sample_weight.size() > 0;
+        const double mse_den = weighted
+            ? sample_weight.sum()
+            : static_cast<double>(n);
+        const Eigen::ArrayXd resid = (pred - y).array();
         for (int i = 0; i < k; ++i) {
-            const double eps = 1e-4 * (1.0 + std::abs(omegas[i]));
-            const double o_fwd = omegas[i] + eps;
-            const double o_bwd = omegas[i] - eps;
-            Eigen::MatrixXd X_f = X;
-            X_f.col(3 + 2*i) = (o_fwd * x.array()).sin().matrix();
-            X_f.col(4 + 2*i) = (o_fwd * x.array()).cos().matrix();
-            Eigen::VectorXd c_fwd = solve_linear_weighted(X_f, y, sample_weight);
-            double mse_fwd = residual_mse_weighted(X_f * c_fwd, y, sample_weight);
-
-            Eigen::MatrixXd X_b = X;
-            X_b.col(3 + 2*i) = (o_bwd * x.array()).sin().matrix();
-            X_b.col(4 + 2*i) = (o_bwd * x.array()).cos().matrix();
-            Eigen::VectorXd c_bwd = solve_linear_weighted(X_b, y, sample_weight);
-            double mse_bwd = residual_mse_weighted(X_b * c_bwd, y, sample_weight);
-            
-            grads[i] = (mse_fwd - mse_bwd) / (2 * eps);
+            const double a_sin = coeffs(3 + 2 * i);
+            const double b_cos = coeffs(4 + 2 * i);
+            const Eigen::ArrayXd arg = omegas[i] * x.array();
+            const Eigen::ArrayXd dcol =
+                x.array() * (a_sin * arg.cos() - b_cos * arg.sin());
+            const double num = weighted
+                ? (sample_weight.array() * resid * dcol).sum()
+                : (resid * dcol).sum();
+            grads[i] = 2.0 * num / mse_den;
         }
         
         // Update omegas with projected gradient descent (§3.98): the FD
