@@ -4886,6 +4886,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 lambda text: self._reduce_formula_noise(text, X, y),
             ),
             ("simplify_formula", self._simplify_formula),
+            # PH6-SNAP: a second simplifier pass with a wider zero tolerance
+            # drops insignificant offsets that the default pass keeps (e.g.
+            # exp(sin(x - 0.00245)) instead of exp(sin(x))). It only returns a
+            # candidate that does not worsen the fit, so the guard below can
+            # never accept a regression through this step.
+            (
+                "tighten_constants",
+                lambda text: self._tighten_formula_constants(text, X, y),
+            ),
         )
         for step_name, cleanup_fn in cleanup_steps:
             try:
@@ -8767,6 +8776,62 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return simplified
         except Exception:
             return formula
+
+    def _tighten_formula_constants(self, formula, X, y):
+        """PH6-SNAP: re-simplify with a wider zero tolerance.
+
+        ``zero_tol`` controls which additive offsets collapse to nothing. At the
+        default 1e-3 an offset like ``x - 0.00245`` survives, which keeps an
+        otherwise-exact formula from reaching its simple exact form and leaves
+        residual error behind (observed: ``exp(sin(x - 0.00245))`` at 4.7e-06
+        instead of ``exp(sin(x))`` at 0). Widening the tolerance lets the
+        simplifier collapse those offsets.
+
+        The tolerance is only widened, never the fit: the candidate is returned
+        solely when it does not worsen display MSE, so a legitimate small
+        constant that carries signal is never discarded. Callers additionally
+        run their own fidelity guard on the result.
+        """
+        text = str(formula or "").strip()
+        if not text or not self.use_simplification:
+            return formula
+        _core = get_cpp_core()
+        if _core is None or not hasattr(_core, "simplify_formula"):
+            return formula
+        base_zero_tol = float(getattr(self, "simplification_zero_tol", 1e-3) or 1e-3)
+        tighten_zero_tol = max(base_zero_tol * 5.0, 5e-3)
+        try:
+            candidate = str(
+                _core.simplify_formula(
+                    text,
+                    int_tol=self.simplification_int_tol,
+                    zero_tol=tighten_zero_tol,
+                    max_passes=6,
+                    n_features=self.n_features_in_,
+                )
+                or ""
+            ).strip()
+        except Exception:
+            return formula
+        if not candidate or candidate == text:
+            return formula
+        # Never let a tolerance tightening rename variables. The simplifier
+        # canonicalises x0 -> x for single-feature inputs, but the public
+        # formula convention (and downstream callers) expect the original
+        # naming, so a rename is not an acceptable outcome for this step.
+        token_re = re.compile(r"\bx\d*\b")
+        if set(token_re.findall(text)) != set(token_re.findall(candidate)):
+            return formula
+        try:
+            current_mse = self._display_formula_mse(text, X, y)
+            candidate_mse = self._display_formula_mse(candidate, X, y)
+        except Exception:
+            return formula
+        if not np.isfinite(candidate_mse):
+            return formula
+        if np.isfinite(current_mse) and candidate_mse > current_mse * (1.0 + 1e-9):
+            return formula
+        return candidate
 
     def _stage_residual_symbolic_fit(
         self, X, y, base_formula, *, _allow_recursion=False
