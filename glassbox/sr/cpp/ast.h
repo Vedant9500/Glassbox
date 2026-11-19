@@ -573,6 +573,11 @@ public:
     }
 
     iterator find(key_type key) {
+        // P-50: single-entry MRU fast path. touch() below always leaves the
+        // hit at the front of order_, so a repeat lookup of the same subtree
+        // (the common case — parents share children) skips the hash probe
+        // and the splice. No extra state, so there is nothing to invalidate.
+        if (!order_.empty() && order_.begin()->first == key) return order_.begin();
         auto it = index_.find(key);
         if (it == index_.end()) return order_.end();
         touch(it->second);
@@ -580,6 +585,7 @@ public:
     }
 
     const_iterator find(key_type key) const {
+        if (!order_.empty() && order_.begin()->first == key) return order_.begin();
         auto it = index_.find(key);
         if (it == index_.end()) return order_.cend();
         return it->second;

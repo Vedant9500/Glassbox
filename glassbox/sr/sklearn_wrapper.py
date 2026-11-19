@@ -8323,6 +8323,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         instead of silently coercing them to 0. The eval cache stores *raw*
         values; ``_safe_eval_formula_array`` applies the predict-only fill
         policy on top.
+
+        P-4: the returned array is **read-only** and shared with the cache — a
+        cache hit costs no copy. Treat prediction vectors as immutable; use
+        ``_eval_formula_raw_copy`` when you need to mutate one in place.
         """
 
         def _safe_log(x):
@@ -8417,7 +8421,10 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 self.formula_eval_cache_hits_ = (
                     int(getattr(self, "formula_eval_cache_hits_", 0) or 0) + 1
                 )
-                return np.asarray(cached, dtype=np.float64).copy()
+                # P-4: hand back the cached payload itself (read-only) instead
+                # of copying it. Large prediction vectors are re-scored many
+                # times per fit, so the copy was pure bandwidth.
+                return cached
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -8445,8 +8452,24 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             # latency spike and discarded every still-reusable prediction.
             while len(cache) >= 512:
                 cache.pop(next(iter(cache)), None)
-            cache[cache_key] = np.asarray(out, dtype=np.float64).copy()
+            # P-4: freeze the cached array. Reads share it; any caller that
+            # tries to write gets a loud error instead of silently corrupting
+            # every later score of the same formula.
+            stored = np.array(out, dtype=np.float64, copy=True)
+            stored.flags.writeable = False
+            cache[cache_key] = stored
+            out = stored
         return out
+
+    def _eval_formula_raw_copy(self, formula, X):
+        """P-4: explicit mutable copy of ``_eval_formula_raw``.
+
+        ``_eval_formula_raw`` returns a read-only array backed by the eval
+        cache; use this when the caller needs to modify predictions in place.
+        """
+        return np.array(
+            self._eval_formula_raw(formula, X), dtype=np.float64, copy=True
+        )
 
     def _safe_eval_formula_array(self, formula, X):
         """Predict-only policy: raw eval with non-finite predictions → 0.

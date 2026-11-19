@@ -4854,6 +4854,76 @@ def _build_signal_seed_graphs(
     )
 
 
+# P-18: memoized polynomial-signature detection. The same (x, y) pair arrives
+# on every beam-search call for a dataset (the fast path and the evolution
+# fallback both ask), and the probe costs eight np.polyfit passes over the full
+# column. Keyed by a content hash so a changed target can never hit a stale
+# signature; entries are tiny and bounded.
+_POLY_SIGNATURE_CACHE: dict[tuple, tuple[bool, int, float]] = {}
+_POLY_SIGNATURE_CACHE_MAX = 32
+
+
+def _poly_signature_cache_key(x_values, y_values, max_degree):
+    return (
+        tuple(x_values.shape),
+        tuple(y_values.shape),
+        int(max_degree),
+        hash(np.ascontiguousarray(x_values, dtype=np.float64).tobytes()),
+        hash(np.ascontiguousarray(y_values, dtype=np.float64).tobytes()),
+    )
+
+
+def _estimate_polynomial_signature(
+    x_values: np.ndarray,
+    y_values: np.ndarray,
+    max_degree: int = 8,
+) -> tuple[bool, int, float]:
+    """Return (is_poly_like, best_degree, relative_mse) from a quick poly fit.
+
+    P-18: memoized on a content fingerprint (see _POLY_SIGNATURE_CACHE).
+    """
+    if x_values.size < max_degree + 2:
+        return (False, 0, float("inf"))
+    cache_key = _poly_signature_cache_key(x_values, y_values, max_degree)
+    hit = _POLY_SIGNATURE_CACHE.get(cache_key)
+    if hit is not None:
+        return hit
+    try:
+        x_span = float(np.max(x_values) - np.min(x_values))
+        x_scaled = (x_values - float(np.mean(x_values))) / max(0.5 * x_span, 1e-8)
+        y_var = max(float(np.var(y_values)), 1e-12)
+
+        best_degree = 1
+        best_mse = float("inf")
+        mse_by_degree: list[tuple[int, float]] = []
+        for degree in range(1, max_degree + 1):
+            coeffs = np.polyfit(x_scaled, y_values, degree)
+            pred = np.polyval(coeffs, x_scaled)
+            mse = float(np.mean((pred - y_values) ** 2))
+            mse_by_degree.append((degree, mse))
+            if np.isfinite(mse) and mse < best_mse:
+                best_degree = degree
+                best_mse = mse
+
+        # Prefer the smallest degree that is effectively exact. This avoids
+        # always returning max_degree when multiple degrees fit near machine precision.
+        effective_degree = best_degree
+        for degree, mse in mse_by_degree:
+            if (mse / y_var) < 1e-11:
+                effective_degree = degree
+                break
+
+        relative_mse = best_mse / y_var
+        is_poly_like = effective_degree >= 2 and relative_mse < 1e-11
+        result = (is_poly_like, effective_degree, relative_mse)
+    except Exception:
+        result = (False, 0, float("inf"))
+    while len(_POLY_SIGNATURE_CACHE) >= _POLY_SIGNATURE_CACHE_MAX:
+        _POLY_SIGNATURE_CACHE.pop(next(iter(_POLY_SIGNATURE_CACHE)), None)
+    _POLY_SIGNATURE_CACHE[cache_key] = result
+    return result
+
+
 def beam_search_evolution(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -4934,45 +5004,6 @@ def beam_search_evolution(
     has_power = "power" in operators
     has_exp = "exp" in operators
     has_log = "log" in operators
-
-    def _estimate_polynomial_signature(
-        x_values: np.ndarray,
-        y_values: np.ndarray,
-        max_degree: int = 8,
-    ) -> tuple[bool, int, float]:
-        """Return (is_poly_like, best_degree, relative_mse) from a quick poly fit."""
-        if x_values.size < max_degree + 2:
-            return (False, 0, float("inf"))
-        try:
-            x_span = float(np.max(x_values) - np.min(x_values))
-            x_scaled = (x_values - float(np.mean(x_values))) / max(0.5 * x_span, 1e-8)
-            y_var = max(float(np.var(y_values)), 1e-12)
-
-            best_degree = 1
-            best_mse = float("inf")
-            mse_by_degree: list[tuple[int, float]] = []
-            for degree in range(1, max_degree + 1):
-                coeffs = np.polyfit(x_scaled, y_values, degree)
-                pred = np.polyval(coeffs, x_scaled)
-                mse = float(np.mean((pred - y_values) ** 2))
-                mse_by_degree.append((degree, mse))
-                if np.isfinite(mse) and mse < best_mse:
-                    best_degree = degree
-                    best_mse = mse
-
-            # Prefer the smallest degree that is effectively exact. This avoids
-            # always returning max_degree when multiple degrees fit near machine precision.
-            effective_degree = best_degree
-            for degree, mse in mse_by_degree:
-                if (mse / y_var) < 1e-11:
-                    effective_degree = degree
-                    break
-
-            relative_mse = best_mse / y_var
-            is_poly_like = effective_degree >= 2 and relative_mse < 1e-11
-            return (is_poly_like, effective_degree, relative_mse)
-        except Exception:
-            return (False, 0, float("inf"))
 
     hinted_max_power = 0.0
     for power in powers:

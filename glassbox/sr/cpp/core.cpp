@@ -1977,8 +1977,15 @@ static py::array_t<double> eval_formula_exact_wrapper(const std::string& formula
         X.emplace_back(Eigen::Map<Eigen::ArrayXd>(static_cast<double*>(buf.ptr), buf.size));
     }
     if (n <= 0) throw std::runtime_error("empty X");
-    auto root = parse_formula_exact(formula);
-    Eigen::ArrayXd out = evaluate_parse_node_exact(root, X, n);
+    // §3.310: X is owned above and the parser/evaluator touch no Python state,
+    // so the walk can run with the GIL released. The thread-local arena in
+    // evaluate_parse_node_exact keeps this allocation-free per thread.
+    Eigen::ArrayXd out;
+    {
+        py::gil_scoped_release release;
+        auto root = parse_formula_exact(formula);
+        out = evaluate_parse_node_exact(root, X, n);
+    }
     py::array_t<double> result(n);
     auto rbuf = result.request();
     Eigen::Map<Eigen::ArrayXd>(static_cast<double*>(rbuf.ptr), n) = out;

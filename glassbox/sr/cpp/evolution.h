@@ -5,6 +5,7 @@
 #include "execution.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -352,6 +353,7 @@ public:
             throw std::invalid_argument("allowed_unary_ops contains no valid op ids");
         if (!config_.allowed_binary_ops.empty() && allowed_binary_ops_.empty())
             throw std::invalid_argument("allowed_binary_ops contains no valid op ids");
+        build_allowed_op_tables();
         // Normalize op_priors if provided
         if (!config_.op_priors.empty()) {
             // Backward compatibility:
@@ -899,6 +901,9 @@ private:
     std::vector<double> binary_op_cdf_; // CDF for prior-weighted binary-op sampling
     std::vector<int> allowed_unary_ops_;
     std::vector<int> allowed_binary_ops_;
+    // P-83: membership tables mirrored from the vectors above.
+    std::array<bool, 6> unary_allowed_table_{};
+    std::array<bool, 3> binary_allowed_table_{};
     
     // S3.274: the seed actually drawn (== requested when >= 0).
     unsigned int actual_random_seed_ = 0;
@@ -1303,16 +1308,35 @@ private:
             }
         }
     }
+    // P-83: membership was a linear scan of a vector that every mutation draw
+    // re-walks. A fixed boolean table makes it one indexed load, and the
+    // masks are small enough (6 unary / 3 binary ops) that the table costs
+    // nothing to keep beside the vector.
+    void build_allowed_op_tables() {
+        unary_allowed_table_.fill(false);
+        binary_allowed_table_.fill(false);
+        for (int v : allowed_unary_ops_) {
+            if (v >= 0 && v < static_cast<int>(unary_allowed_table_.size()))
+                unary_allowed_table_[static_cast<std::size_t>(v)] = true;
+        }
+        for (int v : allowed_binary_ops_) {
+            if (v >= 0 && v < static_cast<int>(binary_allowed_table_.size()))
+                binary_allowed_table_[static_cast<std::size_t>(v)] = true;
+        }
+    }
+
     bool unary_op_allowed(UnaryOp op) const {
         if (allowed_unary_ops_.empty()) return true;
-        int value = static_cast<int>(op);
-        return std::find(allowed_unary_ops_.begin(), allowed_unary_ops_.end(), value) != allowed_unary_ops_.end();
+        const std::size_t value = static_cast<std::size_t>(op);
+        if (value >= unary_allowed_table_.size()) return false;
+        return unary_allowed_table_[value];
     }
 
     bool binary_op_allowed(BinaryOp op) const {
         if (allowed_binary_ops_.empty()) return true;
-        int value = static_cast<int>(op);
-        return std::find(allowed_binary_ops_.begin(), allowed_binary_ops_.end(), value) != allowed_binary_ops_.end();
+        const std::size_t value = static_cast<std::size_t>(op);
+        if (value >= binary_allowed_table_.size()) return false;
+        return binary_allowed_table_[value];
     }
 
     int tournament_select(int k = 5) {
@@ -3429,6 +3453,46 @@ private:
             Eigen::ColPivHouseholderQR<Eigen::MatrixXd> qr;
         } lm_cache;
 
+        // P-108 / §3.407: only parameters with a non-zero Jacobian column need
+        // a slot. Log/Abs carry no inner parameters, so all three of their
+        // columns are identically zero, and a zero column decouples from the
+        // rest under the ridge diagonal (H = J^T J + lambda I is block
+        // diagonal there, so its delta entry is 0/lambda = 0). Dropping them
+        // therefore leaves the accepted step unchanged while shrinking J from
+        // n_samples x 3*n_unary to n_samples x n_live and the normal-equation
+        // solve from (3*n_unary)^2 to n_live^2 — the old shape was quadratic in
+        // nodes that cannot move.
+        const int n_active_unary = static_cast<int>(active_unary.size());
+        std::vector<int> live_theta;
+        std::vector<int> theta_to_col(static_cast<std::size_t>(n_params), -1);
+        for (int ai = 0; ai < n_active_unary; ++ai) {
+            const int node_idx = active_unary[static_cast<std::size_t>(ai)];
+            if (node_idx < 0 || node_idx >= static_cast<int>(ind.nodes.size())) continue;
+            const auto op = ind.nodes[static_cast<std::size_t>(node_idx)].unary_op;
+            if (op == UnaryOp::Log || op == UnaryOp::Abs) continue;
+            for (int pi = 0; pi < 3; ++pi) {
+                theta_to_col[static_cast<std::size_t>(ai * 3 + pi)] =
+                    static_cast<int>(live_theta.size());
+                live_theta.push_back(ai * 3 + pi);
+            }
+        }
+        const int n_live = static_cast<int>(live_theta.size());
+        if (n_live <= 0) return false;
+
+        // §3.408: FD probes share one cache/residual workspace instead of
+        // allocating a full node cache (and two residual vectors) per
+        // perturbation — six times per inactive node per iteration. With a
+        // topologically ordered graph only the perturbed node's subtree is
+        // recomputed; every other column is copied from the cached base, which
+        // an inner-parameter perturbation cannot change.
+        std::vector<Eigen::ArrayXd> fd_cache;
+        std::vector<int> fd_changed;
+        Eigen::VectorXd fd_r_plus;
+        Eigen::VectorXd fd_r_minus;
+        // Partial re-evaluation requires children-before-parents ordering; the
+        // same invariant cleanup_graph relies on.
+        const bool fd_partial_ok = is_valid_topology(best_snapshot);
+
         for (int iter = 0; iter < config_.lm_max_iterations; ++iter) {
             IndividualGraph base_graph = best_snapshot;
             unpack_params(base_graph, theta);
@@ -3479,7 +3543,7 @@ private:
             auto& qr = lm_cache.qr;
             const double base_mse = lm_cache.base_mse;
 
-            Eigen::MatrixXd J(n_samples, n_params);
+            Eigen::MatrixXd J(n_samples, n_live);
             J.setZero();
             
             for (int ai = 0; ai < static_cast<int>(active_unary.size()); ++ai) {
@@ -3516,9 +3580,12 @@ private:
                 // FD residual evals avoided only when this node would have
                 // taken the finite-difference fallback (the analytical branch
                 // merely wasted zero-column Gramian work, not evals).
-                if (config_.fd_skip_inert_params
-                        && (node.unary_op == UnaryOp::Log || node.unary_op == UnaryOp::Abs)) {
-                    if (use_fd) {
+                // P-108/§3.407: Log/Abs contribute no live column at all, so
+                // skip them whether or not the probe-skipping fast path is
+                // configured. The counters keep their old meaning (probes
+                // avoided) only when that path is enabled.
+                if (node.unary_op == UnaryOp::Log || node.unary_op == UnaryOp::Abs) {
+                    if (use_fd && config_.fd_skip_inert_params) {
                         fd_probes_total_ += 6;
                         fd_probes_skipped_inert_ += 6;
                     }
@@ -3527,20 +3594,46 @@ private:
 
                 if (use_fd) {
                     auto& mut_node = base_graph.nodes[static_cast<size_t>(node_idx)];
+                    // §3.408: the base columns are unchanged by perturbing this
+                    // node's own inner params, so the probe can start from them
+                    // and recompute only the affected subtree.
+                    const bool partial_ok = fd_partial_ok
+                        && lm_cache.cache.size() == base_graph.nodes.size();
+                    auto probe_residual = [&](Eigen::VectorXd& out) {
+                        if (partial_ok) {
+                            evaluate_graph_partial(base_graph, node_idx,
+                                                   lm_cache.cache, fd_cache, fd_changed);
+                        } else {
+                            evaluate_graph(base_graph, X_, n_samples, fd_cache);
+                        }
+                        if (!solve_output_weights(base_graph, fd_cache)) {
+                            out.resize(0);
+                            return;
+                        }
+                        Eigen::ArrayXd pred = Eigen::ArrayXd::Constant(
+                            n_samples, base_graph.output_bias);
+                        for (std::size_t f = 0;
+                             f < base_graph.output_weights.size() && f < fd_cache.size();
+                             ++f) {
+                            if (std::abs(base_graph.output_weights[f]) > 1e-12) {
+                                pred += base_graph.output_weights[f] * fd_cache[f];
+                            }
+                        }
+                        out = (pred - y_).matrix();
+                    };
                     double* params[3] = {&mut_node.p, &mut_node.omega, &mut_node.phi};
                     for (int pi = 0; pi < 3; ++pi) {
                         const double original = *params[pi];
                         *params[pi] = original + fd_eps;
-                        Eigen::VectorXd r_plus;
-                        evaluate_residual(base_graph, &r_plus);
+                        probe_residual(fd_r_plus);
                         *params[pi] = original - fd_eps;
-                        Eigen::VectorXd r_minus;
-                        evaluate_residual(base_graph, &r_minus);
+                        probe_residual(fd_r_minus);
                         *params[pi] = original;
-                        int pidx = ai * 3 + pi;
-                        if (r_plus.size() == n_samples && r_minus.size() == n_samples) {
-                            J.col(pidx) = (r_plus - r_minus) / (2.0 * fd_eps);
-                            if (!J.col(pidx).allFinite()) J.col(pidx).setZero();
+                        const int cidx = theta_to_col[static_cast<std::size_t>(ai * 3 + pi)];
+                        if (cidx < 0) continue;
+                        if (fd_r_plus.size() == n_samples && fd_r_minus.size() == n_samples) {
+                            J.col(cidx) = (fd_r_plus - fd_r_minus) / (2.0 * fd_eps);
+                            if (!J.col(cidx).allFinite()) J.col(cidx).setZero();
                         }
                     }
                     // Restore graph params from theta (FD may have left clamps).
@@ -3589,12 +3682,13 @@ private:
                     Eigen::VectorXd AtdAw = A.transpose() * dAw;
                     Eigen::VectorXd correction = A * qr.solve(AtdAw);
                     
-                    int pidx = ai * 3 + pi;
-                    J.col(pidx) = dAw - correction;
+                    const int cidx = theta_to_col[static_cast<std::size_t>(ai * 3 + pi)];
+                    if (cidx < 0) continue;
+                    J.col(cidx) = dAw - correction;
                     // §3.410: same finite sanitization as the FD branch —
                     // clamped node outputs times large log terms can still
                     // yield non-finite entries that would poison H/g_grad.
-                    if (!J.col(pidx).allFinite()) J.col(pidx).setZero();
+                    if (!J.col(cidx).allFinite()) J.col(cidx).setZero();
                 }
             }
 
@@ -3611,7 +3705,13 @@ private:
 
             if (delta.norm() < 1e-8) break;
 
-            Eigen::VectorXd theta_trial = theta + delta;
+            // §3.407: delta is indexed by live parameter only; scatter it back
+            // onto the full theta (inert slots keep their current value, which
+            // is what a zero Jacobian column + ridge diagonal produces).
+            Eigen::VectorXd theta_trial = theta;
+            for (int k = 0; k < n_live; ++k) {
+                theta_trial(live_theta[static_cast<std::size_t>(k)]) += delta(k);
+            }
             IndividualGraph trial_graph = base_graph;
             unpack_params(trial_graph, theta_trial);
             
@@ -5129,7 +5229,16 @@ private:
 
         int n_dims = static_cast<int>(config_.input_units[0].size());
         int n_nodes = static_cast<int>(graph.nodes.size());
-        std::vector<std::vector<double>> node_units(n_nodes, std::vector<double>(n_dims, 0.0));
+        // P-44: one flat contiguous buffer instead of n_nodes separate
+        // vector<double>s. The old form paid n_nodes heap allocations (plus a
+        // temporary per unary/binary node) on every fitness evaluation, which
+        // is pure allocator traffic for a value that is immediately discarded.
+        std::vector<double> units_flat(
+            static_cast<std::size_t>(n_nodes) * static_cast<std::size_t>(n_dims), 0.0);
+        auto U = [&](int node_i, int d) -> double& {
+            return units_flat[static_cast<std::size_t>(node_i) * static_cast<std::size_t>(n_dims)
+                              + static_cast<std::size_t>(d)];
+        };
 
         // Propagate units bottom-up
         for (int i = 0; i < n_nodes; ++i) {
@@ -5137,16 +5246,16 @@ private:
             switch (node.type) {
                 case NodeType::Input:
                     if (node.feature_idx < static_cast<int>(config_.input_units.size())) {
-                        node_units[i] = config_.input_units[node.feature_idx];
+                        const auto& src = config_.input_units[node.feature_idx];
+                        for (int d = 0; d < n_dims; ++d) U(i, d) = src[d];
                     }
                     break;
                 case NodeType::Constant:
                     // Constants are dimensionless
                     break;
                 case NodeType::Unary: {
-                    std::vector<double> child_u(n_dims, 0.0);
-                    if (node.left_child >= 0 && node.left_child < n_nodes)
-                        child_u = node_units[node.left_child];
+                    const bool child_ok = node.left_child >= 0 && node.left_child < n_nodes;
+                    const int child_u = child_ok ? node.left_child : -1;
 
                     if (node.unary_op == UnaryOp::Power || node.unary_op == UnaryOp::IntPow) {
                         // x^p: multiply units by p.
@@ -5161,10 +5270,12 @@ private:
                             exp_val = static_cast<double>(std::clamp(static_cast<int>(std::round(node.p)), 2, 6));
                         }
                         for (int d = 0; d < n_dims; ++d)
-                            node_units[i][d] = child_u[d] * exp_val;
+                            U(i, d) = (child_u >= 0 ? U(child_u, d) : 0.0) * exp_val;
                     } else if (node.unary_op == UnaryOp::Abs) {
                         // abs(x) preserves units of x
-                        node_units[i] = child_u;
+                        if (child_u >= 0) {
+                            for (int d = 0; d < n_dims; ++d) U(i, d) = U(child_u, d);
+                        }
                     } else {
                         // sin, exp, log: argument must be dimensionless
                         // Result is dimensionless too
@@ -5174,11 +5285,10 @@ private:
                     break;
                 }
                 case NodeType::Binary: {
-                    std::vector<double> left_u(n_dims, 0.0), right_u(n_dims, 0.0);
-                    if (node.left_child >= 0 && node.left_child < n_nodes)
-                        left_u = node_units[node.left_child];
-                    if (node.right_child >= 0 && node.right_child < n_nodes)
-                        right_u = node_units[node.right_child];
+                    const int left_u = (node.left_child >= 0 && node.left_child < n_nodes)
+                        ? node.left_child : -1;
+                    const int right_u = (node.right_child >= 0 && node.right_child < n_nodes)
+                        ? node.right_child : -1;
 
                     if (node.binary_op == BinaryOp::Arithmetic) {
                         // §3.105: soft Arithmetic blends +,-,*,soft-div; the old
@@ -5205,25 +5315,36 @@ private:
                         if (d_sub < best) { best = d_sub; mode = 3; }
                         if (mode == 0 || mode == 3) {
                             // Addition/subtraction: units must match, result = same
-                            node_units[i] = left_u;
+                            if (left_u >= 0) {
+                                for (int d = 0; d < n_dims; ++d) U(i, d) = U(left_u, d);
+                            }
                         } else if (mode == 1) {
                             // Multiplication: add exponents
-                            for (int d = 0; d < n_dims; ++d)
-                                node_units[i][d] = left_u[d] + right_u[d];
+                            for (int d = 0; d < n_dims; ++d) {
+                                U(i, d) = (left_u >= 0 ? U(left_u, d) : 0.0)
+                                    + (right_u >= 0 ? U(right_u, d) : 0.0);
+                            }
                         } else {
                             // Soft-division x/sqrt(1+y^2): units of x minus
                             // units of a dimensionless-bounded scale; to first
                             // order this is division-like. Represent as
                             // left - right (exact for the hard-div limit).
-                            for (int d = 0; d < n_dims; ++d)
-                                node_units[i][d] = left_u[d] - right_u[d];
+                            for (int d = 0; d < n_dims; ++d) {
+                                U(i, d) = (left_u >= 0 ? U(left_u, d) : 0.0)
+                                    - (right_u >= 0 ? U(right_u, d) : 0.0);
+                            }
                         }
                     } else if (node.binary_op == BinaryOp::Division) {
                         // Division: subtract exponents
-                        for (int d = 0; d < n_dims; ++d)
-                            node_units[i][d] = left_u[d] - right_u[d];
+                        for (int d = 0; d < n_dims; ++d) {
+                            U(i, d) = (left_u >= 0 ? U(left_u, d) : 0.0)
+                                - (right_u >= 0 ? U(right_u, d) : 0.0);
+                        }
                     } else {
-                        node_units[i] = left_u; // Aggregation keeps units
+                        // Aggregation keeps units
+                        if (left_u >= 0) {
+                            for (int d = 0; d < n_dims; ++d) U(i, d) = U(left_u, d);
+                        }
                     }
                     break;
                 }
@@ -5241,8 +5362,10 @@ private:
                 // so enforcement is via the child's units: any dimensioned
                 // argument is penalized regardless of omega/phi values.
                 if (node.left_child >= 0 && node.left_child < n_nodes) {
-                    for (int d = 0; d < n_dims; ++d)
-                        penalty += node_units[node.left_child][d] * node_units[node.left_child][d];
+                    for (int d = 0; d < n_dims; ++d) {
+                        const double cu = U(node.left_child, d);
+                        penalty += cu * cu;
+                    }
                 }
             }
             if (node.type == NodeType::Binary && node.binary_op == BinaryOp::Arithmetic) {
@@ -5259,7 +5382,7 @@ private:
                     if (node.left_child >= 0 && node.right_child >= 0 &&
                         node.left_child < n_nodes && node.right_child < n_nodes) {
                         for (int d = 0; d < n_dims; ++d) {
-                            double diff = node_units[node.left_child][d] - node_units[node.right_child][d];
+                            const double diff = U(node.left_child, d) - U(node.right_child, d);
                             penalty += diff * diff;
                         }
                     }
@@ -5277,7 +5400,7 @@ private:
             for (int i = 0; i < n_nodes && i < static_cast<int>(graph.output_weights.size()); ++i) {
                 if (std::abs(graph.output_weights[i]) > kOutputWeightActive) {
                     for (int d = 0; d < n_dims && d < static_cast<int>(config_.output_units.size()); ++d) {
-                        double diff = node_units[i][d] - config_.output_units[d];
+                        const double diff = U(i, d) - config_.output_units[d];
                         penalty += diff * diff;
                     }
                 }
