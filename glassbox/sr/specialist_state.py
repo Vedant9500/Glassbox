@@ -1380,6 +1380,18 @@ def propose_specialist_compositions(
 
     # We map formula strings to candidates for quick retrieval of residual_vector
     cand_map = {c.formula: c for c in state.candidates}
+    X_arr = np.asarray(X, dtype=np.float64) if X is not None else None
+    y_arr = np.asarray(y, dtype=np.float64).reshape(-1) if y is not None else None
+
+    # §3.212: pair complementarity is scored on the rows the candidates were
+    # admitted on. Validate each proposed composition on a deterministic
+    # holdout before it can enter the proposal list, so a pair that only looks
+    # complementary in-sample cannot drive a composition.
+    holdout_idx = None
+    if X_arr is not None and y_arr is not None and y_arr.size >= 24:
+        _perm = np.random.RandomState(0).permutation(int(y_arr.size))
+        _n_hold = max(4, int(round(0.25 * float(y_arr.size))))
+        holdout_idx = _perm[:_n_hold]
 
     for pair in list(state.top_pairs)[: max(0, int(max_pairs))]:
         if float(pair.complementarity_score) < float(min_complementarity):
@@ -1631,6 +1643,30 @@ def propose_specialist_compositions(
                 )
             )
 
+        # §3.212: holdout reference for this pair (computed once per pair).
+        holdout_parent_mse = None
+        if holdout_idx is not None:
+            try:
+                _ya = np.asarray(
+                    eval_fn(pair.formula_a, X_arr[holdout_idx]), dtype=np.float64
+                ).reshape(-1)
+                _yb = np.asarray(
+                    eval_fn(pair.formula_b, X_arr[holdout_idx]), dtype=np.float64
+                ).reshape(-1)
+                _yh = y_arr[holdout_idx]
+                if (
+                    _ya.shape == _yh.shape
+                    and _yb.shape == _yh.shape
+                    and np.all(np.isfinite(_ya))
+                    and np.all(np.isfinite(_yb))
+                ):
+                    holdout_parent_mse = min(
+                        float(np.mean((_ya - _yh) ** 2)),
+                        float(np.mean((_yb - _yh) ** 2)),
+                    )
+            except Exception:
+                holdout_parent_mse = None
+
         # Grade templates by training MSE and complexity
         candidate_templates = []
         for operator, formula in forms:
@@ -1648,6 +1684,37 @@ def propose_specialist_compositions(
                     mse_val = float("inf")
             else:
                 mse_val = 0.0
+
+            # §3.212: rank by out-of-sample fit and reject compositions that
+            # lose to the better parent on the holdout (2% tolerance for the
+            # simplicity trade-off). Skip the filter when a parent is already
+            # exact on the holdout: no composition can beat it, and dropping
+            # every proposal there would only remove harmless alternatives.
+            if (
+                holdout_idx is not None
+                and holdout_parent_mse is not None
+                and holdout_parent_mse > 1e-12
+            ):
+                try:
+                    _pred_h = np.asarray(
+                        eval_fn(formula, X_arr[holdout_idx]), dtype=np.float64
+                    ).reshape(-1)
+                    _yh = y_arr[holdout_idx]
+                    if (
+                        _pred_h.shape == _yh.shape
+                        and np.all(np.isfinite(_pred_h))
+                    ):
+                        mse_h = float(np.mean((_pred_h - _yh) ** 2))
+                        if (
+                            np.isfinite(mse_h)
+                            and mse_h
+                            > holdout_parent_mse * 1.02 + 1e-12
+                        ):
+                            continue
+                        if np.isfinite(mse_h):
+                            mse_val = mse_h
+                except Exception:
+                    pass
 
             # Reject too complex templates
             # M-31: string length mixes lexical formatting with structure

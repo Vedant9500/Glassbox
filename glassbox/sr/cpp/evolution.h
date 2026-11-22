@@ -32,6 +32,52 @@ enum class LossMode {
     StudentT = 3,
 };
 
+// §3.103: robust NSGA-II crowding distances for three objectives.
+// Returns one distance per individual, in the same order as the inputs.
+// Boundary individuals on any objective get 1e18 (they are always kept).
+// Interior gaps are divided by a 10th..90th percentile range, so one diverged
+// objective value (raw_mse 1e9) can no longer inflate the denominator and
+// flatten every other individual's distance to ~0. The full span is still used
+// when the robust range is degenerate.
+inline std::vector<double> robust_crowding_distances(
+    const std::vector<double>& obj0,
+    const std::vector<double>& obj1,
+    const std::vector<double>& obj2) {
+    const int n = static_cast<int>(obj0.size());
+    std::vector<double> dist(static_cast<size_t>(n), 0.0);
+    if (n == 0) return dist;
+    if (n <= 2) {
+        for (auto& d : dist) d = 1e18;
+        return dist;
+    }
+    auto apply = [&](const std::vector<double>& vals, double min_range) {
+        std::vector<int> order(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) order[i] = i;
+        std::stable_sort(order.begin(), order.end(),
+                         [&](int a, int b) { return vals[a] < vals[b]; });
+        dist[order.front()] = std::max(dist[order.front()], 1e18);
+        dist[order.back()] = std::max(dist[order.back()], 1e18);
+        std::vector<double> sorted_vals(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) sorted_vals[i] = vals[order[i]];
+        const int lo = static_cast<int>(0.1 * static_cast<double>(n - 1));
+        const int hi = static_cast<int>(0.9 * static_cast<double>(n - 1));
+        double range = sorted_vals[hi] - sorted_vals[lo];
+        if (range <= min_range) {
+            range = sorted_vals.back() - sorted_vals.front();
+        }
+        if (range <= min_range) return;
+        for (int i = 1; i < n - 1; ++i) {
+            double contrib = (vals[order[i + 1]] - vals[order[i - 1]]) / range;
+            if (contrib < 0.0) contrib = 0.0;
+            dist[order[i]] += contrib;
+        }
+    };
+    apply(obj0, 1e-15);
+    apply(obj1, 1e-15);
+    apply(obj2, 0.5);
+    return dist;
+}
+
 // FC-1: process-global OpenMP active-level state must not be mutated
 // concurrently from GIL-released threads. Serialize configuration with a
 // process-wide mutex and restore via RAII (exception-safe).
@@ -495,6 +541,13 @@ public:
     int get_last_island_inner_threads() const { return last_island_inner_threads_; }
     bool get_last_crossover_valid() const { return last_crossover_valid_; }
     int get_crossover_attempts() const { return crossover_attempts_; }
+    // §3.418: crossover calls whose retries all failed and fell back to a
+    // full-rate mutation of parent A instead of a parent clone.
+    int get_crossover_fallback_mutations() const { return crossover_fallback_mutations_; }
+    // §3.139: trimmed-IRLS rows hard-dropped to match the fitness surrogate,
+    // and solves that had to fall back to the soft 1e-6 weights.
+    int get_trimmed_hard_drops() const { return trimmed_hard_drops_; }
+    int get_trimmed_soft_fallbacks() const { return trimmed_soft_fallbacks_; }
     // M-283: prior entries zeroed by sanitize (>= 0; islands sum at join).
     int get_prior_entries_sanitized() const { return prior_entries_sanitized_; }
     // S3.283: prior slots zeroed for contradicting allowed masks.
@@ -839,6 +892,8 @@ public:
             consider_champion(best);
             crossover_attempts_ += island.get_crossover_attempts();
             crossover_successes_ += island.get_crossover_successes();
+            trimmed_hard_drops_ += island.get_trimmed_hard_drops();
+            trimmed_soft_fallbacks_ += island.get_trimmed_soft_fallbacks();
             // M-251: sum island failure reasons alongside attempts/successes.
             crossover_failures_size_ += island.get_crossover_failures_size();
             crossover_failures_topology_ += island.get_crossover_failures_topology();
@@ -912,6 +967,9 @@ private:
     bool trace_enabled_ = false;
     bool last_crossover_valid_ = false;
     int crossover_attempts_ = 0;
+    int crossover_fallback_mutations_ = 0;
+    int trimmed_hard_drops_ = 0;
+    int trimmed_soft_fallbacks_ = 0;
     // §3.426: last generation's effective explorer/main split.
     int last_num_explorers_ = 0;
     int last_main_pop_target_ = 0;
@@ -2963,28 +3021,44 @@ private:
                     rw(i) = (a <= d || a < 1e-15) ? 1.0 : (d / a);
                 }
             } else if (config_.loss_mode == LossMode::TrimmedMse) {
-                // §3.362: the IRLS fit keeps dropped samples at soft weight
-                // 1e-6 (matrix stays invertible) and renormalizes the mean to
-                // ~1 below, while the fitness objective hard-excludes the top
-                // fraction by count. The coefficients therefore optimize a
-                // softer surrogate than the accepting objective — documented,
-                // not aligned: hardening the fit weights to 0 risks singular
-                // normal equations on small fronts.
+                // §3.139: the trimmed IRLS surrogate now matches the fitness
+                // objective exactly — the same by-mass (weighted) / by-count
+                // (unweighted) keep rule, and a HARD zero weight on dropped
+                // rows instead of the old 1e-6 soft weight. trim_fraction is
+                // capped at 0.45, so at least 55% of the rows stay in the
+                // solve; if the hard-trim system still fails, the IRLS loop
+                // retries with the soft weights (counted, not silent).
                 Eigen::ArrayXd sq = resid.square();
                 double frac = std::clamp(config_.trim_fraction, 0.0, 0.45);
-                int drop = static_cast<int>(std::llround(n_samples * frac));
-                drop = std::clamp(drop, 0, std::max(0, n_samples - 1));
-                if (drop > 0) {
-                    std::vector<int> order(static_cast<size_t>(n_samples));
-                    for (int i = 0; i < n_samples; ++i) order[static_cast<size_t>(i)] = i;
-                    std::partial_sort(
-                        order.begin(),
-                        order.begin() + drop,
-                        order.end(),
-                        [&](int a, int b) { return sq(a) > sq(b); }
-                    );
+                std::vector<int> order(static_cast<size_t>(n_samples));
+                for (int i = 0; i < n_samples; ++i) order[static_cast<size_t>(i)] = i;
+                std::sort(order.begin(), order.end(),
+                          [&](int a, int b) { return sq(a) > sq(b); });
+                if (has_y_weights_ && y_weights_.size() == n_samples) {
+                    double w_total = 0.0;
+                    for (int i = 0; i < n_samples; ++i) {
+                        double w = y_weights_(i);
+                        if (std::isfinite(w) && w > 0.0) w_total += w;
+                    }
+                    if (w_total > 0.0) {
+                        const double drop_mass = w_total * frac;
+                        double removed = 0.0;
+                        for (int k = 0; k < n_samples && removed < drop_mass; ++k) {
+                            int i = order[static_cast<size_t>(k)];
+                            double w = y_weights_(i);
+                            if (!std::isfinite(w) || w <= 0.0) continue;
+                            rw(i) = 0.0;
+                            removed += w;
+                            ++trimmed_hard_drops_;
+                        }
+                    }
+                } else {
+                    int keep = std::max(
+                        1, static_cast<int>(std::llround(n_samples * (1.0 - frac))));
+                    int drop = std::clamp(n_samples - keep, 0, n_samples - 1);
                     for (int k = 0; k < drop; ++k) {
-                        rw(order[static_cast<size_t>(k)]) = 1e-6; // soft zero (keep matrix invertible)
+                        rw(order[static_cast<size_t>(k)]) = 0.0;
+                        ++trimmed_hard_drops_;
                     }
                 }
             } else if (config_.loss_mode == LossMode::StudentT) {
@@ -3021,7 +3095,19 @@ private:
             const double mean_w = (base_w * rw).mean();
             const double norm = (mean_w > 0.0 && std::isfinite(mean_w)) ? mean_w : 1.0;
             Eigen::VectorXd w_next;
-            if (!ridge_solve(rw, norm, w_next)) { irls_ok = false; break; }
+            bool solved = ridge_solve(rw, norm, w_next);
+            if (!solved && config_.loss_mode == LossMode::TrimmedMse) {
+                // §3.139 fallback: hard trim left too few independent rows for
+                // the ridge solve. Soften the dropped rows to the legacy 1e-6
+                // surrogate and count it instead of aborting the IRLS chain.
+                Eigen::ArrayXd soft = rw;
+                for (int i = 0; i < n_samples; ++i) {
+                    if (soft(i) == 0.0) soft(i) = 1e-6;
+                }
+                solved = ridge_solve(soft, norm, w_next);
+                if (solved) ++trimmed_soft_fallbacks_;
+            }
+            if (!solved) { irls_ok = false; break; }
             // §3.137: stop when the IRLS fixed point settles instead of
             // always running the full fixed iteration budget.
             double w_change = (w_next - w).cwiseAbs().maxCoeff();
@@ -4927,62 +5013,19 @@ private:
     // Assigns crowding_distance to individuals within the same Pareto front.
     // 3 objectives: raw_mse, complexity, age (AFPO).
     void crowding_distance_assignment(std::vector<IndividualGraph*>& front) {
-        int n = static_cast<int>(front.size());
-        if (n == 0) return;
-
-        for (auto* ind : front) ind->crowding_distance = 0.0;
-        if (n <= 2) {
-            for (auto* ind : front) ind->crowding_distance = 1e18;
-            return;
+        if (front.empty()) return;
+        std::vector<double> mse(front.size());
+        std::vector<double> complexity(front.size());
+        std::vector<double> age(front.size());
+        for (size_t i = 0; i < front.size(); ++i) {
+            mse[i] = front[i]->raw_mse;
+            complexity[i] = static_cast<double>(front[i]->active_complexity());
+            age[i] = static_cast<double>(front[i]->age);
         }
-
-        // For each objective, sort and compute distance
-        // §3.101: boundary handling is standard NSGA-II (each objective
-        // promotes its own extrema). Assignment uses max() so a prior
-        // objective's infinity is never lost when repositioned as middle;
-        // middle contributions only accumulate on top of 1e18.
-        // Objective 0: raw_mse
-        std::sort(front.begin(), front.end(),
-                  [](const IndividualGraph* a, const IndividualGraph* b) {
-                      return a->raw_mse < b->raw_mse;
-                  });
-        front.front()->crowding_distance = std::max(front.front()->crowding_distance, 1e18);
-        front.back()->crowding_distance = std::max(front.back()->crowding_distance, 1e18);
-        double mse_range = front.back()->raw_mse - front.front()->raw_mse;
-        if (mse_range > 1e-15) {
-            for (int i = 1; i < n - 1; ++i) {
-                front[i]->crowding_distance += (front[i+1]->raw_mse - front[i-1]->raw_mse) / mse_range;
-            }
-        }
-
-        // Objective 1: complexity
-        std::sort(front.begin(), front.end(),
-                  [](const IndividualGraph* a, const IndividualGraph* b) {
-                      return a->active_complexity() < b->active_complexity();
-                  });
-        front.front()->crowding_distance = std::max(front.front()->crowding_distance, 1e18);
-        front.back()->crowding_distance = std::max(front.back()->crowding_distance, 1e18);
-        double comp_range = front.back()->active_complexity() - front.front()->active_complexity();
-        if (comp_range > 1e-15) {
-            for (int i = 1; i < n - 1; ++i) {
-                front[i]->crowding_distance += static_cast<double>(
-                    front[i+1]->active_complexity() - front[i-1]->active_complexity()) / comp_range;
-            }
-        }
-
-        // Objective 2: age (AFPO)
-        std::sort(front.begin(), front.end(),
-                  [](const IndividualGraph* a, const IndividualGraph* b) {
-                      return a->age < b->age;
-                  });
-        front.front()->crowding_distance = std::max(front.front()->crowding_distance, 1e18);
-        front.back()->crowding_distance = std::max(front.back()->crowding_distance, 1e18);
-        double age_range = static_cast<double>(front.back()->age - front.front()->age);
-        if (age_range > 0.5) {
-            for (int i = 1; i < n - 1; ++i) {
-                front[i]->crowding_distance += static_cast<double>(
-                    front[i+1]->age - front[i-1]->age) / age_range;
-            }
+        const std::vector<double> distances =
+            robust_crowding_distances(mse, complexity, age);
+        for (size_t i = 0; i < front.size(); ++i) {
+            front[i]->crowding_distance = distances[i];
         }
     }
 
@@ -5055,7 +5098,15 @@ private:
                     int p1 = p_dist(rng_), p2 = p_dist(rng_);
                     while (p2 == p1) p2 = p_dist(rng_);
                     child = crossover_with_retry(population_[p1], population_[p2], 3);
-                    child = mutate_lamarckian(child, scheduled_mutation_rate * 0.3);
+                    if (last_crossover_valid_) {
+                        child = mutate_lamarckian(child, scheduled_mutation_rate * 0.3);
+                    } else {
+                        // §3.418: no valid graft survived the retries. Do not
+                        // let the returned parent-A clone enter as an offspring;
+                        // run a full-rate mutation of parent A instead.
+                        ++crossover_fallback_mutations_;
+                        child = mutate_lamarckian(population_[p1], scheduled_mutation_rate);
+                    }
                 } else {
                     child = mutate_lamarckian(population_[p_dist(rng_)], scheduled_mutation_rate);
                 }
@@ -5167,7 +5218,14 @@ private:
                 int p2 = parent_dist(rng_);
                 while (p2 == p1) p2 = parent_dist(rng_);
                 child = crossover_with_retry(population_[p1], population_[p2], 3);
-                child = mutate_lamarckian(child, scheduled_mutation_rate * 0.3);
+                if (last_crossover_valid_) {
+                    child = mutate_lamarckian(child, scheduled_mutation_rate * 0.3);
+                } else {
+                    // §3.418: same fallback as the main loop — a failed graft
+                    // must not re-enter the pool as an unmutated parent clone.
+                    ++crossover_fallback_mutations_;
+                    child = mutate_lamarckian(population_[p1], scheduled_mutation_rate);
+                }
             } else {
                 int parent_idx = tournament_select();
                 child = mutate_lamarckian(population_[parent_idx], scheduled_mutation_rate);

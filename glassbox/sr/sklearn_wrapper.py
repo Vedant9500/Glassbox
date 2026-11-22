@@ -4312,12 +4312,35 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             self.inception_diagnostics_["last_reject_reason"] = str(reason)
 
         base_feature_count = int(X_base.shape[1])
+        # §3.196: select frozen subexpressions and fit the augmented basis on a
+        # fit split, then accept only on the untouched validation rows. The old
+        # path chose frozen features on all rows and let _fit_blackbox_basis_model
+        # refit its final coefficients on all rows, so the "holdout" gate below
+        # was not out-of-sample for feature/coefficient selection.
+        selection_split = None
+        try:
+            selection_split = self._split_blackbox_holdout(
+                X_base, y_arr, validation_fraction=0.2
+            )
+        except Exception:
+            selection_split = None
+        if selection_split is not None:
+            sel_X = np.asarray(selection_split["X_fit"], dtype=np.float64)
+            sel_y = np.asarray(selection_split["y_fit"], dtype=np.float64).reshape(-1)
+            self.inception_diagnostics_["selection_split"] = "shuffled_holdout"
+            self.inception_diagnostics_["selection_fit_rows"] = int(sel_X.shape[0])
+            self.inception_diagnostics_["selection_val_rows"] = int(
+                np.asarray(selection_split["y_val"]).reshape(-1).shape[0]
+            )
+        else:
+            sel_X, sel_y = X_base, y_arr
+            self.inception_diagnostics_["selection_split"] = "full_data_fallback"
         rounds = int(getattr(self, "max_inception_rounds", 2) or 0)
         for round_idx in range(rounds):
             frozen = self._extract_frozen_subexpressions(
                 current_formula,
-                X_base,
-                y_arr,
+                sel_X,
+                sel_y,
                 max_subexpressions=int(
                     getattr(self, "max_frozen_subexpressions", 3) or 0
                 ),
@@ -4327,7 +4350,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 _record_inception_reject("no_frozen_subexpressions")
                 break
 
-            X_aug = np.column_stack([X_base] + [item["values"] for item in frozen])
+            X_aug = np.column_stack([sel_X] + [item["values"] for item in frozen])
             frozen_formulas = [item["formula"] for item in frozen]
             pool = self._build_inception_basis_pool(base_feature_count, frozen_formulas)
             # §3.195: no public-state mutation — the augmented fit path is
@@ -4337,7 +4360,7 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             # sklearn width stays original throughout (S1-4 precedent).
             candidate = self._fit_blackbox_basis_model(
                 X_aug,
-                y_arr,
+                sel_y,
                 pool,
                 max_terms=max(2, min(5, base_feature_count + len(frozen))),
             )
@@ -4353,55 +4376,71 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             try:
                 expanded = self._cleanup_formula_with_fidelity_guard(
                     expanded,
-                    X_base,
-                    y_arr,
+                    sel_X,
+                    sel_y,
                     stage="inception_reuse",
                 )
                 pred = self._safe_eval_formula_array(expanded, X_base).reshape(-1)
                 mse = float(np.mean((pred - y_arr) ** 2))
+                # §3.196: the improvement gate is measured on the same fit rows
+                # the frozen basis and coefficients were selected on; the
+                # untouched validation rows judge acceptance below.
+                _sel_cur = np.asarray(
+                    self._safe_eval_formula_array(current_formula, sel_X),
+                    dtype=np.float64,
+                ).reshape(-1)
+                _sel_exp = np.asarray(
+                    self._safe_eval_formula_array(expanded, sel_X),
+                    dtype=np.float64,
+                ).reshape(-1)
+                sel_current_mse = float(np.mean((_sel_cur - sel_y) ** 2))
+                sel_mse = float(np.mean((_sel_exp - sel_y) ** 2))
             except Exception:
                 _record_inception_reject(
                     "candidate_eval_failed",
                     candidate=candidate.get("formula"),
                 )
                 break
-            if not np.isfinite(mse):
+            if (
+                not np.isfinite(mse)
+                or not np.isfinite(sel_mse)
+                or not np.isfinite(sel_current_mse)
+            ):
                 _record_inception_reject(
                     "nonfinite_mse", candidate=candidate.get("formula")
                 )
                 break
             improvement = current_mse - mse
-            if improvement <= max(1e-9, 0.01 * max(current_mse, 1e-9)):
+            sel_improvement = sel_current_mse - sel_mse
+            if sel_improvement <= max(
+                1e-9, 0.01 * max(sel_current_mse, 1e-9)
+            ):
                 _record_inception_reject(
-                    "insufficient_improvement",
+                    "insufficient_selection_improvement",
                     candidate=candidate.get("formula"),
                     mse=float(mse),
                 )
                 break
-            # §3.194: train-only acceptance overfits the frozen basis — gate
-            # the expansion on a shuffled holdout split as well. The basis
-            # selection inside _fit_blackbox_basis_model is already
-            # val-gated; this guards the final augmented acceptance.
-            inception_val = self._split_blackbox_holdout(
-                X_base, y_arr, validation_fraction=0.2
-            )
+            # §3.194/§3.196: final acceptance is judged only on the untouched
+            # validation rows of the selection split. No fresh split is drawn
+            # here — that would reuse rows the basis fit already saw.
             val_mse_current = val_mse_expanded = None
-            if inception_val is not None:
+            if selection_split is not None:
                 try:
                     _cur_val = np.asarray(
                         self._safe_eval_formula_array(
-                            current_formula, inception_val["X_val"]
+                            current_formula, selection_split["X_val"]
                         ),
                         dtype=np.float64,
                     ).reshape(-1)
                     _exp_val = np.asarray(
                         self._safe_eval_formula_array(
-                            expanded, inception_val["X_val"]
+                            expanded, selection_split["X_val"]
                         ),
                         dtype=np.float64,
                     ).reshape(-1)
                     _yv = np.asarray(
-                        inception_val["y_val"], dtype=np.float64
+                        selection_split["y_val"], dtype=np.float64
                     ).reshape(-1)
                     val_mse_current = float(np.mean((_cur_val - _yv) ** 2))
                     val_mse_expanded = float(np.mean((_exp_val - _yv) ** 2))
@@ -4436,6 +4475,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 "previous_mse": float(current_mse),
                 "mse": float(mse),
                 "improvement": float(improvement),
+                "selection_fit_mse_current": float(sel_current_mse),
+                "selection_fit_mse_expanded": float(sel_mse),
+                "selection_fit_improvement": float(sel_improvement),
                 "val_mse_current": val_mse_current,
                 "val_mse_expanded": val_mse_expanded,
             }
@@ -4539,11 +4581,11 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         hard mode drops incompatible formulas when units infer successfully.
         soft mode keeps all but sorts physical formulas first and records penalty.
-        Sort policy (§3.204): soft sorts by (penalty if inference ok else 1e3,
-        mse, complexity) — inference failures tie at the fixed 1e3 cutoff, so
-        a successful but highly unphysical formula (penalty > 1e3) ranks behind
-        every failure regardless of fit. The cutoff is undocumented-scale;
-        failures are always fail-open (never rejected, §3.205).
+        Sort policy (§3.204): soft sorts by (inference-ok rank, penalty, mse,
+        complexity) — inference failures are always last, independent of the
+        penalty scale. Previously failures used a fixed 1e3 cutoff, so a
+        successful but highly unphysical formula (penalty > 1e3) ranked behind
+        every failure. Failures are always fail-open (never rejected, §3.205).
         Never applies penalties when inference is unsafe.
         """
         if not candidate_formulas:
@@ -4555,6 +4597,21 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         mode = _validate_unit_mode(
             getattr(self, "effective_unit_mode_", getattr(self, "unit_mode", "soft"))
         )
+        # P-67: unit inference tokenizes/parses each formula and the same
+        # formula is filtered repeatedly across candidate pools. Cache the
+        # result by formula + active unit signature, bounded FIFO.
+        cache = getattr(self, "_unit_inference_cache_", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._unit_inference_cache_ = cache
+        try:
+            unit_key = (
+                tuple(tuple(float(v) for v in row) for row in (iu or [])),
+                tuple(float(v) for v in (ou or [])),
+            )
+        except Exception:
+            unit_key = (str(iu), str(ou))
+        cache_prefix = (mode, unit_key)
         kept = []
         rejected = []
         inference_failures = 0
@@ -4563,7 +4620,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             formula = str((cand or {}).get("formula", "")).strip()
             if not formula:
                 continue
-            ok, info = _formula_unit_compatible(formula, iu, ou, unit_mode=mode)
+            cache_key = cache_prefix + (formula,)
+            cached = cache.get(cache_key)
+            if cached is None:
+                ok, info = _formula_unit_compatible(formula, iu, ou, unit_mode=mode)
+                cache[cache_key] = (bool(ok), dict(info))
+                if len(cache) > 4096:
+                    cache.pop(next(iter(cache)))
+            else:
+                ok, info = cached
             merged = dict(cand)
             merged["unit_penalty"] = float(info.get("penalty") or 0.0)
             merged["unit_ok"] = bool(info.get("ok"))
@@ -4588,9 +4653,15 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                     }
                 )
         if mode == "soft":
+            # §3.204: put inference failures last explicitly. The old key used
+            # a fixed 1e3 penalty for failures, so a successfully-inferred but
+            # highly unphysical candidate (penalty > 1e3) ranked *behind*
+            # every failure regardless of fit. The first component is now a
+            # boolean rank, and the penalty is only compared within a group.
             kept.sort(
                 key=lambda c: (
-                    float(c.get("unit_penalty") or 0.0) if c.get("unit_ok") else 1e3,
+                    0 if c.get("unit_ok") else 1,
+                    float(c.get("unit_penalty") or 0.0),
                     _finite_float(c.get("mse"), float("inf")),
                     _finite_float(c.get("complexity"), float("inf")),
                 )
@@ -8833,6 +8904,63 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return formula
         return candidate
 
+    def _simplify_pareto_front(self, front, X, y):
+        """§3.277: apply the export cleanup to Pareto strings too.
+
+        The engine returns raw graph strings while the selected formula goes
+        through ``_cleanup_formula_with_fidelity_guard``. Pareto rows therefore
+        described a different function than the one that could be exported.
+        Each row is simplified with the same guarded cleanup, re-scored on the
+        display contract (§3.272), and keeps the original when variable tokens
+        would be renamed (the public ``x0``/``x1`` convention).
+        """
+        if not front:
+            return front
+        out = []
+        changed = 0
+        token_re = re.compile(r"\bx\d*\b")
+        for item in front:
+            if not isinstance(item, dict):
+                out.append(item)
+                continue
+            formula = str(item.get("formula", "") or "").strip()
+            if not formula:
+                out.append(item)
+                continue
+            try:
+                simplified = str(
+                    self._cleanup_formula_with_fidelity_guard(
+                        formula, X, y, stage="pareto_export"
+                    )
+                    or ""
+                ).strip()
+            except Exception:
+                simplified = formula
+            if (
+                not simplified
+                or simplified == formula
+                or set(token_re.findall(formula))
+                != set(token_re.findall(simplified))
+            ):
+                out.append(item)
+                continue
+            entry = dict(item)
+            entry["formula"] = simplified
+            entry["pre_simplify_formula"] = formula
+            try:
+                entry["mse"] = float(self._display_formula_mse(simplified, X, y))
+            except Exception:
+                entry["mse"] = item.get("mse", float("inf"))
+            entry["complexity"] = self._formula_complexity(simplified)
+            out.append(entry)
+            changed += 1
+        if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
+            self.blackbox_diagnostics_["pareto_export_simplification"] = {
+                "entries": len(out),
+                "changed": int(changed),
+            }
+        return out
+
     def _stage_residual_symbolic_fit(
         self, X, y, base_formula, *, _allow_recursion=False
     ):
@@ -11803,7 +11931,9 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                                 "random_seed"
                             )
                             if "pareto_front" in best_cpp_result:
-                                self.pareto_front_ = best_cpp_result["pareto_front"]
+                                self.pareto_front_ = self._simplify_pareto_front(
+                                    best_cpp_result["pareto_front"], X, y
+                                )
                     except Exception as e:
                         # H-10: surface C++ evolution failures on the estimator.
                         self.evolution_error_ = (

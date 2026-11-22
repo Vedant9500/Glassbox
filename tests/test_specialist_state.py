@@ -586,3 +586,40 @@ def test_compute_specialist_state_ranks_before_slice():
     assert state is not None
     formula_best = state.hot_spot_base_formula
     assert formula_best == "x0^2"
+
+
+def test_pair_compositions_validated_out_of_sample():
+    """§3.212: a composition that loses to its better parent on holdout is dropped.
+
+    x0 and x1 are complementary for y=x0+x1. The additive composition is exact
+    on the holdout, while the product is much worse there; the product must not
+    be proposed even though it is an operator-diversity candidate.
+    """
+    rng = np.random.RandomState(1)
+    X = rng.uniform(-1.0, 1.0, size=(100, 2))
+    y = X[:, 0] + X[:, 1]
+    state = compute_specialist_state(
+        [
+            {"formula": "x0", "validation_mse": 0.5, "validation_r2": 0.5},
+            {"formula": "x1", "validation_mse": 0.5, "validation_r2": 0.5},
+        ],
+        X,
+        y,
+        evaluate_formula=_eval_formula,
+        complexity_fn=lambda formula: 3,
+        family_signature_fn=lambda formula: str(formula)[:2],
+        max_candidates=2,
+        max_pairs=2,
+    )
+    assert state is not None
+    proposals = propose_specialist_compositions(
+        state,
+        X,
+        y,
+        evaluate_formula=_eval_formula,
+        max_pairs=2,
+        min_complementarity=0.0,
+    )
+    operators = {proposal.operator for proposal in proposals}
+    assert "add" in operators
+    assert "mul" not in operators

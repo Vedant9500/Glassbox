@@ -608,6 +608,16 @@ class StructureConfidenceTracker:
             self.best_mse_seen = mse
             self.last_improvement_gen = generation
 
+        # Update stability counter before computing confidence (§3.90). The
+        # old order scored this generation with last generation's counter, so
+        # reported confidence always lagged one generation behind the evidence
+        # it was supposed to describe.
+        prev_generations_stable = self.generations_stable
+        if correlation > self.CORR_THRESHOLD_HIGH and mse < self.mse_threshold:
+            self.generations_stable += 1
+        else:
+            self.generations_stable = max(0, self.generations_stable - 1)
+
         # Compute individual confidence components
         corr_confidence = self._correlation_confidence(correlation)
         mse_confidence = self._mse_confidence(mse)
@@ -616,13 +626,14 @@ class StructureConfidenceTracker:
         # Validation bonus (if available)
         # M-131: a single validation_corr > 0.98 used to award +0.1 with no
         # stability evidence, pushing capped confidence on noise. Require at
-        # least one stable generation first (uses the prior-gen counter, same
-        # one-generation lag documented for the stability update below).
+        # least one stable generation BEFORE this one (the prior-generation
+        # counter is kept deliberately, even though stability confidence now
+        # uses the freshly updated counter).
         val_bonus = 0.0
         if (
             validation_corr is not None
             and validation_corr > 0.98
-            and self.generations_stable > 0
+            and prev_generations_stable > 0
         ):
             val_bonus = 0.1  # Extra confidence if validation is good
 
@@ -635,12 +646,6 @@ class StructureConfidenceTracker:
             + val_bonus
         )
         self.confidence = min(1.0, self.confidence)  # Cap at 1.0
-
-        # Update stability counter
-        if correlation > self.CORR_THRESHOLD_HIGH and mse < self.mse_threshold:
-            self.generations_stable += 1
-        else:
-            self.generations_stable = max(0, self.generations_stable - 1)
 
         return self.confidence
 

@@ -173,3 +173,65 @@ def test_cpp_no_units_unchanged_api():
         [x], y, pop_size=10, generations=5, early_stop_mse=1e-8, random_seed=2
     )
     assert "formula" in result
+
+
+def test_soft_filter_puts_inference_failures_last():
+    """§3.204: a high-penalty but successfully-inferred candidate outranks a
+    formula whose units could not be inferred at all."""
+    est = GlassboxRegressor(
+        random_state=0,
+        input_units=[[40.0], [0.0]],
+        output_units=[0.0],
+        unit_mode="soft",
+        dim_penalty_weight=1.0,
+    )
+    est.n_features_in_ = 2
+    est.blackbox_diagnostics_ = {}
+    est._activate_physics_units(2)
+    cands = [
+        # ok=True, penalty 1600 (above the old fixed 1e3 failure cutoff)
+        {"formula": "x0+x1", "mse": 0.5, "complexity": 2},
+        # inference failure: atan2 has two arguments
+        {"formula": "atan2(x0,x1)", "mse": 1e-6, "complexity": 2},
+        # ok=True, penalty 0
+        {"formula": "x1", "mse": 0.9, "complexity": 1},
+    ]
+    kept = est._filter_candidates_by_units(cands)
+    assert [c["formula"] for c in kept] == ["x1", "x0+x1", "atan2(x0,x1)"]
+    assert kept[0]["unit_ok"] is True
+    assert kept[1]["unit_penalty"] > 1e3
+    assert kept[2]["unit_ok"] is False
+
+
+def test_unit_inference_cached_across_filter_calls(monkeypatch):
+    """P-67: repeated filtering does not re-parse the same formulas."""
+    import glassbox.sr.sklearn_wrapper as sw
+
+    est = GlassboxRegressor(
+        random_state=0,
+        input_units=[[0, 1, 0], [0, 0, 1]],
+        output_units=[0, 1, -1],
+        unit_mode="soft",
+        dim_penalty_weight=1.0,
+    )
+    est.n_features_in_ = 2
+    est.blackbox_diagnostics_ = {}
+    est._activate_physics_units(2)
+    cands = [
+        {"formula": "x0/x1", "mse": 1.0, "complexity": 3},
+        {"formula": "x0+x1", "mse": 0.1, "complexity": 3},
+    ]
+
+    calls = {"n": 0}
+    original = sw._formula_unit_compatible
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(sw, "_formula_unit_compatible", counting)
+    est._filter_candidates_by_units(cands)
+    first = calls["n"]
+    est._filter_candidates_by_units(cands)
+    assert first == len(cands)
+    assert calls["n"] == first

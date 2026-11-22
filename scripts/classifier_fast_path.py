@@ -551,6 +551,27 @@ def _evaluate_formula_values(formula: str, x_np: np.ndarray) -> np.ndarray | Non
         return None
 
 
+def _domain_edge_holdout_indices(x, holdout_fraction):
+    """Indices held out at the domain edges for the fast-path acceptance gate.
+
+    Univariate inputs take both tails of the sorted values. Multivariate
+    inputs rank rows by distance from the feature centroid and must also take
+    both tails: holding only the farthest rows is a one-tailed extrapolation
+    split (§3.36), so low-edge behaviour is never validated.
+    """
+    x = np.asarray(x)
+    n = int(len(x))
+    n_edge = max(1, int(n * float(holdout_fraction) / 2))
+    if x.ndim == 2 and x.shape[1] > 1:
+        x_center = x.mean(axis=0)
+        dists = np.linalg.norm(x - x_center, axis=1)
+        order = np.argsort(dists)
+        return np.unique(np.concatenate([order[:n_edge], order[-n_edge:]]))
+    x_flat = x.ravel() if x.ndim == 1 else x[:, 0]
+    order = np.argsort(x_flat)
+    return np.unique(np.concatenate([order[:n_edge], order[-n_edge:]]))
+
+
 def _shortcut_holdout_mse(formula, x_holdout, y_holdout, holdout_mask):
     """§3.37: evaluate (not fabricate) holdout MSE for symbolic shortcuts.
 
@@ -2723,17 +2744,7 @@ def fast_path_regression(
 
     if holdout_fraction > 0 and x.ndim <= 2:
         n = len(y)
-        n_edge = max(1, int(n * holdout_fraction / 2))
-        if x.ndim == 2 and x.shape[1] > 1:
-            # Multi-input: hold out based on L2 norm from center
-            x_center = x.mean(axis=0)
-            dists = np.linalg.norm(x - x_center, axis=1)
-            order = np.argsort(dists)
-            holdout_indices = np.concatenate([order[-n_edge:]])
-        else:
-            x_flat = x.ravel() if x.ndim == 1 else x[:, 0]
-            order = np.argsort(x_flat)
-            holdout_indices = np.concatenate([order[:n_edge], order[-n_edge:]])
+        holdout_indices = _domain_edge_holdout_indices(x, holdout_fraction)
 
         holdout_mask = np.zeros(n, dtype=bool)
         holdout_mask[holdout_indices] = True

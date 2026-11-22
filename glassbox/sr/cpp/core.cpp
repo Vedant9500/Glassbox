@@ -1342,6 +1342,9 @@ static py::dict run_evolution_cpp(
     result["last_crossover_valid"] = engine.get_last_crossover_valid();
     result["crossover_attempts"] = engine.get_crossover_attempts();
     result["crossover_successes"] = engine.get_crossover_successes();
+    result["crossover_fallback_mutations"] = engine.get_crossover_fallback_mutations();
+    result["trimmed_irls_hard_drops"] = engine.get_trimmed_hard_drops();
+    result["trimmed_irls_soft_fallbacks"] = engine.get_trimmed_soft_fallbacks();
     result["crossover_valid_rate"] = engine.get_crossover_valid_rate();
     // M-251: failure-reason breakdown (was attempts-only).
     result["crossover_failures_size"] = engine.get_crossover_failures_size();
@@ -2116,6 +2119,11 @@ PYBIND11_MODULE(_core, m) {
           py::arg("y_weights") = py::none(),
           py::arg("holdout_fraction") = 0.0,
           py::arg("relative_slack") = 0.10);
+    // §3.103: robust crowding normalization is exposed for regression tests
+    // and diagnostics; the evolution loop uses the same free function.
+    m.def("robust_crowding_distances", &sr::robust_crowding_distances,
+          py::arg("objective_0"), py::arg("objective_1"), py::arg("objective_2"),
+          "Robust NSGA-II crowding distances for three objectives");
     // §3.391: build manifest — lets Python verify the loaded binary matches
     // current source (git commit), toolchain (C++ standard, OpenMP), and age.
 #ifndef GB_BUILD_COMMIT
