@@ -1669,6 +1669,9 @@ def propose_specialist_compositions(
 
         # Grade templates by training MSE and complexity
         candidate_templates = []
+        # §3.212 fallback bookkeeping: templates that lose to their better
+        # parent on the holdout are demoted, not discarded outright.
+        holdout_losers = set()
         for operator, formula in forms:
             if y is not None and X is not None:
                 try:
@@ -1710,7 +1713,7 @@ def propose_specialist_compositions(
                             and mse_h
                             > holdout_parent_mse * 1.02 + 1e-12
                         ):
-                            continue
+                            holdout_losers.add(formula)
                         if np.isfinite(mse_h):
                             mse_val = mse_h
                 except Exception:
@@ -1756,6 +1759,16 @@ def propose_specialist_compositions(
         candidate_templates = [
             ct for ct in candidate_templates if ct[2] != float("inf")
         ]
+        # §3.212 fallback: when every template loses to its better parent on
+        # the holdout, keep the least-bad ones so the downstream acceptance
+        # gates (val R² / risk / gap) can still judge them. Discarding all of
+        # them lets one dominant complex parent in the top pairs disable
+        # specialist composition screening entirely.
+        holdout_winners = [
+            ct for ct in candidate_templates if ct[1] not in holdout_losers
+        ]
+        if holdout_winners:
+            candidate_templates = holdout_winners
         # Preserve operator diversity before validation. MSE still breaks ties within each template family.
         priority = {
             "nested": 0,

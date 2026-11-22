@@ -141,6 +141,97 @@ inline bool is_shared_basis(const std::vector<OpNode>& nodes,
     return false;
 }
 
+// §3.230: every node reachable from root (inclusive), following child links.
+inline void collect_subtree_nodes(const std::vector<OpNode>& nodes,
+                                  int root,
+                                  std::vector<char>& out) {
+    const int n = static_cast<int>(nodes.size());
+    if (root < 0 || root >= n) return;
+    std::vector<int> stack = {root};
+    while (!stack.empty()) {
+        int idx = stack.back();
+        stack.pop_back();
+        if (idx < 0 || idx >= n || out[static_cast<size_t>(idx)]) continue;
+        out[static_cast<size_t>(idx)] = 1;
+        const auto& node = nodes[static_cast<size_t>(idx)];
+        if ((node.type == NodeType::Unary || node.type == NodeType::Binary) &&
+            node.left_child >= 0) {
+            stack.push_back(node.left_child);
+        }
+        if (node.type == NodeType::Binary && node.right_child >= 0) {
+            stack.push_back(node.right_child);
+        }
+    }
+}
+
+// §3.230: like is_shared_basis, but roots inside `excluded_roots` do not
+// count as independent consumers (they are being folded into the same macro).
+inline bool is_shared_basis_outside(const std::vector<OpNode>& nodes,
+                                    const std::vector<double>& output_weights,
+                                    int victim,
+                                    const std::vector<char>& excluded_roots) {
+    const int n = static_cast<int>(nodes.size());
+    const int nw = static_cast<int>(output_weights.size());
+    if (victim < 0 || victim >= n) return false;
+    for (int r = 0; r < n && r < nw; ++r) {
+        if (r == victim) continue;
+        if (r < static_cast<int>(excluded_roots.size()) &&
+            excluded_roots[static_cast<size_t>(r)]) {
+            continue;
+        }
+        if (std::abs(output_weights[static_cast<size_t>(r)]) <= kOutputWeightActive)
+            continue;
+        std::vector<int> stack = {r};
+        std::vector<char> seen(static_cast<size_t>(n), 0);
+        while (!stack.empty()) {
+            int idx = stack.back();
+            stack.pop_back();
+            if (idx < 0 || idx >= n || seen[static_cast<size_t>(idx)]) continue;
+            seen[static_cast<size_t>(idx)] = 1;
+            if (idx == victim) return true;
+            const auto& node = nodes[static_cast<size_t>(idx)];
+            if ((node.type == NodeType::Unary || node.type == NodeType::Binary) &&
+                node.left_child >= 0) {
+                stack.push_back(node.left_child);
+            }
+            if (node.type == NodeType::Binary && node.right_child >= 0) {
+                stack.push_back(node.right_child);
+            }
+        }
+    }
+    return false;
+}
+
+// §3.230: a multiply/divide macro folds `left` and `right` into a new root.
+// Active descendants of those operands used to keep their own direct output
+// weight, so the graph added the same subtree twice (once inside the product
+// and once additively). Zero the now-redundant direct weights, but keep a
+// descendant that still feeds an independent root outside the composition
+// (§3.414 contract). Returns the number of weights zeroed.
+inline int zero_composed_descendant_weights(std::vector<OpNode>& nodes,
+                                            std::vector<double>& output_weights,
+                                            int left,
+                                            int right,
+                                            int new_root) {
+    const int n = static_cast<int>(nodes.size());
+    if (left < 0 || right < 0 || left >= n || right >= n) return 0;
+    std::vector<char> consumed(static_cast<size_t>(n), 0);
+    collect_subtree_nodes(nodes, left, consumed);
+    collect_subtree_nodes(nodes, right, consumed);
+    int zeroed = 0;
+    const int nw = std::min(n, static_cast<int>(output_weights.size()));
+    for (int idx = 0; idx < nw; ++idx) {
+        if (!consumed[static_cast<size_t>(idx)]) continue;
+        if (idx == left || idx == right || idx == new_root) continue;
+        if (std::abs(output_weights[static_cast<size_t>(idx)]) <= kOutputWeightActive)
+            continue;
+        if (is_shared_basis_outside(nodes, output_weights, idx, consumed)) continue;
+        output_weights[static_cast<size_t>(idx)] = 0.0;
+        ++zeroed;
+    }
+    return zeroed;
+}
+
 // Pre-allocated array representing a formula's structure
 struct IndividualGraph {
     std::vector<OpNode> nodes;

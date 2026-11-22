@@ -52,8 +52,9 @@ def test_p90_exact_evaluator_matches_reference():
         "sin(x0)*exp(x1)": np.sin(x0) * np.exp(x1),
         # protected division: l * sign(r) / (|r| + 1e-12)
         "1/(x0+0.5)": 1.0 / (np.abs(x0 + 0.5) + 1e-12) * np.sign(x0 + 0.5),
-        # non-integer power on a non-negative base
-        "abs(x0)^2.5": (np.abs(x0) + 1e-300) ** 2.5,
+        # non-integer power on a non-negative base. §3.1/§3.331: the exact
+        # path shares the graph power contract, including eps=1e-10.
+        "abs(x0)^2.5": (np.abs(x0) + 1e-10) ** 2.5,
         # nested unary chain
         "log(abs(x0)+1)": np.log(np.abs(x0) + 1.0 + 1e-300),
         # repeated node (shared-subexpression path)

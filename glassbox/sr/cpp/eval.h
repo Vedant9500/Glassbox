@@ -89,15 +89,18 @@ inline double stabilized_tau(double tau) {
     return (tau >= 0.0) ? kMinAbsTau : -kMinAbsTau;
 }
 
+inline constexpr double kPowerParityTol = 1e-9;
+inline constexpr double kPowerEps = 1e-10;
+
+inline bool power_is_near_integer(double p) {
+    return std::abs(p - std::round(p)) < kPowerParityTol;
+}
+
 inline double power_sign_blend(double p) {
-    // §3.1 canonical parity tolerance: single shared contract for all
-    // search paths (eval.h / refine.h / Torch bridge). Exact diagnostic
-    // path (core.cpp) intentionally keeps its tighter 1e-10 integer branch;
-    // see comment at evaluate_parse_node_exact.
-    constexpr double kParityTol = 1e-9;
-    double p_round = std::round(p);
-    if (std::abs(p - p_round) < kParityTol) {
-        long long p_int = static_cast<long long>(p_round);
+    // §3.1 canonical parity tolerance: single shared contract for all paths
+    // (eval.h, refine.h, core.cpp exact eval, formatter and the Torch bridge).
+    if (power_is_near_integer(p)) {
+        long long p_int = static_cast<long long>(std::round(p));
         return (p_int % 2 == 0) ? 1.0 : 0.0;
     }
     return 0.0;
@@ -108,10 +111,15 @@ inline double power_sign_blend(double p) {
 // must share tolerance/epsilon/clamp notes. eps=1e-10 matches historical
 // graph behaviour; exact path uses 1e-300 + integer pow (diagnostic only).
 inline Eigen::ArrayXd canonical_signed_power(const Eigen::ArrayXd& x, double p) {
-    Eigen::ArrayXd abs_pow = (x.abs() + 1e-10).pow(p);
-    double is_even = power_sign_blend(p);
-    Eigen::ArrayXd signed_pow = x.sign() * abs_pow;
-    return (1.0 - is_even) * signed_pow + is_even * abs_pow;
+    Eigen::ArrayXd abs_pow = (x.abs() + kPowerEps).pow(p);
+    // §3.331: branch instead of blending. The old
+    // (1-even)*signed + even*abs form computed 0*inf = NaN when abs_pow
+    // overflowed for an even exponent, so the downstream ±1e8 cap could not
+    // recover a finite value.
+    if (power_sign_blend(p) >= 0.5) {
+        return abs_pow;
+    }
+    return x.sign() * abs_pow;
 }
 
 inline std::array<double, 4> arithmetic_soft_weights(const OpNode& node) {
@@ -537,6 +545,85 @@ inline Eigen::ArrayXd assemble_prediction(
 // (evaluate_graph_partial) and its value deltas applied onto base_pred.
 // Exact because combination weights (Arithmetic soft gates, Aggregation tau,
 // output weights, bias) do not depend on unary inner params {p, omega, phi}.
+// §3.297: seed graphs can carry several active output roots whose design
+// columns are identical or proportional (duplicate terms, x vs 2x, x vs x+c
+// with the bias). Those columns make the ridge/QR fit ill-conditioned and
+// inflate coefficients, hiding the real basis. Merge each near-collinear root
+// into the strongest representative so the seed prediction is unchanged.
+// Returns the number of weights merged away.
+inline int dedupe_collinear_output_columns(
+    IndividualGraph& graph,
+    const std::vector<Eigen::ArrayXd>& X,
+    int num_samples) {
+    const int n = static_cast<int>(graph.nodes.size());
+    const int nw = std::min(n, static_cast<int>(graph.output_weights.size()));
+    if (n < 2 || nw < 2) return 0;
+
+    std::vector<int> active;
+    active.reserve(static_cast<size_t>(nw));
+    for (int i = 0; i < nw; ++i) {
+        if (std::abs(graph.output_weights[static_cast<size_t>(i)]) > kOutputWeightActive) {
+            active.push_back(i);
+        }
+    }
+    if (active.size() < 2) return 0;
+
+    std::vector<Eigen::ArrayXd> cache;
+    evaluate_graph(graph, X, num_samples, cache);
+    if (cache.empty()) return 0;
+
+    std::sort(active.begin(), active.end(), [&](int a, int b) {
+        return std::abs(graph.output_weights[static_cast<size_t>(a)]) >
+               std::abs(graph.output_weights[static_cast<size_t>(b)]);
+    });
+
+    std::vector<int> kept;
+    kept.reserve(active.size());
+    int merged_count = 0;
+    constexpr double kResidualRatioTol = 1e-8;
+    constexpr double kNormEps = 1e-12;
+    for (int idx : active) {
+        if (idx < 0 || idx >= static_cast<int>(cache.size())) {
+            kept.push_back(idx);
+            continue;
+        }
+        const Eigen::ArrayXd& col = cache[static_cast<size_t>(idx)];
+        bool merged = false;
+        for (int ref_idx : kept) {
+            if (ref_idx < 0 || ref_idx >= static_cast<int>(cache.size())) continue;
+            const Eigen::ArrayXd& ref = cache[static_cast<size_t>(ref_idx)];
+            Eigen::ArrayXd dc = col - col.mean();
+            Eigen::ArrayXd dr = ref - ref.mean();
+            const double nc = dc.matrix().norm();
+            const double nr = dr.matrix().norm();
+            double scale = 0.0;
+            if (nr <= kNormEps) {
+                // Both columns must be constant to be dependent.
+                if (nc > kNormEps) continue;
+                const double ref_mean = ref.mean();
+                if (std::abs(ref_mean) <= kNormEps) continue;
+                scale = col.mean() / ref_mean;
+            } else {
+                scale = dc.matrix().dot(dr.matrix()) / (nr * nr);
+                const double resid = (dc - scale * dr).matrix().norm();
+                if (resid / std::max(nc, kNormEps) > kResidualRatioTol) continue;
+            }
+            const double w_idx = graph.output_weights[static_cast<size_t>(idx)];
+            // Affine dependence (x vs x + c) leaves a constant offset that the
+            // bias absorbs; keeping it makes the rewrite prediction-exact.
+            const double offset = col.mean() - scale * ref.mean();
+            graph.output_bias += w_idx * offset;
+            graph.output_weights[static_cast<size_t>(ref_idx)] += w_idx * scale;
+            graph.output_weights[static_cast<size_t>(idx)] = 0.0;
+            ++merged_count;
+            merged = true;
+            break;
+        }
+        if (!merged) kept.push_back(idx);
+    }
+    return merged_count;
+}
+
 inline Eigen::ArrayXd evaluate_perturbed_pred(
     const IndividualGraph& graph,
     int perturbed_node_idx,
@@ -597,14 +684,14 @@ inline double normalize_angle(double value) {
 }
 
 inline std::string format_pi_like(double value, bool allow_pi_snap = true) {
-    constexpr double kPiTol = 5e-3;
-    // §3.370: symbolic pi snapping is a clean-display approximation (5e-3),
-    // not a lossless export. allow_pi_snap=false prints full precision so
-    // tuned frequencies survive export/scoring round-trips — including the
-    // near-zero range the display path collapses to "0" below.
+    // §3.116: symbolic pi snapping is now exact-only (1e-12). The old 5e-3
+    // window moved fitted frequencies by up to 0.0025 and corrupted displayed
+    // MSE; approximations are printed losslessly instead. allow_pi_snap=false
+    // still forces the lossless path.
+    constexpr double kPiTol = 1e-12;
     if (!allow_pi_snap) {
         char lossbuf[64];
-        snprintf(lossbuf, sizeof(lossbuf), "%.17g", value);
+        snprintf(lossbuf, sizeof(lossbuf), "%.12g", value);
         return std::string(lossbuf);
     }
     if (std::abs(value) <= 1e-4) return "0";
@@ -625,7 +712,7 @@ inline std::string format_pi_like(double value, bool allow_pi_snap = true) {
         {1.5, "3*pi/2"},
     };
 
-    // Display path: snap near-pi multiples to symbols, else short %.4g.
+    // Opt-in display path: snap near-pi multiples to symbols, else 12 digits.
     for (const auto& candidate : kCandidates) {
         double target = candidate.multiplier * kPi;
         if (near(abs_value, target, kPiTol)) {
@@ -637,21 +724,18 @@ inline std::string format_pi_like(double value, bool allow_pi_snap = true) {
     if (std::abs(abs_value - std::round(abs_value)) < 1e-6) {
         snprintf(buf, sizeof(buf), "%s%d", negative ? "-" : "", static_cast<int>(std::round(abs_value)));
     } else {
-        snprintf(buf, sizeof(buf), "%s%.4g", negative ? "-" : "", abs_value);
+        snprintf(buf, sizeof(buf), "%s%.12g", negative ? "-" : "", abs_value);
     }
     return std::string(buf);
 }
 
 inline std::string format_constant_display(double value, bool allow_pi_snap = true) {
-    constexpr double kPiTol = 5e-3;
-    // §3.370: same clean-vs-lossless contract as format_pi_like.
-    // §3.115: non-integer fallthrough below is deliberately 4 significant
-    // digits (clean-display contract, matches benchmark display scoring).
-    // Near-exact solutions needing full precision use allow_pi_snap=false
-    // (%.17g lossless) — compact human text stays the default.
+    constexpr double kPiTol = 1e-12;
+    // §3.115/§3.116: 12 significant digits everywhere; pi snapping is
+    // exact-only so it cannot move a fitted value (see format_pi_like).
     if (!allow_pi_snap) {
         char lossbuf[64];
-        snprintf(lossbuf, sizeof(lossbuf), "%.17g", value);
+        snprintf(lossbuf, sizeof(lossbuf), "%.12g", value);
         return std::string(lossbuf);
     }
     if (std::abs(value - kPi) < kPiTol) return "pi";
@@ -670,7 +754,7 @@ inline std::string format_constant_display(double value, bool allow_pi_snap = tr
     if (std::abs(value - std::round(value)) < 1e-6) {
         snprintf(buf, sizeof(buf), "%d", static_cast<int>(std::round(value)));
     } else {
-        snprintf(buf, sizeof(buf), "%.4g", value);
+        snprintf(buf, sizeof(buf), "%.12g", value);
     }
     return std::string(buf);
 }
@@ -813,7 +897,7 @@ inline std::string format_node_to_string(
                     // Even integers use abs-base in evaluate_graph (power_sign_blend);
                     // print abs form so external string eval cannot diverge on negatives.
                     // Odd integers keep signed base; non-integers keep sign*(abs)^p.
-                    if (std::abs(node.p - std::round(node.p)) < 1e-6) {
+                    if (power_is_near_integer(node.p)) {
                         int n = static_cast<int>(std::round(node.p));
                         // M-154: build with std::string — %s into a fixed
                         // buf truncates long child strings into corrupt,
@@ -826,7 +910,7 @@ inline std::string format_node_to_string(
                     } else {
                         // Number-only snprintf stays: %.4g output is bounded
                         // (~14 chars << 64B); only %s embedding was unsafe.
-                        snprintf(buf, sizeof(buf), "%.4g", node.p);
+                        snprintf(buf, sizeof(buf), "%.12g", node.p);
                         return "sign(" + child_str + ")*(abs(" + child_str + "))^" + std::string(buf);
                     }
                 }
@@ -895,10 +979,10 @@ inline std::string format_node_to_string(
                     auto append_term = [&](double ww, const std::string& expr) {
                         // §3.337: omission at the documented activity tolerance
                         // (was 1e-3, a second aggressive display cut beside the
-                        // 0.99 single-op threshold); weights at %.6g like tau.
+                        // 0.99 single-op threshold); weights at %.12g like tau.
                         if (!(ww > kOutputWeightActive)) return;
                         char wbuf[64];
-                        snprintf(wbuf, sizeof(wbuf), "%.6g", ww);
+                        snprintf(wbuf, sizeof(wbuf), "%.12g", ww);
                         if (!first) blend += " + ";
                         blend += std::string(wbuf) + "*" + expr;
                         first = false;
@@ -974,7 +1058,7 @@ inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs
         if (std::abs(abs_bias - std::round(abs_bias)) < 1e-6) {
             snprintf(buf, sizeof(buf), "%s%d", graph.output_bias < 0 ? "-" : "", static_cast<int>(std::round(abs_bias)));
         } else {
-            snprintf(buf, sizeof(buf), "%s%.4g", graph.output_bias < 0 ? "-" : "", abs_bias);
+            snprintf(buf, sizeof(buf), "%s%.12g", graph.output_bias < 0 ? "-" : "", abs_bias);
         }
         return std::string(buf);
     }
@@ -1003,7 +1087,7 @@ inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs
                 if (std::abs(abs_w - std::round(abs_w)) < 1e-6) {
                     snprintf(buf, sizeof(buf), "%d*", static_cast<int>(std::round(abs_w)));
                 } else {
-                    snprintf(buf, sizeof(buf), "%.4g*", abs_w);
+                    snprintf(buf, sizeof(buf), "%.12g*", abs_w);
                 }
                 final_formula += std::string(buf) + sub_formula;
             } else {
@@ -1024,7 +1108,7 @@ inline std::string get_formula_string(const IndividualGraph& graph, int n_inputs
         if (std::abs(abs_bias - std::round(abs_bias)) < 1e-6) {
             snprintf(buf, sizeof(buf), "%d", static_cast<int>(std::round(abs_bias)));
         } else {
-            snprintf(buf, sizeof(buf), "%.4g", abs_bias);
+            snprintf(buf, sizeof(buf), "%.12g", abs_bias);
         }
         final_formula += std::string(buf);
     }

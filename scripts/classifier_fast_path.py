@@ -34,6 +34,13 @@ _POWER_PATTERN = re.compile(r"x\^([0-9.]+)", re.IGNORECASE)
 DEFAULT_EXACT_MATCH_MIN_GPU_WORK = 250_000
 DEFAULT_EXACT_MATCH_MAX_COMBOS = 50_000
 
+# §3.299/§3.300: soft Arithmetic gate-mode priors [add, mul, soft_div, sub].
+# These are gate modes inside BinaryOp::Arithmetic, not the protected
+# BinaryOp::Division operator selected by binary_op_priors.
+PRODUCT_ISLAND_GATE_PRIORS = (0.05, 0.90, 0.05, 0.0)
+PRODUCT_ISLAND_GATE_PRIORS_MILD = (0.10, 0.80, 0.10, 0.0)
+RATIONAL_ISLAND_GATE_PRIORS = (0.05, 0.05, 0.90, 0.0)
+
 
 @lru_cache(maxsize=1)
 def _load_cpp_core() -> tuple[Any | None, str | None]:
@@ -1185,10 +1192,18 @@ def _maybe_match_univariate_transform_template(
                 denom = y_sorted[:-2] + y_sorted[2:] - 2.0 * y_sorted[1:-1]
                 valid = np.abs(denom) > 1e-12
                 if np.any(valid):
-                    offsets = (
-                        y_sorted[:-2] * y_sorted[2:] - y_sorted[1:-1] ** 2
-                    ) / denom
-                    offsets = offsets[np.isfinite(offsets) & valid]
+                    # §3.428: divide only where the second difference is
+                    # non-zero. The old form divided first and masked after,
+                    # emitting a divide-by-zero RuntimeWarning and building
+                    # inf/NaN entries on exactly-linear grids.
+                    offsets = np.full(denom.shape, np.nan, dtype=np.float64)
+                    np.divide(
+                        y_sorted[:-2] * y_sorted[2:] - y_sorted[1:-1] ** 2,
+                        denom,
+                        out=offsets,
+                        where=valid,
+                    )
+                    offsets = offsets[valid & np.isfinite(offsets)]
                     if offsets.size:
                         offset = float(np.median(offsets))
                         shifted = y_flat - offset
@@ -2126,36 +2141,15 @@ def find_exact_symbolic_match(
         if y_norm <= 1e-15:
             return None
 
-        col_scores = []
-        for idx in range(n_basis):
-            col = np.asarray(basis[:, idx], dtype=np.float64)
-            col_centered = col - float(np.mean(col))
-            denom = float(np.linalg.norm(col_centered) * y_norm)
-            if denom <= 1e-15:
-                score = 0.0
-            else:
-                score = abs(float(np.dot(col_centered, y_centered)) / denom)
-            if np.isfinite(score):
-                col_scores.append((score, idx))
-        col_scores.sort(reverse=True)
-        ranked = [
-            idx
-            for _, idx in col_scores[: max(1, min(candidate_limit, len(col_scores)))]
-        ]
-        # §3.155 (S slice): univariate correlation ranking can exclude
-        # jointly-essential columns before expansion. Record coverage so
-        # callers can tell truncated search from exhaustive search
-        # (diversity-aware selection is a larger redesign, deferred).
-        update_diagnostics(
-            {
-                "beam_candidate_coverage": {
-                    "n_basis": int(n_basis),
-                    "ranked_candidates": len(ranked),
-                    "candidate_limit": int(candidate_limit),
-                    "truncated": bool(len(col_scores) > len(ranked)),
-                }
-            }
+        # §3.155: coverage-preserving, residual-guided ranking instead of a
+        # pure top-|corr| cut, which could drop jointly-essential columns.
+        ranked, coverage = coverage_preserving_basis_ranking(
+            basis,
+            y,
+            names,
+            candidate_limit=candidate_limit,
         )
+        update_diagnostics({"beam_candidate_coverage": coverage})
         if not ranked:
             return None
 
@@ -4224,6 +4218,155 @@ def should_use_fast_path(
     return True
 
 
+def _basis_column_family(name: str) -> str:
+    """Coarse family label used for §3.155 coverage-preserving ranking."""
+    text = str(name or "").strip().lower()
+    if not text or text in {"1", "const", "constant"}:
+        return "const"
+    if "sin(" in text or "cos(" in text:
+        return "periodic"
+    if "exp(" in text:
+        return "exp"
+    if "log(" in text:
+        return "log"
+    if "sqrt(" in text or "abs(" in text or "/" in text:
+        return "other"
+    return "poly"
+
+
+def _basis_corr_scores(basis, y_centered, y_norm, indices=None):
+    """Absolute centered correlation of each basis column with the target."""
+    if indices is None:
+        indices = range(int(basis.shape[1]))
+    scores = []
+    for idx in indices:
+        col = np.asarray(basis[:, idx], dtype=np.float64)
+        col_centered = col - float(np.mean(col))
+        denom = float(np.linalg.norm(col_centered) * y_norm)
+        score = 0.0 if denom <= 1e-15 else abs(
+            float(np.dot(col_centered, y_centered)) / denom
+        )
+        if np.isfinite(score):
+            scores.append((score, int(idx)))
+    scores.sort(reverse=True)
+    return scores
+
+
+def coverage_preserving_basis_ranking(
+    basis,
+    y,
+    names,
+    *,
+    candidate_limit: int = 64,
+    residual_guided: int = 4,
+):
+    """§3.155: keep family coverage and residual-correlated columns.
+
+    Univariate |corr| ranking can drop columns that are only useful in
+    combination (cancellation pairs, phase-shifted harmonics). This keeps the
+    top-ranked columns in score order, guarantees at least one representative
+    per basis family, and adds the columns most correlated with the residual of
+    the current ranking. Returns ``(ranked_indices, diagnostics)``.
+    """
+    basis = np.asarray(basis, dtype=np.float64)
+    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+    n_basis = int(basis.shape[1])
+    if n_basis == 0:
+        return [], {"n_basis": 0, "truncated": False}
+    y_centered = y_arr - float(np.mean(y_arr))
+    y_norm = float(np.linalg.norm(y_centered))
+    if y_norm <= 1e-15:
+        return [], {"n_basis": n_basis, "truncated": False}
+
+    scores = _basis_corr_scores(basis, y_centered, y_norm)
+    score_by_idx = {idx: score for score, idx in scores}
+    limit = max(1, min(int(candidate_limit), n_basis))
+    ranked = [idx for _, idx in scores[:limit]]
+    diagnostics = {
+        "n_basis": n_basis,
+        "ranked_candidates": len(ranked),
+        "candidate_limit": int(candidate_limit),
+        "truncated": bool(n_basis > len(ranked)),
+        "family_added": [],
+        "residual_added": [],
+    }
+    if not diagnostics["truncated"]:
+        return ranked, diagnostics
+
+    family_of = {idx: _basis_column_family(names[idx]) for idx in range(n_basis)}
+
+    def _insert(idx: int, bucket: str) -> bool:
+        if idx in ranked:
+            return False
+        if len(ranked) < limit:
+            ranked.append(idx)
+            diagnostics[bucket].append(idx)
+            return True
+        # Only a redundant duplicate (same family kept elsewhere) may be
+        # evicted: coverage/residual additions must never remove the last
+        # representative of another family.
+        victims = [
+            pos
+            for pos, cand in enumerate(ranked)
+            if family_of[cand] != "const"
+            and sum(
+                1 for other in ranked if family_of[other] == family_of[cand]
+            )
+            > 1
+        ]
+        if not victims:
+            return False
+        pos = min(victims, key=lambda pos: score_by_idx.get(ranked[pos], 0.0))
+        ranked.pop(pos)
+        ranked.append(idx)
+        diagnostics[bucket].append(idx)
+        return True
+
+    # 1. Family coverage: a family with no kept column gets its best member.
+    # The constant term is exempt: the beam adds it to every support explicitly.
+    covered = {family_of[idx] for idx in ranked}
+    for family in sorted(set(family_of.values()) - covered):
+        if family == "const":
+            continue
+        members = [idx for idx in range(n_basis) if family_of[idx] == family]
+        if not members:
+            continue
+        best_idx = max(members, key=lambda idx: score_by_idx.get(idx, 0.0))
+        _insert(best_idx, "family_added")
+
+    # 2. Residual-guided pass: fit the current ranking, then add excluded
+    # columns that explain what it leaves behind (orthogonal to the fit).
+    if residual_guided > 0 and ranked:
+        resid_norm = 0.0
+        resid_centered = None
+        try:
+            X = basis[:, list(ranked)]
+            coeffs, _, _, _ = np.linalg.lstsq(X, y_arr, rcond=None)
+            resid = y_arr - X @ coeffs
+            resid_centered = resid - float(np.mean(resid))
+            resid_norm = float(np.linalg.norm(resid_centered))
+        except (np.linalg.LinAlgError, ValueError):
+            resid_norm = 0.0
+        # §3.155: only trust the residual when it is large relative to the
+        # target. A residual at round-off level (e.g. the kept columns already
+        # span y) makes the correlations below pure noise, and inserting on
+        # that noise evicts a genuinely useful column.
+        if resid_norm > max(1e-15, 1e-10 * y_norm):
+            excluded = [idx for idx in range(n_basis) if idx not in ranked]
+            resid_scores = _basis_corr_scores(
+                basis, resid_centered, resid_norm, excluded
+            )
+            for score, idx in resid_scores[: int(residual_guided)]:
+                # Require a real residual relationship; a near-zero correlation
+                # means the column is orthogonal noise, not a missing term.
+                if idx in ranked or not np.isfinite(score) or score < 0.05:
+                    continue
+                _insert(idx, "residual_added")
+
+    diagnostics["ranked_candidates"] = len(ranked)
+    return ranked, diagnostics
+
+
 def run_fast_path(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -5093,6 +5236,7 @@ def beam_search_evolution(
             binary_op_priors_cfg: list[float] | None = None,
             allowed_unary_ops_cfg: list[int] | None = None,
             allowed_binary_ops_cfg: list[int] | None = None,
+            gate_mode_priors_cfg: list[float] | None = None,
             p_min_cfg: float | None = None,
             p_max_cfg: float | None = None,
         ) -> None:
@@ -5112,6 +5256,11 @@ def beam_search_evolution(
                     else None,
                     "allowed_binary_ops": list(allowed_binary_ops_cfg)
                     if allowed_binary_ops_cfg is not None
+                    else None,
+                    # §3.298/§3.299/§3.300: soft Arithmetic gate modes
+                    # [add, mul, soft_div, sub]; distinct from binary ops.
+                    "gate_mode_priors": list(gate_mode_priors_cfg)
+                    if gate_mode_priors_cfg is not None
                     else None,
                     "label": label_cfg,
                 }
@@ -5278,6 +5427,9 @@ def beam_search_evolution(
                     0.10,
                 ],  # Arithmetic-heavy (multiply mode)
                 allowed_binary_ops_cfg=[0],  # Arithmetic only
+                # §3.299: Arithmetic-heavy alone still gave a uniform gate
+                # mode (mul only ~25%). Bias the gate itself toward multiply.
+                gate_mode_priors_cfg=list(PRODUCT_ISLAND_GATE_PRIORS),
             )
         elif has_sin or has_power:
             add_config(
@@ -5287,6 +5439,7 @@ def beam_search_evolution(
                 base_generations,
                 "product-island",
                 binary_op_priors_cfg=[0.80, 0.10, 0.10],
+                gate_mode_priors_cfg=list(PRODUCT_ISLAND_GATE_PRIORS_MILD),
             )
 
         # 7c. Rational island — Division-heavy (x^3/(1+x^4) class)
@@ -5304,6 +5457,11 @@ def beam_search_evolution(
                 "rational-island",
                 binary_op_priors_cfg=[0.25, 0.60, 0.15],  # Division-heavy
                 allowed_binary_ops_cfg=[0, 1],  # Arithmetic + Division
+                # §3.300: the protected Division op above and the soft-div
+                # Arithmetic gate (beta=2, gamma=-1) are different operators.
+                # Ask for the soft-div gate explicitly so Arithmetic nodes in
+                # this island are rational, not generic blends.
+                gate_mode_priors_cfg=list(RATIONAL_ISLAND_GATE_PRIORS),
             )
 
         # 8-11. Integer harmonic frequency variants
@@ -5463,9 +5621,12 @@ def beam_search_evolution(
     multi_binary_op_priors = []
     multi_allowed_unary_ops = []
     multi_allowed_binary_ops = []
+    multi_gate_mode_priors = []
     for cfg in configs:
         bop = cfg.get("binary_op_priors")
         multi_binary_op_priors.append(list(bop) if bop else [])
+        gmp = cfg.get("gate_mode_priors")
+        multi_gate_mode_priors.append(list(gmp) if gmp else [])
         au = cfg.get("allowed_unary_ops")
         multi_allowed_unary_ops.append(list(au) if au else [])
         ab = cfg.get("allowed_binary_ops")
@@ -5580,6 +5741,8 @@ def beam_search_evolution(
         }
         if any(multi_binary_op_priors):
             evolution_kwargs["multi_binary_op_priors"] = multi_binary_op_priors
+        if any(multi_gate_mode_priors):
+            evolution_kwargs["multi_gate_mode_priors"] = multi_gate_mode_priors
         if any(multi_allowed_unary_ops):
             evolution_kwargs["multi_allowed_unary_ops"] = multi_allowed_unary_ops
         if any(multi_allowed_binary_ops):
@@ -5627,6 +5790,7 @@ def beam_search_evolution(
                 "multi_binary_op_priors",
                 "multi_allowed_unary_ops",
                 "multi_allowed_binary_ops",
+                "multi_gate_mode_priors",
             ):
                 evolution_kwargs.pop(optional_key, None)
             result = _core.run_evolution(**evolution_kwargs)

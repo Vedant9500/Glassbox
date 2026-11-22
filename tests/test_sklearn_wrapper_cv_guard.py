@@ -405,8 +405,20 @@ def test_regressor_formula_eval_uses_signed_fractional_powers():
     formula = "x**1.5 - 0.25*x"
 
     est = GlassboxRegressor()
-    reg_pred = est._safe_eval_formula_array(formula, X)
-    bench_pred = bc.evaluate_formula(bc.postprocess_formula(formula), X)
+
+    # 1. Raw fractional power on a negative base must stay real and signed.
+    reg_raw = est._safe_eval_formula_array(formula, X)
+    expected = np.sign(x) * np.abs(x) ** 1.5 - 0.25 * x
+    assert np.all(np.isfinite(reg_raw))
+    np.testing.assert_allclose(reg_raw, expected, rtol=1e-9, atol=1e-9)
+
+    # 2. The same displayed text must score identically in both evaluators.
+    #    (Comparing the raw formula against the benchmark's factored display
+    #    form would differ only by where the canonical eps sits inside the
+    #    power, which is not a parity bug.)
+    displayed = bc.postprocess_formula(formula)
+    reg_pred = est._safe_eval_formula_array(displayed, X)
+    bench_pred = bc.evaluate_formula(displayed, X)
 
     assert bench_pred is not None
     np.testing.assert_allclose(reg_pred, bench_pred, rtol=1e-12, atol=1e-12)

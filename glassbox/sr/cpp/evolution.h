@@ -181,6 +181,12 @@ struct EvolutionConfig {
     std::vector<double> binary_op_priors;
     std::vector<int> allowed_binary_ops;
 
+    // §3.298: gate-mode priors for soft Arithmetic nodes:
+    // [add, multiply, soft_div, subtract] (matches seed_arithmetic_gate).
+    // Empty = uniform. Distinct from BinaryOp::Division, which is the
+    // protected operator selected by binary_op_priors (§3.300).
+    std::vector<double> gate_mode_priors;
+
     // P5: NSGA-II multi-objective
     bool use_nsga2 = false;
 
@@ -195,6 +201,8 @@ struct EvolutionConfig {
     std::vector<std::vector<double>> multi_binary_op_priors;
     std::vector<std::vector<int>> multi_allowed_binary_ops;
     std::vector<std::vector<double>> multi_seed_omegas;
+    // §3.299/§3.300: per-island gate-mode priors (product/rational islands).
+    std::vector<std::vector<double>> multi_gate_mode_priors;
 
     // P7: Dimensional Analysis
     std::vector<std::vector<double>> input_units;  // Per-feature unit exponents
@@ -359,6 +367,97 @@ inline bool is_nested_periodic(const IndividualGraph& graph, const OpNode& node)
     return child.type == NodeType::Unary && child.unary_op == UnaryOp::Periodic;
 }
 
+// §3.287: pure wrap-legality predicate (shared by the engine and tests).
+inline bool unary_wrap_allowed(const IndividualGraph& graph, int child_idx,
+                               UnaryOp op) {
+    if (child_idx < 0 || child_idx >= static_cast<int>(graph.nodes.size())) {
+        return true;
+    }
+    const auto& child = graph.nodes[child_idx];
+    if (child.type != NodeType::Unary) {
+        return true;
+    }
+    UnaryOp child_op = child.unary_op;
+    if (op == UnaryOp::Periodic && child_op == UnaryOp::Periodic) return false;
+    if (op == UnaryOp::Log &&
+        (child_op == UnaryOp::Periodic || child_op == UnaryOp::Exp ||
+         child_op == UnaryOp::Log)) {
+        return false;
+    }
+    if (op == UnaryOp::Exp &&
+        (child_op == UnaryOp::Exp || child_op == UnaryOp::Log)) {
+        return false;
+    }
+    if (op == UnaryOp::Abs && child_op == UnaryOp::Abs) return false;
+    if ((op == UnaryOp::Power || op == UnaryOp::IntPow) &&
+        (child_op == UnaryOp::Power || child_op == UnaryOp::IntPow ||
+         child_op == UnaryOp::Exp)) {
+        return false;
+    }
+    return true;
+}
+
+// §3.286/§3.287: search for an allowed op that also satisfies wrap
+// constraints. Returns false when the two sets have no overlap so callers can
+// abandon the change instead of emitting a forbidden nesting.
+template <typename AllowedFn, typename SampleFn>
+inline bool find_wrap_safe_unary_op(const IndividualGraph& graph, int child_idx,
+                                    AllowedFn allowed, SampleFn sampler,
+                                    UnaryOp& out) {
+    for (int attempt = 0; attempt < 24; ++attempt) {
+        UnaryOp op = sampler();
+        if (allowed(op) && unary_wrap_allowed(graph, child_idx, op)) {
+            out = op;
+            return true;
+        }
+    }
+    for (int op = 0; op <= static_cast<int>(UnaryOp::Abs); ++op) {
+        UnaryOp cand = static_cast<UnaryOp>(op);
+        if (allowed(cand) && unary_wrap_allowed(graph, child_idx, cand)) {
+            out = cand;
+            return true;
+        }
+    }
+    return false;
+}
+
+// §3.298: shared prior -> CDF construction (also used by the gate-mode
+// sampler and by tests). Pins the endpoint to 1.0 after normalization.
+inline std::vector<double> build_prior_cdf(const std::vector<double>& priors) {
+    std::vector<double> cdf(priors.size(), 0.0);
+    if (priors.empty()) {
+        return cdf;
+    }
+    double sum = 0.0;
+    for (double p : priors) sum += (p > 0.0 && std::isfinite(p)) ? p : 0.0;
+    if (!(sum > 0.0)) sum = 1.0;
+    double accum = 0.0;
+    for (size_t i = 0; i < priors.size(); ++i) {
+        double p = (priors[i] > 0.0 && std::isfinite(priors[i])) ? priors[i] : 0.0;
+        accum += p / sum;
+        cdf[i] = accum;
+    }
+    cdf.back() = 1.0;
+    return cdf;
+}
+
+// §3.298: draw one gate mode (0=add, 1=mul, 2=soft_div, 3=sub) from a CDF.
+inline int sample_gate_mode_from_cdf(const std::vector<double>& cdf,
+                                     std::mt19937& rng) {
+    if (cdf.size() < 4) {
+        std::uniform_int_distribution<int> d(0, 3);
+        return d(rng);
+    }
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        double r = u(rng);
+        for (int k = 0; k < 4; ++k) {
+            if (r <= cdf[static_cast<size_t>(k)]) return k;
+        }
+    }
+    return 0;
+}
+
 class EvolutionEngine {
 public:
     EvolutionEngine(const EvolutionConfig& config, 
@@ -447,6 +546,15 @@ public:
             binary_op_cdf_ = build_cdf(config_.binary_op_priors);
         }
 
+        // §3.298: gate-mode priors ([add, mul, soft_div, sub]). Shorter vectors
+        // are padded with zero; all-zero/invalid falls back to uniform.
+        if (!config_.gate_mode_priors.empty()) {
+            gate_mode_priors_ = config_.gate_mode_priors;
+            gate_mode_priors_.resize(4, 0.0);
+            prior_entries_sanitized_ += normalize_prior_vector(gate_mode_priors_);
+            gate_mode_cdf_ = build_cdf(gate_mode_priors_);
+        }
+
         current_structural_mutation_rate_ = config_.mutation_rate_structural;
         best_mse_history_ = 1e9;
         plateau_counter_ = 0;
@@ -456,6 +564,7 @@ public:
     // Main run loop
     void run() {
         auto start_time = std::chrono::steady_clock::now();
+        begin_run_timing(start_time);
         initialize_population();
         
         // Initial Refinement
@@ -466,19 +575,13 @@ public:
         // breaking here degrades refinement, never validity. Timeout<=0
         // keeps legacy run-to-completion init.
         for (auto& ind : population_) {
-            if (config_.timeout_seconds > 0
-                && std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - start_time).count()
-                    > static_cast<double>(config_.timeout_seconds)) {
-                break;
-            }
+            if (deadline_exceeded()) break;
             refine_constants(ind);
         }
         trace_event("init.refined", -1);
 
         for (int gen = 0; gen < config_.generations; ++gen) {
-            auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - start_time).count() > config_.timeout_seconds) {
+            if (deadline_exceeded()) {
                 // M-280: record how the loop exited.
                 termination_reason_ = "timeout";
                 break;
@@ -518,6 +621,31 @@ public:
     }
 
     void set_eval_num_threads(int n) { config_.eval_num_threads = std::max(0, n); }
+    // §3.257: generation work checks a run deadline, not only the
+    // per-generation boundary. Islands share the parent's start time so one
+    // expensive generation cannot overrun the budget.
+    void begin_run_timing(std::chrono::steady_clock::time_point start) {
+        run_start_time_ = start - std::chrono::duration_cast<
+            std::chrono::steady_clock::duration>(
+                std::chrono::duration<double>(debug_deadline_offset_seconds_));
+        run_timing_active_ = true;
+    }
+    // Test hook: shift the deadline into the past to exercise budget paths.
+    void set_debug_deadline_offset(double seconds) {
+        debug_deadline_offset_seconds_ = std::max(0.0, seconds);
+    }
+    bool deadline_exceeded() const {
+        if (!run_timing_active_ || config_.timeout_seconds <= 0) return false;
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - run_start_time_).count();
+        return elapsed > static_cast<double>(config_.timeout_seconds);
+    }
+    int get_deadline_truncated_children() const {
+        return deadline_truncated_children_;
+    }
+    // §3.262: migration exchanges actually performed (skipped once the run
+    // is about to stop).
+    int get_migrations_performed() const { return migrations_performed_; }
     void set_arithmetic_temperature_config(double t) { config_.arithmetic_temperature = t; }
     int max_seed_capacity_public() const { return max_seed_capacity(); }
     // §3.288: effective (clamped) fraction actually used by the engine.
@@ -662,6 +790,8 @@ public:
             return;
         } // Too small for islands
         auto start_time = std::chrono::steady_clock::now();
+        // §3.257: the parent owns the shared deadline that islands inherit.
+        begin_run_timing(start_time);
         auto timed_out = [&]() {
             // M-275: `>` matches the single-population loop — `>=` skipped
             // a generation exactly at the budget boundary in islands only.
@@ -700,6 +830,9 @@ public:
             }
             if (i < config_.multi_binary_op_priors.size() && !config_.multi_binary_op_priors[i].empty()) {
                 current_island_cfg.binary_op_priors = config_.multi_binary_op_priors[i];
+            }
+            if (i < config_.multi_gate_mode_priors.size() && !config_.multi_gate_mode_priors[i].empty()) {
+                current_island_cfg.gate_mode_priors = config_.multi_gate_mode_priors[i];
             }
             if (i < config_.multi_allowed_binary_ops.size() && !config_.multi_allowed_binary_ops[i].empty()) {
                 current_island_cfg.allowed_binary_ops = config_.multi_allowed_binary_ops[i];
@@ -778,6 +911,10 @@ public:
         for (auto& island : islands) {
             island.set_eval_num_threads(inner_threads);
             island.set_arithmetic_temperature_config(config_.arithmetic_temperature);
+            // §3.257: islands share the parent's deadline so in-generation
+            // checks see the same budget.
+            island.set_debug_deadline_offset(debug_deadline_offset_seconds_);
+            island.begin_run_timing(start_time);
         }
 #if defined(_OPENMP)
         // Prefer active levels over deprecated omp_set_nested when available.
@@ -820,12 +957,30 @@ public:
                 islands[i].evolve_one_generation(gen);
             }
 
+            // §3.262: decide whether another generation will run BEFORE
+            // migrating, so the final generation does not pay for migration
+            // nobody consumes.
+            bool should_stop = false;
+            for (auto& island : islands) {
+                auto best = island.get_best();
+                if (early_stop_metric(best) < config_.early_stop_mse &&
+                    best.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
+                    should_stop = true;
+                }
+                consider_champion(best);
+            }
+            const bool timed_out_now =
+                init_timed_out.load(std::memory_order_relaxed) || timed_out() ||
+                deadline_exceeded();
+
             // Migration: ring topology (island i -> island i+1).
             // §3.427: stage from pre-migration snapshots. The old in-place
             // ring let a received migrant re-propagate in the same exchange
             // (island i+1 becomes a source after receiving), so one elite
             // could sweep the whole ring in a single generation.
-            if (gen > 0 && gen % config_.migration_interval == 0) {
+            if (!timed_out_now && !(config_.use_early_stop && should_stop) &&
+                gen > 0 && gen % config_.migration_interval == 0) {
+                ++migrations_performed_;
                 std::vector<std::vector<IndividualGraph>> snapshots;
                 snapshots.reserve(static_cast<size_t>(config_.num_islands));
                 for (int i = 0; i < config_.num_islands; ++i) {
@@ -860,18 +1015,13 @@ public:
                 }
             }
 
-            // Check early stop across all islands
-            bool should_stop = false;
-            for (auto& island : islands) {
-                auto best = island.get_best();
-                if (early_stop_metric(best) < config_.early_stop_mse && best.nodes.size() <= static_cast<size_t>(config_.early_stop_max_nodes)) {
-                    should_stop = true;
-                }
-                consider_champion(best);
-            }
             last_executed_generation_ = gen;
             update_discovery_metrics(gen, start_time);
 
+            if (timed_out_now) {
+                termination_reason_ = "timeout";
+                break;
+            }
             if (config_.use_early_stop && should_stop) {
                 islands_early_stopped = true;
                 break;
@@ -894,6 +1044,7 @@ public:
             crossover_successes_ += island.get_crossover_successes();
             trimmed_hard_drops_ += island.get_trimmed_hard_drops();
             trimmed_soft_fallbacks_ += island.get_trimmed_soft_fallbacks();
+            deadline_truncated_children_ += island.get_deadline_truncated_children();
             // M-251: sum island failure reasons alongside attempts/successes.
             crossover_failures_size_ += island.get_crossover_failures_size();
             crossover_failures_topology_ += island.get_crossover_failures_topology();
@@ -954,6 +1105,14 @@ private:
     SubtreeCache gen_cache_; // Per-generation subtree cache
     std::vector<double> op_cdf_; // CDF for prior-weighted op sampling
     std::vector<double> binary_op_cdf_; // CDF for prior-weighted binary-op sampling
+    std::vector<double> gate_mode_priors_; // §3.298 sanitized [add, mul, div, sub]
+    std::vector<double> gate_mode_cdf_;    // CDF for prior-weighted gate-mode sampling
+    // §3.257: shared run deadline for in-generation budget checks.
+    std::chrono::steady_clock::time_point run_start_time_{};
+    bool run_timing_active_ = false;
+    int deadline_truncated_children_ = 0;
+    int migrations_performed_ = 0;
+    double debug_deadline_offset_seconds_ = 0.0;
     std::vector<int> allowed_unary_ops_;
     std::vector<int> allowed_binary_ops_;
     // P-83: membership tables mirrored from the vectors above.
@@ -1299,21 +1458,7 @@ private:
 
     // §3.281: build_cdf with sum normalization before pinning endpoint
     static std::vector<double> build_cdf(const std::vector<double>& priors) {
-        std::vector<double> cdf(priors.size(), 0.0);
-        if (priors.empty()) {
-            return cdf;
-        }
-        double sum = 0.0;
-        for (double p : priors) sum += (p > 0.0 && std::isfinite(p)) ? p : 0.0;
-        if (!(sum > 0.0)) sum = 1.0;
-        double accum = 0.0;
-        for (size_t i = 0; i < priors.size(); ++i) {
-            double p = (priors[i] > 0.0 && std::isfinite(priors[i])) ? priors[i] : 0.0;
-            accum += p / sum;
-            cdf[i] = accum;
-        }
-        cdf.back() = 1.0;
-        return cdf;
+        return build_prior_cdf(priors);
     }
 
     template <typename EnumT>
@@ -1622,59 +1767,23 @@ private:
         return BinaryOp::Aggregation;
     }
 
-    bool unary_wrap_allowed(const IndividualGraph& graph, int child_idx, UnaryOp op) const {
-        if (child_idx < 0 || child_idx >= static_cast<int>(graph.nodes.size())) {
-            return true;
-        }
-        const auto& child = graph.nodes[child_idx];
-        if (child.type != NodeType::Unary) {
-            return true;
-        }
-        UnaryOp child_op = child.unary_op;
-        if (op == UnaryOp::Periodic && child_op == UnaryOp::Periodic) {
-            return false;
-        }
-        if (op == UnaryOp::Log && (child_op == UnaryOp::Periodic || child_op == UnaryOp::Exp || child_op == UnaryOp::Log)) {
-            return false;
-        }
-        if (op == UnaryOp::Exp && (child_op == UnaryOp::Exp || child_op == UnaryOp::Log)) {
-            return false;
-        }
-        if (op == UnaryOp::Abs && child_op == UnaryOp::Abs) {
-            return false;
-        }
-        if ((op == UnaryOp::Power || op == UnaryOp::IntPow) &&
-            (child_op == UnaryOp::Power || child_op == UnaryOp::IntPow || child_op == UnaryOp::Exp)) {
-            return false;
-        }
-        return true;
+    bool unary_wrap_allowed(const IndividualGraph& graph, int child_idx,
+                            UnaryOp op) const {
+        return sr::unary_wrap_allowed(graph, child_idx, op);
     }
 
-    // §3.287 / M-285: sample_unary_op_for_child verifies unary_wrap_allowed
-    // on fallback attempts before returning to prevent nested illegal combinations.
-    UnaryOp sample_unary_op_for_child(const IndividualGraph& graph, int child_idx) {
-        for (int attempt = 0; attempt < 24; ++attempt) {
-            UnaryOp op = sample_unary_op();
-            if (unary_wrap_allowed(graph, child_idx, op)) {
-                return op;
-            }
-        }
-        const UnaryOp fallbacks[] = {
-            UnaryOp::Periodic, UnaryOp::IntPow, UnaryOp::Power, UnaryOp::Exp, UnaryOp::Log
-        };
-        for (UnaryOp op : fallbacks) {
-            if (unary_op_allowed(op) && unary_wrap_allowed(graph, child_idx, op)) {
-                return op;
-            }
-        }
-        // §3.287: final scan of all unary ops with wrap checks
-        for (int op = 0; op <= static_cast<int>(UnaryOp::Abs); ++op) {
-            UnaryOp cand = static_cast<UnaryOp>(op);
-            if (unary_op_allowed(cand) && unary_wrap_allowed(graph, child_idx, cand)) {
-                return cand;
-            }
-        }
-        return sample_unary_op();
+    // §3.286/§3.287: sample a wrap-safe unary op. Returns false when the
+    // allowed mask and the wrap constraints have no overlap; callers must
+    // then abandon the structural change instead of emitting a forbidden
+    // nesting (the old fallback returned sample_unary_op() unchecked).
+    bool sample_unary_op_for_child(const IndividualGraph& graph,
+                                   int child_idx,
+                                   UnaryOp& out) {
+        return find_wrap_safe_unary_op(
+            graph, child_idx,
+            [&](UnaryOp op) { return unary_op_allowed(op); },
+            [&]() { return sample_unary_op(); },
+            out);
     }
 
     // §3.303 / §3.304: seed_arithmetic_gate initializes beta, gamma for
@@ -1682,8 +1791,9 @@ private:
     // Note: soft_div_gate (beta=2, gamma=-1) blends soft division with arithmetic
     // branches in eval.h; distinct from protected BinaryOp::Division.
     void seed_arithmetic_gate(OpNode& node) {
-        std::uniform_int_distribution<int> mode_dist(0, 3);
-        switch (mode_dist(rng_)) {
+        // §3.298: weighted gate-mode draw when a prior is configured.
+        const int mode = sample_gate_mode_from_cdf(gate_mode_cdf_, rng_);
+        switch (mode) {
             case 0:
                 node.beta = 1.0;
                 node.gamma = 1.0;
@@ -1795,10 +1905,20 @@ private:
                 node.feature_idx = i;
             } else {
                 if (runif(rng_) < 0.6 || i < n_inputs + 1) {
-                    node.type = NodeType::Unary;
                     std::uniform_int_distribution<int> child_dist(0, i - 1);
-                    node.left_child = child_dist(rng_);
-                    node.unary_op = sample_unary_op_for_child(ind, node.left_child);
+                    const int new_child = child_dist(rng_);
+                    UnaryOp chosen = UnaryOp::Periodic;
+                    if (!sample_unary_op_for_child(ind, new_child, chosen)) {
+                        // §3.287: no allowed wrap-safe unary op — use a
+                        // constant instead of an illegal nested op.
+                        node.type = NodeType::Constant;
+                        node.value = 1.0;
+                        normalize_node_fields(node);
+                        continue;
+                    }
+                    node.type = NodeType::Unary;
+                    node.left_child = new_child;
+                    node.unary_op = chosen;
                     if (node.unary_op == UnaryOp::Power && runif(rng_) < 0.7) {
                         node.p = sample_power_exponent();
                     }
@@ -1823,6 +1943,12 @@ private:
                 } else {
                     node.type = NodeType::Binary;
                     node.binary_op = sample_binary_op();
+                    // §3.298: random init left beta/gamma at a generic blend
+                    // (1.5/1.0 Gaussian), so the gate-mode prior could never
+                    // take effect. Seed a real mode for Arithmetic nodes.
+                    if (node.binary_op == BinaryOp::Arithmetic) {
+                        seed_arithmetic_gate(node);
+                    }
 
                     std::uniform_int_distribution<int> child_dist(0, i - 1);
                     node.left_child = child_dist(rng_);
@@ -2210,19 +2336,27 @@ private:
                     // child_dist(0, 0) deterministically yields (0, 0).
                     if (runif(rng_) < 0.6) {
                         const NodeType old_type_unary = node.type;
-                        node.type = NodeType::Unary;
                         std::uniform_int_distribution<int> child_dist(0, i - 1);
-                        node.left_child = child_dist(rng_);
-                        node.unary_op = sample_unary_op_for_child(child, node.left_child);
-                        normalize_node_fields(node);
-                        if (node.type != old_type_unary &&
-                            i < static_cast<int>(child.output_weights.size())) {
-                            child.output_weights[static_cast<size_t>(i)] = 0.0;
-                        }
-                        if (node.unary_op == UnaryOp::IntPow) {
-                            const int intpow_candidates[] = {2, 3, 4, 5, 6};
-                            std::uniform_int_distribution<int> ip_dist(0, 4);
-                            node.p = static_cast<double>(intpow_candidates[ip_dist(rng_)]);
+                        const int new_child = child_dist(rng_);
+                        UnaryOp chosen = UnaryOp::Periodic;
+                        if (!sample_unary_op_for_child(child, new_child, chosen)) {
+                            // §3.287: no allowed wrap-safe unary op. Leave the
+                            // node untouched rather than emit a forbidden
+                            // nesting or a disallowed operator.
+                        } else {
+                            node.type = NodeType::Unary;
+                            node.left_child = new_child;
+                            node.unary_op = chosen;
+                            normalize_node_fields(node);
+                            if (node.type != old_type_unary &&
+                                i < static_cast<int>(child.output_weights.size())) {
+                                child.output_weights[static_cast<size_t>(i)] = 0.0;
+                            }
+                            if (node.unary_op == UnaryOp::IntPow) {
+                                const int intpow_candidates[] = {2, 3, 4, 5, 6};
+                                std::uniform_int_distribution<int> ip_dist(0, 4);
+                                node.p = static_cast<double>(intpow_candidates[ip_dist(rng_)]);
+                            }
                         }
                     } else {
                         const NodeType old_type_binary = node.type;
@@ -2359,7 +2493,13 @@ private:
             OpNode wrap_node;
             wrap_node.type = NodeType::Unary;
             wrap_node.left_child = target;
-            wrap_node.unary_op = sample_unary_op_for_child(child, target);
+            UnaryOp wrap_op = UnaryOp::Periodic;
+            if (!sample_unary_op_for_child(child, target, wrap_op)) {
+                // §3.287: no allowed wrap-safe op — fall back to a plain
+                // structural mutation instead of forcing an illegal wrap.
+                return mutate_lamarckian(child, 0.3);
+            }
+            wrap_node.unary_op = wrap_op;
             wrap_node.p = 1.0;
             wrap_node.omega = 1.0;
             wrap_node.phi = 0.0;
@@ -2437,6 +2577,11 @@ private:
                 right < static_cast<int>(child.output_weights.size())) {
                 child.output_weights[right] = 0.0;
             }
+            // §3.230: descendants consumed by the product must not also stay
+            // active as separate additive terms.
+            zero_composed_descendant_weights(
+                child.nodes, child.output_weights, left, right,
+                static_cast<int>(child.nodes.size()) - 1);
             
         } else if (roll < t_div) {
             // -- Divide / Rational Mutation --
@@ -2479,6 +2624,10 @@ private:
                 right < static_cast<int>(child.output_weights.size())) {
                 child.output_weights[right] = 0.0;
             }
+            // §3.230: same descendant cleanup as the multiply macro.
+            zero_composed_descendant_weights(
+                child.nodes, child.output_weights, left, right,
+                static_cast<int>(child.nodes.size()) - 1);
             
         } else {
             // -- Nest Mutation --
@@ -5090,6 +5239,12 @@ private:
             const double macro_rate = std::clamp(config_.macro_mutation_rate, 0.0, 0.9);
 
             for (int i = 0; i < config_.pop_size; ++i) {
+                // §3.257: stop reproducing once the run budget is spent;
+                // nsga2_select below still gets a valid (smaller) pool.
+                if ((i & 7) == 7 && deadline_exceeded()) {
+                    deadline_truncated_children_ += config_.pop_size - i;
+                    break;
+                }
                 IndividualGraph child;
                 double roll = co(rng_);
                 if (roll < macro_rate) {
@@ -5207,6 +5362,12 @@ private:
 
         // Fill remainder of main population with crossover + mutated offspring
         while (static_cast<int>(next_gen.size()) < main_pop_target) {
+            // §3.257: deadline-aware reproduction.
+            if (deadline_exceeded()) {
+                deadline_truncated_children_ +=
+                    main_pop_target - static_cast<int>(next_gen.size());
+                break;
+            }
             IndividualGraph child;
             double roll = coin(rng_);
 
@@ -5246,6 +5407,11 @@ private:
 
         // Fill explorer population
         while (static_cast<int>(next_gen.size()) < config_.pop_size) {
+            if (deadline_exceeded()) {
+                deadline_truncated_children_ +=
+                    config_.pop_size - static_cast<int>(next_gen.size());
+                break;
+            }
             int parent_idx = tournament_select();
             double explorer_rate = std::min(1.0, scheduled_mutation_rate * config_.explorer_mutation_multiplier);
             IndividualGraph explorer;

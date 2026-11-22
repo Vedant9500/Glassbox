@@ -430,13 +430,13 @@ ALL_TIERS = {
 
 
 def _safe_numpy_power(x, p):
-    """Safe power matching C++ signed power logic."""
+    """Safe power matching the canonical C++ contract (§3.1: tol 1e-9, eps 1e-10)."""
     x = np.asarray(x)
     p = np.asarray(p)
-    abs_x = np.abs(x) + 1e-15
+    abs_x = np.abs(x) + 1e-10
     res = np.power(abs_x, p)
     p_round = np.round(p)
-    is_even = (np.abs(p - p_round) < 1e-6) & (p_round.astype(np.int64) % 2 == 0)
+    is_even = (np.abs(p - p_round) < 1e-9) & (p_round.astype(np.int64) % 2 == 0)
     if np.isscalar(is_even):
         return res if is_even else np.sign(x) * res
     return np.where(is_even, res, np.sign(x) * res)
@@ -867,13 +867,17 @@ def _mse_divergence_stats(
 
 
 def _display_eval_details(formula: str, x: np.ndarray, y: np.ndarray) -> dict[str, Any]:
-    """Evaluate a displayed formula and return MSE plus parser diagnostics."""
-    X = np.asarray(x, dtype=np.float64).reshape(-1, 1)
-    y_pred, diagnostics = bc.evaluate_formula(formula, X, return_diagnostics=True)
-    return {
-        "mse": _evaluate_formula_mse(formula, x, y),
-        "diagnostics": diagnostics,
-    }
+    """Evaluate a displayed formula and return MSE plus parser diagnostics.
+
+    P-27: the strict evaluator runs only when scoring failed, so the common
+    (successful) path pays for one evaluation instead of two.
+    """
+    mse = _evaluate_formula_mse(formula, x, y)
+    diagnostics = None
+    if mse is None and formula:
+        X = np.asarray(x, dtype=np.float64).reshape(-1, 1)
+        _, diagnostics = bc.evaluate_formula(formula, X, return_diagnostics=True)
+    return {"mse": mse, "diagnostics": diagnostics}
 
 
 def _record_display_eval_failure(
@@ -1035,12 +1039,16 @@ def _attach_clean_target_metrics(
     *,
     exact_tol: float = 1e-6,
     acceptable_r2: float = 0.99,
+    y_pred: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Attach clean-target recovery metrics (independent of noisy EXACT band).
 
     Suite ``score`` / ``mse`` may use noisy labels under ``--noise``. Clean
     metrics answer: "does the discovered formula recover the true signal?"
     See ``noise_handling_audit.md``.
+
+    P-27: callers that already evaluated the displayed formula pass its
+    prediction array here instead of evaluating it twice more.
     """
     formula = str(result.get("formula_discovered") or "").strip()
     x_arr = np.asarray(x, dtype=np.float64)
@@ -1049,10 +1057,16 @@ def _attach_clean_target_metrics(
     mse_clean = None
     r2_clean = None
     if formula:
+        # Clean MSE keeps the strict benchmark evaluator contract.
         mse_clean = _evaluate_formula_mse(formula, x_arr, y_arr)
-        y_pred = cfp._evaluate_formula_values(formula, x_arr)
-        if y_pred is not None:
-            r2_clean = _safe_r2_np(y_arr, y_pred)
+        # P-27: reuse the caller's prediction for R2 instead of re-evaluating.
+        pred = y_pred
+        if pred is None:
+            pred = cfp._evaluate_formula_values(formula, x_arr)
+        if pred is not None:
+            pred = np.asarray(pred, dtype=np.float64).reshape(-1)
+            if pred.shape == y_arr.shape:
+                r2_clean = _safe_r2_np(y_arr, pred)
 
     n_terms = int(result.get("n_terms") or _count_terms(formula))
     recovery_exact = bool(
@@ -1186,6 +1200,7 @@ def run_formula(
         "exact_match_diagnostics": None,
     }
 
+    display_prediction = None
     try:
         # Generate data (keep clean labels for recovery; fit on optional noise)
         x_np, y_np, y_clean = _generate_xy_with_optional_noise(
@@ -1691,6 +1706,7 @@ def run_formula(
                 _mse_divergence_stats(result["mse_display"], result["mse_raw"])
             )
             y_pred = cfp._evaluate_formula_values(result["formula_discovered"], x_np)
+            display_prediction = y_pred
             result["residual_diagnostics"] = (
                 cfp._residual_diagnostics(y_np, y_pred, x_np)
                 if y_pred is not None
@@ -1715,7 +1731,9 @@ def run_formula(
     else:
         result["score"] = score_result(result["mse"], result["formula_discovered"])
     if "y_clean" in locals():
-        _attach_clean_target_metrics(result, x_np, y_clean)
+        _attach_clean_target_metrics(
+            result, x_np, y_clean, y_pred=display_prediction
+        )
     return result
 
 
@@ -1761,6 +1779,7 @@ def run_formula_cpp_evolution(
         "mse_divergence_flag": False,
     }
 
+    display_prediction = None
     try:
         # Import C++ backend
         cpp_dir = Path(__file__).resolve().parent.parent / "glassbox" / "sr" / "cpp"
@@ -1886,6 +1905,7 @@ def run_formula_cpp_evolution(
         result["score_mse"] = result["mse"]
         result.update(_mse_divergence_stats(result["mse_display"], result["mse_raw"]))
         y_pred = cfp._evaluate_formula_values(result["formula_discovered"], x_np)
+        display_prediction = y_pred
         result["residual_diagnostics"] = (
             cfp._residual_diagnostics(y_np, y_pred, x_np)
             if y_pred is not None
@@ -1917,7 +1937,9 @@ def run_formula_cpp_evolution(
     else:
         result["score"] = score_result(result["mse"], result["formula_discovered"])
     if "y_clean" in locals():
-        _attach_clean_target_metrics(result, x_np, y_clean)
+        _attach_clean_target_metrics(
+            result, x_np, y_clean, y_pred=display_prediction
+        )
     return result
 
 
@@ -2014,6 +2036,7 @@ def run_formula_specialist_regressor(
         "specialist_composition_screening": None,
     }
 
+    display_prediction = None
     try:
         from glassbox.sr.sklearn_wrapper import GlassboxRegressor
 
@@ -2112,6 +2135,7 @@ def run_formula_specialist_regressor(
         result["n_terms"] = _count_terms(formula)
 
         y_pred = cfp._evaluate_formula_values(formula, x_np)
+        display_prediction = y_pred
         result["residual_diagnostics"] = (
             cfp._residual_diagnostics(y_np, y_pred, x_np)
             if y_pred is not None
@@ -2134,7 +2158,9 @@ def run_formula_specialist_regressor(
     result["score_mse"] = result["mse"]
     result["score"] = score_result(result["mse"], result["formula_discovered"])
     if "y_clean" in locals():
-        _attach_clean_target_metrics(result, x_np, y_clean)
+        _attach_clean_target_metrics(
+            result, x_np, y_clean, y_pred=display_prediction
+        )
     return result
 
 
@@ -3227,21 +3253,21 @@ Examples:
                     finite = mse is not None and math.isfinite(float(mse))
                 except (TypeError, ValueError):
                     finite = False
+                formula = str(result.get("formula_discovered") or "").strip()
                 complexity = result.get("formula_complexity")
+                if complexity is None and formula:
+                    # Results never carried a formula_complexity field, so the
+                    # tie-break was dead and --runs ties kept the first result.
+                    complexity = bc.formula_complexity_score(formula)
                 try:
                     complexity = int(complexity)
                 except (TypeError, ValueError):
                     complexity = 10**9
-                formula = (
-                    result.get("discovered_formula")
-                    or result.get("formula")
-                    or ""
-                )
                 return (
                     0 if finite else 1,
                     float(mse) if finite else float("inf"),
                     complexity,
-                    str(formula),
+                    formula,
                 )
 
             for _ in range(args.runs):

@@ -49,6 +49,8 @@ class BlackboxState:
     )
     # M-204: per-ranker failure provenance (empty when the ranker voted).
     ranker_errors: dict[str, list[str]] = field(default_factory=dict)
+    # §3.172: per-ranker score spread (currently the MI split-half variance).
+    ranker_variance: dict[str, dict[int, float]] = field(default_factory=dict)
     feature_selection_uncertain: bool = False
     candidate_seed_formulas: list[str] = field(default_factory=list)
     # §3.170: which rankers actually voted and with what effective weight.
@@ -480,34 +482,152 @@ def _ranking_subsample(
     return Xs, ys, ws
 
 
+def _digamma_array(values: np.ndarray) -> np.ndarray:
+    """Vectorized digamma for the weighted kNN MI estimator (no scipy dep)."""
+    x = np.asarray(values, dtype=np.float64)
+    x = np.maximum(x, 1e-12)
+    result = np.zeros_like(x)
+    y = x.copy()
+    while True:
+        mask = y < 6.0
+        if not np.any(mask):
+            break
+        result[mask] -= 1.0 / y[mask]
+        y[mask] += 1.0
+    inv = 1.0 / y
+    inv2 = inv * inv
+    # Asymptotic expansion: psi(y) ~ ln y - 1/(2y) - sum B_2n / (2n y^2n).
+    result += (
+        np.log(y)
+        - 0.5 * inv
+        - inv2
+        * (
+            1.0 / 12.0
+            - inv2
+            * (
+                1.0 / 120.0
+                - inv2 * (1.0 / 252.0 - inv2 * (1.0 / 240.0 - inv2 / 132.0))
+            )
+        )
+    )
+    return result
+
+
+def _weighted_knn_mi(
+    x: np.ndarray,
+    y: np.ndarray,
+    weights: np.ndarray | None,
+    k: int = 3,
+) -> float:
+    """§3.172: weighted Kraskov kNN mutual information (estimator 1).
+
+    Replaces the old weighted-resampling hack, which duplicated rows and made
+    duplicate points their own nearest neighbours (inflating MI). Here the
+    neighbour order is unweighted while the marginal counts are weight sums,
+    scaled so the effective sample size stays ``n``.
+    """
+    x_arr = np.asarray(x, dtype=np.float64).reshape(-1)
+    y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
+    n = int(x_arr.shape[0])
+    if n < 4 or y_arr.shape[0] != n:
+        return 0.0
+    w = None
+    if weights is not None:
+        w = np.clip(np.asarray(weights, dtype=np.float64).reshape(-1), 0.0, None)
+        if w.shape[0] != n or float(np.sum(w)) <= 0.0:
+            w = None
+        else:
+            # §3.172: collapse exact duplicate (x, y) rows into one point with
+            # summed weight. Leaving them split makes a duplicate its own
+            # zero-distance neighbour and inflates the MI.
+            stacked = np.column_stack([x_arr, y_arr])
+            uniq, inv = np.unique(stacked, axis=0, return_inverse=True)
+            if int(uniq.shape[0]) < n:
+                agg = np.zeros(int(uniq.shape[0]), dtype=np.float64)
+                np.add.at(agg, inv, w)
+                x_arr = np.ascontiguousarray(uniq[:, 0])
+                y_arr = np.ascontiguousarray(uniq[:, 1])
+                w = agg
+                n = int(uniq.shape[0])
+            total = float(np.sum(w))
+            if total <= 0.0 or n < 4:
+                return 0.0
+            # Scale-invariant: mean weight 1, so N in psi(N) is the number of
+            # distinct support points regardless of the caller's weight scale.
+            w = w * (float(n) / total)
+    k = int(max(1, min(k, max(1, n - 2))))
+    if n < k + 2:
+        return 0.0
+
+    dx = np.abs(x_arr[:, None] - x_arr[None, :])
+    dy = np.abs(y_arr[:, None] - y_arr[None, :])
+    dist = np.maximum(dx, dy)
+    np.fill_diagonal(dist, np.inf)
+    eps = np.partition(dist, k - 1, axis=1)[:, k - 1]
+
+    mask_x = dx < eps[:, None]
+    mask_y = dy < eps[:, None]
+    np.fill_diagonal(mask_x, False)
+    np.fill_diagonal(mask_y, False)
+    if w is None:
+        n_x = mask_x.sum(axis=1).astype(np.float64)
+        n_y = mask_y.sum(axis=1).astype(np.float64)
+    else:
+        n_x = mask_x @ w
+        n_y = mask_y @ w
+    mi = (
+        float(_digamma_array(np.asarray([k]))[0])
+        - float(np.mean(_digamma_array(n_x + 1.0) + _digamma_array(n_y + 1.0)))
+        + float(_digamma_array(np.asarray([float(n)]))[0])
+    )
+    return float(max(0.0, mi))
+
+
 def _mutual_information_scores(
     X: np.ndarray,
     y: np.ndarray,
     sample_weight: np.ndarray | None = None,
+    variance_out: dict[int, float] | None = None,
 ) -> dict[int, float]:
-    if mutual_info_regression is None:
-        return {}
+    """Weighted kNN MI per feature, with a deterministic split-half variance.
+
+    §3.172: the previous estimator approximated weights by resampling rows
+    with replacement, which duplicates points and biases kNN MI upward. The
+    weighted estimator consumes the weights directly; the score is the mean
+    of two disjoint halves and ``variance_out`` reports their spread.
+    """
     try:
         X_arr = np.asarray(X, dtype=np.float64)
         y_arr = np.asarray(y, dtype=np.float64).reshape(-1)
-        # S7-3: subsample large n before MI (O(n log n) per feature).
+        if X_arr.ndim != 2 or X_arr.shape[0] != y_arr.shape[0]:
+            return {}
+        # Subsample large n; pairwise distance matrices are O(n^2).
         X_arr, y_arr, w = _ranking_subsample(
-            X_arr, y_arr, sample_weight, max_rows=1500, random_state=0
+            X_arr, y_arr, sample_weight, max_rows=1000, random_state=0
         )
-        # sklearn MI has no sample_weight; approximate by weighted resampling.
-        if w is not None and X_arr.ndim == 2 and X_arr.shape[0] == y_arr.shape[0]:
-            rng = np.random.RandomState(0)
-            p = w / float(np.sum(w))
-            idx = rng.choice(
-                y_arr.shape[0], size=int(y_arr.shape[0]), replace=True, p=p
+        n = int(y_arr.shape[0])
+        if n < 6:
+            return {}
+        k = 3 if n >= 200 else max(1, min(5, n - 2))
+        first = np.arange(0, n, 2, dtype=int)
+        second = np.arange(1, n, 2, dtype=int)
+        if first.size < k + 2 or second.size < k + 2:
+            first = np.arange(0, n // 2, dtype=int)
+            second = np.arange(n // 2, n, dtype=int)
+        w_first = w[first] if w is not None else None
+        w_second = w[second] if w is not None else None
+        scores: dict[int, float] = {}
+        variances: dict[int, float] = {}
+        for j in range(X_arr.shape[1]):
+            mi_a = _weighted_knn_mi(X_arr[first, j], y_arr[first], w_first, k=k)
+            mi_b = _weighted_knn_mi(
+                X_arr[second, j], y_arr[second], w_second, k=k
             )
-            X_arr = X_arr[idx]
-            y_arr = y_arr[idx]
-        n_neighbors = 3 if X_arr.shape[0] >= 200 else 5
-        scores = mutual_info_regression(
-            X_arr, y_arr, random_state=0, n_neighbors=n_neighbors
-        )
-        return _normalize_score_dict({j: float(scores[j]) for j in range(len(scores))})
+            scores[int(j)] = 0.5 * (mi_a + mi_b)
+            variances[int(j)] = float(np.var([mi_a, mi_b]))
+        if variance_out is not None:
+            variance_out.update(variances)
+        return _normalize_score_dict(scores)
     except Exception:
         return {}
 
@@ -661,6 +781,73 @@ def _ranker_disagreement(
     return float(np.clip(np.mean(spreads) * 2.0, 0.0, 1.0))
 
 
+def _collinear_feature_groups(
+    X: np.ndarray,
+    *,
+    tol: float = 1e-8,
+    max_rows: int = 2000,
+) -> list[list[int]]:
+    """§3.171: groups of features whose columns are (near-)collinear.
+
+    Scale-sensitive rankers (Lasso/ElasticNet) split or drop coefficients
+    arbitrarily inside a collinear group, so importance ordering between the
+    members is noise. Detecting the group lets the blend share importance
+    instead of reporting an arbitrary winner.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim != 2 or X.shape[1] < 2 or X.shape[0] < 4:
+        return []
+    n = int(X.shape[0])
+    if n > max_rows:
+        idx = np.linspace(0, n - 1, int(max_rows)).astype(int)
+        Xs = X[idx]
+    else:
+        Xs = X
+    p = int(Xs.shape[1])
+    normed: list[np.ndarray | None] = []
+    for j in range(p):
+        col = Xs[:, j]
+        finite = np.isfinite(col)
+        if int(finite.sum()) < 4:
+            normed.append(None)
+            continue
+        mu = float(np.mean(col[finite]))
+        sd = float(np.std(col[finite]))
+        if not np.isfinite(sd) or sd <= 1e-12:
+            normed.append(None)
+            continue
+        c = (col - mu) / sd
+        c[~finite] = 0.0
+        normed.append(c)
+
+    assigned = np.zeros(p, dtype=bool)
+    groups: list[list[int]] = []
+    for j in range(p):
+        if assigned[j]:
+            continue
+        assigned[j] = True
+        group = [j]
+        cj = normed[j]
+        if cj is not None:
+            norm_j = float(np.linalg.norm(cj))
+            if norm_j > 1e-12:
+                for k in range(j + 1, p):
+                    if assigned[k] or normed[k] is None:
+                        continue
+                    ck = normed[k]
+                    denom = float(np.dot(ck, ck))
+                    if denom <= 1e-12:
+                        continue
+                    scale = float(np.dot(cj, ck)) / denom
+                    resid = float(np.linalg.norm(cj - scale * ck))
+                    if resid / max(norm_j, 1e-12) <= tol:
+                        group.append(k)
+                        assigned[k] = True
+        if len(group) > 1:
+            groups.append(group)
+    return groups
+
+
 def compute_blackbox_feature_ranking(
     X: np.ndarray,
     y: np.ndarray,
@@ -718,7 +905,10 @@ def compute_blackbox_feature_ranking(
         "holdout_poly": _normalize_score_dict(holdout_poly_scores),
     }
 
-    mi_scores = _mutual_information_scores(X, y, w_all)
+    mi_variance: dict[int, float] = {}
+    mi_scores = _mutual_information_scores(
+        X, y, w_all, variance_out=mi_variance
+    )
     if mi_scores:
         ranker_votes["mutual_information"] = mi_scores
 
@@ -755,6 +945,19 @@ def compute_blackbox_feature_ranking(
             )
         feature_scores[j] = float(score / weight_total)
 
+    # §3.171: share importance across (near-)collinear columns. Without this,
+    # a scale-sensitive ranker's arbitrary choice inside a collinear group
+    # decided the feature order.
+    collinear_groups = _collinear_feature_groups(X)
+    for group in collinear_groups:
+        for votes in ranker_votes.values():
+            mean = float(np.mean([float(votes.get(j, 0.0)) for j in group]))
+            for j in group:
+                votes[j] = mean
+        mean_score = float(np.mean([feature_scores.get(j, 0.0) for j in group]))
+        for j in group:
+            feature_scores[j] = mean_score
+
     return {
         "feature_scores": feature_scores,
         "ranker_votes": ranker_votes,
@@ -764,6 +967,11 @@ def compute_blackbox_feature_ranking(
         "omitted_rankers": list(omitted_rankers),
         # M-204: sparse-ranker failure provenance (empty when it voted).
         "ranker_errors": {"sparse_linear": list(sparse_errors)},
+        # §3.171/§3.172: collinear groups and the MI split-half variance.
+        "collinear_groups": [list(g) for g in collinear_groups],
+        "ranker_variance": (
+            {"mutual_information": dict(mi_variance)} if mi_variance else {}
+        ),
     }
 
 
@@ -1151,6 +1359,7 @@ def prepare_blackbox_search(
     active_ranker_weights: dict[str, float] = {}
     omitted_rankers: list[str] = []
     ranker_errors: dict[str, list[str]] = {}
+    ranker_variance: dict[str, dict[int, float]] = {}
     if n_features < int(min_features_to_select):
         selected = sorted(usable)
         feature_scores = {idx: 0.0 for idx in usable}
@@ -1182,6 +1391,10 @@ def prepare_blackbox_search(
         ranker_errors = {
             k: list(v)
             for k, v in (ranking.get("ranker_errors") or {}).items()
+        }
+        ranker_variance = {
+            str(k): {int(idx): float(val) for idx, val in (v or {}).items()}
+            for k, v in (ranking.get("ranker_variance") or {}).items()
         }
 
         k = int(max(1, min(max_features, len(usable))))
@@ -1419,6 +1632,7 @@ def prepare_blackbox_search(
         active_ranker_weights=active_ranker_weights,
         omitted_rankers=omitted_rankers,
         ranker_errors=ranker_errors,
+        ranker_variance=ranker_variance,
         ranking_sample_weight_mode=str(ranking_weight_mode or "none"),
         imputed_columns=list(_imputed_columns),
         imputed_y_rows=int(_imputed_y_rows),

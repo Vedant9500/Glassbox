@@ -137,29 +137,17 @@ static Eigen::ArrayXd evaluate_parse_node_exact(
                 break;
             }
             case sr::ParseNodeType::Pow: {
-                // §3.1 note: exact/diagnostic path. Integer branch tol 1e-10 +
-                // eps 1e-300 intentionally differs from search-path canonical
-                // contract (eval.h parity tol 1e-9, eps 1e-10). Prefer graph
-                // scorer for ranking; this path remains for display/exact
-                // diagnostics. Do not "fix" by copying graph formula here —
-                // change the shared contract, not local copies.
+                // §3.1/§3.8: exact eval now uses the same canonical power
+                // contract as the graph path (parity tol 1e-9, eps 1e-10), so
+                // one formula cannot score differently per path. Variable
+                // exponents apply the same per-element parity blend.
                 const Eigen::ArrayXd& base = child(left_ptr);
                 const Eigen::ArrayXd& exp_arr = child(right_ptr);
                 bool constant_exp = num_samples > 0 && exp_arr.size() == num_samples
                     && (exp_arr - exp_arr(0)).abs().maxCoeff() < 1e-12;
                 if (constant_exp) {
-                    double p = exp_arr(0);
-                    double p_round = std::round(p);
-                    if (std::abs(p - p_round) < 1e-10) {
-                        out = base.pow(static_cast<int>(p_round));
-                    } else {
-                        // Non-integer constant power: abs-base to stay
-                        // real-valued (S5-10 domain).
-                        out = base.sign() * (base.abs() + 1e-300).pow(p);
-                    }
+                    out = sr::canonical_signed_power(base, exp_arr(0));
                 } else {
-                    // Variable exponent: protected real power
-                    // (sign * |base|^exp).
                     out.resize(num_samples);
                     for (int i = 0; i < num_samples; ++i) {
                         double b = base(i);
@@ -168,9 +156,17 @@ static Eigen::ArrayXd evaluate_parse_node_exact(
                             out(i) = std::numeric_limits<double>::quiet_NaN();
                             continue;
                         }
-                        out(i) = std::copysign(std::pow(std::abs(b) + 1e-300, p), b);
+                        double abs_pow = std::pow(std::abs(b) + sr::kPowerEps, p);
+                        // §3.331: branch (not blend) to avoid 0*inf = NaN on
+                        // overflow for even exponents.
+                        out(i) = (sr::power_sign_blend(p) >= 0.5)
+                            ? abs_pow
+                            : std::copysign(abs_pow, b);
                     }
                 }
+                // §3.331: same output cap as unary Power so the two paths
+                // cannot diverge on overflow.
+                out = out.max(-1e8).min(1e8);
                 break;
             }
             case sr::ParseNodeType::Sin:
@@ -595,7 +591,14 @@ static py::dict run_evolution_cpp(
     double explorer_fraction = 0.2,
     // P-04 test hook: force the FD-Adam inner optimizer (default LM).
     bool use_lm_inner_optimizer = true,
-    py::list macro_mode_weights = py::list()
+    py::list macro_mode_weights = py::list(),
+    // §3.298-§3.300: gate-mode priors [add, mul, soft_div, sub] and per-island
+    // variants (product/rational islands). Separate from binary_op_priors.
+    py::list gate_mode_priors = py::list(),
+    py::list multi_gate_mode_priors = py::list(),
+    // §3.257 test hook: force the run deadline into the past so budget paths
+    // (init refinement, generation reproduction) are exercised deterministically.
+    bool debug_force_deadline = false
 ) {
     // 1. Convert Python/Numpy inputs to C++/Eigen
     // §3.319: require at least one feature
@@ -718,6 +721,15 @@ static py::dict run_evolution_cpp(
         cpp_multi_binary_op_priors.push_back(prior_vec);
     }
 
+    std::vector<std::vector<double>> cpp_multi_gate_mode_priors;
+    for (auto item : multi_gate_mode_priors) {
+        std::vector<double> prior_vec;
+        for (auto val : item.cast<py::list>()) {
+            prior_vec.push_back(val.cast<double>());
+        }
+        cpp_multi_gate_mode_priors.push_back(prior_vec);
+    }
+
     std::vector<std::vector<int>> cpp_multi_allowed_unary_ops;
     for (auto item : multi_allowed_unary_ops) {
         std::vector<int> allowed_vec;
@@ -755,6 +767,7 @@ static py::dict run_evolution_cpp(
         };
         require_island_len("multi_op_priors", cpp_multi_op_priors.size());
         require_island_len("multi_binary_op_priors", cpp_multi_binary_op_priors.size());
+        require_island_len("multi_gate_mode_priors", cpp_multi_gate_mode_priors.size());
         require_island_len("multi_allowed_unary_ops", cpp_multi_allowed_unary_ops.size());
         require_island_len("multi_allowed_binary_ops", cpp_multi_allowed_binary_ops.size());
         require_island_len("multi_seed_omegas", cpp_multi_seed_omegas.size());
@@ -768,6 +781,10 @@ static py::dict run_evolution_cpp(
     std::vector<std::string> seed_rejected_reasons;
     int seed_weights_trimmed_total = 0;
     int seed_weights_activated_last = 0;
+    // §3.330: seed Power exponents clamped into [p_min, p_max].
+    int seed_power_clamped_total = 0;
+    // §3.297: near-collinear seed output roots merged into a representative.
+    int seed_collinear_weights_merged = 0;
     // M-312: unknown seed keys were ignored silently (typos vanished).
     // Counted (bounded reasons like §3.323) — still accepted for
     // forward-compat with newer producers, but now visible.
@@ -866,6 +883,21 @@ static py::dict run_evolution_cpp(
                     }
                 }
                 g.nodes.push_back(node);
+            }
+        }
+
+        // §3.330: a parser-admitted constant power outside [p_min, p_max]
+        // would start the search off-domain. Clamp it (counted, not silent).
+        for (auto& node : g.nodes) {
+            if (node.type == sr::NodeType::Unary &&
+                node.unary_op == sr::UnaryOp::Power) {
+                const double lo = std::min(p_min, p_max);
+                const double hi = std::max(p_min, p_max);
+                const double clamped = std::clamp(node.p, lo, hi);
+                if (clamped != node.p) {
+                    node.p = clamped;
+                    ++seed_power_clamped_total;
+                }
             }
         }
         
@@ -1006,6 +1038,9 @@ static py::dict run_evolution_cpp(
             note_seed_reject(seed_idx, "bad_feature_idx");
             continue;
         }
+        // §3.297: merge near-collinear active output roots before insertion.
+        seed_collinear_weights_merged += sr::dedupe_collinear_output_columns(
+            g, X, static_cast<int>(y_buf.size));
         cpp_seed_graphs.push_back(std::move(g));
         } catch (const std::exception&) {
             // §3.9: non-finite seed params / malformed seed dicts count as
@@ -1091,6 +1126,7 @@ static py::dict run_evolution_cpp(
     config.multi_op_priors = cpp_multi_op_priors;
     config.multi_allowed_unary_ops = cpp_multi_allowed_unary_ops;
     config.multi_binary_op_priors = cpp_multi_binary_op_priors;
+    config.multi_gate_mode_priors = cpp_multi_gate_mode_priors;
     config.multi_allowed_binary_ops = cpp_multi_allowed_binary_ops;
     config.multi_seed_omegas = cpp_multi_seed_omegas;
     config.p_min = p_min;
@@ -1179,6 +1215,21 @@ static py::dict run_evolution_cpp(
             config.macro_mode_weights = std::move(mmw);
         }
     }
+    // §3.298: gate-mode priors [add, mul, soft_div, sub]; empty = uniform.
+    {
+        std::vector<double> gmp;
+        for (auto item : gate_mode_priors) {
+            double v = item.cast<double>();
+            if (!std::isfinite(v))
+                throw py::value_error("gate_mode_priors entries must be finite");
+            gmp.push_back(v);
+        }
+        if (gmp.size() > 4)
+            throw py::value_error("gate_mode_priors must be empty or have at most 4 entries [add, mul, soft_div, sub]");
+        if (!gmp.empty()) {
+            config.gate_mode_priors = std::move(gmp);
+        }
+    }
     // leave eval_num_threads=0 for auto.
 
     // Phase 4: robust search loss (default mse preserves legacy behaviour).
@@ -1238,6 +1289,10 @@ static py::dict run_evolution_cpp(
     // Per-engine budget is already in config; mirror to engine explicitly
     // so single-population runs also honor the caller's request.
     engine.set_eval_num_threads(config.eval_num_threads);
+    if (debug_force_deadline) {
+        engine.set_debug_deadline_offset(
+            static_cast<double>(std::max(0, config.timeout_seconds)) + 5.0);
+    }
     
     // 3. Run evolution loop natively in C++
     {
@@ -1323,8 +1378,17 @@ static py::dict run_evolution_cpp(
     result["seed_rejected_reasons"] = seed_reject_list;
     // §3.325: trimmed tail weights (was silent truncation).
     result["seed_weights_trimmed"] = seed_weights_trimmed_total;
+    // §3.330: off-domain seed powers clamped into the configured range.
+    result["seed_power_clamped"] = seed_power_clamped_total;
     // §3.322: last-node activations of all-zero weight vectors (was silent).
     result["seed_weights_activated_last"] = seed_weights_activated_last;
+    // §3.297: collinear seed output roots merged (was silent coefficient blow-up).
+    result["seed_collinear_weights_merged"] = seed_collinear_weights_merged;
+    // §3.257: reproduction work skipped because the run budget was spent.
+    result["deadline_truncated_children"] =
+        engine.get_deadline_truncated_children();
+    // §3.262: migration exchanges performed (0 when the run stopped first).
+    result["migrations_performed"] = engine.get_migrations_performed();
     // M-248: macro weights the engine max(0,·) clamp zeroed (was silent).
     result["macro_weights_clamped"] = macro_weights_clamped;
     // M-312: unknown seed keys counted at load (accepted, forward-compat).
@@ -2059,7 +2123,10 @@ PYBIND11_MODULE(_core, m) {
           py::arg("crossover_rate")=0.3,
           py::arg("explorer_fraction")=0.2,
           py::arg("use_lm_inner_optimizer")=true,
-          py::arg("macro_mode_weights")=py::list());
+          py::arg("macro_mode_weights")=py::list(),
+          py::arg("gate_mode_priors")=py::list(),
+          py::arg("multi_gate_mode_priors")=py::list(),
+          py::arg("debug_force_deadline")=false);
 
     m.def("refine_frequencies", &refine_frequencies_wrapper,
           "Refines frequencies via Eigen varpro (optional sample_weight for WLS / S5-9)",
@@ -2119,6 +2186,175 @@ PYBIND11_MODULE(_core, m) {
           py::arg("y_weights") = py::none(),
           py::arg("holdout_fraction") = 0.0,
           py::arg("relative_slack") = 0.10);
+    // §3.230: expose the macro descendant-weight cleanup so regression tests
+    // can verify the same helper the evolution loop uses.
+    m.def("macro_zero_descendant_weights",
+          [](py::dict graph, int left, int right) {
+              std::vector<sr::OpNode> nodes;
+              std::vector<double> weights;
+              if (graph.contains("nodes")) {
+                  for (auto item : graph["nodes"].cast<py::list>()) {
+                      auto nd = item.cast<py::dict>();
+                      sr::OpNode node;
+                      if (nd.contains("type")) {
+                          node.type = static_cast<sr::NodeType>(nd["type"].cast<int>());
+                      }
+                      if (nd.contains("left_child")) {
+                          node.left_child = nd["left_child"].cast<int>();
+                      }
+                      if (nd.contains("right_child")) {
+                          node.right_child = nd["right_child"].cast<int>();
+                      }
+                      nodes.push_back(node);
+                  }
+              }
+              if (graph.contains("output_weights")) {
+                  for (auto w : graph["output_weights"].cast<py::list>()) {
+                      weights.push_back(w.cast<double>());
+                  }
+              }
+              const int zeroed = sr::zero_composed_descendant_weights(
+                  nodes, weights, left, right,
+                  static_cast<int>(nodes.size()));
+              py::dict out;
+              py::list wlist;
+              for (double w : weights) wlist.append(w);
+              out["output_weights"] = wlist;
+              out["zeroed"] = zeroed;
+              return out;
+          },
+          py::arg("graph"), py::arg("left"), py::arg("right"));
+    // §3.287: wrap-safe unary-op search hook. Returns the chosen op id or -1
+    // when the allowed mask and the wrap constraints do not overlap.
+    m.def("find_wrap_safe_unary_op",
+          [](py::list node_types, py::list node_unary_ops, int child_idx,
+             py::list allowed_ops, int seed) {
+              sr::IndividualGraph g;
+              const size_t n = std::min(node_types.size(), node_unary_ops.size());
+              g.nodes.resize(n);
+              for (size_t i = 0; i < n; ++i) {
+                  g.nodes[i].type = static_cast<sr::NodeType>(
+                      node_types[static_cast<py::ssize_t>(i)].cast<int>());
+                  g.nodes[i].unary_op = static_cast<sr::UnaryOp>(
+                      node_unary_ops[static_cast<py::ssize_t>(i)].cast<int>());
+              }
+              std::vector<char> allowed(6, 0);
+              if (allowed_ops.empty()) {
+                  std::fill(allowed.begin(), allowed.end(), 1);
+              } else {
+                  for (auto v : allowed_ops) {
+                      int op = v.cast<int>();
+                      if (op >= 0 && op < 6) allowed[static_cast<size_t>(op)] = 1;
+                  }
+              }
+              std::vector<int> pool;
+              for (int op = 0; op < 6; ++op) {
+                  if (allowed[static_cast<size_t>(op)]) pool.push_back(op);
+              }
+              if (pool.empty()) return -1;
+              std::mt19937 rng(static_cast<uint32_t>(seed));
+              std::uniform_int_distribution<int> pick(
+                  0, static_cast<int>(pool.size()) - 1);
+              sr::UnaryOp out = sr::UnaryOp::Periodic;
+              const bool ok = sr::find_wrap_safe_unary_op(
+                  g, child_idx,
+                  [&](sr::UnaryOp op) {
+                      return allowed[static_cast<size_t>(op)] != 0;
+                  },
+                  [&]() {
+                      return static_cast<sr::UnaryOp>(
+                          pool[static_cast<size_t>(pick(rng))]);
+                  },
+                  out);
+              return ok ? static_cast<int>(out) : -1;
+          },
+          py::arg("node_types"), py::arg("node_unary_ops"), py::arg("child_idx"),
+          py::arg("allowed_ops"), py::arg("seed") = 0);
+    // §3.298: gate-mode sampling hook for regression tests.
+    m.def("sample_gate_modes",
+          [](py::list priors, int n, int seed) {
+              std::vector<double> p;
+              for (auto v : priors) p.push_back(v.cast<double>());
+              const auto cdf = sr::build_prior_cdf(p);
+              std::mt19937 rng(static_cast<uint32_t>(seed));
+              py::list out;
+              for (int i = 0; i < n; ++i) {
+                  out.append(sr::sample_gate_mode_from_cdf(cdf, rng));
+              }
+              return out;
+          },
+          py::arg("priors"), py::arg("n") = 100, py::arg("seed") = 0);
+    // §3.297: expose collinear seed-weight merging for regression tests.
+    m.def("dedupe_collinear_seed_weights",
+          [](py::dict graph, py::list X_list) {
+              std::vector<sr::OpNode> nodes;
+              std::vector<double> weights;
+              if (graph.contains("nodes")) {
+                  for (auto item : graph["nodes"].cast<py::list>()) {
+                      auto nd = item.cast<py::dict>();
+                      sr::OpNode node;
+                      if (nd.contains("type")) {
+                          node.type = static_cast<sr::NodeType>(nd["type"].cast<int>());
+                      }
+                      if (nd.contains("feature_idx")) {
+                          node.feature_idx = nd["feature_idx"].cast<int>();
+                      }
+                      if (nd.contains("value")) {
+                          node.value = nd["value"].cast<double>();
+                      }
+                      if (nd.contains("unary_op")) {
+                          node.unary_op = static_cast<sr::UnaryOp>(nd["unary_op"].cast<int>());
+                      }
+                      if (nd.contains("binary_op")) {
+                          node.binary_op = static_cast<sr::BinaryOp>(nd["binary_op"].cast<int>());
+                      }
+                      if (nd.contains("p")) node.p = nd["p"].cast<double>();
+                      if (nd.contains("omega")) node.omega = nd["omega"].cast<double>();
+                      if (nd.contains("phi")) node.phi = nd["phi"].cast<double>();
+                      if (nd.contains("amplitude")) node.amplitude = nd["amplitude"].cast<double>();
+                      if (nd.contains("beta")) node.beta = nd["beta"].cast<double>();
+                      if (nd.contains("gamma")) node.gamma = nd["gamma"].cast<double>();
+                      if (nd.contains("tau")) node.tau = nd["tau"].cast<double>();
+                      if (nd.contains("left_child")) {
+                          node.left_child = nd["left_child"].cast<int>();
+                      }
+                      if (nd.contains("right_child")) {
+                          node.right_child = nd["right_child"].cast<int>();
+                      }
+                      nodes.push_back(node);
+                  }
+              }
+              if (graph.contains("output_weights")) {
+                  for (auto w : graph["output_weights"].cast<py::list>()) {
+                      weights.push_back(w.cast<double>());
+                  }
+              }
+              sr::IndividualGraph ig;
+              ig.nodes = std::move(nodes);
+              ig.output_weights = std::move(weights);
+              if (graph.contains("output_bias")) {
+                  ig.output_bias = graph["output_bias"].cast<double>();
+              }
+              std::vector<Eigen::ArrayXd> X;
+              int num_samples = 0;
+              for (auto item : X_list) {
+                  auto arr = py::array_t<double, py::array::c_style | py::array::forcecast>::ensure(item);
+                  if (!arr) throw std::runtime_error("X entries must be float64 arrays");
+                  auto buf = arr.request();
+                  double* ptr = static_cast<double*>(buf.ptr);
+                  X.emplace_back(Eigen::Map<Eigen::ArrayXd>(ptr, buf.size));
+                  num_samples = static_cast<int>(buf.size);
+              }
+              const int merged = sr::dedupe_collinear_output_columns(ig, X, num_samples);
+              py::dict out;
+              py::list wlist;
+              for (double w : ig.output_weights) wlist.append(w);
+              out["output_weights"] = wlist;
+              out["output_bias"] = ig.output_bias;
+              out["merged"] = merged;
+              return out;
+          },
+          py::arg("graph"), py::arg("X_list"));
     // §3.103: robust crowding normalization is exposed for regression tests
     // and diagnostics; the evolution loop uses the same free function.
     m.def("robust_crowding_distances", &sr::robust_crowding_distances,

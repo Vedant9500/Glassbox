@@ -8422,14 +8422,17 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             return np.sqrt(np.maximum(x, 0.0))
 
         def _signed_power(base, power):
+            # §3.1: one canonical contract shared with the C++ graph/exact
+            # evaluators and ``benchmark_common.evaluate_formula`` (eps=1e-10,
+            # near-integer even parity on the abs base).
             base_arr = np.asarray(base, dtype=np.float64)
             power_val = float(power)
             with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-                if power_val < 0:
-                    return np.sign(base_arr) / (
-                        (np.abs(base_arr) + 1e-12) ** abs(power_val)
-                    )
-                return np.sign(base_arr) * (np.abs(base_arr) ** power_val)
+                abs_base = np.abs(base_arr) + 1e-10
+                nearest = round(power_val)
+                if abs(power_val - nearest) < 1e-9 and int(nearest) % 2 == 0:
+                    return abs_base**power_val
+                return np.sign(base_arr) * (abs_base**power_val)
 
         context = {
             "np": np,
@@ -9557,21 +9560,71 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
         current_formula = base_formula
 
-        holdout_n = max(1, int(round(X.shape[0] * 0.2)))
-        if X.shape[0] < 20 or holdout_n >= X.shape[0]:
+        n_rows = int(X.shape[0])
+        holdout_n = max(1, int(round(n_rows * 0.2)))
+        if n_rows < 20 or holdout_n >= n_rows:
             return base_formula
 
-        X_fit, X_holdout = X[:-holdout_n], X[-holdout_n:]
-        y_fit, y_holdout = y[:-holdout_n], y[-holdout_n:]
-        del X_fit, y_fit
-        # Phase 6: optional holdout weights; never accept residual on train MSE alone.
-        holdout_w = None
-        try:
-            holdout_w = self._active_sample_weight(
-                indices=np.arange(X.shape[0] - holdout_n, X.shape[0], dtype=int)
-            )
-        except Exception:
-            holdout_w = None
+        # §3.190: reserve a final gate that no stage fits, tunes or refines
+        # on, and rotate the tuning rows across stages. The old single suffix
+        # both tuned and reported, so the holdout was a tuning set with no
+        # honest final measure. Small inputs keep the legacy suffix behavior.
+        gate_n = 0
+        X_gate = y_gate = None
+        if n_rows >= 30:
+            gate_n_candidate = max(1, int(round(n_rows * 0.10)))
+            tune_n_candidate = max(1, int(round(n_rows * 0.20)))
+            if gate_n_candidate + tune_n_candidate < n_rows - 5:
+                gate_n = gate_n_candidate
+                tune_n = tune_n_candidate
+        if gate_n:
+            X_gate, y_gate = X[-gate_n:], y[-gate_n:]
+            X_fit_all, y_fit_all = X[:-gate_n], y[:-gate_n]
+            tune_abs_start = int(X_fit_all.shape[0]) - tune_n
+            X_tune_block = X_fit_all[tune_abs_start:]
+            y_tune_block = y_fit_all[tune_abs_start:]
+        else:
+            tune_n = holdout_n
+            X_fit_all, y_fit_all = X, y
+            tune_abs_start = n_rows - holdout_n
+            X_tune_block = X[tune_abs_start:]
+            y_tune_block = y[tune_abs_start:]
+
+        # Rotate a sliding window over the tuning block: stage 0 starts at 0,
+        # each later stage shifts by stride (wrapping), so stages do not all
+        # select on identical rows.
+        tune_window = (
+            max(1, int(round(tune_n * 0.75))) if gate_n else tune_n
+        )
+        tune_stride = max(1, tune_n // max(1, int(max_boosting_stages)))
+
+        def _stage_tuning_idx(stage: int) -> np.ndarray:
+            if not gate_n:
+                return np.arange(tune_n, dtype=int)
+            start = (int(stage) * tune_stride) % tune_n
+            return np.unique((np.arange(tune_window, dtype=int) + start) % tune_n)
+
+        self.boosting_diagnostics_["holdout_mode"] = (
+            "rotating_tune_block+final_gate" if gate_n else "suffix"
+        )
+        self.boosting_diagnostics_["holdout_is_tuning_set"] = True
+        self.boosting_diagnostics_["gate_is_tuning_set"] = False if gate_n else None
+        self.boosting_diagnostics_["gate_size"] = int(gate_n)
+
+        def _stage_tuning_views(stage: int):
+            idx = _stage_tuning_idx(stage)
+            X_h = X_tune_block[idx]
+            y_h = y_tune_block[idx]
+            w_h = None
+            try:
+                w_h = self._active_sample_weight(
+                    indices=tune_abs_start + idx
+                )
+            except Exception:
+                w_h = None
+            return X_h, y_h, w_h
+
+        X_holdout, y_holdout, holdout_w = _stage_tuning_views(0)
         _, boost_abs_slack, boost_slack_diag = self._noise_aware_cleanup_slack(
             base_formula,
             X_holdout,
@@ -9581,7 +9634,59 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
         )
         boost_rel_slack = float(boost_slack_diag.get("relative_slack", 0.05))
 
+        # Baseline gate score of the unboosted formula (the bar a boosted
+        # formula must not fall below on untouched rows).
+        gate_base_r2 = None
+        if gate_n:
+            try:
+                gate_base_pred = self._safe_eval_formula_array(base_formula, X_gate)
+                gate_base_r2 = float(local_r2(y_gate, gate_base_pred))
+            except Exception:
+                gate_base_r2 = None
+
+        # §3.190: stage fitting sees only the gate-excluded rows, so the stored
+        # per-row weights must be sliced to match for the duration of each
+        # nested fit/refinement (nested splits index 0..n_fit-1).
+        _fit_weight_restore = None
+
+        def _push_fit_weights() -> None:
+            nonlocal _fit_weight_restore
+            if not gate_n or not getattr(self, "sample_weight_provided_", False):
+                return
+            w_full = getattr(self, "sample_weight_", None)
+            try:
+                arr = np.asarray(w_full, dtype=np.float64).reshape(-1)
+            except Exception:
+                return
+            if arr.shape[0] != n_rows:
+                return
+            _fit_weight_restore = w_full
+            self.sample_weight_ = arr[:-gate_n]
+
+        def _pop_fit_weights() -> None:
+            nonlocal _fit_weight_restore
+            if _fit_weight_restore is not None:
+                self.sample_weight_ = _fit_weight_restore
+                _fit_weight_restore = None
+
         for stage in range(max_boosting_stages):
+            # §3.190: each stage selects on its own rotated tuning rows.
+            X_holdout, y_holdout, holdout_w = _stage_tuning_views(stage)
+            try:
+                _, boost_abs_slack, boost_slack_diag = (
+                    self._noise_aware_cleanup_slack(
+                        base_formula,
+                        X_holdout,
+                        y_holdout,
+                        relative_slack=0.05,
+                        absolute_slack=1e-10,
+                    )
+                )
+                boost_rel_slack = float(
+                    boost_slack_diag.get("relative_slack", 0.05)
+                )
+            except Exception:
+                pass
             try:
                 pred_all = self._safe_eval_formula_array(current_formula, X)
                 pred_holdout = self._safe_eval_formula_array(current_formula, X_holdout)
@@ -9634,12 +9739,16 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
             except Exception:
                 pass
 
+            _push_fit_weights()
             try:
-                h_k = self._stage_residual_symbolic_fit(
-                    X, y, current_formula, _allow_recursion=True
-                )
+                try:
+                    h_k = self._stage_residual_symbolic_fit(
+                        X_fit_all, y_fit_all, current_formula, _allow_recursion=True
+                    )
+                finally:
+                    self.timeout = orig_timeout
             finally:
-                self.timeout = orig_timeout
+                _pop_fit_weights()
 
             if not h_k or h_k == "0":
                 if isinstance(getattr(self, "blackbox_diagnostics_", None), dict):
@@ -9706,17 +9815,21 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
                 )
                 break
 
-            refined_list = self._refine_candidate_formulas(
-                [
-                    {
-                        "formula": best_combined_formula,
-                        "source": f"residual_boosting_stage_{stage}",
-                    }
-                ],
-                X,
-                y,
-                max_candidates=1,
-            )
+            _push_fit_weights()
+            try:
+                refined_list = self._refine_candidate_formulas(
+                    [
+                        {
+                            "formula": best_combined_formula,
+                            "source": f"residual_boosting_stage_{stage}",
+                        }
+                    ],
+                    X_fit_all,
+                    y_fit_all,
+                    max_candidates=1,
+                )
+            finally:
+                _pop_fit_weights()
             if refined_list:
                 current_formula = refined_list[0]["formula"]
             else:
@@ -9738,6 +9851,29 @@ class GlassboxRegressor(BaseEstimator, RegressorMixin):
 
             if best_holdout_r2 > 0.999:
                 break
+
+        # §3.190: the untouched gate decides whether the boosted formula is
+        # kept. It is scored on rows no stage fitted, tuned or refined on.
+        if gate_n and gate_base_r2 is not None:
+            gate_r2 = None
+            try:
+                gate_pred = self._safe_eval_formula_array(current_formula, X_gate)
+                gate_r2 = float(local_r2(y_gate, gate_pred))
+            except Exception:
+                gate_r2 = None
+            self.boosting_diagnostics_["gate_base_r2"] = float(gate_base_r2)
+            self.boosting_diagnostics_["gate_r2"] = gate_r2
+            if gate_r2 is not None and gate_r2 < gate_base_r2 - 1e-3:
+                self.boosting_diagnostics_["gate_rejected"] = True
+                self.boosting_diagnostics_["gate_reject_reason"] = (
+                    "gate_regression"
+                )
+                _stages = []
+                _improved = False
+                _final_r2 = float(gate_base_r2)
+                current_formula = base_formula
+            else:
+                self.boosting_diagnostics_["gate_rejected"] = False
 
         # §3.193 commit point: publish staged state only on clean exit.
         self.boosting_stages_ = list(_stages)

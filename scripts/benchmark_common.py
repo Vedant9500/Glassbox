@@ -336,7 +336,7 @@ def protect_fractional_powers(formula):
             if exponent is None:
                 return node
             nearest_int = round(exponent)
-            if abs(exponent - nearest_int) <= 1e-10:
+            if abs(exponent - nearest_int) < 1e-9:
                 node.right = ast.Constant(value=int(nearest_int))
                 return node
             return ast.Call(
@@ -710,6 +710,66 @@ def postprocess_formula(
         return protect_fractional_powers(normalized.replace("^", "**"))
 
 
+_FORMULA_COMPILE_CACHE: dict[str, tuple[str, object, str | None]] = {}
+_FORMULA_COMPILE_CACHE_MAX = 512
+
+# Names the displayed-formula evaluator may reference. Kept as a superset of
+# the per-call context so compilation/validation can be cached independently
+# of the feature count.
+_DISPLAY_EVAL_NAMES = frozenset(
+    {
+        "np",
+        "log",
+        "sin",
+        "cos",
+        "exp",
+        "sqrt",
+        "abs",
+        "Abs",
+        "sign",
+        "_signed_power",
+        "pi",
+        "E",
+        "e",
+        "x",
+        *(f"x{i}" for i in range(64)),
+    }
+)
+
+
+def _compile_display_formula(formula_str):
+    """P-27: normalize, protect and compile a displayed formula once.
+
+    The fidelity guard and the benchmark suite evaluate the same formula text
+    several times (raw / processed / fallback, then score + clean metrics).
+    Normalization, the safety AST validation and ``compile`` are the expensive
+    Python-side steps, so cache them per formula string. Returns
+    ``(formula, code_or_None, error_reason_or_None)``.
+    """
+    key = str(formula_str or "")
+    cached = _FORMULA_COMPILE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    formula = normalize_formula_text(key).strip()
+    formula = re.sub(r"\|([^|]+)\|", r"abs(\1)", formula)
+    formula = formula.replace("^", "**")
+    formula = protect_fractional_powers(formula)
+    code = None
+    error = None
+    try:
+        from glassbox.sr.formula_safety import validate_formula_expr
+
+        validate_formula_expr(formula, _DISPLAY_EVAL_NAMES)
+        code = compile(formula, "<benchmark_display_formula>", "eval")
+    except Exception as exc:  # validated again on use for diagnostics
+        error = f"{type(exc).__name__}: {exc}"
+    entry = (formula, code, error)
+    if len(_FORMULA_COMPILE_CACHE) >= _FORMULA_COMPILE_CACHE_MAX:
+        _FORMULA_COMPILE_CACHE.pop(next(iter(_FORMULA_COMPILE_CACHE)))
+    _FORMULA_COMPILE_CACHE[key] = entry
+    return entry
+
+
 def evaluate_formula(formula_str, X, *, return_diagnostics=False):
     """Evaluate a discovered formula string strictly on X."""
     diagnostics = {
@@ -741,10 +801,7 @@ def evaluate_formula(formula_str, X, *, return_diagnostics=False):
     except Exception as exc:
         return _finish(None, reason="invalid_X", exc=exc)
 
-    formula = normalize_formula_text(formula_str).strip()
-    formula = re.sub(r"\|([^|]+)\|", r"abs(\1)", formula)
-    formula = formula.replace("^", "**")
-    formula = protect_fractional_powers(formula)
+    formula, _compiled_code, _compile_error = _compile_display_formula(formula_str)
 
     def _safe_numpy_log(x, base=None):
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -763,11 +820,13 @@ def evaluate_formula(formula_str, X, *, return_diagnostics=False):
         base_arr = np.asarray(base, dtype=np.float64)
         power_val = float(power)
         with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-            if power_val < 0:
-                return np.sign(base_arr) / (
-                    (np.abs(base_arr) + 1e-12) ** abs(power_val)
-                )
-            return np.sign(base_arr) * (np.abs(base_arr) ** power_val)
+            # §3.1 canonical contract: same eps and parity tolerance as the
+            # C++ graph/exact evaluators.
+            abs_base = np.abs(base_arr) + 1e-10
+            nearest = round(power_val)
+            if abs(power_val - nearest) < 1e-9 and int(nearest) % 2 == 0:
+                return abs_base ** power_val
+            return np.sign(base_arr) * (abs_base ** power_val)
 
     def _safe_exp(x):
         return np.exp(np.clip(x, -500.0, 500.0))
@@ -794,11 +853,16 @@ def evaluate_formula(formula_str, X, *, return_diagnostics=False):
 
     try:
         with np.errstate(divide="raise", invalid="raise", over="raise", under="ignore"):
-            # R-02: gate the eval with the AST allowlist before it runs.
-            from glassbox.sr.formula_safety import validate_formula_expr
+            # R-02: gate the eval with the AST allowlist before it runs. The
+            # allowlist check already ran in _compile_display_formula; only
+            # re-run it when compilation failed (so diagnostics stay exact).
+            if _compiled_code is None:
+                from glassbox.sr.formula_safety import validate_formula_expr
 
-            validate_formula_expr(formula, context.keys())
-            y_pred = eval(formula, {"__builtins__": None}, context)
+                validate_formula_expr(formula, context.keys())
+                y_pred = eval(formula, {"__builtins__": None}, context)
+            else:
+                y_pred = eval(_compiled_code, {"__builtins__": None}, context)
         if isinstance(y_pred, (int, float)):
             y_pred = np.full(X.shape[0], y_pred, dtype=np.float64)
         else:
