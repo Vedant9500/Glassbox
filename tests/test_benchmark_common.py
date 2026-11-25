@@ -223,3 +223,22 @@ def test_evaluate_formula_allows_harmless_underflow():
     assert diagnostics["ok"] is True
     assert y_pred is not None
     assert np.all(np.isfinite(y_pred))
+
+
+def test_evaluate_formula_supports_engine_function_vocabulary():
+    """The evolution engine emits tanh/sinh/cosh/atan; display must parse them."""
+    x = np.linspace(-2.0, 2.0, 101).reshape(-1, 1)
+    cases = (
+        ("tanh(x/2)/2", np.tanh(x[:, 0] / 2.0) / 2.0),
+        ("sinh(x)", np.sinh(x[:, 0])),
+        ("cosh(x)", np.cosh(x[:, 0])),
+        ("tan(x)", np.tan(x[:, 0])),
+        ("atan(x)", np.arctan(x[:, 0])),
+        ("ln(x+3)", np.log(x[:, 0] + 3.0)),
+    )
+    for formula, expected in cases:
+        values, diagnostics = bc.evaluate_formula(
+            formula, x, return_diagnostics=True
+        )
+        assert values is not None, (formula, diagnostics)
+        assert np.allclose(values, expected), formula

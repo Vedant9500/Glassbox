@@ -44,6 +44,12 @@ _TRANSFORMS = standard_transformations + (
     implicit_multiplication_application,
 )
 
+
+def _sympy_signed_power(base, power):
+    """Match the production ``_signed_power`` helper inside SymPy."""
+    return sp.sign(base) * (sp.Abs(base) + sp.Float("1e-10")) ** power
+
+
 _LOCAL_DICT = {
     "sin": sp.sin,
     "cos": sp.cos,
@@ -54,6 +60,7 @@ _LOCAL_DICT = {
     "Abs": sp.Abs,
     "abs": sp.Abs,
     "sign": sp.sign,
+    "signed_power": _sympy_signed_power,
     "pi": sp.pi,
     "E": sp.E,
     "e": sp.E,
@@ -343,12 +350,19 @@ def _symbolic(formula: str) -> sp.Expr | None:
         return None
     text = text.replace("np.", "").replace("_signed_power", "signed_power")
     try:
-        return parse_expr(
+        expr = parse_expr(
             text,
             local_dict=_LOCAL_DICT,
             transformations=_TRANSFORMS,
             evaluate=True,
         )
+        # Curve fitting is over a real variable. Without this, SymPy treats
+        # ``x`` as complex and can introduce ``re(x)``/``im(x)`` into
+        # simplified formulas, which the production evaluator does not know.
+        if expr.free_symbols:
+            real = {s: sp.Symbol(s.name, real=True) for s in expr.free_symbols}
+            expr = expr.subs(real)
+        return expr
     except Exception:
         return None
 

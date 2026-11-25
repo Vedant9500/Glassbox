@@ -275,7 +275,15 @@ def fit_dictionary(
     val_idx, train_idx = idx[:n_val], idx[n_val:]
 
     val_by_k: list[tuple[int, float]] = []
-    for k in ks:
+    if B.shape[1] == 1:
+        # OrthogonalMatchingPursuit returns a 0-d coefficient for a single
+        # column and then fails its own predict(); fit it in closed form.
+        column = Bn[train_idx, 0]
+        denominator = float(column @ column)
+        coef = float(column @ yc[train_idx]) / denominator if denominator > 0 else 0.0
+        pred = coef * Bn[val_idx, 0] + y_mean
+        val_by_k.append((1, float(np.mean((pred - y[val_idx]) ** 2))))
+    for k in ks if B.shape[1] > 1 else ():
         if k > min(len(train_idx), B.shape[1]):
             continue
         model = OrthogonalMatchingPursuit(
@@ -299,26 +307,51 @@ def fit_dictionary(
     # validation error. Dense fits extrapolate badly and read badly.
     best_k = min(k for k, mse in val_by_k if mse <= best_val * 1.10 + 1e-12)
 
-    model = OrthogonalMatchingPursuit(n_nonzero_coefs=int(best_k), fit_intercept=False)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        model.fit(Bn, yc)
-    coefs = model.coef_ / norms
+    if B.shape[1] == 1:
+        coefs = np.array(
+            [float(Bn[:, 0] @ yc) / max(float(Bn[:, 0] @ Bn[:, 0]), 1e-12)]
+        ) / norms
+    else:
+        model = OrthogonalMatchingPursuit(
+            n_nonzero_coefs=int(best_k), fit_intercept=False
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model.fit(Bn, yc)
+        coefs = np.atleast_1d(model.coef_) / norms
     intercept = y_mean - float(coefs @ B_mean)
-    formula = _format_formula(names, coefs, intercept)
     n_active = int(np.sum(np.abs(coefs) > 1e-10))
-    if n_active <= 4:
-        formula = _simplify_formula(formula)
-
-    # Domain safety: a candidate that goes non-finite on the fitted domain is
-    # not a formula, it is a singularity. Reject it here rather than letting
-    # the benchmark's display guard fail later.
-    check = lib.evaluate(formula, x)
-    if check is None or not np.all(np.isfinite(check)):
-        return None
 
     pred = B @ coefs + intercept
     mse = float(np.mean((pred - y) ** 2))
+
+    # A generated column name is a claim about the column's values. Some
+    # names are only valid under the basis's signed-power convention
+    # (``x^1.5/x^0.5`` is ``|x|``), which SymPy simplifies differently, so a
+    # formatted candidate can silently describe a different function than the
+    # matrix it was fitted on. Validate every candidate against the fit it
+    # came from; prefer the simplified text only when it agrees.
+    raw_formula = _format_formula(names, coefs, intercept)
+    scale = max(float(np.var(y)), 1e-30)
+    tolerance = 1e-12 * scale
+
+    def _matches_fit(text: str) -> bool:
+        values = lib.evaluate(text, x)
+        if values is None or values.shape != pred.shape:
+            return False
+        if not np.all(np.isfinite(values)):
+            return False
+        return float(np.mean((values - pred) ** 2)) <= tolerance
+
+    formula = raw_formula
+    if n_active <= 4:
+        simplified = _simplify_formula(raw_formula)
+        if simplified != raw_formula and _matches_fit(simplified):
+            formula = simplified
+        elif not _matches_fit(raw_formula):
+            formula = simplified
+    if not _matches_fit(formula):
+        return None
     return {
         "formula": formula,
         "mse": mse,

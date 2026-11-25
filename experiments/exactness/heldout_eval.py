@@ -241,7 +241,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument(
         "--guard",
-        choices=["none", "closure", "compose", "pi", "series", "all"],
+        choices=["none", "closure", "compose", "inverse", "pi", "series", "all"],
         default="none",
     )
     parser.add_argument("--noise", choices=["none", "low", "medium", "high"], default="none")
@@ -260,16 +260,18 @@ def main() -> None:
     if args.noise != "none":
         noise_cfg = bs.NOISE_PRESETS[args.noise]
 
-    if args.guard in {"closure", "compose", "all", "series"}:
+    if args.guard in {"closure", "compose", "inverse", "all", "series"}:
         from experiments.exactness.run_with_guard import (
             apply_composite_pass,
             apply_composition_pass,
+            apply_inverse_pass,
             apply_series_pass,
         )
 
         original_run_fast_path = bs.run_fast_path
-        use_closure = args.guard in {"closure", "compose", "all"}
+        use_closure = args.guard in {"closure", "compose", "inverse", "all"}
         use_composition = args.guard in {"compose", "all"}
+        use_inverse = args.guard in {"inverse", "all"}
         use_series = args.guard in {"series", "all"}
 
         def guarded_run_fast_path(x, y, *fargs, **fkwargs):
@@ -278,6 +280,8 @@ def main() -> None:
                 result = apply_composite_pass(result, x, y, fkwargs)
             if use_composition:
                 result = apply_composition_pass(result, x, y, fkwargs)
+            if use_inverse:
+                result = apply_inverse_pass(result, x, y, fkwargs)
             if use_series:
                 result = apply_series_pass(result, x, y)
             return result

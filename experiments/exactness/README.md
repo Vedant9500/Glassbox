@@ -49,9 +49,9 @@ The hypothesis was that the pipeline accepts approximations as exact answers
 and that an exact-vs-approximate signal would improve results. After the
 measurements:
 
-* **The benchmark rarely accepts an approximation** (3/205; two of those are
-  `e`/`pi` printed at display precision). Exactness *discrimination* is not the
-  bottleneck.
+* **The benchmark rarely accepts an approximation** (3-4/205, ~2%; most are
+  `e`/`pi` printed at display precision). Exactness *discrimination* is not
+  the bottleneck.
 * **The verifier learns the distinction** (ROC AUC 0.989 on
   in-domain-indistinguishable negatives) but has nothing to rerank; reranking
   the existing pool makes the benchmark worse.
@@ -59,13 +59,25 @@ measurements:
   under `*`, `/` and reciprocal finds exact products it could not express
   before: +16/205 exact on the full suite, +4/84 on unseen formulas, and a
   184x improvement in out-of-domain error.
+* **Inverting the target generalises further than composing the basis.**
+  Fitting the *argument* (`op^{-1}(y)` → basis → `op(fit)`) adds +12 exact on
+  tiers 6-8, +29/205 on the full suite, and moves held-out OOD error
+  ~72,000x, because it reaches functions of sums and affine arguments
+  (`log(1+exp(x))`, `exp(-abs(x))`) with arbitrary constants. It still cannot
+  reach deep compositions.
 * **A general mechanism can still be benchmark-specific in effect.** Unary
   composition closure adds +5 on tiers 6-8 but nothing on fresh nested
   formulas, because the benchmark's compositions share the basis vocabulary.
+* **A name is a claim about values.** The damped columns were built as
+  `exp(-a*|x|)` and named `exp(-a*x)`; fixing the names unlocked exact fits
+  the pipeline had been making all along. Generated formulas are now
+  validated against the matrix they were fitted on.
 
 The useful form of "teach exactness" is therefore not a classifier that ranks
 candidates; it is a **machine-precision acceptance test on newly generated
-candidates**, where the generation step creates the headroom.
+candidates**, where the generation step creates the headroom. The generation
+moves that work are operator closure, inverse-target fitting, and faithful
+naming — not scoring.
 
 ## Findings
 
@@ -302,6 +314,121 @@ This is the same trap as the original named-term library, one level up: a
 mechanism can be general in form and still only fire on the benchmark because
 the benchmark shares the basis vocabulary.
 
+### 10. A basis name is a claim about values
+
+The pipeline fits columns of numbers but reports text. When the two disagree,
+the fit can be perfect and the answer still wrong. The damped sinusoids were
+built as `exp(-alpha*|x|)*sin(omega*x)` and named
+`exp(-alpha*x)*sin(omega*x)`. On a two-sided domain those are different
+functions, so every display evaluation of those columns described a curve the
+fit had never seen.
+
+`audit_basis_names.py` evaluates all 110 universal-basis column names with the
+benchmark parser and compares them to the column values. After the fix: 94
+exact, 16 explained (domain-conditional columns such as `log(x+1)`,
+singularity floors such as `1/|x|`, and 6-digit omega printing), **0
+structural**. Before the fix, every damped column was structural.
+
+Two general guards came out of this:
+
+* `fit_dictionary` now evaluates the formula it is about to return and
+  compares it to the matrix fit it came from. If the text and the numbers
+  disagree, it falls back to the unsimplified text or rejects the fit. A
+  generated name like `x^1.5/x^0.5` (which is `|x|` under the signed-power
+  convention but `x` to SymPy) can no longer smuggle in a different function.
+* the inverse dictionary dedupes near-identical columns with the canonical
+  name first, so `abs(x)` survives instead of `x^2/Abs(x)`.
+
+A third fix is about escalation. The closure passes skipped whenever the
+fast-path MSE was below `1e-6` — the benchmark's EXACT wall. A fit at `5e-7`
+is still an approximation, and skipping closure let it block the exact
+product that closure would have found. The gate is now `1e-11`: escalate on
+anything that is not machine-precision exact.
+
+The honest cost: on a one-sided domain (`x > 0`), `exp(-x)` and `exp(-|x|)`
+are indistinguishable, and the pipeline now reports the symmetric form. The
+benchmark's OOD check extends to negative `x` and counts that as a false
+EXACT. That is not a new error — the old name was hiding the same ambiguity —
+but the strict metric now sees it.
+
+### 11. Inverse-target composition: fit the argument, not the curve
+
+Forward composition (`op(g)`) can only build a function of a single basis
+column. The remaining tier 6-8 failures are functions of sums or affine
+arguments: `log(1+exp(x))`, `1/(1+exp(-x))`, `exp(-abs(x))`, `log(x^2+0.3)`.
+
+`inverse_composition.py` inverts the problem. For each invertible outer
+function it computes `z = op^{-1}(y)`, fits `z` with the pipeline's own basis,
+and reconstructs `op(fit)`. There is no named formula list; the inputs are the
+data, the outer operator, and the basis. Branch-sensitive operators (`sin`,
+`cos`) are accepted only when the reconstruction is machine-exact — if the
+true argument leaves the principal branch, the inverse is a sawtooth that the
+basis cannot fit, and the candidate is rejected rather than guessed.
+
+Tiers 6-8, fixed core:
+
+| mode | tier 6 | tier 7 | tier 8 | exact | weighted | OOD OK | false |
+|---|---|---|---|---|---|---|---|
+| closure | 17 | 13 | 11 | 41/75 | 84.4% | 36 | 4 |
+| closure + inverse | **23** | **15** | **15** | **53/75** | **89.8%** | **48** | 5 |
+
++12 exact, 0 lost. The strict analysis gains 12 OOD-OK and 9 structure-OK.
+Of the five false exacts, three are the pre-existing domain ambiguities
+(`exp(-|x|)` and `log(|x|+1)` on one-sided ranges) and two are fast-path fits
+at `1e-7`, just under the benchmark's `1e-6` wall. None comes from the
+inverse pass: its candidates are accepted only at machine precision and it
+replaces nothing that was already exact.
+
+Held-out, two seeds, 114 fresh formulas:
+
+| guard | exact | struct exact | false exact | weighted | OOD median |
+|---|---|---|---|---|---|
+| none | 25/114 | 21/114 | 2 | 58.8% | 0.241 |
+| inverse | **45/114** | **33/114** | 9 | **68.1%** | **3.34e-6** |
+
+Per family (exact / struct):
+
+| family | none | inverse |
+|---|---|---|
+| product | 6/18 · 6 | **12/18 · 10** |
+| quotient | 1/32 · 0 | **9/32 · 5** |
+| transcendental | 14/32 · 13 | **18/32 · 15** |
+| nested | 4/32 · 2 | **6/32 · 3** |
+
+The OOD median improves ~72,000x: the exact products and quotients replace
+surrogates that fit inside the domain and diverge outside it. The nested
+slice is still the frontier. The generator's nested formulas are deep
+multi-layer compositions (`cosh(tanh(sin(1.2211*|x|^0.33)))`,
+`sin(x/(x^2+0.1))`), and one-layer inversion only reaches `op(F)` where `F`
+is in the basis. This is the same lesson as Finding 9 with a different
+boundary: inverse composition generalises to arbitrary constants (because it
+fits the argument) but not to arbitrary depth.
+
+Full suite, 205 formulas:
+
+| mode | exact | weighted | OOD OK | struct OK | false |
+|---|---|---|---|---|---|
+| baseline | 148/205 | 89.8% | 144 | 168 | 4 |
+| closure + inverse | **177/205** | **95.0%** | **171** | **191** | 7 |
+
++29 exact, +27 OOD-OK, +23 structure-OK. The false-exact rate rises from
+1.9% to 3.4%, almost entirely the one-sided-domain class described below.
+
+On the held-out set the false-exact rate rises from 2/114 to 9/114.
+Classified: five are
+one-sided-domain ambiguities (`x` and `|x|` are identical on `x > 0`, so the
+stricter OOD check cannot be satisfied by either choice), two are
+constant-folding approximations at `1e-4`/`1e-7`, one is a small-amplitude
+curve where an absolute `1e-6` wall is loose, and one differs only at
+`x = 0` (a `sqrt` whose argument is `-6e-8` there). None is a machine-exact
+claim about a different function.
+
+One implementation trap: with 320 correlation-ranked columns, sklearn's OMP
+became numerically unstable and returned a 4-term surrogate with `1e-7` noise
+terms instead of the 1-term `-|x|` identity. The candidate set is capped at 64
+columns — plenty for a 1-4 term argument — and a regression test pins the
+float32 path the benchmark uses.
+
 ## Experiment ladder
 
 | id | experiment | status | primary result |
@@ -315,6 +442,9 @@ the benchmark shares the basis vocabulary.
 | E3.5 | series promotion | done | inert on benchmark and held-out |
 | E4 | unary composition closure (`op(g)`) | done | benchmark +5, held-out 0 — vocabulary artifact |
 | E5 | classifier fine-tune with hard negatives | proposed | only meaningful with evolution |
+| E6 | basis name/value faithfulness fix | done | damped columns named `x` but built `|x|`; audit 0 structural mismatches; unlocked fast-path exacts |
+| E7 | closure escalation gate `1e-6 → 1e-11` | done | sub-micro approximations no longer block the exact rewrite |
+| E8 | inverse-target composition (`op^{-1}(y)` → fit argument) | done | full suite 148→177 exact, 89.8→95.0%; held-out 25→45 exact, 21→33 struct, OOD 72,000x |
 
 ## Dataset
 
@@ -355,6 +485,8 @@ Current build: 605 targets, 568 curves, 1422 pairs, 100 hard negatives.
 | `diagnose_recall.py` | is the correct candidate already in the pool? |
 | `composite_basis.py` | general operator closure (`*`, `/`, reciprocal) |
 | `composition_closure.py` | unary composition closure (`op(g)`) |
+| `inverse_composition.py` | inverse-target composition (`op^{-1}(y)` → fit argument) |
+| `audit_basis_names.py` | name-vs-values audit for every basis column |
 | `series_rationalize.py` | truncated polynomial → closed form |
 | `train_verifier.py` | exact-vs-approximation verifier |
 | `run_with_guard.py` | benchmark runner with opt-in guards |

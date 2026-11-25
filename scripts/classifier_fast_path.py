@@ -1926,15 +1926,19 @@ def build_basis_from_predictions(
                     for omega in omegas:
                         basis_list.append(decay * np.sin(omega * xi))
                         if abs(omega - 1.0) < 0.1:
-                            names.append(f"e^(-{alpha}*{name})·sin({name})")
+                            names.append(f"e^(-{alpha}*|{name}|)·sin({name})")
                         else:
-                            names.append(f"e^(-{alpha}*{name})·sin({omega:.6g}*{name})")
+                            names.append(
+                                f"e^(-{alpha}*|{name}|)·sin({omega:.6g}*{name})"
+                            )
 
                         basis_list.append(decay * np.cos(omega * xi))
                         if abs(omega - 1.0) < 0.1:
-                            names.append(f"e^(-{alpha}*{name})·cos({name})")
+                            names.append(f"e^(-{alpha}*|{name}|)·cos({name})")
                         else:
-                            names.append(f"e^(-{alpha}*{name})·cos({omega:.6g}*{name})")
+                            names.append(
+                                f"e^(-{alpha}*|{name}|)·cos({omega:.6g}*{name})"
+                            )
 
     basis = np.column_stack(basis_list)
 

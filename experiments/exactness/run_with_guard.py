@@ -19,11 +19,16 @@ Guards are opt-in wrappers so the baseline stays untouched:
     ``closure`` plus unary composition closure (``sin(g)``, ``exp(g)``,
     ``log(g)``, ... for every basis column ``g``).
 
+``inverse``
+    ``closure`` plus inverse-target composition: for an invertible outer
+    function, invert the target, fit the argument with the basis, and
+    re-apply. Reaches ``log(1+exp(x))``, ``1/(1+exp(-x))``, ``exp(-abs(x))``.
+
 ``both``
     ``pi`` + ``verifier``.
 
 ``all``
-    Every guard above.
+    Every guard above, including the verifier.
 
 Usage:
     python experiments/exactness/run_with_guard.py --guard closure \
@@ -303,7 +308,11 @@ def apply_composite_pass(
         mse_f = float(fp_result.get("mse"))
     except (TypeError, ValueError):
         mse_f = float("inf")
-    if math.isfinite(mse_f) and mse_f < 1e-6:
+    # Escalate on anything that is not machine-precision exact. The
+    # benchmark's EXACT wall (1e-6) is far looser than an identity; a
+    # fast-path fit at 5e-7 is still an approximation and must not block the
+    # closure pass that can replace it with the true formula.
+    if math.isfinite(mse_f) and mse_f < 1e-11:
         return fp_result
 
     from experiments.exactness.composite_basis import fit_closure
@@ -336,7 +345,11 @@ def apply_composition_pass(
         mse_f = float(fp_result.get("mse"))
     except (TypeError, ValueError):
         mse_f = float("inf")
-    if math.isfinite(mse_f) and mse_f < 1e-6:
+    # Escalate on anything that is not machine-precision exact. The
+    # benchmark's EXACT wall (1e-6) is far looser than an identity; a
+    # fast-path fit at 5e-7 is still an approximation and must not block the
+    # closure pass that can replace it with the true formula.
+    if math.isfinite(mse_f) and mse_f < 1e-11:
         return fp_result
 
     from experiments.exactness.composition_closure import fit_composition
@@ -359,6 +372,49 @@ def apply_composition_pass(
         key="guard_composition",
         mse_f=mse_f,
         max_terms=2,
+    )
+
+
+def apply_inverse_pass(
+    fp_result: dict[str, Any] | None,
+    x: Any,
+    y: Any,
+    fkwargs: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Inverse-target composition: fit the argument, re-apply the function."""
+    if not fp_result:
+        return fp_result
+    try:
+        mse_f = float(fp_result.get("mse"))
+    except (TypeError, ValueError):
+        mse_f = float("inf")
+    # Escalate on anything that is not machine-precision exact. The
+    # benchmark's EXACT wall (1e-6) is far looser than an identity; a
+    # fast-path fit at 5e-7 is still an approximation and must not block the
+    # closure pass that can replace it with the true formula.
+    if math.isfinite(mse_f) and mse_f < 1e-11:
+        return fp_result
+
+    from experiments.exactness.inverse_composition import fit_inverse_composition
+
+    x_np = x.cpu().numpy() if hasattr(x, "cpu") else np.asarray(x)
+    y_np = y.cpu().numpy() if hasattr(y, "cpu") else np.asarray(y)
+    x_flat = np.asarray(x_np, dtype=np.float64).reshape(-1)
+    y_flat = np.asarray(y_np, dtype=np.float64).reshape(-1)
+    if x_flat.size != y_flat.size or y_flat.size < 20:
+        return fp_result
+
+    predictions = _predict_operators(x_flat, y_flat, fkwargs)
+    omegas = fkwargs.get("detected_omegas")
+    candidate = fit_inverse_composition(x_flat, y_flat, predictions, omegas)
+    return _accept_candidate(
+        fp_result,
+        x_flat,
+        y_flat,
+        candidate,
+        key="guard_inverse",
+        mse_f=mse_f,
+        max_terms=4,
     )
 
 
@@ -414,7 +470,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--guard",
-        choices=["pi", "verifier", "closure", "compose", "series", "composite", "both", "all"],
+        choices=[
+            "pi",
+            "verifier",
+            "closure",
+            "compose",
+            "inverse",
+            "series",
+            "composite",
+            "both",
+            "all",
+        ],
         default="pi",
         help="composite is an alias for closure (kept for older commands)",
     )
@@ -430,11 +496,12 @@ def main() -> None:
     import scripts.benchmark_suite as bs
 
     use_verifier = args.guard in {"verifier", "both", "all"}
-    use_composite = args.guard in {"closure", "composite", "compose", "all"}
+    use_composite = args.guard in {"closure", "composite", "compose", "inverse", "all"}
     use_composition = args.guard in {"compose", "all"}
+    use_inverse = args.guard in {"inverse", "all"}
     use_series = args.guard in {"series", "all"}
 
-    if use_verifier or use_composite or use_composition or use_series:
+    if use_verifier or use_composite or use_composition or use_inverse or use_series:
         reranker = VerifierReranker(args.verifier) if use_verifier else None
         original_run_fast_path = bs.run_fast_path
 
@@ -446,6 +513,8 @@ def main() -> None:
                 result = apply_composite_pass(result, x, y, fkwargs)
             if use_composition:
                 result = apply_composition_pass(result, x, y, fkwargs)
+            if use_inverse:
+                result = apply_inverse_pass(result, x, y, fkwargs)
             if use_series:
                 result = apply_series_pass(result, x, y)
             return result

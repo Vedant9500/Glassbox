@@ -302,3 +302,108 @@ def test_composition_pass_escalates_and_rejects_dense_surrogates():
     base = {"formula": "0.1*sin(x)", "mse": 1e-3}
     out = apply_composition_pass(base, x, y, {"detected_omegas": [1.0]})
     assert out is base
+
+
+def test_inverse_composition_finds_function_of_sum():
+    """The argument of a composition is often a sum, not a basis column."""
+    from experiments.exactness.inverse_composition import fit_inverse_composition
+
+    x = np.linspace(-3.0, 3.0, 300)
+    cases = (
+        ("log(1+exp(x))", np.log1p(np.exp(x)), "log"),
+        ("1/(1+exp(-x))", 1.0 / (1.0 + np.exp(-x)), "reciprocal"),
+        ("exp(-abs(x))", np.exp(-np.abs(x)), "exp"),
+        ("log(x^2+1)", np.log(x * x + 1.0), "log"),
+    )
+    predictions = {"exp": 1.0, "log": 1.0, "rational": 1.0, "power": 1.0}
+    for formula, y, op in cases:
+        result = fit_inverse_composition(x, y, predictions, [1.0, 2.0])
+        assert result is not None, formula
+        assert result["op"] == op, formula
+        assert result["mse"] < 1e-12, formula
+
+
+def test_inverse_composition_rejects_branch_wrapped_argument():
+    """arcsin of a wrapped argument is a sawtooth, not the true argument."""
+    from experiments.exactness.inverse_composition import fit_inverse_composition
+
+    # x + sin(x) leaves [-pi/2, pi/2] on this domain, so no inverse fit can be
+    # exact; the module must not return a machine-precision claim.
+    x = np.linspace(-2.5, 2.5, 300)
+    y = np.sin(x + np.sin(x))
+    result = fit_inverse_composition(x, y, {"sin": 1.0, "power": 1.0}, [1.0])
+    assert result is None or result["mse"] > 1e-8
+
+
+def test_fit_dictionary_rejects_unfaithful_column_name():
+    """A formula must describe the matrix column it was fitted on."""
+    from experiments.exactness.composite_basis import fit_dictionary
+
+    x = np.linspace(-4.0, 4.0, 300)
+    # The name says ``x`` but the values are ``|x|``: formatting this fit
+    # would emit ``-x``, a different function. It must be rejected.
+    assert fit_dictionary(x, -np.abs(x), [("x", np.abs(x))], ks=(1,)) is None
+
+    honest = fit_dictionary(x, -np.abs(x), [("Abs(x)", np.abs(x))], ks=(1,))
+    assert honest is not None
+    assert np.allclose(lib.evaluate(honest["formula"], x), -np.abs(x), atol=1e-6)
+
+
+def test_select_columns_prefers_canonical_name_and_dedupes():
+    from experiments.exactness.inverse_composition import _select_columns
+
+    x = np.linspace(-4.0, 4.0, 300)
+    canonical = np.abs(x)
+    alias = canonical * (1.0 + 1e-10)
+    selected = _select_columns(
+        [("abs(x)", canonical), ("(x^1.5)/(x^0.5)", alias)], -canonical
+    )
+    assert len(selected) == 1
+    assert selected[0][0] == "abs(x)"
+
+
+def test_closure_escalates_past_sub_micro_fit():
+    """A 5e-7 fast-path fit is still an approximation and must escalate."""
+    from experiments.exactness.run_with_guard import apply_composite_pass
+    from scripts.benchmark_suite import _generate_data
+
+    x, y = _generate_data("exp(-x)*cos(x)", 0.0, 10.0, 300)
+    base = {"formula": "0.1*sin(x)", "mse": 5e-7}
+    out = apply_composite_pass(base, x, y, {"detected_omegas": [1.0, 2.0]})
+    assert "guard_closure" in out
+    assert out["mse"] < 1e-20
+
+
+def test_inverse_composition_stays_parsimonious_with_many_columns():
+    """A dense collinear dictionary must not replace a 1-term identity."""
+    from experiments.exactness.inverse_composition import fit_inverse_composition
+
+    x = np.linspace(-4.0, 4.0, 300)
+    y = np.exp(-np.abs(x))
+    # The benchmark feeds float32 tensors and the classifier's real
+    # predictions; both were needed to reproduce the 320-column OMP
+    # instability that produced a 4-term surrogate with 1e-7 noise terms.
+    xf = x.astype(np.float32).astype(np.float64)
+    yf = y.astype(np.float32).astype(np.float64)
+    predictions = {
+        "exp": 0.80017,
+        "multiplication": 0.89603,
+        "periodic": 0.55766,
+        "exponential": 0.80017,
+    }
+    result = fit_inverse_composition(
+        xf, yf, predictions, [0.7846311730035055, 1.569262346007011, 2.3538935190105166]
+    )
+    assert result is not None
+    assert result["n_terms"] <= 2
+    assert "Abs(x)" in result["formula"]
+    assert result["mse"] < 1e-12
+
+
+def test_equivalent_understands_signed_power_helper():
+    """Production emits `_signed_power`; the analyzer must parse it."""
+    formula = "_signed_power(Abs(x ** 2 + 1), -0.5)"
+    assert lib.equivalent(formula, "1/sqrt(1+x^2)", (-4.0, 4.0))
+    values = lib.evaluate(formula, np.linspace(-4.0, 4.0, 101))
+    assert values is not None
+    assert np.all(np.isfinite(values))
